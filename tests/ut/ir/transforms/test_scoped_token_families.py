@@ -11,6 +11,7 @@
 
 from collections import Counter
 from itertools import product
+from typing import cast
 
 import pytest
 from pypto import ir, passes, testing
@@ -18,6 +19,7 @@ from pypto.ir.op import sync
 
 from .sync_matmul_oracle import hardware_reference, integer, interpret
 from .test_collective_sync_realization import nested_collective, repeat_collective
+from .test_nested_phase_sync import nested_matrix_fixture
 from .test_nested_sync_repetition import resident_pipeline_tree
 from .test_scoped_logical_sync import wrapped_collective
 from .test_token_sync_lowering import FiniteTokenExecution, _apply
@@ -57,9 +59,9 @@ def occurrence_indices(result, calls):
     return occurrences
 
 
-def compare(logical):
+def compare(logical, *, prepare=False):
     snapshot = ir.serialize(ir.Program([logical], "Before", logical.span))
-    result = testing.inspect_scoped_token_families(logical)
+    result = testing.inspect_scoped_token_families(logical, prepare=prepare)
     assert snapshot == ir.serialize(ir.Program([logical], "Before", logical.span))
     original = result["function"]
     _, calls = interpret(original)
@@ -89,7 +91,10 @@ def compare(logical):
         ]:
             retained = set()
             frames = result["regions"][region]["frames"]
-            for digits in product(*(range(lo, hi) for lo, hi in family[key])):
+            steps = family[key.replace("domain", "steps")] or [1] * len(family[key])
+            for digits in product(
+                *(range(lo, hi, step) for (lo, hi), step in zip(family[key], steps, strict=True))
+            ):
                 ordinal = 0
                 for digit, (_, size, _, _) in zip(digits, frames, strict=True):
                     assert 0 <= digit < size
@@ -98,6 +103,14 @@ def compare(logical):
             assert retained == selected
     assert expanded == state.uses, (expanded - state.uses, state.uses - expanded)
     return result, state
+
+
+@pytest.mark.parametrize("count,visits", [(0, 2), (1, 0), (1, 1), (1, 2), (2, 2), (3, 3), (5, 2)])
+def test_phase_capture_actual_token_uses(count, visits):
+    original = nested_matrix_fixture(count, visits=visits, tile_columns=2)
+    logical = testing.analyze_placed_sync(original, True).realize()["function"]
+    compare(logical)
+    compare(ir.deserialize(ir.serialize(logical)))
 
 
 @pytest.mark.parametrize("rows", [1, 2, 5])
@@ -130,13 +143,15 @@ def test_serialized_actual_tokens(tmp_path):
     compare(restored)
 
 
-def _symbolic_start_guard_fixture(offset=2, foreign_origin=False, comparison=ir.Eq):
+def _symbolic_start_guard_fixture(
+    offset=2, foreign_origin: bool | str = False, comparison: type[ir.Eq] | type[ir.Lt] = ir.Eq
+):
     """Author an additional token use on a symbolic-start frame, without analysis."""
     # The shared fixture imports Uses through its independent command checker.
     from .test_sync_case_only_schedule import case_only_fixture  # noqa: PLC0415
 
     _, logical = case_only_fixture(4)
-    block = logical.body.stmts[0].var
+    block = cast(ir.AssignStmt, cast(ir.SeqStmts, logical.body).stmts[0]).var
     span = logical.span
     other = ir.Var(block.name_hint, block.type, span)
 
@@ -162,11 +177,13 @@ def _symbolic_start_guard_fixture(offset=2, foreign_origin=False, comparison=ir.
             elif foreign_origin:
                 origin = ir.Add(block, ci(6), ir.DataType.INDEX, span)
             threshold = origin if offset == 0 else ir.Add(origin, ci(offset), ir.DataType.INDEX, span)
-            statements = list(op.body.stmts)
+            statements = list(cast(ir.SeqStmts, op.body).stmts)
             at = next(
                 i
                 for i, stmt in enumerate(statements)
-                if isinstance(stmt, ir.EvalStmt) and stmt.expr.op.name == ir.get_op("sync.wait").name
+                if isinstance(stmt, ir.EvalStmt)
+                and isinstance(stmt.expr, ir.Call)
+                and stmt.expr.op.name == ir.get_op("sync.wait").name
             )
             statements.insert(
                 at + 1,
@@ -191,8 +208,9 @@ def _symbolic_start_guard_fixture(offset=2, foreign_origin=False, comparison=ir.
 @pytest.mark.parametrize("offset", [0, 2, 4])
 def test_symbolic_start_actual_token_guard_roundtrip(offset):
     logical = _symbolic_start_guard_fixture(offset)
-    options = {"parameter_bounds": {4: (0, 0)}, "block_bounds": (0, 0)}
-    original = testing.inspect_scoped_token_families(logical, **options)
+    original = testing.inspect_scoped_token_families(
+        logical, parameter_bounds={4: (0, 0)}, block_bounds=(0, 0)
+    )
     digit = offset // 2
     selected = [f for f in original["families"] if f["target_domain"] == [(digit, digit + 1)]]
     assert len(selected) == 1
@@ -200,7 +218,10 @@ def test_symbolic_start_actual_token_guard_roundtrip(offset):
     assert selected[0]["source_domain"] == [(digit, digit + 1)]
     assert selected[0]["source"][1] == selected[0]["target"][1] == digit
     restored = ir.deserialize(ir.serialize(logical))
-    reparsed = testing.inspect_scoped_token_families(restored, **options)
+    assert isinstance(restored, ir.Function)
+    reparsed = testing.inspect_scoped_token_families(
+        restored, parameter_bounds={4: (0, 0)}, block_bounds=(0, 0)
+    )
 
     # Serialization may rebuild expression nodes. It must preserve the original
     # SSA bindings and every actual use, including the explicitly added wait.
@@ -222,10 +243,11 @@ def test_symbolic_start_token_guard_requires_original_lattice(offset, foreign):
 
 
 def test_symbolic_start_one_past_guard_is_half_open():
-    options = {"parameter_bounds": {4: (0, 0)}, "block_bounds": (0, 0)}
-    empty = testing.inspect_scoped_token_families(_symbolic_start_guard_fixture(8), **options)
+    empty = testing.inspect_scoped_token_families(
+        _symbolic_start_guard_fixture(8), parameter_bounds={4: (0, 0)}, block_bounds=(0, 0)
+    )
     full = testing.inspect_scoped_token_families(
-        _symbolic_start_guard_fixture(8, comparison=ir.Lt), **options
+        _symbolic_start_guard_fixture(8, comparison=ir.Lt), parameter_bounds={4: (0, 0)}, block_bounds=(0, 0)
     )
     assert len(full["families"]) == len(empty["families"]) + 1
     assert sum(f["count"] for f in full["families"]) == sum(f["count"] for f in empty["families"]) + 4
@@ -263,9 +285,15 @@ def test_actual_capture_coordinate_controls_family(selected):
     logical = _apply(passes.insert_sync, wrapped_collective(3))
 
     class Select(ir.IRMutator):
+        changed = 0
+
         def visit_if_stmt(self, op):
-            if op.return_vars and isinstance(op.return_vars[0].type, ir.SyncTokenType):
-                assert isinstance(op.condition, ir.Eq)
+            if (
+                op.return_vars
+                and isinstance(op.return_vars[0].type, ir.SyncTokenType)
+                and isinstance(op.condition, ir.Eq)
+            ):
+                self.changed += 1
                 guard = ir.Eq(
                     op.condition.left,
                     ir.ConstInt(selected, ir.DataType.INDEX, op.span),
@@ -275,7 +303,10 @@ def test_actual_capture_coordinate_controls_family(selected):
                 return ir.IfStmt(guard, op.then_body, op.else_body, op.return_vars, op.span)
             return super().visit_if_stmt(op)
 
-    compare(Select().visit_function(logical))
+    edit = Select()
+    changed = edit.visit_function(logical)
+    assert edit.changed
+    compare(changed)
 
 
 @pytest.mark.parametrize("mode", ["unguarded", "first_only", "last_only"])
@@ -419,7 +450,7 @@ def test_cyclic_outer_history_is_explicitly_unavailable():
     class Cycle(ir.IRMutator):
         def visit_for_stmt(self, op):
             assert isinstance(op.body, ir.SeqStmts)
-            statements = list(op.body.stmts)
+            statements = list(cast(ir.SeqStmts, op.body).stmts)
             statements[-1] = ir.YieldStmt(list(op.iter_args), op.span)
             return ir.ForStmt(
                 op.loop_var,
@@ -434,3 +465,206 @@ def test_cyclic_outer_history_is_explicitly_unavailable():
 
     with pytest.raises(ValueError, match="Cyclic scoped token equation"):
         testing.inspect_scoped_token_families(Cycle().visit_function(logical))
+
+
+@pytest.mark.parametrize("mode", ["foreign_origin", "zero_modulus", "missing_consumer_residue"])
+def test_phase_capture_requires_exact_original_lattice(mode):
+    logical = testing.analyze_placed_sync(nested_matrix_fixture(5, visits=2, tile_columns=2), True).realize()[
+        "function"
+    ]
+
+    class Change(ir.IRMutator):
+        changed = False
+
+        def visit_if_stmt(self, op):
+            capture = bool(op.return_vars)
+            if capture == (mode == "missing_consumer_residue"):
+                return super().visit_if_stmt(op)
+
+            def alter(expr):
+                if isinstance(expr, ir.And):
+                    left, right = alter(expr.left), alter(expr.right)
+                    if left is None:
+                        return right
+                    if right is None:
+                        return left
+                    return ir.And(left, right, ir.DataType.BOOL, expr.span)
+                if not isinstance(expr, ir.Eq) or not isinstance(expr.left, ir.FloorMod):
+                    return expr
+                self.changed = True
+                if mode == "missing_consumer_residue":
+                    return None
+                mod = expr.left
+                operand, divisor = mod.left, mod.right
+                assert isinstance(operand, ir.Sub)
+                if mode == "foreign_origin":
+                    operand = ir.Sub(
+                        operand.left,
+                        ir.Add(
+                            operand.right,
+                            ir.ConstInt(1, ir.DataType.INDEX, expr.span),
+                            ir.DataType.INDEX,
+                            expr.span,
+                        ),
+                        ir.DataType.INDEX,
+                        expr.span,
+                    )
+                else:
+                    divisor = ir.ConstInt(0, ir.DataType.INDEX, expr.span)
+                return ir.Eq(
+                    ir.FloorMod(operand, divisor, ir.DataType.INDEX, expr.span),
+                    expr.right,
+                    ir.DataType.BOOL,
+                    expr.span,
+                )
+
+            condition = alter(op.condition)
+            if condition is None:
+                return op.then_body
+            return ir.IfStmt(condition, op.then_body, op.else_body, op.return_vars, op.span)
+
+    edit = Change()
+    changed = edit.visit_function(logical)
+    assert edit.changed
+    before = ir.serialize(changed)
+    with pytest.raises(ValueError, match="residue|guard|latest-source|coordinate"):
+        testing.inspect_scoped_token_families(changed)
+    assert ir.serialize(changed) == before
+
+
+def test_capture_followed_by_second_same_frame_history_requires_proof():
+    logical = testing.analyze_placed_sync(nested_matrix_fixture(5, visits=2, tile_columns=2), True).realize()[
+        "function"
+    ]
+
+    class ExtraHistory(ir.IRMutator):
+        changed = False
+
+        def visit_for_stmt(self, op):
+            if self.changed or not isinstance(op.body, ir.SeqStmts):
+                return super().visit_for_stmt(op)
+            captures = [
+                stmt.return_vars[0]
+                for stmt in cast(ir.SeqStmts, op.body).stmts
+                if isinstance(stmt, ir.IfStmt) and stmt.return_vars
+            ]
+            yielded = cast(ir.SeqStmts, op.body).stmts[-1]
+            assert isinstance(yielded, ir.YieldStmt)
+
+            class WaitArguments(ir.IRVisitor):
+                def __init__(self):
+                    super().__init__()
+                    self.values = []
+
+                def visit_eval_stmt(self, op):
+                    statement = op
+                    call = statement.expr
+                    if isinstance(call, ir.Call) and call.op.name == ir.get_op("sync.wait").name:
+                        self.values.append(call.args[0])
+                    super().visit_eval_stmt(statement)
+
+            arguments = WaitArguments()
+            arguments.visit_stmt(op.body)
+            candidates = [
+                i
+                for i, expr in enumerate(yielded.value)
+                if any(expr.same_as(capture) for capture in captures)
+                and any(op.iter_args[i].same_as(value) for value in arguments.values)
+            ]
+            if not candidates:
+                return super().visit_for_stmt(op)
+            previous = op.iter_args[candidates[0]]
+            older = ir.IterArg("test_older", previous.type, previous.initValue, op.span)
+            result = ir.Var("test_older_result", previous.type, op.span)
+
+            class ReplaceWait(ir.IRMutator):
+                count = 0
+
+                def visit_eval_stmt(self, op):
+                    statement = op
+                    call = statement.expr
+                    if (
+                        isinstance(call, ir.Call)
+                        and call.op.name == ir.get_op("sync.wait").name
+                        and call.args[0].same_as(previous)
+                    ):
+                        self.count += 1
+                        return ir.EvalStmt(
+                            ir.Call(call.op, [older], dict(call.kwargs), None, call.type, call.span),
+                            statement.span,
+                        )
+                    return statement
+
+            replace = ReplaceWait()
+            body = replace.visit_stmt(op.body)
+            assert replace.count
+            assert isinstance(body, ir.SeqStmts)
+            body = ir.SeqStmts([*body.stmts[:-1], ir.YieldStmt([*yielded.value, previous], op.span)], op.span)
+            self.changed = True
+            return ir.ForStmt(
+                op.loop_var,
+                op.start,
+                op.stop,
+                op.step,
+                [*op.iter_args, older],
+                body,
+                [*op.return_vars, result],
+                op.span,
+            )
+
+    edit = ExtraHistory()
+    changed = edit.visit_function(logical)
+    assert edit.changed
+    before = ir.serialize(changed)
+    with pytest.raises(ValueError, match="Composed captured history"):
+        testing.inspect_scoped_token_families(changed)
+    assert ir.serialize(changed) == before
+
+
+@pytest.mark.parametrize("count,visits", [(1, 1), (2, 2), (3, 3), (5, 2), (8, 2)])
+def test_prepared_phase_family_unions_preserve_actual_records(count, visits):
+    logical = testing.analyze_placed_sync(
+        nested_matrix_fixture(count, visits=visits, tile_columns=2), True
+    ).realize()["function"]
+    raw, before = compare(logical)
+    prepared, after = compare(logical, prepare=True)
+    assert before.uses == after.uses
+    assert prepared["raw_family_count"] == len(raw["families"])
+    assert len(prepared["families"]) <= len(raw["families"])
+    assert [row["protocol_uses"] for row in raw["families"]] == [[i] for i in range(len(raw["families"]))]
+    assert sorted(i for row in prepared["families"] for i in row["protocol_uses"]) == list(
+        range(len(raw["families"]))
+    )
+    assert prepared["protocol_cuts"] == raw["protocol_cuts"]
+    # compare expands each exact endpoint progression and every paired record;
+    # neither an interval hull nor deduplication can pass these comparisons.
+    if count >= 5:
+        assert prepared["work"]["union_candidates"] > 0
+        assert prepared["work"]["union_reuse_checks"] > 0
+
+
+def test_prepared_family_union_preserves_duplicate_token_uses():
+    logical = testing.analyze_placed_sync(nested_matrix_fixture(5, visits=2, tile_columns=2), True).realize()[
+        "function"
+    ]
+
+    class Duplicate(ir.IRMutator):
+        def visit_eval_stmt(self, op):
+            if isinstance(op.expr, ir.Call) and op.expr.op.name == ir.get_op("sync.wait").name:
+                return ir.SeqStmts([op, op], op.span)
+            return op
+
+    _, before = compare(logical, prepare=True)
+    _, after = compare(Duplicate().visit_function(logical), prepare=True)
+    assert after.uses == Counter({pair: 2 * count for pair, count in before.uses.items()})
+
+
+def test_retained_protocol_rejects_an_equivalent_but_different_token_owner():
+    logical = testing.analyze_placed_sync(nested_matrix_fixture(2, visits=1), True).realize()["function"]
+    order = testing.analyze_scoped_token_order(logical)
+    order.validate_token_owner(logical)
+    replacement = ir.deserialize(ir.serialize(logical))
+    assert isinstance(replacement, ir.Function)
+    ir.assert_structural_equal(logical, replacement)
+    with pytest.raises(ValueError, match="different token IR"):
+        order.validate_token_owner(replacement)

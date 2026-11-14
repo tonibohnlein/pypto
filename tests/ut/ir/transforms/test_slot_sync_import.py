@@ -13,7 +13,7 @@ import pytest
 from pypto import ir, testing
 
 from .sync_matmul_cases import staged_fixture
-from .sync_matmul_oracle import sequence_stmts
+from .sync_matmul_oracle import check_imported_accesses, interpret, sequence_stmts
 from .test_indexed_sync_analysis import indexed_fixture
 from .test_vec_sync_analysis import vec_fixture
 
@@ -384,3 +384,261 @@ def test_different_strides_do_not_supply_a_common_stride_certificate():
 
     with pytest.raises(ValueError, match="one common stride"):
         testing.describe_placed_sync_input(Mixed().visit_function(slot_fixture()), True)
+
+
+def nested_slot_fixture(outer_count=3, inner_count=4, *, coupled=False, escaped=False, constant=False):
+    """An ancestor selects a resident slot; the inner counter drives GM rows."""
+    span = ir.Span.unknown()
+    index, fp = ir.DataType.INDEX, ir.DataType.FP32
+
+    def ci(value):
+        return ir.ConstInt(value, index, span)
+
+    def tup(values):
+        return ir.MakeTuple([ci(value) for value in values], span)
+
+    def call(name, args, ty=None):
+        return ir.Call(ir.get_op(name), args, ty or ir.VoidType(), span)
+
+    ty = ir.BufferType([1, 32], fp, ir.MemorySpace.Vec)
+    group_ty = ir.MultiBufferType(ty, 3)
+    group = ir.Var("outer_ring", group_ty, span)
+    source = ir.Var("source", ir.TensorType([max(1, inner_count), 32], fp), span)
+    output = ir.Var("output", source.type, span)
+    outer_iv, inner_iv = [ir.Var(name, ir.ScalarType(index), span) for name in ("outer", "inner")]
+    selected = ir.Var("selected", ty, span)
+    named_slot = ir.Var("slot_index", ir.ScalarType(index), span)
+    numerator = ir.Add(ir.Mul(outer_iv, ci(2), index, span), ci(1), index, span)
+    if coupled:
+        numerator = ir.Add(numerator, inner_iv, index, span)
+    selection = ci(1) if constant else ir.FloorMod(numerator, ci(3), index, span)
+    definitions = [
+        ir.AssignStmt(named_slot, selection, span),
+        ir.AssignStmt(selected, call("buffer.slot", [group, named_slot], ty), span),
+    ]
+    offsets = ir.MakeTuple([inner_iv, ci(0)], span)
+    body = [
+        ir.EvalStmt(call("buffer.load", [source, offsets, tup([1, 32]), selected]), span),
+        ir.EvalStmt(call("buffer.abs", [selected, selected]), span),
+        ir.EvalStmt(call("buffer.store", [selected, offsets, tup([1, 32]), output]), span),
+        ir.YieldStmt([], span),
+    ]
+    inner = ir.ForStmt(
+        inner_iv,
+        ci(0),
+        ci(inner_count),
+        ci(1),
+        [],
+        ir.SeqStmts([*(definitions if coupled else []), *body], span),
+        [],
+        span,
+    )
+    outer = ir.ForStmt(
+        outer_iv,
+        ci(1),
+        ci(1 + 2 * outer_count),
+        ci(2),
+        [],
+        ir.SeqStmts([*([] if coupled else definitions), inner, ir.YieldStmt([], span)], span),
+        [],
+        span,
+    )
+    statements: list[ir.Stmt] = [
+        ir.AssignStmt(group, call("buffer.alloc_multi", [tup([]), ci(0)], group_ty), span),
+        outer,
+    ]
+    if escaped:
+        statements.append(ir.EvalStmt(call("buffer.abs", [selected, selected]), span))
+    statements.append(ir.ReturnStmt([output], span))
+    function = ir.Function(
+        "nested_slot_frames",
+        [source, (output, ir.ParamDirection.InOut)],
+        [output.type],
+        ir.SeqStmts(statements, span),
+        span,
+        ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    return function, outer, inner
+
+
+@pytest.mark.parametrize("outer_count,inner_count", [(0, 4), (1, 1), (3, 0), (3, 4), (4, 2)])
+def test_ancestor_slot_import_preserves_original_frame_and_access_agreement(outer_count, inner_count):
+    function, outer, inner = nested_slot_fixture(outer_count, inner_count)
+    description = testing.describe_placed_sync_input(function, True)
+    storage, calls = interpret(function)
+    check_imported_accesses(description, storage, calls)
+    assert len(calls) == 3 * outer_count * inner_count
+    for region in description["regions"]:
+        for site in region["sites"]:
+            for access, slot, slot_frame, address_frame in zip(
+                site["accesses"],
+                site["slot_selections"],
+                site["slot_frames"],
+                site["access_frames"],
+                strict=True,
+            ):
+                domain = description["storage"][access[0]]
+                if domain["slot_count"] > 1:
+                    assert slot == (0, 1), "(2*(1+2*visit)+1)%3 uses the original outer ordinal"
+                    assert slot_frame.same_as(outer)
+                    assert address_frame is None
+                elif access[4] or access[5]:
+                    assert address_frame.same_as(inner)
+                    assert slot_frame is None
+    # Slot phases are now retained, but these moving GM writes reuse the same
+    # rows in every outer visit. A visit-local disjointness argument is not an
+    # external replay certificate; preserve that independent export refusal.
+    with pytest.raises(
+        ValueError, match="Phased moving GM writes need a scoped external ownership certificate"
+    ):
+        testing.analyze_placed_sync(function, True)
+
+
+@pytest.mark.parametrize("constant", [False, True])
+def test_slot_selection_cannot_escape_its_defining_invocation(constant):
+    function, _, _ = nested_slot_fixture(escaped=True, constant=constant)
+    # The shared IR verifier rejects this before descriptor recovery, including
+    # the constant-selector case. Do not bypass it to test a later check.
+    with pytest.raises(ValueError, match="used outside its defining scope"):
+        testing.describe_placed_sync_input(function, True)
+
+
+def test_slot_selection_with_coupled_enclosing_coordinates_stays_unavailable():
+    function, _, _ = nested_slot_fixture(coupled=True)
+    with pytest.raises(ValueError, match="Coupled slot coordinates require a multidimensional"):
+        testing.describe_placed_sync_input(function, True)
+
+
+@pytest.mark.parametrize("boxed", [False, True])
+def test_framed_moving_slot_rectangle_is_exact_without_an_interval_export(boxed):
+    original = interval_extract_fixture(ir.TileLayout.row_major, boxed, (32, 16), (0, 0))
+    span, index = original.span, ir.DataType.INDEX
+    source_alloc, target_alloc, load, extract, result = sequence_stmts(original.body)
+    assert isinstance(source_alloc, ir.AssignStmt) and isinstance(source_alloc.value, ir.Call)
+    assert isinstance(target_alloc, ir.AssignStmt)
+    assert isinstance(load, ir.EvalStmt) and isinstance(load.expr, ir.Call)
+    source_type = source_alloc.var.type
+    assert isinstance(source_type, ir.BufferType)
+    multi = ir.MultiBufferType(source_type, 2)
+    group, selected = ir.Var("ring", multi, span), ir.Var("selected", source_type, span)
+    outer_iv, inner_iv = [ir.Var(name, ir.ScalarType(index), span) for name in ("outer", "inner")]
+
+    def ci(value):
+        return ir.ConstInt(value, index, span)
+
+    def call(name, args, ty=None):
+        return ir.Call(ir.get_op(name), args, ty or ir.VoidType(), span)
+
+    allocation = ir.AssignStmt(group, call("buffer.alloc_multi", source_alloc.value.args, multi), span)
+    select = ir.AssignStmt(
+        selected, call("buffer.slot", [group, ir.FloorMod(outer_iv, ci(2), index, span)], source_type), span
+    )
+    load = ir.EvalStmt(call("buffer.load", [*load.expr.args[:-1], selected]), span)
+    extract = ir.EvalStmt(
+        call("buffer.extract", [selected, ci(0), ir.Mul(inner_iv, ci(16), index, span), target_alloc.var]),
+        span,
+    )
+    inner = ir.ForStmt(
+        inner_iv, ci(0), ci(2), ci(1), [], ir.SeqStmts([extract, ir.YieldStmt([], span)], span), [], span
+    )
+    outer = ir.ForStmt(
+        outer_iv,
+        ci(0),
+        ci(3),
+        ci(1),
+        [],
+        ir.SeqStmts([select, load, inner, ir.YieldStmt([], span)], span),
+        [],
+        span,
+    )
+    function = ir.Function(
+        "framed_rectangles",
+        original.params,
+        [],
+        ir.SeqStmts([allocation, target_alloc, outer, result], span),
+        span,
+        ir.FunctionType.AIC,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    description = testing.describe_placed_sync_input(function, True)
+    storage, calls = interpret(function)
+    check_imported_accesses(description, storage, calls)
+    extraction = next(
+        site
+        for region in description["regions"]
+        for site in region["sites"]
+        if site["original"].same_as(extract.expr)
+    )
+    assert extraction["access_precision"][0] == "exact"
+    assert extraction["physical_intervals"][0] is None
+    assert extraction["slot_frames"][0].same_as(outer)
+    assert extraction["access_frames"][0].same_as(inner)
+
+
+@pytest.mark.parametrize("kind", ["equivalent", "different_slot", "extra_payload"])
+def test_initialization_macro_qualifies_arm_local_slot_definitions(kind):
+    original = staged_fixture(2, stages=1)
+    span, index = original.span, ir.DataType.INDEX
+    statements = sequence_stmts(original.body)
+    loop = next(statement for statement in statements if isinstance(statement, ir.ForStmt))
+    branch = next(statement for statement in sequence_stmts(loop.body) if isinstance(statement, ir.IfStmt))
+    assert isinstance(branch.then_body, ir.EvalStmt) and isinstance(branch.then_body.expr, ir.Call)
+    element = branch.then_body.expr.args[0].type
+    assert isinstance(element, ir.BufferType)
+    multi = ir.MultiBufferType(element, 2)
+    group = ir.Var("arm_ring", multi, span)
+
+    def ci(value):
+        return ir.ConstInt(value, index, span)
+
+    def call(name, args, ty=None):
+        return ir.Call(ir.get_op(name), args, ty or ir.VoidType(), span)
+
+    allocation = ir.AssignStmt(
+        group, call("buffer.alloc_multi", [ir.MakeTuple([], span), ci(8192)], multi), span
+    )
+
+    def arm(body, name, slot):
+        selected = ir.Var(name, element, span)
+        prefix = ir.AssignStmt(selected, call("buffer.slot", [group, ci(slot)], element), span)
+        payload = ir.EvalStmt(
+            ir.Call(body.expr.op, [selected, *body.expr.args[1:]], body.expr.type, span), span
+        )
+        return ir.SeqStmts([prefix, *([payload] if kind == "extra_payload" else []), payload], span)
+
+    class Replace(ir.IRMutator):
+        def visit_if_stmt(self, op):
+            return ir.IfStmt(
+                op.condition,
+                arm(op.then_body, "first", 0),
+                arm(op.else_body, "later", 1 if kind == "different_slot" else 0),
+                [],
+                span,
+            )
+
+    changed = Replace().visit_stmt(original.body)
+    function = ir.Function(
+        original.name,
+        list(zip(original.params, original.param_directions, strict=True)),
+        original.return_types,
+        ir.SeqStmts([allocation, *sequence_stmts(changed)], span),
+        span,
+        original.func_type,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    if kind != "equivalent":
+        message = "preserve operands" if kind == "different_slot" else "qualified scalar/slot definitions"
+        with pytest.raises(ValueError, match=message):
+            testing.describe_placed_sync_input(function, True)
+        return
+    description = testing.describe_placed_sync_input(function, True)
+    storage, calls = interpret(function)
+    check_imported_accesses(description, storage, calls)
+    assert any(
+        site["continuation"] is not None for region in description["regions"] for site in region["sites"]
+    )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

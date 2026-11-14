@@ -20,6 +20,7 @@ from .sync_logical_oracle import CommandExecution
 from .sync_matmul_cases import CASES, capture, staged_fixture
 from .sync_matmul_oracle import hardware_reference, interpret, validate
 from .sync_physical_oracle import directional_widths, run_physical
+from .test_collective_sync_interface import wrapped_collective
 from .test_finite_sync_analysis import closure
 from .test_logical_sync_realization import verify
 
@@ -144,7 +145,7 @@ def test_refusal_keeps_original_mathematics():
     before = retained.describe()
     with pytest.raises(ValueError, match="Fixed-plan scarcity"):
         retained.realize_physical("a2a3", [])
-    with pytest.raises(ValueError, match="Unsupported physical target"):
+    with pytest.raises(ValueError, match="hardware contract differs from lowering target"):
         retained.realize_physical("a5")
     with pytest.raises(ValueError, match="Invalid/duplicate"):
         retained.realize_physical("a2a3", [0, 0])
@@ -443,7 +444,7 @@ def test_nonleading_conditional_initializer_stays_conservative():
 
 
 def test_assigned_family_storage_is_shared_read_only():
-    result = testing.check_sync_assignment_contract(capture("matmul_64"))
+    result = testing.check_sync_assignment_contract(wrapped_collective(2))
     assert result["shared_family_storage"]
     assert result["families"] > 0
 
@@ -452,15 +453,15 @@ def test_assigned_family_storage_is_shared_read_only():
     "change,message",
     [
         ("foreign_input", "different input case"),
-        ("owner", "foreign original owner"),
+        ("owner", "different input case"),
         ("target", "target differs"),
-        ("domain", "invocation domain changed"),
-        ("frame", "occurrence frame changed"),
-        ("preassigned_ids", "preassigned IDs"),
+        ("domain", "different input case"),
+        ("frame", "different input case"),
+        ("preassigned_ids", "Protocol handoff, domain or identity changed"),
     ],
 )
 def test_assignment_rejects_uncertified_context(change, message):
-    function = capture("matmul_64")
+    function = wrapped_collective(2)
     before = ir.serialize(function)
     with pytest.raises(ValueError, match=message):
         testing.check_sync_assignment_contract(function, change)

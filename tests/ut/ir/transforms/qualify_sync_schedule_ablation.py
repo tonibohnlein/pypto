@@ -50,7 +50,10 @@ from .test_token_sync_lowering import _apply, _check_actual_tokens
 
 def digest(path: Path) -> str:
     with path.open("rb") as source:
-        return hashlib.file_digest(source, "sha256").hexdigest()
+        digest = hashlib.sha256()
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+        return digest.hexdigest()
 
 
 def fixtures():

@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Supplied scoped order versus an independently expanded selected proof graph."""
+"""Scoped order certificates versus independently interpreted actual tokens."""
 
 from itertools import product
 
@@ -17,11 +17,14 @@ from pypto.backend.pto_backend import _run_ptoas
 
 from .sync_control_metrics import expression_nodes, statements
 from .sync_matmul_oracle import hardware_reference, interpret
-from .sync_physical_oracle import PhysicalExecution, checked_payload_calls
+from .sync_physical_oracle import PhysicalExecution, checked_payload_calls, run_physical
+from .sync_shenggan_cases import capture_shenggan
 from .test_collective_sync_realization import nested_collective, repeat_collective
 from .test_finite_sync_analysis import closure
+from .test_nested_phase_sync import nested_matrix_fixture
 from .test_nested_sync_repetition import resident_pipeline_tree
 from .test_scoped_logical_sync import wrapped_collective
+from .test_scoped_palette_realization import check_physical
 from .test_scoped_token_families import Uses, occurrence_indices
 from .test_token_sync_lowering import _apply, _project
 from .test_vec_sync_analysis import vec_fixture
@@ -69,9 +72,21 @@ def check_order(logical, *, physical=True):
     for a, ai in occurrences.items():
         for b, bi in occurrences.items():
             for ac, bc in product((False, True), repeat=2):
-                assert order.precedes(a, ac, b, bc) == (
-                    (ai == bi and ac == bc) or ((ai, ac), (bi, bc)) in expected
-                ), (a, ac, b, bc)
+                uniform_answer = (ai == bi and ac == bc) or ((ai, ac), (bi, bc)) in expected
+                # Exceptional/periodic tokens may provide a concrete native ->
+                # token -> native witness even when they cannot be installed in
+                # the uniform repeat summary. Derive that witness from executed
+                # SSA uses, independently of the parser's family progression.
+                one_edge = any(
+                    calls[source][2] == calls[ai][2]
+                    and calls[target][2] == calls[bi][2]
+                    and ai <= source
+                    and target <= bi
+                    for source, target in state.uses
+                )
+                answer = order.precedes(a, ac, b, bc)
+                assert answer == (uniform_answer or one_edge), (a, ac, b, bc)
+                assert not answer or (ai == bi and ac == bc) or ((ai, ac), (bi, bc)) in actual_payload
     if physical and calls:
         diagnostic = order.realize()
         lowered = _apply(passes.lower_sync, logical)
@@ -209,11 +224,23 @@ def test_exceptional_reset_edge_does_not_certify_all_visits(mode):
     if mode != "no_seam":
         assert any(not order.uniform(i) for i in range(len(result["families"])))
     with pytest.raises(ValueError, match="reuse is unproved"):
-        order.realize()
+        order.realize_legacy()
     amended = Restrict().visit_function(logical)
     snapshot = ir.serialize(ir.Program([amended], "Before", amended.span))
-    with pytest.raises(ValueError, match="reuse is unproved"):
-        _apply(passes.lower_sync, amended)
+    # The period-one premise remains unproved. A complete directional palette
+    # can nevertheless certify the actual exceptional protocol with more lanes.
+    # This deliberate removal of token waits is not a storage-coverage claim.
+
+    if mode == "no_seam":
+        # This intentionally weakened protocol remains uncertified in the
+        # explicit six-ID pool. Its existing default eight-ID configuration is
+        # tested separately; no production resource pool is enlarged.
+        with pytest.raises(ValueError, match="reuse is unproved"):
+            order.realize(eligible_ids=list(range(6)))
+    else:
+        check_physical(amended, range(6), require_coverage=False)
+    lowered = _apply(passes.lower_sync, amended)
+    check_physical(amended, range(8), require_coverage=False, emitted=lowered)
     assert snapshot == ir.serialize(ir.Program([amended], "Before", amended.span))
 
 
@@ -275,3 +302,119 @@ def test_public_scoped_cpp_and_serialization(tmp_path, fixture):
     body = output.read_text().split("AICORE void ", 1)[1]
     assert "set_flag(" in body and "wait_flag(" in body
     assert "ptoas_auto_sync_tail(" not in body
+
+
+@pytest.mark.parametrize("count,visits", [(1, 1), (2, 1), (3, 2)])
+def test_periodic_token_order_witnesses_are_sound_across_resets(count, visits):
+    original = nested_matrix_fixture(count, visits=visits, slices=4, tile_columns=2)
+    logical = testing.analyze_placed_sync(original, True).realize()["function"]
+    # This independently checks all four event combinations and every accepted
+    # reuse certificate against executed tokens. Physical acceptance is separate.
+    _, order = check_order(logical, physical=False)
+    assert order.witness_attempts > 0
+    assert order.candidate_visits > 0
+    assert order.binary_probes >= order.candidate_visits
+
+
+@pytest.mark.parametrize("count,visits", [(0, 2), (1, 0), (1, 1), (1, 2), (2, 2), (3, 3), (5, 2)])
+def test_nested_phase_physical_matching_and_reuse(count, visits):
+    original = nested_matrix_fixture(count, visits=visits, tile_columns=2)
+    logical = testing.analyze_placed_sync(original, True).realize()["function"]
+    _, order = check_order(logical)
+    if count and visits:
+        # Explicit requested pool, independent of the current native catalog.
+        physical = order.realize(eligible_ids=list(range(6)))
+
+        run_physical(original, physical, eligible=range(6))
+
+
+def test_shenggan_original_tiles_single_invocation_cpp(tmp_path):
+    # Bounded source derivative: original tile sizes and four inner slices.
+    # This does not stand in for the full original kernel's resource outcome.
+    program = capture_shenggan(tmp_path / "capture", m=128, n=256, k=512, workers=1)
+    with passes.PassContext(
+        [],
+        enable_pypto_autosync=True,
+        autosync_disjoint_gm=True,
+        enable_buffer_ir=True,
+        memory_planner=passes.MemoryPlanner.PYPTO,
+    ):
+        logical = passes.insert_sync()(program)
+        physical = passes.lower_sync()(logical)
+    worker = next(f for f in logical.functions.values() if f.func_type == ir.FunctionType.AIC)
+    before = testing.inspect_scoped_token_families(worker, block_bounds=(0, 0))["function"]
+    after = next(f for f in physical.functions.values() if f.func_type == ir.FunctionType.AIC)
+    # Full program supplies the fixed launch count; use its resulting worker
+    # for physical checks with explicit worker zero.
+    run_physical(before, after, eligible=range(6), block_index=0)
+    text = codegen.PTOCodegen().generate(ir.Program([after], "Shenggan", after.span))
+    path = tmp_path / "shenggan.pto"
+    path.write_text(text)
+    cpp = tmp_path / "shenggan.cpp"
+    _run_ptoas(str(path), str(cpp), ["--enable-insert-sync=true"])
+    assert cpp.exists() and cpp.stat().st_size > 0
+
+
+def test_shenggan_collapsed_single_k_startup_remains_explicit(tmp_path):
+    program = capture_shenggan(tmp_path / "capture", m=128, n=256, k=256, workers=1)
+    before = ir.serialize(program)
+    # Upstream specialization removes the K frame. The older rotating-leaf
+    # route does not yet export its initialization/continuation macro.
+    with passes.PassContext(
+        [],
+        enable_pypto_autosync=True,
+        autosync_disjoint_gm=True,
+        enable_buffer_ir=True,
+        memory_planner=passes.MemoryPlanner.PYPTO,
+    ):
+        with pytest.raises(ValueError, match="accumulator/continuation export unavailable"):
+            passes.insert_sync()(program)
+    assert ir.serialize(program) == before
+
+
+@pytest.mark.parametrize("count,visits", [(2, 1), (3, 2)])
+def test_resource_transition_queries_use_actual_tokens(count, visits):
+    logical = testing.analyze_placed_sync(
+        nested_matrix_fixture(count, visits=visits, slices=4, tile_columns=2), True
+    ).realize()["function"]
+    result, order = check_order(logical, physical=False)
+    for family in result["families"]:
+        # The parser's family is an independently checked rectangle of actual
+        # token edges. Asking about that rectangle must not install another edge.
+        axes = []
+        sr, _, _ = family["source"]
+        tr, _, _ = family["target"]
+        source_frames = result["regions"][sr]["frames"]
+        target_frames = result["regions"][tr]["frames"]
+        for i, (frame, length, source_stride, target_stride) in enumerate(family["axes"]):
+            source_unit = 1
+            target_unit = 1
+            for child in source_frames[i + 1 :]:
+                source_unit *= child[1]
+            for child in target_frames[i + 1 :]:
+                target_unit *= child[1]
+            axes.append(
+                (
+                    order.region_frames[sr][i],
+                    length,
+                    source_stride,
+                    target_stride,
+                    source_stride // source_unit,
+                    target_stride // target_unit,
+                )
+            )
+        assert order.prove_transition(family["source"], family["target"], axes)
+        assert not order.prove_transition(family["target"], family["source"], [])
+        if axes:
+            corrupted = list(axes)
+            frame, length, source_stride, target_stride, source_step, target_step = corrupted[0]
+            corrupted[0] = (frame, length, source_stride, target_stride, source_step + 1, target_step)
+            with pytest.raises(ValueError, match="transition step"):
+                order.prove_transition(family["source"], family["target"], corrupted)
+    # Cross-record resource questions are distinct from the supplied token edges.
+    # Point answers agree with the separately checked actual-token order view.
+    for previous, following in product(result["families"][:8], repeat=2):
+        consumer, producer = previous["target"], following["source"]
+        expected = order.precedes(consumer, True, producer, False)
+        assert order.prove_transition(consumer, producer, []) == expected
+        assert order.precedes(consumer, True, producer, False) == expected

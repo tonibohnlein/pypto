@@ -14,7 +14,7 @@ import pytest
 from pypto import ir, testing
 
 from .sync_matmul_oracle import sequence_stmts, validate
-from .sync_physical_oracle import run_physical
+from .sync_physical_oracle import assert_same_family_maps, run_physical
 from .sync_qwen_prefill_cases import capture_qwen_projection
 from .test_nested_sync_repetition import resident_pipeline_tree, scoped_startup_tree
 from .test_qwen_prefill_pipeline import activation_fixture
@@ -51,13 +51,6 @@ def test_scoped_physical_matching_and_reuse_across_every_carry(kind, inner, oute
         # Independent cover validation above establishes these obligations.
         # The admitted target has no qualified DMA/FIX barrier in this path.
         with pytest.raises(ValueError, match="Scoped same-pipe barrier mechanism"):
-            retained.realize_physical("a2a3", list(range(6)))
-        return
-    if kind in {"startup", "fix"} and inner == outer == 2 and replay > 0:
-        # The existing whole-span reservation is sufficient, not optimal. This
-        # nested sharing pattern needs a stronger inter-family certificate;
-        # retain the refusal rather than changing the allocator or ID pool.
-        with pytest.raises(ValueError, match="Allocation unproved by whole-span reservation"):
             retained.realize_physical("a2a3", list(range(6)))
         return
     physical = retained.realize_physical("a2a3", list(range(6)))
@@ -126,9 +119,9 @@ def test_scoped_palette_refusal_is_not_claimed_as_minimum_capacity():
     )
     assert specialized["set_sites"] == specialized["wait_sites"] == 29
     assert not specialized["cases"][0]["finite_minimum"]
-    assert [case["families"] for case in specialized["cases"]] == [
-        case["families"] for case in result["cases"]
-    ]
+    assert len(specialized["cases"]) == len(result["cases"])
+    for specialized_case, baseline_case in zip(specialized["cases"], result["cases"], strict=True):
+        assert_same_family_maps(specialized_case["families"], baseline_case["families"])
 
 
 def test_activation_commands_preserve_empty_cases_and_original_payloads():
@@ -174,15 +167,15 @@ def test_scoped_reuse_proof_and_command_size_do_not_unfold_trip_counts():
         summaries.append(
             (
                 d["analyzed_occurrences"],
-                d["scoped_reuse_queries"],
                 physical["set_sites"],
                 physical["wait_sites"],
                 physical["guard_sites"],
             )
         )
-        # Cached certificate answers must not repeat the proof queries.
+        # Physical realization consumes emitted tokens, not mathematical reuse
+        # caches. Repeated requests must preserve the retained demand inventory.
         retained.realize_physical("a2a3", list(range(6)))
-        assert retained.describe()["scoped_reuse_queries"] == d["scoped_reuse_queries"]
+        assert retained.describe()["scoped_export_builds"] == d["scoped_export_builds"]
     assert len(set(summaries)) == 1
 
 

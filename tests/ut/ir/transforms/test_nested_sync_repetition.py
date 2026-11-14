@@ -107,7 +107,7 @@ def test_nested_repetition_covers_boundaries_and_physical_reuse(outer, inner, re
     physical = retained.realize_physical("a2a3", list(range(6)))
     run_physical(function, physical["function"], range(6), parameters=parameters)
     after = retained.describe()
-    for counter in ("scoped_export_builds", "scoped_reuse_queries", "hierarchy_query_steps"):
+    for counter in ("scoped_export_builds", "hierarchy_query_steps"):
         assert after.pop(counter) >= before.pop(counter)
     assert after == before
     regions = [r for r in before["regions"] if r["nested_frames"]]
@@ -268,14 +268,13 @@ def test_original_frame_work_and_resource_limits_with_depth():
         )
         assert logical["record_sites"] == 5
         assert logical["wait_sites"] == depth + 5
+        physical = retained.realize_physical("a2a3", list(range(6)))
+        # The actual-token palette certificate handles the deeper reset nest.
+        # Execute bounded instances; the larger depths check compact compilation.
         if depth <= 4:
-            physical = retained.realize_physical("a2a3", list(range(6)))
             run_physical(function, physical["function"], range(6), parameters={1: 0, 3: 128})
-        else:
-            # The original-frame allocator does not certify these deep nests.
-            # A former flattened diagnostic assignment was not production evidence.
-            with pytest.raises(ValueError, match="Allocation unproved by whole-span reservation"):
-                retained.realize_physical("a2a3", list(range(6)))
+        assert physical["set_sites"] > 0
+        assert physical["wait_sites"] > 0
     assert all(entries == depth + 5 and nodes == depth + 3 for depth, entries, nodes in measurements)
 
 

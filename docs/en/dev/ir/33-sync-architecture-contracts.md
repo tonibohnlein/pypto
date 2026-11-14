@@ -1,5 +1,9 @@
 # Autosync architecture contracts
 
+The [regional synchronization plan](39-regional-sync-architecture.md) extends
+these ownership boundaries with actual-token protocol skeletons and certified
+palettes. Its staged implementation status is separate from this checkpoint.
+
 This checkpoint hardens the existing token-to-command pipeline before extending
 symbolic or attention-region coverage. The baseline is `0945950aa`. It does not
 change demand generation, physical allocation, hardware exemptions, protocols or

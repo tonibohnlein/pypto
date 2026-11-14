@@ -9,17 +9,30 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef PYPTO_BINDINGS_MODULES_TESTING_SYNC_SUPPORT_H_
-#define PYPTO_BINDINGS_MODULES_TESTING_SYNC_SUPPORT_H_
+#ifndef PYTHON_BINDINGS_MODULES_TESTING_SYNC_SUPPORT_H_
+#define PYTHON_BINDINGS_MODULES_TESTING_SYNC_SUPPORT_H_
+
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "src/ir/transforms/utils/physical_sync_schedule.h"
 
-// Testing-owned adapters. They supply mathematical callbacks or synthetic pure
-// command forests to the SAME allocator/scheduler/emitter used by LowerSync.
+// Testing-owned adapters. Retained mathematics first produces actual tokens,
+// then uses production LowerSync. Synthetic pure command forests exercise the
+// same scheduler/emitter; they supply no order or resource evidence.
 // None is a production route or an independent correctness oracle.
 namespace pypto::python::sync_testing {
-using namespace ir;
-using namespace ir::sync;
+using ir::CallPtr;
+using ir::ExprPtr;
+using ir::FunctionPtr;
+using ir::Span;
+using ir::StmtPtr;
+using ir::sync::CompactSyncResult;
+using ir::sync::PhysicalSyncRealization;
+using ir::sync::SyncInvocationAnalysis;
+using ir::sync::SyncSchedulePolicy;
+namespace physical = ir::sync::physical;
 struct DemandInvocation {
   FunctionPtr function;
   std::vector<PhysicalSyncRealization> cases;
@@ -45,4 +58,4 @@ PhysicalSyncRealization EmitBoundaries(const FunctionPtr&,
                                        const std::vector<std::tuple<CallPtr, StmtPtr, StmtPtr>>&, bool,
                                        bool = false);
 }  // namespace pypto::python::sync_testing
-#endif  // PYPTO_BINDINGS_MODULES_TESTING_SYNC_SUPPORT_H_
+#endif  // PYTHON_BINDINGS_MODULES_TESTING_SYNC_SUPPORT_H_

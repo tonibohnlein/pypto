@@ -58,12 +58,13 @@
 #include "pypto/ir/transforms/utils/finite_sync_analysis.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/sync.h"
+#include "python/bindings/modules/testing_sync_support.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/physical_sync_commands.h"
+#include "src/ir/transforms/utils/scoped_sync_palette.h"
 #include "src/ir/transforms/utils/scoped_token_families.h"
 #include "src/ir/transforms/utils/scoped_token_order.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
-#include "testing_sync_support.h"
 
 namespace nb = nanobind;
 
@@ -84,7 +85,84 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
   out["coordinate_nodes"] = result.input.coordinate_nodes;
   out["coordinate_flatten_visits"] = result.input.coordinate_flatten_visits;
   out["coordinate_coefficient_entries"] = result.input.coordinate_coefficient_entries;
-  nb::list storage, regions;
+  nb::list storage, regions, coordinate_programs;
+  std::map<const ir::sync::SyncCoordinateProgram*, size_t> coordinate_program_ids;
+  auto external_geometry = [&](const ir::sync::SyncAccess& access) -> nb::object {
+    if (!access.external) return nb::none();
+    const auto& footprint = *access.external;
+    auto [entry, fresh] =
+        coordinate_program_ids.emplace(footprint.program.get(), coordinate_program_ids.size());
+    if (fresh) {
+      nb::list nodes;
+      for (const auto& node : footprint.program->nodes) {
+        using Kind = ir::sync::SyncCoordinateNode::Kind;
+        const char* kind = nullptr;
+        switch (node.kind) {
+          case Kind::Constant:
+            kind = "constant";
+            break;
+          case Kind::Parameter:
+            kind = "parameter";
+            break;
+          case Kind::Block:
+            kind = "block";
+            break;
+          case Kind::Loop:
+            kind = "loop";
+            break;
+          case Kind::Add:
+            kind = "add";
+            break;
+          case Kind::Scale:
+            kind = "scale";
+            break;
+          case Kind::ModularShift:
+            kind = "modular_shift";
+            break;
+          case Kind::FloorDivide:
+            kind = "divide";
+            break;
+          case Kind::Remainder:
+            kind = "remainder";
+            break;
+        }
+        INTERNAL_CHECK(kind) << "Unknown retained coordinate node";
+        nb::dict value;
+        value["kind"] = kind;
+        value["lower"] = node.lower;
+        value["upper"] = node.upper;
+        value["factor"] = node.factor;
+        value["start"] = node.start;
+        value["step"] = node.step;
+        value["left"] = node.left;
+        value["right"] = node.right;
+        value["parameter"] = node.parameter;
+        value["frame"] = node.frame;
+        value["constant"] = node.constant;
+        value["dynamic_start"] = node.dynamic_start;
+        nodes.append(value);
+      }
+      coordinate_programs.append(nodes);
+    }
+    nb::dict value;
+    value["program"] = entry->second;
+    value["row"] = footprint.row;
+    value["column"] = footprint.column;
+    value["row_major_tiles"] = nb::none();
+    if (footprint.row_major_tiles) {
+      const auto& proof = *footprint.row_major_tiles;
+      nb::dict row_major;
+      row_major["frame"] = proof.frame;
+      row_major["tile_coordinate"] = proof.tile_coordinate;
+      row_major["frame_start_root"] = proof.frame_start_root;
+      row_major["row_tiles"] = proof.row_tiles;
+      row_major["column_tiles"] = proof.column_tiles;
+      row_major["row_scale"] = proof.row_scale;
+      row_major["column_scale"] = proof.column_scale;
+      value["row_major_tiles"] = row_major;
+    }
+    return value;
+  };
   for (const auto& s : result.input.storage) {
     nb::dict item;
     item["name"] = s.name;
@@ -123,21 +201,25 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
     region["frame_start_expressions"] = start_expressions;
     for (const auto& s : source.sites) {
       nb::dict site;
-      nb::list accesses, precision, slots, access_frames, intervals;
+      nb::list accesses, precision, slots, slot_frames, access_frames, intervals, external;
       site["original"] = s.original;
       site["continuation"] = s.continuation;
       site["initialization_scope"] = s.initialization_scope;
       site["pipe"] = s.pipe;
       for (const auto& a : s.accesses) {
+        external.append(external_geometry(a));
         access_frames.append(a.coordinate_frame);
         intervals.append(nb::cast(a.physical_interval));
         slots.append(nb::make_tuple(a.slot_first, a.slot_step));
+        slot_frames.append(a.slot_coordinate_frame);
         precision.append(a.exact_footprint ? "exact" : "enclosure");
         accesses.append(nb::make_tuple(a.storage, a.write, a.row, a.column, a.row_step, a.column_step, a.rows,
                                        a.columns, a.after_first));
       }
+      site["external_geometry"] = external;
       site["physical_intervals"] = intervals;
       site["slot_selections"] = slots;
+      site["slot_frames"] = slot_frames;
       site["access_precision"] = precision;
       site["accesses"] = accesses;
       site["access_frames"] = access_frames;
@@ -181,6 +263,7 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
     }
     regions.append(region);
   }
+  out["coordinate_programs"] = coordinate_programs;
   out["storage"] = storage;
   out["regions"] = regions;
   out["crossing_demands"] =
@@ -188,6 +271,8 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
   out["crossing_generators"] =
       result.HasHierarchy() ? nb::object(nb::none()) : nb::cast(result.crossing_generators);
   out["analyzed_occurrences"] = result.analyzed_occurrences;
+  out["phase_variants"] = result.phase_variants;
+  out["finite_microbody_occurrences"] = result.finite_microbody_occurrences;
   out["hardware_target"] = result.input.hardware_target;
   out["cells"] = result.cells;
   out["boundary_graph_edges"] = result.graph_edges;
@@ -203,7 +288,6 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
   out["source_region_nodes"] = result.source_region_nodes;
   out["source_coordinate_entries"] = result.source_coordinate_entries;
   out["scoped_export_builds"] = result.scoped_export_builds;
-  out["scoped_reuse_queries"] = result.scoped_reuse_queries;
   out["point_selector_access_visits"] = result.point_selector_access_visits;
   out["interface_cells"] = result.interface_cells;
   out["omitted_bridge_domains"] = result.omitted_bridge_domains;
@@ -639,6 +723,8 @@ nb::dict DescribeSchedule(const ir::sync::PhysicalSyncRealization& result) {
   out["emitted_control_nodes"] = result.schedule_emitted_control_nodes;
   return out;
 }
+nb::dict DescribeScopedPalette(const ir::sync::ScopedPaletteResult& result);
+
 nb::dict DescribePhysicalSync(const ir::sync::PhysicalSyncRealization& result) {
   nb::dict out;
   out["function"] = result.function;
@@ -701,6 +787,14 @@ nb::dict DescribePhysicalSync(const ir::sync::PhysicalSyncRealization& result) {
     row["target"] = nb::make_tuple(f.target_region, f.target_first, f.target_site);
     row["count"] = f.count;
     row["ids"] = nb::cast(f.ids);
+    row["mapping_kind"] = "family-record";
+    if (result.assignment && !result.assignment->RawPalettes().empty() && !f.protocol_uses.empty()) {
+      const auto& raw = result.assignment->RawPalettes().at(f.protocol_uses.front());
+      if (raw.palette) {
+        row["mapping_kind"] = "publication-rank";
+        row["palette"] = *raw.palette;
+      }
+    }
     nb::list axes;
     for (const auto& axis : f.axes)
       axes.append(nb::make_tuple(axis.frame, axis.count, axis.source_stride, axis.target_stride));
@@ -708,8 +802,69 @@ nb::dict DescribePhysicalSync(const ir::sync::PhysicalSyncRealization& result) {
     families.append(row);
   }
   out["families"] = families;
+  nb::list palettes;
+  if (result.assignment) {
+    for (const auto& palette : result.assignment->Palettes()) {
+      nb::dict row;
+      const auto& schedule = *palette.certificate->Schedule();
+      row["direction"] = nb::make_tuple(schedule.SourcePipe(), schedule.TargetPipe());
+      row["ids"] = palette.ids;
+      row["publications"] = schedule.Publications();
+      row["rank_pieces"] = schedule.Pieces().size();
+      palettes.append(row);
+    }
+  }
+  out["palettes"] = palettes;
+  nb::list attempts;
+  for (const auto& attempt : result.palette_attempts) attempts.append(DescribeScopedPalette(*attempt));
+  out["palette_attempts"] = attempts;
+  nb::list allocation_attempts;
+  for (const auto& attempt : result.allocation_attempts) {
+    nb::dict row;
+    row["direction"] = nb::make_tuple(attempt.source, attempt.target);
+    row["status"] = attempt.status;
+    row["reason"] = attempt.reason;
+    row["staged_lanes"] = attempt.staged_lanes;
+    row["reuse_queries"] = attempt.reuse_queries;
+    allocation_attempts.append(row);
+  }
+  out["allocation_attempts"] = allocation_attempts;
   out["guarantee"] = "equal selected order under qualified direct-command model";
   out["native_mode"] = "manual a2a3; fresh flags at entry; closed notifications at exit";
+  return out;
+}
+
+nb::dict DescribeScopedPalette(const ir::sync::ScopedPaletteResult& result) {
+  nb::dict out;
+  out["status"] = ir::sync::ScopedPaletteStatusName(result.status);
+  out["reason"] = result.reason;
+  out["attempted_budgets"] = result.attempted_budgets;
+  out["publications"] = result.schedule ? result.schedule->Publications() : 0;
+  out["grammar_nodes"] = result.work.grammar_nodes;
+  out["phase_visits"] = result.work.phase_visits;
+  out["domain_visits"] = result.work.domain_visits;
+  out["transition_queries"] = result.work.transition_queries;
+  out["routing_entries"] = result.work.routing_entries;
+  out["boundary_node_visits"] = result.work.boundary_node_visits;
+  out["proof_axis_entries"] = result.work.proof_axis_entries;
+  nb::list pieces;
+  auto digits = [](const std::vector<ir::sync::ScopedPublicationDigit>& input) {
+    std::vector<std::tuple<int64_t, int64_t, int64_t>> values;
+    for (const auto& d : input) values.emplace_back(d.first, d.step, d.count);
+    return values;
+  };
+  if (result.schedule) {
+    for (const auto& piece : result.schedule->Pieces()) {
+      nb::dict entry;
+      entry["raw_use"] = piece.raw_use;
+      entry["rank_base"] = piece.rank_base;
+      entry["source"] = digits(piece.source);
+      entry["target"] = digits(piece.target);
+      entry["coefficients"] = piece.rank_coefficients;
+      pieces.append(entry);
+    }
+  }
+  out["pieces"] = pieces;
   return out;
 }
 
@@ -744,7 +899,10 @@ void BindTesting(nb::module_& m) {
   testing.def(
       "inspect_sync_scalar_plan",
       [](const ir::StmtPtr& commands) {
-        using namespace ir::sync::physical;
+        using ir::sync::physical::ControlForest;
+        using ir::sync::physical::ControlSequence;
+        using ir::sync::physical::FreezeCommandForest;
+        using ir::sync::physical::FrozenCommandForest;
         ir::sync::PhysicalSyncRealization work;
         ControlForest forest{sync_testing::ImportCommands(commands, work)};
         const auto plan = FreezeCommandForest(forest, work);
@@ -868,37 +1026,40 @@ void BindTesting(nb::module_& m) {
       "check_sync_assignment_contract",
       [](const ir::FunctionPtr& function, const std::string& change) {
         auto analysis = ir::sync::AnalyzeCompactSync(ir::sync::ImportPlacedSync(function, true));
-        const auto result = sync_testing::RealizeDemandPlan(analysis, "a2a3", std::nullopt);
+        auto logical = ir::sync::RealizeCompactSync(analysis).function;
+        auto stripped = ir::sync::StripStructuredLogicalSync(logical, true);
+        auto input = ir::sync::ImportSyncPayloads(stripped.function, "a2a3");
+        auto protocol = ir::sync::ParseScopedTokenProtocol(logical, std::move(input), stripped.loops);
+        auto order = ir::sync::PrepareScopedTokenOrder(protocol);
+        const auto& context = order->Input();
+        const auto result =
+            ir::sync::AllocateDirectSync(context, order->Families(), order->View(), "a2a3", std::nullopt);
         const auto& assignment = result.assignment;
         INTERNAL_CHECK(assignment) << "Missing completed assignment";
         const auto copy = result;
         nb::dict out;
         out["shared_family_storage"] = &result.Families() == &copy.Families();
         out["families"] = result.Families().size();
-        if (change == "foreign_input") {
-          const auto foreign = analysis.input;
-          assignment->ValidateFor(foreign, "a2a3");
-        } else if (change == "preassigned_ids") {
-          auto families = result.Families();  // Deliberate invalid test input, not production copying.
+        if (change == "preassigned_ids") {
+          auto families = order->Families();  // Deliberately invalid diagnostic input.
           CHECK(!families.empty()) << "Expected a nonempty diagnostic plan";
           families.front().ids = {99};
-          const ir::sync::DirectSyncOrder order{
-              [](const auto&, const auto&) { return false; }, [](const auto&, const auto&) { return false; },
-              [](size_t, size_t, size_t) -> std::optional<__int128> { return {}; }};
-          ir::sync::AllocateDirectSync(analysis.input, std::move(families), order, "a2a3", std::nullopt);
+          ir::sync::AllocateDirectSync(context, std::move(families), order->View(), "a2a3", std::nullopt);
+        } else if (change == "none" || change == "target") {
+          assignment->ValidateFor(context, change == "target" ? "a5" : "a2a3");
         } else {
-          std::string target = "a2a3";
+          // Production input is immutable and privately owned by the protocol.
+          // Copies, including edited copies, cannot borrow its assignment.
+          auto foreign = context;
           if (change == "owner")
-            analysis.input.owner = nullptr;
-          else if (change == "target")
-            target = "a5";
+            foreign.owner = nullptr;
           else if (change == "domain")
-            analysis.input.block_bounds = std::make_pair(123, 456);
+            foreign.block_bounds = std::make_pair(123, 456);
           else if (change == "frame")
-            ++analysis.input.segments.front().count;
+            ++foreign.segments.front().count;
           else
-            CHECK(change == "none") << "Unknown assignment diagnostic mutation";
-          assignment->ValidateFor(analysis.input, target);
+            CHECK(change == "foreign_input") << "Unknown assignment diagnostic mutation";
+          assignment->ValidateFor(foreign, "a2a3");
         }
         return out;
       },
@@ -936,7 +1097,7 @@ void BindTesting(nb::module_& m) {
           },
           nb::arg("target"), nb::arg("eligible_ids") = nb::none(), nb::kw_only(),
           nb::arg("schedule_policy") = ir::sync::SyncSchedulePolicy{},
-          "Test supplied-demand adapter; does not exercise actual-token interpretation")
+          "Test retained-demand insertion through the production token lowering pipeline")
       .def("describe", &DescribeCompactSync, "Inspect retained analysis without additional construction")
       .def("expand_retained_demands", &ir::sync::CompactSyncResult::ExpandRetainedDemands,
            nb::arg("max_payloads"), "Bounded audit expansion of retained records; never reruns analysis")
@@ -964,8 +1125,6 @@ void BindTesting(nb::module_& m) {
             return out;
           },
           "Export cached compact demand families in original source frames; not a physical certificate")
-      .def("scoped_consecutive_reuse", &ir::sync::CompactSyncResult::ScopedConsecutiveReuse,
-           nb::arg("family"), "Certify all carry classes for an owned original scoped family")
       .def("precedes", &ir::sync::CompactSyncResult::Precedes, nb::arg("source"),
            nb::arg("source_completion"), nb::arg("target"), nb::arg("target_completion"),
            "Query original segment/visit/site events")
@@ -976,23 +1135,89 @@ void BindTesting(nb::module_& m) {
            nb::arg("column"), nb::arg("parameters") = std::map<size_t, int64_t>{},
            nb::arg("block_index") = nb::none(),
            "Exact modeled point selector with explicit physical slot identity");
+  nb::class_<ir::sync::ScopedPublicationSchedule>(testing, "ScopedPublicationSchedule")
+      .def_prop_ro("publications", &ir::sync::ScopedPublicationSchedule::Publications)
+      .def("certify", [](std::shared_ptr<const ir::sync::ScopedPublicationSchedule> schedule,
+                         const ir::sync::ScopedTokenOrder& order, int64_t budget) {
+        return DescribeScopedPalette(ir::sync::CertifyScopedPalette(order, std::move(schedule), budget));
+      });
   nb::class_<ir::sync::ScopedTokenOrder>(testing, "ScopedTokenOrder")
       .def("precedes", &ir::sync::ScopedTokenOrder::Precedes)
       .def("uniform", &ir::sync::ScopedTokenOrder::Uniform)
+      .def("publication_schedule",
+           [](const ir::sync::ScopedTokenOrder& order, ir::PipeType source, ir::PipeType target) {
+             const auto result = ir::sync::BuildScopedPublicationSchedule(order, source, target);
+             CHECK(result.schedule) << result.reason;
+             return result.schedule;
+           })
+      .def("palette",
+           [](const ir::sync::ScopedTokenOrder& order, ir::PipeType source, ir::PipeType target,
+              int64_t budget) {
+             // Diagnostic one-shot composition of the actual retained services.
+             auto built = ir::sync::BuildScopedPublicationSchedule(order, source, target);
+             if (!built.schedule) return DescribeScopedPalette(built);
+             auto result = ir::sync::CertifyScopedPalette(order, built.schedule, budget);
+             result.work.grammar_nodes += built.work.grammar_nodes;
+             result.work.phase_visits += built.work.phase_visits;
+             result.work.domain_visits += built.work.domain_visits;
+             result.work.rank_pieces += built.work.rank_pieces;
+             result.work.routing_entries += built.work.routing_entries;
+             return DescribeScopedPalette(result);
+           })
+      .def_prop_ro("region_frames",
+                   [](const ir::sync::ScopedTokenOrder& order) {
+                     std::vector<std::vector<ir::ForStmtPtr>> result;
+                     for (const auto& segment : order.Input().segments) {
+                       std::vector<ir::ForStmtPtr> frames;
+                       for (const auto& frame : segment.nested_frames) frames.push_back(frame.loop);
+                       result.push_back(std::move(frames));
+                     }
+                     return result;
+                   })
+      .def("prove_transition",
+           [](const ir::sync::ScopedTokenOrder& order, const ir::sync::Occurrence& consumer,
+              const ir::sync::Occurrence& producer,
+              const std::vector<std::tuple<ir::ForStmtPtr, int64_t, int64_t, int64_t, int64_t, int64_t>>&
+                  axes) {
+             ir::sync::ScopedEventTransition query{consumer, producer, {}};
+             for (const auto& [frame, count, source, target, source_step, target_step] : axes)
+               query.axes.push_back({frame, count, source, target, source_step, target_step});
+             return order.ProveTransition(query);
+           })
+      .def("validate_token_owner",
+           [](const ir::sync::ScopedTokenOrder& order, const ir::FunctionPtr& function) {
+             order.Protocol()->ValidateTokens(function);
+           })
       .def_prop_ro("summary_nodes", &ir::sync::ScopedTokenOrder::SummaryNodes)
       .def_prop_ro("interface_entries", &ir::sync::ScopedTokenOrder::InterfaceEntries)
+      .def_prop_ro("witness_attempts", &ir::sync::ScopedTokenOrder::WitnessAttempts)
+      .def_prop_ro("candidate_visits", &ir::sync::ScopedTokenOrder::CandidateVisits)
+      .def_prop_ro("binary_probes", &ir::sync::ScopedTokenOrder::BinaryProbes)
       .def("reuse",
            [](const ir::sync::ScopedTokenOrder& order, size_t i) { return order.View().scoped_reuse(i); })
       .def("barrier",
            [](const ir::sync::ScopedTokenOrder& order, size_t i) { return order.View().scoped_barrier(i); })
       .def(
+          "realize_legacy",
+          [](const ir::sync::ScopedTokenOrder& order, const std::optional<std::vector<int>>& eligible_ids) {
+            const auto prepared = ir::sync::PrepareScopedTokenOrder(order.Protocol());
+            auto view = prepared->View();
+            view.scoped_palette = {};
+            return DescribePhysicalSync(ir::sync::RealizeDirectSync(prepared->Input(), prepared->Families(),
+                                                                    view, prepared->Input().hardware_target,
+                                                                    eligible_ids));
+          },
+          nb::arg("eligible_ids") = nb::none())
+      .def(
           "realize",
-          [](const ir::sync::ScopedTokenOrder& order, const std::string& target) {
-            return ir::sync::RealizeDirectSync(order.Input(), order.Families(), order.View(), target,
-                                               std::nullopt)
+          [](const ir::sync::ScopedTokenOrder& order, const std::string& target,
+             const std::optional<std::vector<int>>& eligible_ids) {
+            const auto prepared = ir::sync::PrepareScopedTokenOrder(order.Protocol());
+            return ir::sync::RealizeDirectSync(prepared->Input(), prepared->Families(), prepared->View(),
+                                               target, eligible_ids)
                 .function;
           },
-          nb::arg("target") = "a2a3");
+          nb::arg("target") = "a2a3", nb::arg("eligible_ids") = nb::none());
   testing.def("check_generated_logical_sync", &ir::sync::CheckGeneratedLogicalSync, nb::arg("function"),
               "Check insertion-owned logical IR using the production internal-error boundary");
   testing.def(
@@ -1020,30 +1245,49 @@ void BindTesting(nb::module_& m) {
       "Run the production actual-token lowering with explicit current invocation evidence");
   testing.def(
       "analyze_scoped_token_order",
-      [](const ir::FunctionPtr& function, const std::string& target) {
-        ir::CheckLogicalSync(function);
-        auto stripped = ir::sync::StripStructuredLogicalSync(function, true);
-        auto input = ir::sync::ImportSyncPayloads(stripped.function, target);
-        auto families = ir::sync::ParseScopedTokenFamilies(function, input, stripped.loops);
-        return std::make_shared<ir::sync::ScopedTokenOrder>(std::move(input), std::move(families));
-      },
-      nb::arg("function"), nb::arg("target") = "a2a3");
-  testing.def(
-      "inspect_scoped_token_families",
       [](const ir::FunctionPtr& function, const std::string& target,
          const ir::sync::SyncParameterBounds& parameters, std::optional<std::pair<int64_t, int64_t>> blocks) {
         ir::CheckLogicalSync(function);
         auto stripped = ir::sync::StripStructuredLogicalSync(function, true);
+        auto input = ir::sync::ImportSyncPayloads(stripped.function, target, parameters, blocks);
+        auto families = ir::sync::ParseScopedTokenProtocol(function, input, stripped.loops);
+        return std::make_shared<ir::sync::ScopedTokenOrder>(std::move(families));
+      },
+      nb::arg("function"), nb::arg("target") = "a2a3",
+      nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{}, nb::arg("block_bounds") = nb::none());
+  testing.def(
+      "inspect_scoped_token_families",
+      [](const ir::FunctionPtr& function, const std::string& target,
+         const ir::sync::SyncParameterBounds& parameters, std::optional<std::pair<int64_t, int64_t>> blocks,
+         bool prepare) {
+        ir::CheckLogicalSync(function);
+        auto stripped = ir::sync::StripStructuredLogicalSync(function, true);
         const auto input = ir::sync::ImportSyncPayloads(stripped.function, target, parameters, blocks);
         ir::sync::ScopedTokenWork work;
-        const auto families = ir::sync::ParseScopedTokenFamilies(function, input, stripped.loops, &work);
+        auto protocol = ir::sync::ParseScopedTokenProtocol(function, input, stripped.loops, &work);
+        auto families = protocol->Families();
+        const auto raw_count = families.size();
+        if (prepare) families = ir::sync::PrepareScopedTokenOrder(protocol, &work)->Families();
         nb::dict out;
+        nb::list cuts;
+        for (const auto& cut : protocol->Cuts())
+          cuts.append(nb::make_tuple(cut.region, cut.site, cut.before, cut.after));
+        out["protocol_cuts"] = cuts;
+        out["raw_family_count"] = raw_count;
+        out["prepared"] = prepare;
         out["function"] = stripped.function;
         nb::dict counts;
         counts["read_statement_visits"] = work.statements;
         counts["waits_inspected"] = work.waits_inspected;
         counts["inactive_waits"] = work.inactive_waits;
         counts["families"] = work.families;
+        counts["equation_visits"] = work.equation_visits;
+        counts["capture_specializations"] = work.capture_specializations;
+        counts["union_candidates"] = work.union_candidates;
+        counts["union_merges"] = work.union_merges;
+        counts["union_passes"] = work.union_passes;
+        counts["union_reuse_checks"] = work.union_reuse_checks;
+        counts["union_reuse_refusals"] = work.union_reuse_refusals;
         out["work"] = counts;
         nb::list rows, regions;
         for (const auto& family : families) {
@@ -1051,8 +1295,11 @@ void BindTesting(nb::module_& m) {
           row["source"] = nb::make_tuple(family.source_region, family.source_first, family.source_site);
           row["target"] = nb::make_tuple(family.target_region, family.target_first, family.target_site);
           row["count"] = family.count;
+          row["protocol_uses"] = nb::cast(family.protocol_uses);
           row["source_domain"] = nb::cast(family.source_domain->ranges);
           row["target_domain"] = nb::cast(family.target_domain->ranges);
+          row["source_steps"] = nb::cast(family.source_domain->steps);
+          row["target_steps"] = nb::cast(family.target_domain->steps);
           nb::list axes;
           for (const auto& axis : family.axes)
             axes.append(nb::make_tuple(axis.frame, axis.count, axis.source_stride, axis.target_stride));
@@ -1076,6 +1323,7 @@ void BindTesting(nb::module_& m) {
       },
       nb::arg("function"), nb::arg("target") = "a2a3",
       nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{}, nb::arg("block_bounds") = nb::none(),
+      nb::kw_only(), nb::arg("prepare") = false,
       "Inspect actual scoped token handoffs under the explicit disjoint-GM test contract; no allocation");
   nb::class_<ir::sync::SyncInvocationAnalysis>(testing, "SyncInvocationAnalysis")
       .def(
@@ -1197,6 +1445,7 @@ void BindTesting(nb::module_& m) {
         nb::dict out;
         out["parameters"] = evidence.parameters;
         out["block_indices"] = evidence.block_indices;
+        out["block_counts"] = evidence.block_counts;
         out["call_graph_expression_visits"] = work.call_graph_expression_visits;
         out["call_graph_nodes"] = work.call_graph_nodes;
         out["call_graph_edges"] = work.call_graph_edges;

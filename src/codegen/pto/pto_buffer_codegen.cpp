@@ -33,6 +33,7 @@
 #include "pypto/codegen/pto/pto_type_utils.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/arith/analyzer.h"
 #include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
@@ -48,6 +49,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/loop_step_qualification.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/slot_index_qualification.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -290,10 +292,10 @@ class BufferEmissionPreflight : public ir::IRVisitor {
     }
     if (auto multi = As<ir::MultiBufferType>(expr->GetType())) {
       const auto space = multi->element_type_->memory_space_;
-      CHECK_SPAN(multi->slot_count_ <= 16 && (space == ir::MemorySpace::Vec ||
-                                              space == ir::MemorySpace::Mat || space == ir::MemorySpace::Acc),
-                 expr->span_)
-          << "Direct Buffer multi-buffer emission requires at most 16 slots in Vec, Mat or Acc";
+      CHECK_SPAN(
+          multi->slot_count_ <= 16 && (space == ir::MemorySpace::Vec || backend::IsMatrixBufferSpace(space)),
+          expr->span_)
+          << "Direct Buffer multi-buffer emission requires at most 16 slots in Vec or matrix memory";
       BufferTypeString(multi->element_type_, expr->span_);
       const auto bytes = backend::PhysicalBufferBytes(multi->element_type_);
       const auto alignment = backend_->GetMemAlignment(space);
@@ -328,6 +330,7 @@ class BufferEmissionPreflight : public ir::IRVisitor {
       returned_ = true;
     }
     if (auto assign = As<ir::AssignStmt>(stmt)) {
+      if (As<ir::ScalarType>(assign->var_->GetType())) step_proof_.Define(assign->var_, assign->value_);
       CHECK_SPAN(As<ir::BufferType>(assign->var_->GetType()) ||
                      As<ir::MultiBufferType>(assign->var_->GetType()) ||
                      As<ir::ScalarType>(assign->var_->GetType()),
@@ -350,10 +353,11 @@ class BufferEmissionPreflight : public ir::IRVisitor {
         CHECK_SPAN(dtype == DataType::INDEX || dtype.IsSignedInt(), bound->span_)
             << "Direct Buffer IR codegen requires INDEX or signed integer for-loop bounds";
       }
-      const auto step = ir::transform_utils::EvalConstInt(loop->step_);
-      CHECK_SPAN(step && *step > 0, loop->step_->span_)
-          << "Direct Buffer IR codegen requires a provably positive constant for-loop step; "
-             "rewrite the loop with a positive constant step before emission";
+      // scf.for needs a positive step, not a constant one. Share the native
+      // launch-count bound with Buffer selection; arbitrary scalar steps still
+      // require evidence and remain rejected here.
+      CHECK_SPAN(step_proof_.IsPositive(loop->step_), loop->step_->span_)
+          << "Direct Buffer IR codegen requires a provably positive for-loop step";
     }
     const bool loop_scope = As<ir::ForStmt>(stmt) || As<ir::WhileStmt>(stmt);
     if (loop_scope) loop_slots_.emplace_back();
@@ -488,6 +492,7 @@ class BufferEmissionPreflight : public ir::IRVisitor {
   bool returned_ = false;
   size_t depth_ = 0;
   std::vector<std::unordered_map<const ir::Var*, ir::ExprPtr>> loop_slots_;
+  ir::PositiveLoopStepProof step_proof_;
   ir::FunctionPtr function_;
   bool conversion_supported_;
   const backend::Backend* backend_;

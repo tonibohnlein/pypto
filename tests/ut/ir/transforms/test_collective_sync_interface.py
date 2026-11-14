@@ -14,6 +14,26 @@ from pypto import ir, testing
 
 from .sync_matmul_oracle import validate
 
+
+def wrapped_collective(visits=2, patterns=None):
+    original = collective_fixture(5, patterns or [[(0, 2), (2, 5)]])
+    assert isinstance(original.body, ir.SeqStmts)
+    definition, *body, ret = original.body.stmts
+    span = original.span
+    iv = ir.Var("outer", ir.ScalarType(ir.DataType.INDEX), span)
+    bounds = [ir.ConstInt(x, ir.DataType.INDEX, span) for x in [1, 1 + 2 * visits, 2]]
+    loop = ir.ForStmt(iv, *bounds, [], ir.SeqStmts([*body, ir.YieldStmt([], span)], span), [], span)
+    return ir.Function(
+        original.name,
+        list(zip(original.params, original.param_directions)),
+        original.return_types,
+        ir.SeqStmts([definition, loop, ret], span),
+        span,
+        original.func_type,
+        ir_stage=original.ir_stage,
+    )
+
+
 pytestmark = pytest.mark.usefixtures("ascend_backend")
 
 

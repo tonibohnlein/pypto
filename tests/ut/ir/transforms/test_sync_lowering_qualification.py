@@ -89,6 +89,7 @@ def test_token_lowering_does_not_require_a_common_gm_translation():
                     return op
                 self.changed = True
                 args = list(op.args)
+                assert isinstance(args[1], ir.MakeTuple)
                 rows, columns = args[1].elements
                 args[1] = ir.MakeTuple([rows, ir.Add(columns, offset, ir.DataType.INDEX, span)], span)
                 return ir.Call(op.op, args, op.type, span)

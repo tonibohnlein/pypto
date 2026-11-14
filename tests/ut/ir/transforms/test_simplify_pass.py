@@ -5051,5 +5051,83 @@ class TestEffectfulYieldsKeepControlFlow:
         ir.assert_structural_equal(After, Expected)
 
 
+@pytest.mark.parametrize("period", [2, 3, 7])
+@pytest.mark.parametrize("count", [0, 1, 2, 9])
+@pytest.mark.parametrize("initial_offset,increment,step", [(0, 1, 1), (-1, 1, 1), (0, 2, 1), (0, 1, 2)])
+def test_cyclic_carry_normalization_preserves_final_value(period, count, initial_offset, increment, step):
+    """Normalize the slot selection, including the observable zero-trip result."""
+    sp = ir.Span.unknown()
+    ty = ir.ScalarType(DataType.INDEX)
+
+    def c(value):
+        return ir.ConstInt(value, DataType.INDEX, sp)
+
+    i = ir.Var("i", ty, sp)
+    carry = ir.IterArg("slot", ty, c(period - 1 + initial_offset), sp)
+    updated = ir.Var("updated", ty, sp)
+    result = ir.Var("result", ty, sp)
+    update = ir.FloorMod(ir.Add(carry, c(increment), DataType.INDEX, sp), c(period), DataType.INDEX, sp)
+    body = ir.SeqStmts([ir.AssignStmt(updated, update, sp), ir.YieldStmt([updated], sp)], sp)
+    loop = ir.ForStmt(i, c(0), c(count), c(step), [carry], body, [result], sp)
+    before = ir.Program(
+        [ir.Function("main", [], [ty], ir.SeqStmts([loop, ir.ReturnStmt([result], sp)], sp), sp)],
+        "Cyclic",
+        sp,
+    )
+    after = passes.simplify()(before)
+
+    # Execute the actual scalar IR before/after. This checks the retained carry
+    # and final result as well as the canonical access coordinate.
+    def execute(program):
+        values = {}
+
+        def expr(x):
+            if isinstance(x, ir.ConstInt):
+                return x.value
+            if isinstance(x, (ir.Var, ir.IterArg)):
+                return values[x.name_hint]
+            if isinstance(x, ir.Add):
+                return expr(x.left) + expr(x.right)
+            if isinstance(x, ir.FloorMod):
+                return expr(x.left) % expr(x.right)
+            raise AssertionError(type(x))
+
+        def run(stmt):
+            if isinstance(stmt, ir.SeqStmts):
+                for child in stmt.stmts:
+                    answer = run(child)
+                    if answer is not None:
+                        return answer
+            elif isinstance(stmt, ir.AssignStmt):
+                values[stmt.var.name_hint] = expr(stmt.value)
+            elif isinstance(stmt, (ir.ReturnStmt, ir.YieldStmt)):
+                return [expr(x) for x in stmt.value]
+            elif isinstance(stmt, ir.ForStmt):
+                carried = [expr(x.initValue) for x in stmt.iter_args]
+                for iteration in range(expr(stmt.start), expr(stmt.stop), expr(stmt.step)):
+                    values[stmt.loop_var.name_hint] = iteration
+                    for arg, value in zip(stmt.iter_args, carried):
+                        values[arg.name_hint] = value
+                    carried = run(stmt.body)
+                    assert carried is not None, "Counted-loop fixture must yield its carried values"
+                for var, value in zip(stmt.return_vars, carried):
+                    values[var.name_hint] = value
+            else:
+                raise AssertionError(type(stmt))
+            return None
+
+        return run(program.get_function("main").body)
+
+    expected = period - 1 + initial_offset
+    for _ in range(0, count, step):
+        expected = (expected + increment) % period
+    assert execute(before) == execute(after) == [expected]
+    if count > 1 and (initial_offset, increment, step) == (0, 1, 1):
+        text = str(after)
+        assert "slot +" not in text
+        if count > period:
+            assert "i %" in text
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

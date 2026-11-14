@@ -239,3 +239,15 @@ def directional_widths(state, order):
             )
             assert widths[direction] == brute
     return widths
+
+
+def assert_same_family_maps(left, right):
+    """Compare separate token preparations without equating frame object IDs."""
+    assert len(left) == len(right)
+    for a, b in zip(left, right, strict=True):
+        assert {k: v for k, v in a.items() if k != "axes"} == {k: v for k, v in b.items() if k != "axes"}
+        axes_a, axes_b = a.get("axes", []), b.get("axes", [])
+        assert len(axes_a) == len(axes_b)
+        for x, y in zip(axes_a, axes_b, strict=True):
+            assert x[1:] == y[1:]
+            ir.assert_structural_equal(x[0], y[0])

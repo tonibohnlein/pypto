@@ -14,10 +14,12 @@ from pypto import ir, passes, testing
 
 from .sync_logical_oracle import CommandExecution, check_graph
 from .sync_matmul_oracle import hardware_reference, interpret, validate
-from .test_collective_sync_interface import collective_fixture
+from .test_collective_sync_interface import wrapped_collective
 from .test_collective_sync_realization import nested_collective, repeat_collective
+from .test_external_sync_geometry import unavailable_read_domains
 from .test_logical_sync_realization import verify
-from .test_nested_sync_repetition import resident_pipeline_tree
+from .test_nested_phase_sync import nested_matrix_fixture
+from .test_nested_sync_repetition import expand_scoped_families, resident_pipeline_tree
 from .test_token_sync_lowering import _apply
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
@@ -94,25 +96,6 @@ def test_scoped_token_serialization_and_repeat_preparation(tmp_path):
     check_graph(state, reference, require_equality=True)
 
 
-def wrapped_collective(visits=2, patterns=None):
-    original = collective_fixture(5, patterns or [[(0, 2), (2, 5)]])
-    assert isinstance(original.body, ir.SeqStmts)
-    definition, *body, ret = original.body.stmts
-    span = original.span
-    iv = ir.Var("outer", ir.ScalarType(ir.DataType.INDEX), span)
-    bounds = [ir.ConstInt(x, ir.DataType.INDEX, span) for x in [1, 1 + 2 * visits, 2]]
-    loop = ir.ForStmt(iv, *bounds, [], ir.SeqStmts([*body, ir.YieldStmt([], span)], span), [], span)
-    return ir.Function(
-        original.name,
-        list(zip(original.params, original.param_directions)),
-        original.return_types,
-        ir.SeqStmts([definition, loop, ret], span),
-        span,
-        original.func_type,
-        ir_stage=original.ir_stage,
-    )
-
-
 @pytest.mark.parametrize("visits", [0, 1, 2, 3])
 def test_nonfinal_row_capture_and_outer_seam_reset(visits):
     original = wrapped_collective(visits)
@@ -171,3 +154,38 @@ def test_dynamic_start_tokens_preserve_retained_mathematics():
     verify(logical)
     assert retained.expand_retained_demands(32) == covers
     assert ir.serialize(ir.Program([function], "Dynamic", span)) == snapshot
+
+
+@pytest.mark.parametrize("count,visits", [(0, 2), (1, 0), (1, 1), (1, 2), (2, 2), (3, 3), (5, 2)])
+def test_nested_ring_phase_tokens_match_original_covers(count, visits):
+    original = nested_matrix_fixture(count, visits=visits, tile_columns=2)
+    retained = testing.analyze_placed_sync(original, True)
+    description = testing.describe_placed_sync_input(original, True)
+    checked = validate(original, retained, unavailable_boundaries=unavailable_read_domains(description))
+    assert expand_scoped_families(retained.export_scoped_demands()) == set(
+        retained.expand_retained_demands(checked["payloads"])
+    )
+    logical = retained.realize()["function"]
+    verify(logical)
+    _, calls = interpret(original)
+    reference = hardware_reference(original, calls)
+    state = CommandExecution(calls, reference[0])
+    state.execute(logical.body, {})
+    assert state.payload_count == len(calls)
+    assert not any(state.pending.values())
+    # Actual SSA token interpretation must match each exact nonnative cover,
+    # not merely produce a graph whose transitive closure includes it.
+    check_graph(state, reference, require_equality=True)
+
+
+def test_nested_ring_logical_transport_does_not_unfold_trip_counts():
+    sizes = []
+    for count in (16, 257, 1000000):
+        logical = testing.analyze_placed_sync(
+            nested_matrix_fixture(count, visits=3, tile_columns=2), True
+        ).realize()
+        verify(logical["function"])
+        sizes.append(sum(logical[key] for key in ("record_sites", "wait_sites", "carried_tokens")))
+    # Prefix/tail phase parity changes the family inventory (119, 90, 119),
+    # while token state stays bounded independently of the dynamic K count.
+    assert max(sizes) <= 120

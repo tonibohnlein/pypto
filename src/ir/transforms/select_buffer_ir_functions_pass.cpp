@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -21,6 +22,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "memory_reuse/internal.h"
+#include "memory_reuse/storage.h"
 #include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/backend_handler.h"
@@ -50,6 +53,7 @@
 #include "pypto/ir/transforms/utils/buffer_tuple_results.h"
 #include "pypto/ir/transforms/utils/buffer_valid_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_view_analysis.h"
+#include "pypto/ir/transforms/utils/loop_step_qualification.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/slot_index_qualification.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -66,7 +70,8 @@ namespace {
 class BufferKernelSupport : public IRVisitor {
  public:
   explicit BufferKernelSupport(const FunctionPtr& function)
-      : return_types_(function->return_types_),
+      : body_(function->body_),
+        return_types_(function->return_types_),
         views_(function->body_),
         indexed_(function->body_),
         tuples_(function->body_) {
@@ -293,6 +298,7 @@ class BufferKernelSupport : public IRVisitor {
     if (!supported) return;
     if (As<ScalarType>(assign->var_->GetType())) {
       scalar_multiples_.emplace(assign->var_.get(), KnownAlignmentMultiple(assign->value_));
+      step_proof_.Define(assign->var_, assign->value_);
     }
     if (IsMatrixType(assign->var_->GetType())) {
       ExprPtr source = assign->value_;
@@ -355,7 +361,7 @@ class BufferKernelSupport : public IRVisitor {
       CheckRegionType(result->GetType());
       if (NeedsStableAlias(result->GetType())) {
         const auto& alias = then_region.aliases[i];
-        if (!alias || alias != else_region.aliases[i]) {
+        if (!AliasesAgree(alias, else_region.aliases[i])) {
           supported = false;
           return;
         }
@@ -391,8 +397,10 @@ class BufferKernelSupport : public IRVisitor {
       const auto dtype = GetScalarDtype(bound);
       supported &= dtype == DataType::INDEX || dtype.IsSignedInt();
     }
-    const auto step = transform_utils::EvalConstInt(loop->step_);
-    supported &= step && *step > 0;
+    // Buffer conversion preserves the original loop; it needs positivity, not
+    // a numerical trip count. In particular get_block_num is positive by its
+    // operation contract. Unknown signed scalar steps remain unqualified.
+    supported &= step_proof_.IsPositive(loop->step_);
     loop_slots_.emplace_back();
     CheckLoop(loop);
     loop_slots_.pop_back();
@@ -615,9 +623,8 @@ class BufferKernelSupport : public IRVisitor {
 
   bool QualifySlot(const TileTypePtr& tile, const MemRefPtr& memory) {
     const auto space = tile->GetMemorySpace();
-    if (!space || (*space != MemorySpace::Vec && *space != MemorySpace::Mat && *space != MemorySpace::Acc) ||
-        !memory->base_ || !memory->slot_index_ || !*memory->slot_index_ || memory->slot_count_ == 0 ||
-        memory->slot_count_ > 16)
+    if (!space || (*space != MemorySpace::Vec && !backend::IsMatrixBufferSpace(*space)) || !memory->base_ ||
+        !memory->slot_index_ || !*memory->slot_index_ || memory->slot_count_ == 0 || memory->slot_count_ > 16)
       return false;
     const auto capacity = allocation_capacities_.find(memory->base_.get());
     const auto bytes = TileBytes(tile);
@@ -757,6 +764,29 @@ class BufferKernelSupport : public IRVisitor {
     return IsMatrixType(type) ? matrix_aliases_ : tensor_aliases_;
   }
 
+  // Selection precedes storage legalization. Reuse its liveness-checked Acc
+  // phi plan instead of demanding that a fresh seed already have the carry's
+  // SSA identity. Planning is read-only and lazy, at most once per function;
+  // the existing semantic pass remains responsible for applying the rewrites.
+  bool AliasesAgree(const VarPtr& left, const VarPtr& right) {
+    if (!left || !right) return false;
+    if (left == right) return true;
+    const auto a = As<TileType>(left->GetType());
+    const auto b = As<TileType>(right->GetType());
+    if (!a || !b || a->GetMemorySpace() != MemorySpace::Acc || b->GetMemorySpace() != MemorySpace::Acc)
+      return false;
+    if (!accumulator_plan_) accumulator_plan_ = memory_reuse::PlanAccumulatorIfPhis(body_);
+    auto planned = [&](const VarPtr& value, const TileTypePtr& original) {
+      const auto found = accumulator_plan_->find(value);
+      const auto type = found == accumulator_plan_->end() ? original : As<TileType>(found->second);
+      return type ? type->memref_.value_or(nullptr) : nullptr;
+    };
+    return memory_reuse::SamePhysicalWindow(planned(left, a), planned(right, b));
+  }
+
+  StmtPtr body_;
+  std::optional<std::map<VarPtr, TypePtr>> accumulator_plan_;
+
   VarPtr StableAlias(const ExprPtr& value) {
     const auto var = AsVarLike(value);
     auto& aliases = AliasMap(value->GetType());
@@ -804,7 +834,7 @@ class BufferKernelSupport : public IRVisitor {
       const auto& argument = loop->iter_args_[i];
       if (NeedsStableAlias(argument->GetType())) {
         const auto initial = StableAlias(argument->initValue_);
-        if (region.aliases[i] != initial) {
+        if (!AliasesAgree(region.aliases[i], initial)) {
           supported = false;
           return;
         }
@@ -844,6 +874,7 @@ class BufferKernelSupport : public IRVisitor {
   std::unordered_map<const Var*, VarPtr> matrix_aliases_;
   std::unordered_set<const Type*> checked_types_;
   std::unordered_map<const Expr*, TypePtr> assigned_slot_types_;
+  PositiveLoopStepProof step_proof_;
 };
 
 FunctionPtr SelectBufferFunction(const FunctionPtr& function, bool device_helper) {

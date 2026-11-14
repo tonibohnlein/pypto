@@ -70,6 +70,7 @@ def test_consecutive_prefixes_keep_duplicate_leaves_and_guard_order():
     assert isinstance(output, ir.SeqStmts)
     # Share the initial A prefix and consecutive nested B prefixes, but never
     # collect the trailing A through B. Both identical ID-1 leaves survive.
+    assert isinstance(output, ir.SeqStmts)
     assert len(output.stmts) == 3
     first = output.stmts[0]
     assert isinstance(first, ir.IfStmt)
@@ -93,6 +94,7 @@ def test_free_variable_identity_and_shared_else():
     original = seq(guarded(a, command()), guarded(b, command()), choice, guarded(a, command(3)))
     output = testing.share_sync_command_guards(original)
     assert isinstance(output, ir.SeqStmts)
+    assert isinstance(output, ir.SeqStmts)
     assert len(output.stmts) == 3
     for av in (False, True):
         for bv in (False, True):
@@ -112,9 +114,14 @@ def test_adjacent_nested_decisions_share_both_arms_without_deduplication():
         choice(a, command(5), guarded(b, command(1))),
     )
     output = testing.share_sync_command_guards(original)
+    assert isinstance(output, ir.SeqStmts)
     assert len(output.stmts) == 1
-    assert len(output.stmts[0].then_body.stmts) == 3
-    assert len(output.stmts[0].else_body.stmts) == 1
+    branch = output.stmts[0]
+    assert isinstance(branch, ir.IfStmt)
+    assert isinstance(branch.then_body, ir.SeqStmts)
+    assert isinstance(branch.else_body, ir.SeqStmts)
+    assert len(branch.then_body.stmts) == 3
+    assert len(branch.else_body.stmts) == 1
     for av in (False, True):
         for bv in (False, True):
             before, after = evaluate(original, {a: av, b: bv}), evaluate(output, {a: av, b: bv})
@@ -127,6 +134,7 @@ def test_unconditional_command_fences_decision_sharing():
     decision = ir.IfStmt(a, command(1), command(2), [], SPAN)
     original = seq(decision, command(3), decision)
     output = testing.share_sync_command_guards(original)
+    assert isinstance(output, ir.SeqStmts)
     assert len(output.stmts) == 3
     for av in (False, True):
         assert evaluate(original, {a: av}).trace == evaluate(output, {a: av}).trace
@@ -162,6 +170,7 @@ def test_unproved_decision_expression_keeps_separate_trees():
     original = seq(choice, choice)
     output = testing.share_sync_command_guards(original)
     # The descriptor service has no positive-divisor premise for this value.
+    assert isinstance(output, ir.SeqStmts)
     assert len(output.stmts) == 2
     for value in range(6):
         for period in (1, 2, 3):
@@ -180,6 +189,7 @@ def test_unavailable_structural_comparison_keeps_unfactored_plan():
     assert isinstance(output, ir.SeqStmts)
     # Optional equality has its own traversal limit. Do not turn that into a
     # new physical-export refusal or assume equality without a proof.
+    assert isinstance(output, ir.SeqStmts)
     assert len(output.stmts) == 2
 
 
@@ -263,15 +273,17 @@ def test_qwen_selected_loop_entry_shares_decision_without_changing_actual_tokens
     original = next(f for f in program.functions.values() if f.func_type == ir.FunctionType.AIC)
     logical = worker(apply(passes.insert_sync, program), original.name)
     evidence = testing.sync_invocation_evidence(program)
-    options = {
-        "parameter_bounds": evidence["parameters"][original.name],
-        "block_bounds": tuple(evidence["block_indices"][original.name]),
-    }
-    result = testing.lower_sync_schedule(logical, **options)
+    parameters = evidence["parameters"][original.name]
+    first, last = evidence["block_indices"][original.name]
+    blocks = (first, last)
+    result = testing.lower_sync_schedule(logical, parameter_bounds=parameters, block_bounds=blocks)
     # Without boundary extraction the command remains inside the first visit;
     # ordered payload/command traces still provide an independent placement check.
     unhoisted = testing.lower_sync_schedule(
-        logical, **options, schedule_policy=testing.SyncSchedulePolicy(boundary_motion=False)
+        logical,
+        parameter_bounds=parameters,
+        block_bounds=blocks,
+        schedule_policy=testing.SyncSchedulePolicy(boundary_motion=False),
     )
     assert not unhoisted["schedule"]["parent_gaps"]
     gaps = result["schedule"]["parent_gaps"]

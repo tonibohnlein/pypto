@@ -13,6 +13,8 @@ An unavailable forced mode is a reported refusal, never a successful ablation.
 The token/access/flag interpreters do not consume scheduler cost certificates.
 """
 
+from typing import cast
+
 import pytest
 from pypto import ir, passes, testing
 
@@ -78,7 +80,7 @@ class ExpandedCensus:
                 for dimension in op.type.shape:
                     self.visit_expr(dimension)
             if isinstance(op, ir.IterArg):
-                self.visit_expr(op.init_value)
+                self.visit_expr(op.initValue)
         elif isinstance(op, ir.BinaryExpr):
             self.visit_expr(op.left)
             self.visit_expr(op.right)
@@ -223,9 +225,10 @@ def test_forced_catalogue_preserves_actual_tokens_operands_and_order(mode, count
 @pytest.mark.parametrize("mode", MODES)
 def test_case_only_matrix_preserves_extra_actual_token_uses(mode):
     original, logical = case_only_fixture()
-    evidence = {"parameter_bounds": {4: (0, 0)}, "block_bounds": (0, 1)}
-    baseline = lower(logical, "guarded", **evidence)
-    result = lower(logical, mode, **evidence)
+    parameters = {4: (0, 0)}
+    blocks = (0, 1)
+    baseline = lower(logical, "guarded", parameter_bounds=parameters, block_bounds=blocks)
+    result = lower(logical, mode, parameter_bounds=parameters, block_bounds=blocks)
     assert_receipt(result, mode)
     assert fingerprint(result) == fingerprint(baseline)
     for block in (0, 1):
@@ -260,8 +263,9 @@ def test_period_and_interval_candidates_are_independent(mode):
 )
 def test_forced_mode_never_bypasses_growth_policy(policy):
     original, logical = case_only_fixture()
-    evidence = {"parameter_bounds": {4: (0, 0)}, "block_bounds": (0, 1)}
-    result = lower(logical, "case", **evidence, **policy)
+    parameters = {4: (0, 0)}
+    blocks = (0, 1)
+    result = lower(logical, "case", parameter_bounds=parameters, block_bounds=blocks, **policy)
     assert_receipt(result, "case")
     assert not any(row["mode"] == "case" for row in selected(result))
     assert any(
@@ -299,12 +303,14 @@ def test_production_default_keeps_payload_body_count_and_actual_semantics(fixtur
     if fixture == "streamed":
         original = streamed_fixture(11, start=5, step=2)
         logical = _apply(passes.insert_sync, original)
-        evidence = {}
+        parameters = {}
+        blocks = None
     else:
         original, logical = case_only_fixture()
-        evidence = {"parameter_bounds": {4: (0, 0)}, "block_bounds": (0, 1)}
-    result = testing.lower_sync_schedule(logical, **evidence)
-    baseline = lower(logical, "guarded", **evidence)
+        parameters = {4: (0, 0)}
+        blocks = (0, 1)
+    result = testing.lower_sync_schedule(logical, parameter_bounds=parameters, block_bounds=blocks)
+    baseline = lower(logical, "guarded", parameter_bounds=parameters, block_bounds=blocks)
     assert result["schedule_policy"]["no_clone"] is True
     assert census(result["function"]).payloads <= census(baseline["function"]).payloads
     if fixture == "streamed":
@@ -371,14 +377,14 @@ def predicate_sharing_pair():
             for bound in (2, 3, 4)
         ]
     )
-    payload = original.body.stmts[2]
+    payload = cast(ir.SeqStmts, original.body).stmts[2]
 
     def owner(commands):
         return ir.Function(
             "predicate_sharing",
             [*zip(original.params, original.param_directions), iv],
             [],
-            seq(*original.body.stmts[:2], commands, payload, ir.ReturnStmt([], span)),
+            seq(*cast(ir.SeqStmts, original.body).stmts[:2], commands, payload, ir.ReturnStmt([], span)),
             span,
             original.func_type,
             ir_stage=original.ir_stage,
@@ -403,7 +409,7 @@ def invocation_scaling_fixture(case_count):
     """Empty activation frames partition cases without adding payload hazards."""
     original, logical = case_only_fixture()
     span = original.span
-    block = original.body.stmts[0].var
+    block = cast(ir.AssignStmt, cast(ir.SeqStmts, original.body).stmts[0]).var
     prefixes = []
     for boundary in range(1, case_count):
         iv = ir.Var(f"activation_{boundary}", block.type, span)
@@ -421,7 +427,14 @@ def invocation_scaling_fixture(case_count):
         )
 
     def replace(function):
-        body = ir.SeqStmts([*function.body.stmts[:3], *prefixes, *function.body.stmts[-2:]], span)
+        body = ir.SeqStmts(
+            [
+                *cast(ir.SeqStmts, function.body).stmts[:3],
+                *prefixes,
+                *cast(ir.SeqStmts, function.body).stmts[-2:],
+            ],
+            span,
+        )
         return clone(function, body=body)
 
     return replace(original), replace(logical)
@@ -430,9 +443,10 @@ def invocation_scaling_fixture(case_count):
 @pytest.mark.parametrize("case_count", [2, 4, 8, 16])
 def test_invocation_profile_scaling_keeps_actual_case_protocols(case_count):
     original, logical = invocation_scaling_fixture(case_count)
-    evidence = {"parameter_bounds": {4: (0, 0)}, "block_bounds": (0, case_count - 1)}
-    baseline = lower(logical, "guarded", **evidence)
-    result = lower(logical, "case", **evidence)
+    parameters = {4: (0, 0)}
+    blocks = (0, case_count - 1)
+    baseline = lower(logical, "guarded", parameter_bounds=parameters, block_bounds=blocks)
+    result = lower(logical, "case", parameter_bounds=parameters, block_bounds=blocks)
     assert len(result["physical_cases"]) == case_count
     assert any(row["mode"] == "case" for row in selected(result))
     assert fingerprint(result) == fingerprint(baseline)
@@ -448,7 +462,7 @@ def test_growth_budget_is_cumulative_and_source_order_is_stable_after_serializat
     original, logical = case_only_fixture()
 
     def twice(function):
-        loop = function.body.stmts[-2]
+        loop = cast(ir.SeqStmts, function.body).stmts[-2]
         copied, _ = ir.deep_clone(loop)
 
         class DistinctCalls(ir.IRMutator):
@@ -460,11 +474,18 @@ def test_growth_budget_is_cumulative_and_source_order_is_stable_after_serializat
         copied = DistinctCalls().visit_stmt(copied)
         return clone(
             function,
-            body=ir.SeqStmts([*function.body.stmts[:-1], copied, function.body.stmts[-1]], function.span),
+            body=ir.SeqStmts(
+                [
+                    *cast(ir.SeqStmts, function.body).stmts[:-1],
+                    copied,
+                    cast(ir.SeqStmts, function.body).stmts[-1],
+                ],
+                function.span,
+            ),
         )
 
     original, logical = twice(original), twice(logical)
-    first_loop = original.body.stmts[-3]
+    first_loop = cast(ir.SeqStmts, original.body).stmts[-3]
     extra = ExpandedCensus()
     extra.visit_stmt(first_loop)
     policy = {
@@ -490,9 +511,10 @@ def test_growth_budget_is_cumulative_and_source_order_is_stable_after_serializat
 @pytest.mark.parametrize("block", [0, 1])
 def test_complete_case_cost_delta_matches_independent_active_execution(block):
     original, logical = case_only_fixture()
-    evidence = {"parameter_bounds": {4: (0, 0)}, "block_bounds": (0, 1)}
-    baseline = lower(logical, "guarded", **evidence)
-    candidate = lower(logical, "case", **evidence)
+    parameters = {4: (0, 0)}
+    blocks = (0, 1)
+    baseline = lower(logical, "guarded", parameter_bounds=parameters, block_bounds=blocks)
+    candidate = lower(logical, "case", parameter_bounds=parameters, block_bounds=blocks)
     before_rows, after_rows = selected(baseline), selected(candidate)
     assert len(before_rows) == len(after_rows) == 1
     before, after = before_rows[0], after_rows[0]
@@ -512,9 +534,26 @@ def test_complete_case_cost_delta_matches_independent_active_execution(block):
 @pytest.mark.parametrize("mode", ["auto", "case"])
 def test_actual_token_lowering_refuses_interior_launch_predicate_before_scheduling(mode):
     _, logical = case_only_fixture()
-    block = logical.body.stmts[0].var
+    block = cast(ir.AssignStmt, cast(ir.SeqStmts, logical.body).stmts[0]).var
 
     class InteriorPredicate(ir.IRMutator):
+        def visit_for_stmt(self, op):
+            if op.start.same_as(block):
+                # On blocks 0..3 this prefix executes only at block zero.
+                # Step four preserves those visits and admits the full launch
+                # interval, so this test reaches the interior guard contract.
+                return ir.ForStmt(
+                    op.loop_var,
+                    op.start,
+                    op.stop,
+                    ir.ConstInt(4, ir.DataType.INDEX, op.span),
+                    op.iter_args,
+                    self.visit_stmt(op.body),
+                    op.return_vars,
+                    op.span,
+                )
+            return super().visit_for_stmt(op)
+
         def visit_if_stmt(self, op):
             condition = op.condition
             if isinstance(condition, ir.Lt) and condition.left.same_as(block):
@@ -536,13 +575,16 @@ def test_parent_gap_does_not_cross_dispatch_or_multiple_phases(kind):
     if kind == "versioned":
         original, logical = case_only_fixture()
         mode = "case"
-        evidence = {"parameter_bounds": {4: (0, 0)}, "block_bounds": (0, 1)}
+        parameters = {4: (0, 0)}
+        blocks = (0, 1)
         values = [({4: 0}, block) for block in (0, 1)]
     else:
         original = streamed_fixture(7, start=5, step=2)
         logical = _apply(passes.insert_sync, original)
-        mode, evidence, values = "boundary_periodic", {}, [({}, None)]
-    result = lower(logical, mode, **evidence)
+        mode, values = "boundary_periodic", [({}, None)]
+        parameters = {}
+        blocks = None
+    result = lower(logical, mode, parameter_bounds=parameters, block_bounds=blocks)
     assert_receipt(result, mode)
     assert any(row["mode"] == mode for row in selected(result))
     assert not result["schedule"]["parent_gaps"]
@@ -559,9 +601,13 @@ def test_parent_gap_does_not_cross_dispatch_or_multiple_phases(kind):
 
 def test_repeated_static_loop_pointer_is_rejected_before_parent_composition():
     _, logical = case_only_fixture()
-    loop = logical.body.stmts[-2]
+    loop = cast(ir.SeqStmts, logical.body).stmts[-2]
     repeated = clone(
-        logical, body=ir.SeqStmts([*logical.body.stmts[:-1], loop, logical.body.stmts[-1]], logical.span)
+        logical,
+        body=ir.SeqStmts(
+            [*cast(ir.SeqStmts, logical.body).stmts[:-1], loop, cast(ir.SeqStmts, logical.body).stmts[-1]],
+            logical.span,
+        ),
     )
     snapshot = ir.serialize(repeated)
     # This malformed actual-token program fails SSA admission first. It does

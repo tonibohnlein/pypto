@@ -1,0 +1,369 @@
+{
+  "schema_version": 1,
+  "status": "implemented-and-reviewed-with-explicit-limitations",
+  "baseline": {
+    "head": "48c40512e6c90f444204ad94ef6c6c027d34d970",
+    "branch": "codex/pypto-autosync-clean",
+    "captured_utc": "2026-11-14T16:08:50.088468+00:00",
+    "snapshot_sha256": "f6ef37f956e34ad42fd072b5f8c746fe2e19408aff18622379f3082ae58f253e",
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "binaries": {
+      "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "2b67ef3956731cecedc3e246be6e947fa9ca4950f5d5d589bc5c94cfd66b4c69"
+    }
+  },
+  "baseline_inventory": "build-py314/regional-sync-architecture-20261114/baseline-source.json",
+  "baseline_patch": "build-py314/regional-sync-architecture-20261114/baseline.patch",
+  "rfc": {
+    "url": "https://github.com/hw-native-sys/pypto/issues/3375",
+    "checked": "2026-11-14",
+    "updated": "2026-11-10",
+    "state": "open",
+    "comments": 0
+  },
+  "gates": [
+    {
+      "stage": 1,
+      "name": "baseline-contracts",
+      "architecture_review": "accepted",
+      "compiler_review": "accepted",
+      "tests": {
+        "initial": {
+          "passed": 218,
+          "failed": 3,
+          "seconds": 188.62,
+          "log": "build-py314/regional-sync-architecture-20261114/baseline-tests.log"
+        },
+        "corrected_environment": {
+          "passed": 2,
+          "failed": 0,
+          "log": "build-py314/regional-sync-architecture-20261114/baseline-cpp-recheck.log"
+        },
+        "remaining_failure": {
+          "test": "test_shenggan_original_tiles_single_invocation_cpp",
+          "cause": "Existing M128 N256 K512 workers1 derivative remains Functional IR; InsertSync refuses before analysis.",
+          "changed": false
+        }
+      },
+      "status": "accepted",
+      "all_green": false
+    },
+    {
+      "stage": 2,
+      "name": "actual-token-protocol",
+      "status": "accepted",
+      "architecture_review": "accepted-after-ownership-fixes",
+      "compiler_review": "root-independent-review-accepted",
+      "tests": {
+        "passed": 221,
+        "failed": 1,
+        "seconds": 191.76,
+        "remaining_failure": "unchanged pre-InsertSync Buffer-admission baseline failure",
+        "log": "build-py314/regional-sync-architecture-20261114/gate2-final-tests.log"
+      },
+      "source_manifest": {
+        "CMakeLists.txt": "24eac1aa174ace275852de8a673d627159f151aa5218ad5d9a694bd989689708",
+        "docs/en/dev/ir/33-sync-architecture-contracts.md": "050d8ec1f2bf59c12d85fb9ca4051dfc8bbbc150b6e7c2286e0278331cdaafdc",
+        "docs/zh/dev/ir/33-sync-architecture-contracts.md": "d880b845bf298db0a3c25584a7faecd6ea60989fa2fc5e7ecae0e61dd8c6f837",
+        "include/pypto/codegen/pto/pto_codegen.h": "b6170b727c5735dc4236f29ef967ebdc5f84f07410cd25bf2256543a512d627b",
+        "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "4fa7e8676bf24e7369435a433a6611f7353578b1951b68d72cfe6fb5616f05e9",
+        "python/bindings/modules/testing.cpp": "fe8ccb02ceb90d5551a9b5e5a08dc0f582506bf797963b2b16b1bb15763b8d77",
+        "python/pypto/pypto_core/testing.pyi": "fdbdfbdd1c5628b668a615363cd4b35a771ec6f993bcc721aecbc4e0998032cf",
+        "src/codegen/pto/pto_buffer_codegen.cpp": "b3681a9141bc21add5ece63e13b5b084d87a132589d1924db10466f632ced5aa",
+        "src/codegen/pto/pto_codegen.cpp": "0d48eb6a22787a8cc3c0171168d5d7bbfcdd9201c7b7fb2666a5bdd60ba242a6",
+        "src/codegen/pto/pto_scalar_expr_codegen.cpp": "d6bbbc5c2a8a275033c8b0c5cfb824d54917b2921947a62b03f031ead20887c1",
+        "src/ir/arith/const_int_bound.cpp": "09d96b6a8994212bd04e4765f61ec632025b12fa6f75b6d4d2ab2996874ff085",
+        "src/ir/transforms/memory_reuse/internal.h": "efb4d87f8ca7c2cb30a4f526bb4db641d1ff1163fbec09d865301a4690ac5ef2",
+        "src/ir/transforms/memory_reuse/semantic_aliases.cpp": "18dab5be0f2a56b53119631216117d05d3df4077484688ab26c9df7506124ce9",
+        "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "a1170b5163ff5399c4a26e8db4ba67ff6736513f6a56c9d8b84cb5640c2da93b",
+        "src/ir/transforms/simplify_pass.cpp": "9dfd2a403c7afc6078351526733fa7257ac3684cadfc89787bb8bbcaeba43814",
+        "src/ir/transforms/token_sync.cpp": "70529345e6f3db9e12c8623e9303d2ed0139def4d602252a9360e562faab131d",
+        "src/ir/transforms/utils/compact_sync_analysis.cpp": "aac5b4d30d5634de70c6a89749b8470dcd535238c43efabe527869ff00ae2cab",
+        "src/ir/transforms/utils/numerical_sync_hierarchy.cpp": "2137176ab4cbe6e2ee73a16c876c0b4c36b0b7ad7ad970b8c509107c663fb9b3",
+        "src/ir/transforms/utils/numerical_sync_hierarchy.h": "a3836706850753ff4b65989f24d01e79cd34b29cf3edfad4bec22d0f4d2561dd",
+        "src/ir/transforms/utils/numerical_sync_merge.h": "50bd3d10f5fb5e8bf85d80cd7a76be72ec79f6cee7946573e6cad9a690bfd75f",
+        "src/ir/transforms/utils/physical_sync_allocation.cpp": "64ecac4c0d27013ff29caa93584888c93fa14612c305ac1fcfcb78b7cec6135c",
+        "src/ir/transforms/utils/physical_sync_allocation.h": "e1309ad7b0793618f2f7426910aa177d59df8f49830891a748174fbb33f80ce1",
+        "src/ir/transforms/utils/physical_sync_schedule.cpp": "6dcb1ce0f9d876cc496146a8b9fd5beecad523a4d7e9e3c315cdfe1419c806f8",
+        "src/ir/transforms/utils/placed_sync_import.cpp": "0c1a2c15f2f845168d5f46efd9d8570635beb9fadb9743dec351b1e67debee95",
+        "src/ir/transforms/utils/rotating_sync_analysis.cpp": "3bd5fc15c0d89c6361cb6703cb308fe689f30b04425afdd9d538da950e3ca7fb",
+        "src/ir/transforms/utils/scoped_logical_sync.cpp": "a79b5b95a7ce430baf81812da627779981a5921fe66bbfcd9e5dc087620e9115",
+        "src/ir/transforms/utils/scoped_token_families.cpp": "650c5e203fd7af44b1f55430cfd81810b27faa5673a2f03c17885d9935a20954",
+        "src/ir/transforms/utils/scoped_token_families.h": "54e95b2c32800370dba2fdeabcf611559e448dea1d2afa01a14185de8c8a1e09",
+        "src/ir/transforms/utils/scoped_token_order.cpp": "273f417fcaeb009fd14e37e74443d62de26e886e9fea239002dcdf3ad8cebc5e",
+        "src/ir/transforms/utils/scoped_token_order.h": "ac06abf28c024d9f42a9414140a5c580ce64c28387269cbde88a1b83293aace1",
+        "src/ir/transforms/utils/structured_token_sync.cpp": "1da3a0989deb8c61adb346a45bd7b608143561f2486663bc9aa728512527a94e",
+        "tests/ut/ir/transforms/sync_matmul_oracle.py": "f19b44375fa34d982f88fcb7aa9128d39d83e1a313a177850361940eafca4917",
+        "tests/ut/ir/transforms/test_parameterized_token_sync.py": "b989a5ec7feb9903e23290918c2b8340337b65aa5ed97a9a692626de4d9ee2f9",
+        "tests/ut/ir/transforms/test_regional_slot_composition.py": "f3ce0bc955d8868d7b65cecffe36ea30e8a1d640557b27761c3da425024316a1",
+        "tests/ut/ir/transforms/test_rotating_token_sync.py": "20e2658e61b9a6bd8ae05935c377c4f81c2d8d7a15cab5df73d54e521bf4c41e",
+        "tests/ut/ir/transforms/test_scoped_logical_sync.py": "e701cc0b0c848b66c10f266c90276b01244803ca346379c663cc78786606015e",
+        "tests/ut/ir/transforms/test_scoped_token_families.py": "96380d3b65cdcce79bb7a7b0a00ae70863e30b4d7e327be03eda28ee0d8a9445",
+        "tests/ut/ir/transforms/test_scoped_token_order.py": "1f9503314eb5998cb5d245a8e8c1a5239920443a8f23a25ffdb161bf1e4fbd2c",
+        "tests/ut/ir/transforms/test_select_buffer_ir_functions.py": "0721f5b040c4a6eb59c6a546b595df59757ea508d3ae7e36f88007e31f31029e",
+        "tests/ut/ir/transforms/test_simplify_pass.py": "deb5085fcca63b1f91d51ef1e5c6310c5ae9f0f756119cc4bfa62a99a2773243",
+        "tests/ut/ir/transforms/test_slot_sync_import.py": "15d3f3fc86c368770f2f1bc49cf8902dec078e3e1388a82714d20d44b2702c59",
+        "tests/ut/ir/transforms/test_sync_range_proofs.py": "3531495e25172c02421b297ff2e6db9be2e5c730421aeb98a95d491070b16a4f"
+      },
+      "source_sha256": "cfd88d4fae6ed18dacfa6bab42073ee2733a9d48cda274922cdfd2246800d400"
+    },
+    {
+      "stage": 3,
+      "name": "palette-certificates",
+      "status": "accepted",
+      "construction_design_review": "accepted",
+      "resource_owner": "reuse existing Allocator and whole-function immutable RealizeSync transaction for exclusive leaf cases; general cross-core/multi-pass manager not claimed",
+      "architecture_review": "external-final-source-accepted",
+      "compiler_review": "root-independent-review-accepted",
+      "tests": {
+        "passed": 236,
+        "failed": 1,
+        "seconds": 193.86,
+        "remaining_failure": "unchanged test_shenggan_original_tiles_single_invocation_cpp pre-analysis Buffer-admission failure",
+        "log": "build-py314/regional-sync-architecture-20261114/gate3-final-tests.log"
+      },
+      "diagnostic": "build-py314/regional-sync-architecture-20261114/gate3-original-palette.json",
+      "source_snapshot": "build-py314/regional-sync-architecture-20261114/gate3-source.json",
+      "source_sha256": "29bffd576d708460ef36ce345dd67063200dd03d3dad10877322fb1eaaad7da0"
+    },
+    {
+      "stage": 4,
+      "name": "emission",
+      "status": "accepted",
+      "design_review": "accepted: complete directional palette, distinct eligible ID injection through existing owner; no unsupported cross-lane coloring theorem",
+      "architecture_review": "external-final-source-and-receipts-accepted",
+      "compiler_review": "root-independent-checks-accepted",
+      "tests": {
+        "passed": 78,
+        "failed": 0,
+        "explicitly_excluded": "inherited test_shenggan_original_tiles_single_invocation_cpp Buffer admission failure; included in Gate5",
+        "log": "build-py314/regional-sync-architecture-20261114/gate4-tests-final.log"
+      },
+      "source_snapshot": "build-py314/regional-sync-architecture-20261114/gate4-source.json",
+      "code_sha256": "e52d826094d2af43433cd34dea2c8d26345d6765b51165b612220fd5d6ed863b",
+      "incumbent_comparison": "build-py314/regional-sync-architecture-20261114/gate4-incumbent-recheck.json",
+      "original_compilation": "build-py314/regional-sync-architecture-20261114/gate4-original-final/receipt.json",
+      "resource_scope": {
+        "public": "native eight-ID catalog; actual IDs 0..7",
+        "restricted": "24/24 admitted workers, eligible IDs 0..5, actual IDs 0..3"
+      }
+    },
+    {
+      "stage": 5,
+      "name": "whole-kernel-validation",
+      "status": "accepted",
+      "broad_tests": {
+        "passed": 525,
+        "failed": 1,
+        "seconds": 406.67,
+        "warnings": 6,
+        "warning_kind": "inline helper direction annotation deprecation",
+        "remaining_failure": "unchanged test_shenggan_original_tiles_single_invocation_cpp: Functional IR rejected before InsertSync",
+        "log": "build-py314/regional-sync-architecture-20261114/gate5-tests.log"
+      },
+      "build_log": "build-py314/regional-sync-architecture-20261114/gate5-build.log",
+      "architecture_review": "external-final-source-and-qualification-accepted",
+      "compiler_review": "root-independent-qualification-accepted",
+      "scaling_test": {
+        "passed": 1,
+        "deselected": 12,
+        "log": "build-py314/regional-sync-architecture-20261114/gate5-scaling-final-test.log"
+      },
+      "scaling_receipt": "build-py314/regional-sync-architecture-20261114/gate5-scaling.json",
+      "all_green": false
+    }
+  ],
+  "commands": [
+    "cmake --build build-py314 --parallel 2",
+    "PYTHONPATH=\"$PWD/python:$PWD/tests/ut/ir/transforms\" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python3 -m pytest tests/ut/ir/transforms/test_scoped_token_order.py tests/ut/ir/transforms/test_scoped_token_families.py tests/ut/ir/transforms/test_scoped_logical_sync.py tests/ut/ir/transforms/test_scoped_physical_sync.py tests/ut/ir/transforms/test_nested_phase_sync.py -n 2 --maxprocesses 2 -q",
+    "PTOAS_ROOT=\"$PWD/build-py314/architecture-correction/ptoas-launcher\" PYTHONPATH=\"$PWD/python:$PWD/tests/ut/ir/transforms\" python3 -m pytest tests/ut/ir/transforms/test_scoped_token_order.py::test_public_scoped_cpp_and_serialization -q --basetemp=build-py314/regional-sync-architecture-20261114/pytest-baseline-cpp",
+    "PYTHONPATH=\"$PWD/python:$PWD/tests/ut/ir\" PTOAS_ROOT=\"$PWD/build-py314/architecture-correction/ptoas-launcher\" python3 tests/ut/ir/transforms/qualify_scoped_sync_transport.py build-py314/gemm-remaining-gates/unswizzled-original/stage2-logical.msgpack build-py314/regional-sync-architecture-20261114/gate4-original-final --blocks 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23",
+    "PYTHONPATH=\"$PWD/python:$PWD/tests/ut/ir\" python3 tests/ut/ir/transforms/qualify_scoped_sync_incumbents.py build-py314/regional-sync-architecture-20261114/gate4-incumbent-recheck.json build-py314/pytest-token-m4-reviewed/test_full_qwen_actual_tokens_o0/logical.msgpack build-py314/pytest-token-m4-reviewed/test_full_qwen_actual_tokens_g0/logical.msgpack --blocks 0 1",
+    "PTOAS_ROOT=\"$PWD/build-py314/architecture-correction/ptoas-launcher\" PYTHONPATH=\"$PWD/python:$PWD/tests/ut/ir/transforms\" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python3 -m pytest tests/ut/ir/transforms/test_scoped_token_order.py tests/ut/ir/transforms/test_scoped_token_families.py tests/ut/ir/transforms/test_scoped_logical_sync.py tests/ut/ir/transforms/test_scoped_physical_sync.py tests/ut/ir/transforms/test_nested_phase_sync.py tests/ut/ir/transforms/test_scoped_resource_transitions.py tests/ut/ir/transforms/test_scoped_sync_palette.py tests/ut/ir/transforms/test_scoped_palette_realization.py tests/ut/ir/transforms/test_invocation_token_sync.py tests/ut/ir/transforms/test_nested_sync_repetition.py tests/ut/ir/transforms/test_finite_sync_analysis.py tests/ut/ir/transforms/test_regional_slot_composition.py tests/ut/ir/transforms/test_rotating_token_sync.py -n 2 --maxprocesses 2 -q --basetemp=build-py314/regional-sync-architecture-20261114/pytest-gate5",
+    "PYTHONPATH=\"$PWD/python:$PWD/tests/ut/ir\" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python3 tests/ut/ir/transforms/qualify_scoped_sync_scaling.py build-py314/regional-sync-architecture-20261114/gate5-scaling.json"
+  ],
+  "deletion_ledger": [
+    {
+      "old": "ParseScopedTokenFamilies detached vector entry point",
+      "replacement": "ParseScopedTokenProtocol immutable input/raw-use owner",
+      "remaining_callers": 0
+    },
+    {
+      "old": "ScopedTokenOrder independent mutable input copies and public arbitrary prepared inventory",
+      "replacement": "protocol-owned const input; private trusted preparation factory",
+      "remaining_callers": 0
+    },
+    {
+      "old": "scoped emission ordered by fused allocation family directory",
+      "replacement": "frozen raw protocol cut order with raw-to-assigned lookup",
+      "remaining_callers": 0
+    },
+    {
+      "old": "BuildScopedPalette one-shot production wrapper",
+      "replacement": "tests compose BuildScopedPublicationSchedule and CertifyScopedPalette",
+      "remaining_callers": 0
+    },
+    {
+      "old": "Unused certificate FirstPublications/LastConsumptions vectors",
+      "replacement": "retain only schedule/budget used by allocator; internal proof boundary queries remain",
+      "remaining_callers": 0
+    },
+    {
+      "old": "DirectFamilies/MathematicalOrder test-only physical route",
+      "replacement": "tests invoke production insertion, token optimization and actual-token LowerSync",
+      "remaining_callers": 0
+    },
+    {
+      "old": "CompactSyncResult scoped reuse/adjacent-barrier methods and caches",
+      "replacement": "actual-token order provider; independent oracle checks preserved",
+      "remaining_callers": 0
+    }
+  ],
+  "device_validation": false,
+  "ptoas": {
+    "version": "0.72",
+    "launcher": "build-py314/architecture-correction/ptoas-launcher/ptoas",
+    "entry_sha256": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3"
+  },
+  "tools_final": {
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "python_executable": "/usr/bin/python3",
+    "platform": "Linux-7.2.5-100.fc43.x86_64-x86_64-with-glibc2.42",
+    "head": "48c40512e6c90f444204ad94ef6c6c027d34d970",
+    "branch": "codex/pypto-autosync-clean",
+    "extension": {
+      "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "096dedfe95be8a1f088039cfeca4ce65b23b6c89a0c1a134e4a95e6fb3aa2e6a"
+    },
+    "ptoas_launcher": {
+      "build-py314/architecture-correction/ptoas-launcher/ptoas": "8b52c0bfe3259f37dd17331ec0b8ee534461f18e70042edce0e2b6ee2fd7adf8"
+    }
+  },
+  "limitations": [
+    "Native invocation entry/return and device execution not qualified here.",
+    "Original public path uses native eight-ID catalog; all24 restricted-six worker cases are separate.",
+    "One inherited small-GEMM preanalysis Buffer admission failure remains.",
+    "Unproved reuse is not a fixed-plan capacity lower bound.",
+    "Arbitrary-period residue expansion and checked integer bounds remain explicit.",
+    "No generalized dynamic-history or cross-core resource manager claim.",
+    "Qwen byte-equivalence receipts specialize explicitly supplied parameter bounds.",
+    "PTOAS autosync remains enabled; C++ success alone does not exclude downstream inserted commands."
+  ],
+  "scaling_summary": {
+    "cases": 11,
+    "ordinary_allocated": 11,
+    "restricted_six_allocated": 11,
+    "fixed_period_inner_trips": [
+      32,
+      32000
+    ],
+    "fixed_period_outer_visits": [
+      4,
+      4000
+    ],
+    "emitted_statements_fixed_period": 1877,
+    "branches_fixed_period": 778,
+    "static_source_stage_sweep": "not claimed by new emitted scaling; existing numerical-interface static scaling tests included separately",
+    "optimal_control_size": false,
+    "timing_claim": "single-run descriptive only"
+  },
+  "final_source": {
+    "manifest": "build-py314/regional-sync-architecture-20261114/cleanup-source.json",
+    "parent_revision": "48c40512e6c90f444204ad94ef6c6c027d34d970",
+    "code_sha256": "20341651b801e7960e07f1b9991de87b65ac4b2b5a6a95d8a9ec962672d45330",
+    "dirty_source_pinned": true,
+    "publication_note": "The resulting commit identity is reported separately; source hash excludes documentation to avoid self-reference."
+  },
+  "artifact_sha256": {
+    "build-py314/regional-sync-architecture-20261114/gate5-tests.log": "44a4042ffdeea1ea73ae925327ec9b06ee12ed5503055261e59a35831b10b44c",
+    "build-py314/regional-sync-architecture-20261114/gate5-scaling.json": "d99ad423d1f18d12e67c6165e1c9d1ecd4f2035d882554fdbde542a6494f0bcc",
+    "build-py314/regional-sync-architecture-20261114/gate5-scaling-final-test.log": "b710da7425d13a6c0e7c1c74a43f4e16b4b57f2cb1abcb88dd32e95300dcc6a7",
+    "build-py314/regional-sync-architecture-20261114/gate4-incumbent-recheck.json": "98ba74bc071e2a3d32e52b19cdc5479cd52166fbf68d935e116626dd0e02700c",
+    "build-py314/regional-sync-architecture-20261114/gate4-original-final/receipt.json": "23e320600fa20840be30ac5c1e7c4b7c215567194ca191e0febc8798842b02ea"
+  },
+  "cleanup": {
+    "status": "reviewed-validated",
+    "removed": [
+      "production-only one-shot palette diagnostic wrapper",
+      "unused exported palette boundary vectors and construction",
+      "direct mathematical-demand-to-physical test route",
+      "mathematical scoped reuse and adjacent-barrier proof methods, helpers, cache and counters"
+    ],
+    "replacement": "test adapters call production logical insertion, optimization and actual-token lowering",
+    "production_algorithms_changed": false,
+    "independent_oracles_preserved": true,
+    "tests_so_far": {
+      "independent": 113,
+      "remaining_consumers_initial": {
+        "passed": 389,
+        "failed": 5
+      },
+      "remaining_consumers_corrections": {
+        "passed": 5,
+        "notes": "new supported geometry checked independently; shared reset keeps mathematics but explicitly refuses unavailable DMA barrier; family frames compared structurally; precise production diagnostic"
+      },
+      "scoped_and_nested_tail": 132,
+      "assignment_ownership": 7
+    },
+    "existing_preanalysis_failure_preserved": true,
+    "publication_note": "Final commit identity is reported separately; original gate receipts describe their pinned pre-cleanup snapshots.",
+    "final_token_gate": {
+      "passed": 162,
+      "failed": 1,
+      "failure": "unchanged small-GEMM preanalysis Buffer admission",
+      "log": "build-py314/regional-sync-architecture-20261114/cleanup-final-token-tests.log"
+    },
+    "final_qwen_gate": {
+      "passed": 1,
+      "seconds": 84.36,
+      "log": "build-py314/regional-sync-architecture-20261114/cleanup-qwen-final.log"
+    },
+    "original_outputs": {
+      "public_cpp_byte_identical": true,
+      "restricted_six_worker_cpp_byte_identical": 24,
+      "receipt": "build-py314/regional-sync-architecture-20261114/cleanup-original/receipt.json"
+    },
+    "build_log": "build-py314/regional-sync-architecture-20261114/cleanup-final-build.log",
+    "final_mechanical_checks": {
+      "build": {
+        "passed": true,
+        "log": "build-py314/regional-sync-architecture-20261114/cleanup-hook-build.log"
+      },
+      "focused_core": {
+        "passed": 63,
+        "log": "build-py314/regional-sync-architecture-20261114/cleanup-hook-tests.log"
+      },
+      "test_annotation_gate": {
+        "initial_passed": 234,
+        "initial_failed": 2,
+        "corrected_passed": 2,
+        "notes": "Corrected fixture activation stride without changing any admitted execution; preserves intended nonuniform-guard refusal.",
+        "log": "build-py314/regional-sync-architecture-20261114/type-narrowing-tests.log"
+      },
+      "additional_type_narrowing_gate": {
+        "passed": 365,
+        "log": "build-py314/regional-sync-architecture-20261114/cleanup-final-typing-tests.log"
+      },
+      "original_cpp_byte_identical": 25,
+      "original_receipt": "build-py314/regional-sync-architecture-20261114/cleanup-hook-original/receipt.json",
+      "final_slot_file": {
+        "passed": 50,
+        "log": "build-py314/regional-sync-architecture-20261114/cleanup-final-slot-tests.log"
+      }
+    },
+    "commit_hooks": {
+      "status": "passed",
+      "log": "build-py314/regional-sync-architecture-20261114/commit-hooks-complete.log",
+      "log_sha256": "3939153990402ef42daadf1cd02175adc126f0457f66f72c3777c1fad16f4c07",
+      "python": "3.11",
+      "configuration": "verbatim repository hooks plus local default_language_version.python=python3.11; pinned torch2.8 has no Python3.14 wheel",
+      "scope": "exact intended publication snapshot; unrelated local-only reports excluded",
+      "disabled_hooks": []
+    }
+  },
+  "pre_cleanup_source": {
+    "manifest": "build-py314/regional-sync-architecture-20261114/final-source.json",
+    "code_sha256": "c617a18f2db5a44f409165a73187da1fdbeb37d88115a10acf9a53f2e06d89d2",
+    "dirty_source_pinned": true,
+    "committed": false,
+    "pushed": false
+  }
+}

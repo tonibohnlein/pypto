@@ -9,20 +9,27 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-// Interpret original-frame token equations, never storage demands. Each token
-// equation is resolved once, iteratively. Pattern transport costs O(T D) for T
-// equations and frame depth D, plus indexed lookups; no trip count is unfolded.
-// U use families cost O(UD log(D+2)); payload scope checks visit their D frames.
-// Guard DAG visits are counted per supplied condition, not globally: reused
-// conditions can be revisited, and nested guard scopes copy their domain maps.
+// Interpret original-frame token equations, never storage demands. Resolution
+// is iterative and per use: capture-and-hold is specialized to that consumer's
+// exact domain and cannot share a global resolved-pattern cache. For E inspected
+// equation steps and frame depth D, pattern work is O(E D), plus indexed/domain
+// lookups; E can reach U T for U uses and T equations. Counters expose E rather
+// than claiming one resolution per equation. No trip count is unfolded.
+// Guard DAG visits are per supplied condition, not global: shared conditions
+// can be revisited, and nested guard scopes copy their domain maps. Optional
+// family normalization uses counted indexed passes and candidate comparisons;
+// candidates within a group may be quadratic, and reuse proof cost is separate.
 #include "src/ir/transforms/utils/scoped_token_families.h"
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <set>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -38,7 +45,12 @@ namespace pypto::ir::sync {
 namespace {
 using Site = std::pair<size_t, size_t>;
 using Interval = std::pair<int64_t, int64_t>;  // Half-open normalized visits.
-using Domain = std::map<const ForStmt*, Interval>;
+struct Progression {
+  int64_t first = 0, second = 0, step = 1;
+  int64_t Count() const { return first < second ? 1 + (second - 1 - first) / step : 0; }
+  int64_t Last() const { return first + (Count() - 1) * step; }
+};
+using Domain = std::map<const ForStmt*, Progression>;
 struct Digit {
   const ForStmt* variable = nullptr;
   int64_t offset = 0;
@@ -46,9 +58,11 @@ struct Digit {
 struct Pattern {
   std::optional<Site> source;
   std::vector<Digit> digits;
-  // Exactly the domain where this fact is non-completed, not merely where a
-  // proof succeeded. Completed entry and pure own-carry captures establish
-  // this invariant, allowing waits on completed facts to vanish on other visits.
+  // Exactly the domain where this fact is non-completed, relative to the
+  // current consumer when capture-and-hold is specialized. No per-use pattern
+  // is stored in the global binding cache. This is not merely where a proof succeeded. Completed entry and
+  // pure own-carry captures establish this invariant, allowing waits on completed facts to vanish on other
+  // visits.
   Domain valid;
 };
 enum class EquationKind { Alias, Carry, Exit, Capture };
@@ -58,6 +72,7 @@ struct Equation {
   const ForStmt* frame = nullptr;
   const Var* carry = nullptr;
   int64_t selected = 0;
+  std::optional<Progression> capture;
 };
 struct Wait {
   ExprPtr token;
@@ -129,7 +144,7 @@ class Parser {
       CHECK(!Resolve(initial).source) << "Scoped token carries require completed entry";
     std::vector<PhysicalSyncFamily> output;
     for (const auto& use : uses_) {
-      auto pattern = Resolve(use.wait.token);
+      auto pattern = Resolve(use.wait.token, &use.wait.domain);
       if (!pattern.source) continue;
       auto family = Family(pattern, use);
       if (family) {
@@ -183,11 +198,38 @@ class Parser {
       pattern.digits.push_back({frame.loop.get(), 0});
     return pattern;
   }
-  Interval Full(const ForStmt* frame) const { return {0, frames_.at(frame).count}; }
-  void Intersect(Domain& domain, const ForStmt* frame, Interval interval) const {
+  Progression Full(const ForStmt* frame) const { return {0, frames_.at(frame).count}; }
+  static void Restrict(Progression& value, Interval interval) {
+    const auto low = std::max(value.first, interval.first);
+    value.second = std::min(value.second, interval.second);
+    if (low >= value.second) {
+      value.first = value.second;
+      return;
+    }
+    const auto skip = (__int128(low) - value.first + value.step - 1) / value.step;
+    const auto first = __int128(value.first) + skip * value.step;
+    value.first = static_cast<int64_t>(std::min<__int128>(first, value.second));
+    if (value.Count()) value.second = value.Last() + 1;
+  }
+  void Intersect(Domain& domain, const ForStmt* frame, Progression other) const {
     auto [at, inserted] = domain.try_emplace(frame, Full(frame));
-    at->second.first = std::max(at->second.first, interval.first);
-    at->second.second = std::min(at->second.second, interval.second);
+    auto& value = at->second;
+    if (other.step != 1) {
+      CHECK(value.step == 1 || value.step == other.step)
+          << "Scoped token domain combines unsupported residue periods";
+      if (value.step != 1 && (value.first - other.first) % other.step != 0) {
+        value.second = value.first;
+        return;
+      }
+      if (value.step == 1) {
+        auto remainder = (value.first - other.first) % other.step;
+        if (remainder < 0) remainder += other.step;
+        const auto first = __int128(value.first) + (remainder ? other.step - remainder : 0);
+        value.first = static_cast<int64_t>(std::min<__int128>(first, value.second));
+        value.step = other.step;
+      }
+    }
+    Restrict(value, {other.first, other.second});
   }
   // Guards denote exact rectangular domains, not an enclosure of arbitrary
   // Boolean control. Every variable must be an active original frame.
@@ -281,6 +323,30 @@ class Parser {
         enabled &= *selected;
         continue;
       }
+      if (const auto equal = As<Eq>(expression)) {
+        if (const auto modulo = As<FloorMod>(equal->left_)) {
+          const auto normalized = As<Sub>(modulo->left_);
+          const auto variable = normalized ? AsVarLike(normalized->left_) : nullptr;
+          const auto at = variable ? variables_.find(variable.get()) : variables_.end();
+          const auto modulus = As<ConstInt>(modulo->right_);
+          const auto residue = As<ConstInt>(equal->right_);
+          CHECK(at != variables_.end() && active_frames_.count(at->second) && modulus && residue)
+              << "Scoped token residue requires an active original frame and literal modulus";
+          const auto& frame = frames_.at(at->second);
+          const auto start = frame.start_expression ? frame.start_expression : frame.loop->start_;
+          CHECK(structural_equal(normalized->right_, start, false) && modulus->value_ > 0 &&
+                modulus->value_ % frame.step == 0 && residue->value_ >= 0 &&
+                residue->value_ < modulus->value_ && residue->value_ % frame.step == 0 &&
+                structural_equal(normalized->GetType(), variable->GetType(), false) &&
+                structural_equal(modulo->GetType(), variable->GetType(), false) &&
+                structural_equal(modulus->GetType(), variable->GetType(), false) &&
+                structural_equal(residue->GetType(), variable->GetType(), false))
+              << "Scoped token residue changes its original nonnegative coordinate lattice";
+          Intersect(domain, at->second,
+                    {residue->value_ / frame.step, frame.count, modulus->value_ / frame.step});
+          continue;
+        }
+      }
       const auto [frame, digit] = Coordinate(expression);
       if (As<Eq>(expression))
         Intersect(domain, frame, {digit, digit + 1});
@@ -320,7 +386,18 @@ class Parser {
       return;
     }
     CHECK(!cursor.returned && !cursor.yield) << "Unreachable scoped token cut";
-    const auto call = Payload(statement);
+    auto call = Payload(statement);
+    if (const auto branch = As<IfStmt>(statement); branch && branch->return_vars_.empty()) {
+      std::function<void(const StmtPtr&)> find = [&](const StmtPtr& node) {
+        if (auto sequence = As<SeqStmts>(node)) {
+          for (const auto& child : sequence->stmts_) find(child);
+        } else if (auto eval = As<EvalStmt>(node)) {
+          const auto candidate = As<Call>(eval->expr_);
+          if (sites_.count(candidate.get())) call = candidate;
+        }
+      };
+      find(branch->then_body_);
+    }
     const auto payload = sites_.find(call.get());
     if (payload != sites_.end()) {
       CheckScope(payload->second);
@@ -343,15 +420,20 @@ class Parser {
         return;
       }
       CHECK(cursor.pending.empty() && !scope_.empty() && branch->return_vars_.size() == 1 &&
-            branch->else_body_ && As<Eq>(branch->condition_))
+            branch->else_body_)
           << "Unsupported scoped token capture";
-      const auto [frame, selected] = Coordinate(branch->condition_);
-      CHECK(frame == scope_.back()) << "Scoped capture requires its own exact visit coordinate";
+      Domain capture;
+      CHECK(Guard(branch->condition_, capture) && capture.size() == 1 &&
+            capture.begin()->first == scope_.back())
+          << "Scoped capture requires its own exact active visit progression";
+      const auto frame = capture.begin()->first;
+      const auto selected = capture.begin()->second;
       const auto value = PureYield(branch->then_body_);
       const auto previous = PureYield(*branch->else_body_);
       CHECK(value && previous && AsVarLike(previous)) << "Scoped capture must select pure token facts";
-      equations_.emplace(branch->return_vars_.front().get(),
-                         Equation{EquationKind::Capture, value, frame, AsVarLike(previous).get(), selected});
+      equations_.emplace(
+          branch->return_vars_.front().get(),
+          Equation{EquationKind::Capture, value, frame, AsVarLike(previous).get(), 0, selected});
       cursor.last.reset();
       return;
     }
@@ -382,7 +464,8 @@ class Parser {
       const auto frame = loops_.at(loop.get());
       const auto count = frames_.at(frame).count;
       CHECK(loop->iter_args_.size() == loop->return_vars_.size()) << "Scoped token loop arity mismatch";
-      for (const auto& arg : loop->iter_args_) initials_.push_back(arg->initValue_);
+      for (const auto& arg : loop->iter_args_)
+        if (As<SyncTokenType>(arg->GetType())) initials_.push_back(arg->initValue_);
       Cursor body;
       scope_.push_back(frame);
       active_frames_.insert(frame);
@@ -394,6 +477,7 @@ class Parser {
             (body.yield && body.yield->value_.size() == loop->iter_args_.size()))
           << "Scoped loop requires unconditional simultaneous token yields";
       for (size_t i = 0; i < loop->iter_args_.size(); ++i) {
+        if (!As<SyncTokenType>(loop->iter_args_[i]->GetType())) continue;
         if (!count) {
           resolved_.emplace(loop->return_vars_[i].get(), Pattern{});
           continue;
@@ -418,9 +502,51 @@ class Parser {
     CHECK(false) << "Unsupported scoped token statement";
   }
 
-  void Transform(Pattern& pattern, const Equation& equation) const {
+  void Transform(Pattern& pattern, const Equation& equation, const Domain* consumer) const {
     if (!pattern.source || equation.kind == EquationKind::Alias) return;
     const auto* frame = equation.frame;
+    if (equation.kind == EquationKind::Carry && equation.capture) {
+      CHECK(consumer) << "Captured history requires an actual consumer domain";
+      ++work_.capture_specializations;
+      const auto capture = *equation.capture;
+      const auto available = pattern.valid.find(frame);
+      if (available != pattern.valid.end()) {
+        const auto& valid = available->second;
+        CHECK(capture.first >= valid.first && capture.Last() < valid.second &&
+              (capture.first - valid.first) % valid.step == 0 && capture.step % valid.step == 0)
+            << "Capture can select a completed or incompatible source fact";
+      }
+      const auto found = consumer->find(frame);
+      auto uses = found == consumer->end() ? Full(frame) : found->second;
+      Restrict(uses, {capture.first + 1, frames_.at(frame).count});
+      if (!uses.Count()) {
+        pattern = {};
+        return;
+      }
+      if (capture.Count() == 1 || uses.Count() == 1) {
+        const auto selected = std::min(
+            capture.Last(), capture.first + ((uses.first - 1 - capture.first) / capture.step) * capture.step);
+        for (auto& digit : pattern.digits)
+          if (digit.variable == frame) {
+            CHECK(!__builtin_add_overflow(digit.offset, selected, &digit.offset))
+                << "Scoped captured source coordinate overflows";
+            digit.variable = nullptr;
+          }
+      } else {
+        const auto delta = 1 + (uses.first - 1 - capture.first) % capture.step;
+        CHECK(uses.step % capture.step == 0 && uses.Last() - delta <= capture.Last())
+            << "Scoped consumer does not prove one latest-source residue without fanout";
+        for (auto& digit : pattern.digits)
+          if (digit.variable == frame) {
+            CHECK(!__builtin_sub_overflow(digit.offset, delta, &digit.offset))
+                << "Scoped captured source history overflows";
+          }
+      }
+      // This is a per-use resolution, never a cacheable global fact. Keeping
+      // the exact consumer progression preserves every hole in its activity.
+      pattern.valid[frame] = uses;
+      return;
+    }
     if (equation.kind == EquationKind::Carry) {
       for (auto& digit : pattern.digits)
         if (digit.variable == frame) {
@@ -431,14 +557,16 @@ class Parser {
       const auto previous = found == pattern.valid.end() ? Full(frame) : found->second;
       pattern.valid[frame] = {
           static_cast<int64_t>(std::min<__int128>(frames_.at(frame).count, __int128(previous.first) + 1)),
-          static_cast<int64_t>(std::min<__int128>(frames_.at(frame).count, __int128(previous.second) + 1))};
+          static_cast<int64_t>(std::min<__int128>(frames_.at(frame).count, __int128(previous.second) + 1)),
+          previous.step};
       return;
     }
     const auto selected = equation.selected;
     const auto valid = pattern.valid.find(frame);
     if (selected < 0 || selected >= frames_.at(frame).count ||
         (valid != pattern.valid.end() &&
-         (selected < valid->second.first || selected >= valid->second.second))) {
+         (selected < valid->second.first || selected >= valid->second.second ||
+          (selected - valid->second.first) % valid->second.step != 0))) {
       pattern = {};
       return;
     }
@@ -450,7 +578,7 @@ class Parser {
         digit.variable = nullptr;
       }
   }
-  Pattern Resolve(const ExprPtr& expression) {
+  Pattern Resolve(const ExprPtr& expression, const Domain* consumer = nullptr) {
     // Unary equations after checking capture's own-carry recurrence. Resolve
     // iteratively so long alias/history chains cannot exhaust the C++ stack.
     std::vector<std::pair<const Var*, Equation>> path;
@@ -469,15 +597,21 @@ class Parser {
       const auto found = equations_.find(var.get());
       CHECK(found != equations_.end()) << "Unavailable scoped token binding";
       auto equation = found->second;
+      ++work_.equation_visits;
       CHECK(equation.kind != EquationKind::Capture) << "Scoped capture may only be used through loop result";
       if (equation.kind == EquationKind::Exit || equation.kind == EquationKind::Carry) {
         const auto yielded = AsVarLike(equation.value);
         const auto capture = yielded ? equations_.find(yielded.get()) : equations_.end();
         if (capture != equations_.end() && capture->second.kind == EquationKind::Capture) {
-          CHECK(equation.kind == EquationKind::Exit && capture->second.frame == equation.frame &&
-                capture->second.carry == equation.carry)
+          CHECK(capture->second.frame == equation.frame && capture->second.carry == equation.carry)
               << "Scoped capture must retain its own invocation carry";
-          equation.selected = capture->second.selected;
+          CHECK(capture->second.capture) << "Missing exact capture progression";
+          equation.capture = capture->second.capture;
+          if (!equation.capture->Count()) {
+            result = {};
+            break;
+          }
+          equation.selected = equation.capture->Last();
           equation.value = capture->second.value;
         } else if (equation.kind == EquationKind::Exit) {
           equation.selected = frames_.at(equation.frame).count - 1;
@@ -486,17 +620,30 @@ class Parser {
       path.emplace_back(var.get(), equation);
       next = equation.value;
     }
+    // A captured carry is specialized to this consumer domain. Composing a
+    // second transformation of that same frame would need to pull the domain
+    // backwards through it first. Preserve refusal rather than reuse the
+    // unchanged consumer domain as a certificate for another history.
+    std::map<const ForStmt*, size_t> transforms;
+    std::set<const ForStmt*> captured_frames;
+    for (const auto& [variable, equation] : path) {
+      if (equation.kind == EquationKind::Alias) continue;
+      ++transforms[equation.frame];
+      if (equation.capture) captured_frames.insert(equation.frame);
+    }
+    for (const auto* frame : captured_frames)
+      CHECK(transforms.at(frame) == 1) << "Composed captured history requires additional coordinate evidence";
     for (auto it = path.rbegin(); it != path.rend(); ++it) {
-      Transform(result, it->second);
-      resolved_.emplace(it->first, result);
+      Transform(result, it->second, consumer);
     }
     return result;
   }
   std::map<size_t, std::shared_ptr<const SyncEndpointFrame>> endpoint_frames_;
-  using EndpointKey = std::pair<size_t, std::vector<Interval>>;
+  using EndpointKey = std::tuple<size_t, std::vector<Interval>, std::vector<int64_t>>;
   std::map<EndpointKey, std::shared_ptr<const SyncEndpointDomain>> endpoint_domains_;
-  std::shared_ptr<const SyncEndpointDomain> Endpoint(size_t region, std::vector<Interval> ranges) {
-    EndpointKey key{region, std::move(ranges)};
+  std::shared_ptr<const SyncEndpointDomain> Endpoint(size_t region, std::vector<Interval> ranges,
+                                                     std::vector<int64_t> steps) {
+    EndpointKey key{region, std::move(ranges), std::move(steps)};
     if (auto found = endpoint_domains_.find(key); found != endpoint_domains_.end()) {
       return found->second;
     }
@@ -504,7 +651,8 @@ class Parser {
     if (!frame)
       frame = std::make_shared<SyncEndpointFrame>(SyncEndpointFrame{input_.owner, input_.block_bounds, region,
                                                                     input_.segments[region].nested_frames});
-    auto domain = std::make_shared<SyncEndpointDomain>(SyncEndpointDomain{frame, key.second});
+    auto domain =
+        std::make_shared<SyncEndpointDomain>(SyncEndpointDomain{frame, std::get<1>(key), std::get<2>(key)});
     endpoint_domains_.emplace(std::move(key), domain);
     return domain;
   }
@@ -520,7 +668,7 @@ class Parser {
       CHECK(target_frames.count(frame)) << "Unsubstituted scoped token history frame";
       Intersect(domain, frame, interval);
     }
-    std::map<const ForStmt*, Interval> ranges;
+    Domain ranges;
     std::optional<size_t> last_axis;
     for (size_t i = 0; i < target.size(); ++i) {
       const auto key = target[i].loop.get();
@@ -528,7 +676,7 @@ class Parser {
       const auto interval = found == domain.end() ? Full(key) : found->second;
       if (interval.first >= interval.second) return std::nullopt;
       ranges.emplace(key, interval);
-      if (interval.second - interval.first > 1) last_axis = i;
+      if (interval.Count() > 1) last_axis = i;
     }
     CHECK(pattern.digits.size() == source.size()) << "Scoped token source coordinate arity mismatch";
     std::vector<int64_t> source_strides(source.size()), target_strides(target.size());
@@ -545,6 +693,7 @@ class Parser {
     strides(target, target_strides);
     __int128 source_base = 0, target_base = 0, count = 1;
     std::vector<Interval> source_ranges, target_ranges;
+    std::vector<int64_t> source_steps, target_steps;
     for (size_t i = 0; i < source.size(); ++i) {
       const auto& digit = pattern.digits[i];
       __int128 value = digit.offset;
@@ -553,26 +702,34 @@ class Parser {
         CHECK(digit.variable == source[i].loop.get() && found != ranges.end())
             << "Scoped token source refers to an unavailable original frame";
         value += found->second.first;
-        CHECK(value + found->second.second - found->second.first <= source[i].count)
+        CHECK(value + found->second.Last() - found->second.first < source[i].count)
             << "Scoped token source interval exceeds its original frame";
       }
       CHECK(value >= 0 && value < source[i].count) << "Scoped token source has no active occurrence";
       source_base += value * source_strides[i];
       const auto width =
-          digit.variable ? ranges.at(digit.variable).second - ranges.at(digit.variable).first : 1;
+          digit.variable ? ranges.at(digit.variable).Last() - ranges.at(digit.variable).first + 1 : 1;
       source_ranges.emplace_back(static_cast<int64_t>(value), static_cast<int64_t>(value) + width);
+      source_steps.push_back(digit.variable ? ranges.at(digit.variable).step : 1);
     }
     PhysicalSyncFamily out{sr, ss, tr, ts, 0, 0, 1, {}};
     for (size_t i = 0; i < target.size(); ++i) {
       const auto interval = ranges.at(target[i].loop.get());
-      target_ranges.push_back(interval);
-      const auto axis_count = interval.second - interval.first;
+      target_ranges.emplace_back(interval.first, interval.Last() + 1);
+      target_steps.push_back(interval.step);
+      const auto axis_count = interval.Count();
       target_base += __int128(interval.first) * target_strides[i];
       if (last_axis && i <= *last_axis) {
         CHECK(i < source.size() && source[i].loop == target[i].loop &&
               (axis_count == 1 || pattern.digits[i].variable == target[i].loop.get()))
             << "Scoped token fanout is not an injective common-prefix handoff family";
-        out.axes.push_back({target[i].loop, axis_count, source_strides[i], target_strides[i]});
+        const auto source_stride = __int128(source_strides[i]) * interval.step;
+        const auto target_stride = __int128(target_strides[i]) * interval.step;
+        CHECK(source_stride <= std::numeric_limits<int64_t>::max() &&
+              target_stride <= std::numeric_limits<int64_t>::max())
+            << "Scoped progression stride overflows";
+        out.axes.push_back({target[i].loop, axis_count, static_cast<int64_t>(source_stride),
+                            static_cast<int64_t>(target_stride), interval.step, interval.step});
         count *= axis_count;
         CHECK(count <= std::numeric_limits<int64_t>::max()) << "Scoped token family count overflows";
       }
@@ -583,16 +740,265 @@ class Parser {
     out.source_first = static_cast<int64_t>(source_base);
     out.target_first = static_cast<int64_t>(target_base);
     out.count = static_cast<int64_t>(count);
-    out.source_domain = Endpoint(sr, std::move(source_ranges));
-    out.target_domain = Endpoint(tr, std::move(target_ranges));
+    out.source_domain = Endpoint(sr, std::move(source_ranges), std::move(source_steps));
+    out.target_domain = Endpoint(tr, std::move(target_ranges), std::move(target_steps));
     return out;
   }
 };
+// Optional physical preparation. Parsing actual tokens remains independent of
+// order/allocation services; the caller supplies its existing reuse proof.
+class FamilyNormalizer {
+ public:
+  FamilyNormalizer(const CompactSyncInput& input,
+                   const std::function<bool(const PhysicalSyncFamily&)>& can_reuse, ScopedTokenWork& work)
+      : input_(input), can_reuse_(can_reuse), work_(work) {}
+  void Run(std::vector<PhysicalSyncFamily>& families) {
+    for (const auto& family : families)
+      CHECK(family.ids.empty() && family.source_domain && family.target_domain)
+          << "Scoped family normalization requires unassigned exact endpoint inventories";
+    Coalesce(families);
+  }
+
+ private:
+  const CompactSyncInput& input_;
+  const std::function<bool(const PhysicalSyncFamily&)>& can_reuse_;
+  ScopedTokenWork& work_;
+  static Progression EndpointProgression(const SyncEndpointDomain& domain, size_t axis) {
+    const auto [first, end] = domain.ranges.at(axis);
+    return {first, end, domain.steps.empty() ? 1 : domain.steps.at(axis)};
+  }
+  // Finite CRT intersection, not an interval-overlap approximation. Wide
+  // arithmetic covers the lcm of two admitted int64 periods without expansion.
+  static bool Disjoint(const Progression& a, const Progression& b) {
+    const auto low = std::max(a.first, b.first), high = std::min(a.Last(), b.Last());
+    if (low > high) return true;
+    const auto divisor = std::gcd(a.step, b.step);
+    const auto difference = b.first - a.first;
+    if (difference % divisor) return true;
+    const auto modulus = b.step / divisor;
+    __int128 x = 0;
+    if (modulus != 1) {
+      __int128 r = a.step / divisor, next_r = modulus, coefficient = 1, next_coefficient = 0;
+      while (next_r) {
+        const auto quotient = r / next_r;
+        const auto remainder = r - quotient * next_r;
+        r = next_r;
+        next_r = remainder;
+        const auto replacement = coefficient - quotient * next_coefficient;
+        coefficient = next_coefficient;
+        next_coefficient = replacement;
+      }
+      x = (__int128(difference / divisor) * coefficient) % modulus;
+      if (x < 0) x += modulus;
+    }
+    auto first = __int128(a.first) + __int128(a.step) * x;
+    const auto period = __int128(a.step) * modulus;
+    if (first < low) first += ((__int128(low) - first + period - 1) / period) * period;
+    return first > high;
+  }
+  static std::optional<Progression> Union(const Progression& a, const Progression& b) {
+    CHECK(a.Count() && b.Count()) << "Empty scoped family reached exact union";
+    const auto first = std::min(a.first, b.first), last = std::max(a.Last(), b.Last());
+    auto step = std::gcd(a.Count() > 1 ? a.step : 0, b.Count() > 1 ? b.step : 0);
+    step = std::gcd(step, std::max(a.first, b.first) - first);
+    if (!step) return std::nullopt;  // Equal singleton records must not be deduplicated.
+    const auto count = (__int128(last) - first) / step + 1;
+    if (count != __int128(a.Count()) + b.Count() || !Disjoint(a, b)) return std::nullopt;
+    // Both supplied APs are subsets of this gcd lattice. Disjoint cardinality
+    // equality therefore proves the complete union, including every hole.
+    return Progression{first, last + 1, step};
+  }
+  void Rebuild(PhysicalSyncFamily& family, std::vector<Interval> source_ranges,
+               std::vector<int64_t> source_steps, std::vector<Interval> target_ranges,
+               std::vector<int64_t> target_steps) {
+    const auto& source = input_.segments[family.source_region].nested_frames;
+    const auto& target = input_.segments[family.target_region].nested_frames;
+    for (size_t i = 0; i < source_ranges.size(); ++i)
+      if (source_ranges[i].second - source_ranges[i].first == 1) source_steps[i] = 1;
+    for (size_t i = 0; i < target_ranges.size(); ++i)
+      if (target_ranges[i].second - target_ranges[i].first == 1) target_steps[i] = 1;
+    auto base = [](const std::vector<SyncLoopFrame>& frames, const std::vector<Interval>& ranges) {
+      __int128 value = 0;
+      for (size_t i = 0; i < frames.size(); ++i) value = value * frames[i].count + ranges[i].first;
+      CHECK(value <= std::numeric_limits<int64_t>::max()) << "Unified scoped endpoint overflows";
+      return static_cast<int64_t>(value);
+    };
+    family.source_first = base(source, source_ranges);
+    family.target_first = base(target, target_ranges);
+    std::optional<size_t> last_axis;
+    for (size_t i = 0; i < target.size(); ++i)
+      if (target_ranges[i].second - target_ranges[i].first > 1) last_axis = i;
+    family.axes.clear();
+    __int128 count = 1;
+    auto source_stride = input_.segments[family.source_region].count;
+    auto target_stride = input_.segments[family.target_region].count;
+    if (last_axis) {
+      for (size_t i = 0; i <= *last_axis; ++i) {
+        CHECK(i < source.size() && source[i].loop == target[i].loop)
+            << "Unified scoped family loses its original common frame";
+        source_stride /= source[i].count;
+        target_stride /= target[i].count;
+        const Progression a{source_ranges[i].first, source_ranges[i].second, source_steps[i]};
+        const Progression b{target_ranges[i].first, target_ranges[i].second, target_steps[i]};
+        CHECK(a.Count() == b.Count() && (a.Count() == 1 || a.step == b.step))
+            << "Unified scoped family changes its source/consumer coordinate map";
+        const auto ss = __int128(source_stride) * a.step, ts = __int128(target_stride) * b.step;
+        CHECK(ss <= std::numeric_limits<int64_t>::max() && ts <= std::numeric_limits<int64_t>::max())
+            << "Unified scoped family stride overflows";
+        family.axes.push_back(
+            {target[i].loop, b.Count(), static_cast<int64_t>(ss), static_cast<int64_t>(ts), a.step, b.step});
+        count *= b.Count();
+      }
+    }
+    CHECK(count <= std::numeric_limits<int64_t>::max()) << "Unified scoped family count overflows";
+    family.count = static_cast<int64_t>(count);
+    family.source_domain = std::make_shared<SyncEndpointDomain>(
+        SyncEndpointDomain{family.source_domain->frame, std::move(source_ranges), std::move(source_steps)});
+    family.target_domain = std::make_shared<SyncEndpointDomain>(
+        SyncEndpointDomain{family.target_domain->frame, std::move(target_ranges), std::move(target_steps)});
+  }
+  void Coalesce(std::vector<PhysicalSyncFamily>& families) {
+    // Match only one corresponding original axis at a time. All other endpoint
+    // coordinates, cuts and translations are part of the index key. Rebuild the
+    // index after a successful pass; no quadratic whole-inventory search is
+    // hidden inside a callback, and all candidate comparisons are counted.
+    bool changed;
+    do {
+      changed = false;
+      ++work_.union_passes;
+      std::vector<bool> removed(families.size());
+      std::map<std::vector<int64_t>, std::vector<size_t>> groups;
+      for (size_t index = 0; index < families.size(); ++index) {
+        const auto& f = families[index];
+        if (input_.segments[f.source_region].sites[f.source_site].pipe ==
+            input_.segments[f.target_region].sites[f.target_site].pipe)
+          continue;
+        const auto& source = input_.segments[f.source_region].nested_frames;
+        const auto& target = input_.segments[f.target_region].nested_frames;
+        for (size_t axis = 0;
+             axis < std::min(source.size(), target.size()) && source[axis].loop == target[axis].loop;
+             ++axis) {
+          const auto a = EndpointProgression(*f.source_domain, axis);
+          const auto b = EndpointProgression(*f.target_domain, axis);
+          if (a.Count() != b.Count() || (a.Count() > 1 && a.step != b.step)) continue;
+          std::vector<int64_t> key{static_cast<int64_t>(f.source_region),
+                                   static_cast<int64_t>(f.source_site),
+                                   static_cast<int64_t>(f.target_region),
+                                   static_cast<int64_t>(f.target_site),
+                                   static_cast<int64_t>(axis),
+                                   b.first - a.first};
+          for (const auto* domain : {f.source_domain.get(), f.target_domain.get()}) {
+            key.push_back(static_cast<int64_t>(domain->ranges.size()));
+            for (size_t i = 0; i < domain->ranges.size(); ++i) {
+              if (i == axis) continue;
+              const auto p = EndpointProgression(*domain, i);
+              key.insert(key.end(), {p.first, p.second, p.Count() == 1 ? 1 : p.step});
+            }
+          }
+          groups[std::move(key)].push_back(index);
+        }
+      }
+      for (const auto& [key, members] : groups) {
+        const auto axis = static_cast<size_t>(key[4]);
+        for (size_t x = 0; x < members.size(); ++x) {
+          const auto i = members[x];
+          if (removed[i]) continue;
+          for (size_t y = x + 1; y < members.size(); ++y) {
+            const auto j = members[y];
+            if (removed[j]) continue;
+            // A previous axis group can change an indexed coordinate. Only
+            // merge one group per pass so no stale key can justify a union.
+            ++work_.union_candidates;
+            const auto joined = Union(EndpointProgression(*families[i].source_domain, axis),
+                                      EndpointProgression(*families[j].source_domain, axis));
+            if (!joined) continue;
+            auto& f = families[i];
+            auto sr = f.source_domain->ranges, tr = f.target_domain->ranges;
+            auto ss = f.source_domain->steps, ts = f.target_domain->steps;
+            if (ss.empty()) ss.assign(sr.size(), 1);
+            if (ts.empty()) ts.assign(tr.size(), 1);
+            const auto delta = key[5];
+            sr[axis] = {joined->first, joined->second};
+            tr[axis] = {joined->first + delta, joined->second + delta};
+            ss[axis] = ts[axis] = joined->step;
+            auto candidate = f;
+            Rebuild(candidate, std::move(sr), std::move(ss), std::move(tr), std::move(ts));
+            ++work_.union_reuse_checks;
+            if (!can_reuse_(candidate)) {
+              ++work_.union_reuse_refusals;
+              continue;
+            }
+            candidate.protocol_uses.insert(candidate.protocol_uses.end(), families[j].protocol_uses.begin(),
+                                           families[j].protocol_uses.end());
+            f = std::move(candidate);
+            removed[j] = true;
+            changed = true;
+            ++work_.union_merges;
+          }
+        }
+        if (changed) break;
+      }
+      if (changed) {
+        size_t retained = 0;
+        for (size_t i = 0; i < families.size(); ++i)
+          if (!removed[i]) {
+            if (retained != i) families[retained] = std::move(families[i]);
+            ++retained;
+          }
+        families.resize(retained);
+      }
+    } while (changed);
+  }
+};
 }  // namespace
-std::vector<PhysicalSyncFamily> ParseScopedTokenFamilies(
-    const FunctionPtr& function, const CompactSyncInput& input,
+ScopedSyncProtocol::ScopedSyncProtocol(FunctionPtr tokens, CompactSyncInput input,
+                                       std::vector<PhysicalSyncFamily> families)
+    : tokens_(std::move(tokens)), input_(std::move(input)), families_(std::move(families)) {
+  const auto& source_input = input_;
+  std::map<std::pair<size_t, size_t>, ScopedProtocolCut> cuts;
+  for (size_t i = 0; i < families_.size(); ++i) {
+    auto& f = families_[i];
+    CHECK(f.ids.empty() && f.protocol_uses.empty()) << "Protocol requires fresh unassigned token uses";
+    f.protocol_uses.push_back(i);
+    const auto source = std::make_pair(f.source_region, f.source_site);
+    const auto target = std::make_pair(f.target_region, f.target_site);
+    auto& consume =
+        cuts.try_emplace(target, ScopedProtocolCut{target.first, target.second, {}, {}}).first->second;
+    consume.before.push_back(i);
+    if (source_input.segments[f.source_region].sites[f.source_site].pipe !=
+        source_input.segments[f.target_region].sites[f.target_site].pipe)
+      cuts.try_emplace(source, ScopedProtocolCut{source.first, source.second, {}, {}})
+          .first->second.after.push_back(i);
+  }
+  for (auto& [key, cut] : cuts) {
+    // Existing direct policy: same-pipe barriers precede incoming waits.
+    std::stable_partition(cut.before.begin(), cut.before.end(), [&](size_t i) {
+      const auto& f = families_[i];
+      return source_input.segments[f.source_region].sites[f.source_site].pipe ==
+             source_input.segments[f.target_region].sites[f.target_site].pipe;
+    });
+    cuts_.push_back(std::move(cut));
+  }
+}
+void ScopedSyncProtocol::ValidateFor(const CompactSyncInput& input) const {
+  CHECK(&input == &input_) << "Unassigned synchronization protocol belongs to a different input case";
+}
+void ScopedSyncProtocol::ValidateTokens(const FunctionPtr& tokens) const {
+  CHECK(tokens_ == tokens) << "Unassigned synchronization protocol belongs to different token IR";
+}
+std::shared_ptr<const ScopedSyncProtocol> ParseScopedTokenProtocol(
+    const FunctionPtr& function, CompactSyncInput input,
     const std::map<const ForStmt*, ForStmtPtr>& stripped_loops, ScopedTokenWork* work) {
   ScopedTokenWork local;
-  return Parser(function, input, stripped_loops, work ? *work : local).Run();
+  auto families = Parser(function, input, stripped_loops, work ? *work : local).Run();
+  return std::shared_ptr<const ScopedSyncProtocol>(
+      new ScopedSyncProtocol(function, std::move(input), std::move(families)));
+}
+std::vector<PhysicalSyncFamily> NormalizeScopedTokenFamilies(
+    const CompactSyncInput& input, std::vector<PhysicalSyncFamily> families,
+    const std::function<bool(const PhysicalSyncFamily&)>& can_reuse, ScopedTokenWork* work) {
+  ScopedTokenWork local;
+  FamilyNormalizer(input, can_reuse, work ? *work : local).Run(families);
+  return families;
 }
 }  // namespace pypto::ir::sync

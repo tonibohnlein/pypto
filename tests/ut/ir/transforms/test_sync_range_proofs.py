@@ -269,6 +269,7 @@ def test_forwarded_ranges_join_all_original_callers(submit, unknown, worker_kind
     for name in ["f0", "f1"]:
         assert evidence["parameters"].get(name, {}) == ({} if unknown else {0: (0, 5120)})
         assert evidence["block_indices"][name] == (0, 23)
+        assert evidence["block_counts"][name] == (20, 24)
     assert evidence["call_graph_nodes"] == 3
     assert evidence["call_graph_edges"] == 2
     assert evidence["processed_functions"] == 3
@@ -281,6 +282,7 @@ def test_unknown_launch_does_not_inherit_another_callers_width(launches, worker_
         invocation_chain(2, launches=launches, worker_kind=worker_kind)
     )
     assert evidence["block_indices"] == {}
+    assert evidence["block_counts"] == {}
     assert evidence["parameters"]["f1"] == {0: (0, 5120)}
 
 
@@ -288,6 +290,7 @@ def test_recursive_invocation_evidence_remains_unproved():
     evidence = testing.sync_invocation_evidence(invocation_chain(3, cycle=True))
     assert evidence["parameters"] == {}
     assert evidence["block_indices"] == {}
+    assert evidence["block_counts"] == {}
     assert evidence["processed_functions"] == 1
 
 
@@ -383,6 +386,17 @@ def test_launch_coordinate_modulo_preserves_original_width(divisor, offset, expe
     root = ir.Function("main", [], [], ir.EvalStmt(call, span), span, ir.FunctionType.Orchestration)
     evidence = testing.sync_invocation_evidence(ir.Program([root, wrapper, worker], "modulo", span))
     assert evidence["parameters"].get("worker", {}) == ({} if expected is None else {0: expected})
+
+
+@pytest.mark.parametrize("submit", [False, True])
+@pytest.mark.parametrize("launches,expected", [((24, 24), (24, 24)), ((20, 24), (20, 24))])
+def test_launch_cardinality_is_not_inferred_from_index_hull(submit, launches, expected):
+    evidence = testing.sync_invocation_evidence(invocation_chain(2, launches=launches, submit=submit))
+    # Both programs have the same logical index hull; only one permits replacing
+    # get_block_num with a constant through every admitted caller.
+    for name in ("f0", "f1"):
+        assert evidence["block_indices"][name] == (0, 23)
+        assert evidence["block_counts"][name] == expected
 
 
 if __name__ == "__main__":

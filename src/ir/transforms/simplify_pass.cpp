@@ -708,7 +708,8 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
   }
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
-    auto new_value = SimplifyExpr(op->value_);
+    const auto cyclic = cyclic_updates_.find(op.get());
+    auto new_value = SimplifyExpr(cyclic == cyclic_updates_.end() ? op->value_ : cyclic->second);
     auto new_var = AdoptRewrittenValueType(op, new_value, MaybeRebuildVar(op->var_));
     auto new_type = new_var->GetType();
 
@@ -910,7 +911,9 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
     // Scalars assigned inside the loop body are scoped to that body so their
     // values do not leak to siblings of this ForStmt or to code after the loop
     // (pre-SSA soundness).
+    const auto cyclic_updates = BindCyclicUpdates(op, new_start, new_stop, new_step, new_iter_args);
     auto new_body = VisitScopedBody(op->body_);
+    for (const auto* update : cyclic_updates) cyclic_updates_.erase(update);
 
     if (bound) {
       analyzer_->Unbind(op->loop_var_);
@@ -1207,6 +1210,55 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
   }
 
  private:
+  // Normalize a proved unit cyclic recurrence without unrolling its loop:
+  // x[-1] = p-1; x[i] = (x[i-1]+1) mod p implies x[i] = i mod p.
+  // This is also valid for zero trips: the original carry/result is retained,
+  // and DCE removes it only when neither the carry nor final result is used.
+  // Match only a direct, unconditional update and backedge with INDEX operands.
+  // The old addition is bounded by p; the new induction value is nonnegative
+  // and below a static stop, so neither representation introduces overflow.
+  // Index immediate statements once per loop, not the transitive nested body.
+  std::vector<const AssignStmt*> BindCyclicUpdates(const ForStmtPtr& loop, const ExprPtr& start,
+                                                   const ExprPtr& stop, const ExprPtr& step,
+                                                   const std::vector<IterArgPtr>& arguments) {
+    std::vector<const AssignStmt*> updates;
+    const auto a = As<ConstInt>(start), b = As<ConstInt>(stop), d = As<ConstInt>(step);
+    if (constants_only_ || loop->kind_ != ForKind::Sequential || !a || !b || !d || a->value_ != 0 ||
+        b->value_ < 0 || d->value_ != 1 || GetScalarDtype(loop->loop_var_) != DataType::INDEX ||
+        redefined_.count(loop->loop_var_.get()))
+      return updates;
+    const auto body = As<SeqStmts>(loop->body_);
+    if (!body || body->stmts_.empty()) return updates;
+    const auto yield = As<YieldStmt>(body->stmts_.back());
+    if (!yield || yield->value_.size() != arguments.size()) return updates;
+    std::unordered_map<const Var*, AssignStmtPtr> definitions;
+    for (const auto& statement : body->stmts_)
+      if (const auto assign = As<AssignStmt>(statement)) definitions.emplace(assign->var_.get(), assign);
+    for (size_t i = 0; i < arguments.size(); ++i) {
+      const auto found = definitions.find(AsVarLike(yield->value_[i]).get());
+      if (found == definitions.end()) continue;
+      const auto& assign = found->second;
+      const auto mod = As<FloorMod>(assign->value_);
+      const auto add = mod ? As<Add>(mod->left_) : nullptr;
+      const auto divisor = mod ? As<ConstInt>(mod->right_) : nullptr;
+      const auto increment = add ? As<ConstInt>(add->right_) : nullptr;
+      const auto initial = As<ConstInt>(arguments[i]->initValue_);
+      if (!add || !divisor || !increment || !initial || divisor->value_ <= 0 || increment->value_ != 1 ||
+          initial->value_ != divisor->value_ - 1 || add->left_.get() != loop->iter_args_[i].get() ||
+          multi_assigned_.count(assign->var_.get()) || redefined_.count(loop->iter_args_[i].get()))
+        continue;
+      bool index_only = true;
+      for (const auto& expr : {ExprPtr(mod), ExprPtr(add), ExprPtr(divisor), ExprPtr(increment),
+                               ExprPtr(initial), ExprPtr(loop->iter_args_[i])})
+        index_only &= GetScalarDtype(expr) == DataType::INDEX;
+      if (!index_only) continue;
+      cyclic_updates_.emplace(
+          assign.get(), std::make_shared<FloorMod>(loop->loop_var_, divisor, DataType::INDEX, assign->span_));
+      updates.push_back(assign.get());
+    }
+    return updates;
+  }
+  std::unordered_map<const AssignStmt*, ExprPtr> cyclic_updates_;
   /// Identity elimination per RFC #1300 §3.3:
   /// ``view(x, layout=x.layout)`` → ``x``.
   ///

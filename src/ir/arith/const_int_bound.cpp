@@ -430,10 +430,12 @@ class ConstIntBoundAnalyzer::Impl : public ExprFunctor<Bound> {
   static Bound BoundFromOpSemantics(const OpPtr& op) {
     if (!op) return Everything();
     if (IsOp(op, "tile.get_block_idx") || IsOp(op, "tile.get_subblock_idx") ||
-        IsOp(op, "tensor.get_block_idx") || IsOp(op, "tensor.get_subblock_idx")) {
+        IsOp(op, "tensor.get_block_idx") || IsOp(op, "tensor.get_subblock_idx") ||
+        IsOp(op, "buffer.get_block_idx") || IsOp(op, "buffer.get_subblock_idx")) {
       return {0, Bound::kPosInf};
     }
-    if (IsOp(op, "tile.get_block_num") || IsOp(op, "tensor.get_block_num")) {
+    if (IsOp(op, "tile.get_block_num") || IsOp(op, "tensor.get_block_num") ||
+        IsOp(op, "buffer.get_block_num")) {
       return {1, Bound::kPosInf};
     }
     return Everything();

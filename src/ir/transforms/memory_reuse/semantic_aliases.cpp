@@ -3066,9 +3066,13 @@ class RetypeApplier : public IRMutator {
 // Retyping also propagates a retargeted input through its aliasing views.
 StmtPtr RefreshStorageTypes(const StmtPtr& body) { return RetypeApplier({}).VisitStmt(body); }
 
-StmtPtr CoalesceAccumulatorIfPhis(const StmtPtr& body) {
+std::map<VarPtr, TypePtr> PlanAccumulatorIfPhis(const StmtPtr& body) {
   TopDownRetargeter coalescer;
-  auto rewrites = coalescer.CoalesceAccumulatorIfPhis(body);
+  return coalescer.CoalesceAccumulatorIfPhis(body);
+}
+
+StmtPtr CoalesceAccumulatorIfPhis(const StmtPtr& body) {
+  auto rewrites = PlanAccumulatorIfPhis(body);
   if (rewrites.empty()) return body;
   return RetypeApplier(std::move(rewrites)).VisitStmt(body);
 }

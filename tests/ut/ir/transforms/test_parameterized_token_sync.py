@@ -9,6 +9,8 @@
 
 """Caller evidence is re-established from the actual serialized token program."""
 
+from typing import cast
+
 import pytest
 from pypto import codegen, ir, passes, testing
 from pypto.backend.pto_backend import _run_ptoas
@@ -219,7 +221,7 @@ def test_dynamic_coordinate_guard_does_not_use_placeholder_zero():
     original = dynamic_collective()
     logical = worker(apply(passes.insert_sync, callers(original)), original.name)
     assert isinstance(logical.body, ir.SeqStmts)
-    outer = logical.body.stmts[-2]
+    outer = cast(ir.SeqStmts, logical.body).stmts[-2]
     assert isinstance(outer, ir.ForStmt)
 
     class Guard(ir.IRMutator):
@@ -242,7 +244,7 @@ def block_resident(blocks=10, stop=9, step=10):
     parameter = ir.Var("unused_start", ir.ScalarType(ir.DataType.INDEX), span)
     block_var = ir.Var("block", parameter.type, span)
     assert isinstance(original.body, ir.SeqStmts)
-    outer = original.body.stmts[-2]
+    outer = cast(ir.SeqStmts, original.body).stmts[-2]
     assert isinstance(outer, ir.ForStmt)
     dynamic = ir.ForStmt(
         outer.loop_var,
@@ -261,7 +263,15 @@ def block_resident(blocks=10, stop=9, step=10):
         original.name,
         [*zip(original.params, original.param_directions), parameter],
         original.return_types,
-        ir.SeqStmts([definition, *original.body.stmts[:-2], dynamic, original.body.stmts[-1]], span),
+        ir.SeqStmts(
+            [
+                definition,
+                *cast(ir.SeqStmts, original.body).stmts[:-2],
+                dynamic,
+                cast(ir.SeqStmts, original.body).stmts[-1],
+            ],
+            span,
+        ),
         span,
         original.func_type,
         ir_stage=original.ir_stage,
@@ -398,7 +408,8 @@ def launch_vec(stop=68, blocks=24, moving_output=False):
 
     block = ir.Var("block", ir.ScalarType(index), span)
     unused = ir.Var("unused", ir.ScalarType(index), span)
-    old_loop = original.body.stmts[-2]
+    old_loop = cast(ir.SeqStmts, original.body).stmts[-2]
+    assert isinstance(old_loop, ir.ForStmt)
     tensor_type = ir.TensorType([max(stop, 1) * 2, 8], ir.DataType.FP32)
     params = [ir.Var(p.name_hint, tensor_type, span) for p in original.params]
     replacement = dict(zip(original.params, params))
@@ -427,7 +438,15 @@ def launch_vec(stop=68, blocks=24, moving_output=False):
         "launch_vec",
         [*zip(params, original.param_directions), unused],
         [tensor_type],
-        ir.SeqStmts([definition, *original.body.stmts[:-2], loop, ir.ReturnStmt([params[-1]], span)], span),
+        ir.SeqStmts(
+            [
+                definition,
+                *cast(ir.SeqStmts, original.body).stmts[:-2],
+                loop,
+                ir.ReturnStmt([params[-1]], span),
+            ],
+            span,
+        ),
         span,
         original.func_type,
         ir_stage=original.ir_stage,
@@ -522,7 +541,8 @@ def test_visit_owned_launch_output_keeps_scope_and_separation_refusals(kind):
     def ci(n):
         return ir.ConstInt(n, ir.DataType.INDEX, span)
 
-    original_loop = function.body.stmts[-2]
+    original_loop = cast(ir.SeqStmts, function.body).stmts[-2]
+    assert isinstance(original_loop, ir.ForStmt)
 
     class Invalid(ir.IRMutator):
         def visit_call(self, op):
@@ -532,7 +552,16 @@ def test_visit_owned_launch_output_keeps_scope_and_separation_refusals(kind):
                     args[-1] = function.params[0]
                 elif op.op.name == ir.get_op("buffer.load").name and args[0].same_as(function.params[0]):
                     args[1] = ir.MakeTuple(
-                        [ir.Mul(function.body.stmts[0].var, ci(2), ir.DataType.INDEX, span), ci(0)], span
+                        [
+                            ir.Mul(
+                                cast(ir.AssignStmt, cast(ir.SeqStmts, function.body).stmts[0]).var,
+                                ci(2),
+                                ir.DataType.INDEX,
+                                span,
+                            ),
+                            ci(0),
+                        ],
+                        span,
                     )
             if kind == "overlap" and op.op.name in {
                 ir.get_op("buffer.load").name,
@@ -552,20 +581,34 @@ def test_visit_owned_launch_output_keeps_scope_and_separation_refusals(kind):
             [],
             span,
         )
-        body = ir.SeqStmts([*function.body.stmts[:-2], loop, function.body.stmts[-1]], span)
+        body = ir.SeqStmts(
+            [*cast(ir.SeqStmts, function.body).stmts[:-2], loop, cast(ir.SeqStmts, function.body).stmts[-1]],
+            span,
+        )
     elif kind in {"outside_read", "two_owners"}:
-        first_load = original_loop.body.stmts[0].expr
+        first_load = cast(ir.EvalStmt, cast(ir.SeqStmts, original_loop.body).stmts[0]).expr
+        assert isinstance(first_load, ir.Call)
         args = list(first_load.args)
         args[0] = function.params[2]
         args[1] = ir.MakeTuple(
-            [ir.Mul(function.body.stmts[0].var, ci(2), ir.DataType.INDEX, span), ci(0)], span
+            [
+                ir.Mul(
+                    cast(ir.AssignStmt, cast(ir.SeqStmts, function.body).stmts[0]).var,
+                    ci(2),
+                    ir.DataType.INDEX,
+                    span,
+                ),
+                ci(0),
+            ],
+            span,
         )
         extra = ir.EvalStmt(ir.Call(first_load.op, args, first_load.type, span), span)
         if kind == "two_owners":
             # A second translated write interval is another owner even if its
             # counter starts at the same value and reuses the same local tile.
             iv = ir.Var("second_visit", original_loop.loop_var.type, span)
-            store = original_loop.body.stmts[-2].expr
+            store = cast(ir.EvalStmt, cast(ir.SeqStmts, original_loop.body).stmts[-2]).expr
+            assert isinstance(store, ir.Call)
             args = list(store.args)
             args[1] = ir.MakeTuple([ir.Mul(iv, ci(2), ir.DataType.INDEX, span), ci(0)], span)
             extra = ir.ForStmt(
@@ -581,7 +624,10 @@ def test_visit_owned_launch_output_keeps_scope_and_separation_refusals(kind):
                 [],
                 span,
             )
-        body = ir.SeqStmts([*function.body.stmts[:-1], extra, function.body.stmts[-1]], span)
+        body = ir.SeqStmts(
+            [*cast(ir.SeqStmts, function.body).stmts[:-1], extra, cast(ir.SeqStmts, function.body).stmts[-1]],
+            span,
+        )
     else:
         body = Invalid().visit_stmt(function.body)
     edited = ir.Function(
@@ -598,3 +644,47 @@ def test_visit_owned_launch_output_keeps_scope_and_separation_refusals(kind):
     with pytest.raises(ValueError, match="Visit-owned|visit-owned"):
         apply(passes.insert_sync, program)
     assert ir.serialize(program) == snapshot
+
+
+@pytest.mark.parametrize("blocks", [8, 10])
+def test_launch_count_stride_uses_all_caller_evidence(blocks):
+    original, _ = block_resident(blocks=blocks, stop=blocks - 1, step=blocks)
+
+    class RuntimeStep(ir.IRMutator):
+        def visit_for_stmt(self, op):
+            if isinstance(op.start, ir.Var) and op.start.name_hint == "block":
+                return ir.ForStmt(
+                    op.loop_var,
+                    op.start,
+                    op.stop,
+                    ir.Call(ir.get_op("buffer.get_block_num"), [], op.step.type, op.span),
+                    op.iter_args,
+                    op.body,
+                    op.return_vars,
+                    op.span,
+                )
+            return super().visit_for_stmt(op)
+
+    dynamic = RuntimeStep().visit_function(original)
+    program = callers(dynamic, blocks=blocks)
+    snapshot = ir.serialize(program)
+    logical = apply(passes.insert_sync, program)
+    physical = apply(passes.lower_sync, logical)
+    assert ir.serialize(program) == snapshot
+    # Independent byte conflicts, matching and reuse against the equivalent
+    # literal-step reference, including a worker with an empty invocation.
+    for block in (0, blocks - 1):
+        check(
+            original,
+            worker(logical, original.name),
+            worker(physical, original.name),
+            {len(original.params) - 1: 0},
+            block=block,
+        )
+    unbound = ir.Program([dynamic], "NoCaller", dynamic.span)
+    with pytest.raises(ValueError, match="caller range|constant|step|loop"):
+        apply(passes.insert_sync, unbound)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

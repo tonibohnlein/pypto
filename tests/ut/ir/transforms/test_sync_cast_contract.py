@@ -52,6 +52,7 @@ def test_shared_cast_effects_tokens_and_flags(source_dtype, dtype, mode, tmp_pat
     with passes.PassContext([], enable_pypto_autosync=True, autosync_disjoint_gm=True):
         logical = passes.insert_sync()(original)
         restored = ir.deserialize(ir.serialize(logical))
+        assert isinstance(restored, ir.Program)
         physical = passes.lower_sync()(passes.optimize_sync()(restored))
     run_physical(function, _kernel(physical), range(6))
     source, output = tmp_path / "cast.pto", tmp_path / "cast.cpp"

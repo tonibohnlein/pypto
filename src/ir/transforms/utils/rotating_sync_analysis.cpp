@@ -521,12 +521,17 @@ CompactSegmentResult AnalyzeRotatingSegment(const CompactSyncInput& input, size_
   std::map<size_t, std::optional<int64_t>> stride;
   for (size_t s = 0; s < segment.sites.size(); ++s) {
     const auto& site = segment.sites[s];
-    CHECK(!site.continuation && !site.protected_accumulator && !site.initializes_accumulator)
+    // An unconditional initializer is an invariant overwrite. Only changing
+    // continuation effects and native accumulator protection need another
+    // regional contract; recording the operation's init flag adds neither.
+    CHECK(!site.continuation && !site.protected_accumulator)
         << "Rotating analysis needs invariant payload effects; accumulator/continuation export unavailable";
     CHECK(static_cast<size_t>(site.pipe) < kPipeCount) << "Invalid rotating payload pipe";
     output.pipes.push_back(site.pipe);
     for (size_t i = 0; i < site.accesses.size(); ++i) {
       const auto& a = site.accesses[i];
+      CHECK(!a.slot_coordinate_frame || a.slot_coordinate_frame == segment.original_loop)
+          << "Enclosing slot coordinate requires a phase-specialized regional interface";
       CHECK(a.storage < input.storage.size() && !a.after_first)
           << "Rotating access requires a covered domain and unconditional body membership";
       const auto& storage = input.storage[a.storage];

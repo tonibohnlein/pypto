@@ -79,7 +79,7 @@ struct Transport {
   ExprPtr value;
   VarPtr initial, selected, exported;
   IterArgPtr previous;
-  std::optional<int64_t> capture;
+  ExprPtr capture;
 };
 struct Incoming {
   ExprPtr token, condition;
@@ -124,13 +124,23 @@ class ScopedRealizer : public IRMutator {
   StmtPtr VisitStmt_(const IfStmtPtr& op) override {
     // Qualified initialization/accumulation is one payload macro. Never move
     // a case record into an arm where its SSA fact would become conditional.
-    auto arm = [](StmtPtr body) -> const Call* {
-      while (auto sequence = As<SeqStmts>(body)) {
-        if (sequence->stmts_.size() != 1) return nullptr;
-        body = sequence->stmts_.front();
-      }
-      const auto eval = As<EvalStmt>(body);
-      return eval ? As<Call>(eval->expr_).get() : nullptr;
+    // Only pointers already certified by the access importer identify the
+    // payload. Definitions and the original terminal yield stay in the macro.
+    auto arm = [this](const StmtPtr& body) -> const Call* {
+      const Call* found = nullptr;
+      std::function<void(const StmtPtr&)> find = [&](const StmtPtr& statement) {
+        if (auto sequence = As<SeqStmts>(statement)) {
+          for (const auto& child : sequence->stmts_) find(child);
+        } else if (auto eval = As<EvalStmt>(statement)) {
+          const auto call = As<Call>(eval->expr_);
+          if (cuts_.count(call.get())) {
+            CHECK(!found) << "Scoped logical macro has multiple certified payload cuts";
+            found = call.get();
+          }
+        }
+      };
+      find(body);
+      return found;
     };
     auto found = cuts_.find(arm(op->then_body_));
     if (found == cuts_.end()) return op;
@@ -154,8 +164,8 @@ class ScopedRealizer : public IRMutator {
           {body, VisitStmt(std::make_shared<YieldStmt>(std::vector<ExprPtr>{}, op->span_))}, op->span_);
     active_ = previous;
     std::vector<StmtPtr> statements;
-    std::vector<IterArgPtr> arguments;
-    std::vector<VarPtr> outputs;
+    std::vector<IterArgPtr> arguments = op->iter_args_;
+    std::vector<VarPtr> outputs = op->return_vars_;
     for (const auto& transport : transports_[op.get()]) {
       statements.push_back(std::make_shared<AssignStmt>(
           transport.initial,
@@ -164,22 +174,20 @@ class ScopedRealizer : public IRMutator {
       arguments.push_back(transport.previous);
       outputs.push_back(transport.exported);
     }
-    CHECK(op->iter_args_.empty() && op->return_vars_.empty())
-        << "Scoped token insertion requires coordinate-only original loops";
+    CHECK(op->iter_args_.size() == op->return_vars_.size())
+        << "Scoped token insertion requires consistent original loop results";
     statements.push_back(std::make_shared<ForStmt>(op->loop_var_, op->start_, op->stop_, op->step_, arguments,
                                                    body, outputs, op->span_, op->kind_, op->attrs_,
                                                    op->leading_comments_, op->hardware_loop_policy_));
     return SeqStmts::Flatten(statements, op->span_);
   }
   StmtPtr VisitStmt_(const YieldStmtPtr& op) override {
-    CHECK(active_ && op->value_.empty()) << "Scoped token insertion requires an empty original yield";
+    CHECK(active_) << "Scoped token yield has no original loop frame";
     std::vector<StmtPtr> statements;
-    std::vector<ExprPtr> values;
+    std::vector<ExprPtr> values = op->value_;
     for (const auto& transport : transports_[active_]) {
       if (transport.capture) {
-        auto condition =
-            std::make_shared<Eq>(transport.frame.loop->loop_var_,
-                                 Coordinate(transport.frame, *transport.capture), DataType::BOOL, op->span_);
+        const auto& condition = transport.capture;
         auto selected = std::make_shared<YieldStmt>(std::vector<ExprPtr>{transport.value}, op->span_);
         auto previous = std::make_shared<YieldStmt>(std::vector<ExprPtr>{transport.previous}, op->span_);
         statements.push_back(std::make_shared<IfStmt>(condition, selected, previous,
@@ -206,7 +214,39 @@ class ScopedRealizer : public IRMutator {
   static CallPtr Token(const char* name, PipeType pipe, const Span& span) {
     return OpRegistry::GetInstance().Create(name, {}, {{"pipe", static_cast<int>(pipe)}}, span);
   }
-  Transport Carry(const SyncLoopFrame& frame, const ExprPtr& value, std::optional<int64_t> capture) {
+  // Exact ordinal progression, expressed in the original available IV frame.
+  // Normalizing at the loop start keeps the remainder operand nonnegative on
+  // every execution, even before the first selected source occurrence.
+  static ExprPtr Domain(const SyncLoopFrame& frame, int64_t first, int64_t count, int64_t step) {
+    const auto last = __int128(first) + (__int128(count) - 1) * step;
+    CHECK(first >= 0 && count > 0 && step > 0 && last < frame.count)
+        << "Scoped token activity exceeds its original frame";
+    Coordinate(frame, frame.count - 1);
+    if (count == frame.count && step == 1) return nullptr;
+    const auto& span = frame.loop->span_;
+    const auto& iv = frame.loop->loop_var_;
+    if (count == 1) return std::make_shared<Eq>(iv, Coordinate(frame, first), DataType::BOOL, span);
+    ExprPtr guard;
+    auto add = [&](ExprPtr value) {
+      guard = guard ? std::make_shared<And>(guard, value, DataType::BOOL, span) : value;
+    };
+    if (first) add(std::make_shared<Gt>(iv, Coordinate(frame, first - 1), DataType::BOOL, span));
+    if (last + 1 < frame.count)
+      add(std::make_shared<Lt>(iv, Coordinate(frame, static_cast<int64_t>(last + 1)), DataType::BOOL, span));
+    if (step > 1) {
+      const auto modulus = __int128(step) * frame.step;
+      CHECK(modulus <= std::numeric_limits<int64_t>::max()) << "Scoped token residue modulus overflows";
+      const auto normalized = std::make_shared<Sub>(iv, Coordinate(frame, 0), DataType::INDEX, span);
+      const auto remainder = std::make_shared<FloorMod>(
+          normalized, std::make_shared<ConstInt>(static_cast<int64_t>(modulus), DataType::INDEX, span),
+          DataType::INDEX, span);
+      add(std::make_shared<Eq>(remainder,
+                               std::make_shared<ConstInt>((first % step) * frame.step, DataType::INDEX, span),
+                               DataType::BOOL, span));
+    }
+    return guard;
+  }
+  Transport Carry(const SyncLoopFrame& frame, const ExprPtr& value, const ExprPtr& capture) {
     Coordinate(frame, frame.count - 1);  // Qualify the complete constant frame, not one sample.
     const auto pipe = As<SyncTokenType>(value->GetType())->pipe_;
     Transport out{frame, value, Variable(pipe), Variable(pipe), Variable(pipe), {}, capture};
@@ -240,22 +280,24 @@ class ScopedRealizer : public IRMutator {
     for (size_t i = 0; i < common; ++i) {
       if (i < family.axes.size()) {
         const auto& axis = family.axes[i];
-        CHECK(axis.frame == source[i].loop && axis.count > 0 && axis.source_stride == a.strides[i] &&
-              axis.target_stride == b.strides[i] && axis.count <= source[i].count - a.digits[i] &&
-              axis.count <= target[i].count - b.digits[i])
+        const auto source_last = __int128(a.digits[i]) + (__int128(axis.count) - 1) * axis.source_step;
+        const auto target_last = __int128(b.digits[i]) + (__int128(axis.count) - 1) * axis.target_step;
+        CHECK(axis.frame == source[i].loop && axis.count > 0 && axis.source_step > 0 &&
+              axis.target_step == axis.source_step &&
+              __int128(axis.source_stride) == __int128(a.strides[i]) * axis.source_step &&
+              __int128(axis.target_stride) == __int128(b.strides[i]) * axis.target_step &&
+              source_last < source[i].count && target_last < target[i].count)
             << "Scoped token axis does not match the original occurrence map";
-        if (a.digits[i] != b.digits[i]) {
-          CHECK(!shift && i + 1 == family.axes.size() && !a.digits[i] && b.digits[i] == 1 &&
-                axis.count == source[i].count - 1)
-              << "Scoped logical tokens support only adjacent common-frame seams";
-          shift = i;
-        }
-      } else {
-        // A qualified outer seam exits the entire suffix before carrying the
-        // fact; its inner source/target counters may therefore reset. Without
-        // that seam, differing fixed digits would need an in-frame history.
-        CHECK(shift || a.digits[i] == b.digits[i])
-            << "Scoped logical tokens cannot transport differing fixed common-frame occurrences";
+      }
+      if (!shift && a.digits[i] != b.digits[i]) {
+        const auto delta = b.digits[i] - a.digits[i];
+        const auto period = i < family.axes.size() ? family.axes[i].source_step : delta;
+        CHECK(delta > 0 && delta <= period)
+            << "Scoped token transport requires the latest captured source, not arbitrary history";
+        // Axes beneath the carry would need several simultaneous histories.
+        CHECK(i + 1 >= family.axes.size())
+            << "Scoped token capture cannot collapse a varying inner source coordinate";
+        shift = i;
       }
     }
     auto& source_cut = Cut(input.segments.at(sr).sites.at(ss));
@@ -264,34 +306,25 @@ class ScopedRealizer : public IRMutator {
     ExprPtr fact = record;
     const size_t keep = shift ? *shift + 1 : common;
     for (size_t i = source.size(); i-- > keep;) {
-      // Last-visit export needs only the ordinary simultaneous yield. Other
-      // selected visits retain a pure token capture, scoped to this invocation.
-      std::optional<int64_t> capture;
-      if (a.digits[i] + 1 != source[i].count) capture = a.digits[i];
+      // Source suffix coordinates are fixed at this seam. The selected fact
+      // survives subsequent iterations without inventing a completion event.
+      ExprPtr capture;
+      if (a.digits[i] + 1 != source[i].count) capture = Domain(source[i], a.digits[i], 1, 1);
       fact = Carry(source[i], fact, capture).exported;
     }
-    if (shift) fact = Carry(source[*shift], fact, {}).previous;
-    ExprPtr guard = case_guard;
-    auto add_guard = [&](ExprPtr condition) {
-      guard = guard ? std::make_shared<And>(guard, condition, DataType::BOOL, Span::unknown()) : condition;
-    };
-    for (size_t i = 0; i < target.size(); ++i) {
-      const auto low = b.digits[i];
+    if (shift) {
+      const auto i = *shift;
       const auto count = i < family.axes.size() ? family.axes[i].count : 1;
-      const auto& frame = target[i];
-      Coordinate(frame, frame.count - 1);
-      if (count == frame.count) continue;
-      if (count == 1) {
-        add_guard(std::make_shared<Eq>(frame.loop->loop_var_, Coordinate(frame, low), DataType::BOOL,
-                                       frame.loop->span_));
-      } else {
-        if (low)
-          add_guard(std::make_shared<Gt>(frame.loop->loop_var_, Coordinate(frame, low - 1), DataType::BOOL,
-                                         frame.loop->span_));
-        if (low + count < frame.count)
-          add_guard(std::make_shared<Lt>(frame.loop->loop_var_, Coordinate(frame, low + count),
-                                         DataType::BOOL, frame.loop->span_));
-      }
+      const auto step = i < family.axes.size() ? family.axes[i].source_step : 1;
+      fact = Carry(source[i], fact, Domain(source[i], a.digits[i], count, step)).previous;
+    }
+    ExprPtr guard = case_guard;
+    for (size_t i = 0; i < target.size(); ++i) {
+      const auto count = i < family.axes.size() ? family.axes[i].count : 1;
+      const auto step = i < family.axes.size() ? family.axes[i].target_step : 1;
+      const auto condition = Domain(target[i], b.digits[i], count, step);
+      if (condition)
+        guard = guard ? std::make_shared<And>(guard, condition, DataType::BOOL, Span::unknown()) : condition;
     }
     Cut(input.segments.at(tr).sites.at(ts)).incoming.push_back({fact, guard});
   }
@@ -346,8 +379,8 @@ LogicalSyncRealization RealizeLogicalInvocation(const SyncInvocationAnalysis& an
   }
   CHECK(next == analysis.block_bounds.second + 1) << "Incomplete logical invocation domain";
   // All records are after original payload macros, and every carry starts
-  // completed. Case-independent captures use constant original coordinates;
-  // dynamic singleton exits use only the original available start expression.
+  // completed. Captures use proved original-coordinate progressions;
+  // dynamic exits use only the original available start expression.
   // Thus unused case state is total even outside its case. Only waits add order.
   realizer.result.function = realizer.VisitFunction(analysis.owner);
   CheckLogicalSync(realizer.result.function);

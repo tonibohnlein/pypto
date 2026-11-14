@@ -79,12 +79,15 @@ def test_flat_region_resets_bind_actual_boundary_occurrences(counts):
         ), "fixture must exercise interior-to-interior crossings"
 
 
-def test_shared_reset_original_frame_export_refuses_transactionally():
+def test_shared_reset_retains_mathematics_when_barrier_export_is_unavailable():
     function = repeated_fixture(4, 3)
-    # Production retains original source frames. The removed flattened audit
-    # mode could analyze this shape but could not supply executable transport.
-    with pytest.raises(ValueError, match="Structured rotating source export is not yet qualified"):
-        testing.analyze_placed_sync(function, True)
+    retained = testing.analyze_placed_sync(function, True)
+    validate(function, retained)
+    assert retained.export_scoped_demands() is not None
+    # Original-frame mathematics is now available. This target still lacks a
+    # qualified same-pipe DMA barrier; an analysis refusal would hide that fact.
+    with pytest.raises(ValueError, match="Scoped same-pipe barrier mechanism is unavailable"):
+        retained.realize_physical("a2a3", list(range(6)))
     delegated = apply_hybrid([function])[function.name]
     assert not dict(delegated.attrs)[PYPTO_AUTOSYNC_ATTR]
     assert dict(delegated.attrs)[AUTOSYNC_FALLBACK_REASON_ATTR]

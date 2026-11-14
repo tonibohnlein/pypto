@@ -13,6 +13,8 @@ Synthetic cut tests exercise lowering only; the production campaign separately
 checks matching and physical reuse against independently recovered accesses.
 """
 
+from typing import cast
+
 import pytest
 from pypto import ir, testing
 
@@ -217,7 +219,9 @@ def test_command_scope_uses_original_ready_coordinates(kind):
     elif kind == "private":
         body = seq(guarded(eq(i, 0), ir.AssignStmt(scalar, ci(0), SPAN)), body)
     cut = payload().expr if kind == "wrong_cut" else a.expr
-    supplied = [(cut, guarded(predicate, command()), seq())]
+    supplied: list[tuple[ir.Call, ir.Stmt, ir.Stmt]] = [
+        (cast(ir.Call, cut), guarded(predicate, command()), seq())
+    ]
     if kind == "active":
         result = testing.emit_sync_boundary_commands(owner(body), supplied, validate_scope=True)
         assert result["scheduled_loops"] == 1
@@ -242,11 +246,11 @@ def test_unproved_arithmetic_stays_opaque_and_cannot_gain_production_scope():
     commands = seq(guarded(condition, command(0)), guarded(condition, command(1)))
     # Even a then-only tree cannot bypass the missing positive-divisor proof.
     # Diagnostic comparison preserves the original plan; production refuses it.
-    assert len(testing.share_sync_command_guards(commands).stmts) == 2
+    assert len(cast(ir.SeqStmts, testing.share_sync_command_guards(commands)).stmts) == 2
     a = payload()
     with pytest.raises(ValueError, match="Unproved command predicate arithmetic"):
         testing.emit_sync_boundary_commands(
-            owner(loop(i, 0, 3, 1, seq(a))), [(a.expr, commands, seq())], validate_scope=True
+            owner(loop(i, 0, 3, 1, seq(a))), [(cast(ir.Call, a.expr), commands, seq())], validate_scope=True
         )
 
 

@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <tuple>
 
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/core/dtype.h"
@@ -245,7 +246,29 @@ void PTOCodegen::VisitExpr_(const ir::FloorModPtr& op) {
   // the unsigned remainder PTOAS uses for slot synchronization, while ordinary
   // FloorMod expressions keep the signed floor correction below.
   if (fs_.unsigned_slot_remainders.count(op.get())) {
+    auto induction = op->left_;
+    int64_t offset = 0;
+    if (auto add = As<ir::Add>(induction)) {
+      if (auto constant = As<ir::ConstInt>(add->right_)) {
+        offset = constant->value_;
+        induction = add->left_;
+      }
+    }
+    const auto divisor = As<ir::ConstInt>(op->right_);
+    INTERNAL_CHECK_SPAN(divisor, op->span_) << "Internal error: qualified slot has no constant modulus";
+    const auto key = std::make_tuple(induction.get(), offset, divisor->value_);
+    auto found = fs_.slot_index_ssa.find(key);
+    if (found != fs_.slot_index_ssa.end() && fs_.active_tile_alloc_scopes.count(found->second.second)) {
+      fs_.current_expr_value = found->second.first;
+      return;
+    }
+    // Keep the first dominating definition across nested uses. Recreating an
+    // outer slot inside an inner loop gives downstream synchronization a
+    // non-dominating selector when it places a wait at that loop's entry.
+    // Scope IDs are shared with ordinary lexical codegen: a branch-local
+    // result cannot escape to its sibling or to the enclosing continuation.
     VisitBinaryArithExpr(op, "arith.remui", "arith.remf");
+    fs_.slot_index_ssa[key] = {fs_.current_expr_value, fs_.tile_alloc_scope_stack.back()};
     return;
   }
   const auto dtype = ir::GetScalarDtype(op);
