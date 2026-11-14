@@ -204,7 +204,9 @@ def test_caller_loop_increment_is_checked_in_original_width(dtype, stop, overflo
     assert testing.sync_parameter_bounds(program).get("child", {}) == ({} if overflow else {0: (0, stop - 2)})
 
 
-def invocation_chain(depth=3, unknown=False, cycle=False, launches=(20, 24), submit=False):
+def invocation_chain(
+    depth=3, unknown=False, cycle=False, launches=(20, 24), submit=False, worker_kind=ir.FunctionType.AIC
+):
     """Multiple real launch sites forward a parameter and logical block identity."""
     span, index = ir.Span.unknown(), ir.DataType.INDEX
     ty = ir.ScalarType(index)
@@ -229,7 +231,7 @@ def invocation_chain(depth=3, unknown=False, cycle=False, launches=(20, 24), sub
                 [],
                 body,
                 span,
-                ir.FunctionType.AIC if number == depth - 1 else ir.FunctionType.Spmd,
+                worker_kind if number == depth - 1 else ir.FunctionType.Spmd,
             )
         )
     external = ir.Var("unknown", ty, span)
@@ -259,8 +261,11 @@ def invocation_chain(depth=3, unknown=False, cycle=False, launches=(20, 24), sub
 
 @pytest.mark.parametrize("submit", [False, True])
 @pytest.mark.parametrize("unknown", [False, True])
-def test_forwarded_ranges_join_all_original_callers(submit, unknown):
-    evidence = testing.sync_invocation_evidence(invocation_chain(2, unknown=unknown, submit=submit))
+@pytest.mark.parametrize("worker_kind", [ir.FunctionType.AIC, ir.FunctionType.AIV])
+def test_forwarded_ranges_join_all_original_callers(submit, unknown, worker_kind):
+    evidence = testing.sync_invocation_evidence(
+        invocation_chain(2, unknown=unknown, submit=submit, worker_kind=worker_kind)
+    )
     for name in ["f0", "f1"]:
         assert evidence["parameters"].get(name, {}) == ({} if unknown else {0: (0, 5120)})
         assert evidence["block_indices"][name] == (0, 23)
@@ -270,8 +275,11 @@ def test_forwarded_ranges_join_all_original_callers(submit, unknown):
 
 
 @pytest.mark.parametrize("launches", [(20, None), (20, 0), (20, -1)])
-def test_unknown_launch_does_not_inherit_another_callers_width(launches):
-    evidence = testing.sync_invocation_evidence(invocation_chain(2, launches=launches))
+@pytest.mark.parametrize("worker_kind", [ir.FunctionType.AIC, ir.FunctionType.AIV])
+def test_unknown_launch_does_not_inherit_another_callers_width(launches, worker_kind):
+    evidence = testing.sync_invocation_evidence(
+        invocation_chain(2, launches=launches, worker_kind=worker_kind)
+    )
     assert evidence["block_indices"] == {}
     assert evidence["parameters"]["f1"] == {0: (0, 5120)}
 
@@ -295,13 +303,24 @@ def test_wrapper_proof_work_tracks_static_call_graph():
 
 
 @pytest.mark.parametrize("override,expected", [(None, 19), (8, 7), (0, None)])
-def test_launch_call_override_and_function_default(override, expected):
+@pytest.mark.parametrize(
+    "kind,dual", [(ir.FunctionType.AIC, False), (ir.FunctionType.AIV, False), (ir.FunctionType.AIV, True)]
+)
+def test_launch_call_override_and_function_default(override, expected, kind, dual):
     span, dtype = ir.Span.unknown(), ir.DataType.INDEX
 
     def ci(value):
         return ir.ConstInt(value, dtype, span)
 
-    worker = ir.Function("worker", [], [], ir.ReturnStmt([], span), span, ir.FunctionType.AIC)
+    worker = ir.Function(
+        "worker",
+        [],
+        [],
+        ir.ReturnStmt([], span),
+        span,
+        kind,
+        attrs={"dual_aiv_dispatch": True} if dual else {},
+    )
     wrapper = ir.Function(
         "wrapper",
         [],
@@ -318,7 +337,7 @@ def test_launch_call_override_and_function_default(override, expected):
     assert evidence["block_indices"] == (
         {} if expected is None else {"wrapper": (0, expected), "worker": (0, expected)}
     )
-    # A second direct orchestration->AIC call has no established block semantics.
+    # A second direct orchestration->worker call has no established block semantics.
     root = ir.Function(
         "main",
         [],

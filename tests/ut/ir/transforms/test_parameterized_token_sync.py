@@ -22,6 +22,7 @@ from .test_nested_sync_repetition import BOUNDS, caller_program, nested_fixture,
 from .test_scoped_logical_sync import dynamic_collective
 from .test_scoped_token_families import Uses
 from .test_token_sync_lowering import _apply, _project
+from .test_vec_sync_analysis import vec_fixture
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
 
@@ -231,11 +232,11 @@ def test_dynamic_coordinate_guard_does_not_use_placeholder_zero():
             return op
 
     modified = callers(Guard().visit_function(logical))
-    with pytest.raises(ValueError, match="dynamic original frame"):
+    with pytest.raises(ValueError, match="symbolic guard requires its original start"):
         apply(passes.lower_sync, modified)
 
 
-def block_resident(blocks=10):
+def block_resident(blocks=10, stop=9, step=10):
     original = resident_pipeline_tree(2, 2, 1)
     span = original.span
     parameter = ir.Var("unused_start", ir.ScalarType(ir.DataType.INDEX), span)
@@ -246,8 +247,8 @@ def block_resident(blocks=10):
     dynamic = ir.ForStmt(
         outer.loop_var,
         block_var,
-        ir.ConstInt(9, ir.DataType.INDEX, span),
-        ir.ConstInt(10, ir.DataType.INDEX, span),
+        ir.ConstInt(stop, ir.DataType.INDEX, span),
+        ir.ConstInt(step, ir.DataType.INDEX, span),
         [],
         outer.body,
         [],
@@ -384,3 +385,216 @@ def test_perfect_nested_token_transport_size_does_not_unfold_counts():
     # retained family bound remains fixed; growing visits add no occurrences.
     assert all(families == 7 and axes <= 5 for families, axes in inventories)
     assert inventories[-1] == inventories[-2]
+
+
+def launch_vec(stop=68, blocks=24, moving_output=False):
+    """Launch-strided disjoint GM tiles with reused local Vec storage."""
+    original = vec_fixture(1)
+    span = original.span
+    index = ir.DataType.INDEX
+
+    def ci(n):
+        return ir.ConstInt(n, index, span)
+
+    block = ir.Var("block", ir.ScalarType(index), span)
+    unused = ir.Var("unused", ir.ScalarType(index), span)
+    old_loop = original.body.stmts[-2]
+    tensor_type = ir.TensorType([max(stop, 1) * 2, 8], ir.DataType.FP32)
+    params = [ir.Var(p.name_hint, tensor_type, span) for p in original.params]
+    replacement = dict(zip(original.params, params))
+
+    class Accesses(ir.IRMutator):
+        def visit_call(self, op):
+            if op.op.name in {ir.get_op("buffer.load").name, ir.get_op("buffer.store").name}:
+                args = [replacement.get(a, a) if isinstance(a, ir.Var) else a for a in op.args]
+                if op.op.name == ir.get_op("buffer.load").name or moving_output:
+                    args[1] = ir.MakeTuple([ir.Mul(old_loop.loop_var, ci(2), index, span), ci(0)], span)
+                return ir.Call(op.op, args, op.type, op.span)
+            return super().visit_call(op)
+
+    loop = ir.ForStmt(
+        old_loop.loop_var,
+        block,
+        ci(stop),
+        ci(blocks),
+        [],
+        Accesses().visit_stmt(old_loop.body),
+        [],
+        span,
+    )
+    definition = ir.AssignStmt(block, ir.Call(ir.get_op("buffer.get_block_idx"), [], block.type, span), span)
+    function = ir.Function(
+        "launch_vec",
+        [*zip(params, original.param_directions), unused],
+        [tensor_type],
+        ir.SeqStmts([definition, *original.body.stmts[:-2], loop, ir.ReturnStmt([params[-1]], span)], span),
+        span,
+        original.func_type,
+        ir_stage=original.ir_stage,
+    )
+    return function, callers(function, starts=(0,), blocks=blocks)
+
+
+@pytest.mark.parametrize("stop", [0, 1, 20, 24, 25, 48, 68])
+@pytest.mark.parametrize("moving_output", [False, True])
+def test_launch_strided_frames_roundtrip_and_reuse(stop, moving_output, tmp_path):
+    """One symbolic recipe covers every worker, including empty tail visits."""
+    function, program = launch_vec(stop, moving_output=moving_output)
+    logical = apply(passes.insert_sync, program)
+    path = tmp_path / "launch.msgpack"
+    ir.serialize_to_file(logical, str(path))
+    logical = ir.deserialize_from_file(str(path))
+    physical = apply(passes.lower_sync, apply(passes.optimize_sync, logical))
+    for block in range(24):
+        check(
+            function,
+            worker(logical, function.name),
+            worker(physical, function.name),
+            {len(function.params) - 1: 0},
+            block=block,
+        )
+
+
+def test_launch_strided_multi_threshold_remains_unavailable():
+    _, program = block_resident(49, stop=68, step=24)
+    snapshot = ir.serialize(program)
+    with pytest.raises(ValueError, match="narrower than one loop stride"):
+        apply(passes.insert_sync, program)
+    assert ir.serialize(program) == snapshot
+
+
+@pytest.mark.parametrize("moving_output", [False, True])
+def test_launch_strided_token_and_flag_size_is_trip_compact(moving_output):
+    inventories = []
+    for count in (10, 1000, 1000000):
+        function, program = launch_vec(24 * count - 4, moving_output=moving_output)
+        logical = apply(passes.insert_sync, program)
+        physical = apply(passes.lower_sync, logical)
+        inventory = []
+        for result in (logical, physical):
+            names = []
+
+            class Commands(ir.IRVisitor):
+                def visit_call(self, op):
+                    if op.op.name in {
+                        ir.get_op(n).name
+                        for n in ("sync.record", "sync.wait", "system.set_flag", "system.wait_flag")
+                    }:
+                        names.append(op.op.name)
+                    super().visit_call(op)
+
+            Commands().visit_function(worker(result, function.name))
+            inventory.append(sorted(names))
+        inventories.append(inventory)
+    assert inventories[0] == inventories[1] == inventories[2]
+
+
+@pytest.mark.parametrize("moving_output", [False, True])
+def test_launch_strided_retained_covers_queries_and_selectors(moving_output):
+    function, _ = launch_vec(moving_output=moving_output)
+    for bounds in ((0, 19), (20, 23)):
+        retained = testing.analyze_placed_sync(
+            function, True, parameter_bounds={3: (0, 0)}, block_bounds=bounds
+        )
+        for block in (bounds[0], bounds[1]):
+            validate(function, retained, parameters={3: 0}, block_index=block)
+        if moving_output and bounds[0] == 0:
+            # Visit 0 writes rows 0/1; visit 1 starts at row48. A missing
+            # bridge-cell entry must not turn point export into unavailable.
+            output = next(
+                i
+                for i, domain in enumerate(retained.describe()["storage"])
+                if domain["name"] == function.params[2].name_hint
+            )
+            absent = retained.boundary(output, 2, 0, {3: 0}, 0)
+            assert absent is not None
+            assert absent["first_writer"] is absent["last_writer"] is None
+            assert not any(absent["first_readers"]) and not any(absent["last_readers"])
+
+
+@pytest.mark.parametrize("kind", ["replay", "stationary_read", "overlap", "outside_read", "two_owners"])
+def test_visit_owned_launch_output_keeps_scope_and_separation_refusals(kind):
+    function, _ = launch_vec(
+        stop=3 if kind == "overlap" else 68, blocks=1 if kind == "overlap" else 24, moving_output=True
+    )
+    span = function.span
+
+    def ci(n):
+        return ir.ConstInt(n, ir.DataType.INDEX, span)
+
+    original_loop = function.body.stmts[-2]
+
+    class Invalid(ir.IRMutator):
+        def visit_call(self, op):
+            args = list(op.args)
+            if kind == "stationary_read":
+                if op.op.name == ir.get_op("buffer.store").name:
+                    args[-1] = function.params[0]
+                elif op.op.name == ir.get_op("buffer.load").name and args[0].same_as(function.params[0]):
+                    args[1] = ir.MakeTuple(
+                        [ir.Mul(function.body.stmts[0].var, ci(2), ir.DataType.INDEX, span), ci(0)], span
+                    )
+            if kind == "overlap" and op.op.name in {
+                ir.get_op("buffer.load").name,
+                ir.get_op("buffer.store").name,
+            }:
+                args[1] = ir.MakeTuple([original_loop.loop_var, ci(0)], span)
+            return ir.Call(op.op, args, op.type, op.span)
+
+    if kind == "replay":
+        loop = ir.ForStmt(
+            ir.Var("replay", ir.ScalarType(ir.DataType.INDEX), span),
+            ci(0),
+            ci(1),
+            ci(1),
+            [],
+            ir.SeqStmts([original_loop, ir.YieldStmt([], span)], span),
+            [],
+            span,
+        )
+        body = ir.SeqStmts([*function.body.stmts[:-2], loop, function.body.stmts[-1]], span)
+    elif kind in {"outside_read", "two_owners"}:
+        first_load = original_loop.body.stmts[0].expr
+        args = list(first_load.args)
+        args[0] = function.params[2]
+        args[1] = ir.MakeTuple(
+            [ir.Mul(function.body.stmts[0].var, ci(2), ir.DataType.INDEX, span), ci(0)], span
+        )
+        extra = ir.EvalStmt(ir.Call(first_load.op, args, first_load.type, span), span)
+        if kind == "two_owners":
+            # A second translated write interval is another owner even if its
+            # counter starts at the same value and reuses the same local tile.
+            iv = ir.Var("second_visit", original_loop.loop_var.type, span)
+            store = original_loop.body.stmts[-2].expr
+            args = list(store.args)
+            args[1] = ir.MakeTuple([ir.Mul(iv, ci(2), ir.DataType.INDEX, span), ci(0)], span)
+            extra = ir.ForStmt(
+                iv,
+                original_loop.start,
+                original_loop.stop,
+                original_loop.step,
+                [],
+                ir.SeqStmts(
+                    [ir.EvalStmt(ir.Call(store.op, args, store.type, span), span), ir.YieldStmt([], span)],
+                    span,
+                ),
+                [],
+                span,
+            )
+        body = ir.SeqStmts([*function.body.stmts[:-1], extra, function.body.stmts[-1]], span)
+    else:
+        body = Invalid().visit_stmt(function.body)
+    edited = ir.Function(
+        function.name,
+        list(zip(function.params, function.param_directions)),
+        function.return_types,
+        body,
+        span,
+        function.func_type,
+        ir_stage=function.ir_stage,
+    )
+    program = callers(edited, starts=(0,), blocks=1 if kind == "overlap" else 24)
+    snapshot = ir.serialize(program)
+    with pytest.raises(ValueError, match="Visit-owned|visit-owned"):
+        apply(passes.insert_sync, program)
+    assert ir.serialize(program) == snapshot

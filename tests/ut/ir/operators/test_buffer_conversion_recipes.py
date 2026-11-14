@@ -94,6 +94,41 @@ def test_cast_does_not_silently_drop_unsupported_modes(kwargs):
         _call("cast", args, kwargs)
 
 
+@pytest.mark.parametrize(
+    "source,destination", [(DataType.BF16, DataType.FP32), (DataType.FP32, DataType.BF16)]
+)
+@pytest.mark.parametrize("mode", [0, 1, 2])
+def test_bfloat_cast_preserves_mode_and_effects(source, destination, mode):
+    args = [_buffer("source", dtype=source), _buffer("destination", dtype=destination)]
+    call = _call("cast", args, {"mode": mode, "saturation_mode": 0})
+    assert call.kwargs["mode"] == mode
+    assert ir.get_op_buffer_arg_effect(call.op.name, 0).data == ir.BufferAccess.Read
+    assert ir.get_op_buffer_arg_effect(call.op.name, 1).data == ir.BufferAccess.Write
+    ir.assert_structural_equal(call, ir.deserialize(ir.serialize(call)), enable_auto_mapping=True)
+
+
+@pytest.mark.parametrize("dtype", [DataType.FP16, DataType.INT16, DataType.INT32])
+def test_bfloat_extension_does_not_admit_other_round_casts(dtype):
+    with pytest.raises(ValueError, match="unsupported conversion attributes"):
+        _call("cast", [_buffer("source"), _buffer("dst", dtype=dtype)], {"mode": 2})
+
+
+@pytest.mark.parametrize("bad", ["shape", "valid", "saturation", "mode"])
+def test_bfloat_cast_preserves_restrictions(bad):
+    args = [_buffer("source"), _buffer("dst", dtype=DataType.BF16)]
+    kwargs = {"mode": 2}
+    if bad == "shape":
+        args[1] = _buffer("dst", shape=(4, 64), dtype=DataType.BF16)
+    elif bad == "valid":
+        args[1] = _buffer("dst", valid=(7, 64), dtype=DataType.BF16)
+    elif bad == "saturation":
+        kwargs["saturation_mode"] = 1
+    else:
+        kwargs["mode"] = 3
+    with pytest.raises(ValueError):
+        _call("cast", args, kwargs)
+
+
 @pytest.mark.parametrize("kind", ["cmp", "cmps"])
 def test_comparison_does_not_admit_integer_ordering(kind):
     args, kwargs = _operands(kind)
@@ -102,8 +137,12 @@ def test_comparison_does_not_admit_integer_ordering(kind):
         _call(kind, args, kwargs)
 
 
-def _program(kind, addresses):
+def _program(kind, addresses, cast_dtype=None):
     args, kwargs = _operands(kind)
+    if cast_dtype is not None:
+        assert kind == "cast"
+        args[-1] = _buffer("dst", dtype=cast_dtype)
+        kwargs["mode"] = 2
     statements = []
     for arg, address in zip(args, addresses):
         if not isinstance(arg.type, ir.BufferType):
@@ -150,6 +189,15 @@ def _verify(kind, addresses):
 )
 def test_conversion_rejects_destructive_storage_overlap(kind, addresses):
     diagnostics = _verify(kind, addresses)
+    assert diagnostics and any("disjoint" in d.message for d in diagnostics)
+
+
+def test_bfloat_cast_rejects_destructive_storage_overlap():
+    properties = passes.IRPropertySet()
+    properties.insert(passes.IRProperty.BufferIR)
+    diagnostics = passes.PropertyVerifierRegistry.verify(
+        properties, _program("cast", (0, 0), cast_dtype=DataType.BF16)
+    )
     assert diagnostics and any("disjoint" in d.message for d in diagnostics)
 
 

@@ -130,6 +130,108 @@ def test_serialized_actual_tokens(tmp_path):
     compare(restored)
 
 
+def _symbolic_start_guard_fixture(offset=2, foreign_origin=False, comparison=ir.Eq):
+    """Author an additional token use on a symbolic-start frame, without analysis."""
+    # The shared fixture imports Uses through its independent command checker.
+    from .test_sync_case_only_schedule import case_only_fixture  # noqa: PLC0415
+
+    _, logical = case_only_fixture(4)
+    block = logical.body.stmts[0].var
+    span = logical.span
+    other = ir.Var(block.name_hint, block.type, span)
+
+    def ci(value):
+        return ir.ConstInt(value, ir.DataType.INDEX, span)
+
+    class SymbolicStart(ir.IRMutator):
+        def visit_assign_stmt(self, op):
+            if foreign_origin == "binding" and op.var.same_as(block):
+                # A valid, same-named alias is still a different SSA binding.
+                return ir.SeqStmts([op, ir.AssignStmt(other, block, span)], span)
+            return op
+
+        def visit_for_stmt(self, op):
+            if op.loop_var.name_hint != "i":
+                return op
+            start = ir.Add(block, ci(5), ir.DataType.INDEX, span)
+            # The foreign origin has different arithmetic, not just a different
+            # Python wrapper for the same underlying expression.
+            origin = start
+            if foreign_origin == "binding":
+                origin = ir.Add(other, ci(5), ir.DataType.INDEX, span)
+            elif foreign_origin:
+                origin = ir.Add(block, ci(6), ir.DataType.INDEX, span)
+            threshold = origin if offset == 0 else ir.Add(origin, ci(offset), ir.DataType.INDEX, span)
+            statements = list(op.body.stmts)
+            at = next(
+                i
+                for i, stmt in enumerate(statements)
+                if isinstance(stmt, ir.EvalStmt) and stmt.expr.op.name == ir.get_op("sync.wait").name
+            )
+            statements.insert(
+                at + 1,
+                ir.IfStmt(
+                    comparison(op.loop_var, threshold, ir.DataType.BOOL, span), statements[at], None, [], span
+                ),
+            )
+            return ir.ForStmt(
+                op.loop_var,
+                start,
+                op.stop,
+                op.step,
+                op.iter_args,
+                ir.SeqStmts(statements, span),
+                op.return_vars,
+                span,
+            )
+
+    return SymbolicStart().visit_function(logical)
+
+
+@pytest.mark.parametrize("offset", [0, 2, 4])
+def test_symbolic_start_actual_token_guard_roundtrip(offset):
+    logical = _symbolic_start_guard_fixture(offset)
+    options = {"parameter_bounds": {4: (0, 0)}, "block_bounds": (0, 0)}
+    original = testing.inspect_scoped_token_families(logical, **options)
+    digit = offset // 2
+    selected = [f for f in original["families"] if f["target_domain"] == [(digit, digit + 1)]]
+    assert len(selected) == 1
+    assert selected[0]["count"] == 1
+    assert selected[0]["source_domain"] == [(digit, digit + 1)]
+    assert selected[0]["source"][1] == selected[0]["target"][1] == digit
+    restored = ir.deserialize(ir.serialize(logical))
+    reparsed = testing.inspect_scoped_token_families(restored, **options)
+
+    # Serialization may rebuild expression nodes. It must preserve the original
+    # SSA bindings and every actual use, including the explicitly added wait.
+    def inventory(result):
+        return [
+            {**family, "axes": [tuple(axis[1:]) for axis in family["axes"]]} for family in result["families"]
+        ]
+
+    assert inventory(reparsed) == inventory(original)
+
+
+@pytest.mark.parametrize("offset,foreign", [(1, False), (10, False), (2, True), (2, "binding")])
+def test_symbolic_start_token_guard_requires_original_lattice(offset, foreign):
+    logical = _symbolic_start_guard_fixture(offset, foreign)
+    before = ir.serialize(logical)
+    with pytest.raises(ValueError, match="symbolic guard"):
+        testing.inspect_scoped_token_families(logical, parameter_bounds={4: (0, 0)}, block_bounds=(0, 0))
+    assert ir.serialize(logical) == before
+
+
+def test_symbolic_start_one_past_guard_is_half_open():
+    options = {"parameter_bounds": {4: (0, 0)}, "block_bounds": (0, 0)}
+    empty = testing.inspect_scoped_token_families(_symbolic_start_guard_fixture(8), **options)
+    full = testing.inspect_scoped_token_families(
+        _symbolic_start_guard_fixture(8, comparison=ir.Lt), **options
+    )
+    assert len(full["families"]) == len(empty["families"]) + 1
+    assert sum(f["count"] for f in full["families"]) == sum(f["count"] for f in empty["families"]) + 4
+    assert all(f["target_domain"] == [(0, 4)] for f in full["families"])
+
+
 def test_family_size_independent_of_trip_counts():
     sizes = []
     for rows, counts in [(3, (3, 3)), (1000, (3, 3)), (1000000, (3, 3)), (3, (1000, 3)), (3, (3, 1000000))]:

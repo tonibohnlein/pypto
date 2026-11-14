@@ -211,12 +211,19 @@ std::vector<NumericalCell> InterfaceCells(CompactSyncResult& result, NumericalSy
     }
     if (const auto owner = private_owner.find(storage); owner != private_owner.end()) {
       const auto& region = input.segments[owner->second];
-      CHECK(region.nested_frames.empty())
+      const bool own_frame =
+          region.nested_frames.size() == 1 && region.nested_frames.front().loop == region.original_loop &&
+          region.nested_frames.front().count == region.count && region.reset_period == region.count;
+      // A leaf's own ordinal frame is not an enclosing replay. No ancestor,
+      // including a singleton ancestor, may borrow this visit-local proof.
+      CHECK(region.nested_frames.empty() || own_frame)
           << "Visit-owned storage cannot be omitted across repeated or reset invocations";
       for (const auto& [segment, access] : domain_effects) {
         ++result.interface_access_visits;
         CHECK(segment == &region)
             << "Visit-owned storage has an outside read or write; crossing selector export unavailable";
+        CHECK((!access->row_step && !access->column_step) || access->coordinate_frame == region.original_loop)
+            << "Visit-owned translation belongs to another occurrence frame";
       }
       ++result.omitted_bridge_domains;
       continue;
@@ -668,13 +675,16 @@ NumericalBoundary Point(const CompactSyncResult& result, const NodePtr& node, co
 
 CompactSyncResult AnalyzeNumericalSync(CompactSyncInput input, const std::string& order) {
   const bool structured = input.region_tree.has_value();
-  bool moving_vec_write = false;
+  bool moving_write = false;
   for (const auto& segment : input.segments)
     for (const auto& site : segment.sites)
       for (const auto& access : site.accesses)
-        moving_vec_write |= input.storage[access.storage].byte_coordinates && access.write &&
-                            (access.row_step || access.column_step);
-  const bool invariant_leaves = structured && !moving_vec_write;
+        moving_write |= (input.storage[access.storage].byte_coordinates ||
+                         input.storage[access.storage].space == MemorySpace::DDR) &&
+                        access.write && (access.row_step || access.column_step);
+  // Moving DDR domains use the existing visit-owned proof; selecting this
+  // service does not assert common translation or disjoint visits.
+  const bool invariant_leaves = structured && !moving_write;
   CompactSyncResult result;
   if (invariant_leaves) {
     // The initial structured adapter accepts invariant conflict classes only.

@@ -31,6 +31,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "src/ir/transforms/utils/sync_invocation_domains.h"
 
 namespace pypto::ir::sync {
@@ -156,9 +157,12 @@ class Parser {
   std::vector<Use> uses_;
 
   void Register(const SyncLoopFrame& frame) {
-    CHECK(!frame.start_expression || As<ConstInt>(frame.start_expression) || frame.count <= 1)
-        << "Scoped token lowering requires constant or proved zero/singleton frames";
     CHECK(frame.count >= 0 && frame.start >= 0 && frame.step > 0) << "Invalid scoped token frame";
+    // Fresh import proves a uniform count and original-width arithmetic over
+    // this complete invocation case. Retain its symbolic origin; the numeric
+    // start is not a representative worker that can replace that expression.
+    CHECK(!frame.start_expression || structural_equal(frame.start_expression, frame.loop->start_, false))
+        << "Scoped token frame has a different original start expression";
     frames_.emplace(frame.loop.get(), frame);
     variables_.emplace(frame.loop->loop_var_.get(), frame.loop.get());
   }
@@ -190,13 +194,37 @@ class Parser {
   std::pair<const ForStmt*, int64_t> Coordinate(const ExprPtr& condition) const {
     const auto binary = As<BinaryExpr>(condition);
     const auto var = binary ? AsVarLike(binary->left_) : nullptr;
-    const auto constant = binary ? As<ConstInt>(binary->right_) : nullptr;
     const auto found = var ? variables_.find(var.get()) : variables_.end();
-    CHECK(binary && constant && found != variables_.end() && active_frames_.count(found->second))
+    CHECK(binary && found != variables_.end() && active_frames_.count(found->second))
         << "Scoped token guard requires an active original coordinate";
     const auto& frame = frames_.at(found->second);
-    CHECK(!frame.start_expression || As<ConstInt>(frame.start_expression))
-        << "Scoped token guard on a dynamic original frame is unavailable";
+    if (frame.start_expression && !As<ConstInt>(frame.start_expression)) {
+      const auto& threshold = binary->right_;
+      CHECK(structural_equal(threshold->GetType(), frame.loop->loop_var_->GetType(), false))
+          << "Scoped token symbolic threshold changes its original coordinate type";
+      int64_t offset = 0;
+      if (!structural_equal(threshold, frame.start_expression, false)) {
+        const auto sum = As<Add>(threshold);
+        const auto constant = sum ? As<ConstInt>(sum->right_) : nullptr;
+        // Free variables preserve identity. This admits a serialized copy of
+        // the same pure start expression, never a same-named foreign frame or
+        // an algebraically guessed parameter binding.
+        CHECK(sum && constant && structural_equal(sum->left_, frame.start_expression, false) &&
+              structural_equal(sum->left_->GetType(), threshold->GetType(), false) &&
+              structural_equal(constant->GetType(), threshold->GetType(), false))
+            << "Scoped token symbolic guard requires its original start plus a constant offset";
+        offset = constant->value_;
+      }
+      // Include the one-past threshold used by half-open guards. Fresh import
+      // proves the post-loop increment, not merely the last payload coordinate,
+      // in the original type for every caller. Guard also forms digit+1 below.
+      CHECK(offset >= 0 && offset % frame.step == 0 && offset / frame.step <= frame.count &&
+            offset / frame.step < std::numeric_limits<int64_t>::max())
+          << "Scoped token symbolic guard is outside its original visit lattice";
+      return {found->second, offset / frame.step};
+    }
+    const auto constant = As<ConstInt>(binary->right_);
+    CHECK(constant) << "Scoped token guard requires a constant original coordinate";
     const __int128 delta = __int128(constant->value_) - frame.start;
     CHECK(delta >= 0 && delta % frame.step == 0 && delta / frame.step < std::numeric_limits<int64_t>::max())
         << "Scoped token guard has an unavailable normalized coordinate";
