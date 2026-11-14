@@ -65,10 +65,14 @@ synchronization-free execution mode.
 
 The qualified [physical construction](../ir/15-physical-demand-realization.md)
 establishes modeled payload order, matching and legal directional reuse. It
-assumes fresh invocation entry and closes notifications; it does **not** prove
-that returning from the function has completed its last asynchronous payload.
-Native macro semantics and runtime invocation completion require separate
-device qualification.
+assumes fresh invocation entry and closes notifications. Public `RealizeSync`
+and `LowerSync` additionally emit an explicit A2/A3 `system.bar_all` before
+return when taking whole-kernel ownership. This replaces the terminal completion
+that would otherwise be supplied by PTOAS; notification closure alone is not
+sufficient. Unsupported exits refuse ownership transactionally. Internal child
+lowering still permits pending payloads and does not insert a child-exit drain.
+Native instruction and runtime behavior remain separate device qualifications;
+performance comparisons must use the same invocation-boundary policy.
 
 ## Finite Vec coverage
 
@@ -101,8 +105,12 @@ subviews preserve the original row pitch; dense reshapes preserve their byte
 extent. Overlapping allocations remain overlapping even with different SSA
 names or element widths. Dense accesses require one interval; strided windows
 require one interval per physical row. This cost depends on static window size,
-not loop trip count. For stationary column intervals in one row band, an ordered
-index skips unrelated storage atoms. `class_tests` counts membership checks;
+not loop trip count. Partitioning sweeps write-rectangle row events, splitting
+columns only at active writer boundaries, while retaining holes and read-only
+domains. A shared row/column index finds classes intersecting the full affine
+access envelope; the exact membership proof still checks each candidate.
+For W writes and C output cells, partition construction is `O(W log W + C)`;
+general overlapping rectangles can still produce quadratic C. `class_tests` counts membership checks;
 `class_lookup_tests` separately counts binary-search comparisons. The shared
 analysis still enforces its existing per-visit membership and refresh premises
 before using a compact repeated result.

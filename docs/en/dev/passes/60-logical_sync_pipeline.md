@@ -122,7 +122,7 @@ as a completion-to-start edge.
 
 The periodic core takes `O(k(m+u) log(m+u))` work for `m` sites, `u` token-use
 families and `k` pipes. It does not enumerate visits. Single-segment programs
-need no boundary graph. Multiple segments share the existing explicit boundary graph (first/final ports
+need no boundary graph. Multiple segments share the existing explicit boundary graph (native per-pipe first/final ports
 plus actual crossing endpoints): construction is quadratic in child port counts, and each
 cross-region query takes `O(P+E)` graph work plus child queries. These costs are
 separate from import, allocation and emission; compactness in trip count is not
@@ -230,12 +230,14 @@ intervals in active original frames. Duplicated waits remain duplicated handoffs
 Source fanout that cannot be expressed by an injective common-prefix family is
 unavailable, as are intermediate capture uses and displaced direct cuts.
 
-The unary equation resolver is iterative and memoized. With T equations, U uses
-and depth D, pattern storage/copying is `O(TD)` plus indexed lookups, and family
-construction is `O(UD log(D+2))`. Payload scope checks visit D frames. Guard work
-is charged per condition, including repeated use of a shared guard and copying
-nested domain maps; there is no global guard-DAG-linear claim. No trip count is
-unfolded. Separate importer and verifier costs still apply.
+The unary equation resolver is iterative and resolves each use in its exact
+consumer domain. Capture-and-hold prevents caching solely by token identity.
+For E inspected equation steps and frame depth D, pattern work is `O(ED)` plus
+indexed/domain lookups. E can reach `UT` for U uses and T equations. Optional
+family normalization counts indexed passes and candidate comparisons; candidates
+within a group may be quadratic. Guard work is charged per supplied condition,
+including revisits of shared guards and copying nested domain maps. No trip count
+is unfolded. Import, verification and physical-reuse proofs have separate costs.
 
 This interpretation can describe clipped intervals and longer histories than the
 current insertion subset. It does **not** certify uniform repeated order or
@@ -331,9 +333,12 @@ The historical direct construction is available through explicit testing APIs.
 The invocation qualification driver uses those APIs for its baseline, so it does
 not accidentally compare the new production path with itself.
 
-No successful logical or physical result proves native invocation completion.
-The existing fresh-entry and native macro assumptions still apply. Device
-qualification and the runtime return-boundary contract remain separate.
+The internal logical/physical proof alone does not establish invocation completion.
+Public ownership now adds the existing A2/A3 `system.bar_all` immediately before
+return, covering the final asynchronous payload under that primitive's contract.
+Child lowering retains pending payloads. Fresh-entry and native macro assumptions
+still apply; host order checks do not replace device qualification. Performance
+comparisons must apply the same terminal-completion policy to both compilers.
 
 ## Caller evidence and dynamic singleton frames
 

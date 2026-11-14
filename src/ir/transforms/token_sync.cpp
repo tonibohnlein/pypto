@@ -13,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/core/logging.h"
@@ -62,6 +63,37 @@ bool IsOwnedLeaf(const FunctionPtr& function) {
   return (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV) &&
          !function->requires_runtime_binding_ && !function->HasAttr(kAttrExternalSource) &&
          !function->HasAttr(kAttrBuiltinTemplateDir);
+}
+// Consuming every flag does not complete the last asynchronous payload.
+// Whole-kernel ownership suppresses PTOAS's terminal drain, so explicitly
+// discharge that obligation using the existing A2/A3 ALL-pipe primitive.
+// Internal child lowering never calls this wrapper: a child may return pending
+// payloads. This changes the invocation boundary, not the internal demand set.
+FunctionPtr CompleteOwnedInvocation(const FunctionPtr& function, const std::string& target) {
+  CHECK(target == "a2a3") << "Invocation completion requires the A2/A3 ALL-pipe contract";
+  // Current leaf import admits a canonical terminal return. Reject fallthrough
+  // rather than publish an ownership marker with an uncovered exit.
+  auto body = As<SeqStmts>(function->body_);
+  CHECK(body && !body->stmts_.empty() && As<ReturnStmt>(body->stmts_.back()))
+      << "Invocation completion requires a canonical terminal return";
+  class CompleteReturns : public IRMutator {
+    std::string core_;
+
+   public:
+    explicit CompleteReturns(FunctionType type) : core_(type == FunctionType::AIC ? "aic" : "aiv") {}
+    StmtPtr VisitStmt_(const ReturnStmtPtr& op) override {
+      // Return operands are already computed Buffer/Tensor handles or scalars.
+      // Do not move an effectful return expression past the completion cut.
+      for (const auto& value : op->value_)
+        CHECK(As<Var>(value) || As<ConstInt>(value) || As<ConstFloat>(value) || As<ConstBool>(value))
+            << "Invocation completion requires evaluated return operands";
+      auto completion =
+          OpRegistry::GetInstance().Create("system.bar_all", {}, {{"core_type", core_}}, op->span_);
+      return std::make_shared<SeqStmts>(
+          std::vector<StmtPtr>{std::make_shared<EvalStmt>(completion, op->span_), op}, op->span_);
+    }
+  } complete(function->func_type_);
+  return sync::SyncOutcome(complete.VisitFunction(function), true, "");
 }
 FunctionPtr InsertLogicalSync(const FunctionPtr& function, const std::string& target,
                               const sync::SyncParameterBounds& parameters,
@@ -142,8 +174,10 @@ Pass LowerSync() {
                                                std::nullopt, parameters, blocks);
           // Mark only a complete physical plan. Functions without commands
           // continue to receive downstream PTOAS synchronization as before.
-          function = result.set_sites && result.wait_sites ? sync::SyncOutcome(result.function, true, "")
-                                                           : result.function;
+          function =
+              result.set_sites && result.wait_sites
+                  ? CompleteOwnedInvocation(result.function, context->GetBackendHandler()->GetPtoTargetArch())
+                  : result.function;
         }
         return std::make_shared<Program>(functions, program->name_, program->span_);
       },
@@ -191,7 +225,7 @@ Pass RealizeSync() {
       if (!physical.set_sites || !physical.wait_sites)
         return sync::SyncOutcome(function, false,
                                  "Candidate has no SET/WAIT marker; delegate the original kernel");
-      return sync::SyncOutcome(physical.function, true, "");
+      return CompleteOwnedInvocation(physical.function, target);
     } catch (const pypto::ValueError& error) {
       return sync::SyncOutcome(function, false, error.what());
     }

@@ -23,7 +23,7 @@ namespace pypto::ir::sync {
 // structured-token interpretation. Contains only supplied child order, native
 // chain boundaries and explicitly added crossings. No access analysis.
 // O(sum P_child^2) construction and O(P+E) graph search; child query costs are
-// separate. Ports are first/final visits and supplied crossing endpoints, never
+// separate. Ports are native per-pipe endpoints and supplied crossing endpoints, never
 // an unfolding of trip counts. Supplied interface size is charged separately.
 class SyncBoundaryGraph {
  public:

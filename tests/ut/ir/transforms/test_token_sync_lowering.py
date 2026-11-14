@@ -25,7 +25,7 @@ from .sync_logical_oracle import CommandExecution, Token, value
 from .sync_matmul_cases import capture, staged_fixture
 from .sync_matmul_oracle import hardware_reference
 from .sync_physical_oracle import PhysicalExecution, checked_payload_calls, directional_widths
-from .test_autosync_switch import clone
+from .test_autosync_switch import apply_hybrid, clone
 from .test_finite_sync_analysis import closure
 from .test_logical_sync_realization import verify
 from .test_vec_sync_analysis import vec_fixture
@@ -456,9 +456,58 @@ def test_token_pipeline_generates_cpp(name, tmp_path):
     )
     kernel_body = output.read_text().split("AICORE void ", 1)[1]
     assert "ptoas_auto_sync_tail(" not in kernel_body
+    # Ownership replaces the skipped PTOAS tail with an explicit terminal
+    # completion, not with notification closure alone.
+    assert "pipe_barrier(PIPE_ALL)" in kernel_body
+    assert state.exits and all(
+        ((payload, True), exit_node) in closure(state.vertices, state.edges)
+        for payload in range(state.payload_count)
+        for exit_node in state.exits
+    )
     assert kernel_body.count("set_flag(") == len(state.records)
     assert kernel_body.count("wait_flag(") == len(state.waits)
 
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("producer", ["strict", "optional"])
+@pytest.mark.parametrize("count", [None, 1, 3])
+def test_public_ownership_completes_final_store_before_return(producer, count):
+    original = vec_fixture(count=count)
+    logical = _apply(passes.insert_sync, original)
+    physical = (
+        _apply(passes.lower_sync, logical)
+        if producer == "strict"
+        else apply_hybrid([original])[original.name]
+    )
+    _, _, state = _check_actual_tokens(original, logical, physical)
+    order = closure(state.vertices, state.edges)
+    assert len(state.exits) == 1
+    assert all(((p, True), state.exits[0]) in order for p in range(state.payload_count))
+    assert sum(node[0] == "all_completion" for node in state.barriers) == 1
+
+    # A dependent task or immediate local-storage reuse can start after this
+    # return: all prior payloads reach that boundary under the ALL contract.
+    # Remove precisely the drain to demonstrate that closed flags alone do not
+    # prove the same obligation, without weakening any internal coverage check.
+    class RemoveDrain(ir.IRMutator):
+        def visit_eval_stmt(self, op):
+            if isinstance(op.expr, ir.Call) and op.expr.op.name == ir.get_op("system.bar_all").name:
+                return ir.SeqStmts([], op.span)
+            return op
+
+    without = RemoveDrain().visit_function(physical)
+    _, _, pending = _check_actual_tokens(original, logical, without)
+    assert not pending.live
+    assert ((pending.payload_count - 1, True), pending.exits[0]) not in closure(
+        pending.vertices, pending.edges
+    )
+    # Lowering an already lowered function is a no-op; optional insertion
+    # rejects existing ownership. Neither route appends a second drain.
+    before = ir.python_print(physical)
+    assert ir.python_print(_apply(passes.lower_sync, physical)) == before
+    with pytest.raises(ValueError):
+        apply_hybrid([physical])
+    assert ir.python_print(physical) == before

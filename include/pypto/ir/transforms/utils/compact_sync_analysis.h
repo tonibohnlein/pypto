@@ -233,10 +233,7 @@ struct CompactSegmentResult {
   std::vector<PipeType> pipes;
   std::vector<DemandFamily> generators, demands;
   FiniteSyncResult body;  // One body: cell summaries and finite numerical rows.
-  // Minimum nonnegative visit displacement for each event pair. A negative
-  // value is unavailable reachability, not an unavailable storage domain.
-  std::vector<std::vector<int64_t>> distance;
-  // The rotating strategy retains two pipe-prefix indices, never all pairs.
+  // Repeated strategies retain two pipe-prefix indices, never all pairs.
   // Nonnegative scaled shortest distances are wide to preserve exactness.
   // Missing entries mean unreachable, not an unavailable query capability.
   bool rotating = false;
