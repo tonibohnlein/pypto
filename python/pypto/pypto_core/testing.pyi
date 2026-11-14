@@ -20,6 +20,7 @@ from .ir import (
     BufferResultBehavior,
     Call,
     Expr,
+    ForStmt,
     Function,
     OpIRStage,
     PipeType,
@@ -245,9 +246,6 @@ class CompactSyncAnalysis:
         """Return original-coordinate flat crossings, or unavailable for unsupported shared uses."""
         ...
 
-    def scoped_consecutive_reuse(self, family: int) -> bool:
-        """Uniform period-one reuse of an owned schema; False is unproved, not scarcity."""
-        ...
     def export_scoped_demands(self) -> dict[str, Any] | None:
         """Return cached original-frame Cartesian demand families, or unavailable."""
         ...
@@ -263,12 +261,11 @@ class CompactSyncAnalysis:
         *,
         schedule_policy: SyncSchedulePolicy = SyncSchedulePolicy(),
     ) -> PhysicalSyncRealization:
-        """Test supplied-demand allocation using the target's eligible directional IDs.
+        """Test logical insertion and actual-token lowering with eligible directional IDs.
 
         Optional IDs restrict the catalog. Refuse unsupported realization,
         unproved compact allocation or proved finite fixed-plan scarcity.
-        This bypasses actual-token interpretation; use LowerSync/RealizeSync tests
-        for production coverage.
+        Uses the production logical insertion, optimization and lowering services.
         """
         ...
 
@@ -359,7 +356,7 @@ class SyncInvocationAnalysis:
         *,
         schedule_policy: SyncSchedulePolicy = SyncSchedulePolicy(),
     ) -> dict[str, Any]:
-        """Test supplied-demand cases, bypassing actual-token interpretation."""
+        """Test invocation insertion and actual-token lowering through production services."""
         ...
     def select_case(self, block_index: int, parameters: dict[int, int]) -> CompactSyncAnalysis | None:
         """Return retained mathematics only for an admitted fully bound invocation."""
@@ -383,11 +380,39 @@ def inspect_scoped_token_families(
     target: str = "a2a3",
     parameter_bounds: dict[int, tuple[int, int]] = {},
     block_bounds: tuple[int, int] | None = None,
+    *,
+    prepare: bool = False,
 ) -> dict[str, Any]:
     """Inspect actual token families using payload qualification; no access recovery or allocation."""
     ...
 
+class ScopedPublicationSchedule:
+    @property
+    def publications(self) -> int: ...
+    def certify(self, order: ScopedTokenOrder, budget: int) -> dict[str, Any]: ...
+
 class ScopedTokenOrder:
+    def realize_legacy(self, eligible_ids: list[int] | None = None) -> dict[str, Any]: ...
+    def publication_schedule(self, source: PipeType, target: PipeType) -> ScopedPublicationSchedule: ...
+    def palette(self, source: PipeType, target: PipeType, budget: int) -> dict[str, Any]: ...
+    @property
+    def region_frames(self) -> list[list[ForStmt]]: ...
+    def prove_transition(
+        self,
+        consumer: tuple[int, int, int],
+        producer: tuple[int, int, int],
+        axes: list[tuple[ForStmt, int, int, int, int, int]],
+    ) -> bool: ...
+    def validate_token_owner(self, function: Function) -> None:
+        """Reject token IR other than the immutable owner used by this protocol."""
+        ...
+
+    @property
+    def witness_attempts(self) -> int: ...
+    @property
+    def candidate_visits(self) -> int: ...
+    @property
+    def binary_probes(self) -> int: ...
     @property
     def summary_nodes(self) -> int: ...
     @property
@@ -402,9 +427,14 @@ class ScopedTokenOrder:
     def uniform(self, family: int) -> bool: ...
     def reuse(self, family: int) -> bool: ...
     def barrier(self, family: int) -> bool: ...
-    def realize(self, target: str = "a2a3") -> Function: ...
+    def realize(self, target: str = "a2a3", eligible_ids: list[int] | None = None) -> Function: ...
 
-def analyze_scoped_token_order(function: Function, target: str = "a2a3") -> ScopedTokenOrder: ...
+def analyze_scoped_token_order(
+    function: Function,
+    target: str = "a2a3",
+    parameter_bounds: dict[int, tuple[int, int]] = {},
+    block_bounds: tuple[int, int] | None = None,
+) -> ScopedTokenOrder: ...
 def check_generated_logical_sync(function: Function) -> None:
     """Test the production compiler-error boundary for insertion-owned logical IR."""
     ...
@@ -452,7 +482,7 @@ def emit_sync_boundary_commands(
     cuts: list[tuple[Call, Stmt, Stmt]],
     enabled: bool = True,
     validate_scope: bool = False,
-) -> dict:
+) -> dict[str, Any]:
     """Test command cuts; optionally check original-cut readiness, never matching or coverage."""
     ...
 

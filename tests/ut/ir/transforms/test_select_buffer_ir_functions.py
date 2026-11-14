@@ -12,7 +12,7 @@
 import pypto.language as pl
 import pytest
 import torch
-from pypto import ir, passes, testing
+from pypto import DataType, ir, passes, testing
 from pypto.backend import BackendType
 from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.backend.pto_backend import _run_ptoas
@@ -20,6 +20,7 @@ from pypto.debug import torch_codegen
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 from pypto.language.parser.diagnostics import ParserTypeError
 from pypto.pypto_core import codegen
+from pypto.pypto_core import ir as core_ir
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
 
@@ -375,6 +376,16 @@ def test_unsupported_step_and_changing_gm_carry_are_rejected_before_storage(
         for transform in manager.passes[: boundary + 1]:
             program = transform(program)
     assert _kernel(program).attrs["buffer_ir_selected"] is False
+
+
+@pytest.mark.parametrize("planner", _PLANNERS)
+def test_positive_launch_stride_is_preserved_by_buffer_selection(planner):
+    # The launch count is positive by the operation contract, even when its
+    # numerical value is not available to this function. This admits Buffer
+    # conversion, not an exact synchronization trip-count certificate.
+    program = _lower(_control_flow_program("for", "pl.tile.get_block_num()"), planner)
+    assert _kernel(program).ir_stage == ir.FunctionIRStage.Buffer
+    assert "buffer.get_block_num" in str(program)
 
 
 @pytest.mark.parametrize("planner", _PLANNERS)
@@ -1611,6 +1622,135 @@ class LeadingExtent:
     # autosync. Its strict importer must preserve the missing-range refusal.
     with pytest.raises(ValueError, match="Dynamic allocation extent has no established caller range"):
         testing.analyze_placed_sync(function, True)
+
+
+@pytest.mark.parametrize("planner", _PLANNERS)
+@pytest.mark.parametrize("slots", [2, 3])
+def test_nested_accumulator_seed_with_operand_slot_pools(planner, slots, tmp_path):
+    """Admission consumes the existing seed/carry proof, before legalization.
+
+    Both operand levels use declared pools. The inner selector resets on every
+    K chunk; the pool identity must survive that reset and Buffer conversion.
+    """
+    program = pl.parse_program(f"""
+@pl.program
+class NestedSlots:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 512], pl.FP16], b: pl.Tensor[[512, 64], pl.FP16],
+               out: pl.Out[pl.Tensor[[64, 64], pl.FP32]]) -> pl.Tensor[[64, 64], pl.FP32]:
+        acc = pl.create_tile([64, 64], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+        for k in pl.range(4):
+            am: pl.Tile[
+                [64, 128], pl.FP16, pl.MemRef("am", slots={slots})[k % {slots}], pl.Mem.Mat
+            ] = pl.load(a, [0, k * 128], [64, 128], target_memory=pl.Mem.Mat)
+            bm: pl.Tile[
+                [128, 64], pl.FP16, pl.MemRef("bm", slots={slots})[k % {slots}], pl.Mem.Mat
+            ] = pl.load(b, [k * 128, 0], [128, 64], target_memory=pl.Mem.Mat)
+            for j in pl.range(4):
+                left: pl.Tile[
+                    [64, 32], pl.FP16, pl.MemRef("left", slots={slots})[j % {slots}], pl.Mem.Left
+                ] = pl.tile.extract(am, 0, j * 32, [64, 32], target_memory=pl.Mem.Left)
+                right: pl.Tile[
+                    [32, 64], pl.FP16, pl.MemRef("right", slots={slots})[j % {slots}], pl.Mem.Right
+                ] = pl.tile.extract(bm, j * 32, 0, [32, 64], target_memory=pl.Mem.Right)
+                if k == 0 and j == 0:
+                    acc = pl.matmul(left, right)
+                else:
+                    acc = pl.matmul_acc(acc, left, right)
+        return pl.store(acc, [0, 0], out)
+""")
+    lowered = _lower(program, planner)
+    assert _kernel(lowered).ir_stage == ir.FunctionIRStage.Buffer
+    assert "buffer.matmul" in str(lowered)
+    native = codegen.PTOCodegen().generate(lowered, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS)
+    assert native.count("pto.alloc_multi_tile") == 4
+    # Both L1 operands share one dominating outer selector; L0 operands and
+    # both accumulator branches share the inner selector. Re-emitting the
+    # outer selector inside the inner loop breaks enabled PTOAS synchronization
+    # when its entry wait references that inner definition.
+    assert native.count("arith.remui") == 2
+    source = tmp_path / "nested.pto"
+    source.write_text(native)
+    _run_ptoas(
+        str(source),
+        str(tmp_path / "nested.cpp"),
+        [
+            "--pto-level=" + ("level2" if planner == passes.MemoryPlanner.PTOAS else "level3"),
+            "--pto-arch=a2",
+            "--enable-insert-sync=true",
+        ],
+    )
+
+
+def test_slot_selector_cache_does_not_escape_sibling_regions(tmp_path):
+    # Direct Buffer IR isolates codegen dominance from the deliberately narrower
+    # branch admission policy. Each lexical region contains two equivalent slot
+    # uses, without introducing payload or synchronization semantics.
+    span = ir.Span.unknown()
+
+    def integer(value):
+        return ir.ConstInt(value, DataType.INDEX, span)
+
+    def internal(name, args, result):
+        return core_ir._create_internal_op_call(name, args, {}, result, span)
+
+    element = ir.BufferType([1, 32], DataType.FP32, ir.MemorySpace.Vec)
+    multi = ir.MultiBufferType(element, 2)
+    group = ir.Var("ring", multi, span)
+    index = ir.Var("i", ir.ScalarType(DataType.INDEX), span)
+    allocation = ir.AssignStmt(
+        group, internal("buffer.alloc_multi", [ir.MakeTuple([], span), integer(0)], multi), span
+    )
+
+    def selections(prefix):
+        return ir.SeqStmts(
+            [
+                ir.AssignStmt(
+                    ir.Var(f"{prefix}_{number}", element, span),
+                    internal(
+                        "buffer.slot", [group, ir.FloorMod(index, integer(2), DataType.INDEX, span)], element
+                    ),
+                    span,
+                )
+                for number in range(2)
+            ],
+            span,
+        )
+
+    branch = ir.IfStmt(
+        ir.Eq(index, integer(0), DataType.BOOL, span), selections("then"), selections("else"), [], span
+    )
+    loop = ir.ForStmt(
+        index,
+        integer(0),
+        integer(4),
+        integer(1),
+        [],
+        ir.SeqStmts([branch, selections("after")], span),
+        [],
+        span,
+    )
+    function = ir.Function(
+        "kernel",
+        [],
+        [],
+        ir.SeqStmts([allocation, loop], span),
+        span,
+        type=ir.FunctionType.InCore,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    program = ir.Program([function], "BranchSlots", span)
+    native = codegen.PTOCodegen().generate(program, emit_tile_addr=True)
+    # Each branch needs its own first definition; neither dominates the sibling
+    # or the continuation. Within each body both selections share one remainder.
+    assert native.count("arith.remui") == 3
+    source = tmp_path / "branch_slots.pto"
+    source.write_text(native)
+    _run_ptoas(
+        str(source),
+        str(tmp_path / "branch_slots.cpp"),
+        ["--pto-level=level3", "--pto-arch=a2", "--enable-insert-sync=true"],
+    )
 
 
 if __name__ == "__main__":

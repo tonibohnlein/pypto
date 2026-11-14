@@ -14,6 +14,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -34,6 +35,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/verifier/verifier.h"
@@ -50,9 +52,9 @@ int64_t Checked(__int128 value) {
 // No enclosure or partial boxed layout is flattened into an exact interval.
 std::optional<std::pair<int64_t, int64_t>> PhysicalInterval(const SyncStorage& storage,
                                                             const SyncAccess& access) {
-  if (!access.exact_footprint || access.row_step || access.column_step || access.after_first ||
-      !storage.row_parameters.empty() || !storage.column_parameters.empty() || storage.row_block ||
-      storage.column_block || storage.row_extent_parameter)
+  if (access.external || !access.exact_footprint || access.row_step || access.column_step ||
+      access.after_first || !storage.row_parameters.empty() || !storage.column_parameters.empty() ||
+      storage.row_block || storage.column_block || storage.row_extent_parameter)
     return std::nullopt;
   const auto row_end = __int128(access.row) + access.rows;
   const auto column_end = __int128(access.column) + access.columns;
@@ -116,26 +118,31 @@ using ParameterIndices = std::unordered_map<const Expr*, size_t>;
 // Retain checked scalar definitions as a DAG. Coefficients are only materialized
 // for requested access roots, never for every SSA prefix definition.
 class CoordinateGraph {
-  enum class Kind { Constant, Parameter, Block, Loop, Add, Scale, ModularShift };
-  struct Node {
-    Kind kind;
-    int64_t upper = 0, factor = 0, start = 0, step = 0, lower = 0;
-    size_t left = 0, right = 0, parameter = 0;
-    const ForStmt* frame = nullptr;
-    bool constant = false;
-    bool dynamic_start = false;
-  };
-  std::vector<Node> nodes_;
+  using Node = SyncCoordinateNode;
+  using Kind = Node::Kind;
+  std::shared_ptr<SyncCoordinateProgram> program_ = std::make_shared<SyncCoordinateProgram>();
+  std::vector<Node>& nodes_ = program_->nodes;
   std::map<std::pair<const Expr*, const ForStmt*>, size_t> memo_;
   std::unordered_map<const Expr*, size_t> definitions_;
+  std::unordered_map<const Expr*, ExprPtr> remainders_;
+  std::vector<bool> affine_;
 
  public:
-  bool Defined(const ExprPtr& e) const { return definitions_.count(e.get()); }
+  bool Defined(const ExprPtr& e) const { return definitions_.count(e.get()) || remainders_.count(e.get()); }
+  ExprPtr SlotExpression(const ExprPtr& value) const {
+    const auto found = remainders_.find(value.get());
+    return found == remainders_.end() ? value : found->second;
+  }
   size_t Build(const ExprPtr& e, const SyncSegment& segment, const ParameterIndices& parameters,
                CompactSyncInput& input) {
     const auto maximum = SyncCoordinateMaximum(e);
     CHECK(maximum) << "Synchronization coordinates require integer arithmetic";
     const auto frame = segment.original_loop.get();
+    // A named remainder need not itself be affine: buffer.slot consumes the
+    // affine numerator and modulus as a rotating family. Ordinary coordinate
+    // consumers still go through the original range/wrap proof below.
+    if (auto found = remainders_.find(e.get()); found != remainders_.end())
+      return Build(found->second, segment, parameters, input);
     if (auto found = definitions_.find(e.get()); found != definitions_.end()) {
       return found->second;
     }
@@ -169,7 +176,7 @@ class CoordinateGraph {
         return id;
       }
       n.kind = Kind::Loop;
-      n.frame = loop->loop.get();
+      n.frame = loop->loop;
       n.start = loop->start;
       n.lower = n.start;
       n.step = loop->step;
@@ -184,7 +191,7 @@ class CoordinateGraph {
       }
     } else if (segment.original_loop && e == segment.original_loop->loop_var_) {
       n.kind = Kind::Loop;
-      n.frame = frame;
+      n.frame = segment.original_loop;
       n.start = segment.start;
       n.lower = n.start;
       n.step = segment.step;
@@ -196,21 +203,29 @@ class CoordinateGraph {
       n.parameter = it->second;
       n.lower = input.parameter_bounds.at(it->second).first;
       n.upper = input.parameter_bounds.at(it->second).second;
-    } else if (auto mod = As<FloorMod>(e)) {
-      CHECK(SameCoordinateType(e, mod->left_) && SameCoordinateType(e, mod->right_))
-          << "Coordinate modulo requires matching original types";
-      n.left = Build(mod->left_, segment, parameters, input);
-      Build(mod->right_, segment, parameters, input);
-      const auto modulus = Constant(mod->right_);
-      CHECK(modulus > 0) << "Coordinate modulo requires a positive constant modulus";
-      const auto child = nodes_[n.left];
-      CHECK(child.lower / modulus == child.upper / modulus)
-          << "Invocation modulo crosses a wrap; exact activation partition is required";
-      n.kind = Kind::ModularShift;
-      n.factor = (child.lower / modulus) * modulus;
-      n.lower = child.lower - n.factor;
-      n.upper = child.upper - n.factor;
-      n.constant = child.constant;
+    } else if (As<FloorMod>(e) || As<FloorDiv>(e)) {
+      const auto mod = As<FloorMod>(e);
+      const auto div = As<FloorDiv>(e);
+      const auto lhs = mod ? mod->left_ : div->left_;
+      const auto rhs = mod ? mod->right_ : div->right_;
+      CHECK(SameCoordinateType(e, lhs) && SameCoordinateType(e, rhs))
+          << "Coordinate quotient/remainder requires matching original types";
+      n.left = Build(lhs, segment, parameters, input);
+      n.right = Build(rhs, segment, parameters, input);
+      const auto x = nodes_[n.left], y = nodes_[n.right];
+      CHECK(y.constant && y.lower > 0)
+          << "Coordinate quotient/remainder requires a positive constant divisor";
+      n.kind = mod ? Kind::Remainder : Kind::FloorDivide;
+      n.lower = mod ? 0 : x.lower / y.upper;
+      n.upper = mod ? std::min(x.upper, y.upper - 1) : x.upper / y.lower;
+      n.constant = x.constant && y.constant;
+      if (n.constant) n.lower = n.upper = mod ? x.upper % y.upper : x.upper / y.upper;
+      if (mod && y.constant && x.lower / y.upper == x.upper / y.upper) {
+        n.kind = Kind::ModularShift;
+        n.factor = (x.lower / y.upper) * y.upper;
+        n.lower = x.lower - n.factor;
+        n.upper = x.upper - n.factor;
+      }
     } else {
       ExprPtr left, right;
       const bool multiply = static_cast<bool>(As<Mul>(e));
@@ -220,6 +235,7 @@ class CoordinateGraph {
       } else if (auto mul = As<Mul>(e)) {
         left = mul->left_;
         right = mul->right_;
+
       } else {
         CHECK(false) << "Unavailable affine synchronization access";
       }
@@ -249,9 +265,25 @@ class CoordinateGraph {
     }
     // Each intermediate has been range-checked in its original machine type,
     // including operands of zero and values before a widening INDEX cast.
-    CHECK(n.upper <= *maximum) << "Synchronization coordinate arithmetic may overflow its source type";
+    if (n.kind == Kind::Loop) {
+      // The execution domain, unlike a rectangular caller/start hull, excludes
+      // padded iterations beyond the original stop.
+      if (auto stop = As<ConstInt>(n.frame->stop_); stop && stop->value_ > n.lower)
+        n.upper = std::min(n.upper, stop->value_ - 1);
+      // Empty static bodies retain the prior representative admission bounds;
+      // their zero visit count, not a contradictory negative range, records absence.
+    }
+    CHECK(n.lower >= 0 && n.upper <= *maximum)
+        << "Synchronization coordinate arithmetic may overflow its source type";
     const auto id = nodes_.size();
     nodes_.push_back(n);
+    // This capability is distinct from bounded exact evaluation. Nonlinear
+    // quotients/remainders never silently flatten into representative offsets.
+    const bool affine = n.constant || n.kind == Kind::Parameter || n.kind == Kind::Block ||
+                        (n.kind == Kind::Loop && (!n.dynamic_start || affine_[n.left])) ||
+                        ((n.kind == Kind::Scale || n.kind == Kind::ModularShift) && affine_[n.left]) ||
+                        (n.kind == Kind::Add && affine_[n.left] && affine_[n.right]);
+    affine_.push_back(affine);
     memo_.emplace(key, id);
     ++input.coordinate_nodes;
     return id;
@@ -259,7 +291,90 @@ class CoordinateGraph {
   void Define(const ExprPtr& var, const ExprPtr& value, const SyncSegment& segment,
               const ParameterIndices& parameters, CompactSyncInput& input) {
     CHECK(SameCoordinateType(var, value)) << "Coordinate definition requires an explicit type conversion";
+    if (auto mod = As<FloorMod>(value); mod && As<ConstInt>(mod->right_)) {
+      CHECK(SameCoordinateType(value, mod->left_) && SameCoordinateType(value, mod->right_) &&
+            Constant(mod->right_) > 0)
+          << "Named slot remainder requires matching types and a positive fixed modulus";
+      // Validate operands at the definition's original scope now. This keeps
+      // forward references, cycles, narrowing and unready values unavailable;
+      // only the affine flattening of the remainder itself is deferred.
+      Build(mod->left_, segment, parameters, input);
+      Build(mod->right_, segment, parameters, input);
+      remainders_.emplace(var.get(), value);
+      return;
+    }
     definitions_.emplace(var.get(), Build(value, segment, parameters, input));
+  }
+  bool IsAffine(size_t root) const { return affine_.at(root); }
+  int64_t Upper(size_t root) const { return nodes_.at(root).upper; }
+  void CheckScope(size_t root, const SyncSegment& segment) const {
+    std::set<const ForStmt*> active;
+    if (segment.original_loop) active.insert(segment.original_loop.get());
+    for (const auto& frame : segment.nested_frames) active.insert(frame.loop.get());
+    std::set<size_t> seen;
+    std::vector<size_t> pending{root};
+    while (!pending.empty()) {
+      const auto id = pending.back();
+      pending.pop_back();
+      if (!seen.insert(id).second) continue;
+      const auto& node = nodes_.at(id);
+      if (node.kind == Kind::Loop) {
+        CHECK(active.count(node.frame.get())) << "External coordinate belongs to another occurrence frame";
+        if (node.dynamic_start) pending.push_back(node.left);
+      } else if (node.kind == Kind::Scale || node.kind == Kind::ModularShift) {
+        pending.push_back(node.left);
+      } else if (node.kind == Kind::Add || node.kind == Kind::FloorDivide || node.kind == Kind::Remainder) {
+        pending.push_back(node.left);
+        pending.push_back(node.right);
+      }
+    }
+  }
+  std::shared_ptr<const SyncExternalFootprint> External(size_t row, size_t column, const SyncStorage& storage,
+                                                        int64_t rows, int64_t columns) const {
+    auto out = std::make_shared<SyncExternalFootprint>();
+    // The importer alone owns the mutable builder. This alias is published only
+    // after complete import, when the builder dies; consumers see immutable DAGs.
+    out->program = program_;
+    out->row = row;
+    out->column = column;
+    auto unscale = [&](size_t id, int64_t scale) -> std::optional<size_t> {
+      if (scale == 1) return id;
+      const auto& node = nodes_[id];
+      if (node.kind == Kind::Scale && node.factor == scale) return node.left;
+      return std::nullopt;
+    };
+    const auto r = unscale(row, rows), c = unscale(column, columns);
+    if (!r || !c || storage.row_extent_parameter || storage.rows % rows || storage.columns % columns)
+      return out;
+    const auto& quotient = nodes_[*r];
+    const auto& remainder = nodes_[*c];
+    if (quotient.kind != Kind::FloorDivide ||
+        (remainder.kind != Kind::Remainder && remainder.kind != Kind::ModularShift) ||
+        quotient.left != remainder.left || nodes_[quotient.right].upper != nodes_[remainder.right].upper)
+      return out;
+    const auto& tile = nodes_[quotient.left];
+    const auto divisor = nodes_[quotient.right].upper;
+    // The affine fast path may normalize t%C to t-q*C when the complete
+    // admitted domain stays in one quotient band. Its original positive divisor
+    // remains in right; verify the whole-band proof, not one sampled coordinate.
+    if (remainder.kind == Kind::ModularShift && (tile.lower / divisor != tile.upper / divisor ||
+                                                 remainder.factor != (tile.lower / divisor) * divisor))
+      return out;
+    if (tile.kind != Kind::Loop || divisor != storage.columns / columns ||
+        tile.upper >= __int128(storage.rows / rows) * divisor)
+      return out;
+    // Paired quotient/remainder is an injective tile map: t = rowTile*C+colTile.
+    // This proves the map, NOT that another access/invocation cannot reuse it.
+    // The regional consumer must check the complete effect and visit inventory.
+    out->row_major_tiles =
+        SyncRowMajorTileMap{tile.frame,
+                            quotient.left,
+                            tile.dynamic_start ? std::optional<size_t>(tile.left) : std::nullopt,
+                            storage.rows / rows,
+                            divisor,
+                            rows,
+                            columns};
+    return out;
   }
   AffineCoordinate Flatten(size_t root, CompactSyncInput& input) const {
     // Construction IDs are topological. Propagate aggregate weights once per
@@ -294,16 +409,19 @@ class CoordinateGraph {
           add(n.left, weight);
         else
           shift_origin(__int128(weight) * n.start);
-        auto& coefficient = result.frames[n.frame];
+        auto& coefficient = result.frames[n.frame.get()];
         coefficient = Checked(__int128(coefficient) + __int128(weight) * n.step);
       } else if (n.kind == Kind::Scale) {
         add(n.left, Checked(__int128(weight) * n.factor));
       } else if (n.kind == Kind::ModularShift) {
         shift_origin(-__int128(weight) * n.factor);
         add(n.left, weight);
-      } else {
+      } else if (n.kind == Kind::Add) {
         add(n.left, weight);
         add(n.right, weight);
+
+      } else {
+        CHECK(false) << "Nonlinear coordinate requires an exact external footprint export";
       }
     }
     result.first = Checked(origin);
@@ -315,15 +433,6 @@ class CoordinateGraph {
 std::vector<StmtPtr> Statements(const StmtPtr& s) {
   if (auto seq = As<SeqStmts>(s)) return seq->stmts_;
   return {s};
-}
-CallPtr SingleCall(const StmtPtr& s) {
-  auto statements = Statements(s);
-  CHECK(statements.size() == 1) << "Conditional synchronization body must contain one payload";
-  auto eval = As<EvalStmt>(statements.front());
-  CHECK(eval) << "Conditional synchronization body must be a payload evaluation";
-  auto call = As<Call>(eval->expr_);
-  CHECK(call) << "Submit/indirect execution is outside the synchronization prototype";
-  return call;
 }
 class Importer {
  public:
@@ -347,7 +456,10 @@ class Importer {
   std::optional<size_t> vec_storage;
   struct SlotSelection {
     int64_t first, step;
-    const ForStmt* frame;
+    ForStmtPtr frame;
+    // The defining invocation must enclose every use, even for a constant
+    // selector. Arithmetic invariance is not permission to escape SSA scope.
+    ForStmtPtr scope;
   };
   std::unordered_map<const Expr*, SlotSelection> slots;
   ParameterIndices parameters;
@@ -382,7 +494,7 @@ class Importer {
     const auto id = Storage(call->args_[0]);
     const auto count = result.storage[id].slot_count;
     RequireIndex(call->args_[1]);
-    ExprPtr index = call->args_[1];
+    ExprPtr index = coordinates.SlotExpression(call->args_[1]);
     bool modulo = false;
     if (auto mod = As<FloorMod>(index)) {
       RequireIndex(mod->left_);
@@ -392,17 +504,36 @@ class Importer {
       modulo = true;
     }
     const auto coordinate = Coordinate(index, segment);
-    CHECK(coordinate.parameters.empty() && coordinate.frames.empty() && !coordinate.block)
+    CHECK(coordinate.parameters.empty() && !coordinate.block)
         << "Parameterized slot phase requires an explicit phase certificate";
-    CHECK(modulo || (!coordinate.second && coordinate.first < count))
+    auto frames = coordinate.frames;
+    if (coordinate.second) frames.emplace(segment.original_loop.get(), coordinate.second);
+    CHECK(frames.size() <= 1) << "Coupled slot coordinates require a multidimensional phase certificate";
+    ForStmtPtr frame;
+    int64_t stride = 0;
+    if (!frames.empty()) {
+      const auto [selected, coefficient] = *frames.begin();
+      stride = coefficient;
+      if (segment.original_loop.get() == selected) frame = segment.original_loop;
+      for (const auto& parent : segment.nested_frames)
+        if (parent.loop.get() == selected) frame = parent.loop;
+      CHECK(frame) << "Slot selection has no original occurrence frame";
+    }
+    CHECK(modulo || (!stride && coordinate.first < count))
         << "Slot selection must be a constant in range or a proved nonnegative affine rotation";
+    auto scope = segment.original_loop;
+    if (!scope && !segment.nested_frames.empty()) scope = segment.nested_frames.back().loop;
     objects[assign->var_.get()] = id;
-    slots[assign->var_.get()] = {coordinate.first % count, coordinate.second % count,
-                                 segment.original_loop.get()};
+    slots[assign->var_.get()] = {coordinate.first % count, stride % count, frame, scope};
   }
   void QualifySlot(const ExprPtr& handle, const SyncSegment& segment) const {
     if (auto slot = slots.find(handle.get()); slot != slots.end()) {
-      CHECK(!slot->second.frame || slot->second.frame == segment.original_loop.get())
+      const auto contains = [&](const ForStmtPtr& frame) {
+        return !frame || frame == segment.original_loop ||
+               std::any_of(segment.nested_frames.begin(), segment.nested_frames.end(),
+                           [&](const auto& parent) { return parent.loop == frame; });
+      };
+      CHECK(contains(slot->second.frame) && contains(slot->second.scope))
           << "Slot selection belongs to another occurrence frame";
     }
   }
@@ -411,7 +542,22 @@ class Importer {
     if (auto slot = slots.find(handle.get()); slot != slots.end()) {
       access.slot_first = slot->second.first;
       access.slot_step = slot->second.step;
+      access.slot_coordinate_frame = slot->second.frame;
     }
+  }
+  // All source organizations import the same supported definition forms. The
+  // caller still controls whether this cut may declare placed storage; sharing
+  // dispatch does not admit an allocation inside a previously qualified leaf.
+  void Definition(const AssignStmtPtr& assign, const SyncSegment& segment, bool allocations = false) {
+    const auto call = As<Call>(assign->value_);
+    if (IsOp(call, "buffer.slot"))
+      SelectSlot(assign, segment);
+    else if (IsOp(call, "buffer.subview") || IsOp(call, "buffer.reshape"))
+      View(assign, call, segment);
+    else if (As<ScalarType>(assign->var_->GetType()) || !allocations)
+      DefineCoordinate(assign, segment);
+    else
+      Allocate(assign);
   }
   void RegisterVec(const VarPtr& var, VecView view) {
     const auto type = view.type;
@@ -647,23 +793,56 @@ class Importer {
           << "Synchronization DMA requires a rank-two rectangle";
       // Coordinate readiness and checked arithmetic remain native admission
       // evidence even when no dependence footprint is requested.
-      const auto row = Coordinate(offsets->elements_[0], segment);
-      const auto column = Coordinate(offsets->elements_[1], segment);
+      RequireIndex(offsets->elements_[0]);
+      RequireIndex(offsets->elements_[1]);
+      const auto row_root = coordinates.Build(offsets->elements_[0], segment, parameters, result);
+      const auto column_root = coordinates.Build(offsets->elements_[1], segment, parameters, result);
+      coordinates.CheckScope(row_root, segment);
+      coordinates.CheckScope(column_root, segment);
       if (recover_accesses) {
-        auto id = Storage(call->args_[load ? 0 : 3]);
+        const auto id = Storage(call->args_[load ? 0 : 3]);
         auto& storage = result.storage[id];
-        if (translated_storage.insert(id).second) {
-          storage.row_parameters = row.parameters;
-          storage.column_parameters = column.parameters;
-          storage.row_block = row.block;
-          storage.column_block = column.block;
-        } else {
-          CHECK(storage.row_parameters == row.parameters && storage.column_parameters == column.parameters &&
-                storage.row_block == row.block && storage.column_block == column.block)
-              << "GM accesses need a common invocation translation; parameter-dependent overlap is unproved";
+        const auto rows = Constant(shape->elements_[0]), columns = Constant(shape->elements_[1]);
+        CHECK(rows > 0 && columns > 0 &&
+              __int128(coordinates.Upper(row_root)) + rows <=
+                  (storage.row_extent_parameter
+                       ? result.parameter_bounds.at(*storage.row_extent_parameter).first
+                       : storage.rows) &&
+              __int128(coordinates.Upper(column_root)) + columns <= storage.columns)
+            << "Synchronization access exceeds its proved allocation";
+        std::optional<AffineCoordinate> row, column;
+        if (coordinates.IsAffine(row_root) && coordinates.IsAffine(column_root)) {
+          row = Coordinate(offsets->elements_[0], segment);
+          column = Coordinate(offsets->elements_[1], segment);
         }
-        site.accesses.push_back(Access(id, !load, row, column, Constant(shape->elements_[0]),
-                                       Constant(shape->elements_[1]), segment));
+        std::set<const ForStmt*> moving;
+        if (row && column) {
+          for (const auto& coordinate : {*row, *column}) {
+            for (const auto& [frame, coefficient] : coordinate.frames)
+              if (coefficient) moving.insert(frame);
+            if (coordinate.second) moving.insert(segment.original_loop.get());
+          }
+        }
+        if (!row || !column || moving.size() > 1) {
+          CHECK(storage.space == MemorySpace::DDR) << "External coordinate needs a global storage domain";
+          SyncAccess access{id, !load, 0, 0, 0, 0, rows, columns};
+          access.external = coordinates.External(row_root, column_root, storage, rows, columns);
+          site.accesses.push_back(std::move(access));
+        } else {
+          if (translated_storage.insert(id).second) {
+            storage.row_parameters = row->parameters;
+            storage.column_parameters = column->parameters;
+            storage.row_block = row->block;
+            storage.column_block = column->block;
+          } else {
+            CHECK(storage.row_parameters == row->parameters &&
+                  storage.column_parameters == column->parameters && storage.row_block == row->block &&
+                  storage.column_block == column->block)
+                << "GM accesses need a common invocation translation; parameter-dependent overlap is "
+                   "unproved";
+          }
+          site.accesses.push_back(Access(id, !load, *row, *column, rows, columns, segment));
+        }
       }
       const auto gm_arg = load ? 0 : 3;
       (load ? modes[gm_arg].first : modes[gm_arg].second) = true;
@@ -692,13 +871,21 @@ class Importer {
       if (!extract) CHECK(s.rows == t.rows && s.columns == t.columns) << "Partial copy is not qualified";
       if (s.layout->slayout_ != TileLayout::none_box) {
         const auto box = s.layout->fractal_ / (16 * s.layout->dtype_.GetByte());
+        const auto aligned_frames = [](const auto& frames, int64_t alignment) {
+          return std::all_of(frames.begin(), frames.end(),
+                             [&](const auto& entry) { return entry.second % alignment == 0; });
+        };
         CHECK(row.first % 16 == 0 && row.second % 16 == 0 && t.rows % 16 == 0 && column.first % box == 0 &&
-              column.second % box == 0 && t.columns % box == 0)
+              column.second % box == 0 && t.columns % box == 0 && aligned_frames(row.frames, 16) &&
+              aligned_frames(column.frames, box))
             << "Unaligned boxed extraction requires a separate footprint contract";
       }
       auto source_access = Access(sid, false, row, column, t.rows, t.columns, segment);
-      CHECK(!extract || s.slot_count == 1 || PhysicalInterval(s, source_access))
-          << "Rotating-slot extraction requires an exact contiguous within-slot interval";
+      // The retained rectangle and physical layout are exact even when a
+      // moving or boxed slice has no stationary contiguous interval export.
+      // Consumers qualify their own representation: the periodic extractor
+      // still refuses unsupported moving shared geometry; numerical phase
+      // snapshots may specialize original coordinates before partitioning it.
       ApplySlot(source_access, call->args_[0], segment);
       if (recover_accesses) {
         site.accesses.push_back(std::move(source_access));
@@ -712,6 +899,9 @@ class Importer {
       if (IsOp(call, "buffer.matmul_acc")) whole(2, false);
       whole(2, true);
       site.pipe = PipeType::M;
+      // Initialization is an operation effect, independent of native completion
+      // protection. Small valid tiles still overwrite rather than read L0C.
+      site.initializes_accumulator = IsOp(call, "buffer.matmul");
       const auto lhs = As<BufferType>(call->args_[0]->GetType());
       const auto rhs = As<BufferType>(call->args_[1]->GetType());
       const auto dst = As<BufferType>(call->args_[2]->GetType());
@@ -728,7 +918,6 @@ class Importer {
         CHECK(result.storage[Storage(call->args_[2])].slot_count == 1)
             << "Rotating accumulator protection requires same-physical-slot qualification";
         site.protected_accumulator = Storage(call->args_[2]);
-        site.initializes_accumulator = IsOp(call, "buffer.matmul");
       }
     } else if (auto recipe = backend::FindBufferConversionRecipe(call->op_->name_)) {
       CHECK(result.owner->func_type_ == FunctionType::AIV &&
@@ -805,17 +994,49 @@ class Importer {
     }
     return site;
   }
+  CallPtr InitializationCall(const StmtPtr& statement, const SyncSegment& segment) {
+    auto statements = Statements(statement);
+    // A void original branch may terminate with the explicit empty yield
+    // introduced by Buffer lowering. It carries no payload/result and is not
+    // an additional event. Never skip a value-bearing or nonterminal yield.
+    if (!statements.empty()) {
+      if (const auto yield = As<YieldStmt>(statements.back()); yield && yield->value_.empty()) {
+        statements.pop_back();
+      }
+    }
+    CHECK(!statements.empty()) << "Conditional synchronization body must contain one payload";
+    // Buffer lowering materializes slot handles at each original use. Such
+    // definitions describe storage, not extra payload events. Qualify them in
+    // their actual arm; do not move them or admit arbitrary conditional work.
+    for (size_t i = 0; i + 1 < statements.size(); ++i) {
+      const auto assign = As<AssignStmt>(statements[i]);
+      CHECK(assign &&
+            (As<ScalarType>(assign->var_->GetType()) || IsOp(As<Call>(assign->value_), "buffer.slot")))
+          << "Initialization alternatives require only qualified scalar/slot definitions before one payload";
+      Definition(assign, segment);
+    }
+    const auto eval = As<EvalStmt>(statements.back());
+    CHECK(eval) << "Conditional synchronization body must end in one payload evaluation";
+    const auto call = As<Call>(eval->expr_);
+    CHECK(call) << "Submit/indirect execution is outside the synchronization prototype";
+    return call;
+  }
+  bool SameInitializationOperand(const ExprPtr& a, const ExprPtr& b) const {
+    // Matrix operands currently admit allocations and explicit slots, not
+    // arbitrary subviews (View is Vec-only). If matrix views are introduced,
+    // their exact offset/stride map must join this comparison before admission.
+    if (a == b) return true;
+    if (!structural_equal(a->GetType(), b->GetType()) || Storage(a) != Storage(b)) return false;
+    const auto x = slots.find(a.get()), y = slots.find(b.get());
+    if (x == slots.end() || y == slots.end()) return x == slots.end() && y == slots.end();
+    return x->second.first == y->second.first && x->second.step == y->second.step &&
+           x->second.frame == y->second.frame && x->second.scope == y->second.scope;
+  }
   void Body(const StmtPtr& stmt, SyncSegment& segment) {
     bool preceding_matrix = false;
     for (const auto& s : Statements(stmt)) {
       if (auto assign = As<AssignStmt>(s)) {
-        auto call = As<Call>(assign->value_);
-        if (call && IsOp(call, "buffer.slot"))
-          SelectSlot(assign, segment);
-        else if (call && (IsOp(call, "buffer.subview") || IsOp(call, "buffer.reshape")))
-          View(assign, call, segment);
-        else
-          DefineCoordinate(assign, segment);
+        Definition(assign, segment);
       } else if (auto eval = As<EvalStmt>(s)) {
         auto call = As<Call>(eval->expr_);
         CHECK(call) << "Submit or non-call payload is not qualified";
@@ -852,9 +1073,12 @@ class Importer {
           CHECK(found != first_visits.end() && found->second == frames[f].start)
               << "Initialization guard must test consecutive first-visit frames";
         }
-        auto first = SingleCall(branch->then_body_), later = SingleCall(*branch->else_body_);
+        auto first = InitializationCall(branch->then_body_, segment);
+        auto later = InitializationCall(*branch->else_body_, segment);
         CHECK(IsOp(first, "buffer.matmul") && IsOp(later, "buffer.matmul_acc") &&
-              first->args_ == later->args_)
+              first->args_.size() == later->args_.size() &&
+              std::equal(first->args_.begin(), first->args_.end(), later->args_.begin(),
+                         [&](const auto& a, const auto& b) { return SameInitializationOperand(a, b); }))
             << "Conditional payloads must preserve operands and destination";
         auto site = Site(first, segment);
         auto continuation = Site(later, segment);
@@ -997,10 +1221,7 @@ SyncRegion ImportStructuredBody(Importer& importer, const StmtPtr& statement,
       }
       parents.pop_back();
     } else if (auto assign = As<AssignStmt>(child)) {
-      if (As<ScalarType>(assign->var_->GetType()))
-        importer.DefineCoordinate(assign, finite);
-      else
-        importer.Allocate(assign);
+      importer.Definition(assign, finite, true);
     } else if (!As<YieldStmt>(child) && !As<ReturnStmt>(child)) {
       importer.Body(child, finite);
     }
@@ -1018,7 +1239,8 @@ struct StartupSummary {
   std::map<size_t, Site> first_access;
   std::map<const ForStmt*, Site> pending;
 };
-StartupSummary QualifyStartupScopes(SyncRegion& region, const CompactSyncInput& input) {
+StartupSummary QualifyStartupScopes(SyncRegion& region, const CompactSyncInput& input,
+                                    const std::set<const ForStmt*>& phase_scopes) {
   StartupSummary out;
   if (region.leaf) {
     const auto& segment = input.segments[*region.leaf];
@@ -1035,7 +1257,7 @@ StartupSummary QualifyStartupScopes(SyncRegion& region, const CompactSyncInput& 
     }
   } else {
     for (auto& child : region.children) {
-      auto next = QualifyStartupScopes(child, input);
+      auto next = QualifyStartupScopes(child, input, phase_scopes);
       if (!out.first_matrix) out.first_matrix = next.first_matrix;
       out.first_access.insert(next.first_access.begin(), next.first_access.end());
       for (const auto& [scope, site] : next.pending)
@@ -1049,8 +1271,20 @@ StartupSummary QualifyStartupScopes(SyncRegion& region, const CompactSyncInput& 
       const auto [leaf, index] = found->second;
       const auto& site = input.segments[leaf].sites[index];
       if (out.first_matrix) {
-        CHECK(site.protected_accumulator && out.first_matrix == found->second &&
-              out.first_access.at(*site.protected_accumulator) == found->second)
+        std::optional<size_t> initialized_storage;
+        for (const auto& access : site.accesses)
+          if (access.write && input.storage[access.storage].space == MemorySpace::Acc) {
+            CHECK(!initialized_storage || *initialized_storage == access.storage)
+                << "Scoped initialization requires one accumulator footprint";
+            initialized_storage = access.storage;
+          }
+        // The phase provider reduces the actual finite startup separately.
+        // That construction needs first-touch initialization, not the hardware
+        // >=10-tile exemption. Keep the older invariant provider's stronger
+        // entry contract until its unprotected seam is qualified independently.
+        CHECK(initialized_storage && site.initializes_accumulator &&
+              (site.protected_accumulator || phase_scopes.count(region.repetition->loop.get())) &&
+              out.first_matrix == found->second && out.first_access.at(*initialized_storage) == found->second)
             << "Scoped initialization requires first-touch qualified accumulator evidence";
         region.startup = found->second;
       }
@@ -1074,8 +1308,9 @@ class InvocationBounds : public IRVisitor {
   const std::map<std::string, FunctionPtr>& functions_;
   std::map<std::string, std::map<size_t, std::optional<Bound>>>& evidence_;
   std::map<std::string, std::optional<Bound>>& launches_;
+  std::map<std::string, std::optional<Bound>>& counts_;
   FunctionPtr caller_;
-  std::optional<Bound> block_index_;
+  std::optional<Bound> block_index_, block_count_;
   SyncParameterWork& work_;
   std::unordered_map<const Expr*, std::optional<Bound>> ranges_;
   std::set<const Expr*> visited_;
@@ -1101,6 +1336,9 @@ class InvocationBounds : public IRVisitor {
         call && (IsOp(call, "buffer.get_block_idx") || IsOp(call, "tile.get_block_idx"))) {
       return block_index_;
     }
+    if (auto call = As<Call>(expression);
+        call && (IsOp(call, "buffer.get_block_num") || IsOp(call, "tile.get_block_num")))
+      return block_count_;
     if (auto cast = As<Cast>(expression)) {
       auto source = Range(cast->operand_);
       return source && source->second <= *maximum ? source : std::nullopt;
@@ -1145,15 +1383,19 @@ class InvocationBounds : public IRVisitor {
     if (auto global = As<GlobalVar>(call->op_)) {
       auto found = functions_.find(global->name_);
       if (found != functions_.end()) {
-        std::optional<Bound> launch;
+        std::optional<Bound> launch, count_range;
         if (found->second->func_type_ == FunctionType::Spmd) {
           auto count = call->GetAttr<ExprPtr>(kAttrCoreNum, nullptr);
           if (count) {
             auto bound = Range(count);
-            if (bound && bound->first > 0) launch = Bound{0, bound->second - 1};
+            if (bound && bound->first > 0) {
+              launch = Bound{0, bound->second - 1};
+              count_range = bound;
+            }
           } else if (auto constant = As<ConstInt>(found->second->GetAttr<ExprPtr>(kAttrCoreNum, nullptr));
                      constant && constant->value_ > 0) {
             launch = Bound{0, constant->value_ - 1};
+            count_range = Bound{constant->value_, constant->value_};
           }
         } else if (caller_->func_type_ == FunctionType::Spmd &&
                    (found->second->func_type_ == FunctionType::AIC ||
@@ -1162,6 +1404,7 @@ class InvocationBounds : public IRVisitor {
           // Dual-AIV dispatch shares that index between lanes; it does not
           // establish a subblock range or disjoint storage between the lanes.
           launch = block_index_;
+          count_range = block_count_;
         }
         auto [launch_it, first_launch] = launches_.emplace(global->name_, launch);
         if (!first_launch) {
@@ -1169,6 +1412,15 @@ class InvocationBounds : public IRVisitor {
             launch_it->second = std::nullopt;
           else
             launch_it->second->second = std::max(launch_it->second->second, launch->second);
+        }
+        auto [count_it, first_count] = counts_.emplace(global->name_, count_range);
+        if (!first_count) {
+          if (!count_it->second || !count_range) {
+            count_it->second = std::nullopt;
+          } else {
+            count_it->second->first = std::min(count_it->second->first, count_range->first);
+            count_it->second->second = std::max(count_it->second->second, count_range->second);
+          }
         }
         const auto& params = found->second->params_;
         auto& callee = evidence_[global->name_];
@@ -1193,18 +1445,25 @@ class InvocationBounds : public IRVisitor {
  public:
   InvocationBounds(const std::map<std::string, FunctionPtr>& functions,
                    std::map<std::string, std::map<size_t, std::optional<Bound>>>& evidence,
-                   std::map<std::string, std::optional<Bound>>& launches, FunctionPtr caller,
+                   std::map<std::string, std::optional<Bound>>& launches,
+                   std::map<std::string, std::optional<Bound>>& counts, FunctionPtr caller,
                    SyncParameterWork& work)
       : functions_(functions),
         evidence_(evidence),
         launches_(launches),
+        counts_(counts),
         caller_(std::move(caller)),
         work_(work) {
     // Every predecessor has been processed before this environment is built.
     // Missing/unknown formal bounds are not inferred from a sample invocation.
-    if (auto incoming = evidence.find(caller_->name_); incoming != evidence.end())
-      for (const auto& [index, bound] : incoming->second)
+    if (auto incoming = evidence.find(caller_->name_); incoming != evidence.end()) {
+      for (const auto& [index, bound] : incoming->second) {
         if (bound) analyzer_.Update(caller_->params_.at(index), {bound->first, bound->second});
+      }
+    }
+    if (auto count = counts.find(caller_->name_); count != counts.end()) {
+      block_count_ = count->second;
+    }
     if (auto launch = launches.find(caller_->name_); launch != launches.end()) {
       block_index_ = launch->second;
     }
@@ -1307,7 +1566,7 @@ SyncInvocationEvidence CollectSyncInvocationEvidence(const ProgramPtr& program, 
   std::map<std::string, FunctionPtr> functions;
   for (const auto& [global, function] : program->functions_) functions.emplace(global->name_, function);
   std::map<std::string, std::map<size_t, std::optional<std::pair<int64_t, int64_t>>>> evidence;
-  std::map<std::string, std::optional<std::pair<int64_t, int64_t>>> launches;
+  std::map<std::string, std::optional<std::pair<int64_t, int64_t>>> launches, counts;
   std::map<std::string, std::set<std::string>> edges;
   std::map<std::string, size_t> incoming;
   for (const auto& [name, function] : functions) incoming.emplace(name, 0);
@@ -1329,7 +1588,7 @@ SyncInvocationEvidence CollectSyncInvocationEvidence(const ProgramPtr& program, 
   while (!ready.empty()) {
     const auto name = *ready.begin();
     ready.erase(ready.begin());
-    InvocationBounds collector(functions, evidence, launches, functions.at(name), *work);
+    InvocationBounds collector(functions, evidence, launches, counts, functions.at(name), *work);
     collector.VisitFunction(functions.at(name));
     processed.insert(name);
     ++work->processed_functions;
@@ -1342,6 +1601,8 @@ SyncInvocationEvidence CollectSyncInvocationEvidence(const ProgramPtr& program, 
       if (bound && processed.count(name)) result.parameters[name].emplace(index, *bound);
   for (const auto& [name, bound] : launches)
     if (bound && processed.count(name)) result.block_indices.emplace(name, *bound);
+  for (const auto& [name, bound] : counts)
+    if (bound && processed.count(name)) result.block_counts.emplace(name, *bound);
   return result;
 }
 // Qualify only already recovered exact geometry. This is one pass over static
@@ -1436,7 +1697,16 @@ static CompactSyncInput ImportQualifiedSync(const FunctionPtr& function, const s
     std::vector<SyncLoopFrame> frames;
     importer.result.region_tree = ImportStructuredBody(importer, function->body_, frames, nested);
     if (recover_accesses) {
-      CHECK(QualifyStartupScopes(*importer.result.region_tree, importer.result).pending.empty())
+      std::set<const ForStmt*> phase_scopes;
+      for (const auto& segment : importer.result.segments)
+        for (const auto& site : segment.sites)
+          for (const auto& access : site.accesses)
+            if (access.slot_coordinate_frame && access.slot_coordinate_frame != segment.original_loop &&
+                importer.result.storage[access.storage].slot_count /
+                        std::gcd(importer.result.storage[access.storage].slot_count, access.slot_step) >
+                    1)
+              phase_scopes.insert(access.slot_coordinate_frame.get());
+      CHECK(QualifyStartupScopes(*importer.result.region_tree, importer.result, phase_scopes).pending.empty())
           << "Initialization scope is outside the retained source tree";
       QualifyPhysicalIntervals(importer.result);
     }
@@ -1444,13 +1714,7 @@ static CompactSyncInput ImportQualifiedSync(const FunctionPtr& function, const s
   }
   for (const auto& stmt : Statements(function->body_)) {
     if (auto a = As<AssignStmt>(stmt)) {
-      if (auto call = As<Call>(a->value_); call && IsOp(call, "buffer.slot")) {
-        importer.SelectSlot(a, SyncSegment{});
-      } else if (As<ScalarType>(a->var_->GetType())) {
-        importer.DefineCoordinate(a, SyncSegment{});
-      } else {
-        importer.Allocate(a);
-      }
+      importer.Definition(a, SyncSegment{}, true);
       continue;
     }
     if (As<ReturnStmt>(stmt)) continue;

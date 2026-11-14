@@ -29,6 +29,8 @@
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "src/ir/transforms/utils/scoped_sync_palette.h"
+#include "src/ir/transforms/utils/scoped_token_families.h"
 #include "src/ir/transforms/utils/sync_invocation_domains.h"
 #include "src/ir/transforms/utils/sync_placement.h"
 #include "src/ir/transforms/utils/sync_token_names.h"
@@ -174,6 +176,8 @@ struct AssignedEndpoint {
   size_t case_index, family_index;
   bool publish;
   std::shared_ptr<const SyncEndpointDomain> domain;
+  const AssignedScopedPalette* palette = nullptr;
+  const ScopedPublicationRankPiece* rank = nullptr;
 };
 struct AssignedCut {
   size_t case_index;
@@ -197,12 +201,15 @@ class ScheduleDomains {
       const auto& context = *retained->frame;
       INTERNAL_CHECK(context.owner == input_.owner && context.blocks == input_.block_bounds &&
                      context.region == r && context.loops.size() == frames.size() &&
-                     retained->ranges.size() == frames.size())
+                     retained->ranges.size() == frames.size() &&
+                     (retained->steps.empty() || retained->steps.size() == frames.size()))
           << "Foreign endpoint domain";
       for (size_t i = 0; i < frames.size(); ++i) {
         const auto [first, end] = retained->ranges[i];
-        INTERNAL_CHECK(first >= 0 && first < end && end <= frames[i].count)
-            << "Invalid retained endpoint interval";
+        const auto stride = retained->steps.empty() ? 1 : retained->steps[i];
+        INTERNAL_CHECK(first >= 0 && first < end && end <= frames[i].count && stride > 0 &&
+                       (end - first - 1) % stride == 0)
+            << "Invalid retained endpoint progression";
         INTERNAL_CHECK(context.loops[i].loop == frames[i].loop && context.loops[i].count == frames[i].count &&
                        context.loops[i].start == frames[i].start && context.loops[i].step == frames[i].step &&
                        context.loops[i].start_expression == frames[i].start_expression)
@@ -210,6 +217,9 @@ class ScheduleDomains {
       }
       return retained;
     }
+    CHECK(std::all_of(f.axes.begin(), f.axes.end(), [](const ScopedDemandAxis& axis) {
+      return axis.source_step == 1 && axis.target_step == 1;
+    })) << "Periodic scoped endpoints require retained exact activity domains";
     // Mathematics-only clients use the same domain representation. Decode once
     // at this compatibility boundary; actual-token clients never take this path.
     auto base = publish ? f.source_first : f.target_first;
@@ -254,6 +264,49 @@ class AssignedRegionSchedule {
       const auto& families = cases[c].assignment->Families();
       INTERNAL_CHECK(input.owner == owner) << "Foreign assigned schedule owner";
       ScheduleDomains domains(input);
+      if (const auto& protocol = cases[c].assignment->Protocol()) {
+        protocol->ValidateFor(input);
+        const auto& mapping = cases[c].assignment->ProtocolAssignments();
+        for (const auto& original : protocol->Cuts()) {
+          const auto& payload = input.segments[original.region].sites[original.site];
+          AssignedCut cut{c, payload.original, payload.continuation, {}, {}};
+          auto append = [&](size_t raw, bool publish, std::vector<AssignedEndpoint>& endpoints) {
+            const auto& use = protocol->Families()[raw];
+            const auto assigned = mapping.at(raw);
+            const auto& raw_palettes = cases[c].assignment->RawPalettes();
+            if (!raw_palettes.empty() && raw_palettes[raw].palette) {
+              const auto& palette = cases[c].assignment->Palettes().at(*raw_palettes[raw].palette);
+              const auto& pieces = palette.certificate->Schedule()->Pieces();
+              for (auto index : raw_palettes[raw].pieces) {
+                const auto& piece = pieces.at(index);
+                INTERNAL_CHECK(piece.raw_use == raw) << "Assigned rank piece has a foreign raw use";
+                const auto& digits = publish ? piece.source : piece.target;
+                auto domain = std::make_shared<SyncEndpointDomain>();
+                domain->frame = domains.Get(use, publish)->frame;
+                for (const auto& digit : digits) {
+                  const auto end = static_cast<__int128>(digit.first) +
+                                   static_cast<__int128>(digit.count - 1) * digit.step + 1;
+                  INTERNAL_CHECK(end <= std::numeric_limits<int64_t>::max())
+                      << "Rank piece endpoint overflow";
+                  domain->ranges.emplace_back(digit.first, static_cast<int64_t>(end));
+                  domain->steps.push_back(digit.step);
+                }
+                endpoints.push_back({c, assigned, publish, std::move(domain), &palette, &piece});
+                ++work.assigned_schedule_endpoints;
+              }
+            } else {
+              INTERNAL_CHECK(families[assigned].ids.size() <= 1)
+                  << "Protocol view requires a certified raw-record physical rank map";
+              endpoints.push_back({c, assigned, publish, domains.Get(use, publish)});
+              ++work.assigned_schedule_endpoints;
+            }
+          };
+          for (auto raw : original.before) append(raw, false, cut.before);
+          for (auto raw : original.after) append(raw, true, cut.after);
+          cuts.push_back(std::move(cut));
+        }
+        continue;
+      }
       std::map<SyncSiteKey, std::vector<size_t>> incoming, outgoing;
       for (size_t f = 0; f < families.size(); ++f) {
         const auto& family = families[f];
@@ -385,6 +438,11 @@ RegularSchedules CollectRegularLoops(const AssignedRegionSchedule& schedule, Phy
         if (endpoint.domain) {
           const auto& frames = endpoint.domain->frame->loops;
           if (frames.empty()) continue;
+          // Interval-only phase scheduling has no residue proof for these
+          // domains. Keep the exact guarded path instead of widening holes.
+          if (std::any_of(endpoint.domain->steps.begin(), endpoint.domain->steps.end(),
+                          [](int64_t stride) { return stride != 1; }))
+            continue;
           loop = frames.back().loop;
           std::tie(first, end) = endpoint.domain->ranges.back();
           for (size_t i = 0; i + 1 < frames.size(); ++i)
@@ -431,7 +489,8 @@ RegularSchedules CollectRegularLoops(const AssignedRegionSchedule& schedule, Phy
     for (const auto& use : inventory) {
       const auto& endpoint = *use.endpoint;
       const auto& family = schedule.Record(endpoint);
-      const auto p = static_cast<int64_t>(family.ids.size());
+      const auto p =
+          static_cast<int64_t>(endpoint.palette ? endpoint.palette->ids.size() : family.ids.size());
       if (use.first < 0 || use.end > count || use.first >= use.end) {
         valid = false;
         break;
@@ -609,6 +668,14 @@ class AssignedCommandLowering {
     for (size_t i = 0; i < frames.size(); ++i) {
       const auto [first, end] = domain->ranges[i];
       INTERNAL_CHECK(first >= 0 && end > first && end <= frames[i].count) << "Invalid endpoint interval";
+      const auto stride = domain->steps.empty() ? 1 : domain->steps[i];
+      if (stride > 1) {
+        // Normalize with the admitted original frame origin, not a potentially
+        // later first-active visit: the dividend is nonnegative on all visits.
+        auto residue = std::make_shared<FloorMod>(FrameDigit(frames[i], span), Integer(stride, span),
+                                                  DataType::INDEX, span);
+        guards.push_back(std::make_shared<Eq>(residue, Integer(first % stride, span), DataType::BOOL, span));
+      }
       if (phase_ && frames[i].loop == phase_->loop && phase_->first >= first && phase_->end <= end) continue;
       if (!first && end == frames[i].count) continue;
       // Each requested threshold is within the admitted frame, including
@@ -651,9 +718,9 @@ class AssignedCommandLowering {
     const size_t r = publish ? f.source_region : f.target_region;
     const int64_t first = publish ? f.source_first : f.target_first;
     const bool scoped = input_.region_tree.has_value();
-    // The initial scoped certificate deliberately proves period one. Keep
-    // physical table coordinates separate from the full logical record tuple.
-    INTERNAL_CHECK(!scoped || f.ids.size() <= 1) << "Internal error: unsupported scoped physical period";
+    const auto& ids = endpoint.palette ? endpoint.palette->ids : f.ids;
+    INTERNAL_CHECK(!scoped || endpoint.palette || ids.size() <= 1)
+        << "Internal error: unsupported scoped physical period";
     // Decide activity before constructing calls or predicates. Unknown outer
     // dimensions remain in the retained domain and are emitted normally.
     if (phase_) {
@@ -681,17 +748,42 @@ class AssignedCommandLowering {
     } else {
       ExprPtr residue;
       const bool literal_residue = phase_ && phase_->residue.has_value() && !scoped;
-      if (f.ids.size() > 1 && !literal_residue)
-        residue = std::make_shared<FloorMod>(index, Integer(f.ids.size(), span), DataType::INDEX, span);
+      if (endpoint.palette && ids.size() > 1) {
+        INTERNAL_CHECK(endpoint.rank && endpoint.domain) << "Missing certified publication rank";
+        const auto modulus = static_cast<int64_t>(ids.size());
+        INTERNAL_CHECK(static_cast<__int128>(modulus) * (modulus - 1) <= std::numeric_limits<int64_t>::max())
+            << "Directional palette is too large for bounded modular INDEX arithmetic";
+        residue = Integer(endpoint.rank->rank_base % modulus, span);
+        const auto& digits = publish ? endpoint.rank->source : endpoint.rank->target;
+        for (size_t i = 0; i < endpoint.rank->rank_coefficients.size(); ++i) {
+          const auto coefficient = endpoint.rank->rank_coefficients[i] % modulus;
+          if (!coefficient || endpoint.rank->source[i].count == 1) continue;
+          INTERNAL_CHECK(i < digits.size() && i < endpoint.domain->frame->loops.size())
+              << "Matched WAIT rank lost original source coordinate";
+          ExprPtr digit = FrameDigit(endpoint.domain->frame->loops[i], span);
+          if (digits[i].first)
+            digit = std::make_shared<Sub>(digit, Integer(digits[i].first, span), DataType::INDEX, span);
+          if (digits[i].step != 1)
+            digit = std::make_shared<FloorDiv>(digit, Integer(digits[i].step, span), DataType::INDEX, span);
+          digit = std::make_shared<FloorMod>(digit, Integer(modulus, span), DataType::INDEX, span);
+          if (coefficient != 1)
+            digit = std::make_shared<Mul>(digit, Integer(coefficient, span), DataType::INDEX, span);
+          residue = std::make_shared<FloorMod>(std::make_shared<Add>(residue, digit, DataType::INDEX, span),
+                                               Integer(modulus, span), DataType::INDEX, span);
+        }
+        residue = Conditions(r).Simplify(residue);
+      } else if (ids.size() > 1 && !literal_residue) {
+        residue = std::make_shared<FloorMod>(index, Integer(ids.size(), span), DataType::INDEX, span);
+      }
       ControlPtr selection;
       // This is the complete table for FloorMod(index, positive table size),
       // whose range is [0, size). After excluding residues 0..size-2, the last
       // entry is exhaustive. This proof belongs to this table constructor,
       // not arbitrary conditional trees. Keep the entire selection beneath
       // the original presence guards, including lower bounds on index.
-      for (size_t i = f.ids.size(); i-- > 0;) {
+      for (size_t i = ids.size(); i-- > 0;) {
         if (literal_residue) {
-          const auto period = static_cast<int64_t>(f.ids.size());
+          const auto period = static_cast<int64_t>(ids.size());
           const auto digit =
               static_cast<int64_t>((__int128(phase_->first) + *phase_->residue - first) % period);
           if (i != static_cast<size_t>((digit + period) % period)) continue;
@@ -700,11 +792,11 @@ class AssignedCommandLowering {
             publish ? "system.set_flag" : "system.wait_flag", {},
             {{"src_pipe", static_cast<int>(src)},
              {"dst_pipe", static_cast<int>(dst)},
-             {"event_id", f.ids[i]},
+             {"event_id", ids[i]},
              {"core_type", std::string(input_.owner->func_type_ == FunctionType::AIV ? "aiv" : "aic")}},
             span);
         ControlPtr command = ControlCommand(call, span, result_);
-        if (residue && i + 1 < f.ids.size()) {
+        if (residue && i + 1 < ids.size()) {
           ++result_.guard_sites;
           command = ControlBranch(
               Conditions(r).Simplify(std::make_shared<Eq>(residue, Integer(i, span), DataType::BOOL, span)),
@@ -2062,7 +2154,21 @@ FunctionPtr CompileAssignedSyncSchedule(const FunctionPtr& owner, const std::vec
 
 }  // namespace physical
 
-using namespace physical;
+using physical::AbsentLoops;
+using physical::BoundaryScheduleCollector;
+using physical::CaseCommands;
+using physical::CommandSeams;
+using physical::ControlForest;
+using physical::CutDomains;
+using physical::CutInventory;
+using physical::GroupInvocationSchedules;
+using physical::kScheduleModes;
+using physical::MaterializeSelectedSchedule;
+using physical::PhysicalCuts;
+using physical::PreparedLoops;
+using physical::PreparedSchedulePhase;
+using physical::RequireCommandScope;
+using physical::ScheduleTreeSize;
 void FinishSyncScheduleReceipt(const FunctionPtr& function, PhysicalSyncRealization& work,
                                const SyncSchedulePolicy& policy) {
   CHECK(policy.mode == "auto" ||

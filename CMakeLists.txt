@@ -113,6 +113,8 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/compact_sync_analysis.cpp
     src/ir/transforms/utils/rotating_sync_analysis.cpp
     src/ir/transforms/utils/numerical_sync_hierarchy.cpp
+    src/ir/transforms/utils/numerical_sync_phase.cpp
+    src/ir/transforms/utils/sync_coordinate_program.cpp
     src/ir/transforms/utils/numerical_sync_merge.cpp
     src/ir/transforms/utils/numerical_sync_order.cpp
     src/ir/transforms/utils/placed_sync_import.cpp
@@ -125,6 +127,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/scoped_logical_sync.cpp
     src/ir/transforms/utils/scoped_token_families.cpp
     src/ir/transforms/utils/scoped_token_order.cpp
+    src/ir/transforms/utils/scoped_sync_palette.cpp
     src/ir/transforms/utils/physical_sync_allocation.cpp
     src/ir/transforms/utils/physical_sync_commands.cpp
     src/ir/transforms/utils/physical_sync_schedule.cpp

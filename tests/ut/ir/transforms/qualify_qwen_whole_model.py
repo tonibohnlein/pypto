@@ -19,6 +19,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from typing import Any
 
 import torch
 from pypto import backend, ir, passes, testing
@@ -61,7 +62,7 @@ def main() -> None:
     )
     tool = find_ptoas_binary()
     sys.path[:0] = [str(model), str(library)]
-    receipt = {
+    receipt: dict[str, Any] = {
         "compiler_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
         "library_revision": subprocess.check_output(
             ["git", "-C", str(library), "rev-parse", "HEAD"], text=True
@@ -169,6 +170,8 @@ def main() -> None:
         if args.check_function and receipt["compile_success"]:
             original = ir.deserialize_from_file(str(output / "before-sync.msgpack"))
             physical = ir.deserialize_from_file(str(output / "after-sync.msgpack"))
+            assert isinstance(original, ir.Program)
+            assert isinstance(physical, ir.Program)
             evidence = testing.sync_invocation_evidence(original)
             originals = {f.name: f for f in original.functions.values()}
             emitted = {f.name: f for f in physical.functions.values()}

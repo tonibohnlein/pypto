@@ -16,6 +16,7 @@ import pytest
 from pypto import ir, testing
 
 from .sync_matmul_oracle import interpret, sequence_stmts, validate
+from .sync_physical_oracle import assert_same_family_maps
 from .sync_qwen_prefill_cases import (
     assert_gate_up_body_identity,
     assert_output_body_identity,
@@ -155,7 +156,7 @@ def test_full_output_projection_admits_proved_singleton_launch_frame():
     )
     # Explicitly requested boundary phases keep the same allocated handoffs.
     assert specialized["set_sites"] == specialized["wait_sites"] == 29
-    assert specialized["families"] == physical["families"]
+    assert_same_family_maps(specialized["families"], physical["families"])
 
 
 @pytest.mark.parametrize("block,layer", [(0, 0), (3, 1)])

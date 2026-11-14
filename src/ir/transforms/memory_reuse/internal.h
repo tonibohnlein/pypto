@@ -39,6 +39,8 @@ bool LoopMayExecute(const StmtPtr& statement, bool after_first);
 // Each call owns its analysis/mutator state; no state survives a function pass.
 FunctionPtr TransformMaterializeSemanticAliases(const FunctionPtr& func);
 StmtPtr RefreshStorageTypes(const StmtPtr& body);
+// Read-only plan using the same liveness checks as semantic legalization.
+std::map<VarPtr, TypePtr> PlanAccumulatorIfPhis(const StmtPtr& body);
 StmtPtr CoalesceAccumulatorIfPhis(const StmtPtr& body);
 
 // Function-local plan for descriptor selection. Keys are original Tile Vars;

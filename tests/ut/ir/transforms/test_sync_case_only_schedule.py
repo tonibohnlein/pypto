@@ -9,6 +9,8 @@
 
 """Production case versioning must not require an endpoint-boundary phase."""
 
+from typing import cast
+
 import pytest
 from pypto import ir, testing
 from pypto.ir.op import sync
@@ -22,6 +24,8 @@ pytestmark = pytest.mark.usefixtures("ascend_backend")
 
 def case_only_fixture(trips=12):
     original, logical = _two_streams(strengthen=True)
+    assert isinstance(original.body, ir.SeqStmts) and isinstance(logical.body, ir.SeqStmts)
+    original_body = original.body
     span = original.span
     index = ir.ScalarType(ir.DataType.INDEX)
     block, unused, iv, prefix_iv = [ir.Var(n, index, span) for n in ("block", "unused", "i", "prefix")]
@@ -32,7 +36,8 @@ def case_only_fixture(trips=12):
     definition = ir.AssignStmt(block, ir.Call(ir.get_op("buffer.get_block_idx"), [], index, span), span)
     # This original one-visit/absent prefix establishes two invocation cases.
     # The repeated main loop itself executes with identical bounds in both.
-    prefix_load = original.body.stmts[5].expr
+    prefix_load = cast(ir.EvalStmt, original_body.stmts[5]).expr
+    assert isinstance(prefix_load, ir.Call)
     prefix_payload = ir.EvalStmt(ir.Call(prefix_load.op, prefix_load.args, prefix_load.type, span), span)
     prefix = ir.ForStmt(
         prefix_iv,
@@ -46,14 +51,19 @@ def case_only_fixture(trips=12):
     )
     # The terminal MTE2 payload consumes the closing wait on y, so the next
     # iteration's x load does not introduce an unrepresented same-pipe WAW.
-    last_load = original.body.stmts[5].expr
+    last_load = cast(ir.EvalStmt, original_body.stmts[5]).expr
+    assert isinstance(last_load, ir.Call)
     terminal = ir.EvalStmt(ir.Call(last_load.op, last_load.args, last_load.type, span), span)
     closed = ir.Var("closed", ir.SyncTokenType(ir.PipeType.MTE3), span)
     repeated = list(logical.body.stmts[2:-1])
     # Preserve a legal extra consuming use in the first case. The original
     # actual-token parser, rather than a demand recomputation, owns both cases.
     first_wait = next(
-        s for s in repeated if isinstance(s, ir.EvalStmt) and s.expr.op.name == ir.get_op("sync.wait").name
+        s
+        for s in repeated
+        if isinstance(s, ir.EvalStmt)
+        and isinstance(s.expr, ir.Call)
+        and s.expr.op.name == ir.get_op("sync.wait").name
     )
     repeated.insert(
         repeated.index(first_wait) + 1,
@@ -82,13 +92,13 @@ def case_only_fixture(trips=12):
             original.name,
             [*zip(original.params, original.param_directions), unused],
             original.return_types,
-            ir.SeqStmts([definition, *original.body.stmts[:2], prefix, loop, original.body.stmts[-1]], span),
+            ir.SeqStmts([definition, *original_body.stmts[:2], prefix, loop, original_body.stmts[-1]], span),
             span,
             original.func_type,
             ir_stage=original.ir_stage,
         )
 
-    return make([*original.body.stmts[2:-1], terminal]), make(repeated)
+    return make([*original_body.stmts[2:-1], terminal]), make(repeated)
 
 
 def test_case_only_production_keeps_original_loop_bounds_and_actual_uses():
@@ -118,6 +128,12 @@ def test_case_only_production_keeps_original_loop_bounds_and_actual_uses():
         if isinstance(s, ir.ForStmt) and isinstance(s.start, ir.ConstInt) and s.start.value == 5
     ]
     assert len(loops) == 2  # One unchanged loop version per incompatible case.
-    assert all(s.stop.value == 28 and s.step.value == 2 for s in loops)
+    assert all(
+        isinstance(s.stop, ir.ConstInt)
+        and s.stop.value == 28
+        and isinstance(s.step, ir.ConstInt)
+        and s.step.value == 2
+        for s in loops
+    )
     for block in (0, 1):
         check(original, logical, physical, {4: 0}, block=block, minimum_protocol=False)

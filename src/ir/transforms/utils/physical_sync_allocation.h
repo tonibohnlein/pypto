@@ -14,6 +14,7 @@
 
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -42,6 +43,11 @@ struct DirectSyncOrder {
   std::function<std::optional<__int128>(size_t, size_t, size_t)> threshold;
   std::function<bool(size_t)> scoped_reuse, scoped_barrier;
   bool finite_minimum = false;
+  std::shared_ptr<const ScopedSyncProtocol> protocol;
+  std::function<void(const std::vector<PhysicalSyncFamily>&)> validate_families;
+  // One complete directional protocol with typed refusal and construction work.
+  // The caller supplies existing eligible capacity, never a new resource pool.
+  std::function<ScopedPaletteResult(PipeType, PipeType, int64_t)> scoped_palette;
 };
 PhysicalSyncRealization RealizeDirectSync(const CompactSyncInput& input,
                                           std::vector<PhysicalSyncFamily> families,

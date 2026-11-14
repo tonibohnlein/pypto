@@ -42,6 +42,9 @@ struct SyncInvocationEvidence {
   // Inclusive logical block-index hull, proved from every incoming SPMD launch.
   // Separate from formal ABI positions; absence is an unavailable launch proof.
   std::map<std::string, std::pair<int64_t, int64_t>> block_indices;
+  // Launch cardinality is independent evidence: an index hull alone cannot
+  // establish one count when different callers launch different sizes.
+  std::map<std::string, std::pair<int64_t, int64_t>> block_counts;
 };
 SyncInvocationEvidence CollectSyncInvocationEvidence(const ProgramPtr& program,
                                                      SyncParameterWork* work = nullptr);
@@ -71,21 +74,62 @@ struct SyncStorage {
   // one slot; bytes covers the whole reservation. No slot list is materialized.
   int64_t slot_count = 1, slot_bytes = 0;
 };
+// Checked source-coordinate DAG. Loop nodes denote the ORIGINAL induction
+// value, not a flattened visit ordinal. A dynamic start is a dependency in
+// left; all other node operands precede their users. This retained geometry is
+// distinct from a proof that a storage root has no cross-visit conflicts.
+struct SyncCoordinateNode {
+  enum class Kind { Constant, Parameter, Block, Loop, Add, Scale, ModularShift, FloorDivide, Remainder };
+  Kind kind;
+  int64_t upper = 0, factor = 0, start = 0, step = 0, lower = 0;
+  size_t left = 0, right = 0, parameter = 0;
+  ForStmtPtr frame;
+  bool constant = false, dynamic_start = false;
+};
+struct SyncCoordinateProgram {
+  std::vector<SyncCoordinateNode> nodes;
+};
+// Evaluate a requested exact coordinate using supplied ORIGINAL IV values.
+// Missing bindings or values outside the proved machine/domain ranges return
+// unavailable, not a zero coordinate. Traverses the reachable DAG once.
+std::optional<int64_t> EvaluateSyncCoordinate(const SyncCoordinateProgram& program, size_t root,
+                                              const std::map<const ForStmt*, int64_t>& original_values,
+                                              const std::map<size_t, int64_t>& parameters,
+                                              std::optional<int64_t> block);
+struct SyncRowMajorTileMap {
+  ForStmtPtr frame;
+  size_t tile_coordinate = 0;
+  std::optional<size_t> frame_start_root;
+  int64_t row_tiles = 0, column_tiles = 0;
+  int64_t row_scale = 0, column_scale = 0;
+};
+struct SyncExternalFootprint {
+  std::shared_ptr<const SyncCoordinateProgram> program;
+  size_t row = 0, column = 0;
+  std::optional<SyncRowMajorTileMap> row_major_tiles;
+};
 struct SyncAccess {
   size_t storage;
   bool write;
   int64_t row, column, row_step, column_step, rows, columns;
   bool after_first = false;     // Accumulator read, absent during initialization.
   bool exact_footprint = true;  // False: sound enclosure, selectors describe the selected model.
-  // Selected slot at normalized visit i is (slot_first+i*slot_step) mod the
-  // storage's slot_count. Selection is checked in its original machine type.
+  // Selected slot at the controlling frame's normalized visit i is
+  // (slot_first+i*slot_step) mod slot_count. This frame is independent of the
+  // within-slot address frame below; an ancestor may select a resident slot
+  // consumed by an inner loop. Null means a constant selection. Selection is
+  // checked in its original machine type, with no enclosing-frame substitution.
   int64_t slot_first = 0, slot_step = 0;
+  ForStmtPtr slot_coordinate_frame;
   // Original normalized coordinate controlling row_step/column_step. Null
   // means invariant geometry. It may be an enclosing frame of a finite leaf.
   ForStmtPtr coordinate_frame;
   // Exact half-open physical byte range within the canonical slot. Missing
   // means this geometry has no admitted interval export, never an empty effect.
   std::optional<std::pair<int64_t, int64_t>> physical_interval;
+  // Exact original external rectangle. When present, row/column/step are NOT
+  // its geometry and may not be used as an affine selector or an empty answer.
+  std::shared_ptr<const SyncExternalFootprint> external;
 };
 struct SyncSite {
   CallPtr original;
@@ -159,6 +203,9 @@ using Crossing = std::pair<Occurrence, Occurrence>;
 struct ScopedDemandAxis {
   ForStmtPtr frame;
   int64_t count, source_stride, target_stride;
+  // Original normalized coordinate advances. Periodic families must not be
+  // interpreted by the older contiguous-axis realization qualifier.
+  int64_t source_step = 1, target_step = 1;
 };
 struct ScopedDemandFamily {
   Occurrence source, target;
@@ -219,7 +266,7 @@ struct PointBoundary {
 struct SyncStorageAccessIndex {
   // Region/site/access indices, never borrowed pointers into a moving owner.
   std::vector<std::tuple<size_t, size_t, size_t>> accesses;
-  bool written = false, enclosing_motion = false;
+  bool written = false, enclosing_motion = false, external_geometry = false;
 };
 class NumericalSyncHierarchy;
 class SyncBoundaryGraph;
@@ -239,6 +286,7 @@ class CompactSyncResult {
   size_t interface_access_visits = 0, bridge_candidates = 0, port_normalization_visits = 0;
   size_t omitted_bridge_domains = 0;
   size_t source_region_nodes = 0, source_coordinate_entries = 0;
+  size_t phase_variants = 0, finite_microbody_occurrences = 0;
   mutable size_t scoped_export_builds = 0;
   mutable size_t point_selector_access_visits = 0;
   mutable size_t hierarchy_query_steps = 0;
@@ -251,12 +299,7 @@ class CompactSyncResult {
   // unavailable; a non-null empty inventory proves no modeled demands. This
   // is not a physical reuse certificate or permission to flatten scope axes.
   std::shared_ptr<const ScopedSyncDemands> ExportScopedDemands() const;
-  // Sufficient uniform period-one reuse for an OWNED scoped family. A false
-  // result means unproved reuse, not scarcity. Never accepts detached schemas.
-  bool ScopedConsecutiveReuse(size_t family) const;
-  bool ScopedAdjacentBarrier(size_t family) const;
   bool ReferenceBefore(const Occurrence& a, const Occurrence& b) const;
-  mutable size_t scoped_reuse_queries = 0;
   // Exact point answer within one retained leaf scope; coordinates are local
   // to that scope, not the repeated use of its source definition.
   PointBoundary LeafBoundary(size_t region, size_t storage, int64_t row, int64_t column) const;
@@ -276,7 +319,6 @@ class CompactSyncResult {
 
  private:
   mutable std::shared_ptr<const ScopedSyncDemands> scoped_demands_;
-  mutable std::map<size_t, bool> scoped_reuse_;
   friend CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& composition_order);
   std::optional<PointBoundary> RelativeBoundary(size_t storage, int64_t row, int64_t column,
                                                 std::optional<size_t> leaf = std::nullopt) const;
@@ -331,6 +373,9 @@ struct SyncEndpointDomain {
   std::shared_ptr<const SyncEndpointFrame> frame;
   // Half-open normalized digit intervals, in original outer-to-inner order.
   std::vector<std::pair<int64_t, int64_t>> ranges;
+  // Exact progression in each interval, anchored at its first digit. Empty
+  // means unit steps. An interval hull alone never establishes activity.
+  std::vector<int64_t> steps;
 };
 // One physical handoff family; endpoint ordinals refer to the original loops.
 // A same-pipe family has no IDs. Crossings have count=1 and can span segments.
@@ -342,6 +387,8 @@ struct PhysicalSyncFamily {
   // This inventory is constructed/consumed with the same retained case owner.
   std::vector<ScopedDemandAxis> axes;
   std::shared_ptr<const SyncEndpointDomain> source_domain, target_domain;
+  // Stable identities in the retained unassigned protocol; never physical IDs.
+  std::vector<size_t> protocol_uses;
 };
 struct DirectSyncOrder;
 struct PhysicalSyncRealization;
@@ -349,9 +396,23 @@ struct PhysicalSyncRealization;
 // once, never copied by schedule or diagnostic consumers. Emission is synchronous:
 // the exact, unchanged input used for allocation must outlive ValidateFor/emission.
 // Retaining this handle permits diagnostic reads, not later reuse of borrowed input.
+class ScopedSyncProtocol;
+class ScopedPaletteCertificate;
+struct AssignedScopedPalette {
+  std::shared_ptr<const ScopedPaletteCertificate> certificate;
+  std::vector<int> ids;
+};
+struct AssignedRawPalette {
+  std::optional<size_t> palette;
+  std::vector<size_t> pieces;
+};
 class AssignedSyncPlan {
  public:
   const std::vector<PhysicalSyncFamily>& Families() const;
+  const std::shared_ptr<const ScopedSyncProtocol>& Protocol() const;
+  const std::vector<size_t>& ProtocolAssignments() const;
+  const std::vector<AssignedScopedPalette>& Palettes() const;
+  const std::vector<AssignedRawPalette>& RawPalettes() const;
   void ValidateFor(const CompactSyncInput& input, const std::string& target) const;
 
  private:
@@ -359,7 +420,9 @@ class AssignedSyncPlan {
   std::shared_ptr<const State> state_;
   AssignedSyncPlan(const CompactSyncInput& input, std::vector<PhysicalSyncFamily> families,
                    std::map<std::pair<PipeType, PipeType>, std::vector<int>> eligible,
-                   std::vector<std::tuple<PipeType, PipeType, int>> reservations);
+                   std::vector<std::tuple<PipeType, PipeType, int>> reservations,
+                   std::shared_ptr<const ScopedSyncProtocol> protocol,
+                   std::vector<AssignedScopedPalette> palettes);
   friend PhysicalSyncRealization AllocateDirectSync(const CompactSyncInput&, std::vector<PhysicalSyncFamily>,
                                                     const DirectSyncOrder&, const std::string&,
                                                     const std::optional<std::vector<int>>&);
@@ -395,7 +458,15 @@ struct SyncScheduleParentGapReceipt {
   size_t command_sites = 0;
   std::array<size_t, 3> before{}, after{};
 };
+struct ScopedPaletteResult;
+struct SyncAllocationAttemptReceipt {
+  PipeType source, target;
+  std::string status, reason;
+  size_t staged_lanes = 0, reuse_queries = 0;
+};
 struct PhysicalSyncRealization {
+  std::vector<SyncAllocationAttemptReceipt> allocation_attempts;
+  std::vector<std::shared_ptr<const ScopedPaletteResult>> palette_attempts;
   FunctionPtr function;
   std::shared_ptr<const AssignedSyncPlan> assignment;
   const std::vector<PhysicalSyncFamily>& Families() const;

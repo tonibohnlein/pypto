@@ -60,11 +60,13 @@ def integer(expr, env):
         return bool(integer(expr.left, env)) and bool(integer(expr.right, env))
     if isinstance(expr, ir.Or):
         return bool(integer(expr.left, env)) or bool(integer(expr.right, env))
-    if isinstance(expr, ir.Call) and expr.op.name == ir.get_op("buffer.get_block_idx").name:
-        return env["__block_index__"]
-    if isinstance(expr, ir.Eq):
-        return integer(expr.left, env) == integer(expr.right, env)
+    if isinstance(expr, ir.Call):
+        if expr.op.name == ir.get_op("buffer.get_block_idx").name:
+            return env["__block_index__"]
+        if expr.op.name == ir.get_op("buffer.get_block_num").name:
+            return env["__block_count__"]
     for kind, compare in (
+        (ir.Eq, lambda a, b: a == b),
         (ir.Lt, lambda a, b: a < b),
         (ir.Le, lambda a, b: a <= b),
         (ir.Gt, lambda a, b: a > b),
@@ -163,11 +165,45 @@ def _vector_effects(name, args, access):
     return reads, access(args[-1]), ir.PipeType.V
 
 
+def define_storage(stmt, env, storage):
+    assert isinstance(stmt.value, ir.Call)
+    name = stmt.value.op.name
+    t = stmt.var.type
+    if define_slot_storage(stmt, env, storage):
+        return
+    if name in {ir.get_op("buffer.subview").name, ir.get_op("buffer.reshape").name}:
+        source_arg = stmt.value.args[0]
+        assert isinstance(source_arg, ir.Var)
+        source = storage[source_arg.name_hint]
+        space, base, height, width, layout, scalar_bytes, *inherited = source
+        pitch = inherited[0] if inherited else width * scalar_bytes
+        if name == ir.get_op("buffer.subview").name:
+            offsets = stmt.value.args[1]
+            assert isinstance(offsets, ir.MakeTuple)
+            row, col = [integer(e, env) for e in offsets.elements]
+            base += row * pitch + col * scalar_bytes
+        else:
+            assert pitch == width * scalar_bytes
+            pitch = t.shape[1] * t.dtype.get_byte()
+        storage[stmt.var.name_hint] = (space, base, *t.shape, t, t.dtype.get_byte(), pitch)
+        return
+    assert name == ir.get_op("buffer.alloc").name
+    assert isinstance(t, ir.BufferType)
+    storage[stmt.var.name_hint] = (
+        t.memory_space,
+        integer(stmt.value.args[1], env),
+        *t.shape,
+        t,
+        t.dtype.get_byte(),
+    )
+
+
 def interpret(
     function,
     parameters=None,
     *,
     block_index=None,
+    block_count=None,
     shape_parameters=None,
     operand_signatures=None,
     enumerate_effects=True,
@@ -182,6 +218,10 @@ def interpret(
     if block_index is not None:
         assert block_index >= 0
         environment["__block_index__"] = block_index
+    if block_count is not None:
+        assert block_count > 0
+        assert block_index is None or block_index < block_count
+        environment["__block_count__"] = block_count
     storage = {}
     for param in function.params:
         t = param.type
@@ -195,38 +235,6 @@ def interpret(
     def access(arg, rect=None):
         s = storage[arg.name_hint]
         return address_set(s, *(rect or (0, 0, s[2], s[3]))) if enumerate_effects else set()
-
-    def define_storage(stmt, env):
-        assert isinstance(stmt.value, ir.Call)
-        name = stmt.value.op.name
-        t = stmt.var.type
-        if define_slot_storage(stmt, env, storage):
-            return
-        if name in {ir.get_op("buffer.subview").name, ir.get_op("buffer.reshape").name}:
-            source_arg = stmt.value.args[0]
-            assert isinstance(source_arg, ir.Var)
-            source = storage[source_arg.name_hint]
-            space, base, height, width, layout, scalar_bytes, *inherited = source
-            pitch = inherited[0] if inherited else width * scalar_bytes
-            if name == ir.get_op("buffer.subview").name:
-                offsets = stmt.value.args[1]
-                assert isinstance(offsets, ir.MakeTuple)
-                row, col = [integer(e, env) for e in offsets.elements]
-                base += row * pitch + col * scalar_bytes
-            else:
-                assert pitch == width * scalar_bytes
-                pitch = t.shape[1] * t.dtype.get_byte()
-            storage[stmt.var.name_hint] = (space, base, *t.shape, t, t.dtype.get_byte(), pitch)
-            return
-        assert name == ir.get_op("buffer.alloc").name
-        assert isinstance(t, ir.BufferType)
-        storage[stmt.var.name_hint] = (
-            t.memory_space,
-            integer(stmt.value.args[1], env),
-            *t.shape,
-            t,
-            t.dtype.get_byte(),
-        )
 
     def payload_effects(call, env):
         name, args = call.op.name, call.args
@@ -285,21 +293,42 @@ def interpret(
             pipe = ir.PipeType.M
         return pipe, reads, writes
 
+    def execute_loop(stmt, env):
+        carried = [integer(arg.initValue, env) for arg in stmt.iter_args]
+        for value in range(integer(stmt.start, env), integer(stmt.stop, env), integer(stmt.step, env)):
+            body_env = {**env, stmt.loop_var: value}
+            body_env.update(zip(stmt.iter_args, carried, strict=True))
+            yielded = execute(stmt.body, body_env)
+            assert not stmt.iter_args or yielded is not None, "missing simultaneous loop yield"
+            if yielded is not None:
+                assert len(yielded) == len(carried)
+                carried = list(yielded)
+        assert len(stmt.return_vars) == len(carried)
+        env.update(zip(stmt.return_vars, carried, strict=True))
+
     def execute(stmt, env):
         if isinstance(stmt, ir.SeqStmts):
             for s in stmt.stmts:
-                execute(s, env)
+                yielded = execute(s, env)
+                if yielded is not None:
+                    return yielded
         elif isinstance(stmt, ir.AssignStmt):
             if isinstance(stmt.var.type, ir.ScalarType):
                 env[stmt.var] = integer(stmt.value, env)
             else:
-                define_storage(stmt, env)
+                define_storage(stmt, env, storage)
         elif isinstance(stmt, ir.ForStmt):
-            for value in range(integer(stmt.start, env), integer(stmt.stop, env), integer(stmt.step, env)):
-                execute(stmt.body, {**env, stmt.loop_var: value})
+            execute_loop(stmt, env)
         elif isinstance(stmt, ir.IfStmt):
-            execute(stmt.then_body if integer(stmt.condition, env) else stmt.else_body, dict(env))
-        elif stmt is None or isinstance(stmt, (ir.YieldStmt, ir.ReturnStmt)):
+            yielded = execute(stmt.then_body if integer(stmt.condition, env) else stmt.else_body, dict(env))
+            if stmt.return_vars:
+                assert yielded is not None and len(yielded) == len(stmt.return_vars)
+                env.update(zip(stmt.return_vars, yielded, strict=True))
+            else:
+                assert yielded is None or not yielded
+        elif isinstance(stmt, ir.YieldStmt):
+            return tuple(integer(value, env) for value in stmt.value)
+        elif stmt is None or isinstance(stmt, ir.ReturnStmt):
             return
         elif isinstance(stmt, ir.EvalStmt):
             call = stmt.expr
@@ -429,13 +458,22 @@ def translate_access_description(description, parameters, block_index):
             site["accesses"] = accesses
 
 
-def validate(function, analysis, query_all=True, parameters=None, *, block_index=None):
+def validate(
+    function,
+    analysis,
+    query_all=True,
+    parameters=None,
+    *,
+    block_index=None,
+    block_count=None,
+    unavailable_boundaries=(),
+):
     parameters = parameters or {}
     description = analysis.describe()
     validate_slot_descriptors(function, description)
     translate_access_description(description, parameters, block_index)
-    storage, calls = interpret(function, parameters, block_index=block_index)
-    occurrences, effects = check_imported_accesses(description, storage, calls)
+    storage, calls = interpret(function, parameters, block_index=block_index, block_count=block_count)
+    occurrences, effects = check_imported_accesses(description, storage, calls, parameters)
     vertices = [(o, c) for o in occurrences for c in (False, True)]
     base = {((o, False), (o, True)) for o in occurrences}
     for pipe in PIPES:
@@ -474,7 +512,7 @@ def validate(function, analysis, query_all=True, parameters=None, *, block_index
             for b in vertices:
                 assert analysis.precedes(a[0], a[1], b[0], b[1]) == ((a, b) in order), (a, b)
     checks = validate_boundaries(
-        description, storage, effects, occurrences, analysis, parameters, block_index
+        description, storage, effects, occurrences, analysis, parameters, block_index, unavailable_boundaries
     )
     return {
         "payloads": len(occurrences),
@@ -494,35 +532,53 @@ def domain_addresses(domain, storage, row, col, rows, cols, slot=0):
     return address_set(descriptor, row, col, rows, cols)
 
 
+def add_boundary_points(description, sid, points):
+    for r in description["regions"]:
+        for site in r["sites"]:
+            for access_index, (aid, _, row, col, dr, dc, rows, cols, _) in enumerate(site["accesses"]):
+                if aid == sid:
+                    for visit in range(r["count"]):
+                        i = visit % r["reset_period"] if r.get("reset_period") else visit
+                        frame = site.get("access_frames", [None] * len(site["accesses"]))[access_index]
+                        if frame is not None and r.get("nested_frames"):
+                            remaining = visit
+                            for f, count, _, _ in reversed(r["nested_frames"]):
+                                digit = remaining % count
+                                remaining //= count
+                                if f.same_as(frame):
+                                    i = digit
+                                    break
+                        points.update(
+                            {
+                                (row + i * dr, col + i * dc),
+                                (row + i * dr + rows - 1, col + i * dc + cols - 1),
+                            }
+                        )
+
+
 def validate_boundaries(
-    description, storage, effects, occurrences, analysis, parameters=None, block_index=None
+    description,
+    storage,
+    effects,
+    occurrences,
+    analysis,
+    parameters=None,
+    block_index=None,
+    unavailable_boundaries=(),
 ):
     # Boundary points include interior/exterior and corners of each extracted
     # rectangle. Point membership is looked up in the independent physical map.
     checks = 0
     for sid, domain in enumerate(description["storage"]):
         points = {(0, 0), (domain["rows"] - 1, domain["columns"] - 1)}
-        for r in description["regions"]:
-            for site in r["sites"]:
-                for access_index, (aid, _, row, col, dr, dc, rows, cols, _) in enumerate(site["accesses"]):
-                    if aid == sid:
-                        for visit in range(r["count"]):
-                            i = visit % r["reset_period"] if r.get("reset_period") else visit
-                            frame = site.get("access_frames", [None] * len(site["accesses"]))[access_index]
-                            if frame is not None and r.get("nested_frames"):
-                                remaining = visit
-                                for f, count, _, _ in reversed(r["nested_frames"]):
-                                    digit = remaining % count
-                                    remaining //= count
-                                    if f.same_as(frame):
-                                        i = digit
-                                        break
-                            points.update(
-                                {
-                                    (row + i * dr, col + i * dc),
-                                    (row + i * dr + rows - 1, col + i * dc + cols - 1),
-                                }
-                            )
+        if sid in unavailable_boundaries:
+            # An explicitly expected missing capability is not an empty answer.
+            # This opt-in never changes the independent access/cover oracle.
+            for row, col in points:
+                assert analysis.boundary(sid, row, col, parameters or {}, block_index) is None
+                checks += 1
+            continue
+        add_boundary_points(description, sid, points)
         for slot, (row, col) in product(range(domain.get("slot_count", 1)), points):
             if domain.get("row_extent_parameter") is not None:
                 actual_rows = storage[domain["name"]][2]
@@ -557,7 +613,44 @@ def validate_boundaries(
     return checks
 
 
-def check_imported_accesses(description, storage, calls):
+def external_coordinate(description, footprint, root, env, parameters):
+    """Evaluate the claimed descriptor separately from original-IR accesses."""
+    nodes = description["coordinate_programs"][footprint["program"]]
+    values = {}
+
+    def evaluate(index):
+        if index in values:
+            return values[index]
+        node = nodes[index]
+        kind = node["kind"]
+        if kind == "constant":
+            value = node["upper"]
+        elif kind == "parameter":
+            value = parameters[node["parameter"]]
+        elif kind == "block":
+            value = env["__block_index__"]
+        elif kind == "loop":
+            value = integer(node["frame"].loop_var, env)
+        elif kind == "scale":
+            value = evaluate(node["left"]) * node["factor"]
+        elif kind == "modular_shift":
+            value = evaluate(node["left"]) - node["factor"]
+        elif kind == "add":
+            value = evaluate(node["left"]) + evaluate(node["right"])
+        elif kind == "divide":
+            value = evaluate(node["left"]) // evaluate(node["right"])
+        elif kind == "remainder":
+            value = evaluate(node["left"]) % evaluate(node["right"])
+        else:
+            raise AssertionError(f"Unsupported retained coordinate {kind}")
+        assert node["lower"] <= value <= node["upper"]
+        values[index] = value
+        return value
+
+    return evaluate(root)
+
+
+def check_imported_accesses(description, storage, calls, parameters=None):
     mapping = {}
     for r, region in enumerate(description["regions"]):
         for s, site in enumerate(region["sites"]):
@@ -605,12 +698,21 @@ def check_imported_accesses(description, storage, calls):
                 access_visit = (integer(frame.loop_var, env) - integer(frame.start, env)) // integer(
                     frame.step, env
                 )
-            slot = (selection[0] + local_visit * selection[1]) % domain.get("slot_count", 1)
-            modeled[write].update(
-                domain_addresses(
-                    domain, storage, row + access_visit * dr, col + access_visit * dc, rows, cols, slot
+            slot_visit = local_visit
+            slot_frame = site.get("slot_frames", [None] * len(site["accesses"]))[access_index]
+            if slot_frame is not None:
+                slot_visit = (integer(slot_frame.loop_var, env) - integer(slot_frame.start, env)) // integer(
+                    slot_frame.step, env
                 )
-            )
+            slot = (selection[0] + slot_visit * selection[1]) % domain.get("slot_count", 1)
+            external = site.get("external_geometry", [None] * len(site["accesses"]))[access_index]
+            if external is not None:
+                row = external_coordinate(description, external, external["row"], env, parameters or {})
+                col = external_coordinate(description, external, external["column"], env, parameters or {})
+            else:
+                row += access_visit * dr
+                col += access_visit * dc
+            modeled[write].update(domain_addresses(domain, storage, row, col, rows, cols, slot))
         assert modeled == [reads, writes], (
             r,
             visit,

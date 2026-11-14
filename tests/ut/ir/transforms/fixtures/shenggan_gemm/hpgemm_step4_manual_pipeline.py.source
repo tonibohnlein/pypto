@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""Static PyPTO GEMM benchmark with fixed FP32 output.
+
+Edit the configuration block below, then run:
+
+  python ccfusion/hpgemm.py
+"""
+
+from __future__ import annotations
+
+import statistics
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+import torch
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PYPTO_LIB_ROOT = REPO_ROOT / "pypto-lib"
+if str(PYPTO_LIB_ROOT) not in sys.path:
+    sys.path.insert(0, str(PYPTO_LIB_ROOT))
+
+import pypto.language as pl
+from golden import TensorSpec
+from pypto.runtime import RunConfig
+
+try:
+    from pypto.runtime import benchmark as runtime_benchmark
+except Exception:  # noqa: BLE001
+    runtime_benchmark = None
+
+try:
+    import torch_npu  # type: ignore
+except Exception:  # noqa: BLE001
+    torch_npu = None
+
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+PLATFORM = "a2a3"
+DEVICE_ID = 0
+ENABLE_L2_SWIMLANE = False
+COMPILE_ONLY = False
+RUN_BENCHMARK = True
+DUMP_PASSES = True
+
+M = 2048
+K = 4096
+N = 4096
+M_TILE = 128
+K_TILE = 256
+N_TILE = 256
+L0_K_TILE = 64
+SPMD_CORES = 24
+ENABLE_TILE_SWIZZLE = True
+# N-group swizzle width; see step3_swizzle.py / matmul-n-swizzle-m-zigzag.md.
+SWIZZLE_COUNT_N = 4
+
+INPUT_TORCH_DTYPE = torch.float16
+SEED = 2026
+INPUT_SCALE = 0.02
+RTOL = 2e-2
+ATOL = 2e-1
+
+WARMUP = 10
+ITERS = 50
+ROUNDS = 5
+# -----------------------------------------------------------------------------
+
+OUTPUT_TORCH_DTYPE = torch.float32
+M_BLOCKS = M // M_TILE
+N_BLOCKS = N // N_TILE
+TOTAL_TILES = M_BLOCKS * N_BLOCKS
+
+# hpgemm() pins each manually double-buffered tile (a_mat/b_mat/a_left/b_right) to
+# an explicit pl.MemRef(slots=2) slot inline in its type annotation — see the
+# comment inside hpgemm() for why (a plain pl.range loop gives MemoryReuse no
+# pipeline_membership hint, so two independently-named tile vars with
+# non-overlapping SSA liveness get silently coalesced onto ONE physical buffer,
+# reintroducing the same L0B race under a different guise). A *module-level*
+# `POOL = pl.MemRef(slots=2)` variable referenced from inside the annotation
+# does not work under @pl.jit: @pl.jit regenerates the function's source and
+# re-parses it in a fresh module whose only injected names are pl/pld, so a
+# reference to this module's globals (POOL[slot]) resolves to nothing and the
+# parser rejects the annotation. The inline call form `pl.MemRef("name",
+# slots=2)[slot]` resolves purely from the annotation's own AST, with no
+# closure lookup, so it round-trips through @pl.jit correctly — use that form,
+# repeating the identical ("name", slots=N) literal at every site that must
+# alias the same allocation.
+
+
+@dataclass(frozen=True)
+class BenchResult:
+    median_ms: float
+    mean_ms: float
+    best_ms: float
+    rounds_ms: tuple[float, ...]
+
+
+
+@pl.jit.inline
+def swizzle_tile_index(tile_idx: pl.Scalar[pl.INDEX]):
+    """N-group swizzle + M-direction zigzag.
+
+    Ported from step3_swizzle.py's ``swizzle_nz`` (pto-dsl matmul_optimization_guide):
+    group ``swizzle_count`` adjacent N tiles so the same B panel stays hot in L2
+    across the group's M rows, and reverse the M walk every other group so the
+    boundary A tile is reused instead of a cold restart.
+    """
+    tile_block_span = SWIZZLE_COUNT_N * M_BLOCKS
+    tile_block_loop = (N_BLOCKS + SWIZZLE_COUNT_N - 1) // SWIZZLE_COUNT_N
+    tile_block_idx = tile_idx // tile_block_span
+    in_tile_block_idx = tile_idx % tile_block_span
+
+    is_last_block = tile_block_idx == (tile_block_loop - 1)
+    n_col_tail = N_BLOCKS - SWIZZLE_COUNT_N * tile_block_idx
+    if is_last_block:
+        n_col = n_col_tail
+    else:
+        n_col = SWIZZLE_COUNT_N
+
+    base_m_idx = in_tile_block_idx // n_col
+    n_idx = tile_block_idx * SWIZZLE_COUNT_N + (in_tile_block_idx % n_col)
+
+    odd_block = (tile_block_idx % 2) == 1
+    if odd_block:
+        m_idx = M_BLOCKS - base_m_idx - 1
+    else:
+        m_idx = base_m_idx
+    return m_idx, n_idx
+
+
+@pl.jit
+def hpgemm(
+    a: pl.Tensor[[M, K], pl.FP16],
+    b: pl.Tensor[[K, N], pl.FP16],
+    c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+):
+    k_tiles = K // K_TILE
+    l0_tiles = K_TILE // L0_K_TILE
+
+    with pl.spmd(SPMD_CORES, name_hint="hpgemm_spmd", sync_start=True) as _hpgemm_tid:
+        block_idx = pl.tile.get_block_idx()
+        block_num = pl.tile.get_block_num()
+
+        # Manual pipeline control via pl.range instead of pl.pipeline(stage=...):
+        # CanonicalizeIOOrder (the pass that lowers pl.pipeline(stage>=2) bodies)
+        # clusters every tile.load/tile.extract ahead of all other statements in
+        # the body, including our sync_src/sync_dst flag pairs — those carry no
+        # tile/tensor operand, so they have no SSA edge tying them to the loads
+        # they're meant to gate, and get reordered after the loads regardless of
+        # source position. pl.range is ForKind::Sequential, which
+        # CanonicalizeIOOrder leaves untouched, so the sync/extract ordering below
+        # is emitted exactly as written. Buffer separation for the two physical
+        # instances each pl.MemRef(...)[slot] below rotates through comes from
+        # that pool's declared slots, not from pl.pipeline or from SSA-liveness
+        # inference — see the module comment above hpgemm() for why liveness
+        # alone isn't enough here, and why the pool must be declared inline
+        # rather than as a module-level variable.
+        #
+        # Every wait below is UNCONDITIONAL — no "is this the first use of this
+        # slot" guard. a_mat_pool/b_mat_pool/a_left_pool/b_right_pool (inline
+        # below) are each one allocation for the whole kernel invocation, shared
+        # across every tile_idx this core processes, so "first use" has to mean
+        # "first use across kb, across ko_idx, AND across tile_idx, AND across
+        # separate dispatches of this same compiled kernel" — three different
+        # boundaries a from-scratch guard has to get right simultaneously, and
+        # getting any one wrong either reintroduces the race (skips a wait that
+        # was needed) or hangs (waits for a signal that will never come). A
+        # comparison against a build of PTOAS's own auto-inserted sync (for a
+        # pl.pipeline kernel that has none of these bugs, generated cpp under
+        # playground/build_output/..., LowerPipelineLoops pass dump confirms it's
+        # pl.pipeline-driven) shows the actual pattern PTOInsertSync uses: prime
+        # every flag once before the loop so the real first use's unconditional
+        # wait is trivially satisfied, wait/signal unconditionally every
+        # iteration thereafter, and drain every flag once after the loop so
+        # nothing is left set when the kernel returns (dangling signals are
+        # fire-and-forget hardware event resources with no reset between
+        # separate dispatches — pto-isa docs, ordering-and-synchronization.md).
+        # This sidesteps the whole class of boundary-tracking bugs above by
+        # never needing to know which use is "first".
+        pl.system.sync_src(set_pipe=pl.PipeType.FIX, wait_pipe=pl.PipeType.M, event_id=1)
+        pl.system.sync_src(set_pipe=pl.PipeType.MTE1, wait_pipe=pl.PipeType.MTE2, event_id=0)
+        pl.system.sync_src(set_pipe=pl.PipeType.MTE1, wait_pipe=pl.PipeType.MTE2, event_id=1)
+        pl.system.sync_src(set_pipe=pl.PipeType.M, wait_pipe=pl.PipeType.MTE1, event_id=0)
+        pl.system.sync_src(set_pipe=pl.PipeType.M, wait_pipe=pl.PipeType.MTE1, event_id=1)
+
+        for tile_idx in pl.range(block_idx, TOTAL_TILES, block_num):
+            if ENABLE_TILE_SWIZZLE:
+                mb_block, nb_block = swizzle_tile_index(tile_idx)
+            else:
+                mb_block = tile_idx // N_BLOCKS
+                nb_block = tile_idx % N_BLOCKS
+            m0 = mb_block * M_TILE
+            n0 = nb_block * N_TILE
+            acc = pl.create_tile([M_TILE, N_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+
+            # acc is one buffer reused across tile_idx iterations (not
+            # slot-pooled like a_mat/a_left below), so a fresh pl.matmul here
+            # would race the *previous* iteration's FIX read of the same buffer
+            # (below, after pl.store) — wait for it, primed above for the very
+            # first tile_idx.
+            pl.system.sync_dst(set_pipe=pl.PipeType.FIX, wait_pipe=pl.PipeType.M, event_id=1)
+
+            mat_slot = 1
+            for kb in pl.range(0, k_tiles):
+                mat_slot = (mat_slot + 1) % 2
+                k0 = kb * K_TILE
+
+                # Before overwriting this Mat slot, wait for its previous
+                # occupant (kb - 2, same slot; or the previous tile_idx's tail
+                # use of this slot; or, on this core's first-ever use, the prime
+                # above) to have been fully drained by MTE1.
+                pl.system.sync_dst(set_pipe=pl.PipeType.MTE1, wait_pipe=pl.PipeType.MTE2, event_id=mat_slot)
+
+                a_mat: pl.Tile[[M_TILE, K_TILE], pl.FP16, pl.MemRef("a_mat_pool", slots=2)[mat_slot], pl.Mem.Mat] = pl.load(
+                    a, [m0, k0], [M_TILE, K_TILE], target_memory=pl.MemorySpace.Mat,
+                )
+                b_mat: pl.Tile[[K_TILE, N_TILE], pl.FP16, pl.MemRef("b_mat_pool", slots=2)[mat_slot], pl.Mem.Mat] = pl.load(
+                    b, [k0, n0], [K_TILE, N_TILE], target_memory=pl.MemorySpace.Mat,
+                )
+                pl.system.sync_src(set_pipe=pl.PipeType.MTE2, wait_pipe=pl.PipeType.MTE1, event_id=mat_slot)
+                pl.system.sync_dst(set_pipe=pl.PipeType.MTE2, wait_pipe=pl.PipeType.MTE1, event_id=mat_slot)
+
+                l0_slot = 1
+                for ko_idx in pl.range(0, l0_tiles):
+                    ko = ko_idx * L0_K_TILE
+                    l0_slot = (l0_slot + 1) % 2
+
+                    # Before overwriting this L0 slot, wait for matmul to finish
+                    # reading its previous occupant (same reasoning as the Mat
+                    # slot above).
+                    pl.system.sync_dst(set_pipe=pl.PipeType.M, wait_pipe=pl.PipeType.MTE1, event_id=l0_slot)
+
+                    a_left: pl.Tile[
+                        [M_TILE, L0_K_TILE], pl.FP16, pl.MemRef("a_left_pool", slots=2)[l0_slot], pl.Mem.Left
+                    ] = pl.tile.extract(a_mat, 0, ko, [M_TILE, L0_K_TILE], target_memory=pl.Mem.Left)
+                    b_right: pl.Tile[
+                        [L0_K_TILE, N_TILE], pl.FP16, pl.MemRef("b_right_pool", slots=2)[l0_slot], pl.Mem.Right
+                    ] = pl.tile.extract(b_mat, ko, 0, [L0_K_TILE, N_TILE], target_memory=pl.Mem.Right)
+                    pl.system.sync_src(set_pipe=pl.PipeType.MTE1, wait_pipe=pl.PipeType.M, event_id=l0_slot)
+                    pl.system.sync_dst(set_pipe=pl.PipeType.MTE1, wait_pipe=pl.PipeType.M, event_id=l0_slot)
+
+                    if kb == 0 and ko_idx == 0:
+                        acc = pl.matmul(a_left, b_right)
+                    else:
+                        acc = pl.matmul_acc(acc, a_left, b_right)
+                    pl.system.sync_src(set_pipe=pl.PipeType.M, wait_pipe=pl.PipeType.MTE1, event_id=l0_slot)
+
+                # Release this Mat slot: every extract that reads it has been issued.
+                pl.system.sync_src(set_pipe=pl.PipeType.MTE1, wait_pipe=pl.PipeType.MTE2, event_id=mat_slot)
+
+            # PTOInsertSync (the pass that would normally auto-insert this) bails out
+            # entirely as soon as a function contains ANY manual set_flag/wait_flag —
+            # which the L0/Mat double buffering above does — so the M (cube, writes
+            # L0C) -> FIX (reads L0C for the store) handoff below needs its own
+            # explicit sync; without it the store can read acc while the last
+            # matmul_acc is still writing it (L0C read/write conflict, AICore fault).
+            pl.system.sync_src(set_pipe=pl.PipeType.M, wait_pipe=pl.PipeType.FIX, event_id=0)
+            pl.system.sync_dst(set_pipe=pl.PipeType.M, wait_pipe=pl.PipeType.FIX, event_id=0)
+            c = pl.store(acc, [m0, n0], c)
+            # Signal for the *next* tile_idx iteration's fresh matmul (waited above).
+            pl.system.sync_src(set_pipe=pl.PipeType.FIX, wait_pipe=pl.PipeType.M, event_id=1)
+
+        # Drain every flag this core's last tile_idx left set (mirrors the
+        # prime block above) so nothing is left dangling when the kernel
+        # returns — see the long comment above the prime block.
+        pl.system.sync_dst(set_pipe=pl.PipeType.FIX, wait_pipe=pl.PipeType.M, event_id=1)
+        pl.system.sync_dst(set_pipe=pl.PipeType.MTE1, wait_pipe=pl.PipeType.MTE2, event_id=0)
+        pl.system.sync_dst(set_pipe=pl.PipeType.MTE1, wait_pipe=pl.PipeType.MTE2, event_id=1)
+        pl.system.sync_dst(set_pipe=pl.PipeType.M, wait_pipe=pl.PipeType.MTE1, event_id=0)
+        pl.system.sync_dst(set_pipe=pl.PipeType.M, wait_pipe=pl.PipeType.MTE1, event_id=1)
+        pl.system.bar_all()
+    return c
+
+
+def validate_config() -> None:
+    if PLATFORM not in {"a2a3", "a2a3sim", "a5", "a5sim"}:
+        raise ValueError(f"Unsupported PLATFORM: {PLATFORM}")
+    if M <= 0 or K <= 0 or N <= 0:
+        raise ValueError("M/K/N must be positive")
+    if M_TILE <= 0 or N_TILE <= 0 or K_TILE <= 0:
+        raise ValueError("M_TILE/N_TILE/K_TILE must be positive")
+    if M % M_TILE != 0:
+        raise ValueError(f"M ({M}) must be divisible by M_TILE ({M_TILE})")
+    if N % N_TILE != 0:
+        raise ValueError(f"N ({N}) must be divisible by N_TILE ({N_TILE})")
+    if K % K_TILE != 0:
+        raise ValueError(f"K ({K}) must be divisible by K_TILE ({K_TILE})")
+    if L0_K_TILE <= 0:
+        raise ValueError("L0_K_TILE must be positive")
+    if K_TILE % L0_K_TILE != 0:
+        raise ValueError(f"K_TILE ({K_TILE}) must be divisible by L0_K_TILE ({L0_K_TILE})")
+    if SPMD_CORES <= 0:
+        raise ValueError("SPMD_CORES must be positive")
+    if SWIZZLE_COUNT_N <= 0:
+        raise ValueError("SWIZZLE_COUNT_N must be positive")
+    if ENABLE_TILE_SWIZZLE and SWIZZLE_COUNT_N > N_BLOCKS:
+        raise ValueError(
+            f"SWIZZLE_COUNT_N ({SWIZZLE_COUNT_N}) must be <= N_BLOCKS ({N_BLOCKS})"
+        )
+    if INPUT_TORCH_DTYPE is not torch.float16:
+        raise ValueError("This simplified script is fixed to FP16 input and FP32 output")
+    if WARMUP < 0 or ITERS <= 0 or ROUNDS <= 0:
+        raise ValueError("WARMUP must be >= 0, ITERS/ROUNDS must be > 0")
+
+
+def device_string(platform: str, device_id: int) -> str:
+    if platform.endswith("sim"):
+        return "cpu"
+    return f"npu:{device_id}"
+
+
+def build_specs() -> list[TensorSpec]:
+    return [
+        TensorSpec("a", [M, K], INPUT_TORCH_DTYPE),
+        TensorSpec("b", [K, N], INPUT_TORCH_DTYPE),
+        TensorSpec("c", [M, N], OUTPUT_TORCH_DTYPE, is_output=True),
+    ]
+
+
+def compile_kernel(specs: list[TensorSpec]):
+    dummy_args = [torch.empty(spec.shape, dtype=spec.dtype) for spec in specs]
+    return hpgemm.compile(
+        *dummy_args,
+        config=RunConfig(
+            platform=PLATFORM,
+            dump_passes=DUMP_PASSES,
+        ),
+    )
+
+
+def build_inputs(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    torch.manual_seed(SEED)
+    if torch_npu is not None and device.type == "npu":
+        torch_npu.npu.manual_seed(SEED)
+    a = torch.randn((M, K), dtype=INPUT_TORCH_DTYPE, device=device).mul_(INPUT_SCALE).contiguous()
+    b = torch.randn((K, N), dtype=INPUT_TORCH_DTYPE, device=device).mul_(INPUT_SCALE).contiguous()
+    c = torch.zeros((M, N), dtype=OUTPUT_TORCH_DTYPE, device=device).contiguous()
+    a_host = a.cpu().contiguous()
+    b_host = b.cpu().contiguous()
+    c_host = torch.zeros((M, N), dtype=OUTPUT_TORCH_DTYPE).contiguous()
+    return a, b, c, a_host, b_host, c_host
+
+
+def sync_device(device: torch.device) -> None:
+    if device.type == "npu":
+        if torch_npu is None:
+            raise RuntimeError("torch_npu is required for NPU execution but is not importable")
+        torch_npu.npu.synchronize()
+
+
+def benchmark_torch(
+    fn: Callable[[], torch.Tensor],
+    *,
+    warmup: int,
+    iters: int,
+    rounds: int,
+    device: torch.device,
+) -> BenchResult:
+    output = None
+    for _ in range(warmup):
+        output = fn()
+    sync_device(device)
+
+    rounds_ms: list[float] = []
+    for _ in range(rounds):
+        sync_device(device)
+        start = time.perf_counter()
+        for _ in range(iters):
+            output = fn()
+        sync_device(device)
+        rounds_ms.append((time.perf_counter() - start) * 1000.0 / iters)
+
+    if output is None:
+        raise AssertionError("torch benchmark produced no output")
+
+    return BenchResult(
+        median_ms=statistics.median(rounds_ms),
+        mean_ms=statistics.fmean(rounds_ms),
+        best_ms=min(rounds_ms),
+        rounds_ms=tuple(rounds_ms),
+    )
+
+
+def summarize_ms(samples: tuple[float, ...]) -> str:
+    return (
+        f"median={statistics.median(samples):.3f} ms "
+        f"mean={statistics.fmean(samples):.3f} ms "
+        f"best={min(samples):.3f} ms"
+    )
+
+
+def format_tflops(m: int, n: int, k: int, ms: float) -> float:
+    if ms <= 0.0:
+        return 0.0
+    flops = 2.0 * float(m) * float(n) * float(k)
+    return flops / (ms * 1.0e-3) / 1.0e12
+
+
+def max_abs_rel(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float]:
+    actual_f32 = actual.float()
+    expected_f32 = expected.float()
+    abs_diff = (actual_f32 - expected_f32).abs()
+    max_abs = float(abs_diff.max().item())
+    peak = float(expected_f32.abs().max().item())
+    max_rel = max_abs / max(peak, 1e-12)
+    return max_abs, max_rel
+
+
+def main() -> int:
+    validate_config()
+
+    specs = build_specs()
+    compiled = compile_kernel(specs)
+    print(
+        "compiled PyPTO GEMM:",
+        f"platform={PLATFORM}",
+        f"device={DEVICE_ID}",
+        f"M={M} K={K} N={N}",
+        f"tile=({M_TILE},{N_TILE},{K_TILE})",
+        f"spmd_cores={SPMD_CORES}",
+        f"tile_swizzle={ENABLE_TILE_SWIZZLE}",
+        f"dump_passes={DUMP_PASSES}",
+        "in=fp16",
+        "out=fp32",
+    )
+    if COMPILE_ONLY:
+        print(f"compile_only done: {compiled.output_dir}")
+        return 0
+
+    device = torch.device(device_string(PLATFORM, DEVICE_ID))
+    if device.type == "npu" and torch_npu is None:
+        raise RuntimeError("torch_npu is not importable; cannot run on a real NPU device")
+
+    a, b, c, a_host, b_host, c_host = build_inputs(device)
+    run_config = RunConfig(
+        platform=PLATFORM,
+        device_id=DEVICE_ID,
+        enable_l2_swimlane=ENABLE_L2_SWIMLANE,
+    )
+
+    compiled(a_host, b_host, c_host, config=run_config)
+    sync_device(device)
+
+    expected = torch.mm(a_host.float(), b_host.float())
+    passed = bool(torch.allclose(c_host, expected, rtol=RTOL, atol=ATOL))
+    max_abs, max_rel = max_abs_rel(c_host, expected)
+    print(
+        "correctness:",
+        f"passed={passed}",
+        f"max_abs={max_abs:.6f}",
+        f"max_rel_to_peak={max_rel:.6e}",
+    )
+    if not passed:
+        print("PyPTO GEMM mismatch vs torch reference")
+        return 1
+
+    if not RUN_BENCHMARK:
+        return 0
+
+    if runtime_benchmark is None:
+        raise RuntimeError("pypto.runtime.benchmark is unavailable in the current environment")
+
+    c.zero_()
+    c_host.zero_()
+    pypto_stats = runtime_benchmark(
+        compiled,
+        [a_host, b_host, c_host],
+        rounds=ROUNDS,
+        warmup=WARMUP,
+        platform=PLATFORM,
+        device_id=DEVICE_ID,
+    )
+    if pypto_stats is None:
+        raise RuntimeError("PyPTO benchmark returned no timing data")
+
+    pypto_device_us = tuple(v for v in pypto_stats.device_wall_us if v > 0.0)
+    pypto_host_us = tuple(pypto_stats.per_round("host"))
+    if pypto_device_us:
+        pypto_samples_ms = tuple(v / 1000.0 for v in pypto_device_us)
+        pypto_source = "device_wall_us"
+    elif pypto_host_us:
+        pypto_samples_ms = tuple(v / 1000.0 for v in pypto_host_us)
+        pypto_source = "host_round_us"
+    else:
+        raise RuntimeError("PyPTO benchmark produced neither device nor host timing samples")
+
+    def torch_mm() -> torch.Tensor:
+        return torch.mm(a, b)
+
+    torch_result = benchmark_torch(
+        torch_mm,
+        warmup=WARMUP,
+        iters=ITERS,
+        rounds=ROUNDS,
+        device=device,
+    )
+
+    pypto_median_ms = statistics.median(pypto_samples_ms)
+    torch_median_ms = torch_result.median_ms
+    speedup = torch_median_ms / pypto_median_ms if pypto_median_ms > 0.0 else 0.0
+
+    print(
+        "PyPTO benchmark:",
+        summarize_ms(pypto_samples_ms),
+        f"source={pypto_source}",
+        f"tflops={format_tflops(M, N, K, pypto_median_ms):.2f}",
+    )
+    print(
+        "torch NPU benchmark:",
+        summarize_ms(torch_result.rounds_ms),
+        f"tflops={format_tflops(M, N, K, torch_median_ms):.2f}",
+    )
+    print(f"speedup_vs_torch={speedup:.3f}x")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

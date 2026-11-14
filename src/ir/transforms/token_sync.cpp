@@ -16,9 +16,12 @@
 
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/op_registry.h"
+#include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
+#include "pypto/ir/transforms/utils/simplify.h"
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/scoped_logical_sync.h"
@@ -26,6 +29,35 @@
 
 namespace pypto::ir::pass {
 namespace {
+// Fold only a singleton cardinality proved across every caller. This is
+// scoped specialization of an immutable function, not inference from an index
+// hull. On optional realization failure the caller retains the original body.
+FunctionPtr BindLaunchCount(const FunctionPtr& function, std::optional<int64_t> count) {
+  if (!count) return function;
+  class Binder : public IRMutator {
+    int64_t count_;
+
+   public:
+    bool changed = false;
+    explicit Binder(int64_t count) : count_(count) {}
+    ExprPtr VisitExpr_(const CallPtr& call) override {
+      if (IsOp(call, "buffer.get_block_num") && call->args_.empty()) {
+        changed = true;
+        return std::make_shared<ConstInt>(count_, DataType::INDEX, call->span_);
+      }
+      return IRMutator::VisitExpr_(call);
+    }
+  } binder(*count);
+  auto bound = binder.VisitFunction(function);
+  return binder.changed ? transform_utils::SimplifyFunction(bound, true) : function;
+}
+std::optional<int64_t> FixedLaunchCount(const sync::SyncInvocationEvidence& evidence,
+                                        const std::string& name) {
+  const auto count = evidence.block_counts.find(name);
+  if (count == evidence.block_counts.end() || count->second.first != count->second.second)
+    return std::nullopt;
+  return count->second.first;
+}
 bool IsOwnedLeaf(const FunctionPtr& function) {
   return (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV) &&
          !function->requires_runtime_binding_ && !function->HasAttr(kAttrExternalSource) &&
@@ -69,7 +101,8 @@ Pass InsertSync() {
           auto block = evidence.block_indices.find(global->name_);
           const auto blocks =
               block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second);
-          function = InsertLogicalSync(function, target, parameters, blocks);
+          function = InsertLogicalSync(BindLaunchCount(function, FixedLaunchCount(evidence, global->name_)),
+                                       target, parameters, blocks);
           sync::CheckGeneratedLogicalSync(function);
         }
         return std::make_shared<Program>(functions, program->name_, program->span_);
@@ -119,7 +152,8 @@ Pass LowerSync() {
 
 Pass RealizeSync() {
   auto transform = [](const FunctionPtr& function, const sync::SyncParameterBounds& bounds,
-                      const std::optional<std::pair<int64_t, int64_t>>& block_bounds) -> FunctionPtr {
+                      const std::optional<std::pair<int64_t, int64_t>>& block_bounds,
+                      std::optional<int64_t> block_count) -> FunctionPtr {
     if (!IsInCoreType(function->func_type_)) return function;
     // These functions do not enter PTO code generation; their external owner
     // remains responsible for synchronization. Do not claim PTOAS delegation.
@@ -146,7 +180,8 @@ Pass RealizeSync() {
       // The same logical producer and actual-token consumer as the public
       // stages. Insertion preserves callers, payloads and scalar coordinates,
       // so this transaction may reuse its own freshly collected evidence.
-      const auto logical = InsertLogicalSync(function, target, bounds, block_bounds);
+      const auto bound_function = BindLaunchCount(function, block_count);
+      const auto logical = InsertLogicalSync(bound_function, target, bounds, block_bounds);
       sync::CheckGeneratedLogicalSync(logical);
       const auto optimized = sync::OptimizeLogicalSync(logical);
       sync::CheckGeneratedLogicalSync(optimized);
@@ -179,7 +214,8 @@ Pass RealizeSync() {
           auto block = evidence.block_indices.find(global->name_);
           function = transform(
               function, evidence.parameters[global->name_],
-              block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second));
+              block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second),
+              FixedLaunchCount(evidence, global->name_));
         }
         return std::make_shared<Program>(functions, program->name_, program->span_);
       },

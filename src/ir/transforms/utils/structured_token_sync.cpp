@@ -93,25 +93,32 @@ class Erase : public IRMutator {
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
     CHECK(allow_nested_ || !active_) << "LowerSync nested token frames are unavailable";
     CHECK(op->iter_args_.size() == op->return_vars_.size()) << "Token loop result arity mismatch";
-    for (const auto& arg : op->iter_args_)
-      CHECK(As<SyncTokenType>(arg->GetType())) << "LowerSync non-token loop carries are unavailable";
-    for (const auto& var : op->return_vars_)
-      CHECK(As<SyncTokenType>(var->GetType())) << "LowerSync non-token loop results are unavailable";
+    std::vector<IterArgPtr> arguments;
+    std::vector<VarPtr> results;
+    for (size_t i = 0; i < op->iter_args_.size(); ++i) {
+      const bool token = static_cast<bool>(As<SyncTokenType>(op->iter_args_[i]->GetType()));
+      CHECK(token == static_cast<bool>(As<SyncTokenType>(op->return_vars_[i]->GetType())))
+          << "Token loop argument/result kinds disagree";
+      if (!token) {
+        arguments.push_back(op->iter_args_[i]);
+        results.push_back(op->return_vars_[i]);
+      }
+    }
     const bool parent = active_;
     active_ = true;
     auto body = VisitStmt(op->body_);
     active_ = parent;
-    auto loop =
-        std::make_shared<ForStmt>(op->loop_var_, op->start_, op->stop_, op->step_, std::vector<IterArgPtr>{},
-                                  body, std::vector<VarPtr>{}, op->span_, op->kind_, op->attrs_,
-                                  op->leading_comments_, op->hardware_loop_policy_);
+    auto loop = std::make_shared<ForStmt>(op->loop_var_, op->start_, op->stop_, op->step_, arguments, body,
+                                          results, op->span_, op->kind_, op->attrs_, op->leading_comments_,
+                                          op->hardware_loop_policy_);
     loops.emplace(op.get(), loop);
     return loop;
   }
   StmtPtr VisitStmt_(const YieldStmtPtr& op) override {
+    std::vector<ExprPtr> values;
     for (const auto& value : op->value_)
-      CHECK(As<SyncTokenType>(value->GetType())) << "LowerSync non-token yields are unavailable";
-    return std::make_shared<YieldStmt>(std::vector<ExprPtr>{}, op->span_, op->leading_comments_);
+      if (!As<SyncTokenType>(value->GetType())) values.push_back(value);
+    return std::make_shared<YieldStmt>(values, op->span_, op->leading_comments_);
   }
 
  private:
@@ -496,8 +503,8 @@ LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const
       LoweredLogicalSync result;
       for (const auto& domain : partition.intervals) {
         auto input = ImportSyncPayloads(stripped.function, target, parameters, domain);
-        auto families = ParseScopedTokenFamilies(function, input, stripped.loops);
-        owners.push_back(std::make_unique<ScopedTokenOrder>(std::move(input), std::move(families)));
+        auto families = ParseScopedTokenProtocol(function, std::move(input), stripped.loops);
+        owners.push_back(PrepareScopedTokenOrder(std::move(families)));
         const auto& order = *owners.back();
         plans.push_back(AllocateDirectSync(order.Input(), order.Families(), order.View(), target, eligible));
         cases.push_back({&order.Input(), plans.back().assignment, &plans.back()});
@@ -513,8 +520,9 @@ LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const
   }
   auto input = ImportSyncPayloads(stripped.function, target, parameters, blocks);
   if (input.region_tree) {
-    auto families = ParseScopedTokenFamilies(function, input, stripped.loops);
-    ScopedTokenOrder order(std::move(input), std::move(families));
+    auto families = ParseScopedTokenProtocol(function, std::move(input), stripped.loops);
+    auto prepared = PrepareScopedTokenOrder(std::move(families));
+    const auto& order = *prepared;
     // The callbacks borrow this owner until shared allocation/emission finishes.
     // An unavailable proof refuses; it never substitutes a new demand analysis.
     auto result = RealizeDirectSync(order.Input(), order.Families(), order.View(), target, eligible, policy);

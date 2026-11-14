@@ -259,3 +259,41 @@ def test_coprime_families_keep_separate_histories():
     # Each source keeps its own required history, rather than six joint phases.
     assert len(_loop(logical).iter_args) == 5
     _check_actual_tokens(original, logical, _apply(passes.lower_sync, logical))
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 7])
+@pytest.mark.parametrize("slots", [2, 3])
+def test_named_slot_remainder_retains_rotating_semantics(count, slots):
+    original = rotating_fixture(count, [(slots, 1)], SCHEDULE, stream_input=True, stream_output=True)
+
+    class NameSelections(ir.IRMutator):
+        def __init__(self):
+            super().__init__()
+            self.index = 0
+
+        def visit_assign_stmt(self, op):
+            call = op.value
+            if isinstance(call, ir.Call) and call.op.name == ir.get_op("buffer.slot").name:
+                self.index += 1
+                name = ir.Var(f"selected_slot_{self.index}", call.args[1].type, op.span)
+                return ir.SeqStmts(
+                    [
+                        ir.AssignStmt(name, call.args[1], op.span),
+                        ir.AssignStmt(
+                            op.var, ir.Call(call.op, [call.args[0], name], call.type, call.span), op.span
+                        ),
+                    ],
+                    op.span,
+                )
+            return super().visit_assign_stmt(op)
+
+    named = NameSelections().visit_function(original)
+    retained = testing.analyze_placed_sync(named, True)
+    validate(named, retained)
+    logical = _apply(passes.insert_sync, named)
+    physical = _apply(passes.lower_sync, logical)
+    _check_actual_tokens(named, logical, physical, check_codegen=bool(count))
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

@@ -1295,8 +1295,9 @@ class PTOCodegen : public CodegenBase {
     std::vector<const ir::Var*> multi_buffer_region_order;
     /// Slot remainders proven to have nonnegative operands in canonical loops.
     std::set<const ir::Expr*> unsigned_slot_remainders;
-    /// Canonical (induction, offset, count) remainders in one statement region.
-    std::map<std::tuple<const ir::Expr*, int64_t, int64_t>, std::string> slot_index_ssa;
+    /// Canonical slot remainders with their defining lexical scope. Active
+    /// ancestor scopes dominate the current use; exited siblings never do.
+    std::map<std::tuple<const ir::Expr*, int64_t, int64_t>, std::pair<std::string, size_t>> slot_index_ssa;
 
     int temp_counter = 0;
     std::set<std::string> used_ssa_names;

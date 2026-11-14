@@ -18,6 +18,12 @@
 // this is not a linear-in-source compiler bound. Port-set copying/comparison,
 // per-leaf ancestor paths and interval indexing are charged separately. Summary
 // counters count distinct nonempty nodes/rows, excluding repeated cache aliases.
+// Exceptional token relations additionally supply one-edge native/token/native
+// witnesses. Point requests cost O(F_pair log(records) * frame_depth); a uniform
+// reuse certificate adds one such request per mixed-radix carry class and exact
+// affine range checks. F_pair counts only families in the requested direction.
+// No request enumerates dynamic trips. These witnesses are sufficient, not a
+// complete periodic command-graph closure.
 #include "src/ir/transforms/utils/scoped_token_order.h"
 
 #include <algorithm>
@@ -34,6 +40,8 @@
 #include "pypto/core/logging.h"
 #include "src/ir/transforms/utils/numerical_sync_merge.h"
 #include "src/ir/transforms/utils/rotating_sync_analysis.h"
+#include "src/ir/transforms/utils/scoped_sync_palette.h"
+#include "src/ir/transforms/utils/scoped_token_families.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -57,6 +65,7 @@ struct Spec {
   Spec* right = nullptr;
   Ordinal length = 0;
   std::array<std::optional<Ordinal>, kPipeCount> first{}, last{};
+  std::array<Ordinal, kPipeCount> native_counts{};
   std::set<Edge> edges;
   std::array<std::vector<size_t>, kPipeCount> native_sites;
   // The owner itself is part of the cache identity: equal counts/ports in
@@ -82,17 +91,24 @@ void NativePorts(Ports& ports, const std::array<std::optional<Ordinal>, kPipeCou
 }  // namespace
 class ScopedTokenOrder::State {
  public:
-  CompactSyncInput input;
-  std::vector<PhysicalSyncFamily> families;
+  std::shared_ptr<const ScopedSyncProtocol> protocol;
+  const CompactSyncInput& input;
+  std::optional<std::vector<PhysicalSyncFamily>> prepared;
+  const std::vector<PhysicalSyncFamily>& families;
   std::vector<bool> uniform;
   size_t nodes = 0, entries = 0;
   mutable size_t query_steps = 0;
+  mutable size_t witness_attempts = 0, candidate_visits = 0, binary_probes = 0;
 
-  State(CompactSyncInput in, std::vector<PhysicalSyncFamily> uses)
-      : input(std::move(in)),
-        families(std::move(uses)),
+  State(std::shared_ptr<const ScopedSyncProtocol> source,
+        std::optional<std::vector<PhysicalSyncFamily>> supplied)
+      : protocol(std::move(source)),
+        input(protocol->Input()),
+        prepared(std::move(supplied)),
+        families(prepared ? *prepared : protocol->Families()),
         paths_(input.segments.size()),
         cores_(input.segments.size()) {
+    protocol->ValidateFor(input);
     CHECK(input.region_tree) << "Scoped token order requires original source regions";
     std::vector<const ForStmt*> frames;
     root_ = Structure(*input.region_tree, frames);
@@ -101,6 +117,9 @@ class ScopedTokenOrder::State {
     for (const auto& family : families) {
       CheckFamily(family);
       uniform.push_back(Install(family));
+      const auto source = input.segments[family.source_region].sites[family.source_site].pipe;
+      const auto target = input.segments[family.target_region].sites[family.target_site].pipe;
+      directional_families_[source][target].push_back(uniform.size() - 1);
     }
     for (size_t r = 0; r < cores_.size(); ++r) {
       auto& core = cores_[r];
@@ -130,14 +149,33 @@ class ScopedTokenOrder::State {
     CHECK(!value) << "Scoped occurrence has an incompatible original frame";
     return output;
   }
-  bool Query(const Occurrence& a, bool ac, const Occurrence& b, bool bc) const {
+  bool UniformQuery(const Occurrence& a, bool ac, const Occurrence& b, bool bc) const {
     NumericalOrderQuery query{
         [this](size_t r, Ordinal x, bool xc, Ordinal y, bool yc) { return LeafQuery(r, x, xc, y, yc); },
         query_steps};
     return QueryNumericalOrder(query, order_, Encode(a), ac, Encode(b), bc);
   }
-  bool Reuse(size_t index) const {
-    const auto& f = families.at(index);
+  bool Query(const Occurrence& a, bool ac, const Occurrence& b, bool bc) const {
+    if (UniformQuery(a, ac, b, bc)) return true;
+    const auto [ar, av, as] = a;
+    const auto [br, bv, bs] = b;
+    const auto ap = input.segments[ar].sites[as].pipe, bp = input.segments[br].sites[bs].pipe;
+    const auto first = Encode(a), last = Encode(b);
+    ++witness_attempts;
+    for (const auto index : directional_families_[ap][bp]) {
+      ++candidate_visits;
+      const auto& edge = families[index];
+      const auto record = FirstSourceAtOrAfter(edge, first);
+      if (record < edge.count && Encode(FamilyOccurrence(edge, record, true)) <= last) return true;
+    }
+    return false;
+  }
+  bool Reuse(size_t index) const { return ReuseFamily(families.at(index)); }
+  bool ReuseFamily(const PhysicalSyncFamily& f) const {
+    // Candidate membership/equivalence is a separate preparation obligation.
+    // Validate its original-coordinate schema, but never add candidate edges
+    // to the retained token graph to establish its own resource certificate.
+    CheckFamily(f);
     // All proof edges are translation-invariant at their own named repeat.
     // Reference-forward paths between successive uses cannot leave their
     // contiguous repeat and return. Each mixed-radix carry class therefore has
@@ -148,10 +186,15 @@ class ScopedTokenOrder::State {
     int64_t suffix_target = 0;
     for (size_t i = f.axes.size(); i-- > 0;) {
       const auto& axis = f.axes[i];
-      if (axis.count > 1 &&
-          !Query({f.target_region, f.target_first + suffix_target, f.target_site}, true,
-                 {f.source_region, f.source_first + axis.source_stride, f.source_site}, false))
-        return false;
+      if (axis.count > 1) {
+        const Occurrence previous{f.target_region, f.target_first + suffix_target, f.target_site};
+        const Occurrence next{f.source_region, f.source_first + axis.source_stride, f.source_site};
+        // The old representative proof only applies to unit-step translations.
+        // Periodic domains instead need a witness for the entire carry class.
+        if (!(UnitAxes(f) && UniformQuery(previous, true, next, false)) &&
+            !TokenReuseWitness(f, i, previous, next))
+          return false;
+      }
       const __int128 total = __int128(suffix_target) + __int128(axis.count - 1) * axis.target_stride;
       CHECK(total <= std::numeric_limits<int64_t>::max()) << "Scoped reuse coordinate overflows";
       suffix_target = static_cast<int64_t>(total);
@@ -160,11 +203,25 @@ class ScopedTokenOrder::State {
   }
   bool Barrier(size_t index) const {
     const auto& f = families.at(index);
-    if (f.count > 1 && !uniform[index]) return false;
     const auto source = Encode({f.source_region, f.source_first, f.source_site});
     const auto target = Encode({f.target_region, f.target_first, f.target_site});
     const auto pipe = input.segments[f.target_region].sites[f.target_site].pipe;
-    return Previous(root_, target, pipe) == std::optional<Ordinal>(source);
+    if (input.segments[f.source_region].sites[f.source_site].pipe != pipe ||
+        NativeRank(root_, target, pipe) - NativeRank(root_, source, pipe) != 1)
+      return false;
+    // CheckFamily proves each axis stays inside its original digit without
+    // carrying. Native rank is affine on that exact coordinate rectangle.
+    // Equal coefficients preserve adjacency over every record, including phase
+    // subsets absent from the uniform token proof graph.
+    for (size_t i = 0; i < f.axes.size(); ++i) {
+      if (f.axes[i].count == 1) continue;
+      const auto* a = paths_[f.source_region].frames[i].first;
+      const auto* b = paths_[f.target_region].frames[i].first;
+      if (Product(a->left->native_counts[pipe], AxisStep(f, i, false)) !=
+          Product(b->left->native_counts[pipe], AxisStep(f, i, true)))
+        return false;
+    }
+    return true;
   }
 
  private:
@@ -174,6 +231,177 @@ class ScopedTokenOrder::State {
   Spec* root_ = nullptr;
   Node order_;
   std::set<const NumericalNode*> counted_;
+  std::array<std::array<std::vector<size_t>, kPipeCount>, kPipeCount> directional_families_;
+
+ public:
+  void ValidateFamilies(const std::vector<PhysicalSyncFamily>& supplied) const {
+    CHECK(supplied.size() == families.size()) << "Protocol family inventory changed";
+    for (size_t i = 0; i < families.size(); ++i) {
+      const auto& a = families[i];
+      const auto& b = supplied[i];
+      CHECK(std::tie(a.source_region, a.source_site, a.target_region, a.target_site, a.source_first,
+                     a.target_first, a.count) == std::tie(b.source_region, b.source_site, b.target_region,
+                                                          b.target_site, b.source_first, b.target_first,
+                                                          b.count) &&
+            a.source_domain == b.source_domain && a.target_domain == b.target_domain &&
+            a.protocol_uses == b.protocol_uses && b.ids.empty() && a.axes.size() == b.axes.size())
+          << "Protocol handoff, domain or identity changed";
+      for (size_t j = 0; j < a.axes.size(); ++j) {
+        const auto& x = a.axes[j];
+        const auto& y = b.axes[j];
+        CHECK(x.frame == y.frame && x.count == y.count && x.source_stride == y.source_stride &&
+              x.target_stride == y.target_stride && x.source_step == y.source_step &&
+              x.target_step == y.target_step)
+            << "Protocol matching coordinates changed";
+      }
+    }
+  }
+
+ private:
+  int64_t AxisStep(const PhysicalSyncFamily& f, size_t i, bool target) const {
+    const auto r = target ? f.target_region : f.source_region;
+    auto stride = input.segments[r].count;
+    for (size_t j = 0; j <= i; ++j) stride /= paths_[r].frames[j].first->count;
+    const auto supplied = target ? f.axes[i].target_stride : f.axes[i].source_stride;
+    CHECK(stride > 0 && supplied > 0 && supplied % stride == 0)
+        << "Scoped token axis is not an original-coordinate progression";
+    return supplied / stride;
+  }
+  bool UnitAxes(const PhysicalSyncFamily& f) const {
+    for (size_t i = 0; i < f.axes.size(); ++i)
+      if (AxisStep(f, i, false) != 1 || AxisStep(f, i, true) != 1) return false;
+    return true;
+  }
+  Occurrence FamilyOccurrence(const PhysicalSyncFamily& f, int64_t record, bool target) const {
+    CHECK(record >= 0 && record < f.count) << "Scoped token record is outside its family";
+    Ordinal visit = target ? f.target_first : f.source_first;
+    for (size_t i = f.axes.size(); i-- > 0;) {
+      visit = NumericalAdd(visit, Product(target ? f.axes[i].target_stride : f.axes[i].source_stride,
+                                          record % f.axes[i].count));
+      record /= f.axes[i].count;
+    }
+    CHECK(!record && visit <= std::numeric_limits<int64_t>::max())
+        << "Scoped token family record has incompatible coordinates";
+    return {target ? f.target_region : f.source_region, static_cast<int64_t>(visit),
+            target ? f.target_site : f.source_site};
+  }
+  int64_t FirstSourceAtOrAfter(const PhysicalSyncFamily& edge, Ordinal position) const {
+    int64_t lo = 0, hi = edge.count;
+    while (lo < hi) {
+      ++binary_probes;
+      const auto mid = lo + (hi - lo) / 2;
+      if (Encode(FamilyOccurrence(edge, mid, false)) < position)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+    return lo;
+  }
+  // Translate the historical same-family carry question into the same query
+  // schema used by palette successors across different actual token records.
+  bool TokenReuseWitness(const PhysicalSyncFamily& use, size_t carry, const Occurrence& previous,
+                         const Occurrence& next) const {
+    ScopedEventTransition transition{previous, next, {}};
+    for (size_t j = 0; j <= carry; ++j) {
+      const auto& axis = use.axes[j];
+      transition.axes.push_back({axis.frame, axis.count - (j == carry), axis.target_stride,
+                                 axis.source_stride, axis.target_step, axis.source_step});
+    }
+    return ProveTransition(transition);
+  }
+
+ public:
+  bool ProveTransition(const ScopedEventTransition& transition) const {
+    const auto [pr, pv, ps] = transition.consumer;
+    const auto [nr, nv, ns] = transition.producer;
+    PhysicalSyncFamily query{pr, ps, nr, ns, pv, nv, 1, {}};
+    query.axes = transition.axes;
+    __int128 count = 1;
+    for (const auto& axis : query.axes) {
+      CHECK(axis.count > 0 && axis.source_step > 0 && axis.target_step > 0)
+          << "Invalid resource transition domain";
+      count *= axis.count;
+      CHECK(count <= std::numeric_limits<int64_t>::max()) << "Resource transition volume overflows";
+    }
+    query.count = static_cast<int64_t>(count);
+    const bool forward = CheckFamily(query, false);
+    for (size_t i = 0; i < query.axes.size(); ++i)
+      CHECK(AxisStep(query, i, false) == query.axes[i].source_step &&
+            AxisStep(query, i, true) == query.axes[i].target_step)
+          << "Resource transition step differs from its original-coordinate map";
+    if (!forward) return false;
+    if (query.count == 1) return Query(transition.consumer, true, transition.producer, false);
+    return NativeTokenWitness(query);
+  }
+
+ private:
+  // Prove the complete query rectangle with a single actual token edge between
+  // two native chains. Queries never become evidence in the retained graph.
+  bool NativeTokenWitness(const PhysicalSyncFamily& query) const {
+    const auto pr = query.source_region, ps = query.source_site;
+    const auto nr = query.target_region, ns = query.target_site;
+    const auto previous_pipe = input.segments[pr].sites[ps].pipe;
+    const auto next_pipe = input.segments[nr].sites[ns].pipe;
+    const auto previous_position = Encode({pr, query.source_first, ps});
+    const auto next_position = Encode({nr, query.target_first, ns});
+    ++witness_attempts;
+    std::vector<int64_t> counts;
+    std::vector<Ordinal> before_steps, after_steps;
+    for (size_t j = 0; j < query.axes.size(); ++j) {
+      counts.push_back(query.axes[j].count);
+      before_steps.push_back(Product(paths_[pr].frames[j].second, AxisStep(query, j, false)));
+      after_steps.push_back(Product(paths_[nr].frames[j].second, AxisStep(query, j, true)));
+    }
+    for (const auto index : directional_families_[previous_pipe][next_pipe]) {
+      ++candidate_visits;
+      const auto& edge = families[index];
+      // Source occurrences are strictly increasing in mixed-radix record order.
+      // Find the earliest edge that can follow this carry class's first consumer.
+      const auto lo = FirstSourceAtOrAfter(edge, previous_position);
+      if (lo == edge.count) continue;
+      const auto source = Encode(FamilyOccurrence(edge, lo, false));
+      const auto target = Encode(FamilyOccurrence(edge, lo, true));
+      if (target > next_position) continue;
+      std::vector<int64_t> digits(edge.axes.size());
+      auto record = lo;
+      for (size_t j = edge.axes.size(); j-- > 0;) {
+        digits[j] = record % edge.axes[j].count;
+        record /= edge.axes[j].count;
+      }
+      Ordinal before = source - previous_position, after = next_position - target;
+      bool compatible = true;
+      for (size_t j = 0; j < counts.size() && compatible; ++j) {
+        if (counts[j] == 1) continue;
+        size_t e = 0;
+        while (e < edge.axes.size() && edge.axes[e].frame != query.axes[j].frame) ++e;
+        if (e == edge.axes.size()) {
+          compatible = false;
+          break;
+        }
+        const auto step = AxisStep(query, j, false), edge_step = AxisStep(edge, e, false);
+        if (step % edge_step) {
+          compatible = false;
+          break;
+        }
+        const auto ratio = step / edge_step;
+        if (Ordinal(digits[e]) + Product(ratio, counts[j] - 1) >= edge.axes[e].count) {
+          compatible = false;
+          break;
+        }
+        const auto source_step =
+            Product(paths_[edge.source_region].frames[e].second, AxisStep(edge, e, false));
+        const auto target_step =
+            Product(paths_[edge.target_region].frames[e].second, AxisStep(edge, e, true));
+        const auto before_delta = Product(source_step, ratio) - before_steps[j];
+        const auto after_delta = after_steps[j] - Product(target_step, ratio);
+        if (before_delta < 0) before -= Product(-before_delta, counts[j] - 1);
+        if (after_delta < 0) after -= Product(-after_delta, counts[j] - 1);
+        if (before < 0 || after < 0) compatible = false;
+      }
+      if (compatible) return true;
+    }
+    return false;
+  }
 
   Spec* New(Spec::Kind kind) {
     auto item = std::make_unique<Spec>();
@@ -188,6 +416,7 @@ class ScopedTokenOrder::State {
     out->right = right;
     out->length = NumericalAdd(left->length, right->length);
     for (size_t p = 0; p < kPipeCount; ++p) {
+      out->native_counts[p] = NumericalAdd(left->native_counts[p], right->native_counts[p]);
       out->first[p] = left->first[p];
       if (!out->first[p] && right->first[p]) out->first[p] = NumericalAdd(left->length, *right->first[p]);
       out->last[p] = right->last[p] ? std::optional<Ordinal>(NumericalAdd(left->length, *right->last[p]))
@@ -203,6 +432,7 @@ class ScopedTokenOrder::State {
     out->length = Product(body->length, frame.count);
     if (frame.count) {
       for (size_t p = 0; p < kPipeCount; ++p) {
+        out->native_counts[p] = Product(body->native_counts[p], frame.count);
         out->first[p] = body->first[p];
         if (body->last[p])
           out->last[p] = NumericalAdd(Product(body->length, frame.count - 1), *body->last[p]);
@@ -233,6 +463,7 @@ class ScopedTokenOrder::State {
         if (!out->first[pipe]) out->first[pipe] = s;
         out->last[pipe] = s;
         out->native_sites[pipe].push_back(s);
+        ++out->native_counts[pipe];
       }
       for (size_t i = segment.nested_frames.size(); i-- > frames.size();)
         out = Repeat(out, segment.nested_frames[i]);
@@ -283,7 +514,7 @@ class ScopedTokenOrder::State {
     CHECK(!visit) << "Scoped token visit exceeds original frame inventory";
     return out;
   }
-  void CheckFamily(const PhysicalSyncFamily& f) const {
+  bool CheckFamily(const PhysicalSyncFamily& f, bool require_forward = true) const {
     const auto a = Encode({f.source_region, f.source_first, f.source_site});
     const auto b = Encode({f.target_region, f.target_first, f.target_site});
     Ordinal minimum = b - a;
@@ -298,21 +529,27 @@ class ScopedTokenOrder::State {
       ss /= sp.frames[i].first->count;
       ts /= tp.frames[i].first->count;
       CHECK(axis.frame == sp.frames[i].first->frame && axis.frame == tp.frames[i].first->frame &&
-            axis.count > 0 && axis.source_stride == ss && axis.target_stride == ts &&
-            sd[i] <= sp.frames[i].first->count - axis.count &&
-            td[i] <= tp.frames[i].first->count - axis.count)
+            axis.count > 0 && ss > 0 && ts > 0 && axis.source_stride > 0 && axis.target_stride > 0 &&
+            axis.source_stride % ss == 0 && axis.target_stride % ts == 0 &&
+            axis.source_stride / ss == axis.target_stride / ts &&
+            Ordinal(sd[i]) + Product(axis.source_stride / ss, axis.count - 1) < sp.frames[i].first->count &&
+            Ordinal(td[i]) + Product(axis.target_stride / ts, axis.count - 1) < tp.frames[i].first->count)
           << "Scoped token family has incompatible axes";
       volume *= axis.count;
       CHECK(volume <= std::numeric_limits<int64_t>::max()) << "Scoped token family volume overflows";
-      const auto delta = tp.frames[i].second - sp.frames[i].second;
+      const auto delta = Product(tp.frames[i].second, axis.target_stride / ts) -
+                         Product(sp.frames[i].second, axis.source_stride / ss);
       if (delta < 0) minimum += Product(-delta, axis.count - 1) * -1;
     }
-    CHECK(volume == f.count && minimum > 0) << "Scoped token family is not uniformly reference-forward";
+    CHECK(volume == f.count) << "Scoped token family volume differs from its coordinate map";
+    CHECK(!require_forward || minimum > 0) << "Scoped token family is not uniformly reference-forward";
+    return minimum > 0;
   }
   // The source tree's repeat ancestors are the exact translation group at
   // the edge's owner. Full ancestor domains are required, except at one
   // adjacent-repeat seam. Fixed inner suffixes remain fixed body endpoints.
   bool Install(const PhysicalSyncFamily& f) {
+    if (!UnitAxes(f)) return false;
     const auto& sp = paths_[f.source_region];
     const auto& tp = paths_[f.target_region];
     const auto sd = Digits(f.source_region, f.source_first), td = Digits(f.target_region, f.target_first);
@@ -482,43 +719,96 @@ class ScopedTokenOrder::State {
     spec->cache.emplace(key, result);
     return result;
   }
-  std::optional<Ordinal> Previous(const Spec* spec, Ordinal target, PipeType pipe) const {
+  Ordinal NativeRank(const Spec* spec, Ordinal target, PipeType pipe) const {
     if (spec->kind == Spec::Leaf) {
       const auto& sites = spec->native_sites[pipe];
       const auto at = std::lower_bound(sites.begin(), sites.end(), target);
-      return at == sites.begin() ? std::nullopt : std::optional<Ordinal>(*std::prev(at));
+      return static_cast<Ordinal>(at - sites.begin());
     }
     if (spec->kind == Spec::Repeat) {
       const auto length = spec->left->length;
       const auto visit = target / length;
-      const auto inside = Previous(spec->left, target % length, pipe);
-      if (inside) return NumericalAdd(visit * length, *inside);
-      if (visit && spec->left->last[pipe]) return NumericalAdd((visit - 1) * length, *spec->left->last[pipe]);
-      return std::nullopt;
+      CHECK(visit <= std::numeric_limits<int64_t>::max()) << "Scoped native rank visit overflows";
+      return NumericalAdd(Product(spec->left->native_counts[pipe], static_cast<int64_t>(visit)),
+                          NativeRank(spec->left, target % length, pipe));
     }
-    if (target < spec->left->length) return Previous(spec->left, target, pipe);
-    auto inside = Previous(spec->right, target - spec->left->length, pipe);
-    return inside ? std::optional<Ordinal>(NumericalAdd(spec->left->length, *inside))
-                  : spec->left->last[pipe];
+    if (target < spec->left->length) return NativeRank(spec->left, target, pipe);
+    return NumericalAdd(spec->left->native_counts[pipe],
+                        NativeRank(spec->right, target - spec->left->length, pipe));
   }
 };
-ScopedTokenOrder::ScopedTokenOrder(CompactSyncInput input, std::vector<PhysicalSyncFamily> families)
-    : state_(std::make_unique<State>(std::move(input), std::move(families))) {}
+ScopedTokenOrder::ScopedTokenOrder(std::shared_ptr<const ScopedSyncProtocol> protocol)
+    : ScopedTokenOrder(std::move(protocol), std::nullopt) {}
+ScopedTokenOrder::ScopedTokenOrder(std::shared_ptr<const ScopedSyncProtocol> protocol,
+                                   std::optional<std::vector<PhysicalSyncFamily>> prepared)
+    : state_(std::make_unique<State>(std::move(protocol), std::move(prepared))) {}
 ScopedTokenOrder::~ScopedTokenOrder() = default;
 const CompactSyncInput& ScopedTokenOrder::Input() const { return state_->input; }
+const std::shared_ptr<const ScopedSyncProtocol>& ScopedTokenOrder::Protocol() const {
+  return state_->protocol;
+}
 const std::vector<PhysicalSyncFamily>& ScopedTokenOrder::Families() const { return state_->families; }
 bool ScopedTokenOrder::Precedes(const Occurrence& a, bool ac, const Occurrence& b, bool bc) const {
   return state_->Query(a, ac, b, bc);
 }
 bool ScopedTokenOrder::Uniform(size_t i) const { return state_->uniform.at(i); }
+bool ScopedTokenOrder::ProveTransition(const ScopedEventTransition& transition) const {
+  return state_->ProveTransition(transition);
+}
+bool ScopedTokenOrder::CanReuseFamily(const PhysicalSyncFamily& family) const {
+  return state_->ReuseFamily(family);
+}
 size_t ScopedTokenOrder::SummaryNodes() const { return state_->nodes; }
 size_t ScopedTokenOrder::InterfaceEntries() const { return state_->entries; }
+size_t ScopedTokenOrder::WitnessAttempts() const { return state_->witness_attempts; }
+size_t ScopedTokenOrder::CandidateVisits() const { return state_->candidate_visits; }
+size_t ScopedTokenOrder::BinaryProbes() const { return state_->binary_probes; }
 DirectSyncOrder ScopedTokenOrder::View() const {
   return {[this](const Occurrence& a, const Occurrence& b) { return state_->Query(a, true, b, false); },
           [this](const Occurrence& a, const Occurrence& b) { return state_->Encode(a) < state_->Encode(b); },
           [](size_t, size_t, size_t) -> std::optional<__int128> { return std::nullopt; },
           [this](size_t i) { return state_->Reuse(i); },
           [this](size_t i) { return state_->Barrier(i); },
-          false};
+          false,
+          state_->protocol,
+          [this](const std::vector<PhysicalSyncFamily>& families) { state_->ValidateFamilies(families); },
+          [this](PipeType source, PipeType target, int64_t capacity) {
+            auto result = BuildScopedPublicationSchedule(*this, source, target);
+            if (!result.schedule) return result;
+            const auto schedule = result.schedule;
+            auto work = result.work;
+            size_t attempts = 0;
+            result.status = ScopedPaletteStatus::UnprovedReuse;
+            result.reason = "No eligible directional IDs supplied";
+            for (int64_t budget = 1; budget <= capacity; ++budget) {
+              result = CertifyScopedPalette(*this, schedule, budget);
+              ++attempts;
+              work.transition_queries += result.work.transition_queries;
+              work.boundary_node_visits += result.work.boundary_node_visits;
+              work.proof_axis_entries += result.work.proof_axis_entries;
+              if (result.certificate) break;
+            }
+            result.work = work;
+            result.attempted_budgets = attempts;
+            return result;
+          }};
+}
+std::unique_ptr<ScopedTokenOrder> PrepareScopedTokenOrder(std::shared_ptr<const ScopedSyncProtocol> protocol,
+                                                          ScopedTokenWork* work) {
+  auto original = std::make_unique<ScopedTokenOrder>(std::move(protocol));
+  auto normalized = NormalizeScopedTokenFamilies(
+      original->Input(), original->Families(),
+      [&](const PhysicalSyncFamily& candidate) { return original->CanReuseFamily(candidate); }, work);
+  if (normalized.size() == original->Families().size()) return original;
+  auto candidate =
+      std::unique_ptr<ScopedTokenOrder>(new ScopedTokenOrder(original->Protocol(), std::move(normalized)));
+  // Normalization preserves actual uses, but this sufficient proof graph may
+  // change. Never replace an available preparation with an unproved one.
+  for (const auto& family : candidate->Families()) {
+    const auto direction = SyncFamilyPipes(candidate->Input(), family);
+    if (direction.first != direction.second && family.count > 1 && !candidate->CanReuseFamily(family))
+      return original;
+  }
+  return candidate;
 }
 }  // namespace pypto::ir::sync

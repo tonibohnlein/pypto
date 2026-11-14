@@ -99,7 +99,6 @@ def main():
                                 "merge_nodes",
                                 "interface_entries",
                                 "scoped_export_builds",
-                                "scoped_reuse_queries",
                             ]
                         }
                     )
@@ -164,7 +163,7 @@ def main():
                 "K_and_replay": count,
                 "analysis_seconds": analysis_seconds,
                 "physical_seconds": physical_seconds,
-                **{k: d[k] for k in ["analyzed_occurrences", "merge_nodes", "scoped_reuse_queries"]},
+                **{k: d[k] for k in ["analyzed_occurrences", "merge_nodes"]},
                 **{
                     k: physical[k]
                     for k in ["set_sites", "wait_sites", "barrier_sites", "guard_sites", "reuse_queries"]

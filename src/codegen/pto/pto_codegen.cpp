@@ -2446,27 +2446,9 @@ bool PTOCodegen::TryEmitMultiTileGet(const ir::TileTypePtr& type, const std::str
     CHECK_SPAN(scalar_type && (scalar_type->dtype_.IsInt() || scalar_type->dtype_ == DataType::INDEX), span)
         << "A slot index must be an integer or index expression, got "
         << (scalar_type ? GetTypeString(scalar_type->dtype_) : std::string("a non-scalar"));
-    if (fs_.unsigned_slot_remainders.count(slot_index.get()) != 0) {
-      auto mod = As<ir::FloorMod>(slot_index);
-      ExprPtr induction = mod->left_;
-      int64_t offset = 0;
-      if (auto add = As<ir::Add>(induction)) {
-        offset = As<ir::ConstInt>(add->right_)->value_;
-        induction = add->left_;
-      }
-      const auto key = std::make_tuple(induction.get(), offset, As<ir::ConstInt>(mod->right_)->value_);
-      auto found = fs_.slot_index_ssa.find(key);
-      if (found != fs_.slot_index_ssa.end()) {
-        slot_ssa = found->second;
-      } else {
-        // The scalar emitter owns operand conversion and the proven unsigned
-        // spelling; keep only slot-expression deduplication here.
-        slot_ssa = GetExprAsCode(slot_index);
-        fs_.slot_index_ssa.emplace(key, slot_ssa);
-      }
-    } else {
-      slot_ssa = GetExprAsCode(slot_index);
-    }
+    // Scalar emission shares qualified canonical slot expressions in their
+    // dominating lexical scopes, for both Tile and Buffer inputs.
+    slot_ssa = GetExprAsCode(slot_index);
     if (scalar_type->dtype_ != DataType::INDEX) {
       std::string idx = NewTemp();
       Emit(idx + " = arith.index_cast " + slot_ssa + " : " + GetTypeString(scalar_type->dtype_) +
@@ -3093,10 +3075,6 @@ void PTOCodegen::EmitExtraAllocTiles() {
 // ========================================================================
 
 void PTOCodegen::VisitStmt(const ir::StmtPtr& stmt) {
-  // Never reuse a scalar SSA defined inside a sibling/nested control-flow
-  // region. Within each straight-line body all ring accesses share one index.
-  const bool region_boundary = !As<ir::AssignStmt>(stmt) && !As<ir::EvalStmt>(stmt);
-  if (region_boundary) fs_.slot_index_ssa.clear();
   // Defensive: the first-class SplitAivScopeStmt region is consumed and erased
   // by LowerAutoVectorSplit (pass 23), well before codegen. There is no
   // ScopeStmt handler here, so a survivor would be silently unwrapped by the
@@ -3110,7 +3088,6 @@ void PTOCodegen::VisitStmt(const ir::StmtPtr& stmt) {
   // they frequently rebuild the Call underneath it with a coarser span.
   SpanScope stmt_loc(this, &stmt->span_);
   ir::IRVisitor::VisitStmt(stmt);
-  if (region_boundary) fs_.slot_index_ssa.clear();
 }
 
 void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {

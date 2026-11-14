@@ -80,6 +80,18 @@ struct NumericalOccurrencePath {
   // Outermost first: radix and reference-order payload stride.
   std::vector<std::pair<int64_t, NumericalOrdinal>> frames;
 };
+// A phase-local finite provider is distinct from an original source leaf.
+// Its local ordinal is a contiguous interval in the original reference order;
+// the source layout remains authoritative when a shared provider is repeated.
+struct NumericalFiniteProvider {
+  std::vector<SyncSite> sites;
+  FiniteSyncResult order;
+};
+struct NumericalPhaseSchedule {
+  int64_t period = 1, prefix_count = 0, cycles = 0, tail_count = 0;
+  std::vector<size_t> prefix_providers, cycle_providers, tail_providers;
+  std::shared_ptr<const NumericalNode> prefix, cycle, tail, repeated, seam;
+};
 // Complete schedule proof for a byte domain: full monotone row fills followed
 // by finite interval readers covering every row. Witnesses suffice for crossing
 // generation; they are NOT a materialized cell partition or a selector answer.
@@ -96,6 +108,14 @@ class NumericalSyncHierarchy {
   std::vector<NumericalOrdinal> segment_offsets;
   std::optional<NumericalSourceLayout> source_layout;
   std::vector<NumericalOccurrencePath> source_paths;
+  // Provider IDs start after the original segment directory. They never
+  // overwrite source identities or reuse an unrelated leaf's query rows.
+  std::map<size_t, NumericalFiniteProvider> finite_providers;
+  std::map<const ForStmt*, NumericalPhaseSchedule> phase_schedules;
+  std::map<size_t, size_t> finite_source_providers;
+  std::set<size_t> phase_readonly_domains;
+  // Root-scoped single-write tiled domains; no certificate survives a new parent.
+  std::set<size_t> phase_owned_outputs;
 };
 NumericalOrdinal NumericalAdd(NumericalOrdinal a, NumericalOrdinal b);
 NumericalBoundary MergeNumericalBoundary(const NumericalBoundary& a, const NumericalBoundary& b,

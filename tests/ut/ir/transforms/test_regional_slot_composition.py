@@ -129,6 +129,10 @@ def test_audit_expansion_has_an_explicit_budget():
 def test_inner_count_does_not_expand_interfaces(inner):
     result = testing.analyze_placed_sync(repeated_fixture(inner, 7), True)
     d = result.describe()
+    # A structured wrapper does not turn rotating local effects into invariant
+    # finite classes. Retain the qualified periodic leaf rather than unfolding.
+    assert d["regions"][0]["rotating"]
+    assert d["regions"][0]["internal_scope_count"] == inner
     assert d["analyzed_occurrences"] <= 3
     assert d["interface_slot_visits"] <= 64
     assert d["interface_entries"] <= 10000

@@ -19,8 +19,10 @@ The published `codex/pypto-buffered-intervals` branch at
 conflicts; their CI, A5 VF, non-finite constant and descriptor-ABI changes remain.
 
 No production algorithm, token contract, allocation policy, physical-ID assignment,
-fixture or independent checker was removed. Source review found that the retained
-diagnostic APIs have test consumers; being diagnostic is not evidence of dead code.
+fixture or independent checker was removed. The original reconstruction retained diagnostic APIs for review. Subsequent
+cleanup requires production consumers for implementation paths: tests use the
+actual token pipeline, while independent oracles remain test-owned. Test callers
+alone do not justify an alternate production implementation.
 The first two packages establish prerequisites; the third keeps coupled entry
 points together rather than introducing temporary declarations without definitions.
 

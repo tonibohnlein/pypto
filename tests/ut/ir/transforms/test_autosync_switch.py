@@ -282,7 +282,7 @@ def test_late_realization_refusal_keeps_original_body():
     original = Nonadjacent().visit_function(capture("matmul_64"))
     retained = testing.analyze_placed_sync(original, True)
     before = retained.describe()
-    with pytest.raises(ValueError, match="order-equal same-pipe barrier"):
+    with pytest.raises(ValueError, match="same-pipe barrier would strengthen the recorded prefix"):
         retained.realize_physical("a2a3")
     assert retained.describe() == before
     # Insertion succeeds; physical consumption of its actual tokens refuses.

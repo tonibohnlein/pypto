@@ -95,9 +95,12 @@ def test_partial_rotating_intervals_match_original_access_oracle(count, slots, s
 
 
 @pytest.mark.parametrize("boxed,partial_columns", [(True, False), (False, True)])
-def test_partial_rotating_interval_requires_exact_contiguity(boxed, partial_columns):
-    with pytest.raises(ValueError, match="exact contiguous within-slot"):
-        testing.analyze_placed_sync(interval_pipeline(boxed=boxed, partial_columns=partial_columns), True)
+def test_partial_rotating_geometry_matches_original_accesses(boxed, partial_columns):
+    function = interval_pipeline(boxed=boxed, partial_columns=partial_columns)
+    result = testing.analyze_placed_sync(function, True)
+    # The admitted geometry may use row fragments instead of one contiguous
+    # interval. Validate its actual byte effects, covers and selectors.
+    validate(function, result)
 
 
 def test_interval_generation_avoids_atom_incidence_expansion():
