@@ -22,6 +22,7 @@
 
 #include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_config.h"
+#include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
 #include "pypto/backend/common/buffer_row_recipes.h"
@@ -122,6 +123,7 @@ class CoordinateGraph {
     size_t left = 0, right = 0, parameter = 0;
     const ForStmt* frame = nullptr;
     bool constant = false;
+    bool dynamic_start = false;
   };
   std::vector<Node> nodes_;
   std::map<std::pair<const Expr*, const ForStmt*>, size_t> memo_;
@@ -171,7 +173,15 @@ class CoordinateGraph {
       n.start = loop->start;
       n.lower = n.start;
       n.step = loop->step;
-      n.upper = Checked(__int128(n.start) + __int128(n.step) * std::max<int64_t>(0, loop->count - 1));
+      if (loop->start_expression) {
+        n.left = Build(loop->start_expression, segment, parameters, input);
+        n.dynamic_start = true;
+        n.lower = nodes_[n.left].lower;
+        n.upper = Checked(__int128(nodes_[n.left].upper) +
+                          __int128(n.step) * std::max<int64_t>(0, loop->count - 1));
+      } else {
+        n.upper = Checked(__int128(n.start) + __int128(n.step) * std::max<int64_t>(0, loop->count - 1));
+      }
     } else if (segment.original_loop && e == segment.original_loop->loop_var_) {
       n.kind = Kind::Loop;
       n.frame = frame;
@@ -280,7 +290,10 @@ class CoordinateGraph {
         shift_origin(__int128(weight) * input.block_bounds->first);
         result.block = Checked(__int128(result.block) + weight);
       } else if (n.kind == Kind::Loop) {
-        shift_origin(__int128(weight) * n.start);
+        if (n.dynamic_start)
+          add(n.left, weight);
+        else
+          shift_origin(__int128(weight) * n.start);
         auto& coefficient = result.frames[n.frame];
         coefficient = Checked(__int128(coefficient) + __int128(weight) * n.step);
       } else if (n.kind == Kind::Scale) {
@@ -717,6 +730,21 @@ class Importer {
         site.protected_accumulator = Storage(call->args_[2]);
         site.initializes_accumulator = IsOp(call, "buffer.matmul");
       }
+    } else if (auto recipe = backend::FindBufferConversionRecipe(call->op_->name_)) {
+      CHECK(result.owner->func_type_ == FunctionType::AIV &&
+            recipe->kind == backend::BufferConversionKind::Cast)
+          << "Synchronization conversion import requires a qualified AIV cast";
+      // Shared call validation above establishes dtype, rounding and operand
+      // contracts. Shape-wide accesses are exact only for full-valid casts;
+      // packed predicates and conversion scratch need separate footprints.
+      for (const auto& argument : call->args_) {
+        const auto type = As<BufferType>(argument->GetType());
+        CHECK(type && type->valid_shape_ == type->shape_)
+            << "Synchronization cast requires a full-valid footprint";
+      }
+      whole(0, false);
+      whole(1, true);
+      site.pipe = PipeType::V;
     } else if (auto recipe = backend::FindBufferIndexedRecipe(call->op_->name_)) {
       CHECK(result.owner->func_type_ == FunctionType::AIV) << "Indexed synchronization requires an AIV leaf";
       // The shared contract uses in-range physical element offsets into a
@@ -900,13 +928,16 @@ SyncLoopFrame NumericalFrame(Importer& importer, const ForStmtPtr& loop,
       hi += __int128(start.block) *
             (importer.result.block_bounds->second - importer.result.block_bounds->first);
     }
-    // No sampling: every admitted start executes exactly once. Optional visits
-    // require an absence-aware parent and are not converted to count one.
+    // The invocation partition must establish one count over this entire
+    // domain. Keep the original start, not a representative worker's IV.
     if (lo >= stop) return {loop, 0, 0, step, loop->start_};
-    CHECK(lo >= 0 && hi < stop && __int128(stop) - lo <= step)
+    CHECK(lo >= 0 && hi < stop)
         << "Optional or varying outer visits need a guarded regional activation interface";
-    Checked(hi + step);
-    return {loop, 1, 0, step, loop->start_};
+    const auto count = 1 + (__int128(stop) - lo - 1) / step;
+    CHECK(count == 1 + (__int128(stop) - hi - 1) / step)
+        << "Optional or varying outer visits need a guarded regional activation interface";
+    Checked(hi + count * step);
+    return {loop, Checked(count), 0, step, loop->start_};
   }
   const auto start = Constant(loop->start_);
   const auto count = stop <= start ? 0 : 1 + (stop - start - 1) / step;
@@ -1125,9 +1156,11 @@ class InvocationBounds : public IRVisitor {
             launch = Bound{0, constant->value_ - 1};
           }
         } else if (caller_->func_type_ == FunctionType::Spmd &&
-                   found->second->func_type_ == FunctionType::AIC) {
-          // An outlined AIC worker inherits its wrapper's logical block index.
-          // Other call/core kinds require their own dispatch interpretation.
+                   (found->second->func_type_ == FunctionType::AIC ||
+                    found->second->func_type_ == FunctionType::AIV)) {
+          // Outlined workers receive the wrapper's logical task block index.
+          // Dual-AIV dispatch shares that index between lanes; it does not
+          // establish a subblock range or disjoint storage between the lanes.
           launch = block_index_;
         }
         auto [launch_it, first_launch] = launches_.emplace(global->name_, launch);

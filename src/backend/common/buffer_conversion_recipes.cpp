@@ -78,7 +78,8 @@ bool Predicate(const ir::BufferTypePtr& mask, const ir::BufferTypePtr& values) {
              std::vector<int64_t>{values->valid_shape_[0], (values->valid_shape_[1] + 7) / 8};
 }
 
-const char* OperandError(const BufferConversionRecipe& recipe, const std::vector<ir::BufferTypePtr>& types) {
+const char* OperandError(const BufferConversionRecipe& recipe, const std::vector<ir::BufferTypePtr>& types,
+                         const std::vector<std::pair<std::string, std::any>>& kwargs) {
   for (size_t i = 0; i < types.size(); ++i) {
     if (static_cast<int>(i) != recipe.scalar_index && !IsAlignedDenseVecBuffer(types[i])) {
       return "requires aligned dense rank-2 Vec buffers with positive static valid extents";
@@ -89,9 +90,17 @@ const char* OperandError(const BufferConversionRecipe& recipe, const std::vector
     const auto& src = types[0];
     const bool pair = (src->dtype_ == DataType::FP16 && dst->dtype_ == DataType::FP32) ||
                       (src->dtype_ == DataType::FP32 && dst->dtype_ == DataType::FP16);
-    return pair && Geometry(src, dst)
+    const bool bfloat = (src->dtype_ == DataType::BF16 && dst->dtype_ == DataType::FP32) ||
+                        (src->dtype_ == DataType::FP32 && dst->dtype_ == DataType::BF16);
+    // Preserve the existing half/single rounding contract. A2/A3's direct
+    // float/bfloat conversion additionally supports ROUND (mode 2); widening
+    // bfloat is exact. Neither direction needs integer-narrowing scratch.
+    for (const auto& [key, value] : kwargs)
+      if (key == "mode" && AnyCast<int>(value, "Buffer cast mode") == 2 && !bfloat)
+        return "has unsupported conversion attributes for this dtype pair";
+    return (pair || bfloat) && Geometry(src, dst)
                ? nullptr
-               : "requires FP16/FP32 conversion with matching physical and valid shapes";
+               : "requires FP16/FP32 or BF16/FP32 conversion with matching physical and valid shapes";
   }
   if (recipe.kind == K::Compare || recipe.kind == K::CompareScalar) {
     const auto& src = types[0];
@@ -141,9 +150,9 @@ bool Attributes(const BufferConversionRecipe& recipe,
       return false;
     }
   }
-  // This rollout uses IEEE half/single conversion. Other rounding/saturation
+  // OperandError further qualifies mode 2 by dtype. Other rounding/saturation
   // modes and scratch-backed integer narrowing keep their existing Tile path.
-  if (recipe.kind == K::Cast) return (mode == 0 || mode == 1) && saturation == 0;
+  if (recipe.kind == K::Cast) return (mode == 0 || mode == 1 || mode == 2) && saturation == 0;
   if (recipe.kind == K::Compare || recipe.kind == K::CompareScalar) return comparison >= 0 && comparison < 6;
   return true;
 }
@@ -169,7 +178,7 @@ bool SupportsLogicalBufferConversion(const BufferConversionRecipe& recipe, const
     }
   }
   types.push_back(StaticLogicalBufferDescriptor(call->GetType()));
-  return OperandError(recipe, types) == nullptr;
+  return OperandError(recipe, types, call->kwargs_) == nullptr;
 }
 
 void ValidateBufferConversionOperands(const BufferConversionRecipe& recipe,
@@ -188,7 +197,7 @@ void ValidateBufferConversionOperands(const BufferConversionRecipe& recipe,
       types.push_back(ir::As<ir::BufferType>(args[i]->GetType()));
     }
   }
-  const auto* error = OperandError(recipe, types);
+  const auto* error = OperandError(recipe, types, kwargs);
   CHECK(!error) << recipe.buffer_op << " " << error;
 }
 

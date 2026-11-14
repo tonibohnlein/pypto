@@ -155,6 +155,14 @@ def operand_signature(expr, env, storage):
     return tuple(descriptor)
 
 
+def _vector_effects(name, args, access):
+    """Elementwise operations read inputs and write their typed destination."""
+    # TCVT can change byte widths; partial native footprints are not qualified.
+    assert name != ir.get_op("buffer.cast").name or all(a.type.valid_shape == a.type.shape for a in args)
+    reads = set().union(*(access(a) for a in args[:-1] if isinstance(a.type, ir.BufferType)))
+    return reads, access(args[-1]), ir.PipeType.V
+
+
 def interpret(
     function,
     parameters=None,
@@ -259,14 +267,15 @@ def interpret(
             ir.get_op("buffer.mul").name,
             ir.get_op("buffer.sub").name,
             ir.get_op("buffer.abs").name,
+            ir.get_op("buffer.neg").name,
+            ir.get_op("buffer.cast").name,
             ir.get_op("buffer.adds").name,
             ir.get_op("buffer.recip").name,
             ir.get_op("buffer.exp").name,
             ir.get_op("buffer.row_expand_sub").name,
             ir.get_op("buffer.row_expand_div").name,
         }:
-            reads = set().union(*(access(a) for a in args[:-1] if isinstance(a.type, ir.BufferType)))
-            writes, pipe = access(args[-1]), ir.PipeType.V
+            reads, writes, pipe = _vector_effects(name, args, access)
         else:
             assert name in {ir.get_op("buffer.matmul").name, ir.get_op("buffer.matmul_acc").name}
             reads = access(args[0]) | access(args[1])

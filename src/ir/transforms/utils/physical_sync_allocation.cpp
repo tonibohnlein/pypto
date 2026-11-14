@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
 #include "pypto/backend/common/buffer_row_recipes.h"
@@ -92,6 +93,9 @@ std::map<Direction, std::set<int>> NativeClaims(const CompactSyncInput& a, const
           } else if (auto recipe = backend::FindBufferIndexedRecipe(call->op_->name_)) {
             native = recipe->native_op;
           } else if (auto recipe = backend::FindBufferRowRecipe(call->op_->name_)) {
+            native = recipe->native_op;
+          } else if (auto recipe = backend::FindBufferConversionRecipe(call->op_->name_);
+                     recipe && recipe->kind == backend::BufferConversionKind::Cast) {
             native = recipe->native_op;
           }
           CHECK(native) << "Unavailable native synchronization resource binding: " << call->op_->name_;
