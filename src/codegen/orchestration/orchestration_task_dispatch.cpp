@@ -84,6 +84,18 @@ std::string CoreTypeToSubmitPrefix(CoreType core_type) {
 
 }  // namespace
 
+void KernelRegistrations::RecordTaskDomain(const FunctionPtr& function) {
+  INTERNAL_CHECK(function) << "Internal error: missing emitted task-control domain";
+  const auto type = function->func_type_;
+  INTERNAL_CHECK_SPAN(type == FunctionType::Orchestration || type == FunctionType::Graph ||
+                          type == FunctionType::Spmd || type == FunctionType::Group,
+                      function->span_)
+      << "Internal error: local payload or external domain cannot acquire task-control ownership";
+  const auto [entry, inserted] = task_domains.emplace(function->name_, type);
+  INTERNAL_CHECK_SPAN(inserted || entry->second == type, function->span_)
+      << "Internal error: conflicting emitted task-control domain identity";
+}
+
 int KernelRegistrations::GetOrCreate(const std::string& name, CoreType core_type,
                                      std::vector<std::string> signature) {
   auto key = std::make_tuple(name, core_type, signature);
@@ -1216,6 +1228,7 @@ void OrchestrationStmtCodegen::GenerateGraphCallCode(const CallPtr& call, const 
 
 void OrchestrationStmtCodegen::GenerateSpmdCallCode(const CallPtr& call, const FunctionPtr& spmd_func,
                                                     bool capture_plain_task_id) {
+  registrations_->RecordTaskDomain(spmd_func);
   auto info = FindWrapperInnerCall(spmd_func);
   INTERNAL_CHECK(info.inner_call != nullptr && info.inner_callee != nullptr)
       << "Internal error: no inner call found in Spmd function '" << spmd_func->name_ << "'";
@@ -1248,6 +1261,7 @@ void OrchestrationStmtCodegen::GenerateGroupCallCode(const CallPtr& call, const 
                                                      const FunctionPtr& launch_func,
                                                      bool capture_plain_task_id,
                                                      const WrapperBridge& bridge) {
+  registrations_->RecordTaskDomain(group_func);
   std::string group_name = group_func->name_;
 
   auto info = FindGroupCallees(group_func);

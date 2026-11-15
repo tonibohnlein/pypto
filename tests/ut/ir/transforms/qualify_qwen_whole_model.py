@@ -70,15 +70,17 @@ def static_control_inventory(function: ir.Function) -> dict[str, Any]:
     return dict(sorted(counts.items()))
 
 
-def domain_ownership(receipt, kernels, cpp_names):
+def domain_ownership(receipt, kernels, cpp_names, execution_domains=()):
     """Join observed domains, retaining absent and delegated owners explicitly."""
     before = {f["name"]: f for f in receipt["functions_before_sync"]}
     selected = {f["name"]: f for f in receipt["functions_after_buffer_selection"]}
     after = {f["name"]: f for f in receipt["functions_after_sync"]}
     reports = {k["function"]: k for k in kernels}
+    emitted_domains = {row["function"]: row for row in execution_domains}
     result = []
     for name in sorted(before.keys() | selected.keys() | after.keys()):
         source = before.get(name, selected.get(name, after.get(name)))
+        assert source is not None, "observed domain has no original inventory entry"
         emitted = after.get(name)
         owner = emitted.get("synchronization_owner") if emitted else None
         report = reports.get(name, {})
@@ -88,6 +90,24 @@ def domain_ownership(receipt, kernels, cpp_names):
             and owner is True
             and generated
             and report.get("selected_route") == "pypto"
+        )
+        task = emitted_domains.get(name, {})
+        task_owned = (
+            receipt["compile_success"]
+            and task.get("status") == "task_control_owner_observed"
+            and task.get("owner") == "runtime_task_codegen"
+            and task.get("scope") == "task_control"
+            and task.get("function_type") == source.get("type")
+            and source.get("type")
+            in {
+                str(kind)
+                for kind in (
+                    ir.FunctionType.Orchestration,
+                    ir.FunctionType.Graph,
+                    ir.FunctionType.Spmd,
+                    ir.FunctionType.Group,
+                )
+            }
         )
         result.append(
             {
@@ -99,9 +119,17 @@ def domain_ownership(receipt, kernels, cpp_names):
                 "route_report": report,
                 "generated_cpp": generated,
                 "verified_pypto_leaf": verified,
+                "task_control": task,
+                "task_control_owner_observed": task_owned,
                 "status": "verified_pypto_leaf"
                 if verified
-                else ("delegated" if owner is False else "unverified_domain"),
+                else (
+                    "task_control_owner_observed"
+                    if task_owned
+                    else "delegated"
+                    if owner is False
+                    else "unverified_domain"
+                ),
             }
         )
     return result
@@ -156,6 +184,11 @@ def main() -> None:
     parser.add_argument("--mode", choices=("pypto", "ptoas"), default="pypto")
     parser.add_argument("--policy", choices=("exact", "conservative_prefix"), default="exact")
     parser.add_argument("--require-pypto", action="store_true")
+    parser.add_argument(
+        "--require-domain-owners",
+        action="store_true",
+        help="Require an observed control/local owner for every original domain; delegation is separate",
+    )
     parser.add_argument(
         "--require-function",
         action="append",
@@ -274,7 +307,13 @@ def main() -> None:
         cpp = sorted((output / "compiled/kernels").rglob("*.cpp"))
         receipt["cpp"] = {str(p.relative_to(output)): digest(p) for p in cpp}
         kernels = report.get("kernels", [])
-        receipt["domains"] = domain_ownership(receipt, kernels, {p.stem for p in cpp})
+        receipt["domains"] = domain_ownership(
+            receipt, kernels, {p.stem for p in cpp}, report.get("execution_domains", ())
+        )
+        receipt["domain_owner_counts"] = dict(Counter(row["status"] for row in receipt["domains"]))
+        receipt["unverified_domain_owners"] = [
+            row["function"] for row in receipt["domains"] if row["status"] == "unverified_domain"
+        ]
         receipt["expected_ownership_failures"] = expected_ownership_failures(
             receipt["domains"], args.require_function
         )
@@ -323,6 +362,7 @@ def main() -> None:
         not receipt["compile_success"]
         or "oracle_error" in receipt
         or receipt["expected_ownership_failures"]
+        or (args.require_domain_owners and receipt["unverified_domain_owners"])
         or (args.require_pypto and not receipt["all_generated_leaves_pypto"])
     ):
         raise SystemExit(1)

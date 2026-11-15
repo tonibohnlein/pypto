@@ -12,6 +12,7 @@
 #ifndef PYPTO_CODEGEN_ORCHESTRATION_ORCHESTRATION_CODEGEN_H_
 #define PYPTO_CODEGEN_ORCHESTRATION_ORCHESTRATION_CODEGEN_H_
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -41,6 +42,10 @@ struct OrchestrationResult {
   /// ChipCallable signature so read-only IN tensors skip the D2H copy-back and
   /// pure-OUT tensors take the on-device memset fast path.
   std::vector<std::string> orchestration_signature;
+  /// Actual entry/fragment/wrapper domains lowered by this emission. This is
+  /// task-control ownership only: it certifies neither AICore payload completion
+  /// nor visibility, physical event resources, or an external kernel's protocol.
+  std::map<std::string, ir::FunctionType> task_domains;
 };
 
 /**

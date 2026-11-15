@@ -53,6 +53,10 @@ class KernelRegistrations {
  public:
   int GetOrCreate(const std::string& name, ir::CoreType core_type, std::vector<std::string> signature);
 
+  // The same dispatch owner records only domains it actually lowers. A failed
+  // generation publishes no OrchestrationResult and therefore no such evidence.
+  void RecordTaskDomain(const ir::FunctionPtr& function);
+  std::map<std::string, ir::FunctionType> task_domains;
   std::vector<KernelRegistration> entries;
 
  private:

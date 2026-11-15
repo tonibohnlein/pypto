@@ -9,8 +9,11 @@
 
 """Whole-model receipts preserve unresolved domains and named qualification."""
 
+import json
+
 import pytest
 from pypto import ir
+from pypto.backend.pto_backend import _publish_sync_execution_domains
 
 from .qualify_qwen_whole_model import domain_ownership, expected_ownership_failures, function_inventory
 from .test_conservative_sync_dataflow import conservative_fixture
@@ -80,3 +83,64 @@ def test_inventory_counts_control_without_executing_parameterized_domains(kind):
     assert counts["call:buffer.store"] == 2
     assert any(name.startswith("call:") for name in counts)
     assert ir.serialize(function) == original
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [ir.FunctionType.Orchestration, ir.FunctionType.Graph, ir.FunctionType.Spmd, ir.FunctionType.Group],
+)
+def test_task_control_report_requires_actual_emission_evidence(kind):
+    span = ir.Span.unknown()
+    control = ir.Function("control", [], [], ir.ReturnStmt([], span), span, kind)
+    unused = ir.Function("unused", [], [], ir.ReturnStmt([], span), span, ir.FunctionType.Spmd)
+    program = ir.Program([control, unused], "Owners", span)
+    artifact = "orchestration/main.cpp"
+    files = {"report/autosync.json": json.dumps({"kernels": []}), artifact: "original emitted code"}
+    _publish_sync_execution_domains(program, files, {"control": kind}, artifact)
+    rows = {row["function"]: row for row in json.loads(files["report/autosync.json"])["execution_domains"]}
+    assert rows["control"]["status"] == "task_control_owner_observed"
+    assert rows["control"]["owner"] == "runtime_task_codegen"
+    assert "no independent control, visibility or peer completion" in rows["control"]["guarantee"]
+    assert rows["unused"]["owner"] is None
+    source = {"name": "control", "type": str(kind), "synchronization_owner": None}
+    receipt = {
+        "functions_before_sync": [source],
+        "functions_after_buffer_selection": [source],
+        "functions_after_sync": [source],
+        "compile_success": True,
+        "policy": "conservative_prefix",
+    }
+    joined = domain_ownership(receipt, [], set(), rows.values())
+    assert joined[0]["status"] == "task_control_owner_observed"
+    assert not joined[0]["verified_pypto_leaf"]
+    assert expected_ownership_failures(joined, ["control"]), "task owner cannot satisfy a local-leaf gate"
+    assert files[artifact] == "original emitted code"
+
+
+@pytest.mark.parametrize("fault", ["missing_artifact", "unknown_name", "wrong_type", "local_type"])
+def test_task_control_evidence_cannot_hide_missing_or_local_domains(fault):
+    span = ir.Span.unknown()
+    kind = ir.FunctionType.AIV if fault == "local_type" else ir.FunctionType.Orchestration
+    function = ir.Function("control", [], [], ir.ReturnStmt([], span), span, kind)
+    program = ir.Program([function], "Owners", span)
+    artifact = "orchestration/main.cpp"
+    files = {"report/autosync.json": json.dumps({"kernels": []})}
+    if fault != "missing_artifact":
+        files[artifact] = "emitted"
+    evidence = {
+        "other" if fault == "unknown_name" else "control": ir.FunctionType.Group
+        if fault == "wrong_type"
+        else kind
+    }
+    before = dict(files)
+    with pytest.raises(ValueError, match="Task-control"):
+        _publish_sync_execution_domains(program, files, evidence, artifact)
+    assert files == before
+
+
+def test_default_off_does_not_publish_task_ownership_or_change_artifacts():
+    function = conservative_fixture()
+    program = ir.Program([function], "NoReport", function.span)
+    files = {"kernel.cpp": "unchanged"}
+    _publish_sync_execution_domains(program, files, {}, None)
+    assert files == {"kernel.cpp": "unchanged"}
