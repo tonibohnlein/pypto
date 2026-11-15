@@ -318,6 +318,14 @@ Pass MaterializeValidShapeSymbols();
  */
 Pass LowerTileToBuffer();
 
+/// Export native-only child capabilities from one whole original placed function.
+/// Uses the active context's explicit disjoint-GM premise and selected target.
+/// Requests must be distinct, nonoverlapping original loop scopes. All exports
+/// succeed together or raise without changing input; an empty request exports
+/// no evidence and skips analysis. Each handle retains the immutable root result.
+std::vector<std::shared_ptr<const sync::NativeSyncChild>> PrepareNativeSyncChildren(
+    const FunctionPtr& function, const std::vector<ForStmtPtr>& scopes);
+
 /// Insert logical completion tokens for qualified placed Buffer demands.
 /// Strict standalone stage: unsupported exports raise without modifying input.
 /// Accepted child evidence is immutable and bound to original functions in the
