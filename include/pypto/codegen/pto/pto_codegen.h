@@ -1187,7 +1187,8 @@ class PTOCodegen : public CodegenBase {
    *         that keep ordinary alloc_tile lowering. Unsupported declarations
    *         under the PTOAS planner have already raised in PlanMultiBufferRegions.
    */
-  bool TryEmitMultiTileGet(const ir::TileTypePtr& type, const std::string& tile_buf, const ir::Span& span);
+  bool TryEmitMultiTileGet(const ir::VarPtr& variable, const ir::TileTypePtr& type,
+                           const std::string& tile_buf, const ir::Span& span);
 
   /// Existing operand whose region slot is also the in-place compute result.
   [[nodiscard]] ir::VarPtr FindMultiTileInputAlias(const ir::AssignStmtPtr& stmt) const;
@@ -1295,6 +1296,8 @@ class PTOCodegen : public CodegenBase {
     std::vector<const ir::Var*> multi_buffer_region_order;
     /// Slot remainders proven to have nonnegative operands in canonical loops.
     std::set<const ir::Expr*> unsigned_slot_remainders;
+    /// Checked normalization for individual slot destinations, never raw IVs.
+    std::map<const ir::Var*, ir::ExprPtr> normalized_slot_indices;
     /// Canonical slot remainders with their defining lexical scope. Active
     /// ancestor scopes dominate the current use; exited siblings never do.
     std::map<std::tuple<const ir::Expr*, int64_t, int64_t>, std::pair<std::string, size_t>> slot_index_ssa;
@@ -1441,6 +1444,7 @@ class PTOCodegen : public CodegenBase {
       multi_buffer_regions.clear();
       multi_buffer_region_order.clear();
       unsigned_slot_remainders.clear();
+      normalized_slot_indices.clear();
       slot_index_ssa.clear();
 
       tuple_element_index.clear();

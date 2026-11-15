@@ -2198,13 +2198,14 @@ void PTOCodegen::PlanMultiBufferRegions(const FunctionPtr& func) {
   if (func->body_) {
     phi_collector.VisitStmt(func->body_);
     colive_collector.VisitStmt(func->body_);
-    if (emit_tile_addr_ || !colive_collector.bases.empty()) canonical_collector.VisitStmt(func->body_);
+    canonical_collector.VisitStmt(func->body_);
   }
   // PTOAS 0.64/0.65 mis-synchronize co-live prefetch slots even with static
   // trip counts (#1519). Parent subviews keep alias identity without relying
   // on the affected multi-tile startup/drain event calculation.
   if (emit_tile_addr_ && !colive_collector.bases.empty()) use_addressed_slots = true;
-  if (emit_tile_addr_) fs_.unsigned_slot_remainders = std::move(canonical_collector.remainders);
+  fs_.unsigned_slot_remainders = std::move(canonical_collector.remainders);
+  fs_.normalized_slot_indices = std::move(canonical_collector.normalized_indices);
 
   /// One allocation's slots, accumulated over every tile bound to it. `blocker`
   /// is empty while the allocation can still become a region, and otherwise says
@@ -2419,8 +2420,8 @@ const PTOCodegen::MultiBufferRegion* PTOCodegen::GetMultiBufferRegion(const ir::
   return it != fs_.multi_buffer_regions.end() ? &it->second : nullptr;
 }
 
-bool PTOCodegen::TryEmitMultiTileGet(const ir::TileTypePtr& type, const std::string& tile_buf,
-                                     const ir::Span& span) {
+bool PTOCodegen::TryEmitMultiTileGet(const ir::VarPtr& variable, const ir::TileTypePtr& type,
+                                     const std::string& tile_buf, const ir::Span& span) {
   const auto memref = ir::GetDefinedMemRef(type);
   const MultiBufferRegion* region = GetMultiBufferRegion(memref);
   if (region == nullptr) return false;
@@ -2430,7 +2431,9 @@ bool PTOCodegen::TryEmitMultiTileGet(const ir::TileTypePtr& type, const std::str
   INTERNAL_CHECK_SPAN(memref->slot_index_.has_value() && *memref->slot_index_, span)
       << "Internal error: MemRef on multi-buffer region '" << memref->base_->name_hint_
       << "' carries no slot index";
-  ExprPtr slot_index = *memref->slot_index_;
+  const auto normalized = fs_.normalized_slot_indices.find(variable.get());
+  ExprPtr slot_index =
+      normalized == fs_.normalized_slot_indices.end() ? *memref->slot_index_ : normalized->second;
   std::string region_ssa = region->region_ssa;
   // ptoas reads the slot as an `index` SSA and matches its affine form (`iv % N`,
   // `(iv ± c) % N`, a constant) to decide whether two accesses can touch the same
@@ -2566,7 +2569,7 @@ void PTOCodegen::EmitAllocTileForVar(const ir::VarPtr& tile_var,
   // one. Allocations with no eligible region keep ordinary addressed alloc_tile
   // lowering. An unsupported unaddressed declaration has already been rejected
   // by PlanMultiBufferRegions.
-  if (TryEmitMultiTileGet(tile_type, tile_buf, tile_var->span_)) {
+  if (TryEmitMultiTileGet(tile_var, tile_type, tile_buf, tile_var->span_)) {
     return;
   }
 

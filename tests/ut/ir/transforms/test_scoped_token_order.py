@@ -380,7 +380,9 @@ def test_shenggan_original_tiles_single_invocation_cpp(tmp_path):
     path = tmp_path / "shenggan.pto"
     path.write_text(text)
     cpp = tmp_path / "shenggan.cpp"
-    _run_ptoas(str(path), str(cpp), ["--enable-insert-sync=true"])
+    # PyPTO already placed these buffers. Level 3 consumes their explicit
+    # addresses; the driver's default level 2 would request placement again.
+    _run_ptoas(str(path), str(cpp), ["--pto-level=level3", "--enable-insert-sync=true"])
     assert cpp.exists() and cpp.stat().st_size > 0
 
 

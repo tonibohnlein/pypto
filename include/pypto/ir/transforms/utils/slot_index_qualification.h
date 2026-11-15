@@ -15,7 +15,9 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
+#include <utility>
 
 #include "pypto/ir/arith/analyzer.h"
 #include "pypto/ir/expr.h"
@@ -37,6 +39,10 @@ namespace pypto::ir {
 class CanonicalSlotCollector : public ir::IRVisitor {
  public:
   std::set<const ir::Expr*> remainders;
+  // Only the destination of this qualified slot use is normalized. The original
+  // IV may also be a payload coordinate or select another slot-count family.
+  // These owned expressions keep synthetic remainder identities alive.
+  std::map<const ir::Var*, ir::ExprPtr> normalized_indices;
   std::set<const ir::Var*> unsupported_bases;
   // Original first failing assignment, retained only for admission diagnostics.
   ir::StmtPtr first_unsupported;
@@ -61,15 +67,11 @@ class CanonicalSlotCollector : public ir::IRVisitor {
       const auto memref = ir::GetDefinedMemRef(tile);
       if (memref->slot_index_.has_value()) {
         if (verified_depth_) verified_bases.insert(memref->base_.get());
-        ir::ExprPtr index = *memref->slot_index_;
-        if (ir::AsVarLike(index)) index = ResolveScalarAlias(index);
-        if (!IsCanonical(index, memref->slot_count_)) {
+        if (!QualifyIndex(*memref->slot_index_, memref->slot_count_, op->var_)) {
           unsupported_bases.insert(memref->base_.get());
           if (!first_unsupported) {
             first_unsupported = op;
           }
-        } else if (ir::As<ir::FloorMod>(index)) {
-          remainders.insert(index.get());
         }
       }
     }
@@ -77,15 +79,11 @@ class CanonicalSlotCollector : public ir::IRVisitor {
       const auto group = ir::AsVarLike(call->args_[0]);
       const auto multi = ir::As<ir::MultiBufferType>(call->args_[0]->GetType());
       if (group && multi) {
-        auto index = call->args_[1];
-        if (ir::AsVarLike(index)) index = ResolveScalarAlias(index);
-        if (!IsCanonical(index, static_cast<uint64_t>(multi->slot_count_))) {
+        if (!QualifyIndex(call->args_[1], static_cast<uint64_t>(multi->slot_count_), op->var_)) {
           unsupported_bases.insert(group.get());
           if (!first_unsupported) {
             first_unsupported = op;
           }
-        } else if (ir::As<ir::FloorMod>(index)) {
-          remainders.insert(index.get());
         }
       }
     }
@@ -110,6 +108,44 @@ class CanonicalSlotCollector : public ir::IRVisitor {
       expr = it->second;
     }
     return IsIndex(expr) ? expr : nullptr;
+  }
+
+  bool QualifyIndex(const ir::ExprPtr& original, uint64_t count, const ir::VarPtr& result) {
+    auto index = ir::AsVarLike(original) ? ResolveScalarAlias(original) : original;
+    if (IsCanonical(index, count)) {
+      if (ir::As<ir::FloorMod>(index)) remainders.insert(index.get());
+      return true;
+    }
+    const auto induction = ir::AsVarLike(index);
+    const auto found = loops_.find(induction.get());
+    if (!IsIndex(index) || found == loops_.end() || count == 0 ||
+        count > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+      return false;
+    }
+    const auto& loop = found->second;
+    if (loop->kind_ != ir::ForKind::Sequential || !IsIndex(loop->start_) || !IsIndex(loop->stop_) ||
+        !IsIndex(loop->step_)) {
+      return false;
+    }
+    const auto start = ir::As<ir::ConstInt>(loop->start_);
+    const auto stop = ir::As<ir::ConstInt>(loop->stop_);
+    const auto step = ir::As<ir::ConstInt>(loop->step_);
+    if (!start || !stop || !step || start->value_ < 0 || start->value_ > stop->value_ ||
+        static_cast<uint64_t>(stop->value_) > count || step->value_ <= 0) {
+      return false;
+    }
+    // Every executed IV is <= stop-1. Qualify the original post-final increment
+    // too; the new remainder must not conceal an overflowing source loop.
+    if (start->value_ < stop->value_ &&
+        step->value_ > std::numeric_limits<int64_t>::max() - (stop->value_ - 1)) {
+      return false;
+    }
+    auto divisor =
+        std::make_shared<ir::ConstInt>(static_cast<int64_t>(count), DataType::INDEX, original->span_);
+    auto normalized = std::make_shared<ir::FloorMod>(induction, divisor, DataType::INDEX, original->span_);
+    const auto entry = normalized_indices.emplace(result.get(), std::move(normalized)).first;
+    remainders.insert(entry->second.get());
+    return true;
   }
 
   bool IsCanonical(const ir::ExprPtr& index, uint64_t count) {

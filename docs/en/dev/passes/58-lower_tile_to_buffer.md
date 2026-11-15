@@ -674,6 +674,38 @@ placement. Other slot forms retain Tile IR. Native slot emission and autosync
 admission have additional independent contracts; successful Buffer conversion
 does not imply an executable sync plan.
 
+### Canonical slots after scalar simplification
+
+A slot index may simplify from `i % 2` to `i` inside `for i in range(2)`.
+The shared slot qualifier accepts this direct induction variable only in its
+original sequential loop, after resolving a bounded chain of INDEX aliases.
+It requires literal INDEX bounds and step, `0 <= start <= stop <= slot_count`,
+a positive step, and a representable original increment after the last visit.
+Unknown bounds, narrowing casts and an unrelated or out-of-scope variable do
+not acquire this proof.
+
+The resulting canonical `i % slot_count` belongs to that slot destination.
+LowerTileToBuffer and Tile/Buffer code generation consume the same qualified
+expression; native output uses the existing unsigned-remainder path. Other uses
+of `i`, including GM coordinates and selections in different slot-count families,
+are unchanged. This is not a global scalar rewrite. Definition reuse respects
+lexical dominance, so sibling branches and reset loop invocations cannot reuse
+an unavailable selector. No runtime visits are unfolded.
+
+For native compilation, use `--pto-level=level3` when PyPTO has already placed
+buffers and PTO contains explicit addresses. Use `--pto-level=level2` for
+addressless output whose memory placement is delegated to PTOAS. This level
+choice is independent of synchronization ownership; delegated synchronization
+may still be enabled for level-3 input, and explicit owned flags retain their
+existing skip behavior. Do not ask level 2 to place an already addressed plan.
+
+`test_slot_index_normalization.py` covers boundaries, zero visits, aliases,
+width/overflow refusals, distinct slot counts, branch scopes and resets. It also
+checks original GM coordinates through normal Buffer lowering and native C++
+generation. The original small Shenggan source and all command/physical checks
+are retained; its native driver now explicitly selects level 3 for the newly
+reachable addressed output.
+
 ## Tests
 
 `tests/ut/ir/transforms/test_lower_tile_to_buffer.py` exercises the public
