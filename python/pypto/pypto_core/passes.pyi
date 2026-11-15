@@ -926,6 +926,20 @@ class NativeSyncChild:
     @property
     def scope(self) -> ForStmt: ...
 
+def prepare_native_sync_children(function: Function, scopes: list[ForStmt]) -> list[NativeSyncChild]:
+    """Prepare native-only children using one whole original placed-function analysis.
+
+    Requires an active PassContext with autosync_disjoint_gm=True and a selected
+    backend target. Original scopes must be distinct and nonoverlapping. The
+    whole function must satisfy the existing exact provider; unsupported roots
+    or child exports raise without changing input or returning partial results.
+    Handles retain immutable mathematics after this call returns. An empty
+    request returns no capabilities and does not analyze or certify the root.
+    The read-only factory is policy-independent; consumption requires
+    conservative_prefix. No detached child analysis or automatic discovery runs.
+    """
+    ...
+
 def insert_sync(*, accepted_children: list[NativeSyncChild] = []) -> Pass:
     """Insert logical tokens after placement using the explicit disjoint-GM contract.
 
@@ -1254,6 +1268,7 @@ __all__ = [
     "materialize_valid_shape_symbols",
     "lower_tile_to_buffer",
     "realize_sync",
+    "prepare_native_sync_children",
     "select_buffer_ir_functions",
     "flatten_call_expr",
     "lower_graph_for_runtime",

@@ -454,16 +454,25 @@ or explicit refusal; this is not general structured-token support.
 The public insertion pass can consume an explicitly supplied retained child:
 
 ```python
+with passes.PassContext([], autosync_disjoint_gm=True):
+    children = passes.prepare_native_sync_children(original_function, [original_loop])
 with passes.PassContext([], autosync_policy="conservative_prefix"):
-    logical = passes.insert_sync(accepted_children=[accepted_child])(original_program)
+    logical = passes.insert_sync(accepted_children=children)(original_program)
     optimized = passes.optimize_sync()(logical)
     physical = passes.lower_sync()(optimized)
 ```
 
-`accepted_child` is an immutable `passes.NativeSyncChild` capability exported
-from retained mathematics; it has no public constructor. Obtaining that export
-currently uses the experimental retained-analysis interface. The initial family
-has a native-only internal plan, local effects and an empty event palette.
+`prepare_native_sync_children` performs one existing exact analysis of the whole
+original placed Buffer function, then exports the explicitly requested loop scopes.
+It uses the active context's target and named disjoint-GM premise; it does not
+analyze detached children or search for candidates automatically. Unsupported
+whole roots or exports raise before any capability list is returned. An empty
+scope list skips analysis and returns no evidence. Each immutable
+`passes.NativeSyncChild` retains the shared original mathematical owner and has no
+public constructor. The initial family has a native-only internal plan, local
+effects and an empty event palette. The disjoint-GM premise used to analyze the
+whole root is not inherited by its conservative parent: child exports still
+refuse external-storage effects and caller/launch-specialized premises.
 Original owner, scope, target, guards and coordinates remain bound to the
 capability; clones, unsupplied caller premises and overlapping requested scopes
 refuse transactionally. Parent entry services retain may-access effects at exit;

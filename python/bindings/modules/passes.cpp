@@ -750,6 +750,10 @@ void BindPass(nb::module_& m) {
   nb::class_<ir::sync::NativeSyncChild>(passes, "NativeSyncChild")
       .def_prop_ro("owner", &ir::sync::NativeSyncChild::Owner)
       .def_prop_ro("scope", &ir::sync::NativeSyncChild::Scope);
+  passes.def("prepare_native_sync_children", &pass::PrepareNativeSyncChildren, nb::arg("function"),
+             nb::arg("scopes"),
+             "Export native-only children from one whole original placed function. Requires an active "
+             "PassContext with an explicit disjoint-GM contract; no detached analysis or partial exports.");
   passes.def(
       "insert_sync", &pass::InsertSync, nb::kw_only(),
       nb::arg("accepted_children") = std::vector<std::shared_ptr<const ir::sync::NativeSyncChild>>{},

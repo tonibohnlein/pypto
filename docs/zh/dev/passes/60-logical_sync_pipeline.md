@@ -265,15 +265,22 @@ C 增长；框架深度、守卫域、顺序摘要、负载限定和分配成本
 公开插入 Pass 可消费显式提供的保留子区域：
 
 ```python
+with passes.PassContext([], autosync_disjoint_gm=True):
+    children = passes.prepare_native_sync_children(original_function, [original_loop])
 with passes.PassContext([], autosync_policy="conservative_prefix"):
-    logical = passes.insert_sync(accepted_children=[accepted_child])(original_program)
+    logical = passes.insert_sync(accepted_children=children)(original_program)
     optimized = passes.optimize_sync()(logical)
     physical = passes.lower_sync()(optimized)
 ```
 
-`accepted_child` 是从保留数学结果导出的不可变 `passes.NativeSyncChild` 能力，
-没有公开构造器；目前创建它仍使用实验性分析接口。首个家族只含原生内部计划、
-本地效果且事件调色板为空。能力绑定原始所有者、作用域、目标、保护和坐标；克隆、
+`prepare_native_sync_children` 对整个原始、已放置的 Buffer 函数执行一次既有精确
+分析，再导出显式请求的循环作用域。它使用当前上下文的目标与显式 disjoint-GM
+前提；不会分离子区域重新分析或自动搜索候选。整个根函数或任一导出不受支持时，
+在返回能力列表前拒绝。空作用域列表跳过分析且不导出任何证明。
+不可变的 `passes.NativeSyncChild` 共享并保留原始数学所有者，没有公开构造器。
+首个家族只含原生内部计划、本地效果且事件调色板为空。根分析使用的 disjoint-GM
+前提不会传给保守父区域；导出仍拒绝外部存储效果与调用方／启动范围特化前提。
+能力绑定原始所有者、作用域、目标、保护和坐标；克隆、
 未提供调用方前提以及重叠请求都事务性拒绝。父区域入口服务保留出口可能未完成的
 访问效果；通知闭合不代表载荷完成。零次子区域访问仍可能支付入口服务成本。
 有事件子区域的重置、传输组合和 JIT 自动发现仍不可用。此导入既不要求也不伪造

@@ -22,6 +22,7 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/transforms/base/mutator.h"
+#include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
@@ -101,6 +102,46 @@ FunctionPtr CompleteOwnedInvocation(const FunctionPtr& function, const std::stri
   } complete(function->func_type_, execution.terminal_completion_op);
   return sync::SyncOutcome(complete.VisitFunction(function), true, "");
 }
+// Validate the requested original cuts in one statement occurrence walk before
+// constructing mathematics. Pointer membership alone cannot detect a shared
+// subtree appearing twice, and an accepted ancestor would hide a nested import.
+class NativeChildScopeRequests : public IRVisitor {
+ public:
+  explicit NativeChildScopeRequests(const std::vector<ForStmtPtr>& scopes) {
+    for (const auto& scope : scopes) {
+      CHECK(scope) << "Native child preparation received a missing loop scope";
+      CHECK_SPAN(occurrences_.emplace(scope.get(), 0).second, scope->span_)
+          << "Native child preparation received duplicate loop scopes";
+    }
+  }
+  void Validate(const FunctionPtr& function) {
+    VisitFunction(function);
+    for (const auto& [scope, count] : occurrences_) {
+      CHECK_SPAN(count == 1, scope->span_)
+          << "Native child scope must occur exactly once in the original function";
+    }
+  }
+  void VisitStmt(const StmtPtr& statement) override {
+    const auto loop = As<ForStmt>(statement);
+    const auto selected = loop ? occurrences_.find(loop.get()) : occurrences_.end();
+    if (selected != occurrences_.end()) {
+      CHECK_SPAN(!inside_selected_, statement->span_)
+          << "Native child preparation refuses overlapping requested scopes";
+      ++selected->second;
+      inside_selected_ = true;
+    }
+    IRVisitor::VisitStmt(statement);
+    if (selected != occurrences_.end()) {
+      inside_selected_ = false;
+    }
+  }
+  void VisitExpr(const ExprPtr&) override {}
+
+ private:
+  std::unordered_map<const ForStmt*, size_t> occurrences_;
+  bool inside_selected_ = false;
+};
+
 FunctionPtr InsertLogicalSync(const FunctionPtr& function, const std::string& target,
                               const sync::SyncParameterBounds& parameters,
                               std::optional<std::pair<int64_t, int64_t>> blocks) {
@@ -114,6 +155,42 @@ FunctionPtr InsertLogicalSync(const FunctionPtr& function, const std::string& ta
   return sync::RealizeCompactSync(sync::AnalyzeCompactSync(std::move(input))).function;
 }
 }  // namespace
+
+std::vector<std::shared_ptr<const sync::NativeSyncChild>> PrepareNativeSyncChildren(
+    const FunctionPtr& function, const std::vector<ForStmtPtr>& scopes) {
+  auto* context = PassContext::Current();
+  CHECK(context && context->GetAutoSyncDisjointGM())
+      << "Native child preparation requires the explicit disjoint GM argument contract";
+  CHECK(function) << "Native child preparation requires an original function";
+  CHECK_SPAN(IsOwnedLeaf(function), function->span_)
+      << "Native child preparation requires an owned local leaf";
+  CHECK_SPAN(
+      function->ir_stage_ == FunctionIRStage::Buffer && context->GetMemoryPlanner() != MemoryPlanner::PtoAS,
+      function->span_)
+      << "Native child preparation requires physically placed Buffer IR";
+  CheckLogicalSync(function);
+  CHECK_SPAN(!sync::HasLogicalSync(function), function->span_)
+      << "Native child preparation refuses preexisting logical synchronization";
+  if (scopes.empty()) {
+    return {};  // No evidence is exported; in particular this proves no empty plan.
+  }
+  NativeChildScopeRequests(scopes).Validate(function);
+  const auto target = context->GetBackendHandler()->GetPtoTargetArch();
+  // One explicit whole-root request, not detached scope analysis or automatic
+  // backend search. Every returned capability shares this immutable result.
+  auto input = sync::ImportPlacedSync(function, context->GetAutoSyncDisjointGM(), target);
+  const auto mathematics = sync::AnalyzeCompactSync(std::move(input));
+  std::vector<std::shared_ptr<const sync::NativeSyncChild>> children;
+  children.reserve(scopes.size());
+  for (const auto& scope : scopes) {
+    auto exported = sync::ExportNativeSyncChild(mathematics, scope, target);
+    CHECK_SPAN(exported.child, scope->span_)
+        << "Native child export unavailable (" << sync::NativeSyncChildStatusName(exported.status)
+        << "): " << exported.reason;
+    children.push_back(std::move(exported.child));
+  }
+  return children;
+}
 
 Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accepted_children) {
   // Invocation evidence belongs to this program, never to a process-global

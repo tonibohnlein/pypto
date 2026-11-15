@@ -102,11 +102,14 @@ def test_public_retained_child_pipeline_and_cpp_preserve_actual_commands(tmp_pat
     if find_ptoas_binary() is None:
         pytest.skip("PTOAS is not available")
     original, scope = resident_child_fixture(3, 2, initialize_in_child=True)
-    export, mathematics = exported(original, scope)
     program = ir.Program([original], "PublicNativeChild", original.span)
     before = ir.serialize(program)
+    # Obtain the capability through the production provider, with no testing
+    # factory or detached-child analysis anywhere in this public pipeline.
+    with passes.PassContext([], autosync_disjoint_gm=True):
+        children = passes.prepare_native_sync_children(original, [scope])
     with passes.PassContext([], autosync_policy="conservative_prefix", autosync_disjoint_gm=True):
-        logical_program = passes.insert_sync(accepted_children=[export["child"]])(program)
+        logical_program = passes.insert_sync(accepted_children=children)(program)
         optimized = passes.optimize_sync()(logical_program)
     # Actual-token lowering does not rely on the producer policy or its owner.
     with passes.PassContext([]):
@@ -114,7 +117,7 @@ def test_public_retained_child_pipeline_and_cpp_preserve_actual_commands(tmp_pat
     logical = next(iter(logical_program.functions.values()))
     physical = next(iter(physical_program.functions.values()))
     assert ir.serialize(program) == before
-    assert testing.export_native_sync_child(mathematics, scope)["child"] is not None
+    assert children[0].owner is original and children[0].scope is scope
     _, checked = check_closed_commands(
         logical, physical, {}, range(6), tensor_bases=BASES, compare_commands=False, hardware_source=original
     )
