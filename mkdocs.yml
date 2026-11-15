@@ -321,6 +321,7 @@ nav:
           - Runtime Valid Broadcast: en/dev/ir/41-general-autosync-runtime-valid.md
           - Runtime Valid Axes and Casts: en/dev/ir/41-general-autosync-runtime-axis.md
           - Retained Eventful Sync Children: en/dev/ir/41-general-autosync-eventful-child.md
+          - Read-only External Sync Children: en/dev/ir/41-general-autosync-readonly-child.md
           - Explicit Module Sync Ownership: en/dev/ir/41-general-autosync-module-ownership.md
       - Passes:
           - en/dev/passes/index.md

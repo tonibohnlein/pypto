@@ -14,6 +14,7 @@
 #include <array>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -73,6 +74,9 @@ struct SyncStorage {
   // Uniform physical slots: address + slot*slot_bytes. rows/columns describe
   // one slot; bytes covers the whole reservation. No slot list is materialized.
   int64_t slot_count = 1, slot_bytes = 0;
+  // False means geometry/selectors for this original domain are unavailable,
+  // never an empty footprint. Unavailable extents need not contain numeric bounds.
+  bool boundary_available = true;
 };
 // Checked source-coordinate DAG. Loop nodes denote the ORIGINAL induction
 // value, not a flattened visit ordinal. A dynamic start is a dependency in
@@ -177,10 +181,16 @@ struct SyncStorageClass {
   size_t storage;
   int64_t row, column, rows, columns;
 };
+// A qualified read-only external projection removes no internal conflict:
+// external memory is distinct from local spaces and every external effect reads.
+// It does not provide an exact external storage interface.
+enum class SyncExternalPolicy { Geometry, ReadOnlyProjection };
 struct CompactSyncInput {
   FunctionPtr owner;
   std::string hardware_target;
   std::vector<SyncStorage> storage;
+  std::set<MemorySpace> unavailable_storage_spaces;
+  std::vector<ExprPtr> projected_readonly_external_roots;
   std::vector<SyncSegment> segments;
   SyncParameterBounds parameter_bounds;
   std::optional<std::pair<int64_t, int64_t>> block_bounds;
@@ -195,6 +205,7 @@ CompactSyncInput ImportPlacedSync(
     const FunctionPtr& function, bool disjoint_gm, const std::string& target = "a2a3",
     const SyncParameterBounds& parameter_bounds = {},
     const std::optional<std::pair<int64_t, int64_t>>& block_bounds = std::nullopt);
+CompactSyncInput ImportReadonlyExternalSync(const FunctionPtr& function, const std::string& target);
 
 using Occurrence = std::tuple<size_t, int64_t, size_t>;  // segment, visit, site
 using Crossing = std::pair<Occurrence, Occurrence>;

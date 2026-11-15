@@ -5,6 +5,9 @@
 尚不能接纳包含 GM 加载的 Qwen K 区域：其外部读取和自由地址坐标仍需单独验证
 的投影构造。
 
+后续[只读外部投影检查点](41-general-autosync-readonly-child.md)扩展到原始 Qwen K 调用。
+下述仅本地限制属于初始检查点，并非后续扩展的覆盖范围。
+
 ## 提供者和所有权
 
 `prepare_eventful_sync_children(original, scopes)` 为整个请求构造一个原函数的

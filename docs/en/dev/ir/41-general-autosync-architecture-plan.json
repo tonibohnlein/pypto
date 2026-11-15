@@ -1,8 +1,8 @@
 {
   "kind": "source-audit-and-architecture-plan",
   "compiler_revision": "b5597650a75b598645b1b1d3fe05bd3aab220f09",
-  "review_status": "accepted_plan_only",
-  "implementation_status": "not_started",
+  "review_status": "Original plan accepted; continued implementation gates reviewed individually.",
+  "implementation_status": "Partially implemented through independently reviewed qualified gates; whole-model ownership and native contracts remain incomplete.",
   "source_sha256": {
     "include/pypto/ir/stmt.h": "da38209dafcde1b8b0974a78053bc18fcd35831203eff8aa294ec099f934a600",
     "include/pypto/ir/op_registry.h": "fdacd9f58b8aa1cb695e0a2a837a22cf04cda5f74c7aa1c01ab3ee6aa2845820",
@@ -88,5 +88,38 @@
     "fresh_whole_qwen_capture": false,
     "device": false
   },
-  "next_gate": "M1 shared qualification and domain ownership; refresh existing pinned capture"
+  "next_gate": {
+    "remaining_native_contracts": [
+      "Mixed full/partial operation value/metadata semantics",
+      "Scalar GM input visibility and readiness",
+      "Cross-core local completion, peer release and resource ownership"
+    ],
+    "remaining_precision_contracts": [
+      "Symbolic caller relations and exact GM boundary exports"
+    ],
+    "rule": "Preserve qualified exact results and explicit conservative requests; no implied admission from benchmark parameters or address enclosures."
+  },
+  "latest_checkpoint": {
+    "date": "2026-11-15",
+    "runtime_commit": "32c472089cf8e29ab4cff24964cf79c5d03ecc32",
+    "runtime_report": "41-general-autosync-runtime-axis.json",
+    "retained_child_report": "41-general-autosync-readonly-child.json",
+    "whole_model": {
+      "cpp_leaves": 32,
+      "prefix_owned": 16,
+      "exact_owned": 3,
+      "prefix_delegated": 16,
+      "other_unverified_domains": 47
+    },
+    "remaining": [
+      "Mixed-full/partial ADD and carrier value-domain contracts",
+      "Scalar GM visibility and readiness",
+      "Cross-core readiness, release and ownership",
+      "Additional symbolic caller/GM export contracts",
+      "Whole-model native/device qualification"
+    ],
+    "all_original_milestones_complete": false
+  },
+  "historical_field_scope": "compiler_revision, source_sha256, historical_evidence, draft, review and validation preserve the original architecture-plan audit; they are not a current build or test claim. latest_checkpoint and its linked receipts identify current implementation and dirty-source evidence.",
+  "historical_next_gate": "M1 shared qualification and domain ownership; refresh existing pinned capture"
 }

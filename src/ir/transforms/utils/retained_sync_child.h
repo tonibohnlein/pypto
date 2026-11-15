@@ -73,6 +73,10 @@ class NativeSyncChild {
 // lexical descriptor bindings, entry acknowledgments and directional resources.
 inline constexpr const char* kClosedSyncChildAttr = "pypto.closed_sync_child";
 
+// Inspect actual selected instruction effects, including implicit effects.
+// Returns true only when external effects exist and every such effect reads.
+bool HasReadonlyExternalSyncEffects(const ForStmtPtr& scope, FunctionType core, const std::string& target);
+
 struct SyncRegionIndexWork {
   size_t source_nodes;
 };
@@ -91,7 +95,8 @@ struct SyncRegionContext {
 class SyncRegionBindings {
  public:
   SyncRegionBindings(FunctionPtr owner, std::string target);
-  SyncRegionContext Bind(const ForStmtPtr& scope) const;
+  SyncRegionContext Bind(const ForStmtPtr& scope,
+                         SyncExternalPolicy external_policy = SyncExternalPolicy::Geometry) const;
 
  private:
   class State;
@@ -108,6 +113,7 @@ class EventfulSyncChild {
   void ValidateFor(const FunctionPtr& owner, const std::string& target) const;
 
  private:
+  friend struct RetainedSyncChildDiagnostics;
   SyncRegionContext context_;
   CompactSyncResult mathematics_;
   StmtPtr logical_recipe_;

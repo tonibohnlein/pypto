@@ -17,6 +17,7 @@
 #include <numeric>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -40,6 +41,7 @@
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/verifier/verifier.h"
+#include "src/ir/transforms/utils/sync_scalar_readiness.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
 
 namespace pypto::ir::sync {
@@ -123,36 +125,85 @@ class CoordinateGraph {
   using Kind = Node::Kind;
   std::shared_ptr<SyncCoordinateProgram> program_ = std::make_shared<SyncCoordinateProgram>();
   std::vector<Node>& nodes_ = program_->nodes;
-  std::map<std::pair<const Expr*, const ForStmt*>, size_t> memo_;
   std::unordered_map<const Expr*, size_t> definitions_;
   std::unordered_map<const Expr*, ExprPtr> remainders_;
   std::vector<bool> affine_;
+  struct CoordinateContext {
+    ForStmtPtr original_loop;
+    int64_t count, start, step;
+    std::vector<SyncLoopFrame> nested_frames;
+  };
+  struct Deferred {
+    ExprPtr value;
+    std::shared_ptr<const CoordinateContext> context;
+  };
+  using FrameKey = std::tuple<const ForStmt*, int64_t, int64_t, int64_t, const Expr*>;
+  using ContextKey = std::tuple<const ForStmt*, int64_t, int64_t, int64_t, std::vector<FrameKey>>;
+  std::map<std::pair<const Expr*, const CoordinateContext*>, size_t> memo_;
+  std::map<ContextKey, std::shared_ptr<const CoordinateContext>> contexts_;
+  std::unordered_map<const Expr*, Deferred> deferred_;
+
+  std::shared_ptr<const CoordinateContext> ContextFor(const SyncSegment& segment) {
+    std::vector<FrameKey> frames;
+    frames.reserve(segment.nested_frames.size());
+    for (const auto& frame : segment.nested_frames)
+      frames.emplace_back(frame.loop.get(), frame.count, frame.start, frame.step,
+                          frame.start_expression.get());
+    const ContextKey key{segment.original_loop.get(), segment.count, segment.start, segment.step,
+                         std::move(frames)};
+    auto found = contexts_.find(key);
+    if (found == contexts_.end()) {
+      found = contexts_
+                  .emplace(key, std::make_shared<const CoordinateContext>(
+                                    CoordinateContext{segment.original_loop, segment.count, segment.start,
+                                                      segment.step, segment.nested_frames}))
+                  .first;
+    }
+    return found->second;
+  }
 
  public:
-  bool Defined(const ExprPtr& e) const { return definitions_.count(e.get()) || remainders_.count(e.get()); }
+  bool Defined(const ExprPtr& e) const {
+    return definitions_.count(e.get()) || remainders_.count(e.get()) || deferred_.count(e.get());
+  }
   ExprPtr SlotExpression(const ExprPtr& value) const {
+    if (const auto found = deferred_.find(value.get()); found != deferred_.end()) {
+      if (As<FloorMod>(found->second.value)) return found->second.value;
+    }
     const auto found = remainders_.find(value.get());
     return found == remainders_.end() ? value : found->second;
   }
-  size_t Build(const ExprPtr& e, const SyncSegment& segment, const ParameterIndices& parameters,
+  size_t Build(const ExprPtr& expression, const SyncSegment& segment, const ParameterIndices& parameters,
                CompactSyncInput& input) {
+    return BuildInContext(expression, *ContextFor(segment), parameters, input);
+  }
+  size_t BuildInContext(const ExprPtr& e, const CoordinateContext& segment,
+                        const ParameterIndices& parameters, CompactSyncInput& input) {
     const auto maximum = SyncCoordinateMaximum(e);
     CHECK(maximum) << "Synchronization coordinates require integer arithmetic";
-    const auto frame = segment.original_loop.get();
+    if (const auto found = deferred_.find(e.get()); found != deferred_.end()) {
+      if (const auto materialized = definitions_.find(e.get()); materialized != definitions_.end())
+        return materialized->second;
+      // Own only original coordinate context, never a copy of accumulated sites.
+      const auto& original = found->second;
+      const auto root = BuildInContext(original.value, *original.context, parameters, input);
+      definitions_.emplace(e.get(), root);
+      return root;
+    }
     // A named remainder need not itself be affine: buffer.slot consumes the
     // affine numerator and modulus as a rotating family. Ordinary coordinate
     // consumers still go through the original range/wrap proof below.
     if (auto found = remainders_.find(e.get()); found != remainders_.end())
-      return Build(found->second, segment, parameters, input);
+      return BuildInContext(found->second, segment, parameters, input);
     if (auto found = definitions_.find(e.get()); found != definitions_.end()) {
       return found->second;
     }
-    const auto key = std::make_pair(e.get(), frame);
+    const auto key = std::make_pair(e.get(), &segment);
     if (auto found = memo_.find(key); found != memo_.end()) {
       return found->second;
     }
     if (auto cast = As<Cast>(e)) {
-      const auto child = Build(cast->operand_, segment, parameters, input);
+      const auto child = BuildInContext(cast->operand_, segment, parameters, input);
       CHECK(nodes_[child].upper <= *maximum) << "Synchronization coordinate cast may change its value";
       memo_.emplace(key, child);
       return child;
@@ -172,7 +223,7 @@ class CoordinateGraph {
       if (loop->start_expression && loop->count <= 1) {
         // Uniform singleton, not a sampled IV. Preserve the source frame in
         // the region tree while substituting its proved invariant start.
-        const auto id = Build(loop->start_expression, segment, parameters, input);
+        const auto id = BuildInContext(loop->start_expression, segment, parameters, input);
         memo_.emplace(key, id);
         return id;
       }
@@ -182,7 +233,7 @@ class CoordinateGraph {
       n.lower = n.start;
       n.step = loop->step;
       if (loop->start_expression) {
-        n.left = Build(loop->start_expression, segment, parameters, input);
+        n.left = BuildInContext(loop->start_expression, segment, parameters, input);
         n.dynamic_start = true;
         n.lower = nodes_[n.left].lower;
         n.upper = Checked(__int128(nodes_[n.left].upper) +
@@ -211,8 +262,8 @@ class CoordinateGraph {
       const auto rhs = mod ? mod->right_ : div->right_;
       CHECK(SameCoordinateType(e, lhs) && SameCoordinateType(e, rhs))
           << "Coordinate quotient/remainder requires matching original types";
-      n.left = Build(lhs, segment, parameters, input);
-      n.right = Build(rhs, segment, parameters, input);
+      n.left = BuildInContext(lhs, segment, parameters, input);
+      n.right = BuildInContext(rhs, segment, parameters, input);
       const auto x = nodes_[n.left], y = nodes_[n.right];
       CHECK(y.constant && y.lower > 0)
           << "Coordinate quotient/remainder requires a positive constant divisor";
@@ -242,8 +293,8 @@ class CoordinateGraph {
       }
       CHECK(SameCoordinateType(e, left) && SameCoordinateType(e, right))
           << "Coordinate arithmetic requires matching operand types and explicit casts";
-      n.left = Build(left, segment, parameters, input);
-      n.right = Build(right, segment, parameters, input);
+      n.left = BuildInContext(left, segment, parameters, input);
+      n.right = BuildInContext(right, segment, parameters, input);
       // Copy scalar node metadata: recursive construction can reallocate nodes_.
       auto x = nodes_[n.left], y = nodes_[n.right];
       if (multiply) {
@@ -290,8 +341,12 @@ class CoordinateGraph {
     return id;
   }
   void Define(const ExprPtr& var, const ExprPtr& value, const SyncSegment& segment,
-              const ParameterIndices& parameters, CompactSyncInput& input) {
+              const ParameterIndices& parameters, CompactSyncInput& input, bool lazy = false) {
     CHECK(SameCoordinateType(var, value)) << "Coordinate definition requires an explicit type conversion";
+    if (lazy) {
+      deferred_.emplace(var.get(), Deferred{value, ContextFor(segment)});
+      return;
+    }
     if (auto mod = As<FloorMod>(value); mod && As<ConstInt>(mod->right_)) {
       CHECK(SameCoordinateType(value, mod->left_) && SameCoordinateType(value, mod->right_) &&
             Constant(mod->right_) > 0)
@@ -439,8 +494,12 @@ class Importer {
  public:
   // Native instruction, descriptor and control qualification is shared. Only
   // dependence clients construct storage effects and their selector evidence.
-  explicit Importer(bool recover_accesses) : recover_accesses(recover_accesses) {}
-  const bool recover_accesses;
+  Importer(bool recover_accesses, SyncExternalPolicy policy)
+      : recover_accesses(recover_accesses),
+        readonly_external(policy == SyncExternalPolicy::ReadOnlyProjection) {}
+  const bool recover_accesses, readonly_external;
+  std::set<const Var*> ready_scalars;
+  std::set<const Expr*> external_roots;
   CompactSyncInput result;
   std::unordered_map<const Expr*, size_t> objects;
   // Vec descriptors retain their own geometry; all placed Vec bytes share one
@@ -480,14 +539,33 @@ class Importer {
     }
     return out;
   }
+  void ReadyScalar(const ExprPtr& expression, const SyncSegment& segment) const {
+    CheckSyncScalarReadiness(expression, [&](const VarPtr& variable) {
+      return parameters.count(variable.get()) || ready_scalars.count(variable.get()) ||
+             (segment.original_loop && variable == segment.original_loop->loop_var_) ||
+             std::any_of(segment.nested_frames.begin(), segment.nested_frames.end(),
+                         [&](const auto& frame) { return variable == frame.loop->loop_var_; });
+    });
+  }
   void DefineCoordinate(const AssignStmtPtr& assign, const SyncSegment& segment) {
     CHECK(As<ScalarType>(assign->var_->GetType()))
         << "Nested or data-dependent storage/view definitions are outside this compact provider";
-    CHECK(SyncCoordinateMaximum(assign->var_)) << "Unavailable scalar coordinate type";
+    CHECK(readonly_external || SyncCoordinateMaximum(assign->var_)) << "Unavailable scalar coordinate type";
     CHECK(!parameters.count(assign->var_.get()) && !coordinates.Defined(assign->var_) &&
           (!segment.original_loop || assign->var_ != segment.original_loop->loop_var_))
         << "Invocation and loop coordinates must retain their original single-assignment identities";
-    coordinates.Define(assign->var_, assign->value_, segment, parameters, result);
+    if (readonly_external) {
+      if (const auto call = As<Call>(assign->value_)) {
+        const auto descriptor = backend::QualifyBufferSyncNonPayload(call, result.hardware_target);
+        CHECK(descriptor && descriptor->SignalFree())
+            << "Opaque scalar needs a ready native metadata contract";
+        for (const auto& argument : call->args_) ReadyScalar(argument, segment);
+      } else {
+        ReadyScalar(assign->value_, segment);
+      }
+      ready_scalars.insert(assign->var_.get());
+    }
+    coordinates.Define(assign->var_, assign->value_, segment, parameters, result, readonly_external);
   }
   void SelectSlot(const AssignStmtPtr& assign, const SyncSegment& segment) {
     auto call = As<Call>(assign->value_);
@@ -754,6 +832,21 @@ class Importer {
     const auto operation =
         backend::QualifyBufferSyncOperation(call, result.owner->func_type_, result.hardware_target);
     const auto& implementation = operation.Implementation();
+    if (readonly_external) {
+      for (size_t index = 0; index < operation.ArgumentEffects().size(); ++index) {
+        const auto effect = operation.ArgumentEffects()[index].data;
+        if (effect == BufferAccess::None) continue;
+        const auto type = call->args_[index]->GetType();
+        const auto buffer = As<BufferType>(type);
+        if (!As<TensorType>(type) && (!buffer || buffer->memory_space_ != MemorySpace::DDR)) continue;
+        CHECK(effect == BufferAccess::Read) << "Read-only external projection cannot omit an external write";
+        if (external_roots.insert(call->args_[index].get()).second)
+          result.projected_readonly_external_roots.push_back(call->args_[index]);
+      }
+      for (const auto& effect : implementation.ImplicitEffects())
+        CHECK(effect.space != MemorySpace::DDR || effect.data == BufferAccess::Read)
+            << "Read-only external projection cannot omit an implicit external write";
+    }
     SyncSite site{call, nullptr, implementation.Pipe(), {}};
     // Track modes by operand, not storage: in-place operands can share bytes
     // while retaining different registered read/write modes.
@@ -806,61 +899,67 @@ class Importer {
       // evidence even when no dependence footprint is requested.
       RequireIndex(offsets->elements_[0]);
       RequireIndex(offsets->elements_[1]);
-      const auto row_root = coordinates.Build(offsets->elements_[0], segment, parameters, result);
-      const auto column_root = coordinates.Build(offsets->elements_[1], segment, parameters, result);
-      coordinates.CheckScope(row_root, segment);
-      coordinates.CheckScope(column_root, segment);
-      if (recover_accesses) {
-        const auto id = Storage(call->args_[load ? 0 : 3]);
-        auto& storage = result.storage[id];
-        const auto rows = Constant(shape->elements_[0]), columns = Constant(shape->elements_[1]);
-        CHECK(rows > 0 && columns > 0 &&
-              __int128(coordinates.Upper(row_root)) + rows <=
-                  (storage.row_extent_parameter
-                       ? result.parameter_bounds.at(*storage.row_extent_parameter).first
-                       : storage.rows) &&
-              __int128(coordinates.Upper(column_root)) + columns <= storage.columns)
-            << "Synchronization access exceeds its proved allocation";
-        std::optional<AffineCoordinate> row, column;
-        if (coordinates.IsAffine(row_root) && coordinates.IsAffine(column_root)) {
-          row = Coordinate(offsets->elements_[0], segment);
-          column = Coordinate(offsets->elements_[1], segment);
-        }
-        std::set<const ForStmt*> moving;
-        if (row && column) {
-          for (const auto& coordinate : {*row, *column}) {
-            for (const auto& [frame, coefficient] : coordinate.frames)
-              if (coefficient) moving.insert(frame);
-            if (coordinate.second) moving.insert(segment.original_loop.get());
+      if (readonly_external) {
+        CHECK(load && gm_read && !gm_write) << "Read-only external projection requires a read-only DMA";
+        ReadyScalar(offsets->elements_[0], segment);
+        ReadyScalar(offsets->elements_[1], segment);
+      } else {
+        const auto row_root = coordinates.Build(offsets->elements_[0], segment, parameters, result);
+        const auto column_root = coordinates.Build(offsets->elements_[1], segment, parameters, result);
+        coordinates.CheckScope(row_root, segment);
+        coordinates.CheckScope(column_root, segment);
+        if (recover_accesses) {
+          const auto id = Storage(call->args_[load ? 0 : 3]);
+          auto& storage = result.storage[id];
+          const auto rows = Constant(shape->elements_[0]), columns = Constant(shape->elements_[1]);
+          CHECK(rows > 0 && columns > 0 &&
+                __int128(coordinates.Upper(row_root)) + rows <=
+                    (storage.row_extent_parameter
+                         ? result.parameter_bounds.at(*storage.row_extent_parameter).first
+                         : storage.rows) &&
+                __int128(coordinates.Upper(column_root)) + columns <= storage.columns)
+              << "Synchronization access exceeds its proved allocation";
+          std::optional<AffineCoordinate> row, column;
+          if (coordinates.IsAffine(row_root) && coordinates.IsAffine(column_root)) {
+            row = Coordinate(offsets->elements_[0], segment);
+            column = Coordinate(offsets->elements_[1], segment);
           }
-        }
-        if (!row || !column || moving.size() > 1) {
-          CHECK(storage.space == MemorySpace::DDR) << "External coordinate needs a global storage domain";
-          SyncAccess access{id, gm_write, 0, 0, 0, 0, rows, columns};
-          access.external = coordinates.External(row_root, column_root, storage, rows, columns);
-          site.accesses.push_back(std::move(access));
-        } else {
-          if (translated_storage.insert(id).second) {
-            storage.row_parameters = row->parameters;
-            storage.column_parameters = column->parameters;
-            storage.row_block = row->block;
-            storage.column_block = column->block;
+          std::set<const ForStmt*> moving;
+          if (row && column) {
+            for (const auto& coordinate : {*row, *column}) {
+              for (const auto& [frame, coefficient] : coordinate.frames)
+                if (coefficient) moving.insert(frame);
+              if (coordinate.second) moving.insert(segment.original_loop.get());
+            }
+          }
+          if (!row || !column || moving.size() > 1) {
+            CHECK(storage.space == MemorySpace::DDR) << "External coordinate needs a global storage domain";
+            SyncAccess access{id, gm_write, 0, 0, 0, 0, rows, columns};
+            access.external = coordinates.External(row_root, column_root, storage, rows, columns);
+            site.accesses.push_back(std::move(access));
           } else {
-            CHECK(storage.row_parameters == row->parameters &&
-                  storage.column_parameters == column->parameters && storage.row_block == row->block &&
-                  storage.column_block == column->block)
-                << "GM accesses need a common invocation translation; parameter-dependent overlap is "
-                   "unproved";
+            if (translated_storage.insert(id).second) {
+              storage.row_parameters = row->parameters;
+              storage.column_parameters = column->parameters;
+              storage.row_block = row->block;
+              storage.column_block = column->block;
+            } else {
+              CHECK(storage.row_parameters == row->parameters &&
+                    storage.column_parameters == column->parameters && storage.row_block == row->block &&
+                    storage.column_block == column->block)
+                  << "GM accesses need a common invocation translation; parameter-dependent overlap is "
+                     "unproved";
+            }
+            site.accesses.push_back(Access(id, gm_write, *row, *column, rows, columns, segment));
           }
-          site.accesses.push_back(Access(id, gm_write, *row, *column, rows, columns, segment));
-        }
-        if (gm_read && gm_write) {
-          // Atomic accumulation reads and writes exactly the same GM window.
-          // Both effects belong to this occurrence; no new storage root or
-          // cross-worker ordering is inferred from the atomic mode.
-          auto write = site.accesses.back();
-          site.accesses.back().write = false;
-          site.accesses.push_back(std::move(write));
+          if (gm_read && gm_write) {
+            // Atomic accumulation reads and writes exactly the same GM window.
+            // Both effects belong to this occurrence; no new storage root or
+            // cross-worker ordering is inferred from the atomic mode.
+            auto write = site.accesses.back();
+            site.accesses.back().write = false;
+            site.accesses.push_back(std::move(write));
+          }
         }
       }
       modes[gm_arg] = {gm_read, gm_write};
@@ -989,6 +1088,7 @@ class Importer {
           << "Imported data modes disagree with registered operation contract";
     }
     for (const auto& effect : implementation.ImplicitEffects()) {
+      if (readonly_external && effect.space == MemorySpace::DDR) continue;
       CHECK(effect.space == MemorySpace::Vec)
           << "Implicit native effects require a qualified common physical storage domain";
       // A workspace effect can order different calls; it cannot repair an
@@ -997,6 +1097,7 @@ class Importer {
       // A strided/rotating hull touching it is unproved, not a capacity failure.
       for (size_t arg = 0; arg < call->args_.size(); ++arg) {
         if (operation.ArgumentEffects()[arg].data == BufferAccess::None) continue;
+        if (readonly_external && As<TensorType>(call->args_[arg]->GetType())) continue;
         const auto& storage = result.storage[Storage(call->args_[arg])];
         if (storage.space != effect.space) continue;
         int64_t begin = storage.address, end = Checked(__int128(storage.address) + storage.bytes);
@@ -1738,7 +1839,7 @@ static void QualifyPhysicalIntervals(CompactSyncInput& input) {
 static CompactSyncInput ImportQualifiedSync(const FunctionPtr& function, const std::string& target,
                                             const SyncParameterBounds& parameter_bounds,
                                             const std::optional<std::pair<int64_t, int64_t>>& block_bounds,
-                                            bool recover_accesses) {
+                                            bool recover_accesses, SyncExternalPolicy external_policy) {
   CHECK(function && (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV))
       << "Synchronization prototype requires one AIC or AIV leaf";
   if (function->func_type_ == FunctionType::AIV) {
@@ -1752,7 +1853,8 @@ static CompactSyncInput ImportQualifiedSync(const FunctionPtr& function, const s
     for (const auto& diagnostic : diagnostics)
       CHECK(diagnostic.severity != DiagnosticSeverity::Error) << diagnostic.message;
   }
-  Importer importer(recover_accesses);
+  Importer importer(recover_accesses, external_policy);
+  if (importer.readonly_external) importer.result.unavailable_storage_spaces.insert(MemorySpace::DDR);
   importer.result.owner = function;
   importer.result.hardware_target = target;
   importer.result.parameter_bounds = parameter_bounds;
@@ -1773,7 +1875,7 @@ static CompactSyncInput ImportQualifiedSync(const FunctionPtr& function, const s
   for (size_t index = 0; index < function->params_.size(); ++index) {
     const auto& param = function->params_[index];
     if (As<ScalarType>(param->GetType())) {
-      if (recover_accesses) {
+      if (recover_accesses && !importer.readonly_external) {
         CHECK(SyncCoordinateMaximum(param)) << "Unavailable invocation coordinate type";
         CHECK(parameter_bounds.count(index)) << "Invocation coordinate has no established caller range";
       }
@@ -1781,8 +1883,25 @@ static CompactSyncInput ImportQualifiedSync(const FunctionPtr& function, const s
     }
   }
   for (const auto& param : function->params_) {
-    if (!recover_accesses) break;  // GM allocation geometry is not token-order evidence.
     if (As<ScalarType>(param->GetType())) continue;
+    if (importer.readonly_external) {
+      const auto type = As<TensorType>(param->GetType());
+      CHECK(type && type->shape_.size() == 2 && type->dtype_.GetBit() % 8 == 0 && !type->tensor_view_)
+          << "Projected external roots require the existing unviewed rank-two ND descriptor contract";
+      CHECK(Constant(type->shape_[1]) > 0) << "Projected external ND pitch must remain a positive constant";
+      if (As<ConstInt>(type->shape_[0])) {
+        CHECK(Constant(type->shape_[0]) > 0) << "Projected external extent must remain positive";
+      } else {
+        RequireIndex(type->shape_[0]);
+        importer.ReadyScalar(type->shape_[0], SyncSegment{});
+      }
+      importer.objects[param.get()] = importer.result.storage.size();
+      SyncStorage unavailable{param->name_hint_, MemorySpace::DDR, 0, 0, 0, 0, nullptr};
+      unavailable.boundary_available = false;
+      importer.result.storage.push_back(std::move(unavailable));
+      continue;
+    }
+    if (!recover_accesses) break;  // GM geometry is not token-order evidence.
     auto t = As<TensorType>(param->GetType());
     CHECK(t && t->shape_.size() == 2 && t->dtype_.GetBit() % 8 == 0 && !t->tensor_view_)
         << "Synchronization prototype requires unviewed ND tensor arguments";
@@ -1876,11 +1995,16 @@ CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm,
                                   const std::optional<std::pair<int64_t, int64_t>>& blocks) {
   CHECK(disjoint_gm)
       << "Disjoint GM argument contract must be explicitly supplied; may-alias import unavailable";
-  return ImportQualifiedSync(function, target, parameters, blocks, true);
+  return ImportQualifiedSync(function, target, parameters, blocks, true, SyncExternalPolicy::Geometry);
 }
 CompactSyncInput ImportSyncPayloads(const FunctionPtr& function, const std::string& target,
                                     const SyncParameterBounds& parameters,
-                                    const std::optional<std::pair<int64_t, int64_t>>& blocks) {
-  return ImportQualifiedSync(function, target, parameters, blocks, false);
+                                    const std::optional<std::pair<int64_t, int64_t>>& blocks,
+                                    SyncExternalPolicy external_policy) {
+  return ImportQualifiedSync(function, target, parameters, blocks, false, external_policy);
+}
+CompactSyncInput ImportReadonlyExternalSync(const FunctionPtr& function, const std::string& target) {
+  return ImportQualifiedSync(function, target, {}, std::nullopt, true,
+                             SyncExternalPolicy::ReadOnlyProjection);
 }
 }  // namespace pypto::ir::sync

@@ -25,7 +25,8 @@ namespace pypto::ir::sync {
 // needed to qualify a native instruction or original control remains checked.
 CompactSyncInput ImportSyncPayloads(const FunctionPtr& function, const std::string& target,
                                     const SyncParameterBounds& parameters = {},
-                                    const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt);
+                                    const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt,
+                                    SyncExternalPolicy external_policy = SyncExternalPolicy::Geometry);
 
 // Insertion owns its generated SSA: malformed output is a compiler error,
 // never an unsupported-input reason for downstream delegation.
@@ -54,7 +55,8 @@ struct LoweredLogicalSync {
 LoweredLogicalSync LowerStructuredLogicalSync(
     const FunctionPtr& function, const std::string& target,
     const std::optional<std::vector<int>>& eligible_ids, const SyncParameterBounds& parameters = {},
-    std::optional<std::pair<int64_t, int64_t>> blocks = std::nullopt, const SyncSchedulePolicy& policy = {});
+    std::optional<std::pair<int64_t, int64_t>> blocks = std::nullopt, const SyncSchedulePolicy& policy = {},
+    SyncExternalPolicy external_policy = SyncExternalPolicy::Geometry);
 // Interpret actual logical token uses without substituting minimum demands.
 // The finite adapter keeps actual command cuts and has no payload families;
 // canonical structured transport certifies and retains direct-cut families.
@@ -62,6 +64,7 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
                                     const std::optional<std::vector<int>>& eligible_ids,
                                     const SyncParameterBounds& parameters = {},
                                     std::optional<std::pair<int64_t, int64_t>> blocks = std::nullopt,
-                                    const SyncSchedulePolicy& policy = {});
+                                    const SyncSchedulePolicy& policy = {},
+                                    SyncExternalPolicy external_policy = SyncExternalPolicy::Geometry);
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_TOKEN_SYNC_LOWERING_H_

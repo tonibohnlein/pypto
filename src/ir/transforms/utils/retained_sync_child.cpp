@@ -28,10 +28,12 @@
 #include "pypto/ir/sync.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/parent_stmt_analysis.h"
+#include "pypto/ir/transforms/utils/signature_symbols.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/numerical_sync_merge.h"
+#include "src/ir/transforms/utils/sync_scalar_readiness.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -94,6 +96,9 @@ class Operations : public IRVisitor {
         if (operation.ArgumentEffects()[index].data == BufferAccess::None) continue;
         const auto type = call->args_[index]->GetType();
         const auto buffer = As<BufferType>(type);
+        const bool projected = mathematics_.State().input.unavailable_storage_spaces.count(MemorySpace::DDR);
+        const bool external = As<TensorType>(type) || (buffer && buffer->memory_space_ == MemorySpace::DDR);
+        if (projected && external && operation.ArgumentEffects()[index].data == BufferAccess::Read) continue;
         if (!buffer || buffer->memory_space_ == MemorySpace::DDR) {
           result_.status = NativeSyncChildStatus::AccessPremises;
           result_.reason = "Native child needs an external-storage alias premise not supplied to its parent";
@@ -108,6 +113,9 @@ class Operations : public IRVisitor {
         return;
       }
       for (const auto& effect : operation.Implementation().ImplicitEffects()) {
+        if (mathematics_.State().input.unavailable_storage_spaces.count(MemorySpace::DDR) &&
+            effect.space == MemorySpace::DDR && effect.data == BufferAccess::Read)
+          continue;
         if (effect.space != MemorySpace::Vec || effect.begin < 0 || effect.end <= effect.begin) {
           result_.status = NativeSyncChildStatus::AccessPremises;
           result_.reason = "Native child implicit effects lack a qualified local storage domain";
@@ -173,6 +181,11 @@ NativeSyncChildExport ExportNativeSyncChild(const CompactSyncResult& mathematics
   if (!state.input.owner || target != state.input.hardware_target) {
     result.status = NativeSyncChildStatus::ForeignContext;
     result.reason = "Child target/context differs from the retained mathematics";
+    return result;
+  }
+  if (!state.input.unavailable_storage_spaces.empty()) {
+    result.status = NativeSyncChildStatus::AccessPremises;
+    result.reason = "Native-only child export lacks an external-domain contract for projected storage";
     return result;
   }
   if (!state.input.parameter_bounds.empty() || state.input.block_bounds) {
@@ -246,6 +259,41 @@ NativeSyncChildExport ExportNativeSyncChild(const CompactSyncResult& mathematics
   result.reason = "Retained internal order is native-only, with no notification resources";
   return result;
 }
+bool HasReadonlyExternalSyncEffects(const ForStmtPtr& scope, FunctionType core, const std::string& target) {
+  class Effects : public IRVisitor {
+   public:
+    Effects(FunctionType core, const std::string& target) : core_(core), target_(target) {}
+    bool external = false;
+    void VisitExpr_(const CallPtr& call) override {
+      if (GetLogicalSyncKind(call->op_) != LogicalSyncKind::None ||
+          backend::QualifyBufferSyncNonPayload(call, target_))
+        return;
+      const auto operation = backend::QualifyBufferSyncOperation(call, core_, target_);
+      for (size_t index = 0; index < operation.ArgumentEffects().size(); ++index) {
+        const auto effect = operation.ArgumentEffects()[index].data;
+        if (effect == BufferAccess::None) continue;
+        const auto type = call->args_[index]->GetType();
+        const auto buffer = As<BufferType>(type);
+        if (As<TensorType>(type) || (buffer && buffer->memory_space_ == MemorySpace::DDR)) {
+          CHECK(effect == BufferAccess::Read) << "Closed child external effects are not uniformly read-only";
+          external = true;
+        }
+      }
+      for (const auto& effect : operation.Implementation().ImplicitEffects()) {
+        if (effect.space != MemorySpace::DDR) continue;
+        CHECK(effect.data == BufferAccess::Read) << "Closed child implicit external effect is not read-only";
+        external = true;
+      }
+    }
+
+   private:
+    FunctionType core_;
+    const std::string& target_;
+  } effects(core, target);
+  effects.VisitStmt(scope);
+  return effects.external;
+}
+
 class SyncRegionBindings::State : public ParentStmtAnalysis {
  public:
   FunctionPtr owner;
@@ -255,12 +303,19 @@ class SyncRegionBindings::State : public ParentStmtAnalysis {
   std::unordered_map<const Var*, std::vector<AssignStmtPtr>> definitions;
   // Ephemeral request-local qualification cache. Published mathematics and
   // capabilities do not depend on later mutations of this index.
-  std::unordered_map<const AssignStmt*, bool> qualified;
+  std::map<std::pair<const AssignStmt*, SyncExternalPolicy>, bool> qualified;
   std::shared_ptr<const SyncRegionIndexWork> work;
+  std::vector<VarPtr> ready_shape_symbols;
 
   State(FunctionPtr function, std::string native) : owner(std::move(function)), target(std::move(native)) {
     CHECK(owner) << "Regional synchronization requires an original owner";
     BuildMap(owner);
+    // The existing signature service identifies physical tensor extents supplied
+    // by the invocation ABI. This is readiness, never a numerical bound or a
+    // valid-shape-only/tensor.read visibility premise.
+    const auto physical_symbols = CollectParamDimSymbols(owner->params_);
+    for (const auto& symbol : ClassifySignatureSymbols(owner).bound)
+      if (physical_symbols.count(symbol.get())) ready_shape_symbols.push_back(symbol);
     work = std::make_shared<const SyncRegionIndexWork>(SyncRegionIndexWork{clock});
   }
   void VisitStmt(const StmtPtr& statement) override {
@@ -281,8 +336,9 @@ class SyncRegionBindings::State : public ParentStmtAnalysis {
            occurrences.at(parent.get()) == 1 && begin.at(definition.get()) < begin.at(use.get()) &&
            begin.at(use.get()) < end.at(parent.get());
   }
-  bool Qualify(const AssignStmtPtr& assignment) {
-    if (const auto found = qualified.find(assignment.get()); found != qualified.end()) {
+  bool Qualify(const AssignStmtPtr& assignment, SyncExternalPolicy policy) {
+    const auto key = std::make_pair(assignment.get(), policy);
+    if (const auto found = qualified.find(key); found != qualified.end()) {
       return found->second;
     }
     const auto call = As<Call>(assignment->value_);
@@ -298,8 +354,12 @@ class SyncRegionBindings::State : public ParentStmtAnalysis {
     } else {
       ready = As<ConstInt>(assignment->value_) || As<ConstBool>(assignment->value_) ||
               As<ConstFloat>(assignment->value_);
+      if (policy == SyncExternalPolicy::ReadOnlyProjection) {
+        CheckSyncScalarReadiness(assignment->value_, [](const VarPtr&) { return true; });
+        ready = true;  // Every operand is separately bound at this original cut below.
+      }
     }
-    qualified.emplace(assignment.get(), ready);
+    qualified.emplace(key, ready);
     return ready;
   }
 };
@@ -307,7 +367,7 @@ class SyncRegionBindings::State : public ParentStmtAnalysis {
 SyncRegionBindings::SyncRegionBindings(FunctionPtr owner, std::string target)
     : state_(std::make_shared<State>(std::move(owner), std::move(target))) {}
 
-SyncRegionContext SyncRegionBindings::Bind(const ForStmtPtr& scope) const {
+SyncRegionContext SyncRegionBindings::Bind(const ForStmtPtr& scope, SyncExternalPolicy policy) const {
   CHECK(scope && state_->occurrences.count(scope.get()) && state_->occurrences.at(scope.get()) == 1)
       << "Regional synchronization scope must occur exactly once in its original owner";
   std::vector<StmtPtr> ancestors;
@@ -337,19 +397,49 @@ SyncRegionContext SyncRegionBindings::Bind(const ForStmtPtr& scope) const {
       if (!uses.var_defs.count(metadata)) pending.emplace_back(metadata, scope);
   std::set<const Var*> required;
   std::vector<AssignStmtPtr> ordered;
+  std::map<const Var*, std::pair<VarPtr, ParamDirection>> captures;
+  std::map<const Var*, std::pair<VarPtr, ParamDirection>> available;
+  std::map<const Var*, ForStmtPtr> invocation_frames;
+  if (policy == SyncExternalPolicy::ReadOnlyProjection) {
+    for (size_t index = 0; index < state_->owner->params_.size(); ++index)
+      available.emplace(
+          state_->owner->params_[index].get(),
+          std::make_pair(state_->owner->params_[index], state_->owner->param_directions_[index]));
+    for (const auto& symbol : state_->ready_shape_symbols)
+      available.emplace(symbol.get(), std::make_pair(symbol, ParamDirection::In));
+    for (const auto& ancestor : ancestors) {
+      if (const auto loop = As<ForStmt>(ancestor)) {
+        available.emplace(loop->loop_var_.get(), std::make_pair(loop->loop_var_, ParamDirection::In));
+        invocation_frames.emplace(loop->loop_var_.get(), loop);
+      }
+    }
+  }
   while (!pending.empty()) {
     const auto [variable, use] = pending.back();
     pending.pop_back();
+    if (const auto captured = available.find(variable); captured != available.end()) {
+      if (const auto frame = invocation_frames.find(variable); frame != invocation_frames.end()) {
+        const auto& loop = frame->second;
+        CHECK(state_->occurrences.at(loop.get()) == 1 &&
+              state_->begin.at(loop.get()) < state_->begin.at(use.get()) &&
+              state_->begin.at(use.get()) < state_->end.at(loop.get()))
+            << "Opaque enclosing coordinate is unavailable at its original definition/use cut";
+      }
+      captures.emplace(variable, captured->second);
+      continue;
+    }
     const auto found = state_->definitions.find(variable);
     CHECK(found != state_->definitions.end() && found->second.size() == 1)
         << "Regional synchronization child has an unavailable enclosing coordinate, caller value or "
-           "descriptor binding";
+           "descriptor binding: "
+        << variable->name_hint_;
     const auto& definition = found->second.front();
     // Check every source-use cut, including repeated uses of a shared binding.
     // Dominance of the child alone cannot justify an earlier initializer use.
     CHECK(state_->Dominates(definition, use))
         << "Regional synchronization descriptor binding does not dominate its original use";
-    CHECK(state_->Qualify(definition)) << "Regional synchronization requires a signal-free original binding";
+    CHECK(state_->Qualify(definition, policy))
+        << "Regional synchronization requires a signal-free original binding";
     if (!required.insert(variable).second) continue;
     ordered.push_back(definition);
     Uses dependencies;
@@ -367,6 +457,10 @@ SyncRegionContext SyncRegionBindings::Bind(const ForStmtPtr& scope) const {
   auto binding = std::make_shared<Function>(*state_->owner);
   binding->params_.clear();
   binding->param_directions_.clear();
+  for (const auto& [identity, capture] : captures) {
+    binding->params_.push_back(capture.first);
+    binding->param_directions_.push_back(capture.second);
+  }
   binding->return_types_.clear();
   binding->body_ = std::make_shared<SeqStmts>(body, scope->span_);
   return {state_->owner,    scope,         std::move(ancestors), std::move(binding), state_->work,
@@ -377,10 +471,15 @@ std::shared_ptr<const EventfulSyncChild> PrepareEventfulSyncChild(const Function
                                                                   const ForStmtPtr& scope,
                                                                   const std::string& target,
                                                                   const SyncRegionBindings& bindings) {
-  auto context = bindings.Bind(scope);
+  const auto policy = HasReadonlyExternalSyncEffects(scope, owner->func_type_, target)
+                          ? SyncExternalPolicy::ReadOnlyProjection
+                          : SyncExternalPolicy::Geometry;
+  auto context = bindings.Bind(scope, policy);
   CHECK(context.original_owner == owner)
       << "Regional synchronization index belongs to another original owner";
-  auto mathematics = AnalyzeCompactSync(ImportPlacedSync(context.binding_owner, true, target));
+  auto mathematics = AnalyzeCompactSync(policy == SyncExternalPolicy::ReadOnlyProjection
+                                            ? ImportReadonlyExternalSync(context.binding_owner, target)
+                                            : ImportPlacedSync(context.binding_owner, true, target));
   NativeSyncChildExport qualification;
   Operations operations(mathematics, target, qualification);
   operations.VisitStmt(scope);
@@ -410,7 +509,7 @@ std::shared_ptr<const EventfulSyncChild> PrepareEventfulSyncChild(const Function
   selected.VisitFunction(logical);
   CHECK(selected.found) << "Eventful child logical recipe lost its original invocation frame";
   CheckLogicalSync(logical);
-  const auto logical_context = SyncRegionBindings(logical, target).Bind(selected.found);
+  const auto logical_context = SyncRegionBindings(logical, target).Bind(selected.found, policy);
   std::vector<StmtPtr> recipe;
   const auto bound = As<SeqStmts>(logical_context.binding_owner->body_);
   INTERNAL_CHECK(bound) << "Internal error: region bindings are not a sequence";
@@ -435,7 +534,9 @@ std::map<std::string, size_t> EventfulSyncChild::Describe() const {
           {"binding_definitions", context_.binding_definitions},
           {"analyzed_occurrences", mathematics_.Diagnostics().analyzed_occurrences},
           {"retained_cells", mathematics_.Diagnostics().cells},
-          {"retained_regions", mathematics_.State().segments.size()}};
+          {"retained_regions", mathematics_.State().segments.size()},
+          {"unavailable_storage_domains", mathematics_.State().input.unavailable_storage_spaces.size()},
+          {"projected_external_roots", mathematics_.State().input.projected_readonly_external_roots.size()}};
 }
 
 void EventfulSyncChild::ValidateFor(const FunctionPtr& owner, const std::string& target) const {

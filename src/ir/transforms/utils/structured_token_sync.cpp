@@ -491,7 +491,8 @@ LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const
                                               const std::optional<std::vector<int>>& eligible,
                                               const SyncParameterBounds& parameters,
                                               std::optional<std::pair<int64_t, int64_t>> blocks,
-                                              const SyncSchedulePolicy& policy) {
+                                              const SyncSchedulePolicy& policy,
+                                              SyncExternalPolicy external_policy) {
   auto stripped = StripStructuredLogicalSync(function, true);
   if (blocks) {
     const auto partition = PartitionSyncInvocation(stripped.function, parameters, *blocks);
@@ -502,7 +503,7 @@ LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const
       std::vector<AssignedSyncCase> cases;
       LoweredLogicalSync result;
       for (const auto& domain : partition.intervals) {
-        auto input = ImportSyncPayloads(stripped.function, target, parameters, domain);
+        auto input = ImportSyncPayloads(stripped.function, target, parameters, domain, external_policy);
         auto families = ParseScopedTokenProtocol(function, std::move(input), stripped.loops);
         owners.push_back(PrepareScopedTokenOrder(std::move(families)));
         const auto& order = *owners.back();
@@ -518,7 +519,7 @@ LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const
       return result;
     }
   }
-  auto input = ImportSyncPayloads(stripped.function, target, parameters, blocks);
+  auto input = ImportSyncPayloads(stripped.function, target, parameters, blocks, external_policy);
   if (input.region_tree) {
     auto families = ParseScopedTokenProtocol(function, std::move(input), stripped.loops);
     auto prepared = PrepareScopedTokenOrder(std::move(families));

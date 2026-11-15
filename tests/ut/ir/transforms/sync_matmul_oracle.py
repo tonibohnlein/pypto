@@ -84,7 +84,7 @@ def address_set(storage, row, col, rows, cols):
     points = set()
     for r in range(row, row + rows):
         for c in range(col, col + cols):
-            assert 0 <= r < height and 0 <= c < width
+            assert 0 <= r < height and 0 <= c < width, (space, base, r, c, height, width)
             if layout is None or layout.slayout == ir.TileLayout.none_box:
                 offset = r * (pitch[0] // scalar_bytes if pitch else width) + c
             else:
@@ -499,13 +499,16 @@ def validate(
     block_index=None,
     block_count=None,
     unavailable_boundaries=(),
+    readonly_external_projection=False,
 ):
     parameters = parameters or {}
     description = analysis.describe()
     validate_slot_descriptors(function, description)
     translate_access_description(description, parameters, block_index)
     storage, calls = interpret(function, parameters, block_index=block_index, block_count=block_count)
-    occurrences, effects = check_imported_accesses(description, storage, calls, parameters)
+    occurrences, effects = check_imported_accesses(
+        description, storage, calls, parameters, readonly_external_projection
+    )
     vertices = [(o, c) for o in occurrences for c in (False, True)]
     base = {((o, False), (o, True)) for o in occurrences}
     for pipe in PIPES:
@@ -682,7 +685,17 @@ def external_coordinate(description, footprint, root, env, parameters):
     return evaluate(root)
 
 
-def check_imported_accesses(description, storage, calls, parameters=None):
+def projected_model_reads(reads, writes, modeled, readonly_external_projection):
+    if not readonly_external_projection:
+        return reads
+    # This is an explicit test contract, never inferred from omitted compiler
+    # effects. ALL original GM reads remain in the returned effect/reference graph.
+    assert not any(isinstance(space, str) for space, _ in writes), "external write cannot be projected"
+    assert all(not isinstance(space, str) for footprint in modeled for space, _ in footprint)
+    return {point for point in reads if not isinstance(point[0], str)}
+
+
+def check_imported_accesses(description, storage, calls, parameters=None, readonly_external_projection=False):
     mapping = {}
     for r, region in enumerate(description["regions"]):
         for s, site in enumerate(region["sites"]):
@@ -745,14 +758,15 @@ def check_imported_accesses(description, storage, calls, parameters=None):
                 row += access_visit * dr
                 col += access_visit * dc
             modeled[write].update(domain_addresses(domain, storage, row, col, rows, cols, slot))
-        assert modeled == [reads, writes], (
+        expected_reads = projected_model_reads(reads, writes, modeled, readonly_external_projection)
+        assert modeled == [expected_reads, writes], (
             r,
             visit,
             s,
             "access mismatch",
             [
                 (len(m), len(a), sorted(m - a, key=repr)[:3], sorted(a - m, key=repr)[:3])
-                for m, a in zip(modeled, [reads, writes], strict=True)
+                for m, a in zip(modeled, [expected_reads, writes], strict=True)
             ],
         )
     return occurrences, effects

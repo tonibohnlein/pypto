@@ -1,0 +1,1405 @@
+{
+  "status": "Accepted: independent architecture/correctness review, final-build semantic audits and all configured hooks passed.",
+  "base_revision": "32c472089cf8e29ab4cff24964cf79c5d03ecc32",
+  "scope": "Explicit read-only external projection for whole closed eventful children; no automatic selection or allocator change",
+  "evidence": {
+    "actual_commands": {
+      "path": "build-py314/eventful-child-20261115/qwen-command-interned/receipt.json",
+      "sha256": "23035a471ec4d8a4f4e60a8122cebbf7204acb5ca2df7658e96d14683fd7fdfd",
+      "scope": "Historical pre-format evidence; final-source results below supersede the summary, raw receipt remains pinned."
+    },
+    "block0_exhaustive": {
+      "path": "build-py314/eventful-child-20261115/qwen-math-block0/receipt.json",
+      "sha256": "a8d943814431f095d50cba5e39033ec5e1e18cf2bdde1acc90563f196310c2b3",
+      "scope": "Historical pre-format evidence; final-source results below supersede the summary, raw receipt remains pinned."
+    },
+    "block19_exhaustive": {
+      "path": "build-py314/eventful-child-20261115/qwen-math-block19/receipt.json",
+      "sha256": "3231be266c21f0db4532c8c5e8d4cbe0828d8e1c3b92803c9c4e85b267e7528b",
+      "scope": "Historical pre-format evidence; final-source results below supersede the summary, raw receipt remains pinned."
+    },
+    "generic": {
+      "path": "build-py314/eventful-child-20261115/readonly-qualification/measurement.json",
+      "sha256": "39a89e8e9e47097e1f0b4d607df20990cb36855cbbe470ba51f6506cd8600137",
+      "scope": "Historical pre-format evidence; final-source results below supersede the summary, raw receipt remains pinned."
+    },
+    "production_stages": {
+      "path": "build-py314/eventful-child-20261115/qwen-readonly-abi/receipt.json",
+      "sha256": "2d979cbc5d8a437b64e02f48a543138f53c459cd9d6f78cf87201deaaee539f8",
+      "scope": "Historical pre-format evidence; final-source results below supersede the summary, raw receipt remains pinned."
+    },
+    "final_commands": {
+      "path": "build-py314/eventful-child-20261115/postformat-commands/receipt.json",
+      "sha256": "c0cf5e77c3ce8b4f714e8e399d35a94b30a6dbeac5de110e6750a10e996c3672",
+      "result": {
+        "input_sha256": "e7eea4f1e67d9ca3abb98ebfed3c968d311bedadef006f6816bb57b857bfc1bc",
+        "scope": "cb_inline1641__idx_v0",
+        "parameters": {
+          "3": 0,
+          "4": 0
+        },
+        "shape_values": {
+          "LAYER_INTER_ROWS_DYN": 34816
+        },
+        "caller_qualification": "Finite explicitly supplied ABI executions; these values are not compiler assumptions.",
+        "retained": {
+          "analyzed_occurrences": 40,
+          "binding_definitions": 14,
+          "projected_external_roots": 2,
+          "query_scope_nodes": 29,
+          "retained_cells": 13,
+          "retained_regions": 3,
+          "shared_index_source_nodes": 62,
+          "unavailable_storage_domains": 1
+        },
+        "executions": [
+          {
+            "retained_mathematical_checks": null,
+            "block_index": 0,
+            "payloads": 443,
+            "hazards": 16368,
+            "required_pairs": 95614,
+            "old_excess": 2259,
+            "new_excess": 71,
+            "removed_pairs": 2188,
+            "added_pairs": 0,
+            "old_commands": [
+              1772,
+              1772,
+              444
+            ],
+            "new_commands": [
+              408,
+              408,
+              31
+            ],
+            "new_directional_ids": {
+              "(PipeType.MTE1, PipeType.MTE2)": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5
+              ],
+              "(PipeType.MTE2, PipeType.MTE1)": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5
+              ],
+              "(PipeType.MTE1, PipeType.M)": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5
+              ],
+              "(PipeType.M, PipeType.MTE1)": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5
+              ],
+              "(PipeType.MTE2, PipeType.M)": [
+                0,
+                1
+              ],
+              "(PipeType.M, PipeType.MTE2)": [
+                0,
+                1
+              ],
+              "(PipeType.FIX, PipeType.MTE2)": [
+                0,
+                1
+              ],
+              "(PipeType.MTE2, PipeType.FIX)": [
+                0,
+                1
+              ],
+              "(PipeType.FIX, PipeType.M)": [
+                0,
+                1
+              ],
+              "(PipeType.M, PipeType.FIX)": [
+                0,
+                1
+              ]
+            },
+            "checked_reuses": 372,
+            "actual_token_all_event_order_preserved": true
+          },
+          {
+            "retained_mathematical_checks": null,
+            "block_index": 19,
+            "payloads": 443,
+            "hazards": 16368,
+            "required_pairs": 95614,
+            "old_excess": 2259,
+            "new_excess": 71,
+            "removed_pairs": 2188,
+            "added_pairs": 0,
+            "old_commands": [
+              1772,
+              1772,
+              444
+            ],
+            "new_commands": [
+              408,
+              408,
+              31
+            ],
+            "new_directional_ids": {
+              "(PipeType.MTE1, PipeType.MTE2)": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5
+              ],
+              "(PipeType.MTE2, PipeType.MTE1)": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5
+              ],
+              "(PipeType.MTE1, PipeType.M)": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5
+              ],
+              "(PipeType.M, PipeType.MTE1)": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5
+              ],
+              "(PipeType.MTE2, PipeType.M)": [
+                0,
+                1
+              ],
+              "(PipeType.M, PipeType.MTE2)": [
+                0,
+                1
+              ],
+              "(PipeType.FIX, PipeType.MTE2)": [
+                0,
+                1
+              ],
+              "(PipeType.MTE2, PipeType.FIX)": [
+                0,
+                1
+              ],
+              "(PipeType.FIX, PipeType.M)": [
+                0,
+                1
+              ],
+              "(PipeType.M, PipeType.FIX)": [
+                0,
+                1
+              ]
+            },
+            "checked_reuses": 372,
+            "actual_token_all_event_order_preserved": true
+          }
+        ],
+        "seconds_inclusive": 18.93358917813748,
+        "device": "not run",
+        "memory_limit_mib": 2048,
+        "observed_peak_rss_kib": 996884,
+        "graph_lifetime": "One logical or physical arm at a time; no graph/cache retained across executions",
+        "retained_mathematics": "minimum demands for declared footprints and core native chains",
+        "retained_mathematics_checked": false
+      }
+    },
+    "final_block0_exhaustive": {
+      "path": "build-py314/eventful-child-20261115/postformat-math-0/receipt.json",
+      "sha256": "805da20faf32a2791eef20f105da61a06188fb4a0e5f6cea0e0ad3d0acb3712f",
+      "result": {
+        "seconds_inclusive": 66.71808988321573,
+        "observed_peak_rss_kib": 1345384,
+        "memory_limit_mib": 2048,
+        "retained_mathematics": "minimum demands for declared footprints and core native chains",
+        "retained_mathematics_checked": true,
+        "checks": [
+          {
+            "block_index": 0,
+            "access_checks": 416,
+            "actual_covers": 284,
+            "event_queries": 692224,
+            "boundary_samples": 86,
+            "unavailable_gm_domains": 2
+          }
+        ]
+      }
+    },
+    "final_block19_exhaustive": {
+      "path": "build-py314/eventful-child-20261115/postformat-math-19/receipt.json",
+      "sha256": "ad266cc00f76d0f84243d97a79b6b7da4cae4babe284421b36942b0dd5621549",
+      "result": {
+        "seconds_inclusive": 65.22056057397276,
+        "observed_peak_rss_kib": 1344332,
+        "memory_limit_mib": 2048,
+        "retained_mathematics": "minimum demands for declared footprints and core native chains",
+        "retained_mathematics_checked": true,
+        "checks": [
+          {
+            "block_index": 19,
+            "access_checks": 416,
+            "actual_covers": 284,
+            "event_queries": 692224,
+            "boundary_samples": 86,
+            "unavailable_gm_domains": 2
+          }
+        ]
+      }
+    },
+    "final_generic": {
+      "path": "build-py314/eventful-child-20261115/postformat-generic/measurement.json",
+      "sha256": "5f8065207a6763bcebfce910f94284512ac9b9b5a20312438c4beae52e0d7502",
+      "result": {
+        "scope": "readonly external eventful child, host-only, identical conservative-prefix policy",
+        "checks": "Actual-token/physical equality, independently recovered physical-byte conflicts, acyclicity, matching, causal reuse",
+        "executions_checked": 18,
+        "maximum_added_pairs": 6,
+        "representative_tradeoff": {
+          "K": 3,
+          "visits": 3,
+          "execute": true,
+          "old_prerequisites": 1935,
+          "new_prerequisites": 1902,
+          "removed": 39,
+          "added": 6,
+          "added_witnesses": [
+            {
+              "source": {
+                "index": 4,
+                "operation": "buffer.matmul",
+                "pipe": "PipeType.M",
+                "coordinates": {
+                  "visits": 3,
+                  "execute_child": true,
+                  "visit": 0
+                }
+              },
+              "target": {
+                "index": 5,
+                "operation": "buffer.load",
+                "pipe": "PipeType.MTE2",
+                "coordinates": {
+                  "visits": 3,
+                  "execute_child": true,
+                  "visit": 0,
+                  "k": 0,
+                  "opaque_address": 0
+                }
+              },
+              "path": [
+                {
+                  "event": "('payload', 4, 'C')"
+                },
+                {
+                  "event": "('publish', 37)",
+                  "record": "sync_parent_completion_56"
+                },
+                {
+                  "event": "('acquire', 37)"
+                },
+                {
+                  "event": "('command_issue', 81)"
+                },
+                {
+                  "event": "('acquire', 40)"
+                },
+                {
+                  "event": "('payload', 5, 'I')"
+                }
+              ],
+              "present_before_physical_allocation": true
+            },
+            {
+              "source": {
+                "index": 4,
+                "operation": "buffer.matmul",
+                "pipe": "PipeType.M",
+                "coordinates": {
+                  "visits": 3,
+                  "execute_child": true,
+                  "visit": 0
+                }
+              },
+              "target": {
+                "index": 6,
+                "operation": "buffer.load",
+                "pipe": "PipeType.MTE2",
+                "coordinates": {
+                  "visits": 3,
+                  "execute_child": true,
+                  "visit": 0,
+                  "k": 0,
+                  "opaque_address": 0
+                }
+              },
+              "path": [
+                {
+                  "event": "('payload', 4, 'C')"
+                },
+                {
+                  "event": "('publish', 37)",
+                  "record": "sync_parent_completion_56"
+                },
+                {
+                  "event": "('acquire', 37)"
+                },
+                {
+                  "event": "('command_issue', 81)"
+                },
+                {
+                  "event": "('acquire', 40)"
+                },
+                {
+                  "event": "('payload', 6, 'I')"
+                }
+              ],
+              "present_before_physical_allocation": true
+            },
+            {
+              "source": {
+                "index": 25,
+                "operation": "buffer.matmul",
+                "pipe": "PipeType.M",
+                "coordinates": {
+                  "visits": 3,
+                  "execute_child": true,
+                  "visit": 1
+                }
+              },
+              "target": {
+                "index": 26,
+                "operation": "buffer.load",
+                "pipe": "PipeType.MTE2",
+                "coordinates": {
+                  "visits": 3,
+                  "execute_child": true,
+                  "visit": 1,
+                  "k": 0,
+                  "opaque_address": 0
+                }
+              },
+              "path": [
+                {
+                  "event": "('payload', 25, 'C')"
+                },
+                {
+                  "event": "('publish', 101)",
+                  "record": "sync_parent_completion_56"
+                },
+                {
+                  "event": "('acquire', 101)"
+                },
+                {
+                  "event": "('command_issue', 209)"
+                },
+                {
+                  "event": "('acquire', 104)"
+                },
+                {
+                  "event": "('payload', 26, 'I')"
+                }
+              ],
+              "present_before_physical_allocation": true
+            }
+          ],
+          "removed_witnesses": [
+            {
+              "source": {
+                "index": 5,
+                "operation": "buffer.load",
+                "pipe": "PipeType.MTE2",
+                "coordinates": {
+                  "visits": 3,
+                  "execute_child": true,
+                  "visit": 0,
+                  "k": 0,
+                  "opaque_address": 0
+                }
+              },
+              "target": {
+                "index": 6,
+                "operation": "buffer.load",
+                "pipe": "PipeType.MTE2",
+                "coordinates": {
+                  "visits": 3,
+                  "execute_child": true,
+                  "visit": 0,
+                  "k": 0,
+                  "opaque_address": 0
+                }
+              },
+              "path": [
+                {
+                  "event": "('payload', 5, 'C')"
+                },
+                {
+                  "event": "('publish', 32)",
+                  "record": "sync_parent_completion_32"
+                },
+                {
+                  "event": "('acquire', 32)"
+                },
+                {
+                  "event": "('command_issue', 67)"
+                },
+                {
+                  "event": "('acquire', 33)"
+                },
+                {
+                  "event": "('payload', 6, 'I')"
+                }
+              ],
+              "present_before_physical_allocation": true
+            },
+            {
+              "source": {
+                "index": 6,
+                "operation": "buffer.load",
+                "pipe": "PipeType.MTE2",
+                "coordinates": {
+                  "visits": 3,
+                  "execute_child": true,
+                  "visit": 0,
+                  "k": 0,
+                  "opaque_address": 0
+                }
+              },
+              "target": {
+                "index": 7,
+                "operation": "buffer.copy",
+                "pipe": "PipeType.MTE1",
+                "coordinates": {
+                  "visits": 3,
+                  "execute_child": true,
+                  "visit": 0,
+                  "k": 0,
+                  "opaque_address": 0
+                }
+              },
+              "path": [
+                {
+                  "event": "('payload', 6, 'C')"
+                },
+                {
+                  "event": "('publish', 36)",
+                  "record": "sync_parent_completion_36"
+                },
+                {
+                  "event": "('acquire', 36)"
+                },
+                {
+                  "event": "('command_issue', 77)"
+                },
+                {
+                  "event": "('acquire', 38)"
+                },
+                {
+                  "event": "('payload', 7, 'I')"
+                }
+              ],
+              "present_before_physical_allocation": true
+            },
+            {
+              "source": {
+                "index": 6,
+                "operation": "buffer.load",
+                "pipe": "PipeType.MTE2",
+                "coordinates": {
+                  "visits": 3,
+                  "execute_child": true,
+                  "visit": 0,
+                  "k": 0,
+                  "opaque_address": 0
+                }
+              },
+              "target": {
+                "index": 10,
+                "operation": "buffer.load",
+                "pipe": "PipeType.MTE2",
+                "coordinates": {
+                  "visits": 3,
+                  "execute_child": true,
+                  "visit": 0,
+                  "k": 1,
+                  "opaque_address": 0
+                }
+              },
+              "path": [
+                {
+                  "event": "('payload', 6, 'C')"
+                },
+                {
+                  "event": "('publish', 52)",
+                  "record": "sync_parent_completion_27"
+                },
+                {
+                  "event": "('acquire', 52)"
+                },
+                {
+                  "event": "('command_issue', 107)"
+                },
+                {
+                  "event": "('acquire', 53)"
+                },
+                {
+                  "event": "('payload', 10, 'I')"
+                }
+              ],
+              "present_before_physical_allocation": true
+            }
+          ],
+          "required": 1861,
+          "old_excess": 74,
+          "new_excess": 41,
+          "old_executed_set": 252,
+          "new_executed_set": 165,
+          "old_executed_wait": 252,
+          "new_executed_wait": 165,
+          "old_executed_barrier": 64,
+          "new_executed_barrier": 28,
+          "new_directional_ids": {
+            "(PipeType.MTE1, PipeType.MTE2)": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "(PipeType.MTE2, PipeType.MTE1)": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "(PipeType.FIX, PipeType.MTE2)": [
+              0,
+              1
+            ],
+            "(PipeType.MTE2, PipeType.FIX)": [
+              0,
+              1
+            ],
+            "(PipeType.M, PipeType.MTE1)": [
+              0,
+              1,
+              2
+            ],
+            "(PipeType.MTE1, PipeType.M)": [
+              0,
+              1,
+              2
+            ],
+            "(PipeType.FIX, PipeType.M)": [
+              0,
+              1
+            ],
+            "(PipeType.M, PipeType.FIX)": [
+              0,
+              1
+            ],
+            "(PipeType.MTE2, PipeType.M)": [
+              0,
+              1
+            ],
+            "(PipeType.M, PipeType.MTE2)": [
+              0,
+              1
+            ]
+          }
+        },
+        "static_child_scaling": [
+          {
+            "children": 1,
+            "source_nodes": 27,
+            "analysis_seconds": 0.0005361898802220821,
+            "interfaces": [
+              {
+                "analyzed_occurrences": 15,
+                "binding_definitions": 5,
+                "projected_external_roots": 2,
+                "query_scope_nodes": 9,
+                "retained_cells": 5,
+                "retained_regions": 1,
+                "shared_index_source_nodes": 27,
+                "unavailable_storage_domains": 1
+              }
+            ]
+          },
+          {
+            "children": 2,
+            "source_nodes": 36,
+            "analysis_seconds": 0.0009331009350717068,
+            "interfaces": [
+              {
+                "analyzed_occurrences": 15,
+                "binding_definitions": 5,
+                "projected_external_roots": 2,
+                "query_scope_nodes": 9,
+                "retained_cells": 5,
+                "retained_regions": 1,
+                "shared_index_source_nodes": 36,
+                "unavailable_storage_domains": 1
+              },
+              {
+                "analyzed_occurrences": 15,
+                "binding_definitions": 5,
+                "projected_external_roots": 2,
+                "query_scope_nodes": 9,
+                "retained_cells": 5,
+                "retained_regions": 1,
+                "shared_index_source_nodes": 36,
+                "unavailable_storage_domains": 1
+              }
+            ]
+          },
+          {
+            "children": 4,
+            "source_nodes": 54,
+            "analysis_seconds": 0.0016960077919065952,
+            "interfaces": [
+              {
+                "analyzed_occurrences": 15,
+                "binding_definitions": 5,
+                "projected_external_roots": 2,
+                "query_scope_nodes": 9,
+                "retained_cells": 5,
+                "retained_regions": 1,
+                "shared_index_source_nodes": 54,
+                "unavailable_storage_domains": 1
+              },
+              {
+                "analyzed_occurrences": 15,
+                "binding_definitions": 5,
+                "projected_external_roots": 2,
+                "query_scope_nodes": 9,
+                "retained_cells": 5,
+                "retained_regions": 1,
+                "shared_index_source_nodes": 54,
+                "unavailable_storage_domains": 1
+              },
+              {
+                "analyzed_occurrences": 15,
+                "binding_definitions": 5,
+                "projected_external_roots": 2,
+                "query_scope_nodes": 9,
+                "retained_cells": 5,
+                "retained_regions": 1,
+                "shared_index_source_nodes": 54,
+                "unavailable_storage_domains": 1
+              },
+              {
+                "analyzed_occurrences": 15,
+                "binding_definitions": 5,
+                "projected_external_roots": 2,
+                "query_scope_nodes": 9,
+                "retained_cells": 5,
+                "retained_regions": 1,
+                "shared_index_source_nodes": 54,
+                "unavailable_storage_domains": 1
+              }
+            ]
+          },
+          {
+            "children": 8,
+            "source_nodes": 90,
+            "analysis_seconds": 0.0032559987157583237,
+            "interfaces": [
+              {
+                "analyzed_occurrences": 15,
+                "binding_definitions": 5,
+                "projected_external_roots": 2,
+                "query_scope_nodes": 9,
+                "retained_cells": 5,
+                "retained_regions": 1,
+                "shared_index_source_nodes": 90,
+                "unavailable_storage_domains": 1
+              },
+              {
+                "analyzed_occurrences": 15,
+                "binding_definitions": 5,
+                "projected_external_roots": 2,
+                "query_scope_nodes": 9,
+                "retained_cells": 5,
+                "retained_regions": 1,
+                "shared_index_source_nodes": 90,
+                "unavailable_storage_domains": 1
+              },
+              {
+                "analyzed_occurrences": 15,
+                "binding_definitions": 5,
+                "projected_external_roots": 2,
+                "query_scope_nodes": 9,
+                "retained_cells": 5,
+                "retained_regions": 1,
+                "shared_index_source_nodes": 90,
+                "unavailable_storage_domains": 1
+              },
+              {
+                "analyzed_occurrences": 15,
+                "binding_definitions": 5,
+                "projected_external_roots": 2,
+                "query_scope_nodes": 9,
+                "retained_cells": 5,
+                "retained_regions": 1,
+                "shared_index_source_nodes": 90,
+                "unavailable_storage_domains": 1
+              },
+              {
+                "analyzed_occurrences": 15,
+                "binding_definitions": 5,
+                "projected_external_roots": 2,
+                "query_scope_nodes": 9,
+                "retained_cells": 5,
+                "retained_regions": 1,
+                "shared_index_source_nodes": 90,
+                "unavailable_storage_domains": 1
+              },
+              {
+                "analyzed_occurrences": 15,
+                "binding_definitions": 5,
+                "projected_external_roots": 2,
+                "query_scope_nodes": 9,
+                "retained_cells": 5,
+                "retained_regions": 1,
+                "shared_index_source_nodes": 90,
+                "unavailable_storage_domains": 1
+              },
+              {
+                "analyzed_occurrences": 15,
+                "binding_definitions": 5,
+                "projected_external_roots": 2,
+                "query_scope_nodes": 9,
+                "retained_cells": 5,
+                "retained_regions": 1,
+                "shared_index_source_nodes": 90,
+                "unavailable_storage_domains": 1
+              },
+              {
+                "analyzed_occurrences": 15,
+                "binding_definitions": 5,
+                "projected_external_roots": 2,
+                "query_scope_nodes": 9,
+                "retained_cells": 5,
+                "retained_regions": 1,
+                "shared_index_source_nodes": 90,
+                "unavailable_storage_domains": 1
+              }
+            ]
+          }
+        ],
+        "scaling": [
+          {
+            "K": 0,
+            "analyzed_occurrences": 15,
+            "binding_definitions": 5,
+            "projected_external_roots": 2,
+            "query_scope_nodes": 9,
+            "retained_cells": 5,
+            "retained_regions": 1,
+            "shared_index_source_nodes": 26,
+            "unavailable_storage_domains": 1,
+            "analysis_seconds": 0.0008290410041809082,
+            "baseline_static_commands": {
+              "set": 44,
+              "wait": 44,
+              "barrier": 12
+            },
+            "candidate_static_commands": {
+              "set": 40,
+              "wait": 40,
+              "barrier": 10
+            }
+          },
+          {
+            "K": 1,
+            "analyzed_occurrences": 15,
+            "binding_definitions": 5,
+            "projected_external_roots": 2,
+            "query_scope_nodes": 9,
+            "retained_cells": 5,
+            "retained_regions": 1,
+            "shared_index_source_nodes": 26,
+            "unavailable_storage_domains": 1,
+            "analysis_seconds": 0.0006877053529024124,
+            "baseline_static_commands": {
+              "set": 44,
+              "wait": 44,
+              "barrier": 12
+            },
+            "candidate_static_commands": {
+              "set": 43,
+              "wait": 43,
+              "barrier": 10
+            }
+          },
+          {
+            "K": 3,
+            "analyzed_occurrences": 15,
+            "binding_definitions": 5,
+            "projected_external_roots": 2,
+            "query_scope_nodes": 9,
+            "retained_cells": 5,
+            "retained_regions": 1,
+            "shared_index_source_nodes": 26,
+            "unavailable_storage_domains": 1,
+            "analysis_seconds": 0.0007441961206495762,
+            "baseline_static_commands": {
+              "set": 44,
+              "wait": 44,
+              "barrier": 12
+            },
+            "candidate_static_commands": {
+              "set": 46,
+              "wait": 46,
+              "barrier": 10
+            },
+            "source_generation_seconds": 0.10525518096983433,
+            "generated_pto_sha256": "238820930d42ea97c8ca8c9e8e55f685a3720a5db893efb719791245b6c3da9a",
+            "generated_cpp_sha256": "e38cd56b559288a3524338ad15b44a9c83c06a832442bd12430d29257cf0bf7b"
+          },
+          {
+            "K": 2,
+            "analyzed_occurrences": 15,
+            "binding_definitions": 5,
+            "projected_external_roots": 2,
+            "query_scope_nodes": 9,
+            "retained_cells": 5,
+            "retained_regions": 1,
+            "shared_index_source_nodes": 26,
+            "unavailable_storage_domains": 1,
+            "analysis_seconds": 0.0006938199512660503
+          },
+          {
+            "K": 17,
+            "analyzed_occurrences": 15,
+            "binding_definitions": 5,
+            "projected_external_roots": 2,
+            "query_scope_nodes": 9,
+            "retained_cells": 5,
+            "retained_regions": 1,
+            "shared_index_source_nodes": 26,
+            "unavailable_storage_domains": 1,
+            "analysis_seconds": 0.0005631442181766033
+          },
+          {
+            "K": 1023,
+            "analyzed_occurrences": 15,
+            "binding_definitions": 5,
+            "projected_external_roots": 2,
+            "query_scope_nodes": 9,
+            "retained_cells": 5,
+            "retained_regions": 1,
+            "shared_index_source_nodes": 26,
+            "unavailable_storage_domains": 1,
+            "analysis_seconds": 0.0005458001978695393
+          },
+          {
+            "K": 1000000,
+            "analyzed_occurrences": 15,
+            "binding_definitions": 5,
+            "projected_external_roots": 2,
+            "query_scope_nodes": 9,
+            "retained_cells": 5,
+            "retained_regions": 1,
+            "shared_index_source_nodes": 26,
+            "unavailable_storage_domains": 1,
+            "analysis_seconds": 0.0005405950360000134
+          }
+        ]
+      }
+    },
+    "final_production_stages": {
+      "path": "build-py314/eventful-child-20261115/postformat-stages/receipt.json",
+      "sha256": "376b3e018b94d0994daf8aa2ab0bd5d727dbb3f383edba927592482055125e37",
+      "result": {
+        "stages": {
+          "regional_preparation": {
+            "status": "ready",
+            "seconds": 0.0030623702332377434,
+            "retained": {
+              "analyzed_occurrences": 40,
+              "binding_definitions": 14,
+              "projected_external_roots": 2,
+              "query_scope_nodes": 29,
+              "retained_cells": 13,
+              "retained_regions": 3,
+              "shared_index_source_nodes": 62,
+              "unavailable_storage_domains": 1
+            }
+          },
+          "logical_composition": {
+            "status": "ready",
+            "seconds": 0.002397622913122177
+          },
+          "physical_realization": {
+            "status": "ready",
+            "seconds": 0.007224449887871742
+          },
+          "cpp_generation": {
+            "status": "ready",
+            "seconds": 0.13479438377544284,
+            "sha256": "4429f4464aaa99805009a3716cba3c5aa65fa6da22342fff1c74c1bbe0340218"
+          }
+        },
+        "physical_shape_metadata": [
+          {
+            "name": "LAYER_INTER_ROWS_DYN",
+            "original_formal_dimensions": [
+              [
+                2,
+                0
+              ]
+            ]
+          }
+        ],
+        "input_sha256": "e7eea4f1e67d9ca3abb98ebfed3c968d311bedadef006f6816bb57b857bfc1bc",
+        "device": "not run"
+      }
+    },
+    "final_prefix_census": {
+      "path": "build-py314/milestone-loop-20261115/postformat-qwen-prefix/receipt.json",
+      "sha256": "1bbd2197ca49f16475c1b5df2e822bb325a2b376931843d3dea87cc6972fde76",
+      "result": {
+        "compile_seconds_inclusive": 6.552353736944497,
+        "cpp_leaves": 32,
+        "owned_leaves": 16,
+        "owned_functions": [
+          "attention_finalize_phase",
+          "down_proj",
+          "final_rmsnorm",
+          "gate_up_proj",
+          "kv_proj",
+          "mlp_out_cast",
+          "mlp_out_cast_0",
+          "mlp_out_seed",
+          "out_proj_aic",
+          "q_proj",
+          "qk_pv_partial_merge",
+          "save_prefill_last_token_group",
+          "save_prefill_last_token_single",
+          "silu",
+          "x_gamma",
+          "x_gamma_0"
+        ],
+        "delegated_leaves": 16,
+        "matrix_scope": "Complete per-leaf routes, precise first refusals and strict-name gates remain in the pinned raw receipt."
+      }
+    },
+    "final_exact_census": {
+      "path": "build-py314/milestone-loop-20261115/postformat-qwen-exact/receipt.json",
+      "sha256": "8bfc24dc0d738b32b8c58a7c59048d2f6e7d3103e9855b7812583a69772d4c96",
+      "result": {
+        "compile_seconds_inclusive": 6.70510643767193,
+        "cpp_leaves": 32,
+        "owned_leaves": 3,
+        "owned_functions": [
+          "final_rmsnorm",
+          "mlp_out_seed",
+          "silu"
+        ],
+        "delegated_leaves": 29,
+        "matrix_scope": "Complete per-leaf routes, precise first refusals and strict-name gates remain in the pinned raw receipt."
+      }
+    }
+  },
+  "watchdog": {
+    "seconds": 120,
+    "memory_limit_mib": 2048,
+    "combined_exhaustive_request": {
+      "exit_code": 124,
+      "log": "build-py314/milestone-loop-20261115/qwen-command-math-allocations.log",
+      "partial_result": "build-py314/eventful-child-20261115/qwen-command-math-allocations/completed-executions.json",
+      "note": "Block0 complete, block19 timed out. Individual exhaustive invocations are a separate audit configuration; not an all-pass rerun of this combined request."
+    }
+  },
+  "review": "Independent source/semantic gate accepted including original-scope inventory, unique physical descriptor mapping, actual covers and all event queries; no native/device claim",
+  "remaining": [
+    "Unavailable exact GM selectors",
+    "Mixed full/partial ADD and carrier domain semantics",
+    "Scalar GM visibility/readiness",
+    "Cross-core local completion, peer release and resource ownership",
+    "Arbitrary relational caller bounds and symbolic composition",
+    "Whole-model PyPTO ownership and device qualification"
+  ],
+  "source_snapshot": {
+    "base_revision": "32c472089cf8e29ab4cff24964cf79c5d03ecc32",
+    "dirty_sources_sha256": {
+      "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "75733b707e1a001e3c2d380f122832c089d31a8d651ddf6a66f65213a3efc51b",
+      "python/bindings/modules/testing.cpp": "0fb96bbaeafea235110c5aa71fc5988a4fc6061b97b493f55f3d0ba730b6361b",
+      "python/pypto/pypto_core/testing.pyi": "edda91229be5a3c83bba7ee72ef4171022e3e2d3e1b7d155edd6605c65da82fb",
+      "src/ir/transforms/utils/closed_prefix_sync.cpp": "9f62f769320fbf846d40f313bc36229c40d5707d6a018eb1f38aabd74a47e66d",
+      "src/ir/transforms/utils/compact_sync_analysis.cpp": "184e1e03fce7e07593b406d8acc87be14a5d5726b1e2e90998357a5b8ddae1ca",
+      "src/ir/transforms/utils/conservative_sync_dataflow.cpp": "1726f1bdd9e13df2b23c8215a4b5770152f9a1c4fb9c1ab024d0f133c5a3b60d",
+      "src/ir/transforms/utils/placed_sync_import.cpp": "67e1b2a1e52256c876dadd7522da131c5300136b29b3f791d296e6cb71f3c7f0",
+      "src/ir/transforms/utils/retained_sync_child.cpp": "93997400c111afb4e6e6b586ed442d0f84b2c83de18c8fcabed7562e9da25322",
+      "src/ir/transforms/utils/retained_sync_child.h": "82df5ad4fa8fb5cb53f633bb61938353398a205d55fcf4c7f194cc47e4405d1d",
+      "src/ir/transforms/utils/structured_token_sync.cpp": "133478b870d5b29e8df30d1fefae91407230e76e26d7f8d8f125f64148ffba95",
+      "src/ir/transforms/utils/sync_scalar_readiness.h": "76fcc4fe08b46a8dcfb142ff8e332eff5bb4eeea95a83f5a1a9c77862b723de9",
+      "src/ir/transforms/utils/token_sync_lowering.cpp": "e7aa216d50f89c158a3271ea44fab63a6638957ef9ae4b214a86f6c3de143856",
+      "src/ir/transforms/utils/token_sync_lowering.h": "c81929a81232aa7c9914ed0ad789546dd82f6fbaeec4623abbff9ea30a79ab46",
+      "tests/ut/ir/transforms/qualify_captured_child_commands.py": "8c1972eefee9741b0200b7b15b7cdc5c706be3ab146bcf425f0cfae80d035e47",
+      "tests/ut/ir/transforms/qualify_eventful_sync_children.py": "4f998c4f76742b87a8dd7f07e100436d38a21758d03899b58e2eb4db11daa125",
+      "tests/ut/ir/transforms/qualify_retained_sync_child.py": "bd4b6fb7a637229be7d66fdcccb638e4bb515ddb89b91b915f9d7a124bb166cf",
+      "tests/ut/ir/transforms/sync_closed_command_oracle.py": "1d6bfc2f9324196cc29cb6ba7cb6e12031104dcdbc360260f06ec40d720fc36f",
+      "tests/ut/ir/transforms/sync_matmul_oracle.py": "b44730abe973eba32bb8616f2666d563b816eb1167ff4366cdf38cccf02c0ebc",
+      "tests/ut/ir/transforms/test_eventful_sync_children.py": "23d61fe41f93fe3c8fe485026fd38e2ba816edbf3cd4bedb44a4699598955ae8"
+    },
+    "extension_sha256": {
+      "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "b22f38a1573bb7ce33cd85f35dedb9e1a2a109ef41c954f83089d62591acdac0"
+    },
+    "python_executable": "/usr/bin/python",
+    "python_version": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "runtime_submodule": "355ce3015e3e344d1fc3a61c206ee01823ce292c",
+    "native_pto_isa": "5487a6b0",
+    "build": "Linux Release; build-py314; cmake --build build-py314 --parallel 1"
+  },
+  "final_verification": {
+    "focused_tests": "267 passed in39.79s; retained children, compact/rotating/nested, conservative parents, explicit module ownership, rebuild and scoped actual-token order",
+    "focused_log": "build-py314/milestone-loop-20261115/readonly-final-tests.log",
+    "runtime_recheck": "60 passed in2.99s after the final rebuild",
+    "runtime_log": "build-py314/milestone-loop-20261115/postbuild-runtime.log",
+    "commands": [
+      {
+        "name": "postbuild-runtime",
+        "command": [
+          "timeout",
+          "--signal=TERM",
+          "120s",
+          "/usr/bin/python",
+          "-m",
+          "pytest",
+          "-q",
+          "--require-ptoas",
+          "--basetemp=build-py314/milestone-loop-20261115/postbuild-runtime-pytest",
+          "tests/ut/ir/transforms/test_runtime_valid_broadcast.py",
+          "tests/ut/ir/transforms/test_runtime_valid_cast.py",
+          "tests/ut/ir/transforms/test_runtime_valid_reduction_axis.py",
+          "tests/ut/ir/transforms/test_runtime_valid_metadata.py"
+        ],
+        "exit_code": 0,
+        "log": "build-py314/milestone-loop-20261115/postbuild-runtime.log"
+      },
+      {
+        "name": "postformat-commands",
+        "command": [
+          "timeout",
+          "--signal=TERM",
+          "120s",
+          "/usr/bin/python",
+          "-m",
+          "transforms.qualify_captured_child_commands",
+          "--input",
+          "build-py314/column-transfer-20261115/qwen-prefix/before-sync.msgpack",
+          "--function",
+          "down_proj",
+          "--scope",
+          "cb_inline1641__idx_v0",
+          "--parameters",
+          "{\"3\":0,\"4\":0}",
+          "--shape-values",
+          "{\"LAYER_INTER_ROWS_DYN\":34816}",
+          "--memory-limit-mib",
+          "2048",
+          "--block-index",
+          "0",
+          "--block-index",
+          "19",
+          "--output",
+          "build-py314/eventful-child-20261115/postformat-commands"
+        ],
+        "exit_code": 0,
+        "log": "build-py314/milestone-loop-20261115/postformat-commands.log"
+      },
+      {
+        "name": "postformat-math-0",
+        "command": [
+          "timeout",
+          "--signal=TERM",
+          "120s",
+          "/usr/bin/python",
+          "-m",
+          "transforms.qualify_captured_child_commands",
+          "--input",
+          "build-py314/column-transfer-20261115/qwen-prefix/before-sync.msgpack",
+          "--function",
+          "down_proj",
+          "--scope",
+          "cb_inline1641__idx_v0",
+          "--parameters",
+          "{\"3\":0,\"4\":0}",
+          "--shape-values",
+          "{\"LAYER_INTER_ROWS_DYN\":34816}",
+          "--memory-limit-mib",
+          "2048",
+          "--block-index",
+          "0",
+          "--check-retained",
+          "--output",
+          "build-py314/eventful-child-20261115/postformat-math-0"
+        ],
+        "exit_code": 0,
+        "log": "build-py314/milestone-loop-20261115/postformat-math-0.log"
+      },
+      {
+        "name": "postformat-math-19",
+        "command": [
+          "timeout",
+          "--signal=TERM",
+          "120s",
+          "/usr/bin/python",
+          "-m",
+          "transforms.qualify_captured_child_commands",
+          "--input",
+          "build-py314/column-transfer-20261115/qwen-prefix/before-sync.msgpack",
+          "--function",
+          "down_proj",
+          "--scope",
+          "cb_inline1641__idx_v0",
+          "--parameters",
+          "{\"3\":0,\"4\":0}",
+          "--shape-values",
+          "{\"LAYER_INTER_ROWS_DYN\":34816}",
+          "--memory-limit-mib",
+          "2048",
+          "--block-index",
+          "19",
+          "--check-retained",
+          "--output",
+          "build-py314/eventful-child-20261115/postformat-math-19"
+        ],
+        "exit_code": 0,
+        "log": "build-py314/milestone-loop-20261115/postformat-math-19.log"
+      },
+      {
+        "name": "postformat-generic",
+        "command": [
+          "timeout",
+          "--signal=TERM",
+          "120s",
+          "/usr/bin/python",
+          "-m",
+          "transforms.qualify_eventful_sync_children",
+          "--readonly-external",
+          "--output",
+          "build-py314/eventful-child-20261115/postformat-generic"
+        ],
+        "exit_code": 0,
+        "log": "build-py314/milestone-loop-20261115/postformat-generic.log"
+      },
+      {
+        "name": "postformat-stages",
+        "command": [
+          "timeout",
+          "--signal=TERM",
+          "120s",
+          "/usr/bin/python",
+          "-m",
+          "transforms.qualify_retained_sync_child",
+          "--input",
+          "build-py314/column-transfer-20261115/qwen-prefix/before-sync.msgpack",
+          "--function",
+          "down_proj",
+          "--scope",
+          "cb_inline1641__idx_v0",
+          "--output",
+          "build-py314/eventful-child-20261115/postformat-stages"
+        ],
+        "exit_code": 0,
+        "log": "build-py314/milestone-loop-20261115/postformat-stages.log"
+      },
+      {
+        "name": "postformat-qwen-prefix",
+        "command": [
+          "timeout",
+          "--signal=TERM",
+          "120s",
+          "/usr/bin/python",
+          "--library",
+          "/home/toni/work/pypto3/pypto-lib",
+          "--output",
+          "build-py314/milestone-loop-20261115/postformat-qwen-prefix",
+          "--layers",
+          "2",
+          "--policy",
+          "conservative_prefix",
+          "--require-function",
+          "down_proj",
+          "--require-function",
+          "gate_up_proj",
+          "--require-function",
+          "kv_proj",
+          "--require-function",
+          "mlp_out_cast",
+          "--require-function",
+          "mlp_out_cast_0",
+          "--require-function",
+          "mlp_out_seed",
+          "--require-function",
+          "out_proj_aic",
+          "--require-function",
+          "q_proj",
+          "--require-function",
+          "save_prefill_last_token_group",
+          "--require-function",
+          "save_prefill_last_token_single",
+          "--require-function",
+          "silu",
+          "--tool-artifact",
+          "build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas",
+          "--tool-artifact",
+          "build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so",
+          "--tool-artifact",
+          "build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so",
+          "--require-function",
+          "final_rmsnorm",
+          "--require-function",
+          "attention_finalize_phase",
+          "--require-function",
+          "qk_pv_partial_merge",
+          "--require-function",
+          "x_gamma",
+          "--require-function",
+          "x_gamma_0"
+        ],
+        "exit_code": 2,
+        "log": "build-py314/milestone-loop-20261115/postformat-qwen-prefix.log"
+      }
+    ],
+    "census_commands": [
+      {
+        "policy": "prefix",
+        "command": [
+          "timeout",
+          "--signal=TERM",
+          "120s",
+          "/usr/bin/python",
+          "-m",
+          "transforms.qualify_qwen_whole_model",
+          "--library",
+          "/home/toni/work/pypto3/pypto-lib",
+          "--output",
+          "build-py314/milestone-loop-20261115/postformat-qwen-prefix",
+          "--layers",
+          "2",
+          "--policy",
+          "conservative_prefix",
+          "--require-function",
+          "down_proj",
+          "--require-function",
+          "gate_up_proj",
+          "--require-function",
+          "kv_proj",
+          "--require-function",
+          "mlp_out_cast",
+          "--require-function",
+          "mlp_out_cast_0",
+          "--require-function",
+          "mlp_out_seed",
+          "--require-function",
+          "out_proj_aic",
+          "--require-function",
+          "q_proj",
+          "--require-function",
+          "save_prefill_last_token_group",
+          "--require-function",
+          "save_prefill_last_token_single",
+          "--require-function",
+          "silu",
+          "--tool-artifact",
+          "build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas",
+          "--tool-artifact",
+          "build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so",
+          "--tool-artifact",
+          "build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so",
+          "--require-function",
+          "final_rmsnorm",
+          "--require-function",
+          "attention_finalize_phase",
+          "--require-function",
+          "qk_pv_partial_merge",
+          "--require-function",
+          "x_gamma",
+          "--require-function",
+          "x_gamma_0"
+        ],
+        "exit_code": 0
+      },
+      {
+        "policy": "exact",
+        "command": [
+          "timeout",
+          "--signal=TERM",
+          "120s",
+          "/usr/bin/python",
+          "-m",
+          "transforms.qualify_qwen_whole_model",
+          "--library",
+          "/home/toni/work/pypto3/pypto-lib",
+          "--output",
+          "build-py314/milestone-loop-20261115/postformat-qwen-exact",
+          "--layers",
+          "2",
+          "--policy",
+          "exact",
+          "--require-function",
+          "silu",
+          "--require-function",
+          "mlp_out_seed",
+          "--tool-artifact",
+          "build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas",
+          "--tool-artifact",
+          "build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so",
+          "--tool-artifact",
+          "build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so",
+          "--require-function",
+          "final_rmsnorm"
+        ],
+        "exit_code": 0
+      }
+    ],
+    "census_invocation_errors": {
+      "logs": [
+        "build-py314/milestone-loop-20261115/postformat-qwen-prefix.log",
+        "build-py314/milestone-loop-20261115/postformat-qwen-prefix-corrected.log"
+      ],
+      "classification": "Audit invocation errors before compiler entry (missing module invocation); corrected with python -m transforms.qualify_qwen_whole_model. Not synchronization analysis failures."
+    },
+    "typing": {
+      "result": "Pinned full-project Pyright passed in a fresh serial process with2GiB Node heap. No ignored diagnostics, source changes or exclusions.",
+      "log": "build-py314/milestone-loop-20261115/readonly-pyright-serial.log",
+      "earlier_attempts": "One1GiB run reported3 unused imports in unchanged test_decorator.py (each directly used); another reached the artificial1GiB heap limit. Logs preserved. Unrelated source unchanged."
+    },
+    "device": "not run",
+    "configured_hooks": {
+      "result": "All configured hooks passed serially with2GiB Node heap, including full-project Pyright; no exclusions or suppressed diagnostics.",
+      "path": "build-py314/milestone-loop-20261115/readonly-accepted-hooks.log",
+      "sha256": "b1c12e7d7805d4a6b74a42dd137abc924281d6256d34ac7c9a3e90960e180640"
+    }
+  },
+  "alias_contracts": {
+    "child": "All explicit/implicit DDR effects read-only; no GM disjointness assumed; parent retains sound DDR enclosures",
+    "prefix_census": "Whole-memory-space conservative effects; no GM disjointness",
+    "exact_census": "Explicit caller promise: distinct input GM arguments disjoint; physical local aliases still modeled",
+    "bounded_qwen": "Finite explicit disjoint ABI layouts; generic fixture separately exercises aliased input roots and overlapping parent GM writes"
+  }
+}

@@ -432,7 +432,10 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
                             ? std::optional<SyncRegionBindings>{}
                             : std::optional<SyncRegionBindings>{std::in_place, function, target};
   for (const auto& child : discovered.children) {
-    auto context = bindings->Bind(child);
+    const auto external_policy = HasReadonlyExternalSyncEffects(child, function->func_type_, target)
+                                     ? SyncExternalPolicy::ReadOnlyProjection
+                                     : SyncExternalPolicy::Geometry;
+    auto context = bindings->Bind(child, external_policy);
     CheckLogicalSync(context.binding_owner);
     NativeOperations child_native(function->func_type_, target);
     child_native.VisitFunction(context.binding_owner);
@@ -503,7 +506,7 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     auto actual = replace.VisitFunction(context.binding_owner);
     std::optional<std::vector<int>> private_ids;
     if (intersection) private_ids = std::vector<int>(intersection->begin(), intersection->end());
-    auto lowered = LowerLogicalSync(actual, target, private_ids);
+    auto lowered = LowerLogicalSync(actual, target, private_ids, {}, std::nullopt, {}, external_policy);
     const auto original_body = As<SeqStmts>(actual->body_);
     const auto lowered_body = As<SeqStmts>(lowered.function->body_);
     INTERNAL_CHECK(original_body && lowered_body) << "Internal error: child binding body is not a sequence";

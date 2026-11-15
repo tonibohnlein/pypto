@@ -49,6 +49,7 @@ std::vector<Atom> Partition(const CompactSyncInput& input) {
         if (access.write) writes.at(access.storage).push_back(&access);
   for (size_t s = 0; s < input.storage.size(); ++s) {
     const auto& storage = input.storage[s];
+    if (!storage.boundary_available) continue;
     // Complete row-sweep partition: only writers active in a row band split
     // its columns. Keep holes and read-only domains covered. Global Cartesian
     // cuts would create quadratic empty cells even for disjoint diagonal writes.
@@ -470,6 +471,8 @@ std::optional<PointBoundary> CompactSyncView::BoundarySlot(size_t storage, int64
       slot >= State().input.storage[storage].slot_count)
     return std::nullopt;
   const auto& domain = State().input.storage[storage];
+  if (!domain.boundary_available || State().input.unavailable_storage_spaces.count(domain.space))
+    return std::nullopt;
   if (domain.row_extent_parameter) {
     const auto parameter = *domain.row_extent_parameter;
     auto value = parameters.find(parameter);
@@ -540,6 +543,10 @@ std::optional<PointBoundary> CompactSyncView::BoundarySlot(size_t storage, int64
 }
 std::optional<PointBoundary> CompactSyncView::RelativeBoundary(size_t storage, int64_t row, int64_t column,
                                                                std::optional<size_t> leaf) const {
+  if (storage < State().input.storage.size() &&
+      (!State().input.storage[storage].boundary_available ||
+       State().input.unavailable_storage_spaces.count(State().input.storage[storage].space)))
+    return std::nullopt;
   if (storage >= State().input.storage.size() || row < 0 || column < 0 ||
       row >= State().input.storage[storage].rows || column >= State().input.storage[storage].columns)
     return std::nullopt;
@@ -592,6 +599,9 @@ std::optional<PointBoundary> CompactSyncView::RelativeBoundary(size_t storage, i
 PointBoundary CompactSyncView::LeafBoundary(size_t region, size_t storage, int64_t row,
                                             int64_t column) const {
   CHECK(region < State().segments.size()) << "Invalid compact leaf";
+  CHECK(storage < State().input.storage.size() && State().input.storage[storage].boundary_available &&
+        !State().input.unavailable_storage_spaces.count(State().input.storage[storage].space))
+      << "Leaf storage selector unavailable for this storage domain";
   for (const auto& site : State().input.segments[region].sites)
     for (const auto& access : site.accesses)
       CHECK(access.storage != storage ||
