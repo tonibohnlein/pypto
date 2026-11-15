@@ -1,5 +1,10 @@
 # General autosync integration: architecture and Qwen acceptance plan
 
+Current priority (2026-11-16): external review identifies four blocking defects.
+Complete repair gates R1–R4 below before resuming the paused coverage packages.
+Earlier accepted gates and test receipts are historical evidence, not a current
+merge-readiness claim.
+
 Status: the continued operation, ownership and retained-child gates are reviewed.
 The original six milestones and whole-model ownership remain **partially complete**:
 missing native and value-domain premises are not inferred from a passing capture.
@@ -15,6 +20,159 @@ Baseline: `b5597650a75b598645b1b1d3fe05bd3aab220f09`. This extends the
 the acceptance target, not a source of kernel-specific admission rules. Autosync
 remains default-off; the producer policy defaults to `exact`. Choosing
 `conservative_prefix` explicitly does not enable autosync or establish ownership.
+
+## Revised execution order after external review (2026-11-16)
+
+The original goal and M1–M6 remain in force: implement reusable synchronization
+services and qualify the unchanged Qwen model, preserving exact analysis where
+its premises hold. The repairs below are prerequisites, not a replacement goal
+or evidence that the remaining milestones are complete. Cross-core and
+inter-kernel synchronization construction remain excluded. Preserve their
+existing manual/runtime/compiler owners and qualify only local boundaries.
+
+The external review covers `bef68ac84` through `ef3572fd2`. Inspection of the
+current sources supports its four reported defect mechanisms; this plan update
+does not claim a fresh reproduction or adopt its aggregated test counts as our
+own green run. HEAD is `3521d7f64`; the subsequent active-domain, scalar-payload
+and effective-coordinate edits are **paused, uncommitted and unqualified**.
+Keep those edits intact and separately owned while repairing the reviewed base.
+Do not run the interrupted milestone build or resume coverage work implicitly.
+
+| Order | Repair gate | Required result before advancing |
+| ----- | ----------- | -------------------------------- |
+| R1 | Closed-prefix recognition and complete token elimination | DAG-safe preflight; valid completed-token aliases either lower completely or receive a transactional capability refusal; no residual logical operations or token-typed IR in any successful physical result |
+| R2 | Shared native placement legality | Exact, conservative and actual-token ownership paths agree on operand/workspace legality, including supplied placed Buffer IR |
+| R3 | Static row descriptors on promoted allocations | Preserve proved static extents at each row-operation use, or refuse during selection before Buffer mutation; all three planners covered |
+| R4 | Fresh regression and scaling gate | Correct stale expectations without weakening semantic negatives; record one fresh green focused run; separately attribute nested physical-realization growth |
+| Then | Resume original M2/M3 and M5 work | Rebase the paused edits on accepted repairs; operation/readiness and symbolic-coordinate constructions retain their original proof obligations |
+| Finally | Complete M4 and M6 acceptance | Recheck retained children, local manual-boundary refusals, whole-model local ownership and matching/reuse under the same completion policy |
+
+Each repair follows **implementation → independent review → accepted commit**.
+Dependent work waits for acceptance. A failed gate is repaired and reviewed
+again. Keep default dispatch, allocation algorithms, six-ID eligibility, scalar
+native order, qualified accumulator exemptions, expert protocols, compact K/
+replay and zero-inner-body behavior unchanged. No larger limits or watchdogs.
+
+### R1 — Closed-prefix lowering must preserve valid IR and bounded discovery
+
+Owner: `closed_prefix_sync.cpp` discovery/emission and the existing public
+lowering/ownership boundary in `token_sync_lowering.cpp` and `token_sync.cpp`.
+
+Before: a depth-D shared expression `t = join(t, t)` is recursively revisited
+through both references; an unrelated input can pay this cost before the prefix
+recognizer declines it. An unused `alias = completed_token` can survive after
+its definition is erased, leaving a free token variable in an owned function.
+
+After: memoize context-independent expression inspection by original identity,
+or decline unsupported syntax before traversing it. Keep statement occurrences,
+ordered cuts, frames and uses separate: a shared expression is not permission to
+deduplicate two executed commands. Resolve supported pure-token aliases as part
+of lowering, including unused completed facts. Unsupported alias/control forms
+must decline before mutation; no optimizer prepass is a hidden requirement.
+
+Require a shared final postcondition on every successful physical lowering and
+ownership publication: no logical operators, token-valued expressions/bindings,
+token carries or token-bearing signatures remain. These are logical-sync
+operations and `SyncTokenType` values; ordinary runtime TaskIds retain their
+separate meaning and owner. Reuse the verifier/type walk;
+memoize shared expressions/types without skipping occurrence checks. Unsupported
+input remains a capability refusal; invalid output from an accepted lowering is
+a compiler failure and cannot receive an ownership marker.
+
+Acceptance: restore the existing 28-join public regression; vary distinct DAG
+nodes independently of uses and count distinct traversal work, with timing only
+descriptive. Cover command-only and payload-bearing services, completed alias
+chains, unused tokens, branch/carry/capture boundaries, OptimizeSync on/off and
+serialization. Check output SSA, token elimination, payload order, matching,
+acyclicity, consuming reuse and PTOAS generation on accepted cases. Preserve
+actual-token semantics, including deliberately stronger waits.
+
+### R2 — Native workspace legality is independent of synchronization policy
+
+Owner: the existing shared selected-native contract and placement/view evidence;
+clients include `placed_sync_import.cpp`, `conservative_sync_dataflow.cpp` and
+closed-prefix/native qualification. Factor the existing exact check rather than
+maintaining a second policy-specific interpretation or a new registry.
+
+Example: a row broadcast with an explicit operand at 184 KiB overlaps its
+selected native staging workspace `[184 KiB,192 KiB)`. Adding barriers between
+calls cannot make the instruction's internal overwrite-before-read safe.
+
+Retain static instruction selection separately from placement qualification.
+After local allocation/view facts are available, prove separation for every
+explicit data operand against the selected variant's implicit workspace. Reuse
+indexed local alias, stride/slot and enclosing-coordinate evidence; account for
+all admitted positions with checked byte arithmetic. A hull intersecting scratch is
+unproved unless stronger existing evidence establishes separation. An existing
+allocator reservation may supply the proof only within its enforced scope.
+This check must not require exact GM selectors or declare an uncertain GM
+location empty. Implicit effects remain in cross-call hazard analysis as well.
+
+Acceptance: extend `independent_broadcasts(..., operand_alias=True)` through exact
+and conservative analysis, public InsertSync/LowerSync and enabled RealizeSync.
+Include aliases/views, workspace edges, read and write operands, legal disjoint
+controls, reserved-placement evidence and unavailable local bounds. Refusals
+preserve original IR and publish no commands/claims/ownership. Direct actual-token
+lowering cannot bypass native legality by skipping storage-demand extraction.
+
+### R3 — Preserve static row-operation descriptors at their original uses
+
+Owner: `buffer_valid_analysis.h`, shared row recipes and
+`lower_tile_to_buffer_pass.cpp`, reusing the static-cast descriptor bridge.
+
+Example: `source` has physical `[8,32]` and static valid `[8,16]`; another alias
+sets valid columns to runtime `width`. A later row sum on `source` still requests
+its original `[8,16]`, even though the shared allocation handle became dynamic.
+Restore the logical alias's metadata and supply an independently owned static
+descriptor window at that use. Preserve physical address/pitch, reduction axis,
+scratch effects, output extent and ordering. Metadata restoration does not
+restore bytes overwritten through another alias. Do not widen to 32 columns,
+assume dynamic `width` equals 16 or remove runtime metadata checks.
+Restore every affected operand/output/scratch metadata object as required by
+its use, preserve zero-extent guards and qualify descriptor ownership under the
+selected planner, including alias/borrowed-view restrictions.
+
+If the bridge cannot establish the selected native contract, reject during
+SelectBufferIRFunctions and preserve the original Functional body. Selection
+success must not defer a known descriptor incompatibility into lowering failure.
+
+Acceptance: partial/full static columns with a dynamic alias, alias use before
+and after the row operation, reductions and broadcasts, changing rows/columns,
+scratch reuse and invalid/unproved metadata. Run PYPTO, DSA_RP and PTOAS planners,
+plus Buffer-disabled controls. Check native descriptors, physical access
+agreement, original values and guards, and conservative/exact policies where
+applicable. Keep genuinely dynamic full-column requirements intact.
+
+### R4 — Restore a fresh gate and diagnose nested physical cost separately
+
+Update the reported stale tests at their actual changed boundary: diagnostic
+text, newly admitted packed columns and descriptor construction versus use-site
+qualification. Preserve function-level negatives for unrelated runtime metadata;
+construction success is not execution evidence. Do not xfail, skip or loosen a
+semantic assertion merely to produce a passing count.
+
+Run the affected modules and established focused gate serially, with pinned
+dirty-source/tool hashes and retained failure logs. Report fresh runs separately
+from the external review's aggregated 2,354 passes and 12 stale failures. Repeat
+real PTOAS ownership/final-drain and debug-rebuild checks; no device claim.
+
+Independently isolate nested physical realization using the same logical tokens
+and assignment policy. Vary static nesting depth with payload sites/trip counts
+controlled; record stage times, retained size, distinct expression/statement
+visits, resolver steps, query/cache work and emitted command count. Avoid the
+exhaustive execution oracle in the cost probe. The review did not establish this
+slowdown as a regression, so do not attribute it to R1 without evidence. If
+superlinear repeated work is confirmed, repair its owning service under a
+separate reviewed change, preserving the protocol and allocation algorithm.
+Record any watchdog refusal; increasing it cannot satisfy the scaling gate.
+
+Passing R1–R4 makes the reviewed base suitable for continuing M2–M6; it does not
+extend regional capabilities beyond their qualified interfaces, qualify scalar GM
+visibility, prove missing caller relations or make delegated local leaves owned.
+Any additional common-completion construction retains M3's separate design
+subgate only if needed; these repairs do not add it as a mandatory new algorithm.
+Resume and test the paused active-domain, blocking-scalar and effective-coordinate
+packages against the repaired base before their individual reviewer gates.
 
 ## Evidence and scope
 
