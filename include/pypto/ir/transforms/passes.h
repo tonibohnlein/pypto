@@ -24,6 +24,9 @@
 
 namespace pypto {
 namespace ir {
+namespace sync {
+class NativeSyncChild;
+}  // namespace sync
 
 /**
  * @brief Internal base class for pass implementations
@@ -324,7 +327,9 @@ Pass LowerTileToBuffer();
 
 /// Insert logical completion tokens for qualified placed Buffer demands.
 /// Strict standalone stage: unsupported exports raise without modifying input.
-Pass InsertSync();
+/// Accepted child evidence is immutable and bound to original functions in the
+/// supplied program. It is consumed only under the explicit conservative policy.
+Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accepted_children = {});
 
 /// Verify logical completion IR; initially an identity optimization stage.
 Pass OptimizeSync();

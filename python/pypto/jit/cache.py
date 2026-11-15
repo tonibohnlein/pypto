@@ -145,11 +145,14 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
     enable_software_pipeline: bool = False,
     enable_pypto_autosync: bool = False,
     autosync_disjoint_gm: bool = False,
+    autosync_policy: str = "exact",
 ) -> CacheKey:
     """Build a cache key for a JIT call site.
 
     Args:
         source_hash: Hash of captured source dependencies, including folded constants.
+        autosync_policy: Logical producer selected by the active PassContext.
+            Exact and conservative_prefix requests must not share artifacts.
         param_names: Ordered list of all parameter names (preserves arg order).
         tensor_shapes: Concrete shape per tensor parameter name.
         tensor_dtypes: DataType per tensor parameter name.
@@ -255,6 +258,7 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
         ("enable_software_pipeline", enable_software_pipeline),
         ("enable_pypto_autosync", enable_pypto_autosync),
         ("autosync_disjoint_gm", autosync_disjoint_gm),
+        ("autosync_policy", autosync_policy),
     )
     return CacheKey(
         source_hash,

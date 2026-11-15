@@ -49,6 +49,11 @@ Occurrence Target(const Family& f, int64_t ordinal) { return Endpoint(f, ordinal
 // Resource binding uses the same selected implementation as access import.
 // Each distinct immutable call is resolved once, including continuation arms;
 // do not deduplicate by macro alone because overload/core claims can differ.
+void ReserveNativeClaims(const backend::BufferSyncImplementation& implementation,
+                         SyncNativeReservations& claimed) {
+  for (const auto& claim : implementation.Claims())
+    for (auto id : claim.ids) claimed[{claim.pool.src, claim.pool.dst}].insert(static_cast<int>(id));
+}
 std::map<Direction, std::set<int>> NativeClaims(const CompactSyncInput& a, const std::string& target) {
   CHECK(a.hardware_target == target) << "Synchronization hardware contract differs from lowering target";
   backend::RequireLocalSyncExecutionContract(target);
@@ -62,8 +67,7 @@ std::map<Direction, std::set<int>> NativeClaims(const CompactSyncInput& a, const
         const auto implementation =
             backend::SelectBufferSyncImplementation(call, a.owner->func_type_, target);
         INTERNAL_CHECK(implementation.Pipe() == site.pipe) << "Native binding differs from imported pipe";
-        for (const auto& claim : implementation.Claims())
-          for (auto id : claim.ids) claimed[{claim.pool.src, claim.pool.dst}].insert(static_cast<int>(id));
+        ReserveNativeClaims(implementation, claimed);
       }
     }
   }
@@ -382,15 +386,34 @@ SyncDirection SyncFamilyPipes(const CompactSyncInput& a, const Family& f) {
 SyncNativeReservations SyncNativeClaims(const CompactSyncInput& input, const std::string& target) {
   return NativeClaims(input, target);
 }
+SyncNativeReservations SyncNativeClaims(const FunctionPtr& owner, const std::vector<CallPtr>& calls,
+                                        const std::string& target) {
+  backend::RequireLocalSyncExecutionContract(target);
+  SyncNativeReservations claimed;
+  std::set<const Call*> checked;
+  for (const auto& call : calls) {
+    if (!checked.insert(call.get()).second) continue;
+    const auto operation = backend::QualifyBufferSyncOperation(call, owner->func_type_, target);
+    ReserveNativeClaims(operation.Implementation(), claimed);
+  }
+  return claimed;
+}
 std::vector<int> SyncEligibleIds(const CompactSyncInput& input, const std::string& target,
                                  SyncDirection direction, const std::optional<std::vector<int>>& restricted,
+                                 const SyncNativeReservations& claimed) {
+  CHECK(input.hardware_target == target) << "Synchronization hardware contract differs from lowering target";
+  return SyncEligibleIds(input.owner, target, direction, restricted, claimed);
+}
+std::vector<int> SyncEligibleIds(const FunctionPtr& owner, const std::string& target, SyncDirection direction,
+                                 const std::optional<std::vector<int>>& restricted,
                                  const SyncNativeReservations& claimed) {
   using pypto::sync::CoreScope;
   using pypto::sync::ResourceKind;
   const auto* catalog = pypto::sync::FindResourceCatalog(target);
   CHECK(catalog) << "Unavailable synchronization resource catalog: " << target;
-  CHECK(input.hardware_target == target) << "Synchronization hardware contract differs from lowering target";
-  const auto core = input.owner->func_type_ == FunctionType::AIV ? CoreScope::AIV : CoreScope::AIC;
+  CHECK(owner && (owner->func_type_ == FunctionType::AIV || owner->func_type_ == FunctionType::AIC))
+      << "Directional resources require a qualified AIC/AIV owner";
+  const auto core = owner->func_type_ == FunctionType::AIV ? CoreScope::AIV : CoreScope::AIC;
   auto spec = catalog->FindPool({ResourceKind::PipelineEvent, core, direction.first, direction.second});
   CHECK(spec) << "Unavailable directional event pool";
   auto legal = spec->legal_ids;

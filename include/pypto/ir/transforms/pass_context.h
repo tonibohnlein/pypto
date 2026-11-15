@@ -311,6 +311,9 @@ class PassContext {
    * @param enable_software_pipeline Lower eligible pipeline loops to rotating
    *        slots with explicit prefetch (default: false). Requires PyPTO memory
    *        planning and the tile IR pipeline.
+   * @param autosync_policy Logical synchronization producer: "exact" (default)
+   *        or the explicitly conservative "conservative_prefix" construction.
+   *        This does not enable automatic synchronization or claim ownership.
    */
   explicit PassContext(std::vector<PassInstrumentPtr> instruments,
                        VerificationLevel verification_level = VerificationLevel::Basic,
@@ -320,7 +323,7 @@ class PassContext {
                        bool enable_pypto_l0c_double_buffer = false, RuntimeKind runtime = kDefaultRuntimeKind,
                        bool enable_buffer_ir = true, bool enable_software_pipeline = false,
                        bool report_hardware_loops = false, bool enable_pypto_autosync = false,
-                       bool autosync_disjoint_gm = false);
+                       bool autosync_disjoint_gm = false, std::string autosync_policy = "exact");
 
   /**
    * @brief Push this context onto the thread-local stack
@@ -382,6 +385,8 @@ class PassContext {
   [[nodiscard]] bool GetEnablePyptoAutoSync() const;
   /// Explicit caller contract: distinct GM roots denote disjoint allocations.
   [[nodiscard]] bool GetAutoSyncDisjointGM() const;
+  /// Explicit logical producer policy; actual-token lowering is independent.
+  [[nodiscard]] const std::string& GetAutoSyncPolicy() const;
 
   /**
    * @brief Return the legacy flag; it does not override the planner's dbC policy.
@@ -450,6 +455,7 @@ class PassContext {
   bool enable_software_pipeline_;
   bool enable_pypto_autosync_;
   bool autosync_disjoint_gm_;
+  std::string autosync_policy_;
   PassContext* previous_;
 
   static thread_local PassContext* current_;

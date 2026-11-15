@@ -29,6 +29,7 @@ from .ir import (
     Stmt,
     Type,
 )
+from .passes import NativeSyncChild
 
 def validate_buffer_op_contract(
     stage: OpIRStage,
@@ -333,9 +334,28 @@ def analyze_placed_sync(
     """
     ...
 
+def export_native_sync_child(
+    mathematics: CompactSyncAnalysis, scope: ForStmt, target: str = "a2a3"
+) -> dict[str, Any]:
+    """Export or explicitly refuse an existing numerical child; never reanalyze a detached body."""
+    ...
+
+def analyze_conservative_sync(
+    function: Function, target: str = "a2a3", *, children: list[NativeSyncChild] = []
+) -> dict[str, Any]:
+    """Qualify structured no-KILL effects/readiness; does not insert commands or export exact selectors."""
+    ...
+
+def insert_conservative_prefixes(
+    function: Function, target: str = "a2a3", *, children: list[NativeSyncChild] = []
+) -> Function:
+    """Explicit research request for conservative logical prefix protocols; production dispatch unchanged."""
+    ...
+
 def describe_buffer_sync_operation(call: Call, core: FunctionType, target: str = "a2a3") -> dict[str, Any]:
     """Inspect validated static payload effects, retaining original operand expressions.
 
+    Includes selected native implicit byte enclosures with separate precision.
     This neither proves geometry/readiness nor performs loop occurrence analysis.
     Unsupported native variants and malformed registrations/IR remain failures.
     """
@@ -464,6 +484,7 @@ def lower_sync_schedule(
     block_bounds: tuple[int, int] | None = None,
     *,
     schedule_policy: SyncSchedulePolicy = SyncSchedulePolicy(),
+    eligible_ids: list[int] | None = None,
 ) -> SyncScheduleLoweringResult:
     """Run production token lowering with explicit current invocation evidence."""
     ...

@@ -129,6 +129,13 @@ SyncDirection SyncFamilyPipes(const CompactSyncInput& input, const PhysicalSyncF
 // Shared native-owner and target eligibility policy. Neither helper computes
 // demands or assumes that a logical token owns a consuming hardware event.
 SyncNativeReservations SyncNativeClaims(const CompactSyncInput& input, const std::string& target);
+// Protocol clients have original operations but need no numerical occurrence
+// inventory. Keep native reservations and pool eligibility owned by allocation.
+SyncNativeReservations SyncNativeClaims(const FunctionPtr& owner, const std::vector<CallPtr>& calls,
+                                        const std::string& target);
+std::vector<int> SyncEligibleIds(const FunctionPtr& owner, const std::string& target, SyncDirection direction,
+                                 const std::optional<std::vector<int>>& restricted,
+                                 const SyncNativeReservations& claimed);
 std::vector<int> SyncEligibleIds(const CompactSyncInput& input, const std::string& target,
                                  SyncDirection direction, const std::optional<std::vector<int>>& restricted,
                                  const SyncNativeReservations& claimed);

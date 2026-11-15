@@ -61,8 +61,10 @@
 #include "pypto/ir/verifier/sync.h"
 #include "python/bindings/modules/testing_sync_support.h"
 #include "src/ir/transforms/utils/compact_sync_builder.h"
+#include "src/ir/transforms/utils/conservative_sync_dataflow.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/physical_sync_commands.h"
+#include "src/ir/transforms/utils/retained_sync_child.h"
 #include "src/ir/transforms/utils/scoped_sync_palette.h"
 #include "src/ir/transforms/utils/scoped_token_families.h"
 #include "src/ir/transforms/utils/scoped_token_order.h"
@@ -1238,9 +1240,9 @@ void BindTesting(nb::module_& m) {
       "lower_sync_schedule",
       [](const ir::FunctionPtr& function, const std::string& target,
          const ir::sync::SyncParameterBounds& parameters, std::optional<std::pair<int64_t, int64_t>> blocks,
-         const ir::sync::SyncSchedulePolicy& policy) {
+         const ir::sync::SyncSchedulePolicy& policy, const std::optional<std::vector<int>>& eligible_ids) {
         const auto result =
-            ir::sync::LowerLogicalSync(function, target, std::nullopt, parameters, blocks, policy);
+            ir::sync::LowerLogicalSync(function, target, eligible_ids, parameters, blocks, policy);
         nb::dict out;
         out["function"] = result.function;
         out["set_sites"] = result.set_sites;
@@ -1256,6 +1258,7 @@ void BindTesting(nb::module_& m) {
       nb::arg("function"), nb::arg("target") = "a2a3",
       nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{}, nb::arg("block_bounds") = nb::none(),
       nb::kw_only(), nb::arg("schedule_policy") = ir::sync::SyncSchedulePolicy{},
+      nb::arg("eligible_ids") = nb::none(),
       "Run the production actual-token lowering with explicit current invocation evidence");
   testing.def(
       "analyze_scoped_token_order",
@@ -1464,6 +1467,97 @@ void BindTesting(nb::module_& m) {
       },
       nb::arg("call"), nb::arg("core"), nb::arg("target") = "a2a3",
       "Inspect static payload effects without loop, coordinate, geometry or readiness analysis");
+  testing.def(
+      "analyze_conservative_sync",
+      [](const ir::FunctionPtr& function, const std::string& target,
+         const std::vector<std::shared_ptr<const ir::sync::NativeSyncChild>>& children) {
+        const auto analysis = ir::sync::AnalyzeConservativeSync(function, target, children);
+        auto facts = [](const ir::sync::ConservativeAccessSet& accesses) {
+          nb::list result;
+          for (const auto& [space, pipe, write] : accesses) {
+            nb::dict fact;
+            fact["space"] = ir::MemorySpaceToString(space);
+            fact["pipe"] = pipe;
+            fact["write"] = write;
+            result.append(fact);
+          }
+          return result;
+        };
+        nb::list sites;
+        size_t control_output_nodes = 0;
+        for (size_t index = 0; index < analysis.Sites().size(); ++index) {
+          const auto& site = analysis.Sites()[index];
+          nb::dict record;
+          record["cut"] = site.cut;
+          record["operation"] = site.operation.Operation();
+          record["pipe"] = site.operation.Implementation().Pipe();
+          auto control = analysis.ControlPath(index);
+          control_output_nodes += control.size();
+          record["control"] = control;
+          record["effects"] = facts(site.effects);
+          record["incoming"] = facts(site.incoming);
+          record["source_pipes"] = site.source_pipes;
+          sites.append(record);
+        }
+        const auto& cost = analysis.Cost();
+        nb::dict counters;
+        counters["statements"] = cost.statements;
+        counters["expression_visits"] = cost.expression_visits;
+        counters["dataflow_visits"] = cost.dataflow_visits;
+        counters["retained_facts"] = cost.retained_facts;
+        counters["services"] = cost.services;
+        counters["parent_links"] = cost.parent_links;
+        counters["diagnostic_control_output_nodes"] = control_output_nodes;
+        nb::dict result;
+        result["function"] = analysis.Function();
+        result["sites"] = sites;
+        nb::list child_entries;
+        for (const auto& child : analysis.ChildEntries()) {
+          nb::dict entry;
+          entry["scope"] = child.scope;
+          entry["incoming"] = facts(child.incoming);
+          entry["effects"] = facts(child.effects);
+          entry["services"] = child.services;
+          child_entries.append(entry);
+        }
+        result["children"] = child_entries;
+        result["exit_effects"] = facts(analysis.ExitEffects());
+        result["cost"] = counters;
+        result["precision"] = "whole_memory_space_no_kill";
+        result["exact_storage_selectors"] = false;
+        result["executable_protocol"] = false;
+        return result;
+      },
+      nb::arg("function"), nb::arg("target") = "a2a3", nb::kw_only(),
+      nb::arg("children") = std::vector<std::shared_ptr<const ir::sync::NativeSyncChild>>{},
+      "Qualify conservative effects/readiness and solve no-KILL structured may-dataflow without insertion");
+  testing.def(
+      "insert_conservative_prefixes",
+      [](const ir::FunctionPtr& function, const std::string& target,
+         const std::vector<std::shared_ptr<const ir::sync::NativeSyncChild>>& children) {
+        return ir::sync::InsertConservativePrefixes(
+            ir::sync::AnalyzeConservativeSync(function, target, children));
+      },
+      nb::arg("function"), nb::arg("target") = "a2a3", nb::kw_only(),
+      nb::arg("children") = std::vector<std::shared_ptr<const ir::sync::NativeSyncChild>>{},
+      "Explicit research request for conservative logical prefix protocols; production dispatch unchanged");
+  testing.def(
+      "export_native_sync_child",
+      [](const ir::sync::CompactSyncResult& mathematics, const ir::ForStmtPtr& scope,
+         const std::string& target) {
+        const auto result = ir::sync::ExportNativeSyncChild(mathematics, scope, target);
+        nb::dict out;
+        out["status"] = ir::sync::NativeSyncChildStatusName(result.status);
+        out["reason"] = result.reason;
+        out["child"] = result.child;
+        out["source_nodes"] = result.source_nodes;
+        out["summary_nodes"] = result.summary_nodes;
+        out["demands"] = result.demands;
+        out["operations"] = result.operations;
+        return out;
+      },
+      nb::arg("mathematics"), nb::arg("scope"), nb::arg("target") = "a2a3",
+      "Request a context-bound native-only child from existing retained numerical mathematics");
   testing.def(
       "describe_placed_sync_input",
       [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,

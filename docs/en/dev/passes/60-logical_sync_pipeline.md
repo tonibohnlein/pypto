@@ -409,8 +409,10 @@ inspected, invocation-case-disabled waits and emitted families. Read visits excl
 the nested wait-only traversal, whose wait leaves are counted separately; skipped
 zero-trip bodies and empty loop-coordinate domains are not case-disabled waits. No visit count is unfolded.
 
-Opt-in production orchestration uses the same activation transport. Neither
-route establishes native return completion or device correctness.
+Opt-in production orchestration uses the same activation transport. Public owned
+lowering additionally supplies the invocation drain described in RealizeSync;
+the activation transport itself proves neither native return behavior nor device
+correctness.
 
 ## Perfect nests and original frames
 
@@ -429,3 +431,43 @@ construction can cost more than the flattened periodic form. Count sweeps retain
 seven families and at most five axes in the nested-DMA regression; a singleton
 carry interval may omit an axis. This is a fixture bound, not a universal linear
 bound for numerical interfaces.
+
+## Closed current-prefix transactions
+
+Actual-token lowering also accepts qualified structured sequences of closed
+current-prefix services, including publications after imported waits and empty
+source prefixes. For source `p` and destination `q`, one service is the ordered
+logical sequence `record(p), wait(q), record(q), wait(p)`, with each wait naming
+its corresponding record. The acknowledgment is already part of the supplied
+logical order; allocation does not add it secretly. Contiguous same-pipe
+record/wait pairs use the existing pipe completion mechanism, or the qualified
+native scalar rule. This does not insert scalar-pipe barriers.
+
+The structural grammar requires common-control matching and no escaping tokens.
+Sequences, branches and sequential loops compose closed transactions, including
+zero visits, skipped arms and counter resets. Progress and role rearming follow
+that grammar, not an unfolded trip count or storage-coverage argument. Existing
+directional eligibility, native claims and reservations supply at most two roles
+per used direction. Unsupported forms retain their existing alternative lowering
+or explicit refusal; this is not general structured-token support.
+
+The public insertion pass can consume an explicitly supplied retained child:
+
+```python
+with passes.PassContext([], autosync_policy="conservative_prefix"):
+    logical = passes.insert_sync(accepted_children=[accepted_child])(original_program)
+    optimized = passes.optimize_sync()(logical)
+    physical = passes.lower_sync()(optimized)
+```
+
+`accepted_child` is an immutable `passes.NativeSyncChild` capability exported
+from retained mathematics; it has no public constructor. Obtaining that export
+currently uses the experimental retained-analysis interface. The initial family
+has a native-only internal plan, local effects and an empty event palette.
+Original owner, scope, target, guards and coordinates remain bound to the
+capability; clones, unsupplied caller premises and overlapping requested scopes
+refuse transactionally. Parent entry services retain may-access effects at exit;
+closed notifications do not imply completed payloads. Zero-trip child visits can
+still pay entry-service overhead. Eventful-child rearming, transport composition
+and automatic JIT child discovery remain unavailable. Exact storage selectors
+are neither required nor fabricated by this import.

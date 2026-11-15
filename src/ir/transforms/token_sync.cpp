@@ -12,6 +12,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -25,6 +27,8 @@
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/simplify.h"
 #include "pypto/ir/verifier/sync.h"
+#include "src/ir/transforms/utils/closed_prefix_sync.h"
+#include "src/ir/transforms/utils/conservative_sync_dataflow.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/scoped_logical_sync.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
@@ -111,16 +115,43 @@ FunctionPtr InsertLogicalSync(const FunctionPtr& function, const std::string& ta
 }
 }  // namespace
 
-Pass InsertSync() {
+Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accepted_children) {
   // Invocation evidence belongs to this program, never to a process-global
   // sidecar. Standalone failure leaves the immutable input program untouched.
   return CreateProgramPass(
-      [](const ProgramPtr& program) {
+      [accepted_children = std::move(accepted_children)](const ProgramPtr& program) {
         auto* context = PassContext::Current();
-        CHECK(context && context->GetAutoSyncDisjointGM())
+        CHECK(context &&
+              (context->GetAutoSyncPolicy() == "conservative_prefix" || context->GetAutoSyncDisjointGM()))
             << "InsertSync requires the explicit disjoint GM argument contract";
         const auto target = context->GetBackendHandler()->GetPtoTargetArch();
-        const auto evidence = sync::CollectSyncInvocationEvidence(program);
+        const bool prefix = context->GetAutoSyncPolicy() == "conservative_prefix";
+        CHECK(prefix || accepted_children.empty())
+            << "Accepted synchronization children require the explicit conservative_prefix policy";
+        // Validate the complete request before constructing any transformed
+        // function. Names or a structurally equivalent clone cannot authorize
+        // reuse of retained coordinates, placement, or caller evidence.
+        std::unordered_map<const Function*, size_t> owner_counts;
+        if (!accepted_children.empty())
+          for (const auto& [global, function] : program->functions_) ++owner_counts[function.get()];
+        std::unordered_map<const Function*, std::vector<std::shared_ptr<const sync::NativeSyncChild>>>
+            children_by_owner;
+        std::unordered_map<const Function*, std::unordered_set<const ForStmt*>> requested_scopes;
+        for (const auto& child : accepted_children) {
+          CHECK(child) << "InsertSync received an unavailable child capability";
+          const auto& owner = child->Owner();
+          const auto found = owner_counts.find(owner.get());
+          CHECK(found != owner_counts.end() && found->second == 1)
+              << "InsertSync accepted child has no unique original owner in this program";
+          CHECK(IsOwnedLeaf(owner)) << "InsertSync accepted child requires an owned local leaf";
+          child->ValidateFor(owner, target);
+          CHECK(requested_scopes[owner.get()].insert(child->Scope().get()).second)
+              << "InsertSync received duplicate accepted child scopes";
+          children_by_owner[owner.get()].push_back(child);
+        }
+        const std::vector<std::shared_ptr<const sync::NativeSyncChild>> no_children;
+        const auto evidence =
+            prefix ? sync::SyncInvocationEvidence{} : sync::CollectSyncInvocationEvidence(program);
         auto functions = program->functions_;
         for (auto& [global, function] : functions) {
           CheckLogicalSync(function);
@@ -129,6 +160,14 @@ Pass InsertSync() {
           CHECK(function->ir_stage_ == FunctionIRStage::Buffer &&
                 context->GetMemoryPlanner() != MemoryPlanner::PtoAS)
               << "InsertSync requires physically placed Buffer IR";
+          if (prefix) {
+            const auto found = children_by_owner.find(function.get());
+            const auto& children = found == children_by_owner.end() ? no_children : found->second;
+            function =
+                sync::InsertConservativePrefixes(sync::AnalyzeConservativeSync(function, target, children));
+            sync::CheckGeneratedLogicalSync(function);
+            continue;
+          }
           auto bounds = evidence.parameters.find(global->name_);
           const auto parameters =
               bounds == evidence.parameters.end() ? sync::SyncParameterBounds{} : bounds->second;
@@ -160,7 +199,12 @@ Pass LowerSync() {
         // Re-establish caller facts from this token program. Neither insertion's
         // old analysis nor a process-global sidecar authorizes physical lowering.
         for (const auto& [global, function] : program->functions_) CheckLogicalSync(function);
-        const auto evidence = sync::CollectSyncInvocationEvidence(program);
+        bool needs_occurrences = false;
+        for (const auto& [global, function] : program->functions_)
+          needs_occurrences |= IsOwnedLeaf(function) && sync::HasLogicalSync(function) &&
+                               !sync::HasOnlyClosedPrefixSyntax(function);
+        const auto evidence =
+            needs_occurrences ? sync::CollectSyncInvocationEvidence(program) : sync::SyncInvocationEvidence{};
         auto* context = PassContext::Current();
         CHECK(context) << "LowerSync requires a target PassContext";
         auto functions = program->functions_;
@@ -213,7 +257,8 @@ Pass RealizeSync() {
       }
       return sync::SyncOutcome(function, false, reason);
     }
-    if (!ctx->GetAutoSyncDisjointGM())
+    const bool prefix = ctx->GetAutoSyncPolicy() == "conservative_prefix";
+    if (!prefix && !ctx->GetAutoSyncDisjointGM())
       return sync::SyncOutcome(function, false, "Disjoint GM argument contract was not supplied");
     auto target = ctx->GetBackendHandler()->GetPtoTargetArch();
     if (target != "a2a3")
@@ -227,8 +272,9 @@ Pass RealizeSync() {
       // The same logical producer and actual-token consumer as the public
       // stages. Insertion preserves callers, payloads and scalar coordinates,
       // so this transaction may reuse its own freshly collected evidence.
-      const auto bound_function = BindLaunchCount(function, block_count);
-      const auto logical = InsertLogicalSync(bound_function, target, bounds, block_bounds);
+      const auto logical =
+          prefix ? sync::InsertConservativePrefixes(sync::AnalyzeConservativeSync(function, target))
+                 : InsertLogicalSync(BindLaunchCount(function, block_count), target, bounds, block_bounds);
       sync::CheckGeneratedLogicalSync(logical);
       const auto optimized = sync::OptimizeLogicalSync(logical);
       sync::CheckGeneratedLogicalSync(optimized);
@@ -255,7 +301,10 @@ Pass RealizeSync() {
           CHECK(!function->GetAttr<bool>(kAttrPyptoAutosync))
               << "RealizeSync cannot reprocess an owned physical plan";
         }
-        auto evidence = sync::CollectSyncInvocationEvidence(program);
+        const auto* context = PassContext::Current();
+        auto evidence = context && context->GetAutoSyncPolicy() == "conservative_prefix"
+                            ? sync::SyncInvocationEvidence{}
+                            : sync::CollectSyncInvocationEvidence(program);
         auto functions = program->functions_;
         for (auto& [global, function] : functions) {
           auto block = evidence.block_indices.find(global->name_);

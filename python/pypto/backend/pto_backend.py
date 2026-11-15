@@ -45,7 +45,10 @@ from typing import Any
 
 from pypto._external_source import EXTERNAL_INCLUDE_DIRS_ATTR, decode_external_include_dirs
 from pypto._function_attrs import (
+    AUTOSYNC_ACCESS_PRECISION_ATTR,
+    AUTOSYNC_ANALYSIS_POLICY_ATTR,
     AUTOSYNC_FALLBACK_REASON_ATTR,
+    AUTOSYNC_REALIZATION_ORDER_ATTR,
     BUILTIN_TEMPLATE_DIR_ATTR,
     BUILTIN_TEMPLATE_VARS_ATTR,
     DUAL_AIV_DISPATCH_ATTR,
@@ -2833,6 +2836,16 @@ def _autosync_report(transformed_program: _ir_core.Program) -> dict[str, str]:
                 "reason": attrs.get(AUTOSYNC_FALLBACK_REASON_ATTR, "complete literal flag plan"),
             }
         )
+        # Precision is independent of ownership and allocation. Preserve the
+        # producer's report only when supplied; older exact/manual plans retain
+        # their existing report shape and acquire no invented guarantee.
+        for key in (
+            AUTOSYNC_ANALYSIS_POLICY_ATTR,
+            AUTOSYNC_ACCESS_PRECISION_ATTR,
+            AUTOSYNC_REALIZATION_ORDER_ATTR,
+        ):
+            if key in attrs:
+                sync_reports[-1][key] = attrs[key]
     if sync_reports:
         result_files["report/autosync.json"] = (
             json.dumps({"downstream_autosync_enabled": True, "kernels": sync_reports}, indent=2) + "\n"

@@ -82,6 +82,32 @@ lowering still permits pending payloads and does not insert a child-exit drain.
 Native instruction and runtime behavior remain separate device qualifications;
 performance comparisons must use the same invocation-boundary policy.
 
+## Explicit conservative-prefix policy
+
+`autosync_policy="exact"` remains the default. A separate explicit request can
+use qualified operation effects without exact occurrence counts or GM selectors:
+
+```python
+with passes.PassContext([], enable_pypto_autosync=True,
+                        autosync_policy="conservative_prefix"):
+    compiled = kernel.compile(a, b, c, config=config)
+```
+
+This route uses whole-memory-space read/write enclosures: distinct GM roots may
+overlap, and local slots/views share their physical memory-space class. Original
+access-validity preconditions still apply. Branches union may-access facts;
+loops retain zero-trip and backedge facts without unfolding trip counts. No
+possible write kills older obligations. Unsupported effects, scalar-memory
+readiness and compound transport still refuse transactionally.
+
+Each cross-pipe consumer-cut service selects a logical forward-and-return
+acknowledgment before physical lowering. It may add payload order. The qualified
+closed protocol uses at most two eligible roles per direction, after existing
+native claims and exclusions; unavailable directions or capacity remain refusals.
+The same invocation drain and whole-kernel ownership rules apply. This policy
+does not silently replace successful exact mathematics after an export failure.
+Its identity is retained by context cloning, JIT caches and route reports.
+
 ## Finite Vec coverage
 
 The AIV path reuses the same demand analysis, placement and flag allocator. It

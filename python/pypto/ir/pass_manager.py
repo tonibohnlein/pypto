@@ -381,6 +381,7 @@ class PassManager:
         # the active planner to retain automatic dbC only for PTOAS.
         self._construction_autosync = ctx.get_enable_pypto_autosync() if ctx else False
         self._construction_sync_contract = ctx.get_autosync_disjoint_gm() if ctx else False
+        self._construction_sync_policy = ctx.get_autosync_policy() if ctx else "exact"
         self._construction_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
         self._construction_buffer_ir = ctx.get_enable_buffer_ir() if ctx else True
         skipped_mem_planning_passes: tuple[str, ...]
@@ -450,7 +451,12 @@ class PassManager:
         ctx = passes.PassContext.current()
         run_autosync = ctx.get_enable_pypto_autosync() if ctx else False
         run_contract = ctx.get_autosync_disjoint_gm() if ctx else False
-        if (run_autosync, run_contract) != (self._construction_autosync, self._construction_sync_contract):
+        run_policy = ctx.get_autosync_policy() if ctx else "exact"
+        if (run_autosync, run_contract, run_policy) != (
+            self._construction_autosync,
+            self._construction_sync_contract,
+            self._construction_sync_policy,
+        ):
             raise RuntimeError("PassManager autosync contract changed after construction")
         run_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
         run_buffer_ir = ctx.get_enable_buffer_ir() if ctx else True
@@ -616,6 +622,7 @@ class PassManager:
             software_pipeline,
             enable_pypto_autosync=ctx.get_enable_pypto_autosync() if ctx else False,
             autosync_disjoint_gm=ctx.get_autosync_disjoint_gm() if ctx else False,
+            autosync_policy=ctx.get_autosync_policy() if ctx else "exact",
         ):
             try:
                 return self._pipeline.run(input_ir)
@@ -674,6 +681,7 @@ class PassManager:
             software_pipeline,
             enable_pypto_autosync=ctx.get_enable_pypto_autosync() if ctx else False,
             autosync_disjoint_gm=ctx.get_autosync_disjoint_gm() if ctx else False,
+            autosync_policy=ctx.get_autosync_policy() if ctx else "exact",
         ):
             try:
                 return self._pipeline.run(input_ir)

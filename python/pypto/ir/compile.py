@@ -277,6 +277,7 @@ def _run_pass_pipeline(  # noqa: PLR0913
         software_pipeline,
         enable_pypto_autosync=outer.get_enable_pypto_autosync() if outer else False,
         autosync_disjoint_gm=outer.get_autosync_disjoint_gm() if outer else False,
+        autosync_policy=outer.get_autosync_policy() if outer else "exact",
     )
 
     if mplan == _passes.MemoryPlanner.PTOAS:

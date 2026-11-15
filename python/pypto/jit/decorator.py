@@ -1266,6 +1266,7 @@ class JITFunction:
             runtime=runtime,
             enable_pypto_autosync=sync_context.get_enable_pypto_autosync() if sync_context else False,
             autosync_disjoint_gm=sync_context.get_autosync_disjoint_gm() if sync_context else False,
+            autosync_policy=sync_context.get_autosync_policy() if sync_context else "exact",
         )
 
         if _contract is not None:
