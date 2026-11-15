@@ -68,8 +68,27 @@ class Discover : public IRVisitor {
   size_t logical_calls = 0;
   std::vector<ForStmtPtr> children;
   std::map<const ForStmt*, std::set<SyncDirection>> entries;
+  std::set<const Var*> completed_tokens;
+
+  void VisitExpr(const ExprPtr& expression) override {
+    // This is static syntax discovery, not execution. Recognized services are
+    // counted at their statement cuts above; shared expression DAGs need only
+    // one inspection, even when this recognizer ultimately declines them.
+    if (expression && seen_.insert(expression.get()).second) IRVisitor::VisitExpr(expression);
+  }
 
  protected:
+  void VisitStmt_(const AssignStmtPtr& assignment) override {
+    const auto call = As<Call>(assignment->value_);
+    const auto alias = As<Var>(assignment->value_);
+    if (As<SyncTokenType>(assignment->var_->GetType()) &&
+        (IsOp(call, "sync.completed") || (alias && completed_tokens.count(alias.get())))) {
+      // Logical verification establishes dominance. These are pure aliases of
+      // empty facts, never publications or evidence of payload completion.
+      completed_tokens.insert(assignment->var_.get());
+    }
+    IRVisitor::VisitStmt_(assignment);
+  }
   void VisitVarLike_(const VarPtr&) override {}
   void VisitExpr_(const IterArgPtr&) override {}
   void VisitStmt_(const ForStmtPtr& loop) override {
@@ -135,6 +154,9 @@ class Discover : public IRVisitor {
       IRVisitor::VisitExpr_(call);
     }
   }
+
+ private:
+  std::set<const Expr*> seen_;
 };
 
 // Reinspect every operation independently of loop counts and of the memory
@@ -307,13 +329,16 @@ class Assignment {
 
 class Emit : public IRMutator {
  public:
-  Emit(const Assignment& assignment, FunctionType core, const std::map<const ForStmt*, StmtPtr>& children)
-      : assignment_(assignment), core_(core == FunctionType::AIV ? "aiv" : "aic"), children_(children) {}
+  Emit(const Assignment& assignment, FunctionType core, const std::map<const ForStmt*, StmtPtr>& children,
+       const std::set<const Var*>& completed_tokens)
+      : assignment_(assignment),
+        core_(core == FunctionType::AIV ? "aiv" : "aic"),
+        children_(children),
+        completed_tokens_(completed_tokens) {}
 
  protected:
   StmtPtr VisitStmt_(const AssignStmtPtr& assignment) override {
-    const auto call = As<Call>(assignment->value_);
-    if (call && GetLogicalSyncKind(call->op_) == LogicalSyncKind::Completed)
+    if (completed_tokens_.count(assignment->var_.get()))
       return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, assignment->span_);
     return IRMutator::VisitStmt_(assignment);
   }
@@ -349,6 +374,7 @@ class Emit : public IRMutator {
   const Assignment& assignment_;
   std::string core_;
   const std::map<const ForStmt*, StmtPtr>& children_;
+  const std::set<const Var*>& completed_tokens_;
 };
 }  // namespace
 
@@ -398,6 +424,20 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
    public:
     explicit TokenUses(const std::set<const Var*>& tokens) : tokens_(tokens) {}
     size_t uses = 0;
+    void VisitExpr(const ExprPtr& expression) override {
+      if (!expression) return;
+      const auto found = counts_.find(expression.get());
+      if (found != counts_.end()) {
+        uses += found->second;
+        return;
+      }
+      // Summarize static expressions once, then charge that summary on EVERY
+      // use. Unlike a seen-set, this still detects repeated command/alias uses
+      // of one publication while avoiding repeated walks of scalar DAGs.
+      const auto before = uses;
+      IRVisitor::VisitExpr(expression);
+      counts_.emplace(expression.get(), uses - before);
+    }
 
    protected:
     void VisitStmt_(const AssignStmtPtr& assignment) override { VisitExpr(assignment->value_); }
@@ -407,10 +447,39 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
 
    private:
     const std::set<const Var*>& tokens_;
+    std::map<const Expr*, size_t> counts_;
   } token_uses(local_tokens);
   token_uses.VisitFunction(function);
   CHECK(token_uses.uses == 2 * discovered.transactions.size() + discovered.local.size())
       << "Closed prefix tokens require one within-visit consumer and no escapes";
+  // Token carries/signatures and aliases of publications need another parser.
+  // Decline before emitting anything rather than leave residual token values.
+  auto erased_tokens = local_tokens;
+  erased_tokens.insert(discovered.completed_tokens.begin(), discovered.completed_tokens.end());
+  class TokenShape : public IRVisitor {
+   public:
+    TokenShape(const std::set<const Var*>& erased, const std::vector<ForStmtPtr>& children)
+        : erased_(erased), children_(children.begin(), children.end()) {}
+    bool supported = true;
+    void VisitExpr(const ExprPtr& expression) override {
+      if (expression && seen_.insert(expression.get()).second) IRVisitor::VisitExpr(expression);
+    }
+
+   protected:
+    void VisitVarLike_(const VarPtr& variable) override {
+      if (As<SyncTokenType>(variable->GetType()) && !erased_.count(variable.get())) supported = false;
+    }
+    void VisitStmt_(const ForStmtPtr& loop) override {
+      if (!children_.count(loop)) IRVisitor::VisitStmt_(loop);
+    }
+
+   private:
+    const std::set<const Var*>& erased_;
+    std::set<ForStmtPtr> children_;
+    std::set<const Expr*> seen_;
+  } shape(erased_tokens, discovered.children);
+  shape.VisitFunction(function);
+  if (!shape.supported) return std::nullopt;
   NativeOperations native(function->func_type_, target);
   native.VisitFunction(function);
   const auto reservations = SyncNativeClaims(function, native.payloads, target);
@@ -531,7 +600,8 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
   }
   const Assignment assignment(function, discovered, native.payloads, target, eligible_ids);
   PhysicalSyncRealization result;
-  result.function = Emit(assignment, function->func_type_, children).VisitFunction(function);
+  result.function =
+      Emit(assignment, function->func_type_, children, discovered.completed_tokens).VisitFunction(function);
   result.set_sites = 2 * discovered.transactions.size() + child_sets;
   result.wait_sites = 2 * discovered.transactions.size() + child_waits;
   result.barrier_sites = child_barriers;

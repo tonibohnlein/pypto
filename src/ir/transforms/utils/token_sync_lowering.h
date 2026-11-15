@@ -13,6 +13,7 @@
 #define SRC_IR_TRANSFORMS_UTILS_TOKEN_SYNC_LOWERING_H_
 
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -31,6 +32,9 @@ CompactSyncInput ImportSyncPayloads(const FunctionPtr& function, const std::stri
 // Insertion owns its generated SSA: malformed output is a compiler error,
 // never an unsupported-input reason for downstream delegation.
 void CheckGeneratedLogicalSync(const FunctionPtr& function);
+// Compiler-output postcondition, including token-typed values and signatures.
+// This is intentionally distinct from unsupported-input qualification.
+void CheckPhysicalSyncResult(const FunctionPtr& function);
 // Shared public/production logical stage. Rewrites belong here, never only in
 // the pass wrapper. Invalid caller input is a qualification error; invalid
 // output after a future rewrite is a compiler error.

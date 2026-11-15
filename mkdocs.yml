@@ -323,6 +323,7 @@ nav:
           - Retained Eventful Sync Children: en/dev/ir/41-general-autosync-eventful-child.md
           - Read-only External Sync Children: en/dev/ir/41-general-autosync-readonly-child.md
           - Explicit Module Sync Ownership: en/dev/ir/41-general-autosync-module-ownership.md
+          - Autosync Review Repairs: en/dev/ir/42-autosync-review-repairs.md
       - Passes:
           - en/dev/passes/index.md
           - en/dev/passes/00-pass_manager.md
