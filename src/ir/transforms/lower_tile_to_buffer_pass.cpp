@@ -63,6 +63,7 @@
 #include "pypto/ir/transforms/utils/buffer_valid_analysis.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/normalize_stmt_structure.h"
+#include "pypto/ir/transforms/utils/slot_index_qualification.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/property_verifier_registry.h"
 
@@ -738,7 +739,9 @@ class TileToBufferMutator : public IRMutator {
         guarded_valid_(guarded_valid),
         local_accumulators_(local_accumulators),
         indexed_(body),
-        tuples_(body) {}
+        tuples_(body) {
+    canonical_slots_.VisitStmt(body);
+  }
 
   StmtPtr VisitStmt(const StmtPtr& stmt) override {
     auto previous_slots = std::move(slot_handles_);
@@ -983,7 +986,9 @@ class TileToBufferMutator : public IRMutator {
       // Selection is rebuilt at its actual use, where original loop coordinates
       // are in scope. Only this statement's aliases share the handle; it cannot
       // escape a branch, loop visit, or counter reset.
-      auto index = VisitExpr(selection.index);
+      const auto normalized = canonical_slots_.normalized_indices.find(AsVarLike(value).get());
+      auto index = VisitExpr(normalized == canonical_slots_.normalized_indices.end() ? selection.index
+                                                                                     : normalized->second);
       const auto key = std::make_pair(selection.group.get(), structural_hash(index));
       auto& candidates = slot_handles_[key];
       for (const auto& [existing, handle] : candidates) {
@@ -1608,6 +1613,7 @@ class TileToBufferMutator : public IRMutator {
   }
 
   const StorageIndex& storage_;
+  CanonicalSlotCollector canonical_slots_;
   bool guarded_valid_;
   std::unordered_map<const TileType*, CallPtr> window_recipes_;
   std::unordered_map<const TileType*, std::pair<CallPtr, VarPtr>> deferred_windows_;

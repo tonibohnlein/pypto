@@ -540,6 +540,7 @@ void PTOCodegen::GenerateBufferFunction(const ir::FunctionPtr& func) {
       << "Direct Buffer delegated slot selection requires a qualified nonnegative canonical modulo";
   fs_.Reset();
   fs_.unsigned_slot_remainders = std::move(canonical_slots.remainders);
+  fs_.normalized_slot_indices = std::move(canonical_slots.normalized_indices);
   fs_.buffer_ir = true;
   fs_.current_function = func;
   fs_.truncating_floor_div_mod = PrepareScalarFloorDivMod(func->body_, func->params_);
@@ -721,7 +722,10 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
     if (multi->slot_count_ == 1) {
       BindVarToMlir(result, source);
     } else {
-      const std::string index = EmitBufferIntegerOperand(call->args_[1], DataType::INDEX);
+      const auto normalized = fs_.normalized_slot_indices.find(result.get());
+      const auto& slot_index =
+          normalized == fs_.normalized_slot_indices.end() ? call->args_[1] : normalized->second;
+      const std::string index = EmitBufferIntegerOperand(slot_index, DataType::INDEX);
       const std::string name = NewNamedTemp(result->name_hint_);
       Emit(name + " = pto.multi_tile_get " + source + "[" + index +
            "] : " + FormatMultiTileBufTypeString(element, static_cast<uint64_t>(multi->slot_count_)) +
