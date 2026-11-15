@@ -165,22 +165,22 @@ def test_buffer_roundtrip_rejects_lost_stage_and_operands(monkeypatch):
 @pytest.mark.parametrize("planner", _PLANNERS)
 def test_lowering_never_falls_back_to_legacy_codegen_for_an_unimplemented_recipe(planner):
     @pl.program
-    class ReciprocalSquareRoot:
+    class ColumnSum:
         @pl.function(type=pl.FunctionType.InCore)
         def kernel(
             self,
             source: pl.Tensor[[16, 32], pl.FP32],
-            output: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
-        ) -> pl.Tensor[[16, 32], pl.FP32]:
+            output: pl.Out[pl.Tensor[[1, 32], pl.FP32]],
+        ) -> pl.Tensor[[1, 32], pl.FP32]:
             value: pl.Tile[[16, 32], pl.FP32] = pl.load(source, [0, 0], [16, 32])
-            result: pl.Tile[[16, 32], pl.FP32] = pl.rsqrt(value)
-            out: pl.Tensor[[16, 32], pl.FP32] = pl.store(result, [0, 0], output)
+            result: pl.Tile[[1, 32], pl.FP32] = pl.tile.col_sum(value)
+            out: pl.Tensor[[1, 32], pl.FP32] = pl.store(result, [0, 0], output)
             return out
 
     with passes.PassContext([], passes.VerificationLevel.NONE, memory_planner=planner, enable_buffer_ir=True):
         manager = buffer_recipe_pipeline()
-        with pytest.raises(ValueError, match="no conversion recipe for 'tile.rsqrt'"):
-            manager.run(ReciprocalSquareRoot)
+        with pytest.raises(ValueError, match="no conversion recipe for 'tile.col_sum'"):
+            manager.run(ColumnSum)
 
 
 @pl.program

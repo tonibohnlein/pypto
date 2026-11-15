@@ -1475,9 +1475,13 @@ class TileToBufferMutator : public IRMutator {
                                  : backend::FindLogicalBufferElementwiseRecipe(call->op_->name_)) {
       INTERNAL_CHECK_SPAN(result, call->span_) << "Internal error: Tile elementwise recipe has no result";
       const auto& entry = OpRegistry::GetInstance().GetEntry(call->op_->name_);
-      INTERNAL_CHECK_SPAN(call->args_.size() == entry.GetArgumentCount(), call->span_)
-          << "Internal error: malformed Tile elementwise recipe operand count";
       ValidateKwargs(call->kwargs_, entry.GetOp()->GetAttrs(), call->op_->name_);
+      // The registry documents optional operands as well as required ones.
+      // Validate the original call with its registered schema, then qualify the
+      // selected fixed recipe; a valid workspace variant is not that recipe.
+      (void)entry.GetDeduceType()(call->args_, call->kwargs_);
+      CHECK_SPAN(backend::SupportsLogicalBufferElementwise(*recipe, call), call->span_)
+          << "LowerTileToBuffer: unsupported elementwise recipe operands or native attributes";
       auto destination = Handle(result);
       const auto dtype = As<BufferType>(destination->GetType())->dtype_;
       bool needs_windows = false;

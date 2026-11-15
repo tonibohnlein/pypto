@@ -106,6 +106,14 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        BufferElementwiseTypePolicy::DenseFP32,
        BufferDestinationAliasPolicy::ExactOrDisjoint,
        true},
+      {"tile.rsqrt",
+       "buffer.rsqrt",
+       "pto.trsqrt",
+       {{0}},
+       BufferPrecisionKind::Rsqrt,
+       BufferElementwiseTypePolicy::DenseFP32,
+       BufferDestinationAliasPolicy::Disjoint,
+       true},
       {"tile.neg",
        "buffer.neg",
        GetPtoNativeOpSpec("tile.neg").native_op,
@@ -241,6 +249,13 @@ bool SupportsElementwiseDtype(const BufferElementwiseRecipe& recipe, DataType dt
 }  // namespace
 
 bool SupportsLogicalBufferElementwise(const BufferElementwiseRecipe& recipe, const ir::CallPtr& call) {
+  // Fixed recipes must account for every logical operand, including metadata
+  // such as tile.full's shape at index 0. Never silently drop an optional
+  // workspace just because the basic recipe only selects its first input.
+  size_t arity = 0;
+  for (const auto& input : recipe.inputs) arity = std::max(arity, input.logical_index + 1);
+  if (call->args_.size() != arity || !SupportsBufferElementwiseAttributes(recipe, call->kwargs_))
+    return false;
   const auto destination = ir::As<ir::TileType>(call->GetType());
   if (!destination) return false;
   const auto dtype = destination->dtype_;
@@ -277,6 +292,18 @@ bool SupportsLogicalBufferElementwise(const BufferElementwiseRecipe& recipe, con
     }
   }
   return destination->GetMemorySpace() == ir::MemorySpace::Vec;
+}
+
+bool SupportsBufferElementwiseAttributes(const BufferElementwiseRecipe& recipe,
+                                         const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  if (recipe.precision != BufferPrecisionKind::Rsqrt) return true;
+  // The default two-operand native form is vrsqrt. The high-precision form
+  // requires a distinct scratch operand and is not this recipe.
+  for (const auto& [name, value] : kwargs) {
+    const auto flag = std::any_cast<bool>(&value);
+    if (name != "high_precision" || !flag || *flag) return false;
+  }
+  return true;
 }
 
 void ValidateBufferElementwiseOperands(const BufferElementwiseRecipe& recipe,
@@ -334,6 +361,8 @@ const char* BufferPrecisionAttributeName(BufferPrecisionKind precision) {
       return GetPtoNativeOpSpec("tile.log").precision_attribute;
     case BufferPrecisionKind::Recip:
       return GetPtoNativeOpSpec("tile.recip").precision_attribute;
+    case BufferPrecisionKind::Rsqrt:
+      return "rsqrt_precision";
     case BufferPrecisionKind::None:
       return nullptr;
   }

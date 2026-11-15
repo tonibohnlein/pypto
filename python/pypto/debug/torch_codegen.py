@@ -1516,6 +1516,7 @@ def _register_ops() -> None:  # noqa: PLR0915
         "abs",
         "exp",
         "sqrt",
+        "rsqrt",
         "neg",
         "relu",
         "log",

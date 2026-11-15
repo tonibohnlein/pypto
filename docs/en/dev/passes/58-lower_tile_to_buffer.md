@@ -45,6 +45,7 @@ partition form before storage planning rather than failing during final lowering
 | Ordinary packed ND GM load/store | FP16, BF16, FP32, INT32 |
 | add, mul | FP16, FP32, INT32 |
 | sub, div, maximum, minimum, abs, exp, sqrt, neg, relu, log, recip | FP32 |
+| rsqrt (default precision, no workspace) | FP32 |
 | adds, subs, muls, divs, maximums, minimums, lrelu, full | FP32 |
 | row_max, row_sum, row_min, row_prod | FP32, positive static valid |
 | row_expand_add/sub/mul/div/max/min | FP32, positive static valid, contiguous column carrier |
@@ -59,6 +60,21 @@ requires a distinct destination, enforced by storage legalization and verificati
 Precision attributes retain their existing native policy. GM return aliases must
 resolve to parameters whose types match the declared results, including TensorView
 metadata; kernels with mismatched return views retain Tile IR.
+
+`rsqrt` uses the existing dense unary recipe with a disjoint destination. Both
+omitted `high_precision` and explicit `False` select the two-operand default
+implementation; `True`, an extra workspace, or an unknown attribute do not.
+Fixed recipes require their complete logical operand arity, including metadata
+operands such as `full`'s shape, so optional operands cannot be silently discarded.
+The selected A2/A3 implementation is pinned to
+[PTO-ISA `TUnaryOp.hpp`](https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TUnaryOp.hpp):
+the default `TRSQRT_IMPL` calls the shared `TUNARY_IMPL<RsqrtOp>` and `vrsqrt`,
+with no implicit scratch or numbered-event claims. The separate high-precision
+workspace overload is not covered by this recipe. Runtime-valid descriptors use
+the existing per-use metadata restoration and positive-extent guard; an empty
+valid region does not execute the native unary operation. Host tests cover
+positive numerical inputs, empty/partial/full valid regions, storage aliases,
+and generated C++; they do not establish native accuracy or device behavior.
 
 Stores with an explicit `shapes=` partition also retain Tile IR. The Buffer
 store recipe currently derives its partition from the source valid shape and

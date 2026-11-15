@@ -88,7 +88,7 @@ def vec_fixture(count=None, visits=1, view="dense", operation="buffer.add", inpl
     body = list(definitions)
     for visit in range(visits):
         args = [x, y, z]
-        if operation in ("buffer.abs", "buffer.recip"):
+        if operation in ("buffer.abs", "buffer.recip", "buffer.rsqrt"):
             args = [x, z]
         elif operation == "buffer.adds":
             args = [x, ir.ConstFloat(2.0, fp, span), z]
