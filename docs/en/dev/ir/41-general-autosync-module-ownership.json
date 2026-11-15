@@ -1,0 +1,82 @@
+{
+  "checkpoint": "explicit whole-module synchronization ownership",
+  "architecture_scope": "Bounded M6 deployment slice; original M5 relational caller analysis and whole-model acceptance are not declared complete.",
+  "base_revision": "e5544af5dbfd368ba4853d464714a435eceb3eb3",
+  "snapshot_status": "Accepted integrated dirty source snapshot before focused package commits; source hashes and binary identify the checkpoint.",
+  "working_tree_source_hashes": {
+    "include/pypto/ir/function.h": "3fe0a1abd0d30044f7b2b8fb4fc863eb82ed018d4d4d391c1deed7269f75bbf9",
+    "include/pypto/ir/transforms/passes.h": "df44e68b3643c86eb464a0d31f4a748d8540ea3c66bd12bdb146e2e21d3a10c5",
+    "include/pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h": "753c1820a3b64e017045f27a8a1e7efe7653a224ba257decf9a9673f0c8a9530",
+    "python/bindings/modules/passes.cpp": "57f8308d2360967ee933805bfbe395a19ce7c96c8711c6c93016b6f2525307ee",
+    "python/pypto/_function_attrs.py": "46651f724d5cc356d4df9a9488a0b4b993e9de14b72909db7437aa5ebbd5c522",
+    "python/pypto/backend/_sync_ownership.py": "e0cfeb1f994a486ae28e5a91a3e9410d1308883496f098900bc4f0b1aa5342e0",
+    "python/pypto/backend/pto_backend.py": "05f341da0a82d4cf65bc20b6d3a37cb41bf855c95c891844efcb916468827c05",
+    "python/pypto/pypto_core/passes.pyi": "8a91fb1073a632a5f2b7a6033b8d1d0abc776c41b4a86287cbf96fc07b5c6a56",
+    "python/pypto/runtime/debug/pto_rebuild.py": "e3beb2a5579ecd53e3e1a55c7d207c864501416bb56d83f7962985d9303695ba",
+    "src/ir/transforms/token_sync.cpp": "d28986a0873634c827aad642e67ffdfd08226080bdd7c1ed11f02b9ffd8a0862",
+    "src/ir/transforms/utils/closed_prefix_sync.cpp": "9304cee9a92002a93cd298fc2bc57dea488cdf04eab70a57e512b1042b087f15",
+    "src/ir/transforms/utils/closed_prefix_sync.h": "212f79cc6f320c8f87fc6498951f55159aa1d3d438a7db0b587e973539ee5996",
+    "tests/ut/ir/transforms/test_whole_module_sync_ownership.py": "8f3dae5e4cba898fae10558d33dfbd4e9c2da5b6954871e4f45b8d3c5003e674"
+  },
+  "build": {
+    "directory": "build-py314",
+    "type": "Release",
+    "compiler": "/usr/bin/c++",
+    "python": "/usr/bin/python3 (Python 3.14)",
+    "integrated_log": "build-py314/milestone-loop-20261115/build-accepted.log",
+    "integrated_log_sha256": "a4694b87520e3633e7f10d080be77f11d2bcb9c199f65a3f90583aefd4730c86",
+    "binary": "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so",
+    "binary_sha256": "3c57d9cca1afc89bbf996adcc88616a02f0bc056c631372ad376712d43979406",
+    "final_log": "build-py314/milestone-loop-20261115/build-frozen.log",
+    "final_log_sha256": "879f37d00401255c3708835dcc6fde7f4359a27032465c4c79b12103a3bfd213"
+  },
+  "tools": {
+    "ptoas": "v0.72 required by toolchain/versions.env",
+    "runtime_revision": "355ce3015e3e344d1fc3a61c206ee01823ce292c",
+    "versions_env_sha256": "15067c515da2dfb9768e61ef28d88debf817066ca2163a32c9fe36c9d4c2c53f"
+  },
+  "commands": [
+    "cmake --build build-py314 --parallel 2",
+    "PYTHONPATH=python /usr/bin/python3 -m pytest -q --require-ptoas tests/ut/ir/transforms/test_whole_module_sync_ownership.py"
+  ],
+  "stage_outcomes": {
+    "public_admission": "Atomic explicit require_whole_module=True; local placed AIC/AIV only; mixed helper/external/SIMT refuses.",
+    "native_qualification": "Actual operations, hidden native resources, use-site runtime metadata checked even without logical sync.",
+    "logical_semantics": "LowerSync consumes actual supplied tokens; no claim of memory coverage for manual input.",
+    "invocation": "Payload/command debt receives existing terminal ALL; genuinely empty program emits no command.",
+    "ownership_transport": "Every actual emitted peer/helper inventoried; only wholly qualified A2/A3 level3 units disable PTOAS insertion.",
+    "artifacts": "Owned marker plus exact-source SHA256 sidecar and bounded compiler options; raw standalone CLI is unsupported.",
+    "debug_rebuild": "Unchanged artifact restores options; edited/missing/downgraded manifest, unknown target or placement refuses.",
+    "device": "Not run."
+  },
+  "focused_results": {
+    "m5_file": "All ownership cases passed in the accepted 183-test integrated gate.",
+    "combined_log": "build-py314/milestone-loop-20261115/focused-accepted.log",
+    "combined_log_sha256": "c2dbe8d2d28c0ba124bcb034ba5e08284ddf5e877d70f1399827bb2944f84277",
+    "final_gate": "183 passed in 111.50 seconds",
+    "runtime_followup": "14 passed (separate runtime-final.log); no ownership failures",
+    "runtime_followup_log": "build-py314/milestone-loop-20261115/runtime-final.log",
+    "runtime_followup_log_sha256": "7b399b70addff27043f10655cb2e6b11ccca711dec3e0fffe63f756eb7bfa845",
+    "final_gate_log": "build-py314/milestone-loop-20261115/accepted-gate.log",
+    "final_gate_log_sha256": "ab8bdf1f633e599d00ea67b3406722ee2a7b7bbfb1c964291e039c114e3286fc",
+    "hooks": "all passed, including full Pyright",
+    "hooks_log": "build-py314/milestone-loop-20261115/hooks-accepted.log",
+    "hooks_log_sha256": "b1c12e7d7805d4a6b74a42dd137abc924281d6256d34ac7c9a3e90960e180640"
+  },
+  "defaults_unchanged": [
+    "Default LowerSync/RealizeSync per-leaf flag ownership",
+    "PTOAS insertion enabled for ordinary delegated/mixed units",
+    "Logical protocol and physical-ID assignment",
+    "Allocation algorithms and six-ID eligibility",
+    "Scalar/Cube native exemptions and zero-inner-body barriers"
+  ],
+  "limitations": [
+    "No automatic fallback or full-Qwen ownership",
+    "No tensor.read cache-visibility grant",
+    "No general AIC/AIV transport contract",
+    "No dynamic reduction/axis/mixed-valid semantic qualification",
+    "No native device correctness or latency claim",
+    "Manifest is artifact consistency, not authentication"
+  ],
+  "review": "Independent parent source/design acceptance and independent composition-agent final review accepted; 183-test integrated gate and full hooks passed."
+}

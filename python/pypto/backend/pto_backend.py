@@ -49,6 +49,7 @@ from pypto._function_attrs import (
     AUTOSYNC_ANALYSIS_POLICY_ATTR,
     AUTOSYNC_FALLBACK_REASON_ATTR,
     AUTOSYNC_REALIZATION_ORDER_ATTR,
+    AUTOSYNC_WHOLE_MODULE_ATTR,
     BUILTIN_TEMPLATE_DIR_ATTR,
     BUILTIN_TEMPLATE_VARS_ATTR,
     DUAL_AIV_DISPATCH_ATTR,
@@ -68,6 +69,7 @@ from pypto.backend._ptoas_locate import PTOAS_RELEASES_URL as _PTOAS_RELEASES_UR
 from pypto.backend._ptoas_locate import check_ptoas_version as _check_ptoas_version
 from pypto.backend._ptoas_locate import find_ptoas_binary as _find_ptoas_binary
 from pypto.backend._ptoas_preprocess import preprocess_ptoas_output as _preprocess_ptoas_output
+from pypto.backend._sync_ownership import OWNED_PTO_MARKER, make_sync_ownership, validate_sync_ownership
 from pypto.compile_profiling import CompileProfiler, StageRecord
 from pypto.pypto_core import DataType as _DataType
 from pypto.pypto_core import backend as _backend_core
@@ -1861,6 +1863,7 @@ def _get_ptoas_flags(
     passes_dump_dir: str | None = None,
     *,
     buffer_id_sync: bool = False,
+    sync_owned: bool = False,
 ) -> list[str]:
     """Build the common ptoas flag list for kernel compilation.
 
@@ -1871,8 +1874,10 @@ def _get_ptoas_flags(
     request pass-target IR snapshots after every ptoas pass.
     """
     level = "level2" if memory_planner == _passes.MemoryPlanner.PTOAS else "level3"
+    if sync_owned and level != "level3":
+        raise ValueError("Whole-module synchronization ownership requires preserved physical placement")
     flags = [
-        "--enable-bufid_sync" if buffer_id_sync else "--enable-insert-sync",
+        ("--enable-insert-sync=false" if sync_owned else "--enable-bufid_sync" if buffer_id_sync else "--enable-insert-sync"),
         f"--pto-level={level}",
     ]
     if passes_dump_dir is not None:
@@ -1884,7 +1889,22 @@ def _get_ptoas_flags(
                 f"--mlir-print-ir-tree-dir={passes_dump_dir}",
             ]
         )
-    flags.extend(_backend_core.get_handler().get_extra_ptoas_flags())
+    extra = _backend_core.get_handler().get_extra_ptoas_flags()
+    if sync_owned and any(flag.startswith("--enable-insert-sync") for flag in extra):
+        raise ValueError("Backend flags conflict with qualified module synchronization ownership")
+    if sync_owned:
+        # A serialized owner does not qualify another native target. Preserve
+        # exactly the current A2/A3 selected implementation and use one durable
+        # spelling so the ownership-aware rebuild can validate its options.
+        if extra in (["--pto-arch", "a2"], ["--pto-arch=a2"]):
+            extra = ["--pto-arch=a2"]
+        elif extra in (["--pto-arch", "a3"], ["--pto-arch=a3"]):
+            extra = ["--pto-arch=a3"]
+        else:
+            raise ValueError(
+                "Whole-module synchronization ownership requires qualified A2/A3 compiler options"
+            )
+    flags.extend(extra)
     return flags
 
 
@@ -1975,6 +1995,7 @@ def _compile_pto_module(
     output_dir: str,
     memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
     dump_ptoas_passes: bool = False,
+    sync_ownership: dict[str, Any] | None = None,
 ) -> str:
     """Run PTOAS and return EmitC text; VPTO writes its object beside the PTO."""
     ptoas_dir = os.path.join(output_dir, "ptoas")
@@ -1983,6 +2004,12 @@ def _compile_pto_module(
     pto_path = os.path.join(ptoas_dir, f"{unit_name}.pto")
     with open(pto_path, "w") as f:
         f.write(pto_code)
+    sync_owned = sync_ownership is not None and validate_sync_ownership(pto_code, sync_ownership)
+    if sync_owned and sync_ownership is not None:
+        sync_ownership["compile_flags"] = _get_ptoas_flags(memory_planner, sync_owned=True)
+    if sync_ownership is not None:
+        with open(os.path.join(ptoas_dir, f"{unit_name}.sync.json"), "w") as f:
+            f.write(json.dumps(sync_ownership, indent=2) + "\n")
 
     passes_dump_dir = None
     if dump_ptoas_passes:
@@ -1999,7 +2026,7 @@ def _compile_pto_module(
     _run_ptoas(
         pto_path,
         compiled_path,
-        ptoas_flags=_get_ptoas_flags(memory_planner, passes_dump_dir, buffer_id_sync=buffer_id_sync),
+        ptoas_flags=_get_ptoas_flags(memory_planner, passes_dump_dir, buffer_id_sync=buffer_id_sync, sync_owned=sync_owned),
     )
 
     if is_vpto:
@@ -2034,6 +2061,7 @@ def _emit_single_function_output(
     skip_ptoas: bool,
     memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
     dump_ptoas_passes: bool = False,
+    sync_ownership: dict[str, Any] | None = None,
 ) -> None:
     """Emit output files for one InCore function."""
     suffix = "pto" if skip_ptoas else "cpp"
@@ -2049,9 +2077,12 @@ def _emit_single_function_output(
             output_dir,
             memory_planner,
             dump_ptoas_passes=True,
+            sync_ownership=sync_ownership,
         )
     else:
-        ptoas_cpp = _compile_pto_module(pto_code, func.name, output_dir, memory_planner)
+        ptoas_cpp = _compile_pto_module(
+            pto_code, func.name, output_dir, memory_planner, sync_ownership=sync_ownership
+        )
     if 'pto.backend = "vpto"' in pto_code.partition("\n")[0]:
         object_path = os.path.join(output_dir, "ptoas", f"{func.name}.o")
         with open(object_path, "rb") as object_file:
@@ -2088,6 +2119,7 @@ def _emit_group_output(
     skip_ptoas: bool,
     memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
     dump_ptoas_passes: bool = False,
+    sync_ownership: dict[str, Any] | None = None,
 ) -> None:
     """Emit output files for one grouped MLIR module."""
     memory_planner = _group_memory_planner(members, memory_planner)
@@ -2111,9 +2143,12 @@ def _emit_group_output(
             output_dir,
             memory_planner,
             dump_ptoas_passes=True,
+            sync_ownership=sync_ownership,
         )
     else:
-        ptoas_cpp = _compile_pto_module(pto_code, group_name, output_dir, memory_planner)
+        ptoas_cpp = _compile_pto_module(
+            pto_code, group_name, output_dir, memory_planner, sync_ownership=sync_ownership
+        )
     if 'pto.backend = "vpto"' in pto_code.partition("\n")[0]:
         object_path = os.path.join(output_dir, "ptoas", f"{group_name}.o")
         with open(object_path, "rb") as object_file:
@@ -2175,6 +2210,10 @@ class _CodegenUnit:
     # Keys are emitted function names, not the group/compilation-unit name.
     # The two AIV lanes share one entry and therefore the same helper objects.
     entry_helpers: dict[str, list[str]] = field(default_factory=lambda: dict[str, list[str]]())
+    # Actual generated subprogram, including peer functions and SIMT helpers;
+    # entry ownership alone cannot authorize skipping another body's insertion.
+    sync_domains: list[tuple[str, bool]] = field(default_factory=lambda: list[tuple[str, bool]]())
+    sync_whole_requested: bool = False
 
 
 @dataclass
@@ -2200,6 +2239,29 @@ def _emit_unit(
     PTOCodegen has already run; ``unit.pto_code`` contains the MLIR.
     """
     local_files: dict[str, str] = {}
+    sync_ownership = make_sync_ownership(
+        unit.pto_code, unit.sync_domains, [helper.symbol for helper in unit.helpers]
+    )
+    pto_code = (
+        OWNED_PTO_MARKER + unit.pto_code
+        if sync_ownership["owned"] and not unit.pto_code.startswith(OWNED_PTO_MARKER)
+        else unit.pto_code
+    )
+    sync_ownership = make_sync_ownership(
+        pto_code, unit.sync_domains, [helper.symbol for helper in unit.helpers]
+    )
+    local_files[f"ptoas/{unit.name}.sync.json"] = json.dumps(sync_ownership, indent=2) + "\n"
+    paths: list[str] = []
+    if skip_ptoas:
+        # Raw PTO requires the paired manifest and an ownership-aware driver.
+        # The ordinary standalone PTOAS CLI does not inspect this metadata.
+        paths = (
+            [f"kernels/{unit.name}.sync.json"]
+            if unit.is_group
+            else [_get_kernel_output_path(unit.funcs[0], "sync.json")]
+        )
+        for path in paths:
+            local_files[path] = json.dumps(sync_ownership, indent=2) + "\n"
     # Each helper is self-contained. ABI data is retained beside the sources for
     # review, while source contents participate in the runtime binary cache key.
     for helper in unit.helpers:
@@ -2240,6 +2302,19 @@ def _emit_unit(
         )
     ptoas_record = StageRecord(name="ptoas", start=time.perf_counter())
     try:
+        if unit.sync_whole_requested and not sync_ownership["owned"]:
+            raise ValueError(
+                "Explicit whole-module synchronization ownership lacks a qualified peer/helper domain"
+            )
+        if sync_ownership["owned"]:
+            # Semantic compiler options survive relocation/debug rebuild.
+            # Diagnostic destinations are never serialized as executable flags.
+            sync_ownership["compile_flags"] = _get_ptoas_flags(memory_planner, sync_owned=True)
+            manifest = json.dumps(sync_ownership, indent=2) + "\n"
+            local_files[f"ptoas/{unit.name}.sync.json"] = manifest
+            if skip_ptoas:
+                for path in paths:
+                    local_files[path] = manifest
         if unit.helpers and not skip_ptoas:
             ptoas_bin = _find_ptoas_binary()
             if ptoas_bin is None:
@@ -2250,21 +2325,23 @@ def _emit_unit(
                 local_files,
                 unit.name,
                 unit.funcs,
-                unit.pto_code,
+                pto_code,
                 output_dir,
                 skip_ptoas,
                 memory_planner,
                 dump_ptoas_passes,
+                sync_ownership=sync_ownership,
             )
         else:
             _emit_single_function_output(
                 local_files,
                 unit.funcs[0],
-                unit.pto_code,
+                pto_code,
                 output_dir,
                 skip_ptoas,
                 memory_planner,
                 dump_ptoas_passes,
+                sync_ownership=sync_ownership,
             )
         ptoas_record.end = time.perf_counter()
         return _EmitResult(name=unit.name, files=local_files, ptoas_record=ptoas_record)
@@ -2819,7 +2896,7 @@ def _validate_external_bridge_runtime(program: _ir_core.Program, runtime: _passe
 
 
 def _autosync_report(transformed_program: _ir_core.Program) -> dict[str, str]:
-    """Report retained selection without changing downstream synchronization."""
+    """Report retained selection; unit manifests establish downstream ownership."""
     result_files: dict[str, str] = {}
     sync_reports: list[dict[str, Any]] = []
     for function in transformed_program.functions.values():
@@ -2833,7 +2910,12 @@ def _autosync_report(transformed_program: _ir_core.Program) -> dict[str, str]:
             {
                 "function": function.name,
                 "selected_route": "pypto" if owner else "ptoas",
-                "reason": attrs.get(AUTOSYNC_FALLBACK_REASON_ATTR, "complete literal flag plan"),
+                "reason": attrs.get(
+                    AUTOSYNC_FALLBACK_REASON_ATTR,
+                    "complete module invocation contract"
+                    if attrs.get(AUTOSYNC_WHOLE_MODULE_ATTR) is True
+                    else "complete literal flag plan",
+                ),
             }
         )
         # Precision is independent of ownership and allocation. Preserve the
@@ -2843,14 +2925,35 @@ def _autosync_report(transformed_program: _ir_core.Program) -> dict[str, str]:
             AUTOSYNC_ANALYSIS_POLICY_ATTR,
             AUTOSYNC_ACCESS_PRECISION_ATTR,
             AUTOSYNC_REALIZATION_ORDER_ATTR,
+            AUTOSYNC_WHOLE_MODULE_ATTR,
         ):
             if key in attrs:
                 sync_reports[-1][key] = attrs[key]
     if sync_reports:
-        result_files["report/autosync.json"] = (
-            json.dumps({"downstream_autosync_enabled": True, "kernels": sync_reports}, indent=2) + "\n"
-        )
+        explicit = any(report.get(AUTOSYNC_WHOLE_MODULE_ATTR) is True for report in sync_reports)
+        report: dict[str, Any] = {"kernels": sync_reports}
+        if explicit:
+            report["downstream_autosync_policy"] = "per-unit-manifest"
+        else:
+            report["downstream_autosync_enabled"] = True
+        result_files["report/autosync.json"] = json.dumps(report, indent=2) + "\n"
     return result_files
+
+
+def _sync_domain_inventory(program: _ir_core.Program) -> list[tuple[str, bool]]:
+    """Inventory every body given to PTOCodegen, including linked peer/helper IR."""
+    return [
+        (
+            function.name,
+            function.func_type in (_ir_core.FunctionType.AIC, _ir_core.FunctionType.AIV)
+            and dict(function.attrs).get(PYPTO_AUTOSYNC_ATTR) is True
+            and dict(function.attrs).get(AUTOSYNC_WHOLE_MODULE_ATTR) is True
+            and not function.requires_runtime_binding
+            and _external_source_of(function) is None
+            and _builtin_template_of(function) is None,
+        )
+        for function in program.functions.values()
+    ]
 
 
 def _generate_single_chip(
@@ -2962,6 +3065,11 @@ def _generate_single_chip(
                     stage_record=stage,
                     helpers=helpers,
                     entry_helpers=entry_helpers,
+                    sync_domains=_sync_domain_inventory(grouped_program),
+                    sync_whole_requested=any(
+                        dict(f.attrs).get(AUTOSYNC_WHOLE_MODULE_ATTR) is True
+                        for f in grouped_program.functions.values()
+                    ),
                 )
             )
         except Exception as e:
@@ -3006,6 +3114,11 @@ def _generate_single_chip(
                     stage_record=stage,
                     helpers=helpers,
                     entry_helpers=entry_helpers,
+                    sync_domains=_sync_domain_inventory(single_program),
+                    sync_whole_requested=any(
+                        dict(f.attrs).get(AUTOSYNC_WHOLE_MODULE_ATTR) is True
+                        for f in single_program.functions.values()
+                    ),
                 )
             )
         except Exception as e:

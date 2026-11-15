@@ -26,6 +26,9 @@ BUFFER_IR_SELECTED_ATTR = "buffer_ir_selected"
 # Whole-kernel physical synchronization owned by RealizeSync (bool).
 PYPTO_AUTOSYNC_ATTR = "pypto_autosync"
 
+# Explicit atomic module ownership; codegen still checks every emitted domain.
+AUTOSYNC_WHOLE_MODULE_ATTR = "autosync_whole_module"
+
 # Whole-kernel delegation reason recorded by RealizeSync (str).
 AUTOSYNC_FALLBACK_REASON_ATTR = "autosync_fallback_reason"
 
@@ -85,6 +88,7 @@ REQUIRE_CONTIGUOUS_OPERANDS_ATTR = "require_contiguous_operands"
 AUTO_SCOPE_ATTR = "auto_scope"
 
 __all__ = [
+    "AUTOSYNC_WHOLE_MODULE_ATTR",
     "AUTOSYNC_ACCESS_PRECISION_ATTR",
     "AUTOSYNC_ANALYSIS_POLICY_ATTR",
     "AUTOSYNC_REALIZATION_ORDER_ATTR",

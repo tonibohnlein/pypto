@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <string>
@@ -69,6 +70,49 @@ bool IsOwnedLeaf(const FunctionPtr& function) {
   return (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV) &&
          !function->requires_runtime_binding_ && !function->HasAttr(kAttrExternalSource) &&
          !function->HasAttr(kAttrBuiltinTemplateDir);
+}
+// Explicit whole-module requests are atomic and deliberately narrower than
+// per-leaf delegation. Orchestration/group wrappers are not local PTO bodies;
+// unknown, external and per-thread helper domains require their own owner.
+void CheckWholeModuleScope(const ProgramPtr& program) {
+  const auto* context = PassContext::Current();
+  CHECK(context && context->GetMemoryPlanner() != MemoryPlanner::PtoAS)
+      << "Whole-module synchronization ownership requires PyPTO-placed storage";
+  size_t leaves = 0;
+  for (const auto& [global, function] : program->functions_) {
+    const auto type = function->func_type_;
+    if (type == FunctionType::Orchestration || type == FunctionType::Graph || type == FunctionType::Group ||
+        type == FunctionType::Spmd)
+      continue;
+    CHECK_SPAN(IsOwnedLeaf(function) && function->ir_stage_ == FunctionIRStage::Buffer, function->span_)
+        << "Whole-module synchronization ownership requires qualified local Buffer AIC/AIV leaves; "
+           "mixed, external or helper ownership is unavailable";
+    CHECK_SPAN(!function->GetAttr<bool>(kAttrPyptoAutosync), function->span_)
+        << "Whole-module synchronization ownership cannot reprocess an owned physical plan";
+    ++leaves;
+  }
+  CHECK(leaves) << "Whole-module synchronization ownership requires a local compilation domain";
+}
+ProgramPtr PublishWholeModuleOutcome(const ProgramPtr& program) {
+  for (const auto& [global, function] : program->functions_)
+    if (IsOwnedLeaf(function))
+      CHECK_SPAN(function->GetAttr<bool>(kAttrPyptoAutosync), function->span_)
+          << "Whole-module synchronization ownership refused for " << function->name_ << ": "
+          << function->GetAttr<std::string>(kAttrAutosyncFallbackReason);
+  auto functions = program->functions_;
+  for (auto& [global, function] : functions) {
+    if (!IsOwnedLeaf(function)) continue;
+    auto marked = std::make_shared<Function>(*function);
+    marked->attrs_.emplace_back(kAttrAutosyncWholeModule, true);
+    function = std::move(marked);
+  }
+  return std::make_shared<Program>(functions, program->name_, program->span_);
+}
+bool HasPhysicalCommands(const sync::LoweredLogicalSync& result) {
+  if (result.set_sites || result.wait_sites) return true;
+  return std::any_of(result.physical_cases.begin(), result.physical_cases.end(), [](const auto& candidate) {
+    return candidate.set_sites || candidate.wait_sites || candidate.barrier_sites;
+  });
 }
 // Consuming every flag does not complete the last asynchronous payload.
 // Whole-kernel ownership suppresses PTOAS's terminal drain, so explicitly
@@ -309,9 +353,10 @@ Pass OptimizeSync() {
       "OptimizeSync", PassProperties{.produced = {IRProperty::LogicalSyncValid}});
 }
 
-Pass LowerSync() {
+Pass LowerSync(bool require_whole_module) {
   return CreateProgramPass(
-      [](const ProgramPtr& program) {
+      [require_whole_module](const ProgramPtr& program) {
+        if (require_whole_module) CheckWholeModuleScope(program);
         // Re-establish caller facts from this token program. Neither insertion's
         // old analysis nor a process-global sidecar authorizes physical lowering.
         for (const auto& [global, function] : program->functions_) CheckLogicalSync(function);
@@ -332,24 +377,33 @@ Pass LowerSync() {
           auto block = evidence.block_indices.find(global->name_);
           const auto blocks =
               block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second);
+          const bool payloads =
+              require_whole_module &&
+              sync::QualifyLocalSyncInvocation(function, context->GetBackendHandler()->GetPtoTargetArch());
           auto result = sync::LowerLogicalSync(function, context->GetBackendHandler()->GetPtoTargetArch(),
                                                std::nullopt, parameters, blocks);
-          // Mark only a complete physical plan. Functions without commands
-          // continue to receive downstream PTOAS synchronization as before.
-          function =
-              result.set_sites && result.wait_sites
-                  ? CompleteOwnedInvocation(result.function, context->GetBackendHandler()->GetPtoTargetArch())
-                  : result.function;
+          // Default deployment still delegates plans lacking literal flags.
+          // The explicit request also qualifies resource-empty/native-only
+          // plans. A genuinely empty program has no asynchronous exit debt.
+          if (require_whole_module && !payloads && !HasPhysicalCommands(result))
+            function = sync::SyncOutcome(result.function, true, "");
+          else
+            function = (require_whole_module || (result.set_sites && result.wait_sites))
+                           ? CompleteOwnedInvocation(result.function,
+                                                     context->GetBackendHandler()->GetPtoTargetArch())
+                           : result.function;
         }
-        return std::make_shared<Program>(functions, program->name_, program->span_);
+        auto result = std::make_shared<Program>(functions, program->name_, program->span_);
+        return require_whole_module ? PublishWholeModuleOutcome(result) : result;
       },
       "LowerSync", PassProperties{.produced = {IRProperty::LogicalSyncValid}});
 }
 
-Pass RealizeSync() {
-  auto transform = [](const FunctionPtr& function, const sync::SyncParameterBounds& bounds,
-                      const std::optional<std::pair<int64_t, int64_t>>& block_bounds,
-                      std::optional<int64_t> block_count) -> FunctionPtr {
+Pass RealizeSync(bool require_whole_module) {
+  auto transform = [require_whole_module](const FunctionPtr& function,
+                                          const sync::SyncParameterBounds& bounds,
+                                          const std::optional<std::pair<int64_t, int64_t>>& block_bounds,
+                                          std::optional<int64_t> block_count) -> FunctionPtr {
     if (!IsInCoreType(function->func_type_)) return function;
     // These functions do not enter PTO code generation; their external owner
     // remains responsible for synchronization. Do not claim PTOAS delegation.
@@ -397,9 +451,12 @@ Pass RealizeSync() {
       const auto physical = sync::LowerLogicalSync(optimized, target, std::nullopt, bounds, block_bounds);
       // PTOAS recognizes literal flags, not empty plans or barriers, as manual
       // ownership. Do not fabricate a dummy flag or mix partial ownership.
-      if (!physical.set_sites || !physical.wait_sites)
+      if (!require_whole_module && (!physical.set_sites || !physical.wait_sites))
         return sync::SyncOutcome(function, false,
                                  "Candidate has no SET/WAIT marker; delegate the original kernel");
+      if (require_whole_module && !sync::QualifyLocalSyncInvocation(optimized, target) &&
+          !HasPhysicalCommands(physical))
+        return sync::SyncOutcome(physical.function, true, "");
       return CompleteOwnedInvocation(physical.function, target);
     } catch (const pypto::ValueError& error) {
       return sync::SyncOutcome(function, false, error.what());
@@ -408,7 +465,8 @@ Pass RealizeSync() {
   // Range evidence belongs to this closed program's call sites, not mutable
   // function metadata. Do not infer bounds when the standalone API has none.
   return CreateProgramPass(
-      [transform](const ProgramPtr& program) {
+      [transform, require_whole_module](const ProgramPtr& program) {
+        if (require_whole_module) CheckWholeModuleScope(program);
         // Never delegate unresolved logical IR or reprocess an owned physical
         // plan, even when an earlier eligibility test would skip that function.
         for (const auto& [global, function] : program->functions_) {
@@ -429,7 +487,8 @@ Pass RealizeSync() {
               block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second),
               FixedLaunchCount(evidence, global->name_));
         }
-        return std::make_shared<Program>(functions, program->name_, program->span_);
+        auto result = std::make_shared<Program>(functions, program->name_, program->span_);
+        return require_whole_module ? PublishWholeModuleOutcome(result) : result;
       },
       "RealizeSync", PassProperties{});
 }

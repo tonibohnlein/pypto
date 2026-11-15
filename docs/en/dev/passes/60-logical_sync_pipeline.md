@@ -539,3 +539,44 @@ without running recognition or constructing exports. Independent batches build
 their own indexes. No trip count is unfolded.
 This does not establish general symbolic-frame, eventful transport or whole-Qwen
 coverage.
+
+## Explicit whole-module ownership
+
+`LowerSync(require_whole_module=True)` and `RealizeSync(require_whole_module=True)`
+request atomic ownership of every local AIC/AIV Buffer body in the supplied
+Program. The default remains per-leaf flag-bearing ownership and delegation.
+The explicit request refuses unsupported helper/external/SIMT domains and any
+leaf that cannot be qualified; it never inserts fake flags as an ownership
+marker. Operation and native-resource qualification runs even when the logical
+program has no synchronization operations. Native-only/barrier-only plans retain
+an invocation drain where payload or command completion remains outstanding;
+a genuinely empty return has no asynchronous debt and needs no drain.
+
+LowerSync preserves the supplied token program. Its ownership does not assert
+that a manually supplied program covers every memory hazard; InsertSync provides
+that separate guarantee. RealizeSync uses the same logical producer/consumer and
+must additionally establish coverage for its selected exact/conservative model.
+
+An accepted explicit request publishes the reserved `autosync_whole_module`
+function attribute. Backend emission inventories the actual codegen subprogram,
+including peer functions and generated helpers. Only a completely qualified unit
+on the qualified A2/A3 target with preserved physical placement may pass
+`--enable-insert-sync=false` to PTOAS. A requested unit with an unknown
+peer/helper refuses rather than silently changing the supplied plan. Existing
+flag-only deployment keeps downstream insertion enabled and relies on PTOAS's
+literal-flag recognition.
+
+The generated PTO carries a first-line ownership marker and a sibling
+`<unit>.sync.json` manifest containing its SHA256, complete domain inventory and
+bounded compiler options. Raw exports put the manifest beside the actual PTO
+file, including grouped units. Debug rebuild validates this claim and restores
+the qualified options; an edited owned PTO, missing manifest or unsupported
+rebuild options requires recompilation from IR. The format detects accidental
+artifact mismatch; it is not an authentication mechanism. The standalone PTOAS
+CLI does not consume PyPTO manifests, so compiling raw owned PTO with that CLI's
+default options is outside this ownership contract.
+
+`test_whole_module_sync_ownership.py` exercises empty, barrier-only and final-store
+plans, mixed helper refusal, per-unit compiler options, grouped raw artifacts,
+serialization and refusal of edited/missing-manifest debug rebuilds. These are
+host-model checks; no native cache-visibility or device-execution claim follows.

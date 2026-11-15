@@ -770,9 +770,9 @@ void BindPass(nb::module_& m) {
       "Insert logical synchronization; accepted immutable children require conservative_prefix policy.");
   passes.def("optimize_sync", &pass::OptimizeSync,
              "Verify logical synchronization; initially an identity optimization stage.");
-  passes.def("lower_sync", &pass::LowerSync,
+  passes.def("lower_sync", &pass::LowerSync, nb::kw_only(), nb::arg("require_whole_module") = false,
              "Lower supported logical tokens using certified directional event resources.");
-  passes.def("realize_sync", &pass::RealizeSync,
+  passes.def("realize_sync", &pass::RealizeSync, nb::kw_only(), nb::arg("require_whole_module") = false,
              "Realize qualified placed demands as physical synchronization");
   passes.def("lower_tile_to_buffer", &pass::LowerTileToBuffer,
              "Replace planned device Tile storage with explicit Buffer IR.\n\n"
