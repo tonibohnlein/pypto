@@ -657,3 +657,64 @@ kernel admission, OptimizeSync rewrites or native/device qualification. Required
 order, actual-token order, consuming notification reuse and invocation completion
 remain distinct contracts. Allocation algorithms, pool sizes, hardware exemptions,
 logical protocols and payload schedules are unchanged.
+
+## Minimum-demand audit and deferred control cleanup (2026-11-15)
+
+The audit at `b39fc091453856ca6210c93a81394e21caa8d307` distinguishes three
+properties: retained demands equal the nonnative covers of the qualified access
+model; generated tokens express that required payload order; physical commands
+preserve the actual token order. Compilation success alone establishes none of
+these equalities. In particular, `conservative_prefix` deliberately selects a
+stronger order, and downstream PTOAS delegation is not a PyPTO minimum-demand
+result. The original whole-model capture and the separately qualified Qwen
+projection captures have different caller evidence and ownership outcomes.
+
+For exact sequential composition, `numerical_sync_merge.cpp` constructs storage
+crossings from last writers/readers and first writers/readers, includes native
+pipe crossings, and reduces the crossing set using child reachability. It does
+not simply concatenate child handoffs. With forward sequential execution, a path
+leaving a child cannot return to make one of that child's internal covers
+redundant. The hierarchy applies this merge recursively to qualified repetitions,
+preserving original coordinates and empty visits. This matches the draft's
+numerical sequence/repetition construction. It is not a claim of exact treatment
+of arbitrary interleaving or data-dependent branches.
+
+`sync_matmul_oracle.validate` independently interprets original Buffer addresses,
+constructs concrete conflicts, computes closure and covers, and compares the
+actual retained demand records after bounded expansion. It also checks all four
+event-kind queries and storage selectors at sampled boundary/interior points.
+Regional tests cover unequal siblings, alternative merge parenthesizations,
+resident storage, nested rotations, counter resets, empty visits and qualified
+initialization/accumulation branches. Separate logical/physical interpreters
+check payload-order equality, matching and causal flag reuse where claimed.
+These are bounded checks under declared layout, alias and native-operation
+contracts; they do not independently qualify native footprints or prove every
+parameter instance by enumeration. Guarded invocation partitions are qualified
+cases, not a general minimum-demand construction for arbitrary runtime branches.
+
+Two avoidable emitted-control patterns are recorded for later work, without
+changing the compiler or the selected synchronization plan:
+
+1. Qwen output: a final `SET(M,FIX,0)` guarded by `stage == 18` at the end of
+   `for (stage=0; stage<20; stage+=2)` can move just beyond that nonempty loop,
+   inside the same enclosing visit. No payload or command is crossed. The
+   general rule needs nonemptiness, a terminal legal cut and compatible exit
+   control; it cannot introduce a publication for a zero-trip loop.
+2. Qwen gate/up: adjacent alternatives at one cut both test `k == 192`.
+   Factor that test once; for `stage` in `{0,2,...,18}`, use `else` instead of a
+   separate `stage == 18` test after `stage < 18`. Preserve the worker guard and
+   the two different IDs. Five conditional statements become three without
+   payload duplication. Commands separated by payloads or another publication
+   must not be regrouped by this argument.
+
+Generated-C++ rewrite experiments preserved ordered payload-macro/flag traces
+for 40 output and 48 gate/up invocations. These checks are host-only, and do not
+establish device speedups. The terminal invocation drain remains a separate
+completion obligation; it adds no internal completion-to-start payload pair.
+The fresh serial pytest gates passed 602 and 268 tests (870 total, no failures or
+skips; 24 existing inline-helper deprecation warnings). The C++ numerical-order
+gate also passed its 2,000 supplied-order graph seeds; that gate checks queries,
+not storage extraction or minimality by itself. Nested compactness regressions
+include million-trip counts without payload-visit expansion. No minimum-demand,
+order-preservation or reuse counterexample was found in these checked cases.
+See `39-regional-sync-minimum-audit.json` for the pinned validation receipt.
