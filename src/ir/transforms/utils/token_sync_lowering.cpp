@@ -341,6 +341,39 @@ bool HasLogicalSync(const FunctionPtr& function) {
   logical.VisitFunction(function);
   return logical.found;
 }
+void CheckPhysicalSyncResult(const FunctionPtr& function) {
+  // A successful physical result must be standalone executable IR. Looking
+  // only for logical calls misses aliases, carries, tuple members and signatures
+  // left behind after their token-producing definitions have been erased.
+  class PhysicalResult : public IRVisitor {
+   public:
+    void CheckType(const TypePtr& type, const Span& span) {
+      if (!type || !types_.insert(type.get()).second) return;
+      INTERNAL_CHECK_SPAN(!As<SyncTokenType>(type), span)
+          << "Internal error: physical synchronization left a logical token type";
+      if (const auto tuple = As<TupleType>(type))
+        for (const auto& member : tuple->types_) CheckType(member, span);
+    }
+    void VisitExpr(const ExprPtr& expression) override {
+      if (!expression || !seen_.insert(expression.get()).second) return;
+      CheckType(expression->GetType(), expression->span_);
+      IRVisitor::VisitExpr(expression);
+    }
+
+   protected:
+    void VisitExpr_(const CallPtr& call) override {
+      INTERNAL_CHECK_SPAN(GetLogicalSyncKind(call->op_) == LogicalSyncKind::None, call->span_)
+          << "Internal error: physical synchronization left a logical operation";
+      IRVisitor::VisitExpr_(call);
+    }
+
+   private:
+    std::set<const Expr*> seen_;
+    std::set<const Type*> types_;
+  } physical;
+  for (const auto& type : function->return_types_) physical.CheckType(type, function->span_);
+  physical.VisitFunction(function);
+}
 void CheckGeneratedLogicalSync(const FunctionPtr& function) {
   std::vector<Diagnostic> diagnostics;
   VerifyLogicalSync(function, diagnostics);
@@ -365,11 +398,13 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
   if (!HasLogicalSync(function)) {
     PhysicalSyncRealization result;
     result.function = function;
+    CheckPhysicalSyncResult(result.function);
     FinishSyncScheduleReceipt(function, result, policy);
     return {function, 0, 0, {std::move(result)}};
   }
   FindLogical(true).VisitFunction(function);
   if (auto closed = TryLowerClosedPrefixSync(function, target, eligible_ids)) {
+    CheckPhysicalSyncResult(closed->function);
     FinishSyncScheduleReceipt(closed->function, *closed, policy);
     return {closed->function, closed->set_sites, closed->wait_sites, {std::move(*closed)}};
   }
@@ -382,14 +417,18 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
     void VisitExpr(const ExprPtr&) override {}
   } structure;
   structure.VisitFunction(function);
-  if (structure.loop)
-    return LowerStructuredLogicalSync(function, target, eligible_ids, parameters, blocks, policy,
-                                      external_policy);
+  if (structure.loop) {
+    auto result = LowerStructuredLogicalSync(function, target, eligible_ids, parameters, blocks, policy,
+                                             external_policy);
+    CheckPhysicalSyncResult(result.function);
+    return result;
+  }
   auto stripped = StripTokens().VisitFunction(function);
   // No storage-demand importer or GM partition authorizes this lowering.
   // Actual token uses, including manually supplied ordering, are authoritative.
   auto input = ImportSyncPayloads(stripped, target, parameters, blocks, external_policy);
   auto result = FiniteLowering(function, std::move(input), target, eligible_ids).Run();
+  CheckPhysicalSyncResult(result.function);
   FinishSyncScheduleReceipt(result.function, result, policy);
   return {result.function, result.set_sites, result.wait_sites, {std::move(result)}};
 }

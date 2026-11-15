@@ -120,6 +120,7 @@ bool HasPhysicalCommands(const sync::LoweredLogicalSync& result) {
 // Internal child lowering never calls this wrapper: a child may return pending
 // payloads. This changes the invocation boundary, not the internal demand set.
 FunctionPtr CompleteOwnedInvocation(const FunctionPtr& function, const std::string& target) {
+  sync::CheckPhysicalSyncResult(function);
   const auto& execution = backend::RequireLocalSyncExecutionContract(target);
   // Current leaf import admits a canonical terminal return. Reject fallthrough
   // rather than publish an ownership marker with an uncovered exit.

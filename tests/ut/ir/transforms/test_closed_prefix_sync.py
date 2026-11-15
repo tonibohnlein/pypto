@@ -18,6 +18,7 @@ from pypto.ir.op import sync
 from .sync_closed_command_oracle import ClosedCommands, check_closed_commands, opname
 from .test_autosync_switch import clone
 from .test_conservative_sync_dataflow import conservative_fixture
+from .test_logical_sync_realization import verify
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
 SPAN = ir.Span.unknown()
@@ -383,3 +384,36 @@ def test_all_completion_does_not_consume_outstanding_flags():
     invalid = clone(command_fixture(), body=seq(publication, barrier, ir.ReturnStmt([], SPAN)))
     with pytest.raises(AssertionError, match="outstanding flags"):
         ClosedCommands(invalid, {0: 0, 1: 0, 2: 0}, SIX_IDS).run()
+
+
+@pytest.mark.parametrize("payloads", [False, True])
+@pytest.mark.parametrize("optimized", [False, True])
+@pytest.mark.parametrize("roundtrip", [False, True])
+def test_completed_alias_chain_is_eliminated_before_ownership(payloads, optimized, roundtrip):
+    # Empty facts and their unused aliases are valid unoptimized token IR.
+    # Erasing only the original definition used to publish an owned function
+    # containing a free token variable; verify the actual physical output too.
+    original = manual_payload_protocol("for") if payloads else command_fixture()
+    aliases = []
+    token = ir.Var("empty_fact", ir.SyncTokenType(PIPES[0]), SPAN)
+    aliases.append(ir.AssignStmt(token, sync.completed(PIPES[0]), SPAN))
+    for index in range(3):
+        alias = ir.Var(f"empty_alias_{index}", token.type, SPAN)
+        aliases.append(ir.AssignStmt(alias, token, SPAN))
+        token = alias
+    logical = clone(original, body=seq(*aliases, original.body))
+    if roundtrip:
+        logical = ir.deserialize(ir.serialize(logical))
+        assert isinstance(logical, ir.Function)
+    verify(logical)
+    program = ir.Program([logical], "CompletedAliases", SPAN)
+    with passes.PassContext([], enable_pypto_autosync=True):
+        if optimized:
+            program = passes.optimize_sync()(program)
+        output = passes.lower_sync()(program)
+    physical = next(iter(output.functions.values()))
+    verify(physical)
+    assert "SyncToken" not in str(physical)
+    assert "empty_alias" not in str(physical)
+    parameters = {3: 3, 4: 2, 5: 1} if payloads else {0: 3, 1: 2, 2: 1}
+    check_closed_commands(logical, physical, parameters, range(8), compare_commands=False)
