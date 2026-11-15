@@ -22,6 +22,10 @@ namespace pypto::ir::sync {
 // execution qualification. It lets public lowering avoid unrelated occurrence
 // bound recovery when the actual program uses only current-cut transactions.
 bool HasOnlyClosedPrefixSyntax(const FunctionPtr& function);
+// Establish operation/native-resource eligibility even for an empty logical
+// program. This interprets no required-order edges and supplies no coverage
+// claim: explicit LowerSync still consumes the caller's actual token program.
+bool QualifyLocalSyncInvocation(const FunctionPtr& function, const std::string& target);
 // Interpret actual four-command logical transactions at original structured
 // cuts. Absence means the token language is not this class; a qualified-looking
 // program with unavailable native/resource evidence refuses before any emission.

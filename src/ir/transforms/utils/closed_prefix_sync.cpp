@@ -25,6 +25,7 @@
 #include "pypto/ir/sync.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/retained_sync_child.h"
@@ -350,6 +351,22 @@ class Emit : public IRMutator {
   const std::map<const ForStmt*, StmtPtr>& children_;
 };
 }  // namespace
+
+bool QualifyLocalSyncInvocation(const FunctionPtr& function, const std::string& target) {
+  backend::RequireLocalSyncExecutionContract(target);
+  NativeOperations native(function->func_type_, target);
+  native.VisitFunction(function);
+  // Even a token-free plan may contain a native macro with hidden claims.
+  // Resolve every selected variant instead of interpreting zero flags as an
+  // independently established resource-empty implementation.
+  (void)SyncNativeClaims(function, native.payloads, target);
+  // Descriptor sentinels do not prove the selected native implementation's
+  // runtime shape relations. Ownership must consume the same use-site proof as
+  // Buffer code generation, including for token-free native-only programs.
+  const BufferRuntimeValidAnalysis metadata(function);
+  if (const auto& issue = metadata.issue()) CHECK_SPAN(false, issue->call->span_) << issue->message;
+  return !native.payloads.empty();
+}
 
 bool HasOnlyClosedPrefixSyntax(const FunctionPtr& function) {
   Discover discovered;

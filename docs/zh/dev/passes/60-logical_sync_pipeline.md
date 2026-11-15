@@ -316,3 +316,29 @@ with passes.PassContext([], autosync_policy="conservative_prefix"):
 （每批只计一次）、单查询作用域节点数及捕获定义数，不运行识别或构造导出。独立批次
 构造各自的索引，不展开循环次数。这不代表一般符号帧、带事件通信
 或整个 Qwen 的覆盖。
+
+## 显式整模块同步所有权
+
+`LowerSync(require_whole_module=True)` 和 `RealizeSync(require_whole_module=True)`
+原子请求所给 Program 内所有本地 AIC/AIV Buffer 函数的同步所有权。默认仍保留有
+标志命令的逐叶所有权和委托。未知 helper、外部或 SIMT 执行域会拒绝整个请求。
+即使没有逻辑同步操作，也验证实际操作和原生资源，不能用伪标志命令表示所有权。
+存在未完成载荷或命令时保留调用末尾 drain；真正空返回没有异步义务，无需 drain。
+
+LowerSync 保持实际 token 程序，不能据此声称手写 token 已覆盖所有内存冲突；后者
+是 InsertSync 的独立保证。RealizeSync 还需证明所选精确或保守模型的依赖覆盖。
+成功的显式请求发布保留属性 `autosync_whole_module`。后端检查实际代码生成单元的
+全部函数、peer 和生成 helper，仅在合格 A2/A3 目标上保持原物理放置、且全部已限定的单元才能对 PTOAS 使用
+`--enable-insert-sync=false`。显式请求遇到未知域时拒绝，不静默委托更改方案。
+原有仅标志所有权部署仍启用下游插入，由 PTOAS 识别已有标志。
+
+生成的 PTO 包含首行所有权标记，配套 `<unit>.sync.json` 记录 SHA256、全部域及
+限定的编译参数；组模块的 raw 导出同样将 manifest 放在实际 PTO 文件旁。
+调试重建验证字节哈希并恢复参数。修改过的 owned PTO、缺少 manifest 或不支持的
+参数都要求从 IR 重新编译。该格式检测意外文件不匹配，不是认证机制。
+独立 PTOAS CLI 不读取 PyPTO manifest，使用其默认选项编译 raw owned PTO 不在
+此所有权合同内。
+
+`test_whole_module_sync_ownership.py` 验证空方案、仅 barrier、最终 store、混合
+helper 拒绝、逐模块参数、组 raw 文件、序列化及调试重建拒绝。全部为主机模型检查，
+不证明原生缓存可见性或设备执行。

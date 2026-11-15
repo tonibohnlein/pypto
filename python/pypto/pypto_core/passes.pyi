@@ -966,15 +966,21 @@ def insert_sync(
 def optimize_sync() -> Pass:
     """Verify logical synchronization and return it unchanged."""
 
-def lower_sync() -> Pass:
+def lower_sync(*, require_whole_module: bool = False) -> Pass:
     """Lower supported logical token programs to certified physical commands.
 
     Consumes token definitions and uses, including manually supplied dependencies.
     Unsupported token control flow or insufficient physical evidence raises.
+    require_whole_module atomically qualifies all local AIC/AIV Buffer domains,
+    including empty/barrier-only plans, and refuses unsupported helper owners.
     """
 
-def realize_sync() -> Pass:
-    """Try whole-kernel physical synchronization; delegate unqualified bodies unchanged."""
+def realize_sync(*, require_whole_module: bool = False) -> Pass:
+    """Try whole-kernel physical synchronization; delegate unqualified bodies unchanged.
+
+    require_whole_module refuses the entire request if any local domain lacks
+    operation, resource or invocation-completion evidence. Default is False.
+    """
 
 def lower_tile_to_buffer() -> Pass:
     """Replace planned device Tile storage with explicit Buffer IR.

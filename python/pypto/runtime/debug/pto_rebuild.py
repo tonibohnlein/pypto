@@ -37,6 +37,7 @@ from pypto.backend._ptoas_config import get_ptoas_timeout
 from pypto.backend._ptoas_locate import check_ptoas_version as _check_ptoas_version
 from pypto.backend._ptoas_locate import find_ptoas_binary as _ptoas_binary
 from pypto.backend._ptoas_preprocess import preprocess_ptoas_output as _preprocess_ptoas_body
+from pypto.backend._sync_ownership import owned_rebuild_flags
 
 __all__ = ["rebuild_kernel_cpp_from_pto", "PTOAS_BODY_BEGIN", "PTOAS_BODY_END"]
 
@@ -89,7 +90,10 @@ def _run_ptoas(ptoas_bin: str, pto_path: Path, out_cpp: Path) -> None:
     _check_ptoas_version(ptoas_bin)
     timeout = get_ptoas_timeout()
     pto_content = pto_path.read_text(encoding="utf-8")
-    cmd = [ptoas_bin, str(pto_path), "-o", str(out_cpp), *_ptoas_flags(pto_content)]
+    flags = owned_rebuild_flags(pto_path, pto_content)
+    if flags is None:
+        flags = _ptoas_flags(pto_content)
+    cmd = [ptoas_bin, str(pto_path), "-o", str(out_cpp), *flags]
     result = subprocess.run(  # noqa: S603 — args are constructed locally, no shell
         cmd,
         capture_output=True,

@@ -344,10 +344,13 @@ Pass OptimizeSync();
 
 /// Lower the supported logical token subset using certified physical resources.
 /// This consumes token semantics, not a recomputed minimum-demand inventory.
-Pass LowerSync();
+/// require_whole_module atomically qualifies every emitted local domain, including
+/// token-free/native-only plans; unsupported helper or external owners refuse.
+Pass LowerSync(bool require_whole_module = false);
 
 /// Opt-in whole-kernel physical synchronization; qualification refusals delegate to PTOAS.
-Pass RealizeSync();
+/// require_whole_module instead refuses the entire request on any unqualified domain.
+Pass RealizeSync(bool require_whole_module = false);
 
 /// Select whole kernels for the default Buffer rollout before storage legalization.
 Pass SelectBufferIRFunctions();

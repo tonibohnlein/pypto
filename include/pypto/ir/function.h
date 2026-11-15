@@ -451,6 +451,10 @@ inline constexpr const char* kAttrSpmdUnwrapped = "spmd_unwrapped";
 // PTOAS remains enabled and skips those functions by its explicit-sync contract.
 // Retained through printing/parsing; not permission to skip analysis of new IR.
 inline constexpr const char* kAttrPyptoAutosync = "pypto_autosync";
+// Explicit atomic module request accepted by LowerSync/RealizeSync. Backend
+// still inventories every emitted peer/helper before suppressing PTOAS insertion.
+// Default flag-bearing ownership does not set this stronger transport marker.
+inline constexpr const char* kAttrAutosyncWholeModule = "autosync_whole_module";
 // RealizeSync records admission/refusal details without modifying the original
 // payload body. Backend publishes them in report/autosync.json; preserved in IR.
 inline constexpr const char* kAttrAutosyncFallbackReason = "autosync_fallback_reason";
