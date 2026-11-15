@@ -114,11 +114,13 @@
       "historical_unverified_owner_domains": 47
     },
     "remaining": [
+      "Review repairs R1-R4 must pass before resuming coverage expansion",
       "Mixed-full/partial ADD and carrier value-domain contracts",
       "Scalar GM visibility and readiness",
-      "Cross-core readiness, release and ownership",
+      "Qualified local boundaries around existing manual protocols; no new cross-core or inter-kernel synchronization",
       "Additional symbolic caller/GM export contracts",
-      "Whole-model native/device qualification"
+      "Remaining shared regional capabilities under original contracts; additional common-completion construction only if needed under a separate M3 subgate",
+      "Whole-model local ownership and separate native/device qualification"
     ],
     "all_original_milestones_complete": false,
     "task_domain_report": "41-general-autosync-task-domains.json"
@@ -128,5 +130,120 @@
   "scope_clarification_20261115": {
     "user_instruction": "Do not implement cross-core synchronization beyond existing hand/native/compiler-owned protocols; match local autosync scope.",
     "M4": "Qualified local boundary effects and resource coexistence only; no new peer handshake, matching or rearming construction. Unknown boundaries remain delegated."
+  },
+  "review_repair_plan_20261116": {
+    "status": "Independent three-file plan review accepted; repair implementation not resumed",
+    "original_goal": "Retain M1-M6 and unchanged-Qwen qualification through reusable local synchronization services; repairs are prerequisites, not a replacement goal",
+    "external_review": {
+      "base": "bef68ac841798bc136b2956de9c8d3d505119268",
+      "head": "ef3572fd21126f0d74aab49811ae13abb4d969e6",
+      "claims": "Four P2 mechanisms supported by local source inspection; no fresh execution reproduced during this plan-only update",
+      "test_evidence": "External aggregated runs are not a current local fresh green gate"
+    },
+    "committed_head": "3521d7f640582ef51008ccb47dc74d09d7556737",
+    "paused_edits": [
+      "M2 active-domain normalization",
+      "M2/M3 blocking scalar payloads",
+      "M5 effective invocation coordinates"
+    ],
+    "scope_excluded": [
+      "new cross-core synchronization construction",
+      "new inter-kernel synchronization construction",
+      "allocation algorithm changes",
+      "larger ID pool, admission limits or watchdogs"
+    ],
+    "gates": [
+      {
+        "id": "R1",
+        "owner": [
+          "closed_prefix_sync.cpp",
+          "token_sync_lowering.cpp",
+          "token_sync.cpp"
+        ],
+        "work": [
+          "distinct-expression-safe discovery with separate occurrence accounting",
+          "complete supported pure-token alias elimination or pre-mutation refusal",
+          "final no-logical-operators and no-token-typed-IR postcondition"
+        ],
+        "acceptance": [
+          "28-node shared-join public lowering regression and structural work scaling",
+          "completed aliases with/without payloads, branches/carries/captures, optimizer on/off and serialization",
+          "SSA, token semantics, matching, acyclicity, reuse and PTOAS generation"
+        ],
+        "status": "planned"
+      },
+      {
+        "id": "R2",
+        "owner": [
+          "shared selected-native contract and existing placement/view evidence",
+          "exact importer",
+          "conservative importer",
+          "actual-token/native ownership qualification"
+        ],
+        "work": [
+          "share selected-variant operand/implicit-workspace separation check",
+          "retain implicit cross-operation hazards separately from within-instruction legality",
+          "preserve refusal for insufficient local placement evidence without requiring exact GM selectors"
+        ],
+        "acceptance": [
+          "workspace-alias negative through both policies and public ownership/lowering",
+          "legal controls, aliases/views, byte boundaries, reservations and unavailable bounds",
+          "transactional IR/resource/ownership behavior"
+        ],
+        "status": "planned"
+      },
+      {
+        "id": "R3",
+        "owner": [
+          "buffer_valid_analysis.h",
+          "shared row recipes",
+          "lower_tile_to_buffer_pass.cpp"
+        ],
+        "work": [
+          "restore static logical valid metadata and use-site descriptor for promoted row operands",
+          "preserve physical geometry, scratch/output metadata, zero guards and alias ownership",
+          "reject before Buffer selection when bridge is unavailable"
+        ],
+        "acceptance": [
+          "static partial/full columns plus dynamic alias across PYPTO/DSA_RP/PTOAS planners",
+          "Buffer-disabled control and dynamic metadata negative cases",
+          "descriptor, access, value and guard agreement"
+        ],
+        "status": "planned"
+      },
+      {
+        "id": "R4",
+        "owner": [
+          "affected regression modules",
+          "nested physical-realization cost owner after attribution"
+        ],
+        "work": [
+          "correct stale expectations at actual changed API boundaries",
+          "fresh single complete focused regression gate",
+          "separately attribute nested physical-realization growth and repair demonstrated repeated work under its own review"
+        ],
+        "acceptance": [
+          "pinned source/build/tool/input and retained failure/watchdog evidence",
+          "native ownership/final-drain and debug-rebuild smoke checks",
+          "controlled nesting with fixed token/assignment policy; stage/counter accounting separated from exhaustive oracles"
+        ],
+        "status": "planned"
+      }
+    ],
+    "execution_order": [
+      "R1 reviewed and committed",
+      "R2 reviewed and committed",
+      "R3 reviewed and committed",
+      "R4 fresh regression and separate scaling gate",
+      "revalidate paused M2/M3 and M5 packages against repaired base",
+      "complete remaining M4 and M6 acceptance under original contracts"
+    ],
+    "review_loop": "Implement, independent reviewer acceptance, exact-package commit; repair and re-review on failure before dependent work",
+    "completion_rule": "Do not declare all milestones complete from a repaired base, a delegated whole-model compile or qualified prefix/child support alone. Do not add a mandatory common-completion algorithm: retain the original conditional M3 subgate.",
+    "plan_review": {
+      "status": "accepted",
+      "scope": "EN/ZH architecture plan and companion JSON only",
+      "validation": "Source inspection and documentation checks; no fresh compiler defect reproduction, build, runtime or device validation"
+    }
   }
 }
