@@ -172,6 +172,11 @@ TypePtr DeduceBufferTransfer(const std::vector<ExprPtr>& args, bool load) {
   CHECK(tensor->shape_.size() == 2 && buffer->shape_.size() == 2)
       << name << " requires rank-2 tensor and buffer operands";
   CheckTransferEndpoints(*tensor, *buffer, load, name);
+  const auto tensor_columns = As<ConstInt>(tensor->shape_[1]);
+  if (backend::IsColumnVectorBuffer(buffer) || (tensor_columns && tensor_columns->value_ == 1)) {
+    CHECK(backend::SupportsPackedColumnBufferTransfer(tensor, buffer))
+        << name << " column transfers require packed singleton-column GM and full-valid FP32 columns";
+  }
   auto offsets = As<MakeTuple>(args[1]);
   auto valid = As<MakeTuple>(args[2]);
   CHECK(offsets && offsets->elements_.size() == 2 && valid && valid->elements_.size() == 2)

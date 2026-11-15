@@ -1,0 +1,54 @@
+{
+  "base_revision": "4e54c546e4d8eeff5bf92bf065f9c8f37e13503e",
+  "gate": "packed full-valid column transfer",
+  "review": "independent reviewer accepted native/source design, target guard and explicit moving-GM export refusal",
+  "paths": {
+    "include/pypto/backend/common/buffer_type_support.h": "0850f05bb390188f3706617a03e5d6181159e145bbf56f6bac0b8326425733fd",
+    "src/codegen/pto/pto_buffer_codegen.cpp": "cb8b938a8ec799d8d7d747285df594412f87c2bef86f16faa0d6691f774d00b5",
+    "src/ir/op/buffer_ops/memory.cpp": "fc000786c2f8e7ccee4e15a981c7899d98a2efddbde4a5c562d1d58d5a658c63",
+    "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "28e0804baf0911d4fbd3b9d6ebcae668318e761e589409d8977f9f40a95cd32c",
+    "tests/ut/ir/transforms/test_column_sync_transfer.py": "bc072f3c724b4a71f50dd7a96b1bc84212db065e1b7ef93569a4c8b9dc91ce21",
+    "docs/en/dev/passes/58-lower_tile_to_buffer.md": "9479c84e7571af5262cd9ff4ff070240d5541ed5eb8705e883e89bde263572b1",
+    "docs/zh/dev/passes/58-lower_tile_to_buffer.md": "7e1576f02cd2b23613bb17e7da3ff4a2fcc378eba69c0c379261a9e1696a832c"
+  },
+  "binary_sha256": "59e68cabeea500e1631214b89964f6d891d1fe38165fcb581834275bcc9fd42e",
+  "qualification_scope": "The workspace binary also contains concurrent, uncommitted eventful-child work. These tests exercise ordinary transfer routes. This is not an isolated clean-commit build receipt; a final integrated build is required for the complete milestone batch.",
+  "native_headers": {
+    "build-py314/packed-column-contract/TLoad.hpp": "28a849ffef4fcb7772b18e3f443bddea873cf9723c0849b620c4f2d6415f8ea6",
+    "build-py314/packed-column-contract/tload_common.hpp": "8fe56369f36a11f26c37e153063143c7f8ea8d0f93399613ac20bb239625f781",
+    "build-py314/packed-column-contract/TStore.hpp": "5ac8b76106cdfa77e182d062453b7b4b2c447917113393415e032becedd697aa",
+    "build-py314/packed-column-contract/tstore_common.hpp": "d1ea6f21d2bfb88b6d0f20d28036180a814c773be41a2b0ae758599d68c7005f",
+    "build-py314/packed-column-contract/TRowSum.hpp": "32461a74dcf1697eef87cf7af100a407d5c4ae644b0b3d22d468870c31e8fee0",
+    "build-py314/packed-column-contract/TRowMax.hpp": "2e535e1a5bb5c76239ad7ba33ea5b822a35e7cb19d2fb5936d3a0fb6f6dff632",
+    "build-py314/packed-column-contract/TRowExpandMul.hpp": "6848d414aa542af8d136c2dddf7809e17b2da397dc97660d9332796c79cf456b",
+    "build-py314/packed-column-contract/TRowExpandBinOp.hpp": "7a37a1b24db962fe028df5b2ded7da4b32448fd7504cfc6b11298ec61d15f6ef",
+    "build-py314/packed-column-contract/TRowReduceOps.hpp": "ca6645d76b7abb931ab8c1fdf1bd05090c10f29d3c289da12bdcafc5a87d5dce"
+  },
+  "commands": [
+    "cmake --build build-py314 --parallel 2",
+    "python -m pytest -q --require-ptoas tests/ut/ir/transforms/test_column_sync_transfer.py",
+    "python -m pytest -q --require-ptoas tests/ut/ir/transforms/test_column_sync_transfer.py tests/ut/ir/transforms/test_row_sync_analysis.py tests/ut/ir/transforms/test_select_buffer_ir_functions.py tests/ut/codegen/test_buffer_view_codegen.py tests/ut/ir/transforms/test_external_sync_geometry.py"
+  ],
+  "results": {
+    "focused": "59 passed",
+    "regression": "923 passed",
+    "device": "not run"
+  },
+  "logs": {
+    "build-py314/column-transfer-20261115/tests-accepted.log": "d4304aa807af813e315b50efecba67025ce2a917e0aeb69649e0831b6db2f711",
+    "build-py314/column-transfer-20261115/regression.log": "4e632453d0aa68d04aa74bede86128d03dcdd69e44db7ecc7a7a4cc9126d4487",
+    "build-py314/column-transfer-20261115/build-a5-guard.log": "5a170d3b83a636c1e8cca8dfbbb72ab1eb578eaccb13e3a6e25d88051bb98432",
+    "build-py314/column-transfer-20261115/hooks-accepted.log": "c244e168a19b1c04745abdca208ee41a19014934b8492ee9ad9cba3aa0d37274",
+    "build-py314/column-transfer-20261115/types-final.log": "0b7249c7b442157826036b3870a1681ed1573cbfbaadba18774e2e43275835b8"
+  },
+  "limits": [
+    "A2/A3 qualified native transfer only; A5 remains refused.",
+    "Full-valid static FP32 local column and packed static GM column only.",
+    "Moving GM writes across repeated/reset regions retain a separate regional export refusal.",
+    "No allocation-algorithm, pool-size, native-order exemption or expert-protocol changes."
+  ],
+  "checks": {
+    "configured_hooks": "All non-type hooks passed in hooks-accepted.log; pyright then passed in types-final.log after restoring tracked examples in exact typing snapshot.",
+    "snapshot": "HEAD Python/tests/typings/examples plus this new transfer test; excludes unrelated unfinished milestone sources. Project typing rules unchanged."
+  }
+}
