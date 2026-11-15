@@ -310,7 +310,8 @@ PassContext::PassContext(std::vector<PassInstrumentPtr> instruments, Verificatio
                          DiagnosticPhase diagnostic_phase, DiagnosticCheckSet disabled_diagnostics,
                          MemoryPlanner memory_planner, bool enable_pypto_l0c_double_buffer,
                          RuntimeKind runtime, bool enable_buffer_ir, bool enable_software_pipeline,
-                         bool report_hardware_loops, bool enable_pypto_autosync, bool autosync_disjoint_gm)
+                         bool report_hardware_loops, bool enable_pypto_autosync, bool autosync_disjoint_gm,
+                         std::string autosync_policy)
     : report_hardware_loops_(report_hardware_loops),
       instruments_(std::move(instruments)),
       verification_level_(verification_level),
@@ -323,7 +324,10 @@ PassContext::PassContext(std::vector<PassInstrumentPtr> instruments, Verificatio
       enable_software_pipeline_(enable_software_pipeline),
       enable_pypto_autosync_(enable_pypto_autosync),
       autosync_disjoint_gm_(autosync_disjoint_gm),
+      autosync_policy_(std::move(autosync_policy)),
       previous_(nullptr) {
+  CHECK(autosync_policy_ == "exact" || autosync_policy_ == "conservative_prefix")
+      << "autosync_policy must be exact or conservative_prefix";
   CHECK(!enable_software_pipeline_ || memory_planner_ == MemoryPlanner::PyPTO)
       << "enable_software_pipeline requires memory_planner=PYPTO";
   CHECK(!enable_software_pipeline_ || !enable_buffer_ir_)
@@ -337,6 +341,8 @@ MemoryPlanner PassContext::GetMemoryPlanner() const { return memory_planner_; }
 bool PassContext::GetEnablePyptoAutoSync() const { return enable_pypto_autosync_; }
 
 bool PassContext::GetAutoSyncDisjointGM() const { return autosync_disjoint_gm_; }
+
+const std::string& PassContext::GetAutoSyncPolicy() const { return autosync_policy_; }
 
 RuntimeKind PassContext::GetRuntime() const { return runtime_; }
 

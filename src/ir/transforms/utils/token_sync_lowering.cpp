@@ -35,6 +35,7 @@
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/verifier/sync.h"
+#include "src/ir/transforms/utils/closed_prefix_sync.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
 
@@ -368,6 +369,10 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
     return {function, 0, 0, {std::move(result)}};
   }
   FindLogical(true).VisitFunction(function);
+  if (auto closed = TryLowerClosedPrefixSync(function, target, eligible_ids)) {
+    FinishSyncScheduleReceipt(closed->function, *closed, policy);
+    return {closed->function, closed->set_sites, closed->wait_sites, {std::move(*closed)}};
+  }
   class Structure : public IRVisitor {
    public:
     bool loop = false;

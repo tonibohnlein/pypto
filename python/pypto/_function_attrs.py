@@ -30,12 +30,15 @@ PYPTO_AUTOSYNC_ATTR = "pypto_autosync"
 AUTOSYNC_FALLBACK_REASON_ATTR = "autosync_fallback_reason"
 
 
-# Versioned selector refusals; diagnostic evidence never authorizes lowering.
+# Selector refusal and producer diagnostics; never authorize synchronization.
 BUFFER_ADMISSION_VERSION_ATTR = "buffer_admission_version"
 BUFFER_ADMISSION_PROPERTY_ATTR = "buffer_admission_property"
 BUFFER_ADMISSION_STAGE_ATTR = "buffer_admission_stage"
 BUFFER_ADMISSION_OPERATION_ATTR = "buffer_admission_operation"
 BUFFER_ADMISSION_LOCATION_ATTR = "buffer_admission_location"
+AUTOSYNC_ANALYSIS_POLICY_ATTR = "autosync_analysis_policy"
+AUTOSYNC_ACCESS_PRECISION_ATTR = "autosync_access_precision"
+AUTOSYNC_REALIZATION_ORDER_ATTR = "autosync_realization_order"
 
 # AIV kernel running on BOTH vector sub-lanes of a mixed kernel (bool).
 DUAL_AIV_DISPATCH_ATTR = "dual_aiv_dispatch"
@@ -79,6 +82,9 @@ REQUIRE_CONTIGUOUS_OPERANDS_ATTR = "require_contiguous_operands"
 AUTO_SCOPE_ATTR = "auto_scope"
 
 __all__ = [
+    "AUTOSYNC_ACCESS_PRECISION_ATTR",
+    "AUTOSYNC_ANALYSIS_POLICY_ATTR",
+    "AUTOSYNC_REALIZATION_ORDER_ATTR",
     "BUFFER_ADMISSION_LOCATION_ATTR",
     "BUFFER_ADMISSION_OPERATION_ATTR",
     "BUFFER_ADMISSION_PROPERTY_ATTR",

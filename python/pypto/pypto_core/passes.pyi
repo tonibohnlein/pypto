@@ -14,7 +14,15 @@ from types import TracebackType
 from typing import Any, overload
 
 from pypto.pypto_core.backend import Backend
-from pypto.pypto_core.ir import Function, HardwareLoopProfile, HardwareLoopQualification, Program, Span, Stmt
+from pypto.pypto_core.ir import (
+    ForStmt,
+    Function,
+    HardwareLoopProfile,
+    HardwareLoopQualification,
+    Program,
+    Span,
+    Stmt,
+)
 
 class IRProperty(Enum):
     """Verifiable IR properties."""
@@ -313,6 +321,7 @@ class PassContext:
         report_hardware_loops: bool = False,
         enable_pypto_autosync: bool = False,
         autosync_disjoint_gm: bool = False,
+        autosync_policy: str = "exact",
     ) -> None:
         """Create a PassContext with instruments and pass configuration (incl. memory planner).
 
@@ -363,6 +372,14 @@ class PassContext:
 
     def get_autosync_disjoint_gm(self) -> bool:
         """Get the explicit distinct-GM-root disjointness contract."""
+
+    def get_autosync_policy(self) -> str:
+        """Get the logical producer policy: exact or conservative_prefix.
+
+        The default exact policy is unchanged. Selecting conservative_prefix
+        does not enable synchronization or claim downstream ownership. Actual
+        serialized tokens are lowered independently of this producer choice.
+        """
 
     def get_memory_planner(self) -> MemoryPlanner:
         """Get the memory planner selection for this context."""
@@ -893,11 +910,21 @@ def select_buffer_ir_functions() -> Pass:
     """Select supported whole kernels before Buffer storage legalization."""
     ...
 
-def insert_sync() -> Pass:
+class NativeSyncChild:
+    """Opaque immutable child capability, constructible only by its retained analysis provider."""
+
+    @property
+    def owner(self) -> Function: ...
+    @property
+    def scope(self) -> ForStmt: ...
+
+def insert_sync(*, accepted_children: list[NativeSyncChild] = []) -> Pass:
     """Insert logical tokens after placement using the explicit disjoint-GM contract.
 
     Unsupported analysis or token exports raise without modifying the input.
     This standalone stage does not require enable_pypto_autosync.
+    Accepted children require conservative_prefix policy and their exact original
+    owners in the input Program. The pass retains the capabilities by value.
     """
 
 def optimize_sync() -> Pass:

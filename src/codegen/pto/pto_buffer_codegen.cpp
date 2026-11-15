@@ -50,6 +50,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/loop_step_qualification.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/slot_index_qualification.h"
@@ -400,9 +401,11 @@ class BufferEmissionPreflight : public ir::IRVisitor {
     // Physical synchronization has no Tile/MemRef operands. Admit the existing
     // operations here and let the ordinary backend validate/emit them; Buffer
     // IR must not need a second flag emitter or reconstruct logical Tile IR.
+    // Use the existing physical-barrier inventory, including DMA/FIX pipes.
+    // Closed current-prefix protocols can drain any qualified local pipe; the
+    // ordinary backend still checks and emits its existing native operation.
     if (ir::IsOp(call, "system.set_flag") || ir::IsOp(call, "system.wait_flag") ||
-        ir::IsOp(call, "system.bar_m") || ir::IsOp(call, "system.bar_v") ||
-        ir::IsOp(call, "system.bar_all")) {
+        ir::core_affinity::IsPipeBarrier(call)) {
       IRVisitor::VisitExpr_(call);
       return;
     }

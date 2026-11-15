@@ -467,6 +467,11 @@ inline constexpr const char* kAttrBufferAdmissionProperty = "buffer_admission_pr
 inline constexpr const char* kAttrBufferAdmissionStage = "buffer_admission_stage";
 inline constexpr const char* kAttrBufferAdmissionOperation = "buffer_admission_operation";
 inline constexpr const char* kAttrBufferAdmissionLocation = "buffer_admission_location";
+// Reports describe the selected construction; these attributes never authorize
+// lowering or substitute for rechecking the actual token program.
+inline constexpr const char* kAttrAutosyncAnalysisPolicy = "autosync_analysis_policy";
+inline constexpr const char* kAttrAutosyncAccessPrecision = "autosync_access_precision";
+inline constexpr const char* kAttrAutosyncRealizationOrder = "autosync_realization_order";
 
 /**
  * @brief Reserved Function attr key marking an AIV kernel that runs on BOTH

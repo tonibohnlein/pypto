@@ -32,6 +32,7 @@
 #include "pypto/ir/verifier/property_verifier_registry.h"
 #include "pypto/ir/verifier/verification_error.h"
 #include "pypto/ir/verifier/verifier.h"
+#include "src/ir/transforms/utils/retained_sync_child.h"
 
 namespace nb = nanobind;
 
@@ -365,7 +366,7 @@ void BindPass(nb::module_& m) {
                           "verification and the diagnostic channel (warnings + performance\n"
                           "hints) for PassPipeline.")
       .def(nb::init<std::vector<PassInstrumentPtr>, VerificationLevel, DiagnosticPhase, DiagnosticCheckSet,
-                    MemoryPlanner, bool, RuntimeKind, bool, bool, bool, bool, bool>(),
+                    MemoryPlanner, bool, RuntimeKind, bool, bool, bool, bool, bool, std::string>(),
            nb::arg("instruments"), nb::arg("verification_level") = VerificationLevel::Basic,
            nb::arg("diagnostic_phase") = DiagnosticPhase::PrePipeline,
            nb::arg("disabled_diagnostics") = DiagnosticCheckSet{DiagnosticCheck::UnusedControlFlowResult},
@@ -373,7 +374,7 @@ void BindPass(nb::module_& m) {
            nb::arg("enable_pypto_l0c_double_buffer") = false, nb::arg("runtime") = kDefaultRuntimeKind,
            nb::arg("enable_buffer_ir") = true, nb::arg("enable_software_pipeline") = false,
            nb::arg("report_hardware_loops") = false, nb::arg("enable_pypto_autosync") = false,
-           nb::arg("autosync_disjoint_gm") = false,
+           nb::arg("autosync_disjoint_gm") = false, nb::arg("autosync_policy") = "exact",
            "Create a PassContext with instruments, verification level, diagnostic phase gate, "
            "optional disabled diagnostic checks, memory planner selection, the stored legacy "
            "L0C double-buffer compatibility flag, the target Simpler runtime ABI, and default-on "
@@ -403,6 +404,8 @@ void BindPass(nb::module_& m) {
            "Whether to try PyPTO synchronization before PTOAS")
       .def("get_autosync_disjoint_gm", &PassContext::GetAutoSyncDisjointGM,
            "Get explicit disjoint GM contract")
+      .def("get_autosync_policy", &PassContext::GetAutoSyncPolicy,
+           "Get the explicit exact or conservative_prefix logical producer policy")
       .def("get_memory_planner", &PassContext::GetMemoryPlanner,
            "Get the memory planner selection for this context")
       .def("get_enable_pypto_l0c_double_buffer", &PassContext::GetEnablePyptoL0cDoubleBuffer,
@@ -740,9 +743,13 @@ void BindPass(nb::module_& m) {
              "the caller's actual extent at every call/submit site.");
   passes.def("select_buffer_ir_functions", &pass::SelectBufferIRFunctions,
              "Select whole kernels for Buffer IR before storage legalization.");
+  nb::class_<ir::sync::NativeSyncChild>(passes, "NativeSyncChild")
+      .def_prop_ro("owner", &ir::sync::NativeSyncChild::Owner)
+      .def_prop_ro("scope", &ir::sync::NativeSyncChild::Scope);
   passes.def(
-      "insert_sync", &pass::InsertSync,
-      "Insert logical completion tokens for qualified placed Buffer demands; refuses missing exports.");
+      "insert_sync", &pass::InsertSync, nb::kw_only(),
+      nb::arg("accepted_children") = std::vector<std::shared_ptr<const ir::sync::NativeSyncChild>>{},
+      "Insert logical synchronization; accepted immutable children require conservative_prefix policy.");
   passes.def("optimize_sync", &pass::OptimizeSync,
              "Verify logical synchronization; initially an identity optimization stage.");
   passes.def("lower_sync", &pass::LowerSync,

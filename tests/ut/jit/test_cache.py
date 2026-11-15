@@ -180,6 +180,7 @@ class TestMakeCacheKey:
             ("enable_software_pipeline", False),
             ("enable_pypto_autosync", False),
             ("autosync_disjoint_gm", False),
+            ("autosync_policy", "exact"),
         )
 
     def test_tensor_shape_in_key(self):

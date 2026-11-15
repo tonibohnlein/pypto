@@ -111,6 +111,7 @@ set(PYPTO_SOURCES
     # IR - Core
     src/ir/transforms/utils/finite_sync_analysis.cpp
     src/ir/transforms/utils/compact_sync_analysis.cpp
+    src/ir/transforms/utils/conservative_sync_dataflow.cpp
     src/ir/transforms/utils/rotating_sync_analysis.cpp
     src/ir/transforms/utils/numerical_sync_hierarchy.cpp
     src/ir/transforms/utils/numerical_sync_phase.cpp
@@ -123,6 +124,9 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/structured_token_sync.cpp
     src/ir/transforms/utils/sync_boundary_graph.cpp
     src/ir/transforms/utils/token_sync_lowering.cpp
+    src/ir/transforms/utils/closed_prefix_sync.cpp
+    src/ir/transforms/utils/conservative_sync_realization.cpp
+    src/ir/transforms/utils/retained_sync_child.cpp
     src/ir/transforms/utils/logical_sync_realization.cpp
     src/ir/transforms/utils/scoped_logical_sync.cpp
     src/ir/transforms/utils/scoped_token_families.cpp
