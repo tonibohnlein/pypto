@@ -1,0 +1,325 @@
+{
+  "revision": "b39fc091453856ca6210c93a81394e21caa8d307",
+  "starting_worktree": "clean",
+  "production_changes": false,
+  "changes": "Documentation note and audit receipt only; no control simplification implemented.",
+  "python": {
+    "executable": "/usr/bin/python",
+    "version": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "sha256": "9a2d26e5dcbd8e7ff6c1e3cfa37a45a5b83dff8ebba39cbae293cb9e94f15a55"
+  },
+  "extension": {
+    "path": "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so",
+    "sha256": "9e5db8b0cbd3848edca5ad2e73ba82efdd1c812e899abfcfd9e28d4755c8e3d8"
+  },
+  "environment": {
+    "setup": "source .claude/skills/testing/load-env.sh",
+    "PYTHONPATH": "$PWD/python:$PWD/tests/ut/ir:$PWD",
+    "PTOAS_ROOT": "$PWD/build-py314/architecture-correction/ptoas-launcher",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "PYPTO_CODEGEN_MAX_WORKERS": "1",
+    "workers": "At most two simultaneous serial jobs"
+  },
+  "build": {
+    "command": "cmake --build build-py314 --parallel 2",
+    "result": "ninja: no work to do."
+  },
+  "fresh_pytest_gates": [
+    {
+      "name": "tests",
+      "counts": {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "0",
+        "tests": "602",
+        "time": "279.588",
+        "timestamp": "2026-11-15T18:00:54.722948+01:00",
+        "hostname": "toni-fedora"
+      },
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "--require-ptoas",
+        "tests/ut/ir/transforms/test_finite_sync_analysis.py",
+        "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+        "tests/ut/ir/transforms/test_vec_sync_analysis.py",
+        "tests/ut/ir/transforms/test_rotating_sync_analysis.py",
+        "tests/ut/ir/transforms/test_interval_sync_analysis.py",
+        "tests/ut/ir/transforms/test_nested_sync_repetition.py",
+        "tests/ut/ir/transforms/test_nested_phase_sync.py",
+        "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+        "tests/ut/ir/transforms/test_qwen_prefill_production.py",
+        "tests/ut/ir/transforms/test_collective_sync_interface.py",
+        "tests/ut/ir/transforms/test_crossing_token_sync.py",
+        "tests/ut/ir/transforms/test_scoped_token_order.py",
+        "tests/ut/ir/transforms/test_token_sync_lowering.py",
+        "tests/ut/ir/transforms/test_conservative_sync_children.py",
+        "tests/ut/ir/transforms/test_conservative_sync_child_commands.py",
+        "tests/ut/ir/transforms/test_closed_prefix_sync.py",
+        "--junitxml=build-py314/minimum-demand-audit-20261115/tests.xml"
+      ],
+      "xml": {
+        "path": "build-py314/minimum-demand-audit-20261115/tests.xml",
+        "sha256": "9caf0c3fd418a07f9404e7cd89f3ef9e84cd8bbec96d8d44365c42c555262179"
+      },
+      "log": {
+        "path": "build-py314/minimum-demand-audit-20261115/tests.log",
+        "sha256": "ae4a8d3f3044d3d6042823c995ce7aa68cb68cfa543e7a25fbbbe3c1e3d31ea8"
+      }
+    },
+    {
+      "name": "composition",
+      "counts": {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "0",
+        "tests": "268",
+        "time": "53.651",
+        "timestamp": "2026-11-15T18:02:02.335854+01:00",
+        "hostname": "toni-fedora"
+      },
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "--require-ptoas",
+        "tests/ut/ir/transforms/test_regional_slot_composition.py",
+        "tests/ut/ir/transforms/test_parameterized_sync.py",
+        "tests/ut/ir/transforms/test_logical_sync_realization.py",
+        "tests/ut/ir/transforms/test_physical_sync_realization.py",
+        "tests/ut/ir/transforms/test_buffered_sync_realization.py",
+        "tests/ut/ir/transforms/test_row_sync_analysis.py",
+        "tests/ut/ir/transforms/test_indexed_sync_analysis.py",
+        "tests/ut/ir/transforms/test_sync_cpp_order.py",
+        "--junitxml=build-py314/minimum-demand-audit-20261115/composition.xml"
+      ],
+      "xml": {
+        "path": "build-py314/minimum-demand-audit-20261115/composition.xml",
+        "sha256": "0c2a010222f602ddad0491485ba6c36a8708b292ef6d18bc35ce9c725a59fec2"
+      },
+      "log": {
+        "path": "build-py314/minimum-demand-audit-20261115/composition.log",
+        "sha256": "972c59be28bdcd395a5a5f5c7c93692d15fdd3c08190005ca66358c6e7730dac"
+      }
+    }
+  ],
+  "fresh_pytest_total": {
+    "passed": 870,
+    "failed": 0,
+    "skipped": 0,
+    "warnings": 24,
+    "warning_scope": "Existing inline-helper direction annotation deprecation"
+  },
+  "numerical_query_gate": {
+    "command": "ctest --test-dir build-py314 -j1 -R ^pypto_numerical_sync_order_test$ --output-on-failure",
+    "passed": 1,
+    "supplied_order_graph_seeds": 2000,
+    "scope": "Order queries/port summaries; this C++ gate alone does not test storage extraction or cover reduction.",
+    "log": {
+      "path": "build-py314/minimum-demand-audit-20261115/numerical.log",
+      "sha256": "6094ae00e6ea20e043e9e7f03f33f9a03fb91b4e819c3d5854d578f63db428f1"
+    }
+  },
+  "draft_sections": {
+    "minimum_demands.tex": "fdf4a7abee76af3db82314d48f2cd66bd0d33ddfb23607f8d29f8353fbe48077",
+    "combined_algorithm.tex": "a9297986154c644f91b5d6500d9c1ab9ef6ff9e8ff93edc63702560db6ce2500",
+    "direct_realization.tex": "ab3594827523fea38d59aa54c11714f5b84220b78db2ce792c28bff919c47e8e"
+  },
+  "oracle": {
+    "accesses": "Independent original Buffer-IR interpretation and physical-byte conflicts under qualified native/layout and disjoint-GM contracts.",
+    "covers": "Expand actual retained demand records, deduplicate, compare equality with independent nonnative covers, then check closure equality.",
+    "queries": "All four start/completion combinations on bounded payload occurrences.",
+    "selectors": "First/last writers and boundary readers at sampled corners, interior/exterior points and slots; not exhaustive over every byte or parameter.",
+    "realization": "Actual logical-token and physical-command interpreters; equality where claimed, matching, acyclicity, causal consumption-before-republication and eligible IDs.",
+    "scope_limit": "Bounded validation corroborates qualified uniform constructions; not a universal native/device or arbitrary-control-flow proof."
+  },
+  "reused_same_revision_examples": [
+    {
+      "name": "matmul_64",
+      "retained_checks": {
+        "payloads": 6,
+        "covers": 4,
+        "query_checks": 144,
+        "boundary_checks": 16,
+        "access_checks": 6
+      },
+      "bounded_checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "coverage": true,
+          "excess_completion_start": 0
+        }
+      ],
+      "scope": "Reused same-revision receipt; large cases without bounded_checks are static-only here."
+    },
+    {
+      "name": "matmul_acc_64",
+      "retained_checks": {
+        "payloads": 11,
+        "covers": 10,
+        "query_checks": 484,
+        "boundary_checks": 20,
+        "access_checks": 11
+      },
+      "bounded_checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "coverage": true,
+          "excess_completion_start": 0
+        }
+      ],
+      "scope": "Reused same-revision receipt; large cases without bounded_checks are static-only here."
+    },
+    {
+      "name": "ddr_split_k",
+      "retained_checks": {
+        "payloads": 28,
+        "covers": 19,
+        "query_checks": 3136,
+        "boundary_checks": 42,
+        "access_checks": 28
+      },
+      "bounded_checks": [
+        {
+          "parameters": {},
+          "block": null,
+          "coverage": true,
+          "excess_completion_start": 0
+        }
+      ],
+      "scope": "Reused same-revision receipt; large cases without bounded_checks are static-only here."
+    },
+    {
+      "name": "qwen_output_b3_h512",
+      "retained_checks": null,
+      "bounded_checks": [
+        {
+          "parameters": {
+            "3": 0
+          },
+          "block": 0,
+          "coverage": true,
+          "excess_completion_start": 0
+        },
+        {
+          "parameters": {
+            "3": 1
+          },
+          "block": 19,
+          "coverage": true,
+          "excess_completion_start": 0
+        }
+      ],
+      "scope": "Reused same-revision receipt; large cases without bounded_checks are static-only here."
+    },
+    {
+      "name": "qwen_gate_up_b3_h512",
+      "retained_checks": null,
+      "bounded_checks": [
+        {
+          "parameters": {
+            "3": 0
+          },
+          "block": 0,
+          "coverage": true,
+          "excess_completion_start": 0
+        },
+        {
+          "parameters": {
+            "3": 1
+          },
+          "block": 23,
+          "coverage": true,
+          "excess_completion_start": 0
+        }
+      ],
+      "scope": "Reused same-revision receipt; large cases without bounded_checks are static-only here."
+    },
+    {
+      "name": "qwen_output_b3_h5120",
+      "retained_checks": null,
+      "bounded_checks": [],
+      "scope": "Reused same-revision receipt; large cases without bounded_checks are static-only here."
+    },
+    {
+      "name": "qwen_gate_up_b3_h5120",
+      "retained_checks": null,
+      "bounded_checks": [],
+      "scope": "Reused same-revision receipt; large cases without bounded_checks are static-only here."
+    }
+  ],
+  "reused_receipts": [
+    {
+      "path": "build-py314/sync-plan-check-20261115/summary.json",
+      "sha256": "625af93aedb4862907ecc17aea8ce3cb352f22877959e29c55df8de65fe9a092"
+    },
+    {
+      "path": "build-py314/sync-plan-check-20261115/comparison.json",
+      "sha256": "2aad8cceb366dc3fe9aa7966214cdcf85240b8bebaa482fdd214c2c9b193e206"
+    },
+    {
+      "path": "build-py314/sync-plan-check-20261115/interior.json",
+      "sha256": "f600c843cb8b8b12e12d3df6178259c2da07b0f726be8a213b7fdf2211e0ee08"
+    },
+    {
+      "path": "build-py314/sync-plan-check-20261115/conservative.json",
+      "sha256": "a5128765df8dee0c8a5a02cab4378471194d52baa42ab86fdcbeaff54bc99970"
+    },
+    {
+      "path": "build-py314/sync-plan-check-20261115/whole-model-static.json",
+      "sha256": "f872af25dfec3b1199e0254cbca3d42b6d4770fa9872e7bfe039f4d02a33a985"
+    }
+  ],
+  "deferred_control_note": [
+    {
+      "name": "qwen_output_b3_h5120",
+      "changed_block_before": "      if (v80 == v26) {\n        set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);\n      };\n    };\n    wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);",
+      "changed_block_after": "    };\n    set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);\n    wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);",
+      "argument": "Loop has exactly ten iterations 0,2,...,18. The SET is the last command of the final iteration. Move it just beyond that loop, within the same enclosing visit, without crossing any command or payload.",
+      "visits_checked": 40,
+      "ordered_payload_macro_and_flag_trace_equal": true,
+      "conditions_before_after": [
+        31760,
+        31360
+      ],
+      "source_sha256_before_after": [
+        "2854e7e68c17eefadea5abbdf12653b602479135f325889da3771e23fdacd3a1",
+        "0bb9e6e6e68d647810337f997ad21ff66209ffc9398b7bd0b10d88bcfc892e0f"
+      ],
+      "scope": "Generated-C++ local rewrite experiment, production source unchanged; modeled macro/command sequence, not native instruction timing."
+    },
+    {
+      "name": "qwen_gate_up_b3_h5120",
+      "changed_block_before": "        bool v139 = v102 < v24;\n        if (v139) {\n          // pto: %29\n          ;\n          if (v129 == v33) {\n            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);\n          };\n        };\n        // pto: %30\n        ;\n        bool v140 = v96 > v34;\n        if (v140) {\n          // pto: %31\n          ;\n          if (v102 == v24) {\n            // pto: %32\n            ;\n            if (v129 == v33) {\n              set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);\n            };\n          };\n        };\n",
+      "changed_block_after": "        bool v139 = v102 < v24;\n        bool v140 = v96 > v34;\n        if (v129 == v33) {\n          if (v139) {\n            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);\n          } else {\n            if (v140) {\n              set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);\n            };\n          };\n        };\n",
+      "argument": "At this cut, both alternatives require inner k=192. Outer t belongs to 0,2,...,18, so not(t<18) implies t=18. Both conditions are pure and use ready unchanged integer coordinates. Keep both SET leaves and exact IDs; no command/payload crosses the cut.",
+      "visits_checked": 48,
+      "ordered_payload_macro_and_flag_trace_equal": true,
+      "conditions_before_after": [
+        98746,
+        95656
+      ],
+      "source_sha256_before_after": [
+        "11bba0467725f323bb81cc84d71f2a8d28c609884dfff9d7bcece82fa035c253",
+        "add1e06c0525a9cdcb6bb28da82243df1bd2de428e699883b02108e17c2397e1"
+      ],
+      "scope": "Generated-C++ local rewrite experiment, production source unchanged; modeled macro/command sequence, not native instruction timing."
+    }
+  ],
+  "classification": {
+    "exact": "Finite, periodic/rotating, numerical sequence/repetition, resident/row and qualified invocation/startup partitions tested against their applicable exact model.",
+    "conservative": "Explicit conservative_prefix has coverage and protocol guarantees, not minimum-demand or no-excess-order guarantees.",
+    "delegated": "PTOAS-owned leaves cannot be counted as PyPTO exact results.",
+    "whole_model": "Reused capture: 32 leaves, 2 exact-owned or 11 prefix-owned depending on policy. This task does not repeat that survey.",
+    "completion": "Terminal drain is separate exit completion, not an extra internal payload completion-to-start pair."
+  }
+}
