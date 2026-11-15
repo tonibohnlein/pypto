@@ -29,6 +29,14 @@ PYPTO_AUTOSYNC_ATTR = "pypto_autosync"
 # Whole-kernel delegation reason recorded by RealizeSync (str).
 AUTOSYNC_FALLBACK_REASON_ATTR = "autosync_fallback_reason"
 
+
+# Versioned selector refusals; diagnostic evidence never authorizes lowering.
+BUFFER_ADMISSION_VERSION_ATTR = "buffer_admission_version"
+BUFFER_ADMISSION_PROPERTY_ATTR = "buffer_admission_property"
+BUFFER_ADMISSION_STAGE_ATTR = "buffer_admission_stage"
+BUFFER_ADMISSION_OPERATION_ATTR = "buffer_admission_operation"
+BUFFER_ADMISSION_LOCATION_ATTR = "buffer_admission_location"
+
 # AIV kernel running on BOTH vector sub-lanes of a mixed kernel (bool).
 DUAL_AIV_DISPATCH_ATTR = "dual_aiv_dispatch"
 
@@ -71,6 +79,11 @@ REQUIRE_CONTIGUOUS_OPERANDS_ATTR = "require_contiguous_operands"
 AUTO_SCOPE_ATTR = "auto_scope"
 
 __all__ = [
+    "BUFFER_ADMISSION_LOCATION_ATTR",
+    "BUFFER_ADMISSION_OPERATION_ATTR",
+    "BUFFER_ADMISSION_PROPERTY_ATTR",
+    "BUFFER_ADMISSION_STAGE_ATTR",
+    "BUFFER_ADMISSION_VERSION_ATTR",
     "AUTO_SCOPE_ATTR",
     "AUTOSYNC_FALLBACK_REASON_ATTR",
     "BUFFER_IR_SELECTED_ATTR",

@@ -13,8 +13,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
@@ -29,6 +31,7 @@
 
 namespace pypto::backend {
 static_assert(!std::is_default_constructible_v<BufferSyncImplementation>);
+static_assert(!std::is_default_constructible_v<BufferSyncOperation>);
 const char* BufferNativeOperation(const ir::CallPtr& call) {
   using ir::IsOp;
   if (IsOp(call, "buffer.load")) return "pto.tload";
@@ -49,7 +52,13 @@ const LocalSyncExecutionContract& RequireLocalSyncExecutionContract(const std::s
   CHECK(target == "a2a3") << "Unsupported physical target: native variants are qualified only for a2a3";
   // Existing local-pipeline contract: scalar prefixes execute serially. ALL
   // completes asynchronous payloads at invocation exit; it does not consume flags.
-  static const LocalSyncExecutionContract contract{true, "system.bar_all"};
+  // A2/A3 local event semantics: publication observes completion of the issued
+  // source prefix; acquisition consumes the matching flag before its queue can
+  // advance. This is the backend semantic binding used by direct handoffs and
+  // ordered acknowledgment protocols, not a device/wrapper qualification result.
+  // CANN SetFlag/WaitFlag contract (including consuming flag clear):
+  // https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_0181.html
+  static const LocalSyncExecutionContract contract{true, "system.bar_all", true, true};
   return contract;
 }
 
@@ -116,6 +125,54 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
                   result.pipe_ == PipeType::M || result.pipe_ == PipeType::FIX))
       << "Payload pipe is unavailable on the owning synchronization core";
   return result;
+}
+
+BufferSyncOperation QualifyBufferSyncOperation(const ir::CallPtr& call, ir::FunctionType core,
+                                               const std::string& target) {
+  auto& registry = ir::OpRegistry::GetInstance();
+  registry.ValidateBufferCall(call);
+  auto implementation = SelectBufferSyncImplementation(call, core, target);
+  const auto& entry = registry.GetEntry(call->op_->name_);
+  std::vector<ir::BufferArgEffect> effects;
+  effects.reserve(call->args_.size());
+  for (size_t arg = 0; arg < call->args_.size(); ++arg) effects.push_back(entry.GetBufferArgEffect(arg));
+  return BufferSyncOperation(call, std::move(implementation), std::move(effects), entry.GetBufferResultSpec(),
+                             BufferSyncOperationKind::Payload);
+}
+
+std::optional<BufferSyncOperation> QualifyBufferSyncNonPayload(const ir::CallPtr& call,
+                                                               const std::string& target) {
+  using ir::IsOp;
+  const bool query = IsOp(call, "buffer.get_block_idx") || IsOp(call, "buffer.get_block_num") ||
+                     IsOp(call, "buffer.get_subblock_idx");
+  const bool allocation = IsOp(call, "buffer.alloc") || IsOp(call, "buffer.alloc_multi");
+  const bool alias =
+      IsOp(call, "buffer.subview") || IsOp(call, "buffer.reshape") || IsOp(call, "buffer.slot");
+  const bool setter = IsOp(call, "buffer.set_validshape");
+  if (!query && !allocation && !alias && !setter) return std::nullopt;
+  RequireLocalSyncExecutionContract(target);
+  auto& registry = ir::OpRegistry::GetInstance();
+  registry.ValidateBufferCall(call);
+  CHECK(call->kwargs_.empty() && call->attrs_.empty())
+      << "Descriptor/scalar synchronization contract requires the existing attribute-free native recipe";
+  const auto& entry = registry.GetEntry(call->op_->name_);
+  std::vector<ir::BufferArgEffect> effects;
+  for (size_t arg = 0; arg < call->args_.size(); ++arg) {
+    const auto effect = entry.GetBufferArgEffect(arg);
+    INTERNAL_CHECK(effect.data == ir::BufferAccess::None)
+        << "Internal error: descriptor/scalar recipe unexpectedly has payload effects";
+    effects.push_back(effect);
+  }
+  const auto result = entry.GetBufferResultSpec();
+  const auto expected = query        ? ir::BufferResultBehavior::Value
+                        : allocation ? ir::BufferResultBehavior::Allocate
+                        : alias      ? ir::BufferResultBehavior::Alias
+                                     : ir::BufferResultBehavior::None;
+  INTERNAL_CHECK(result.behavior == expected)
+      << "Internal error: selected descriptor/scalar recipe disagrees with registered result behavior";
+  return BufferSyncOperation(
+      call, std::nullopt, std::move(effects), result,
+      query ? BufferSyncOperationKind::ReadyScalar : BufferSyncOperationKind::Descriptor);
 }
 
 std::vector<sync::IsaResourceClaim> BufferSyncImplementation::Claims() const {

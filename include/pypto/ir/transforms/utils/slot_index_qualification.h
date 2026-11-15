@@ -38,6 +38,8 @@ class CanonicalSlotCollector : public ir::IRVisitor {
  public:
   std::set<const ir::Expr*> remainders;
   std::set<const ir::Var*> unsupported_bases;
+  // Original first failing assignment, retained only for admission diagnostics.
+  ir::StmtPtr first_unsupported;
   std::set<const ir::Var*> verified_bases;
 
   void VisitStmt_(const ir::ForStmtPtr& op) override {
@@ -63,6 +65,9 @@ class CanonicalSlotCollector : public ir::IRVisitor {
         if (ir::AsVarLike(index)) index = ResolveScalarAlias(index);
         if (!IsCanonical(index, memref->slot_count_)) {
           unsupported_bases.insert(memref->base_.get());
+          if (!first_unsupported) {
+            first_unsupported = op;
+          }
         } else if (ir::As<ir::FloorMod>(index)) {
           remainders.insert(index.get());
         }
@@ -76,6 +81,9 @@ class CanonicalSlotCollector : public ir::IRVisitor {
         if (ir::AsVarLike(index)) index = ResolveScalarAlias(index);
         if (!IsCanonical(index, static_cast<uint64_t>(multi->slot_count_))) {
           unsupported_bases.insert(group.get());
+          if (!first_unsupported) {
+            first_unsupported = op;
+          }
         } else if (ir::As<ir::FloorMod>(index)) {
           remainders.insert(index.get());
         }

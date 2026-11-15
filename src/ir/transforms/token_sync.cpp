@@ -200,8 +200,19 @@ Pass RealizeSync() {
     CHECK(ctx && ctx->GetEnablePyptoAutoSync()) << "RealizeSync requires enable_pypto_autosync=True";
     if (function->func_type_ != FunctionType::AIC && function->func_type_ != FunctionType::AIV)
       return sync::SyncOutcome(function, false, "PyPTO synchronization supports only AIC/AIV leaves");
-    if (function->ir_stage_ != FunctionIRStage::Buffer || ctx->GetMemoryPlanner() == MemoryPlanner::PtoAS)
-      return sync::SyncOutcome(function, false, "PyPTO synchronization requires physically placed Buffer IR");
+    if (function->ir_stage_ != FunctionIRStage::Buffer || ctx->GetMemoryPlanner() == MemoryPlanner::PtoAS) {
+      std::string reason = "PyPTO synchronization requires physically placed Buffer IR";
+      if (function->HasAttr(kAttrBufferAdmissionProperty)) {
+        reason += "; first obligation: " + function->GetAttr<std::string>(kAttrBufferAdmissionStage) + "/" +
+                  function->GetAttr<std::string>(kAttrBufferAdmissionProperty) + " at " +
+                  function->GetAttr<std::string>(kAttrBufferAdmissionOperation);
+        const auto location = function->GetAttr<std::string>(kAttrBufferAdmissionLocation);
+        if (!location.empty()) {
+          reason += " (" + location + ")";
+        }
+      }
+      return sync::SyncOutcome(function, false, reason);
+    }
     if (!ctx->GetAutoSyncDisjointGM())
       return sync::SyncOutcome(function, false, "Disjoint GM argument contract was not supplied");
     auto target = ctx->GetBackendHandler()->GetPtoTargetArch();
