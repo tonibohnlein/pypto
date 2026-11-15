@@ -13,6 +13,7 @@
 #define PYPTO_BACKEND_COMMON_BUFFER_SYNC_CONTRACT_H_
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -120,6 +121,16 @@ class BufferSyncOperation {
 // not payloads and retain their existing result/alias/metadata interpretation.
 BufferSyncOperation QualifyBufferSyncOperation(const ir::CallPtr& call, ir::FunctionType core,
                                                const std::string& target);
+
+// Placement evidence is separate from selected instruction semantics. A supplied
+// half-open hull must enclose every admitted address of this operand; absence
+// means unavailable, never empty. Only matching local spaces require a hull.
+struct BufferSyncByteWindow {
+  int64_t begin, end;
+};
+void RequireBufferSyncWorkspaceSeparation(
+    const BufferSyncOperation& operation,
+    const std::function<std::optional<BufferSyncByteWindow>(const ir::ExprPtr&)>& window);
 
 // Recognize the existing emitted alloc/view/valid-metadata/SPMD recipes. Registry
 // effects/result behavior remain authoritative. The selected native recipe

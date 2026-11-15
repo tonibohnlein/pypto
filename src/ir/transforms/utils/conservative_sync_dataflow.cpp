@@ -25,6 +25,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/type.h"
+#include "src/ir/transforms/utils/native_sync_placement.h"
 #include "src/ir/transforms/utils/sync_scalar_readiness.h"
 
 namespace pypto::ir::sync {
@@ -60,7 +61,7 @@ class Builder {
   Builder(const FunctionPtr& function, std::string target,
           const std::vector<std::shared_ptr<const NativeSyncChild>>& retained,
           const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful)
-      : function_(function), target_(std::move(target)) {
+      : function_(function), target_(std::move(target)), placement_(function) {
     scopes_.emplace_back();
     for (const auto& parameter : function->params_) {
       const auto& type = parameter->GetType();
@@ -192,6 +193,7 @@ class Builder {
       return;
     }
     auto operation = backend::QualifyBufferSyncOperation(call, function_->func_type_, target_);
+    placement_.Require(operation);
     CHECK_SPAN(!result && operation.Result().behavior == BufferResultBehavior::None, call->span_)
         << "Conservative synchronization: payload-produced scalar/handle readiness is unavailable";
     ConservativeAccessSet effects;
@@ -329,6 +331,7 @@ class Builder {
 
   FunctionPtr function_;
   std::string target_;
+  NativeSyncPlacement placement_;
   std::vector<std::vector<const Var*>> scopes_;
   std::unordered_set<const Var*> ready_;
   size_t control_depth_ = 0;

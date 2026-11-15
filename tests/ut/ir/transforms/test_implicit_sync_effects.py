@@ -15,11 +15,13 @@ These checks prove selected-model behavior, not native instruction footprints.
 
 import pytest
 import torch
-from pypto import ir, passes, testing
+from pypto import Error, ir, passes, testing
+from pypto._function_attrs import AUTOSYNC_FALLBACK_REASON_ATTR
 from pypto.debug import torch_codegen
 
 from .sync_matmul_oracle import interpret, validate
 from .test_autosync_switch import clone
+from .test_closed_prefix_sync import Services
 from .test_contiguous_vector_views import reduction_vector_program
 from .test_physical_sync_realization import check
 from .test_select_buffer_ir_functions import _PLANNERS, _compile_dynamic_state_native, _kernel, _lower
@@ -28,7 +30,9 @@ pytestmark = pytest.mark.usefixtures("ascend_backend")
 SCRATCH = (184 * 1024, 192 * 1024)
 
 
-def independent_broadcasts(names=("sub", "div"), count=None, explicit_alias=False, operand_alias=False):
+def independent_broadcasts(
+    names=("sub", "div"), count=None, explicit_alias=False, operand_alias=False, addresses=None
+):
     span = ir.Span.unknown()
     fp, index = ir.DataType.FP32, ir.DataType.INDEX
 
@@ -47,6 +51,7 @@ def independent_broadcasts(names=("sub", "div"), count=None, explicit_alias=Fals
     definitions: list[ir.Stmt] = []
 
     def alloc(name, address, shape=(8, 8), column=False):
+        address = (addresses or {}).get(name, address)
         ty = ir.BufferType(
             list(shape),
             fp,
@@ -236,3 +241,198 @@ def test_row_multiply_reuses_conversion_view_and_row_family(planner, tmp_path):
     _compile_dynamic_state_native(lowered, tmp_path, planner)
     if planner != passes.MemoryPlanner.PTOAS:
         validate(function, testing.analyze_placed_sync(function, True))
+
+
+@pytest.mark.parametrize("name", ["sub", "div", "mul"])
+@pytest.mark.parametrize("operand", ["x0", "column0", "z0"])
+@pytest.mark.parametrize("route", ["exact", "conservative", "insert", "lower", "realize"])
+def test_native_workspace_legality_is_shared_by_all_ownership_routes(name, operand, route):
+    function, _, _ = independent_broadcasts((name,), addresses={operand: SCRATCH[0]})
+    if route == "lower":
+        assert isinstance(function.body, ir.SeqStmts)
+        function = clone(
+            function,
+            body=ir.SeqStmts(
+                [*Services().closed(ir.PipeType.MTE2, ir.PipeType.V), *function.body.stmts], function.span
+            ),
+        )
+    before = ir.serialize(function)
+    with passes.PassContext(
+        [], enable_pypto_autosync=True, autosync_policy="conservative_prefix", autosync_disjoint_gm=True
+    ):
+        if route == "realize":
+            result = passes.realize_sync()(ir.Program([function], "IllegalWorkspace", function.span))
+            preserved = next(iter(result.functions.values()))
+            ir.assert_structural_equal(preserved.body, function.body)
+            assert not dict(preserved.attrs).get("pypto_autosync", False)
+            assert (
+                "Native implicit workspace separation is unproved"
+                in dict(preserved.attrs)[AUTOSYNC_FALLBACK_REASON_ATTR]
+            )
+        else:
+            with pytest.raises(ValueError, match="Native implicit workspace separation is unproved"):
+                if route == "exact":
+                    testing.analyze_placed_sync(function, True)
+                elif route == "conservative":
+                    testing.analyze_conservative_sync(function)
+                else:
+                    transform = passes.insert_sync() if route == "insert" else passes.lower_sync()
+                    transform(ir.Program([function], "IllegalWorkspace", function.span))
+    assert ir.serialize(function) == before
+
+
+@pytest.mark.parametrize("address", [SCRATCH[0] - 256, SCRATCH[1]])
+def test_workspace_half_open_edges_remain_qualified(address):
+    function, _, _ = independent_broadcasts(("mul",), addresses={"x0": address})
+    # A matrix touching, but not intersecting, either edge is not illegal.
+    testing.analyze_placed_sync(function, True)
+    testing.analyze_conservative_sync(function)
+
+
+@pytest.mark.parametrize("address", [None, SCRATCH[0], 0])
+@pytest.mark.parametrize("alias", [False, True])
+def test_conservative_workspace_requires_available_alias_placement(address, alias):
+    function, _, _ = independent_broadcasts(("mul",), addresses={"x0": address or 0})
+    assert isinstance(function.body, ir.SeqStmts)
+    statements = list(function.body.stmts)
+    declaration = statements[0]
+    assert isinstance(declaration, ir.AssignStmt) and declaration.var.name_hint == "x0"
+    parameters = list(zip(function.params, function.param_directions))
+    if address is None:
+        statements.pop(0)
+        parameters.append((declaration.var, ir.ParamDirection.InOut))
+    if alias:
+        renamed = ir.Var("matrix_alias", declaration.var.type, function.span)
+        statements.insert(
+            1 if address is not None else 0,
+            ir.AssignStmt(
+                renamed,
+                ir.Call(ir.get_op("buffer.reshape"), [declaration.var], declaration.var.type, function.span),
+                function.span,
+            ),
+        )
+        rewritten: list[ir.Stmt] = []
+        for statement in statements:
+            if isinstance(statement, ir.EvalStmt) and isinstance(statement.expr, ir.Call):
+                call = statement.expr
+                if call.op.name == ir.get_op("buffer.row_expand_mul").name:
+                    statement = ir.EvalStmt(
+                        ir.Call(call.op, [renamed, *call.args[1:]], call.type, call.span), function.span
+                    )
+            rewritten.append(statement)
+        statements = rewritten
+    function = ir.Function(
+        function.name,
+        parameters,
+        function.return_types,
+        ir.SeqStmts(statements, function.span),
+        function.span,
+        function.func_type,
+        ir_stage=function.ir_stage,
+    )
+    properties = passes.IRPropertySet()
+    properties.insert(passes.IRProperty.BufferIR)
+    program = ir.Program([function], "WorkspaceAliasInput", function.span)
+    if address is None:
+        # Borrowed operands also lack the within-operation allocation provenance
+        # required by BufferIR. Preserve that earlier refusal; this is not a
+        # verified native program whose missing placement may be assumed away.
+        with pytest.raises(Error, match="allocation provenance"):
+            passes.verify_properties(properties, program, "input")
+    else:
+        passes.verify_properties(properties, program, "input")
+    if address == 0:
+        testing.analyze_conservative_sync(function)
+    else:
+        with pytest.raises(ValueError, match="Native implicit workspace separation is unproved"):
+            testing.analyze_conservative_sync(function)
+
+
+@pytest.mark.parametrize("kind", ["subview", "slot"])
+@pytest.mark.parametrize("address", [0, SCRATCH[0]])
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("route", ["conservative", "lower", "realize"])
+def test_workspace_view_containment_requires_proved_offset_range(kind, address, dynamic, route):
+    function, _, _ = independent_broadcasts(("mul",), addresses={"x0": address})
+    assert isinstance(function.body, ir.SeqStmts)
+    statements = list(function.body.stmts)
+    declaration = statements[0]
+    assert isinstance(declaration, ir.AssignStmt)
+    original = declaration.var
+    span = function.span
+    offset = ir.Var("unbounded_offset", ir.ScalarType(ir.DataType.INDEX), span)
+    zero = ir.ConstInt(0, ir.DataType.INDEX, span)
+    selector = offset if dynamic else zero
+    window = ir.Var("window", original.type, span)
+    if kind == "subview":
+        view = ir.Call(
+            ir.get_op("buffer.subview"),
+            [original, ir.MakeTuple([selector, zero], span)],
+            original.type,
+            span,
+        )
+        statements.insert(1, ir.AssignStmt(window, view, span))
+    else:
+        assert isinstance(original.type, ir.BufferType)
+        multi_type = ir.MultiBufferType(original.type, 2)
+        multi = ir.Var("slots", multi_type, span)
+        allocation = ir.Call(
+            ir.get_op("buffer.alloc_multi"),
+            [ir.MakeTuple([], span), ir.ConstInt(address, ir.DataType.INDEX, span)],
+            multi_type,
+            span,
+        )
+        view = ir.Call(ir.get_op("buffer.slot"), [multi, selector], original.type, span)
+        statements[0:1] = [ir.AssignStmt(multi, allocation, span), ir.AssignStmt(window, view, span)]
+    rewritten: list[ir.Stmt] = []
+    for statement in statements:
+        if isinstance(statement, ir.EvalStmt) and isinstance(statement.expr, ir.Call):
+            call = statement.expr
+            arguments = [window if argument.same_as(original) else argument for argument in call.args]
+            statement = ir.EvalStmt(ir.Call(call.op, arguments, call.type, span), span)
+        rewritten.append(statement)
+    if route == "lower":
+        rewritten = [*Services().closed(ir.PipeType.MTE2, ir.PipeType.V), *rewritten]
+    function = ir.Function(
+        function.name,
+        [*zip(function.params, function.param_directions), (offset, ir.ParamDirection.In)],
+        function.return_types,
+        ir.SeqStmts(rewritten, span),
+        span,
+        function.func_type,
+        ir_stage=function.ir_stage,
+    )
+    properties = passes.IRPropertySet()
+    properties.insert(passes.IRProperty.BufferIR)
+    passes.verify_properties(properties, ir.Program([function], "WorkspaceViewInput", span), "input")
+    before = ir.serialize(function)
+    refused = address == SCRATCH[0] or (dynamic and kind == "slot")
+
+    def invoke():
+        if route == "conservative":
+            return testing.analyze_conservative_sync(function)
+        transform = passes.lower_sync() if route == "lower" else passes.realize_sync()
+        return transform(ir.Program([function], "WorkspaceViewRange", span))
+
+    with passes.PassContext(
+        [], enable_pypto_autosync=True, autosync_policy="conservative_prefix", autosync_disjoint_gm=True
+    ):
+        if route == "realize":
+            physical = invoke()
+            assert isinstance(physical, ir.Program)
+            result = next(iter(physical.functions.values()))
+            if refused:
+                ir.assert_structural_equal(result.body, function.body)
+                assert not dict(result.attrs).get("pypto_autosync", False)
+                assert (
+                    "Native implicit workspace separation is unproved"
+                    in dict(result.attrs)[AUTOSYNC_FALLBACK_REASON_ATTR]
+                )
+            else:
+                assert dict(result.attrs).get("pypto_autosync", False)
+        elif refused:
+            with pytest.raises(ValueError, match="Native implicit workspace separation is unproved"):
+                invoke()
+        else:
+            invoke()
+    assert ir.serialize(function) == before
