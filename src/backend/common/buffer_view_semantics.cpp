@@ -53,6 +53,18 @@ std::optional<uint64_t> PhysicalBufferBytes(const ir::BufferTypePtr& type) {
   return bytes;
 }
 
+bool IsContiguousVectorReshape(const ir::BufferTypePtr& source, const ir::BufferTypePtr& destination) {
+  if (!source || !destination || source->valid_shape_ != source->shape_ ||
+      destination->valid_shape_ != destination->shape_)
+    return false;
+  const auto column = IsColumnVectorBuffer(source) ? source : destination;
+  const auto row = column == source ? destination : source;
+  const auto bytes = PhysicalBufferBytes(source);
+  return bytes && IsColumnVectorBuffer(column) && IsAlignedDenseVecBuffer(row) &&
+         row->dtype_ == DataType::FP32 && row->shape_[0] == 1 && column->shape_[0] > 0 &&
+         row->shape_[1] == column->shape_[0] && bytes == PhysicalBufferBytes(destination);
+}
+
 namespace {
 
 ir::BufferTypePtr StaticViewDescriptor(const ir::TypePtr& type, const std::string& name) {
@@ -159,6 +171,7 @@ void ValidateBufferReshape(const std::vector<ir::ExprPtr>& args, const ir::TypeP
   INTERNAL_CHECK(args.size() == 1 && args[0]) << "Internal error: buffer.reshape requires exactly one source";
   auto matrix_source = ir::As<ir::BufferType>(args[0]->GetType());
   const auto destination_type = ir::As<ir::BufferType>(result);
+  if (IsContiguousVectorReshape(matrix_source, destination_type)) return;
   if (IsColumnVectorBuffer(matrix_source) || IsColumnVectorBuffer(destination_type)) {
     CHECK(IsColumnVectorBuffer(matrix_source) && IsColumnVectorBuffer(destination_type) &&
           matrix_source->shape_ == destination_type->shape_)

@@ -740,3 +740,27 @@ scratch a private allocation before storage planning. Workspace operands carry
 no caller-readable result, so no copy is needed. Private `tile.create` scratch
 used only by gather calls retains its allocation. This applies to both Tile
 fallback and Buffer selection and preserves other native window parents.
+
+### Contiguous reduction-vector views
+
+The Buffer selector admits a full-valid FP32 reduction column `[L, 1]` in
+column-major layout and its row-major `[1, L]` reshape when `L` is a positive
+multiple of eight. Both descriptors denote the same contiguous bytes. A shared
+backend predicate qualifies this form for selection and `buffer.reshape`
+validation; it does not equate an ordinary padded row-major `[L, 1]` tile with a
+contiguous column.
+
+The existing storage owner preserves the allocation, byte offset and typed
+views. Fixed-address lowering emits aliases at the same planned address;
+addressless lowering uses the existing `buffer.reshape` / PTO `treshape` path.
+Neither changes payload order or inserts a data movement. Initial admission
+requires complete static valid extents and qualified original pitch/provenance;
+slice windows, dynamic/partial valid extents, dtype changes and overflowing
+physical extents remain outside this added capability.
+
+`test_contiguous_vector_views.py` checks both directions, rejected descriptors,
+and a reduction/view/elementwise/inverse-view/broadcast pipeline through all
+three planners, with independent host values, modeled access checks and PTOAS
+C++ generation. These checks qualify the declared contiguous storage model;
+they do not establish native device correctness or add unsupported broadcast
+operation recipes.

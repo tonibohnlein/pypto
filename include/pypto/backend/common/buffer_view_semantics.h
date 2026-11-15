@@ -28,6 +28,12 @@ std::optional<uint64_t> DenseBufferBytes(const ir::BufferTypePtr& type);
 /// fractal matrix layouts, whose physical extents are already whole boxes.
 std::optional<uint64_t> PhysicalBufferBytes(const ir::BufferTypePtr& type);
 
+/// Whole contiguous FP32 vector relabel: column-major [L,1] and row-major
+/// [1,L], with full static valid extents and 32-byte alignment. This proves
+/// descriptor equivalence only; callers must preserve the original storage
+/// window/provenance and exclude inherited noncontiguous slices.
+bool IsContiguousVectorReshape(const ir::BufferTypePtr& source, const ir::BufferTypePtr& destination);
+
 /// Static native view forms, with every intermediate descriptor already in IR.
 /// Subview slices full-width UINT8[N,32] rows; reshape preserves physical bytes.
 /// A matrix-space reshape relabels one fractal window within its memory space.

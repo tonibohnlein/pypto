@@ -115,7 +115,7 @@ def define_slot_storage(stmt, env, storage):
     if name == ir.get_op("buffer.alloc_multi").name:
         assert isinstance(t, ir.MultiBufferType)
         element = t.element_type
-        storage[stmt.var.name_hint] = (
+        storage[stmt.var] = storage[stmt.var.name_hint] = (
             element.memory_space,
             integer(stmt.value.args[1], env),
             *element.shape,
@@ -128,10 +128,10 @@ def define_slot_storage(stmt, env, storage):
         assert isinstance(parent.type, ir.MultiBufferType)
         slot = integer(selector, env)
         assert 0 <= slot < parent.type.slot_count
-        space, base, height, width, layout, scalar_bytes = storage[parent.name_hint]
+        space, base, height, width, layout, scalar_bytes = storage[parent]
         # Admitted whole-slot fixtures have no physical padding. Derive
         # the pitch from original IR, never from the compiler's slot map.
-        storage[stmt.var.name_hint] = (
+        storage[stmt.var] = storage[stmt.var.name_hint] = (
             space,
             base + slot * height * width * scalar_bytes,
             height,
@@ -153,7 +153,7 @@ def operand_signature(expr, env, storage):
     assert isinstance(expr, ir.Var)
     # Keep each operand separately: unioned effects alone would miss a
     # swapped matrix operand or a changed scalar computation.
-    descriptor = storage[expr.name_hint]
+    descriptor = storage[expr]
     return tuple(descriptor)
 
 
@@ -174,7 +174,7 @@ def define_storage(stmt, env, storage):
     if name in {ir.get_op("buffer.subview").name, ir.get_op("buffer.reshape").name}:
         source_arg = stmt.value.args[0]
         assert isinstance(source_arg, ir.Var)
-        source = storage[source_arg.name_hint]
+        source = storage[source_arg]
         space, base, height, width, layout, scalar_bytes, *inherited = source
         pitch = inherited[0] if inherited else width * scalar_bytes
         if name == ir.get_op("buffer.subview").name:
@@ -185,11 +185,18 @@ def define_storage(stmt, env, storage):
         else:
             assert pitch == width * scalar_bytes
             pitch = t.shape[1] * t.dtype.get_byte()
-        storage[stmt.var.name_hint] = (space, base, *t.shape, t, t.dtype.get_byte(), pitch)
+        storage[stmt.var] = storage[stmt.var.name_hint] = (
+            space,
+            base,
+            *t.shape,
+            t,
+            t.dtype.get_byte(),
+            pitch,
+        )
         return
     assert name == ir.get_op("buffer.alloc").name
     assert isinstance(t, ir.BufferType)
-    storage[stmt.var.name_hint] = (
+    storage[stmt.var] = storage[stmt.var.name_hint] = (
         t.memory_space,
         integer(stmt.value.args[1], env),
         *t.shape,
@@ -222,6 +229,10 @@ def interpret(
         assert block_count > 0
         assert block_index is None or block_index < block_count
         environment["__block_count__"] = block_count
+    # Original SSA identity owns an operand descriptor. Typed aliases may share
+    # name_hint and address while having different extents. String entries are
+    # retained only for inspecting named compiler storage domains below; payload
+    # interpretation never uses that diagnostic directory.
     storage = {}
     for param in function.params:
         t = param.type
@@ -229,11 +240,11 @@ def interpret(
             assert param.name_hint in environment, "missing invocation coordinate"
             continue
         shape = [integer(x, environment) for x in t.shape]
-        storage[param.name_hint] = (param.name_hint, 0, *shape, None, t.dtype.get_byte())
+        storage[param] = storage[param.name_hint] = (param.name_hint, 0, *shape, None, t.dtype.get_byte())
     calls = []
 
     def access(arg, rect=None):
-        s = storage[arg.name_hint]
+        s = storage[arg]
         return address_set(s, *(rect or (0, 0, s[2], s[3]))) if enumerate_effects else set()
 
     def payload_effects(call, env):

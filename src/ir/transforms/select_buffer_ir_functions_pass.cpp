@@ -509,12 +509,21 @@ class BufferKernelSupport : public IRVisitor {
       const auto source = call->args_.empty() ? nullptr : As<TileType>(call->args_[0]->GetType());
       const auto destination = As<TileType>(call->GetType());
       const auto source_bytes = TileBytes(source);
-      admission.Require(
-          source && destination && source->GetMemorySpace() == MemorySpace::Vec &&
-              destination->GetMemorySpace() == MemorySpace::Vec && source_bytes &&
-              source_bytes == TileBytes(destination) && views_.HasDenseRowPitch(call->args_[0]) &&
-              (!views_.IsWindow(call->args_[0]) || views_.Get(call->args_[0]).offsets.has_value()),
-          BufferAdmissionProperty::OperationRecipe);
+      // Row reductions use a contiguous column descriptor, not a padded
+      // row-major [R,1] box. The existing typed-root owner preserves its bytes
+      // when the upstream layout resolver relabels it as a single dense row.
+      const bool vector_relabel =
+          source && destination && IsOp(call, "tile.reshape") && !views_.IsWindow(call->args_[0]) &&
+          views_.HasDenseRowPitch(call->args_[0]) &&
+          backend::IsContiguousVectorReshape(backend::StaticLogicalBufferDescriptor(source),
+                                             backend::StaticLogicalBufferDescriptor(destination));
+      admission.Require(source && destination && source->GetMemorySpace() == MemorySpace::Vec &&
+                            destination->GetMemorySpace() == MemorySpace::Vec &&
+                            (vector_relabel || (source_bytes && source_bytes == TileBytes(destination) &&
+                                                views_.HasDenseRowPitch(call->args_[0]) &&
+                                                (!views_.IsWindow(call->args_[0]) ||
+                                                 views_.Get(call->args_[0]).offsets.has_value()))),
+                        BufferAdmissionProperty::OperationRecipe);
       if (IsOp(call, "tile.reshape")) {
         admission.Require(call->args_.size() == 2 && call->kwargs_.empty() && source && destination &&
                               source->dtype_ == destination->dtype_,
