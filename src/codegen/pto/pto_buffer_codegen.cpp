@@ -120,7 +120,7 @@ void CheckBufferTensorParameter(const ir::TensorTypePtr& tensor, const ir::Span&
       << "Direct Buffer IR GM parameters currently require rank-2 FP16/BF16/FP32/INT32/INT8 tensors";
   auto cols = As<ir::ConstInt>(tensor->shape_[1]);
   CHECK_SPAN(backend::IsBufferTensorShape(tensor->shape_), span)
-      << "Direct Buffer IR GM parameters require static columns > 1 and positive static rows or an "
+      << "Direct Buffer IR GM parameters require positive static columns and positive static rows or an "
          "INDEX row symbol";
   if (tensor->tensor_view_) {
     const auto& view = *tensor->tensor_view_;
@@ -456,8 +456,15 @@ class BufferEmissionPreflight : public ir::IRVisitor {
     if (ir::IsOp(call, "buffer.load") || ir::IsOp(call, "buffer.store")) {
       const bool load = ir::IsOp(call, "buffer.load");
       const auto buffer = As<ir::BufferType>(call->args_[load ? 3 : 0]->GetType());
-      CHECK_SPAN(!backend::IsColumnVectorBuffer(buffer), call->span_)
-          << "Direct Buffer IR GM transfers do not support reduction column vectors";
+      const auto tensor_type = As<ir::TensorType>(call->args_[load ? 0 : 3]->GetType());
+      const auto tensor_columns = tensor_type ? As<ir::ConstInt>(tensor_type->shape_.back()) : nullptr;
+      CHECK_SPAN(
+          (!backend::IsColumnVectorBuffer(buffer) && (!tensor_columns || tensor_columns->value_ != 1)) ||
+              (conversion_supported_ && backend::SupportsPackedColumnBufferTransfer(tensor_type, buffer)),
+          call->span_)
+          << "Direct Buffer IR column transfers require the qualified A2/A3 packed singleton-column "
+             "GM tensor and "
+             "a full-valid aligned FP32 column vector";
       auto tensor = ir::AsVarLike(call->args_[load ? 0 : 3]);
       auto parameter = tensor_parameters_.find(tensor.get());
       CHECK_SPAN(parameter != tensor_parameters_.end(), call->span_)

@@ -147,9 +147,26 @@ Those exclusions remain explicit admission boundaries. Host checks compare the
 declared enclosure, actual commands and reuse; they do not establish device
 behavior or prove that every enclosed byte is physically accessed.
 
-Column vectors are on-chip reduction/broadcast operands only. Kernels that load
-or store them directly to GM remain on Tile IR until a column transfer recipe is
-validated; the ordinary dense transfer recipe does not cover strided columns.
+Full-valid FP32 column vectors `[M,1]` can load/store packed GM `[R,1]` tensors
+through the existing DN-to-DN native transfer. The shared qualifier requires
+`M % 8 == 0`, `M <= 2097151 / 4`, static `R >= M`, and
+`R <= INT32_MAX / 4` to preserve native
+signed-int byte-stride arithmetic. Existing tensor-view emission selects DN
+without changing physical addresses: the only column is contiguous. Loads and
+stores preserve original row offsets and allocation identity; no transpose,
+extra payload, scratch or flags are introduced. A column slice of a wider GM
+tensor, dynamic GM row bounds and partial-valid columns remain unavailable.
+Those cases need a distinct footprint/layout certificate, not descriptor
+reinterpretation by assumption. The 2201 aligned-copy contracts permit
+byte-aligned GM addresses while requiring 32-byte UB addresses and a maximum
+2097151-byte burst; GM row offsets need not be multiples of eight. See the
+[GM-to-UB](https://asc.gitcode.com/api/SIMD-API/c_api/vector_data_move/asc_copy_gm2ub_align/asc_copy_gm2ub_align_arch_2201.html)
+and [UB-to-GM](https://asc.gitcode.com/api/SIMD-API/c_api/vector_data_move/asc_copy_ub2gm_align/asc_copy_ub2gm_align_arch_2201.html)
+contracts (documentation build `166fc2913e15`). The selected pinned pto-isa
+`5487a6b0` DN-to-DN implementations use the corresponding aligned-copy
+intrinsics. Physical UB allocation alignment remains an existing placement
+precondition. Host tests include GM row offset one; device qualification is
+separate.
 
 This supports the complete `row_max -> row_expand_sub -> exp -> row_sum ->
 row_expand_div` softmax chain. Row recipes in kernels with runtime/empty valid

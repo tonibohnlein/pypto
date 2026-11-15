@@ -54,7 +54,7 @@ inline bool SupportsBufferStoreMode(int atomic, std::optional<ir::MemorySpace> s
 inline bool IsBufferTensorShape(const std::vector<ir::ExprPtr>& shape) {
   if (shape.size() != 2) return false;
   const auto columns = ir::As<ir::ConstInt>(shape[1]);
-  if (!columns || columns->value_ <= 1) return false;
+  if (!columns || columns->value_ <= 0) return false;
   if (auto rows = ir::As<ir::ConstInt>(shape[0])) return rows->value_ > 0;
   const auto rows = ir::As<ir::Var>(shape[0]);
   const auto scalar = rows ? ir::As<ir::ScalarType>(rows->GetType()) : nullptr;
@@ -136,6 +136,48 @@ inline ir::BufferTypePtr StaticLogicalBufferDescriptor(const ir::TypePtr& type) 
     }
   }
   return std::make_shared<ir::BufferType>(shape, tile->dtype_, ir::MemorySpace::Vec, valid, view.blayout);
+}
+
+/// Packed singleton-column GM and a full-valid contiguous FP32 Vec column.
+/// Existing PTO tensor-view emission selects DN for [R,1]; its address map
+/// row + col*R agrees with packed ND row*1 + col on the sole column. The
+/// A2/A3 DN-to-DN transfer then copies one aligned burst, with no transpose,
+/// padding or implicit scratch. General column slices of wide tensors do not
+/// satisfy this contract. Static GM rows bound the native signed-int byte
+/// stride arithmetic; dynamic rows need a separate checked range certificate.
+/// The 2201 aligned-copy primitive accepts byte-aligned GM addresses, requires
+/// 32-byte UB alignment and limits one burst to 2097151 bytes. Full-valid FP32
+/// columns have no UB padding because their row count is a multiple of eight.
+inline bool SupportsPackedColumnBufferTransfer(const ir::TensorTypePtr& tensor,
+                                               const ir::BufferTypePtr& buffer) {
+  if (!tensor || tensor->shape_.size() != 2 || !IsColumnVectorBuffer(buffer) ||
+      buffer->valid_shape_ != buffer->shape_ || buffer->shape_[0] > 2097151 / 4 ||
+      tensor->dtype_ != buffer->dtype_)
+    return false;
+  const auto columns = ir::As<ir::ConstInt>(tensor->shape_[1]);
+  const auto rows = ir::As<ir::ConstInt>(tensor->shape_[0]);
+  if (!columns || columns->value_ != 1 || !rows || rows->value_ < buffer->shape_[0] ||
+      rows->value_ > INT32_MAX / 4)
+    return false;
+  if (tensor->tensor_view_) {
+    const auto& view = *tensor->tensor_view_;
+    if (view.layout != ir::TensorLayout::ND || view.pad != ir::PadValue::null) return false;
+    if (!view.stride.empty()) {
+      if (view.stride.size() != 2) return false;
+      for (const auto& item : view.stride) {
+        const auto stride = ir::As<ir::ConstInt>(item);
+        if (!stride || stride->value_ != 1) return false;
+      }
+    }
+    if (!view.valid_shape.empty()) {
+      if (view.valid_shape.size() != 2) return false;
+      for (size_t axis = 0; axis < 2; ++axis) {
+        const auto extent = ir::As<ir::ConstInt>(view.valid_shape[axis]);
+        if (!extent || extent->value_ != (axis ? 1 : rows->value_)) return false;
+      }
+    }
+  }
+  return true;
 }
 
 /// On-chip spaces whose descriptors carry a cube fractal layout. Their bytes

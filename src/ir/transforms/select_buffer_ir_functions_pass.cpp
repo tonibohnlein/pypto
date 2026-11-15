@@ -752,11 +752,15 @@ class BufferKernelSupport : public IRVisitor {
       return;
     }
     const auto space = tile->GetMemorySpace();
-    // Reduction columns are on-chip operands only. The ordinary GM recipe
-    // cannot transfer a contiguous column into a strided row-major tensor.
-    admission.Require(
-        !backend::IsColumnVectorBufferTile(tile, tile_view_semantics::GetEffectiveTileView(*tile)),
-        BufferAdmissionProperty::TransferTypes);
+    // DN-to-DN preserves packed singleton columns. A column into a wider
+    // ND tensor still needs a separate layout/footprint construction.
+    const auto tensor_columns = As<ConstInt>(tensor->shape_.back());
+    if (backend::IsColumnVectorBufferTile(tile, tile_view_semantics::GetEffectiveTileView(*tile)) ||
+        (tensor_columns && tensor_columns->value_ == 1)) {
+      admission.Require(
+          backend::SupportsPackedColumnBufferTransfer(tensor, backend::StaticLogicalBufferDescriptor(tile)),
+          BufferAdmissionProperty::TransferTypes);
+    }
     if (space == MemorySpace::Vec || (load && space == MemorySpace::Mat)) {
       admission.Require(tile->dtype_ == tensor->dtype_, BufferAdmissionProperty::TransferTypes);
     } else {
