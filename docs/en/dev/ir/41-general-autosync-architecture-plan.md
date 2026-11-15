@@ -1,12 +1,15 @@
 # General autosync integration: architecture and Qwen acceptance plan
 
-Status: reviewed implementation slices are delivered; the six original milestones
-and whole-model ownership are **not complete**. The latest focused atomic/public
-child-provider gate passes 444 tests. The final broad gate passes 2,437 tests
-with four warnings; the earlier slot gate passed 1,791 tests. Fresh unchanged two-layer Qwen produces 32/32 C++
-leaves under either policy: exact owns 2, conservative prefix owns 11. Prefix still
-delegates 21 leaves, and 47 other observed domains remain unverified. See the
-milestone dispositions and pinned qualification below.
+Status: the continued operation, ownership and retained-child gates are reviewed.
+The original six milestones and whole-model ownership remain **partially complete**:
+missing native and value-domain premises are not inferred from a passing capture.
+The latest unchanged two-layer Qwen capture produces 32/32 C++ leaves under both
+policies: exact owns 3, conservative prefix owns 16 and delegates 16. Another
+47 previously observed domains remain unverified. The runtime package passes
+256 tests; the broader 52-module campaign recorded 2,669 passes and six stale
+fixture expectations, resolved by a reviewed 196-test module rerun. This is
+aggregate evidence, not a fresh single all-green 2,675-test campaign. See the
+continued ledger and [retained-child checkpoint](41-general-autosync-readonly-child.md).
 Baseline: `b5597650a75b598645b1b1d3fe05bd3aab220f09`. This extends the
 [regional architecture](39-regional-sync-architecture.md). Qwen end-to-end remains
 the acceptance target, not a source of kernel-specific admission rules. Autosync
@@ -398,9 +401,9 @@ definitions are restored on exit, and unknown callers poison joined numerical
 bounds. A later branch cannot legitimize an earlier overflow. This produces
 numerical evidence for existing consumers, not a symbolic callee relation ABI.
 
-## Current qualification and reproduction
+## Earlier atomic checkpoint: qualification and reproduction
 
-The latest receipts are under
+The earlier atomic-checkpoint receipts are under
 `build-py314/general-autosync-20261115/m6-atomic/{exact,conservative_prefix}`.
 Both use compiler base `c4b9c237ed1606fa29484504c93955c5c3002fec` **plus the recorded
 dirty-source hashes and binary**, not an assumed clean commit. Library/model pin:
@@ -618,3 +621,55 @@ evidence. Rank-one index loads additionally require scalar-memory visibility
 and readiness evidence. The existing refusals are retained until those
 obligations are established. Eventful child composition and paired AIC/AIV
 transport remain subsequent gates; this operation recipe does not qualify them.
+
+## Continued accepted gates and remaining contracts (2026-11-15)
+
+The earlier tables preserve their original source snapshots. The current
+operation/native audits, reproduction commands and binary hashes are in the
+runtime-valid, runtime-axis, module-ownership and read-only-child companion
+receipts. The unchanged model pin remains `b72c66d9`, two layers, batch one,
+sequence 128 and original hidden/intermediate dimensions 5120/17408.
+
+| Milestone | Delivered through reviewed gates | First remaining obligation |
+| --------- | -------------------------------- | -------------------------- |
+| M1 effects and ownership | Typed first obligations, shared effects, original owner/frame index, explicit complete-unit ownership | Some observed protocol domains remain unqualified; a leaf census is not a proof of every domain |
+| M2 native operation and storage contracts | Column broadcast/transfer, use-site runtime metadata, FP32 row reductions/axis aliases, BF16/FP32 casts | Mixed full/partial ADD value semantics, unqualified scalar GM visibility and broader native variants |
+| M3 conservative control and actual protocols | Existing no-KILL transfer, explicit prefix/acknowledgment services, joint pruning and actual-token lowering | A general common-completion or arbitrary command protocol needs its own admitted grammar/progress proof |
+| M4 retained children | Local and read-only-GM whole invocations, original frames, pending effects, existing entry rearming and directional palettes | Cross-core borrowed-buffer readiness/release/peer ownership; missing exact GM boundaries remain unavailable |
+| M5 caller and exact composition | Existing bounded caller evidence and compact K/replay retained; original physical-shape ABI metadata can be ready opaque coordinates | Additional symbolic relations/ranges and executable exact GM exports need actual caller evidence |
+| M6 complete-model deployment | Opt-in empty/barrier/flag module ownership, final drain, debug/cache rebuild checks; all 32 leaves generate C++ | 16 prefix leaves still delegate; no whole-model device or universal ownership qualification |
+
+The fresh prefix census improves from 14 to 16 owned leaves at the immediate
+preceding packed-transfer checkpoint; `x_gamma` and `x_gamma_0` are new. Exact
+owns `final_rmsnorm`, `mlp_out_seed` and `silu`. The older 11/32 and 2/32 figures
+above are historical, not the current denominator. Neither route silently
+converts exact export failure into stronger synchronization.
+
+The read-only adapter is explicitly requested through the existing child API.
+Ordinary model capture does not automatically select retained children. Original
+Qwen K preparation, logical composition, six-ID physical allocation and C++ now
+succeed. Each independent bounded invocation checks 284 actual retained covers,
+all 692,224 event queries, 86 boundary samples and 416 original accesses. Original
+GM readers remain pending in the parent and their exact selectors unavailable.
+The two checked complete parent executions remove 2,188 prerequisite pairs and
+add none. Generic fixtures also expose cases with added wrapper order, so no
+uniform dominance claim follows. Matching, payload completion and physical reuse
+remain separate obligations.
+
+Completion of all original milestones cannot be declared from these results.
+The next obligations are operation semantics or explicit backend/caller facts:
+
+1. A full-valid carrier and partial-valid matrix cannot be silently narrowed.
+   Runtime row-reduction output leaves inactive rows untouched, so no implicit
+   zeros justify mixed full/partial ADD. Enclosing addresses do not fix this.
+2. Native scalar same-pipe order does not prove visibility of externally loaded
+   control. The runtime's task barrier alone does not establish the required
+   cacheline/producer publication contract; benchmark shape facts supply none.
+3. Cross-core pushes, pops and frees have distinct local readiness, peer release,
+   and resource epochs. Local prefix/ALL completion cannot replace that protocol.
+
+The initial broad test failures, combined exhaustive-audit timeout and audit
+memory refusals remain recorded. Research interpreters can unfold bounded
+instances; production retained representations still avoid trip-count expansion.
+No allocator, ID pool, hardware exemption, expert protocol or zero-inner-body
+barrier was changed to obtain the new acceptance.

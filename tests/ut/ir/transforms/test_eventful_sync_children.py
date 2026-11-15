@@ -13,7 +13,7 @@ import pytest
 from pypto import ir, passes, testing
 
 from .sync_closed_command_oracle import check_closed_commands
-from .sync_matmul_oracle import sequence_stmts
+from .sync_matmul_oracle import sequence_stmts, validate
 from .test_autosync_switch import clone
 from .test_closed_prefix_sync import Services
 from .test_conservative_sync_children import resident_child_fixture
@@ -481,3 +481,256 @@ def test_command_only_child_pipes_require_their_own_entry_evidence():
         with pytest.raises(ValueError, match="acknowledgment"):
             passes.lower_sync()(ir.Program([logical], "CommandOnlyChild", span))
     assert ir.serialize(logical) == before
+
+
+def readonly_external_fixture(count=3, *, local_offset=False):
+    function, previous = eventful_fixture(count)
+    span = function.span
+    root = list(sequence_stmts(function.body))
+    outer = root[-2]
+    assert isinstance(outer, ir.ForStmt)
+    allocations = root[:5]
+    assert all(isinstance(statement, ir.AssignStmt) for statement in allocations)
+    handles = [statement.var for statement in allocations if isinstance(statement, ir.AssignStmt)]
+    address = ir.Var("opaque_address", ir.ScalarType(ir.DataType.INDEX), span)
+
+    def ci(value):
+        return ir.ConstInt(value, ir.DataType.INDEX, span)
+
+    def payload(name, args):
+        return ir.EvalStmt(ir.Call(ir.get_op(name), args, ir.VoidType(), span), span)
+
+    def rectangle(values):
+        return ir.MakeTuple(values, span)
+
+    body: list[ir.Stmt] = [
+        ir.AssignStmt(address, ir.Mul(outer.loop_var, ci(0), ir.DataType.INDEX, span), span),
+        payload(
+            "buffer.load",
+            [function.params[0], rectangle([address, ci(0)]), rectangle([ci(64), ci(32)]), handles[0]],
+        ),
+        payload(
+            "buffer.load",
+            [function.params[1], rectangle([ci(0), ci(0)]), rectangle([ci(32), ci(64)]), handles[1]],
+        ),
+        *sequence_stmts(previous.body),
+    ]
+    if local_offset:
+        body[3] = payload("buffer.extract", [handles[0], address, ci(0), handles[2]])
+    child = ir.ForStmt(
+        previous.loop_var, previous.start, previous.stop, previous.step, [], ir.SeqStmts(body, span), [], span
+    )
+    enclosing = []
+    for member in sequence_stmts(outer.body):
+        if isinstance(member, ir.IfStmt) and member.then_body is previous:
+            # This later guard does not establish a range at address's original
+            # defining cut, and is never imported as an unstated caller premise.
+            member = ir.IfStmt(member.condition, child, None, [], member.span)
+        enclosing.append(member)
+    wrapper = ir.ForStmt(
+        outer.loop_var, outer.start, outer.stop, outer.step, [], ir.SeqStmts(enclosing, span), [], span
+    )
+    original = clone(function, body=ir.SeqStmts([*root[:-2], wrapper, root[-1]], span))
+    oracle = ir.Function(
+        "readonly_child_oracle",
+        [*zip(original.params, original.param_directions), outer.loop_var],
+        [],
+        ir.SeqStmts([*allocations, child, ir.ReturnStmt([], span)], span),
+        span,
+        ir.FunctionType.AIC,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    return original, child, oracle
+
+
+@pytest.mark.parametrize("count", [0, 1, 3])
+def test_readonly_external_projection_retains_exact_local_math_and_unavailable_gm(count):
+    original, scope, oracle = readonly_external_fixture(count)
+    child, logical, physical = construct(original, scope)
+    assert child.describe()["unavailable_storage_domains"] == 1
+    retained = testing.inspect_eventful_sync_child(child)
+    description = retained.describe()
+    unavailable = [
+        index for index, domain in enumerate(description["storage"]) if domain["space"] == ir.MemorySpace.DDR
+    ]
+    assert len(unavailable) == 2
+    assert all(not description["storage"][index]["boundary_available"] for index in unavailable)
+    # This is the actual retained result, with every original load still an
+    # event. No diagnostic reanalysis or specialization produces an easier plan.
+    checked = validate(
+        oracle,
+        retained,
+        parameters={3: 1, 4: True, 5: 0},
+        unavailable_boundaries=unavailable,
+        readonly_external_projection=True,
+    )
+    assert checked["payloads"] == count * 5
+    for index in unavailable:
+        assert retained.boundary(index, 0, 0) is None
+        assert retained.boundary_slot(index, 0, 0, 0) is None
+    for visits in [0, 1, 3]:
+        for execute in [False, True]:
+            for bases in [BASES, {0: 0, 1: 0, 2: 2 << 20}, {0: 0, 1: 1 << 20, 2: 0}]:
+                check_closed_commands(
+                    logical,
+                    physical,
+                    {3: visits, 4: execute},
+                    range(6),
+                    tensor_bases=bases,
+                    compare_commands=False,
+                    hardware_source=original,
+                )
+
+
+def test_opaque_external_coordinate_cannot_supply_a_local_numeric_proof():
+    original, scope, _ = readonly_external_fixture(3, local_offset=True)
+    before = ir.serialize(original)
+    with passes.PassContext([]):
+        with pytest.raises(ValueError, match="caller range|synchronization access|affine"):
+            passes.prepare_eventful_sync_children(original, [scope])
+    assert ir.serialize(original) == before
+
+
+def test_readonly_projection_cannot_capture_a_future_enclosing_coordinate():
+    original, scope, _ = readonly_external_fixture(3)
+    root = list(sequence_stmts(original.body))
+    child_body = list(sequence_stmts(scope.body))
+    address = child_body.pop(0)
+    assert isinstance(address, ir.AssignStmt)
+    changed = ir.ForStmt(
+        scope.loop_var,
+        scope.start,
+        scope.stop,
+        scope.step,
+        [],
+        ir.SeqStmts(child_body, scope.span),
+        [],
+        scope.span,
+    )
+    outer = root[-2]
+    assert isinstance(outer, ir.ForStmt)
+    outer_body = [
+        ir.IfStmt(member.condition, changed, None, [], member.span)
+        if isinstance(member, ir.IfStmt) and member.then_body is scope
+        else member
+        for member in sequence_stmts(outer.body)
+    ]
+    wrapper = ir.ForStmt(
+        outer.loop_var,
+        outer.start,
+        outer.stop,
+        outer.step,
+        [],
+        ir.SeqStmts(outer_body, outer.span),
+        [],
+        outer.span,
+    )
+    # The address's dependence on this IV predates entry to the IV's scope.
+    invalid = clone(original, body=ir.SeqStmts([*root[:-2], address, wrapper, root[-1]], original.span))
+    before = ir.serialize(invalid)
+    with passes.PassContext([]):
+        with pytest.raises(ValueError, match="original definition/use cut"):
+            passes.prepare_eventful_sync_children(invalid, [changed])
+    assert ir.serialize(invalid) == before
+
+
+def physical_shape_fixture(*, foreign=False, valid_shape_only=False):
+    original, old_scope, _ = readonly_external_fixture(3)
+    old_parameter = original.params[0]
+    old_type = old_parameter.type
+    assert isinstance(old_type, ir.TensorType)
+    extent = ir.Var("physical_rows", ir.ScalarType(ir.DataType.INDEX), original.span)
+    shape: list[ir.Expr] = [extent, ir.ConstInt(32, ir.DataType.INDEX, original.span)]
+    view = None
+    if valid_shape_only:
+        shape = [
+            ir.ConstInt(64, ir.DataType.INDEX, original.span),
+            ir.ConstInt(32, ir.DataType.INDEX, original.span),
+        ]
+        view = ir.TensorView([32, 1], ir.TensorLayout.ND, valid_shape=[extent, 32])
+    parameter = ir.Var(
+        old_parameter.name_hint,
+        ir.TensorType(shape, old_type.dtype, memref=None, tensor_view=view),
+        original.span,
+    )
+    body = ir.substitute_stmt(original.body, [(old_parameter, parameter)])
+    updated = ir.Function(
+        original.name,
+        [
+            (parameter if item is old_parameter else item, direction)
+            for item, direction in zip(original.params, original.param_directions, strict=True)
+        ],
+        original.return_types,
+        body,
+        original.span,
+        original.func_type,
+        ir_stage=original.ir_stage,
+    )
+    root = list(sequence_stmts(updated.body))
+    outer = root[-2]
+    assert isinstance(outer, ir.ForStmt)
+    branch = next(member for member in sequence_stmts(outer.body) if isinstance(member, ir.IfStmt))
+    scope = branch.then_body
+    assert isinstance(scope, ir.ForStmt) and scope.loop_var is old_scope.loop_var
+    if foreign or valid_shape_only:
+        foreign_extent = ir.Var(extent.name_hint, extent.type, extent.span) if foreign else extent
+        child_body = list(sequence_stmts(scope.body))
+        first = child_body[0]
+        assert isinstance(first, ir.AssignStmt)
+        child_body[0] = ir.AssignStmt(first.var, foreign_extent, first.span)
+        replacement = ir.ForStmt(
+            scope.loop_var,
+            scope.start,
+            scope.stop,
+            scope.step,
+            [],
+            ir.SeqStmts(child_body, scope.span),
+            [],
+            scope.span,
+        )
+        outer_body = [
+            ir.IfStmt(member.condition, replacement, None, [], member.span)
+            if isinstance(member, ir.IfStmt) and member is branch
+            else member
+            for member in sequence_stmts(outer.body)
+        ]
+        wrapper = ir.ForStmt(
+            outer.loop_var,
+            outer.start,
+            outer.stop,
+            outer.step,
+            [],
+            ir.SeqStmts(outer_body, outer.span),
+            [],
+            outer.span,
+        )
+        updated = clone(updated, body=ir.SeqStmts([*root[:-2], wrapper, root[-1]], updated.span))
+        scope = replacement
+    return updated, scope
+
+
+def test_original_physical_shape_metadata_is_ready_but_not_numerically_bounded():
+    original, scope = physical_shape_fixture()
+    with passes.PassContext([]):
+        child = passes.prepare_eventful_sync_children(original, [scope])[0]
+    retained = testing.inspect_eventful_sync_child(child)
+    assert child.describe()["unavailable_storage_domains"] == 1
+    assert any(
+        domain["space"] != ir.MemorySpace.DDR and domain["boundary_available"]
+        for domain in retained.describe()["storage"]
+    )
+    exported = testing.export_native_sync_child(retained, scope)
+    assert exported["status"] == "access_premises" and exported["child"] is None
+    assert "external-domain contract" in exported["reason"]
+
+
+@pytest.mark.parametrize("kind", ["foreign", "valid_shape_only"])
+def test_opaque_shape_readiness_requires_original_physical_abi_identity(kind):
+    original, scope = physical_shape_fixture(
+        foreign=kind == "foreign", valid_shape_only=kind == "valid_shape_only"
+    )
+    before = ir.serialize(original)
+    with passes.PassContext([]):
+        with pytest.raises(ValueError, match="unavailable enclosing coordinate|ND descriptor"):
+            passes.prepare_eventful_sync_children(original, [scope])
+    assert ir.serialize(original) == before

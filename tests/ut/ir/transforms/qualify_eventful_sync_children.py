@@ -16,6 +16,7 @@ import pathlib
 import subprocess
 import sys
 import time
+from typing import Any
 
 from pypto import backend, codegen, ir, passes
 from pypto.backend.pto_backend import _run_ptoas
@@ -23,18 +24,26 @@ from pypto.backend.pto_backend import _run_ptoas
 from .sync_closed_command_oracle import ClosedCommands, check_closed_commands
 from .sync_matmul_oracle import protected_accumulator_pairs, sequence_stmts
 from .test_autosync_switch import clone
-from .test_eventful_sync_children import BASES, count_statements, eventful_fixture
+from .test_eventful_sync_children import BASES, count_statements, eventful_fixture, readonly_external_fixture
 from .test_finite_sync_analysis import closure
 from .test_logical_sync_realization import verify
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--output", type=pathlib.Path, required=True)
+parser.add_argument("--readonly-external", action="store_true")
 arguments = parser.parse_args()
 ROOT = pathlib.Path.cwd()
 OUTPUT = arguments.output.resolve()
 OUTPUT.mkdir(parents=True, exist_ok=True)
 backend.reset_for_testing()
 backend.set_backend_type(backend.BackendType.Ascend910)
+
+
+def fixture(count):
+    if arguments.readonly_external:
+        function, scope, _ = readonly_external_fixture(count)
+        return function, scope
+    return eventful_fixture(count)
 
 
 def digest(path):
@@ -89,6 +98,52 @@ def payload_order(state):
     return {(a[1], b[1]) for a, b in state.order if a[0] == b[0] == "payload" and a[2] == "C" and b[2] == "I"}
 
 
+def describe_witness(pair, state):
+    def payload(index):
+        call, env, pipe, _, _ = state.calls[index]
+        return {
+            "index": index,
+            "operation": call.op.name,
+            "pipe": str(pipe),
+            "coordinates": {
+                var.name_hint: value
+                for var, value in env.items()
+                if isinstance(var, ir.Var)
+                and isinstance(var.type, ir.ScalarType)
+                and isinstance(value, (int, bool))
+            },
+        }
+
+    source, target = ("payload", pair[0], "C"), ("payload", pair[1], "I")
+    previous: dict[tuple[Any, ...], tuple[Any, ...] | None] = {source: None}
+    pending = [source]
+    outgoing = {}
+    for a, b in state.edges:
+        outgoing.setdefault(a, set()).add(b)
+    for node in pending:
+        if node == target:
+            break
+        for successor in sorted(outgoing.get(node, ()), key=repr):
+            if successor not in previous:
+                previous[successor] = node
+                pending.append(successor)
+    assert target in previous
+    path = []
+    node = target
+    while node is not None:
+        item = {"event": repr(node)}
+        if node in state.record_origins:
+            item["record"] = state.record_origins[node]
+        path.append(item)
+        node = previous[node]
+    return {
+        "source": payload(pair[0]),
+        "target": payload(pair[1]),
+        "path": path[::-1],
+        "present_before_physical_allocation": True,
+    }
+
+
 def build(function, children):
     start = time.perf_counter()
     with passes.PassContext([], autosync_policy="conservative_prefix"):
@@ -115,7 +170,7 @@ def build(function, children):
 rows = []
 scaling = []
 for count in [0, 1, 3]:
-    original, scope = eventful_fixture(count)
+    original, scope = fixture(count)
     start = time.perf_counter()
     with passes.PassContext([]):
         child = passes.prepare_eventful_sync_children(original, [scope])[0]
@@ -125,8 +180,9 @@ for count in [0, 1, 3]:
     for visits in [0, 1, 3]:
         for execute in [False, True]:
             states = []
+            logical_states = []
             for logical, physical, _ in [baseline, candidate]:
-                _, checked = check_closed_commands(
+                checked_logical, checked = check_closed_commands(
                     logical,
                     physical,
                     {3: visits, 4: execute},
@@ -136,6 +192,7 @@ for count in [0, 1, 3]:
                     hardware_source=original,
                 )
                 states.append(checked)
+                logical_states.append(checked_logical)
             old, new = map(payload_order, states)
             required = concrete_required(original, {3: visits, 4: execute})
             assert required <= old and required <= new
@@ -148,6 +205,12 @@ for count in [0, 1, 3]:
                     "new_prerequisites": len(new),
                     "removed": len(old - new),
                     "added": len(new - old),
+                    "added_witnesses": [
+                        describe_witness(pair, logical_states[1]) for pair in sorted(new - old)[:3]
+                    ],
+                    "removed_witnesses": [
+                        describe_witness(pair, logical_states[0]) for pair in sorted(old - new)[:3]
+                    ],
                     "required": len(required),
                     "old_excess": len(old - required),
                     "new_excess": len(new - required),
@@ -188,21 +251,19 @@ for count in [0, 1, 3]:
         scaling[-1]["generated_pto_sha256"] = hashlib.sha256(text.encode()).hexdigest()
         scaling[-1]["generated_cpp_sha256"] = hashlib.sha256(cpp.read_bytes()).hexdigest()
 for count in [2, 17, 1023, 1000000]:
-    original, scope = eventful_fixture(count)
+    original, scope = fixture(count)
     start = time.perf_counter()
     with passes.PassContext([]):
         child = passes.prepare_eventful_sync_children(original, [scope])[0]
     scaling.append({"K": count, **child.describe(), "analysis_seconds": time.perf_counter() - start})
 static_children = []
 for number in [1, 2, 4, 8]:
-    original, first = eventful_fixture(2)
+    original, first = fixture(2)
     scopes = [first]
     for index in range(1, number):
         coordinate = ir.Var(f"child_{index}", first.loop_var.type, first.span)
-        statements = [
-            ir.EvalStmt(member.expr, member.span) if isinstance(member, ir.EvalStmt) else member
-            for member in sequence_stmts(first.body)
-        ]
+        cloned, _ = ir.deep_clone(first.body)
+        statements = list(sequence_stmts(cloned))
         scopes.append(
             ir.ForStmt(
                 coordinate,
@@ -257,7 +318,8 @@ result = {
     "python_version": sys.version,
     "binaries": binaries,
     "static_child_scaling": static_children,
-    "scope": "initial local eventful child, host-only, identical conservative-prefix policy",
+    "scope": ("readonly external" if arguments.readonly_external else "local")
+    + " eventful child, host-only, identical conservative-prefix policy",
     "timing_qualification": (
         "Single serial measurements; inclusive stages are not summed or speedup evidence."
     ),

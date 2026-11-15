@@ -25,6 +25,7 @@ the page covering what you are changing.
 | [Logical Demand Realization](14-logical-demand-realization.md) | Retained demand to completion-token construction and independent command checks |
 | [Physical Demand Realization](15-physical-demand-realization.md) | Qualified flag allocation, direct placement and independent reuse checks |
 | [Runtime Valid Axes](41-general-autosync-runtime-axis.md) | Shared native geometry, actual valid metadata, placed axis aliases, reductions and direct casts |
+| [Read-only External Children](41-general-autosync-readonly-child.md) | Explicit coverage, original frames and retained compact command plans |
 | [Logical Synchronization](11-logical-sync.md) | SSA completion tokens, pipeline ordering, runtime address predicates, and VF completion boundaries |
 
 ## See Also

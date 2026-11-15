@@ -24,6 +24,7 @@ IR 定义是整个编译器的真源：pass 可以重写，IR 节点定义不可
 | [逻辑需求实现](14-logical-demand-realization.md) | 保留需求到完成 token 的构造与独立命令验证 |
 | [物理需求实现](15-physical-demand-realization.md) | 限定范围内的标志分配、直接放置及独立复用检查 |
 | [运行时有效轴](41-general-autosync-runtime-axis.md) | 共享物理几何、实际有效元数据、放置轴别名、归约和直接转换 |
+| [只读外部子区域](41-general-autosync-readonly-child.md) | 明确覆盖、原始坐标和保留紧凑命令计划 |
 | [逻辑同步](11-logical-sync.md) | SSA 完成凭证、流水顺序、运行时地址谓词与 VF 完成边界 |
 
 ## 另请参阅

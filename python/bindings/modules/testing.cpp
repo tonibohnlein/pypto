@@ -72,11 +72,22 @@
 
 namespace nb = nanobind;
 
+namespace pypto::ir::sync {
+// Diagnostic access returns the existing immutable shared result; it never
+// rebuilds mathematics or transfers its owner to another region context.
+struct RetainedSyncChildDiagnostics {
+  static CompactSyncResult Mathematics(const EventfulSyncChild& child) { return child.mathematics_; }
+};
+}  // namespace pypto::ir::sync
+
 namespace pypto {
 namespace python {
 
 nb::dict DescribeCompactSync(const ir::sync::CompactSyncView& result) {
   nb::dict out;
+  nb::list unavailable_spaces;
+  for (const auto space : result.State().input.unavailable_storage_spaces) unavailable_spaces.append(space);
+  out["unavailable_storage_spaces"] = unavailable_spaces;
   out["interval_access_visits"] = result.State().input.interval_access_visits;
   out["collective_domains"] = result.Diagnostics().collective_domains;
   out["collective_witnesses"] = result.Diagnostics().collective_witnesses;
@@ -170,6 +181,7 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncView& result) {
   for (const auto& s : result.State().input.storage) {
     nb::dict item;
     item["name"] = s.name;
+    item["boundary_available"] = s.boundary_available;
     item["space"] = s.space;
     item["address"] = s.address;
     item["rows"] = s.rows;
@@ -1541,6 +1553,8 @@ void BindTesting(nb::module_& m) {
       nb::arg("function"), nb::arg("target") = "a2a3", nb::kw_only(),
       nb::arg("children") = std::vector<std::shared_ptr<const ir::sync::NativeSyncChild>>{},
       "Explicit research request for conservative logical prefix protocols; production dispatch unchanged");
+  testing.def("inspect_eventful_sync_child", &ir::sync::RetainedSyncChildDiagnostics::Mathematics,
+              nb::arg("child"), "Inspect the child's actual retained immutable mathematics without analysis");
   testing.def(
       "export_native_sync_child",
       [](const ir::sync::CompactSyncResult& mathematics, const ir::ForStmtPtr& scope,

@@ -360,7 +360,7 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
                                     const std::optional<std::vector<int>>& eligible_ids,
                                     const SyncParameterBounds& parameters,
                                     std::optional<std::pair<int64_t, int64_t>> blocks,
-                                    const SyncSchedulePolicy& policy) {
+                                    const SyncSchedulePolicy& policy, SyncExternalPolicy external_policy) {
   CheckLogicalSync(function);
   if (!HasLogicalSync(function)) {
     PhysicalSyncRealization result;
@@ -383,11 +383,12 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
   } structure;
   structure.VisitFunction(function);
   if (structure.loop)
-    return LowerStructuredLogicalSync(function, target, eligible_ids, parameters, blocks, policy);
+    return LowerStructuredLogicalSync(function, target, eligible_ids, parameters, blocks, policy,
+                                      external_policy);
   auto stripped = StripTokens().VisitFunction(function);
   // No storage-demand importer or GM partition authorizes this lowering.
   // Actual token uses, including manually supplied ordering, are authoritative.
-  auto input = ImportSyncPayloads(stripped, target, parameters, blocks);
+  auto input = ImportSyncPayloads(stripped, target, parameters, blocks, external_policy);
   auto result = FiniteLowering(function, std::move(input), target, eligible_ids).Run();
   FinishSyncScheduleReceipt(result.function, result, policy);
   return {result.function, result.set_sites, result.wait_sites, {std::move(result)}};

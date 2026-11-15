@@ -6,6 +6,10 @@ is not admitted by the numerical exact importer. Default dispatch is unchanged.
 The initial family does not qualify the load-bearing Qwen K region: its external
 reads and free address coordinates require a separately qualified projection.
 
+The subsequent [read-only external projection checkpoint](41-general-autosync-readonly-child.md)
+qualifies an additional family, including the original Qwen K invocation. The
+local-only limits below describe this initial checkpoint, not that extension.
+
 ## Provider and ownership
 
 `prepare_eventful_sync_children(original, scopes)` makes one original-owner

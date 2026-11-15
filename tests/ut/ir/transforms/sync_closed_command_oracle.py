@@ -41,9 +41,14 @@ _BARRIERS = {
 
 
 class ClosedCommands:
-    def __init__(self, function, parameters, eligible, tensor_bases=None):
+    def __init__(
+        self, function, parameters, eligible, tensor_bases=None, *, shape_parameters=None, block_index=None
+    ):
         self.function = function
         self.env = {function.params[i]: x for i, x in parameters.items()}
+        self.env.update(shape_parameters or {})
+        if block_index is not None:
+            self.env["__block_index__"] = block_index
         self.storage = {}
         self.layouts = {}
         self.footprints = {}
@@ -54,6 +59,7 @@ class ClosedCommands:
         self.live, self.last_consumption = {}, {}
         self.reuses, self.publications, self.acquisitions = [], [], []
         self.used_tokens = set()
+        self.record_origins = {}
         self.logical_records = False
         self.trace, self.payloads, self.descriptors = [], [], []
         self.ids = defaultdict(set)
@@ -226,9 +232,18 @@ class ClosedCommands:
                 self.signature(args[3]),
                 call.kwargs.get("atomic", 0),
             )
-        elif name == opname("buffer.copy"):
-            pipe, reads, writes = ir.PipeType.MTE1, self.bytes(args[0]), self.bytes(args[1])
-            signature = name, self.signature(args[0]), self.signature(args[1])
+        elif name in (opname("buffer.copy"), opname("buffer.extract")):
+            target = 3 if name == opname("buffer.extract") else 1
+            rect = None
+            if target == 3:
+                rect = (
+                    value(args[1], env),
+                    value(args[2], env),
+                    self.storage[args[target]][2],
+                    self.storage[args[target]][3],
+                )
+            pipe, reads, writes = ir.PipeType.MTE1, self.bytes(args[0], rect), self.bytes(args[target])
+            signature = name, self.signature(args[0]), rect, self.signature(args[target])
         elif name in (opname("buffer.add"), opname("buffer.mul")):
             pipe = ir.PipeType.V
             reads, writes = self.bytes(args[0]) | self.bytes(args[1]), self.bytes(args[2])
@@ -309,7 +324,9 @@ class ClosedCommands:
             self.logical_records = True
             pipe = ir.PipeType(call.kwargs["pipe"])
             assert isinstance(statement.var.type, ir.SyncTokenType) and statement.var.type.pipe == pipe
-            env[statement.var] = pipe, self.publish(pipe)
+            publication = self.publish(pipe)
+            self.record_origins[publication] = statement.var.name_hint
+            env[statement.var] = pipe, publication
         else:
             env[statement.var] = value(statement.value, env)
 

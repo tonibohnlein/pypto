@@ -25,6 +25,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/type.h"
+#include "src/ir/transforms/utils/sync_scalar_readiness.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -175,36 +176,8 @@ class Builder {
   }
 
   void Ready(const ExprPtr& expression) {
-    std::unordered_set<const Expr*> visited;
-    Ready(expression, visited);
-  }
-  void Ready(const ExprPtr& expression, std::unordered_set<const Expr*>& visited) {
-    CHECK(expression) << "Conservative synchronization: missing expression";
-    if (!visited.insert(expression.get()).second) return;
-    ++cost.expression_visits;
-    if (const auto variable = AsVarLike(expression)) {
-      if (ready_.count(variable.get())) return;
-      CHECK_SPAN(false, expression->span_)
-          << "Conservative synchronization: scalar or descriptor use lacks a ready definition";
-    } else if (As<ConstInt>(expression) || As<ConstFloat>(expression) || As<ConstBool>(expression)) {
-      return;
-    } else if (const auto binary = As<BinaryExpr>(expression)) {
-      Ready(binary->left_, visited);
-      Ready(binary->right_, visited);
-      return;
-    } else if (const auto unary = As<UnaryExpr>(expression)) {
-      Ready(unary->operand_, visited);
-      return;
-    } else if (const auto tuple = As<MakeTuple>(expression)) {
-      for (const auto& element : tuple->elements_) Ready(element, visited);
-      return;
-    } else if (const auto item = As<TupleGetItemExpr>(expression)) {
-      Ready(item->tuple_, visited);
-      return;
-    }
-    CHECK_SPAN(false, expression->span_)
-        << "Conservative synchronization: control/metadata expression requires an explicit readiness "
-           "and visibility contract (nested calls and scalar memory reads are unavailable)";
+    cost.expression_visits += CheckSyncScalarReadiness(
+        expression, [this](const VarPtr& variable) { return ready_.count(variable.get()) != 0; });
   }
 
   void Payload(const StmtPtr& cut, const CallPtr& call, const VarPtr& result) {

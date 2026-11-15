@@ -29,7 +29,7 @@ from .ir import (
     Stmt,
     Type,
 )
-from .passes import NativeSyncChild
+from .passes import EventfulSyncChild, NativeSyncChild
 
 def validate_buffer_op_contract(
     stage: OpIRStage,
@@ -318,6 +318,10 @@ def sync_invocation_evidence(program: Program) -> dict[str, Any]:
     Missing entries are unproved. Launch indices are not formal ABI parameters.
     Recursive components and their descendants remain unavailable.
     """
+    ...
+
+def inspect_eventful_sync_child(child: EventfulSyncChild) -> CompactSyncAnalysis:
+    """Inspect actual retained immutable mathematics without recognition or reanalysis."""
     ...
 
 def analyze_placed_sync(
