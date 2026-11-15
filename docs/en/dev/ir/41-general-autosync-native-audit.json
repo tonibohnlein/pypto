@@ -1,0 +1,335 @@
+{
+  "source_revision": "5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f",
+  "method": "GitHub contents API pinned files; source audit only. No CCEC/device or new host tests.",
+  "findings": [
+    "Admitted SUB and DIV and proposed MUL Mode1 share implicit Vec bytes [188416,196608).",
+    "8KiB is conservative enclosure, not exact used footprint. Bound follows <=32 vbrcb repeats for validRow<256 and <=30 repeats in large-row chunks.",
+    "Internal vbrcb\u2192PIPE_V barrier\u2192arithmetic does not establish prior invocation final scratch read before next vbrcb write.",
+    "TCvt integer-narrowing and Vec-to-Vec TExtract scratch paths are outside current admitted variants.",
+    "No implicit fixed scratch identified in other inspected selected vector, movement or matrix implementations. This is selected-source evidence, not universal operation/native qualification."
+  ],
+  "files": [
+    {
+      "path": "include/pto/npu/a2a3/TRowExpandMul.hpp",
+      "blob_sha": "85634aada53c59627550cd6e0d9e3313b3379821",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TRowExpandMul.hpp",
+      "interesting_line_numbers": [
+        66,
+        74,
+        89,
+        97,
+        131,
+        137,
+        150,
+        156
+      ]
+    },
+    {
+      "path": "include/pto/npu/a2a3/TRowExpandSub.hpp",
+      "blob_sha": "07dd426a1a96db6f5f998c8f4dee41f1a93c66a3",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TRowExpandSub.hpp",
+      "interesting_line_numbers": [
+        80,
+        88,
+        103,
+        111,
+        145,
+        151,
+        164,
+        170
+      ]
+    },
+    {
+      "path": "include/pto/npu/a2a3/TRowExpandDiv.hpp",
+      "blob_sha": "67742df76d585bcc532c9166121c6d1371a95522",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TRowExpandDiv.hpp",
+      "interesting_line_numbers": [
+        81,
+        89,
+        104,
+        112,
+        148,
+        154,
+        167,
+        173
+      ]
+    },
+    {
+      "path": "include/pto/npu/a2a3/TRowExpandBinOp.hpp",
+      "blob_sha": "7ae59e4188578aa880dd9ec25a433b75a3c00274",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TRowExpandBinOp.hpp",
+      "interesting_line_numbers": [
+        67,
+        68,
+        70,
+        71,
+        72,
+        73,
+        74,
+        75,
+        77,
+        80,
+        84,
+        87,
+        90,
+        107,
+        118,
+        208,
+        209
+      ]
+    },
+    {
+      "path": "include/pto/npu/a2a3/TRowSum.hpp",
+      "blob_sha": "0495284fed400f59d018f054f9f78e5ee2c2c8af",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TRowSum.hpp",
+      "interesting_line_numbers": [
+        92,
+        93,
+        101,
+        102
+      ]
+    },
+    {
+      "path": "include/pto/npu/a2a3/TRowMax.hpp",
+      "blob_sha": "7d38c6534960237822b266b11b4df4802f5eee61",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TRowMax.hpp",
+      "interesting_line_numbers": [
+        50,
+        51,
+        60,
+        61
+      ]
+    },
+    {
+      "path": "include/pto/npu/a2a3/TRowReduceOps.hpp",
+      "blob_sha": "9f7078f7762c8da237e06a6b187635f570a1a29e",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TRowReduceOps.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TGather.hpp",
+      "blob_sha": "d7e19751389552f0978fc8b8d00358e696678f7e",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TGather.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TScatter.hpp",
+      "blob_sha": "9bc3f9524f156398ce23fdeb570406b523dc967f",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TScatter.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TCvt.hpp",
+      "blob_sha": "6724cf8a2c602e35d30c5415eb9d5846b701d545",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TCvt.hpp",
+      "interesting_line_numbers": [
+        50,
+        903,
+        1154,
+        1275
+      ]
+    },
+    {
+      "path": "include/pto/npu/a2a3/TAdd.hpp",
+      "blob_sha": "178a20dd979bee3320b9c42034a1e7074f519bb4",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TAdd.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TMul.hpp",
+      "blob_sha": "dfe57ba4f105b206663618912e34ed11dfb12e68",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TMul.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TSub.hpp",
+      "blob_sha": "e5594eaa2a7cabc322b6c53f5c454b93bab56e6c",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TSub.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TDiv.hpp",
+      "blob_sha": "9071f32d26a2cd10e7a0191c1d7e9ef02ca8dfdd",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TDiv.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TMax.hpp",
+      "blob_sha": "51de87c7a01a54f74215f6d769b8203a14cb7f24",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TMax.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TMin.hpp",
+      "blob_sha": "1294c91ed7ff65d04277f9c739ea9b0da36e0bae",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TMin.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TBinOp.hpp",
+      "blob_sha": "1269b47faae4af787b4f16decedb677d4b606a75",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TBinOp.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TBinSOp.hpp",
+      "blob_sha": "45b11a826cbb147338c8afce89e6be3bf4cdc73f",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TBinSOp.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TUnaryOp.hpp",
+      "blob_sha": "6803bb5fd0408a613e6397590cc1b3185008682c",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TUnaryOp.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TExpandS.hpp",
+      "blob_sha": "943133a876ed76b582453b6a4ed2845d36792c74",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TExpandS.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TAddS.hpp",
+      "blob_sha": "70fb0add01c7ae5ead92a45bc8354290ccc43d50",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TAddS.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TSubS.hpp",
+      "blob_sha": "cf09f7afb7897b262d5f36168d8adfd4adb99f2b",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TSubS.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TMulS.hpp",
+      "blob_sha": "700e958ce0bc77633579bbb69e76d72487cec072",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TMulS.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TDivS.hpp",
+      "blob_sha": "0312a0d4d211f32d5fc3150308f055ca04edf211",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TDivS.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TMaxS.hpp",
+      "blob_sha": "667ac2a17f0aadbd655dd2b8c0ff7427ce6189d0",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TMaxS.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TMins.hpp",
+      "blob_sha": "687f5ab0e32bee223f0523c739eb36b78b452481",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TMins.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TLRelu.hpp",
+      "blob_sha": "30203ed6175fbadf070251336d09f7ced8c2bdf3",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TLRelu.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TLoad.hpp",
+      "blob_sha": "b7330bf8ce513b2189ce20928a9eb3ddf1f6c837",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TLoad.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TStore.hpp",
+      "blob_sha": "2c10e91a3ec26db5d4cba31b3b51a1563f2aeb7a",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TStore.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TMov.hpp",
+      "blob_sha": "3654568e68ec27c4c5c4df45de550fb0379378a2",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TMov.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/TExtract.hpp",
+      "blob_sha": "d4cedd68079a4046a742a180f75883c3fd3955ed",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TExtract.hpp",
+      "interesting_line_numbers": [
+        395,
+        396,
+        407,
+        408,
+        462,
+        471
+      ]
+    },
+    {
+      "path": "include/pto/npu/a2a3/TMatmul.hpp",
+      "blob_sha": "f4bffddd368fd288751528a8dcbe40d57739be79",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TMatmul.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/npu/a2a3/common.hpp",
+      "blob_sha": "89c77ce834de9ec08da2bc74b57c2f6521a8ffd7",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/common.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/common/constants.hpp",
+      "blob_sha": "6a397c869475a9edd93f71c2ad6295d1e8fbd234",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/common/constants.hpp",
+      "interesting_line_numbers": [
+        30,
+        31
+      ]
+    },
+    {
+      "path": "include/pto/common/pto_instr.hpp",
+      "blob_sha": "34c52cf57ea5a036bf865fb236cfcc67e27cf29d",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/common/pto_instr.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "docs/isa/TROWEXPANDMUL.md",
+      "blob_sha": "1d38b3104400e282d1948898b954d13eb1a9a977",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/docs/isa/TROWEXPANDMUL.md",
+      "interesting_line_numbers": [
+        116,
+        125
+      ]
+    },
+    {
+      "path": "include/pto/common/arch/memory/tload_common.hpp",
+      "blob_sha": "842a8f5ef6e88e6a4bfbc3e2b511c701697f721b",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/common/arch/memory/tload_common.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/common/arch/memory/tstore_common.hpp",
+      "blob_sha": "09cc3043d589df29200aaaecda54db601b860185",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/common/arch/memory/tstore_common.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/common/arch/memory/tmov_common.hpp",
+      "blob_sha": "faf921c5d1f6e703cde09169502875876b476fff",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/common/arch/memory/tmov_common.hpp",
+      "interesting_line_numbers": []
+    },
+    {
+      "path": "include/pto/common/arch/memory/textract_common.hpp",
+      "blob_sha": "4afae034d09c83b45e6b816795bf266a7314a7e5",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/common/arch/memory/textract_common.hpp",
+      "interesting_line_numbers": [
+        494,
+        495,
+        497,
+        498,
+        511,
+        512,
+        514,
+        515
+      ]
+    }
+  ]
+}

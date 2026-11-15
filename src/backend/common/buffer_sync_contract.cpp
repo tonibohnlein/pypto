@@ -118,6 +118,25 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
           << "Synchronization conversion import requires a qualified AIV cast";
     result.pipe_ = PipeType::V;
   }
+  if (const auto row = FindBufferRowRecipe(call->op_->name_); row && !row->reduction) {
+    CHECK(target == "a2a3" && (IsOp(call, "buffer.row_expand_sub") || IsOp(call, "buffer.row_expand_div") ||
+                               IsOp(call, "buffer.row_expand_mul")))
+        << "Row broadcast implicit effects require a qualified native implementation";
+    // Registry validation selects FP32 Mode1 (a contiguous column carrier),
+    // with no explicit temporary operand. The pinned A2/A3 TRowExpandBin helper
+    // fills and reads TMP_UB_OFFSET. Its small-row paths use <=32 256-byte
+    // repeats; large-row paths reuse <=30 repeats, within the same 8KiB range.
+    // This is an enclosure of native scratch, not its exact used-byte footprint.
+    // Internal fill->use barriers do not discharge the next call's overwrite.
+    // pto-isa 5487a6b0: common/constants.hpp and npu/a2a3/TRowExpandBinOp.hpp.
+    result.implicit_effects_.push_back({MemorySpace::Vec, 184 * 1024, 192 * 1024, ir::BufferAccess::ReadWrite,
+                                        "a2a3-row-broadcast-mode1-implicit-scratch", false});
+    // These three selected wrappers and their shared Mode1 helper contain
+    // PIPE_V barriers, but no SET/WAIT or compiler-allocated event operations.
+    // This positive source audit, not absence from the signal catalog, supplies
+    // the no-numbered-event premise for the new MUL family as well as SUB/DIV.
+    result.audited_signal_free_variant_ = true;
+  }
   const bool vector = core == FunctionType::AIV;
   CHECK(vector ? (result.pipe_ == PipeType::MTE2 || result.pipe_ == PipeType::MTE3 ||
                   result.pipe_ == PipeType::V)
@@ -178,6 +197,11 @@ std::optional<BufferSyncOperation> QualifyBufferSyncNonPayload(const ir::CallPtr
 std::vector<sync::IsaResourceClaim> BufferSyncImplementation::Claims() const {
   RequireLocalSyncExecutionContract(target_);
   const auto declaration = GetBackendInstance(BackendType::Ascend910)->FindIsaMacroResources(macro_);
+  if (audited_signal_free_variant_) {
+    CHECK(!declaration || declaration->claims.empty())
+        << "Audited signal-free native variant conflicts with its resource declaration";
+    return {};
+  }
   std::vector<sync::IsaResourceClaim> result;
   if (!declaration) return result;  // Only the selected, audited variants above.
   for (const auto& claim : declaration->claims) {

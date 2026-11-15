@@ -12,6 +12,7 @@
 #ifndef PYPTO_BACKEND_COMMON_BUFFER_SYNC_CONTRACT_H_
 #define PYPTO_BACKEND_COMMON_BUFFER_SYNC_CONTRACT_H_
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <utility>
@@ -19,11 +20,23 @@
 
 #include "pypto/core/logging.h"
 #include "pypto/ir/function.h"
+#include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/pipe.h"
 #include "pypto/sync/isa_macro_resources.h"
 
 namespace pypto::backend {
+// Additional accesses of the selected native implementation, not operands or
+// allocator reservations. Physical byte coordinates share the ordinary storage
+// domain. A conservative enclosure must not become an exact footprint/selector.
+// Factory-owned BufferSyncImplementation publishes this inventory immutably.
+struct BufferSyncImplicitEffect {
+  ir::MemorySpace space;
+  int64_t begin, end;
+  ir::BufferAccess data;
+  const char* provenance;
+  bool exact_footprint;
+};
 // Operation identity shared with Buffer emission. This does not qualify effects,
 // target execution, aliases, readiness or synchronization ownership.
 const char* BufferNativeOperation(const ir::CallPtr& call);
@@ -35,6 +48,7 @@ class BufferSyncImplementation {
   ir::PipeType Pipe() const { return pipe_; }
   bool AccumulatorSizeEligible() const { return accumulator_size_eligible_; }
   std::vector<sync::IsaResourceClaim> Claims() const;
+  const std::vector<BufferSyncImplicitEffect>& ImplicitEffects() const { return implicit_effects_; }
 
  private:
   friend BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr&, ir::FunctionType,
@@ -47,11 +61,14 @@ class BufferSyncImplementation {
   std::string target_;
   bool accumulator_size_eligible_ = false;
   bool mat_to_operand_extract_ = false;
+  bool audited_signal_free_variant_ = false;
+  std::vector<BufferSyncImplicitEffect> implicit_effects_;
 };
 // Input is a registry-validated Buffer call. Select only existing single-pipe
 // variants; geometry/readiness/modes remain the importer's obligation. Unknown
-// targets retain conservative mathematics without accumulator protection, but
-// Claims() refuses executable resource qualification for them.
+// targets retain conservative mathematics without accumulator protection only
+// when their effects are target-independent. Target-specific implicit effects
+// require a selected contract; Claims() always refuses unknown physical targets.
 BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call, ir::FunctionType core,
                                                         const std::string& target);
 
@@ -59,8 +76,9 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
 // The original immutable call owns every operand, including Tensor GM operands,
 // descriptor metadata and scalar coordinate expressions. Effects come from the
 // registry after call validation; none are inferred from an operand's type or
-// from a missing effect declaration. This establishes neither footprint coverage
-// nor readiness, alias separation, loop membership or executable resource reuse.
+// from a missing effect declaration. Native implicit effects are separately
+// retained by the selected implementation. This establishes neither operand
+// footprint coverage nor readiness, alias separation, loop membership or reuse.
 // Those capabilities remain separate; in particular there is no trip count or
 // normalized occurrence frame in this contract.
 enum class BufferSyncOperationKind { Payload, Descriptor, ReadyScalar };

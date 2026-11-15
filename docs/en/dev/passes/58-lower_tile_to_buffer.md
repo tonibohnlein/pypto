@@ -67,12 +67,47 @@ does not carry the separate partition operand, even for rank-2 destinations.
 The FP32 row recipes accept dense allocation-backed matrices and static positive
 valid extents. Reductions write a column-major `[R,1]` destination whose physical
 rows are a multiple of eight. Broadcast reads that column vector and preserves
-the matrix's physical shape and valid rectangle. Scratch is an explicit,
+the matrix's physical shape and valid rectangle. Reduction scratch is an explicit,
 full-valid FP32 tile covering the source's physical shape. It remains an explicit
 operand during planning; Buffer IR declares its write effect. Reduction source, scratch and destination
 must be disjoint. Broadcast may reuse its matrix exactly, but never its column
 vector. A column vector retains its typed descriptor when storage addresses are
 reused; it is not reinterpreted as a row-major window.
+
+The selected A2/A3 column-broadcast implementations (`sub`, `div`, `mul`) also
+use an implicit native workspace. The shared backend synchronization contract
+declares read/write access to the conservative Vec byte enclosure
+`[184 KiB, 192 KiB)`. Exact analysis adds this effect to the same physical byte
+domain as placed buffers; it does not invent a disjoint scratch root. Its
+minimum-demand guarantee is relative to this selected enclosing access model.
+Conservative analysis includes the effect in its Vec class, including retained
+child entry and pending-exit summaries. Neither interface claims exact native
+scratch selectors.
+
+Valid native operand placement is a separate premise: a broadcast's own inputs
+and destination must not overlap its implicit workspace. Ordinary A2/A3 planning
+enforces the 184 KiB user-allocation ceiling. Exact import additionally refuses
+explicit operand address hulls whose separation from this workspace is unproved.
+An earlier or later operation may still access the same bytes and must participate
+in inter-operation conflicts. Coarse conservative effects do not prove native
+operand validity or invent disjointness within a compound instruction.
+
+This binding follows pinned PTO-ISA
+[`5487a6b0`'s `TRowExpandBinOp.hpp`](https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TRowExpandBinOp.hpp)
+and [`constants.hpp`](https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/common/constants.hpp).
+For fewer than 256 active rows, at most 32 broadcast repeats occupy 256 bytes
+each; larger rows use chunks of at most 30 repeats. Internal barriers protect
+each workspace fill before its use, but the final arithmetic may remain pending
+when a later invocation overwrites that workspace. Thus distinct user operands
+alone do not remove inter-call synchronization. Empty numbered-event claims
+do not mean an implementation has no implicit memory effects.
+
+The same pinned-source audit distinguishes other native variants: admitted
+FP16/FP32/BF16 casts do not select integer-narrowing scratch paths, and admitted
+Mat-to-operand extracts do not select the Vec-to-Vec widening scratch path.
+Those exclusions remain explicit admission boundaries. Host checks compare the
+declared enclosure, actual commands and reuse; they do not establish device
+behavior or prove that every enclosed byte is physically accessed.
 
 Column vectors are on-chip reduction/broadcast operands only. Kernels that load
 or store them directly to GM remain on Tile IR until a column transfer recipe is

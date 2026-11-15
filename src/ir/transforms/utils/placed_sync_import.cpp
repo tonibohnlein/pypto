@@ -560,6 +560,22 @@ class Importer {
     else
       Allocate(assign);
   }
+  size_t VecByteDomain(int64_t begin, int64_t end) {
+    CHECK(begin >= 0 && end > begin) << "Synchronization requires a nonempty physical byte interval";
+    for (const auto& old : result.storage) {
+      CHECK(old.space != MemorySpace::Vec || old.byte_coordinates || begin >= old.address + old.bytes ||
+            old.address >= end)
+          << "Overlapping slot and ordinary Vec views require a common physical-layout partition";
+    }
+    if (!vec_storage) {
+      vec_storage = result.storage.size();
+      result.storage.push_back({"Vec physical bytes", MemorySpace::Vec, 0, 1, end, end, nullptr, true});
+    } else {
+      auto& domain = result.storage[*vec_storage];
+      domain.bytes = domain.columns = std::max(domain.bytes, end);
+    }
+    return *vec_storage;
+  }
   void RegisterVec(const VarPtr& var, VecView view) {
     const auto type = view.type;
     // A full-valid column vector [R,1] occupies consecutive elements in either
@@ -570,19 +586,7 @@ class Importer {
     const auto end =
         Checked(__int128(view.address) + view.last_displacement + __int128(type->shape_[0] - 1) * view.pitch +
                 __int128(type->shape_[1]) * type->dtype_.GetByte());
-    for (const auto& old : result.storage) {
-      CHECK(old.space != MemorySpace::Vec || old.byte_coordinates ||
-            view.address >= old.address + old.bytes || old.address >= end)
-          << "Overlapping slot and ordinary Vec views require a common physical-layout partition";
-    }
-    if (!vec_storage) {
-      vec_storage = result.storage.size();
-      result.storage.push_back({"Vec physical bytes", MemorySpace::Vec, 0, 1, end, end, nullptr, true});
-    } else {
-      auto& domain = result.storage[*vec_storage];
-      domain.bytes = domain.columns = std::max(domain.bytes, end);
-    }
-    objects[var.get()] = *vec_storage;
+    objects[var.get()] = VecByteDomain(view.address, end);
     vec_views.emplace(var.get(), std::move(view));
   }
   void View(const AssignStmtPtr& assign, const CallPtr& call, const SyncSegment& segment = {}) {
@@ -972,6 +976,41 @@ class Importer {
       CHECK(reads == (effect == BufferAccess::Read || effect == BufferAccess::ReadWrite) &&
             writes == (effect == BufferAccess::Write || effect == BufferAccess::ReadWrite))
           << "Imported data modes disagree with registered operation contract";
+    }
+    for (const auto& effect : implementation.ImplicitEffects()) {
+      CHECK(effect.space == MemorySpace::Vec)
+          << "Implicit native effects require a qualified common physical storage domain";
+      // A workspace effect can order different calls; it cannot repair an
+      // invalid overlap inside one native call. Production placement reserves
+      // this range. Explicit supplied Buffer IR must satisfy the same premise.
+      // A strided/rotating hull touching it is unproved, not a capacity failure.
+      for (size_t arg = 0; arg < call->args_.size(); ++arg) {
+        if (operation.ArgumentEffects()[arg].data == BufferAccess::None) continue;
+        const auto& storage = result.storage[Storage(call->args_[arg])];
+        if (storage.space != effect.space) continue;
+        int64_t begin = storage.address, end = Checked(__int128(storage.address) + storage.bytes);
+        if (const auto view = vec_views.find(call->args_[arg].get()); view != vec_views.end()) {
+          const auto& value = view->second;
+          begin = Checked(__int128(value.address) + std::min<int64_t>(0, value.last_displacement));
+          end = Checked(__int128(value.address) + std::max<int64_t>(0, value.last_displacement) +
+                        __int128(value.type->shape_[0] - 1) * value.pitch +
+                        __int128(value.type->shape_[1]) * value.type->dtype_.GetByte());
+        }
+        CHECK(end <= effect.begin || effect.end <= begin)
+            << "Native implicit workspace separation is unproved for an explicit operand";
+      }
+      // Reuse ordinary placed-byte identity: implicit scratch is not a private
+      // disjoint root. Any explicit access to these bytes shares its conflicts.
+      const auto id = VecByteDomain(effect.begin, effect.end);
+      if (!recover_accesses) continue;
+      for (bool write : {false, true}) {
+        if (effect.data != BufferAccess::ReadWrite &&
+            effect.data != (write ? BufferAccess::Write : BufferAccess::Read))
+          continue;
+        auto access = Access(id, write, {0, 0}, {effect.begin, 0}, 1, effect.end - effect.begin, segment);
+        access.exact_footprint = effect.exact_footprint;
+        site.accesses.push_back(std::move(access));
+      }
     }
     return site;
   }

@@ -59,6 +59,28 @@ FP32 行配方支持 allocation-backed 的稠密矩阵和正静态 valid。归�
 列向量仅用作片上归约和广播操作数。直接从 GM 加载列向量或将其写入 GM 的内核
 保留在 Tile IR，等待列向量传输 recipe 的验证；普通稠密传输 recipe 不覆盖跨步列。
 
+A2/A3 的列广播 `sub`、`div`、`mul` 还使用隐式原生工作区。共享 backend 同步契约
+将 Vec 字节区间 `[184 KiB, 192 KiB)` 声明为保守读写包络。精确分析将其加入已有的
+物理字节域，不创建假定不重叠的私有存储根；最小需求仅相对于该选定包络模型成立。
+保守分析将其纳入 Vec 类，保留子区域的入口与退出未完成效果也包含该工作区。
+这些接口不声称原生工作区选择器是精确的。
+
+原生操作数放置合法性是独立前提：广播自身的输入和输出不得与隐式工作区重叠。
+常规 A2/A3 规划通过 184 KiB 用户分配上限保证这一点。精确导入还会拒绝无法证明
+操作数地址包络与工作区分离的显式 Buffer IR。之前或之后的其他操作仍可访问相同
+字节，其冲突必须建模。粗粒度保守效果不能证明复合指令内部的操作数合法性或分离性。
+
+依据为固定 PTO-ISA
+[`5487a6b0` 的 `TRowExpandBinOp.hpp`](https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TRowExpandBinOp.hpp)
+与 [`constants.hpp`](https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/common/constants.hpp)。
+少于 256 个有效行时至多使用 32 次、每次 256 字节的广播；更多行分为至多 30 次的块。
+内部屏障保护工作区填充后再读取，但最后一次算术读取未必在下一次调用覆盖工作区前完成。
+因此用户操作数互不重叠不等于调用间无同步需求。没有编号事件声明也不等于没有隐式内存效果。
+
+同一源码审计区分了其他变体：当前 FP16/FP32/BF16 cast 不选择整数窄化 scratch 路径，
+Mat 到操作数的 extract 也不选择 Vec 到 Vec 的扩展 scratch 路径。未支持变体仍拒绝。
+主机检查验证包络模型、实际命令及资源复用，不声称设备验证或包络内每个字节都被实际访问。
+
 支持完整的 `row_max -> row_expand_sub -> exp -> row_sum -> row_expand_div` softmax
 链。包含运行时/空 valid 状态、窗口操作数、其他 dtype 或其他归约操作的行配方 kernel
 继续 Tile。空归约轴不沿用逐元素操作的无数据路径语义。
