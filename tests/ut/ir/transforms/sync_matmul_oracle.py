@@ -303,6 +303,7 @@ def interpret(
             ir.get_op("buffer.cast").name,
             ir.get_op("buffer.adds").name,
             ir.get_op("buffer.recip").name,
+            ir.get_op("buffer.rsqrt").name,
             ir.get_op("buffer.exp").name,
             ir.get_op("buffer.row_expand_sub").name,
             ir.get_op("buffer.row_expand_div").name,

@@ -34,6 +34,7 @@ autosync 仍须独立建立范围、访问与出现坐标的证明。
 | 普通紧密 ND GM load/store | FP16、BF16、FP32、INT32 |
 | add、mul | FP16、FP32、INT32 |
 | sub、div、maximum、minimum、abs、exp、sqrt、neg、relu、log、recip | FP32 |
+| rsqrt（默认精度，无 workspace） | FP32 |
 | adds、subs、muls、divs、maximums、minimums、lrelu、full | FP32 |
 | row_max、row_sum、row_min、row_prod | FP32，正静态 valid |
 | row_expand_add/sub/mul/div/max/min | FP32，正静态 valid，连续列向量 |
@@ -46,6 +47,16 @@ autosync 仍须独立建立范围、访问与出现坐标的证明。
 `recip` 的独立目的地由存储合法化和验证保证；精度属性保留原生既有策略。
 GM 返回别名必须解析到参数，其类型（包括 TensorView 元数据）须与声明的返回类型一致；
 返回视图不匹配的 kernel 保持 Tile。
+
+`rsqrt` 复用稠密一元配方，目标与输入须物理不相交。省略 `high_precision` 或显式
+`False` 选择默认双操作数实现；`True`、额外 workspace 和未知属性不在支持范围内。
+固定配方检查完整逻辑操作数数量，包括 `full` 的 shape 等元数据，不能静默丢弃可选操作数。
+已选 A2/A3 实现固定为
+[PTO-ISA `TUnaryOp.hpp`](https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TUnaryOp.hpp)：
+默认 `TRSQRT_IMPL` 调用公共 `TUNARY_IMPL<RsqrtOp>` 与 `vrsqrt`，无隐式 scratch
+或编号事件资源声明；带 workspace 的高精度重载是另一实现，不由本配方覆盖。
+运行时 valid 描述符复用逐次使用的元数据恢复与正范围守卫，空 valid 不执行原生一元操作。
+主机测试检查正数输入、空/部分/完整 valid、物理别名及生成的 C++，不据此宣称原生精度或设备行为。
 
 带有显式 `shapes=` 分区的 store 也保留在 Tile IR。Buffer store 配方目前根据源的
 有效形状（valid shape）推导分区，不携带独立的分区操作数，即使目的地是二维张量也是如此。

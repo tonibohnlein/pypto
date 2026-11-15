@@ -110,11 +110,13 @@ REGISTER_OP("buffer.copy")
     entry.add_argument("dst", "Destination buffer")
         .set_buffer_arg_effect(recipe.inputs.size(), BufferAccess::Write, BufferAccess::Read);
     if (recipe.precision != backend::BufferPrecisionKind::None) entry.set_attr<bool>("high_precision");
-    entry.f_deduce_type(
-        [recipe](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>&) {
-          backend::ValidateBufferElementwiseOperands(recipe, args);
-          return GetVoidType();
-        });
+    entry.f_deduce_type([recipe](const std::vector<ExprPtr>& args,
+                                 const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      CHECK(backend::SupportsBufferElementwiseAttributes(recipe, kwargs))
+          << recipe.buffer_op << " has unsupported selected native precision attributes";
+      backend::ValidateBufferElementwiseOperands(recipe, args);
+      return GetVoidType();
+    });
   }
   return true;
 }();

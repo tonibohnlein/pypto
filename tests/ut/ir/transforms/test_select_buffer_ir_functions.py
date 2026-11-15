@@ -35,6 +35,7 @@ _VECTOR = {
     "abs": torch.abs,
     "exp": torch.exp,
     "sqrt": torch.sqrt,
+    "rsqrt": torch.rsqrt,
     "neg": torch.neg,
     "relu": torch.relu,
     "log": torch.log,

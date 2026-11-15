@@ -118,6 +118,14 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
           << "Synchronization conversion import requires a qualified AIV cast";
     result.pipe_ = PipeType::V;
   }
+  if (IsOp(call, "buffer.rsqrt")) {
+    CHECK(target == "a2a3") << "Default rsqrt requires a qualified native implementation";
+    // pto-isa 5487a6b0 TUnaryOp.hpp: the admitted two-operand default
+    // TRSQRT_IMPL invokes TUNARY_IMPL<RsqrtOp> / vrsqrt. No temporary or
+    // numbered-event operation is present. The explicit-workspace overload
+    // is a different recipe and is rejected by shared call validation.
+    result.audited_signal_free_variant_ = true;
+  }
   if (const auto row = FindBufferRowRecipe(call->op_->name_); row && !row->reduction) {
     CHECK(target == "a2a3" && (IsOp(call, "buffer.row_expand_sub") || IsOp(call, "buffer.row_expand_div") ||
                                IsOp(call, "buffer.row_expand_mul")))

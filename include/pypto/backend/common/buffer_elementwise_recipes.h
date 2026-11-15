@@ -12,8 +12,10 @@
 #ifndef PYPTO_BACKEND_COMMON_BUFFER_ELEMENTWISE_RECIPES_H_
 #define PYPTO_BACKEND_COMMON_BUFFER_ELEMENTWISE_RECIPES_H_
 
+#include <any>
 #include <cstddef>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "pypto/ir/expr.h"
@@ -22,7 +24,7 @@ namespace pypto {
 namespace backend {
 
 /// Native precision attributes are selected by the recipe, never by lowering text.
-enum class BufferPrecisionKind { None, Div, Log, Recip };
+enum class BufferPrecisionKind { None, Div, Log, Recip, Rsqrt };
 enum class BufferElementwiseTypePolicy { MatchingVec, DenseFP32 };
 enum class BufferDestinationAliasPolicy { ExactOrDisjoint, Disjoint };
 enum class BufferElementwiseOperandKind { Buffer, ElementScalar };
@@ -56,6 +58,11 @@ std::vector<std::string> GetBufferElementwiseRecipeNames();
 
 /// Non-throwing logical form check before storage planning.
 bool SupportsLogicalBufferElementwise(const BufferElementwiseRecipe& recipe, const ir::CallPtr& call);
+
+/// Additional selected-variant restrictions shared by logical admission and
+/// explicit Buffer validation. The registry still owns the typed kwargs schema.
+bool SupportsBufferElementwiseAttributes(const BufferElementwiseRecipe& recipe,
+                                         const std::vector<std::pair<std::string, std::any>>& kwargs);
 
 /// Validate the real explicit operands; does not create or mutate logical Tile IR.
 void ValidateBufferElementwiseOperands(const BufferElementwiseRecipe& recipe,
