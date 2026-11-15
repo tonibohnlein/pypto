@@ -1087,30 +1087,23 @@ class Importer {
             writes == (effect == BufferAccess::Write || effect == BufferAccess::ReadWrite))
           << "Imported data modes disagree with registered operation contract";
     }
+    backend::RequireBufferSyncWorkspaceSeparation(
+        operation, [&](const ExprPtr& operand) -> std::optional<backend::BufferSyncByteWindow> {
+          const auto& storage = result.storage[Storage(operand)];
+          int64_t begin = storage.address, end = Checked(__int128(storage.address) + storage.bytes);
+          if (const auto view = vec_views.find(operand.get()); view != vec_views.end()) {
+            const auto& value = view->second;
+            begin = Checked(__int128(value.address) + std::min<int64_t>(0, value.last_displacement));
+            end = Checked(__int128(value.address) + std::max<int64_t>(0, value.last_displacement) +
+                          __int128(value.type->shape_[0] - 1) * value.pitch +
+                          __int128(value.type->shape_[1]) * value.type->dtype_.GetByte());
+          }
+          return backend::BufferSyncByteWindow{begin, end};
+        });
     for (const auto& effect : implementation.ImplicitEffects()) {
       if (readonly_external && effect.space == MemorySpace::DDR) continue;
       CHECK(effect.space == MemorySpace::Vec)
           << "Implicit native effects require a qualified common physical storage domain";
-      // A workspace effect can order different calls; it cannot repair an
-      // invalid overlap inside one native call. Production placement reserves
-      // this range. Explicit supplied Buffer IR must satisfy the same premise.
-      // A strided/rotating hull touching it is unproved, not a capacity failure.
-      for (size_t arg = 0; arg < call->args_.size(); ++arg) {
-        if (operation.ArgumentEffects()[arg].data == BufferAccess::None) continue;
-        if (readonly_external && As<TensorType>(call->args_[arg]->GetType())) continue;
-        const auto& storage = result.storage[Storage(call->args_[arg])];
-        if (storage.space != effect.space) continue;
-        int64_t begin = storage.address, end = Checked(__int128(storage.address) + storage.bytes);
-        if (const auto view = vec_views.find(call->args_[arg].get()); view != vec_views.end()) {
-          const auto& value = view->second;
-          begin = Checked(__int128(value.address) + std::min<int64_t>(0, value.last_displacement));
-          end = Checked(__int128(value.address) + std::max<int64_t>(0, value.last_displacement) +
-                        __int128(value.type->shape_[0] - 1) * value.pitch +
-                        __int128(value.type->shape_[1]) * value.type->dtype_.GetByte());
-        }
-        CHECK(end <= effect.begin || effect.end <= begin)
-            << "Native implicit workspace separation is unproved for an explicit operand";
-      }
       // Reuse ordinary placed-byte identity: implicit scratch is not a private
       // disjoint root. Any explicit access to these bytes shares its conflicts.
       const auto id = VecByteDomain(effect.begin, effect.end);

@@ -203,6 +203,26 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
   return result;
 }
 
+void RequireBufferSyncWorkspaceSeparation(
+    const BufferSyncOperation& operation,
+    const std::function<std::optional<BufferSyncByteWindow>(const ir::ExprPtr&)>& window) {
+  const auto& call = operation.Operation();
+  for (const auto& implicit : operation.Implementation().ImplicitEffects()) {
+    for (size_t arg = 0; arg < call->args_.size(); ++arg) {
+      if (operation.ArgumentEffects()[arg].data == ir::BufferAccess::None) continue;
+      const auto& operand = call->args_[arg];
+      const auto buffer = ir::As<ir::BufferType>(operand->GetType());
+      const auto space = buffer ? buffer->memory_space_ : ir::MemorySpace::DDR;
+      if (space != implicit.space) continue;
+      const auto bound = window(operand);
+      CHECK_SPAN(bound && bound->begin >= 0 && bound->end > bound->begin &&
+                     (bound->end <= implicit.begin || implicit.end <= bound->begin),
+                 call->span_)
+          << "Native implicit workspace separation is unproved for an explicit operand";
+    }
+  }
+}
+
 BufferSyncOperation QualifyBufferSyncOperation(const ir::CallPtr& call, ir::FunctionType core,
                                                const std::string& target) {
   auto& registry = ir::OpRegistry::GetInstance();

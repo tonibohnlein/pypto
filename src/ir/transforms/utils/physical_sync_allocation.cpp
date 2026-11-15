@@ -29,6 +29,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/sync/isa_macro_resources.h"
 #include "pypto/sync/resource_catalog.h"
+#include "src/ir/transforms/utils/native_sync_placement.h"
 #include "src/ir/transforms/utils/scoped_sync_palette.h"
 #include "src/ir/transforms/utils/scoped_token_families.h"
 #include "src/ir/transforms/utils/sync_placement.h"
@@ -390,10 +391,12 @@ SyncNativeReservations SyncNativeClaims(const FunctionPtr& owner, const std::vec
                                         const std::string& target) {
   backend::RequireLocalSyncExecutionContract(target);
   SyncNativeReservations claimed;
+  NativeSyncPlacement placement(owner);
   std::set<const Call*> checked;
   for (const auto& call : calls) {
     if (!checked.insert(call.get()).second) continue;
     const auto operation = backend::QualifyBufferSyncOperation(call, owner->func_type_, target);
+    placement.Require(operation);
     ReserveNativeClaims(operation.Implementation(), claimed);
   }
   return claimed;

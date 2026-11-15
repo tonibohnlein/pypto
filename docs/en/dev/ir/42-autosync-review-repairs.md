@@ -22,3 +22,26 @@ those failures remain recorded separately and are not a green milestone claim.
 
 These checks establish admitted host-model behavior, not native/device correctness.
 The logical protocol, eligible ID pool and allocation algorithms are unchanged.
+
+## R2: policy-independent native workspace legality
+
+Selected native operation qualification now exposes one operand/workspace
+separation predicate. Exact access recovery supplies its retained physical bounds;
+conservative analysis and actual-token resource qualification use an indexed local
+placement inventory. An unavailable bound remains unavailable. Adding ordering
+between calls cannot repair overlap within one native instruction.
+
+All relevant explicit operands must be disjoint from each selected same-space
+implicit workspace. Half-open edge equality is legal; arithmetic is checked before
+publishing bounds. Aliases preserve allocation identity. Runtime subviews inherit
+the Buffer IR contract that their window stays inside the source allocation
+([types](02-types.md)); their parent enclosure is conservative, not an exact
+selector. Slot indices require separate evidence; this adapter currently accepts
+static in-range selectors and refuses unsupported dynamic selectors for workspace
+qualification. Borrowed operands lacking allocation provenance can already fail
+Buffer IR verification, independently of the synchronization-policy check.
+
+Public regression routes cover exact/conservative analysis, insertion, lowering
+of actual closed tokens and enabled transactional realization, with read/write
+operands, view aliases, workspace edges, unavailable placement and slots. Implicit
+workspace effects remain in inter-operation hazard analysis as well.
