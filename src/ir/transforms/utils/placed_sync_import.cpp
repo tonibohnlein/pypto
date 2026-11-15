@@ -1285,7 +1285,9 @@ StartupSummary QualifyStartupScopes(SyncRegion& region, const CompactSyncInput& 
 // parameters and data-loaded values remain unproved. No branch is sampled.
 class InvocationBounds : public IRVisitor {
   using Bound = std::pair<int64_t, int64_t>;
-  arith::ConstIntBoundAnalyzer analyzer_;
+  std::shared_ptr<arith::Analyzer> analyzer_ = std::make_shared<arith::Analyzer>();
+  std::vector<VarPtr> definitions_;
+  std::set<const Expr*> unproved_definitions_;
   const std::map<std::string, FunctionPtr>& functions_;
   std::map<std::string, std::map<size_t, std::optional<Bound>>>& evidence_;
   std::map<std::string, std::optional<Bound>>& launches_;
@@ -1325,16 +1327,27 @@ class InvocationBounds : public IRVisitor {
       return source && source->second <= *maximum ? source : std::nullopt;
     }
     if (As<Var>(expression) || As<ConstInt>(expression)) {
-      const auto b = analyzer_(expression);
-      if (b.min_value < 0 || b.max_value >= arith::ConstIntBound::kPosInf || b.max_value > *maximum)
+      // A later branch restriction must not legitimize an earlier overflowing
+      // definition. Only definitions qualified at their original cut are bound.
+      if (unproved_definitions_.count(expression.get())) return std::nullopt;
+      auto b = analyzer_->const_int_bound(expression);
+      const auto correlated = analyzer_->const_int_bound(analyzer_->Simplify(expression));
+      b.min_value = std::max(b.min_value, correlated.min_value);
+      b.max_value = std::min(b.max_value, correlated.max_value);
+      if (b.min_value < 0 || b.min_value > b.max_value || b.max_value >= arith::ConstIntBound::kPosInf ||
+          b.max_value > *maximum)
         return std::nullopt;
       return Bound{b.min_value, b.max_value};
     }
     ExprPtr left, right;
-    bool multiply = false, modulo = false;
+    bool multiply = false, modulo = false, subtract = false;
     if (auto add = As<Add>(expression)) {
       left = add->left_;
       right = add->right_;
+    } else if (auto sub = As<Sub>(expression)) {
+      left = sub->left_;
+      right = sub->right_;
+      subtract = true;
     } else if (auto mul = As<Mul>(expression)) {
       left = mul->left_;
       right = mul->right_;
@@ -1349,6 +1362,16 @@ class InvocationBounds : public IRVisitor {
     if (!SameCoordinateType(expression, left) || !SameCoordinateType(expression, right)) return std::nullopt;
     auto a = Range(left), b = Range(right);
     if (!a || !b) return std::nullopt;
+    // Simplify only after both original operands have passed machine-width
+    // qualification. Correlation can prove a nonnegative subtraction even when
+    // independent operand intervals overlap; no intermediate overflow is erased.
+    if (subtract) {
+      const auto result = analyzer_->const_int_bound(analyzer_->Simplify(expression));
+      if (result.min_value < 0 || result.min_value > result.max_value ||
+          result.max_value >= arith::ConstIntBound::kPosInf || result.max_value > *maximum)
+        return std::nullopt;
+      return Bound{result.min_value, result.max_value};
+    }
     // Only a proved positive constant divisor is admitted. Both operands were
     // checked in their original machine types before reducing the range.
     if (modulo) {
@@ -1359,6 +1382,40 @@ class InvocationBounds : public IRVisitor {
     const __int128 hi = multiply ? __int128(a->second) * b->second : __int128(a->second) + b->second;
     if (hi >= arith::ConstIntBound::kPosInf || hi > *maximum) return std::nullopt;
     return Bound{static_cast<int64_t>(lo), static_cast<int64_t>(hi)};
+  }
+  bool QualifiedCondition(const ExprPtr& expression) {
+    if (!(As<Lt>(expression) || As<Le>(expression) || As<Gt>(expression) || As<Ge>(expression) ||
+          As<Eq>(expression) || As<Ne>(expression)))
+      return false;
+    const auto comparison = As<BinaryExpr>(expression);
+    return SameCoordinateType(comparison->left_, comparison->right_) && Range(comparison->left_) &&
+           Range(comparison->right_);
+  }
+  void Unbind(const VarPtr& var) {
+    analyzer_->const_int_bound.Unbind(var);
+    analyzer_->rewrite_simplify.Update(var, nullptr);
+  }
+  void ForgetDefinitions(size_t first) {
+    while (definitions_.size() > first) {
+      Unbind(definitions_.back());
+      unproved_definitions_.erase(definitions_.back().get());
+      definitions_.pop_back();
+    }
+  }
+  void VisitBranch(const StmtPtr& body, const ExprPtr& condition) {
+    const auto first = definitions_.size();
+    Invalidate();
+    if (condition) {
+      auto scope = analyzer_->GetConstraintContext(condition);
+      VisitStmt(body);
+      ForgetDefinitions(first);
+    } else {
+      VisitStmt(body);
+      ForgetDefinitions(first);
+    }
+    // ConstraintContext restores every analyzer, including substitutions.
+    // Branch-local SSA definitions never become evidence at sibling/later cuts.
+    Invalidate();
   }
   void RecordCall(const CallPtr& call) {
     if (auto global = As<GlobalVar>(call->op_)) {
@@ -1439,7 +1496,8 @@ class InvocationBounds : public IRVisitor {
     // Missing/unknown formal bounds are not inferred from a sample invocation.
     if (auto incoming = evidence.find(caller_->name_); incoming != evidence.end()) {
       for (const auto& [index, bound] : incoming->second) {
-        if (bound) analyzer_.Update(caller_->params_.at(index), {bound->first, bound->second});
+        if (bound)
+          analyzer_->const_int_bound.Update(caller_->params_.at(index), {bound->first, bound->second});
       }
     }
     if (auto count = counts.find(caller_->name_); count != counts.end()) {
@@ -1469,11 +1527,31 @@ class InvocationBounds : public IRVisitor {
   void VisitStmt_(const AssignStmtPtr& statement) override {
     VisitExpr(statement->value_);
     auto b = Range(statement->value_);
-    if (b && SameCoordinateType(statement->var_, statement->value_))
-      analyzer_.Update(statement->var_, {b->first, b->second});
-    else
-      analyzer_.Unbind(statement->var_);
+    definitions_.push_back(statement->var_);
+    if (b && SameCoordinateType(statement->var_, statement->value_)) {
+      // This producer consumes only substitutions and constant bounds. Do not
+      // populate transitive-comparison inventories which it never queries (and
+      // whose per-definition removal scans the entire retained inventory).
+      analyzer_->rewrite_simplify.Update(statement->var_, analyzer_->Simplify(statement->value_));
+      // Preserve specialized bounds for calls such as get_block_idx which the
+      // generic arithmetic analyzer intentionally treats as opaque.
+      analyzer_->const_int_bound.Update(statement->var_, {b->first, b->second});
+    } else {
+      Unbind(statement->var_);
+      unproved_definitions_.insert(statement->var_.get());
+    }
     Invalidate();
+  }
+  void VisitStmt_(const IfStmtPtr& branch) override {
+    VisitExpr(branch->condition_);
+    const bool qualified = QualifiedCondition(branch->condition_);
+    VisitBranch(branch->then_body_, qualified ? branch->condition_ : nullptr);
+    if (branch->else_body_) {
+      ExprPtr complement =
+          qualified ? std::make_shared<Not>(branch->condition_, DataType::BOOL, branch->condition_->span_)
+                    : nullptr;
+      VisitBranch(*branch->else_body_, complement);
+    }
   }
   void VisitStmt_(const ForStmtPtr& loop) override {
     // Calls in bounds and initial values execute outside the iteration domain.
@@ -1490,15 +1568,19 @@ class InvocationBounds : public IRVisitor {
       int64_t last = stop->second - 1;
       if (start->first == start->second && stop->first == stop->second && step->first == step->second)
         last = start->first + (stop->first - start->first - 1) / step->first * step->first;
-      analyzer_.Update(loop->loop_var_, {start->first, last});
+      analyzer_->const_int_bound.Update(loop->loop_var_, {start->first, last});
     } else {
-      analyzer_.Unbind(loop->loop_var_);
+      Unbind(loop->loop_var_);
+      unproved_definitions_.insert(loop->loop_var_.get());
     }
     // Inclusive hull is deliberately conservative for nonunit strides. Calls
     // in empty/unknown loops do not manufacture vacuous range certificates.
     Invalidate();
+    const auto first = definitions_.size();
     VisitStmt(loop->body_);
-    analyzer_.Unbind(loop->loop_var_);
+    ForgetDefinitions(first);
+    Unbind(loop->loop_var_);
+    unproved_definitions_.erase(loop->loop_var_.get());
     Invalidate();
   }
 };

@@ -39,6 +39,14 @@ from its current Program, including serialized or edited tokens. A later failure
 publishes no intermediate token IR. Empty or barrier-only candidates retain the
 existing whole-kernel delegation policy.
 
+Caller-range recovery retains qualified SSA definitions and scoped integer
+comparisons through the existing arithmetic analyzer. Correlated expressions
+can therefore establish a numeric bound without losing their shared operands.
+Every original intermediate must first pass its machine-width checks; algebraic
+cancellation cannot repair an earlier overflow. Branch-local evidence does not
+escape its arm, and an unqualified caller invalidates a joined parameter bound.
+This exports numerical intervals, not a general relational shape contract.
+
 A successful attempt publishes its complete body and the boolean
 `pypto_autosync=True` attribute. PTOAS skips insertion independently for each
 function containing explicit SET/WAIT or record/wait events. Thus a module can
