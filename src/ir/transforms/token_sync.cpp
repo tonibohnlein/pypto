@@ -192,24 +192,47 @@ std::vector<std::shared_ptr<const sync::NativeSyncChild>> PrepareNativeSyncChild
   return children;
 }
 
-Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accepted_children) {
+std::vector<std::shared_ptr<const sync::EventfulSyncChild>> PrepareEventfulSyncChildren(
+    const FunctionPtr& function, const std::vector<ForStmtPtr>& scopes) {
+  auto* context = PassContext::Current();
+  CHECK(context && function) << "Eventful child preparation requires an original function and active context";
+  CHECK_SPAN(IsOwnedLeaf(function) && function->ir_stage_ == FunctionIRStage::Buffer &&
+                 context->GetMemoryPlanner() != MemoryPlanner::PtoAS,
+             function->span_)
+      << "Eventful child preparation requires a physically placed local Buffer owner";
+  CheckLogicalSync(function);
+  CHECK(!sync::HasLogicalSync(function)) << "Eventful child preparation requires original payload IR";
+  if (scopes.empty()) return {};
+  NativeChildScopeRequests(scopes).Validate(function);
+  const auto target = context->GetBackendHandler()->GetPtoTargetArch();
+  std::vector<std::shared_ptr<const sync::EventfulSyncChild>> children;
+  children.reserve(scopes.size());
+  const sync::SyncRegionBindings bindings(function, target);
+  for (const auto& scope : scopes)
+    children.push_back(sync::PrepareEventfulSyncChild(function, scope, target, bindings));
+  return children;
+}
+
+Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accepted_children,
+                std::vector<std::shared_ptr<const sync::EventfulSyncChild>> eventful_children) {
   // Invocation evidence belongs to this program, never to a process-global
   // sidecar. Standalone failure leaves the immutable input program untouched.
   return CreateProgramPass(
-      [accepted_children = std::move(accepted_children)](const ProgramPtr& program) {
+      [accepted_children = std::move(accepted_children),
+       eventful_children = std::move(eventful_children)](const ProgramPtr& program) {
         auto* context = PassContext::Current();
         CHECK(context &&
               (context->GetAutoSyncPolicy() == "conservative_prefix" || context->GetAutoSyncDisjointGM()))
             << "InsertSync requires the explicit disjoint GM argument contract";
         const auto target = context->GetBackendHandler()->GetPtoTargetArch();
         const bool prefix = context->GetAutoSyncPolicy() == "conservative_prefix";
-        CHECK(prefix || accepted_children.empty())
+        CHECK(prefix || (accepted_children.empty() && eventful_children.empty()))
             << "Accepted synchronization children require the explicit conservative_prefix policy";
         // Validate the complete request before constructing any transformed
         // function. Names or a structurally equivalent clone cannot authorize
         // reuse of retained coordinates, placement, or caller evidence.
         std::unordered_map<const Function*, size_t> owner_counts;
-        if (!accepted_children.empty())
+        if (!accepted_children.empty() || !eventful_children.empty())
           for (const auto& [global, function] : program->functions_) ++owner_counts[function.get()];
         std::unordered_map<const Function*, std::vector<std::shared_ptr<const sync::NativeSyncChild>>>
             children_by_owner;
@@ -226,7 +249,21 @@ Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accept
               << "InsertSync received duplicate accepted child scopes";
           children_by_owner[owner.get()].push_back(child);
         }
+        std::unordered_map<const Function*, std::vector<std::shared_ptr<const sync::EventfulSyncChild>>>
+            eventful_by_owner;
+        for (const auto& child : eventful_children) {
+          CHECK(child) << "InsertSync received an unavailable eventful child capability";
+          const auto& owner = child->Owner();
+          const auto found = owner_counts.find(owner.get());
+          CHECK(found != owner_counts.end() && found->second == 1)
+              << "InsertSync eventful child has no unique original owner";
+          child->ValidateFor(owner, target);
+          CHECK(requested_scopes[owner.get()].insert(child->Scope().get()).second)
+              << "InsertSync received duplicate accepted child scopes";
+          eventful_by_owner[owner.get()].push_back(child);
+        }
         const std::vector<std::shared_ptr<const sync::NativeSyncChild>> no_children;
+        const std::vector<std::shared_ptr<const sync::EventfulSyncChild>> no_eventful;
         const auto evidence =
             prefix ? sync::SyncInvocationEvidence{} : sync::CollectSyncInvocationEvidence(program);
         auto functions = program->functions_;
@@ -240,8 +277,10 @@ Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accept
           if (prefix) {
             const auto found = children_by_owner.find(function.get());
             const auto& children = found == children_by_owner.end() ? no_children : found->second;
-            function =
-                sync::InsertConservativePrefixes(sync::AnalyzeConservativeSync(function, target, children));
+            const auto events = eventful_by_owner.find(function.get());
+            const auto& eventful = events == eventful_by_owner.end() ? no_eventful : events->second;
+            function = sync::InsertConservativePrefixes(
+                sync::AnalyzeConservativeSync(function, target, children, eventful));
             sync::CheckGeneratedLogicalSync(function);
             continue;
           }

@@ -11,8 +11,13 @@
 
 #include "src/ir/transforms/utils/retained_sync_child.h"
 
+#include <algorithm>
+#include <map>
 #include <memory>
+#include <optional>
+#include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -20,8 +25,12 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/sync.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/utils/parent_stmt_analysis.h"
+#include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/numerical_sync_merge.h"
 
 namespace pypto::ir::sync {
@@ -236,5 +245,203 @@ NativeSyncChildExport ExportNativeSyncChild(const CompactSyncResult& mathematics
   result.status = NativeSyncChildStatus::Ready;
   result.reason = "Retained internal order is native-only, with no notification resources";
   return result;
+}
+class SyncRegionBindings::State : public ParentStmtAnalysis {
+ public:
+  FunctionPtr owner;
+  std::string target;
+  size_t clock = 0;
+  std::unordered_map<const Stmt*, size_t> occurrences, begin, end;
+  std::unordered_map<const Var*, std::vector<AssignStmtPtr>> definitions;
+  // Ephemeral request-local qualification cache. Published mathematics and
+  // capabilities do not depend on later mutations of this index.
+  std::unordered_map<const AssignStmt*, bool> qualified;
+  std::shared_ptr<const SyncRegionIndexWork> work;
+
+  State(FunctionPtr function, std::string native) : owner(std::move(function)), target(std::move(native)) {
+    CHECK(owner) << "Regional synchronization requires an original owner";
+    BuildMap(owner);
+    work = std::make_shared<const SyncRegionIndexWork>(SyncRegionIndexWork{clock});
+  }
+  void VisitStmt(const StmtPtr& statement) override {
+    ++occurrences[statement.get()];
+    begin.emplace(statement.get(), clock++);
+    if (const auto definition = As<AssignStmt>(statement))
+      definitions[definition->var_.get()].push_back(definition);
+    ParentStmtAnalysis::VisitStmt(statement);
+    end[statement.get()] = clock;
+  }
+  void VisitExpr(const ExprPtr&) override {}
+  bool Dominates(const AssignStmtPtr& definition, const StmtPtr& use) const {
+    const auto parent = GetParent(definition);
+    // A binding in a sequence dominates precisely the later sibling subtrees
+    // in that sequence. Its interval ends at the original branch/loop scope;
+    // a definition from another arm or a prior iteration cannot leak out.
+    return parent && As<SeqStmts>(parent) && occurrences.at(definition.get()) == 1 &&
+           occurrences.at(parent.get()) == 1 && begin.at(definition.get()) < begin.at(use.get()) &&
+           begin.at(use.get()) < end.at(parent.get());
+  }
+  bool Qualify(const AssignStmtPtr& assignment) {
+    if (const auto found = qualified.find(assignment.get()); found != qualified.end()) {
+      return found->second;
+    }
+    const auto call = As<Call>(assignment->value_);
+    bool ready;
+    if (call) {
+      // Completed facts have no physical notification; keep actual initializers
+      // for the token parser without promoting them to payload completion.
+      const auto descriptor = GetLogicalSyncKind(call->op_) == LogicalSyncKind::Completed
+                                  ? std::optional<backend::BufferSyncOperation>{}
+                                  : backend::QualifyBufferSyncNonPayload(call, target);
+      ready = GetLogicalSyncKind(call->op_) == LogicalSyncKind::Completed ||
+              (descriptor && descriptor->SignalFree());
+    } else {
+      ready = As<ConstInt>(assignment->value_) || As<ConstBool>(assignment->value_) ||
+              As<ConstFloat>(assignment->value_);
+    }
+    qualified.emplace(assignment.get(), ready);
+    return ready;
+  }
+};
+
+SyncRegionBindings::SyncRegionBindings(FunctionPtr owner, std::string target)
+    : state_(std::make_shared<State>(std::move(owner), std::move(target))) {}
+
+SyncRegionContext SyncRegionBindings::Bind(const ForStmtPtr& scope) const {
+  CHECK(scope && state_->occurrences.count(scope.get()) && state_->occurrences.at(scope.get()) == 1)
+      << "Regional synchronization scope must occur exactly once in its original owner";
+  std::vector<StmtPtr> ancestors;
+  for (auto parent = state_->GetParent(scope); parent; parent = state_->GetParent(parent))
+    ancestors.push_back(parent);
+  std::reverse(ancestors.begin(), ancestors.end());
+  class Uses : public var_collectors::VarDefUseCollector {
+   public:
+    size_t scope_nodes = 0;
+    void VisitStmt(const StmtPtr& statement) override {
+      ++scope_nodes;
+      IRVisitor::VisitStmt(statement);
+    }
+    void VisitExpr(const ExprPtr& expression) override {
+      if (expression && seen_.insert(expression.get()).second) IRVisitor::VisitExpr(expression);
+    }
+
+   private:
+    std::unordered_set<const Expr*> seen_;
+  } uses;
+  uses.VisitStmt(scope);
+  std::vector<std::pair<const Var*, StmtPtr>> pending;
+  for (const auto* variable : uses.var_uses)
+    if (!uses.var_defs.count(variable)) pending.emplace_back(variable, scope);
+  for (const auto* variable : uses.GetAllVarRefs())
+    for (const auto* metadata : var_collectors::CollectTypeVars(variable->GetType()))
+      if (!uses.var_defs.count(metadata)) pending.emplace_back(metadata, scope);
+  std::set<const Var*> required;
+  std::vector<AssignStmtPtr> ordered;
+  while (!pending.empty()) {
+    const auto [variable, use] = pending.back();
+    pending.pop_back();
+    const auto found = state_->definitions.find(variable);
+    CHECK(found != state_->definitions.end() && found->second.size() == 1)
+        << "Regional synchronization child has an unavailable enclosing coordinate, caller value or "
+           "descriptor binding";
+    const auto& definition = found->second.front();
+    // Check every source-use cut, including repeated uses of a shared binding.
+    // Dominance of the child alone cannot justify an earlier initializer use.
+    CHECK(state_->Dominates(definition, use))
+        << "Regional synchronization descriptor binding does not dominate its original use";
+    CHECK(state_->Qualify(definition)) << "Regional synchronization requires a signal-free original binding";
+    if (!required.insert(variable).second) continue;
+    ordered.push_back(definition);
+    Uses dependencies;
+    dependencies.VisitExpr(definition->value_);
+    for (const auto* dependency : dependencies.var_uses) pending.emplace_back(dependency, definition);
+    for (const auto* metadata : var_collectors::CollectTypeVars(variable->GetType()))
+      pending.emplace_back(metadata, definition);
+  }
+  std::sort(ordered.begin(), ordered.end(), [&](const auto& a, const auto& b) {
+    return state_->begin.at(a.get()) < state_->begin.at(b.get());
+  });
+  std::vector<StmtPtr> body(ordered.begin(), ordered.end());
+  body.push_back(scope);
+  body.push_back(std::make_shared<ReturnStmt>(std::vector<ExprPtr>{}, scope->span_));
+  auto binding = std::make_shared<Function>(*state_->owner);
+  binding->params_.clear();
+  binding->param_directions_.clear();
+  binding->return_types_.clear();
+  binding->body_ = std::make_shared<SeqStmts>(body, scope->span_);
+  return {state_->owner,    scope,         std::move(ancestors), std::move(binding), state_->work,
+          uses.scope_nodes, ordered.size()};
+}
+
+std::shared_ptr<const EventfulSyncChild> PrepareEventfulSyncChild(const FunctionPtr& owner,
+                                                                  const ForStmtPtr& scope,
+                                                                  const std::string& target,
+                                                                  const SyncRegionBindings& bindings) {
+  auto context = bindings.Bind(scope);
+  CHECK(context.original_owner == owner)
+      << "Regional synchronization index belongs to another original owner";
+  auto mathematics = AnalyzeCompactSync(ImportPlacedSync(context.binding_owner, true, target));
+  NativeSyncChildExport qualification;
+  Operations operations(mathematics, target, qualification);
+  operations.VisitStmt(scope);
+  CHECK(operations.available) << "Eventful child native/effect qualification unavailable: "
+                              << qualification.reason;
+  std::set<PipeType> participating;
+  for (const auto& operation : operations.payloads) participating.insert(operation.Implementation().Pipe());
+  auto logical = RealizeCompactSync(mathematics).function;
+  class FindLogical : public IRVisitor {
+   public:
+    explicit FindLogical(const VarPtr& coordinate) : coordinate_(coordinate) {}
+    ForStmtPtr found;
+
+   protected:
+    void VisitStmt_(const ForStmtPtr& loop) override {
+      if (loop->loop_var_ == coordinate_) {
+        CHECK(!found) << "Eventful child has ambiguous original loop coordinates";
+        found = loop;
+      }
+      IRVisitor::VisitStmt_(loop);
+    }
+    void VisitExpr(const ExprPtr&) override {}
+
+   private:
+    VarPtr coordinate_;
+  } selected(scope->loop_var_);
+  selected.VisitFunction(logical);
+  CHECK(selected.found) << "Eventful child logical recipe lost its original invocation frame";
+  CheckLogicalSync(logical);
+  const auto logical_context = SyncRegionBindings(logical, target).Bind(selected.found);
+  std::vector<StmtPtr> recipe;
+  const auto bound = As<SeqStmts>(logical_context.binding_owner->body_);
+  INTERNAL_CHECK(bound) << "Internal error: region bindings are not a sequence";
+  for (const auto& statement : bound->stmts_) {
+    const auto assignment = As<AssignStmt>(statement);
+    if (assignment && As<SyncTokenType>(assignment->var_->GetType())) recipe.push_back(statement);
+  }
+  auto marked = std::make_shared<ForStmt>(*selected.found);
+  CHECK(!marked->HasAttr(kClosedSyncChildAttr))
+      << "Original child already contains synchronization routing metadata";
+  marked->attrs_.emplace_back(kClosedSyncChildAttr, 1);
+  recipe.push_back(marked);
+  auto logical_recipe = std::make_shared<SeqStmts>(recipe, scope->span_);
+  return std::shared_ptr<const EventfulSyncChild>(
+      new EventfulSyncChild(std::move(context), std::move(mathematics), logical_recipe, target,
+                            std::vector<PipeType>(participating.begin(), participating.end())));
+}
+
+std::map<std::string, size_t> EventfulSyncChild::Describe() const {
+  return {{"shared_index_source_nodes", context_.index_work->source_nodes},
+          {"query_scope_nodes", context_.query_scope_nodes},
+          {"binding_definitions", context_.binding_definitions},
+          {"analyzed_occurrences", mathematics_.Diagnostics().analyzed_occurrences},
+          {"retained_cells", mathematics_.Diagnostics().cells},
+          {"retained_regions", mathematics_.State().segments.size()}};
+}
+
+void EventfulSyncChild::ValidateFor(const FunctionPtr& owner, const std::string& target) const {
+  CHECK(owner == Owner() && target == target_)
+      << "Eventful child belongs to a different original owner or native context";
+  // The original owner is immutable. Identity and target bind the retained
+  // original scope/ancestor proof without rescanning the entire owner per use.
 }
 }  // namespace pypto::ir::sync
