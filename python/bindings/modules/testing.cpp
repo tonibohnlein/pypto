@@ -1445,6 +1445,18 @@ void BindTesting(nb::module_& m) {
         result["operation"] = qualified.Operation();
         result["pipe"] = qualified.Implementation().Pipe();
         result["arguments"] = arguments;
+        nb::list implicit;
+        for (const auto& effect : qualified.Implementation().ImplicitEffects()) {
+          nb::dict item;
+          item["space"] = effect.space;
+          item["begin"] = effect.begin;
+          item["end"] = effect.end;
+          item["data"] = name(effect.data);
+          item["provenance"] = effect.provenance;
+          item["exact_footprint"] = effect.exact_footprint;
+          implicit.append(item);
+        }
+        result["implicit_effects"] = implicit;
         result["footprint_available"] = false;
         result["readiness_available"] = false;
         result["resource_assignment_available"] = false;

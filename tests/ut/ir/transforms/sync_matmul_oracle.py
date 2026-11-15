@@ -162,7 +162,20 @@ def _vector_effects(name, args, access):
     # TCVT can change byte widths; partial native footprints are not qualified.
     assert name != ir.get_op("buffer.cast").name or all(a.type.valid_shape == a.type.shape for a in args)
     reads = set().union(*(access(a) for a in args[:-1] if isinstance(a.type, ir.BufferType)))
-    return reads, access(args[-1]), ir.PipeType.V
+    writes = access(args[-1])
+    if name in {
+        ir.get_op("buffer.row_expand_sub").name,
+        ir.get_op("buffer.row_expand_div").name,
+        ir.get_op("buffer.row_expand_mul").name,
+    }:
+        # Independently instantiate the declared native envelope from
+        # pinned A2/A3 TRowExpandBin Mode1, not compiler partitions or
+        # selected-effect exports. This is modeled scratch, not an
+        # assertion that every byte is touched by every invocation.
+        scratch = {(ir.MemorySpace.Vec, byte) for byte in range(184 * 1024, 192 * 1024)}
+        reads |= scratch
+        writes |= scratch
+    return reads, writes, ir.PipeType.V
 
 
 def define_storage(stmt, env, storage):
@@ -293,6 +306,7 @@ def interpret(
             ir.get_op("buffer.exp").name,
             ir.get_op("buffer.row_expand_sub").name,
             ir.get_op("buffer.row_expand_div").name,
+            ir.get_op("buffer.row_expand_mul").name,
         }:
             reads, writes, pipe = _vector_effects(name, args, access)
         else:
