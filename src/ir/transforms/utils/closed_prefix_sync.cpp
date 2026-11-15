@@ -10,8 +10,11 @@
  */
 #include "src/ir/transforms/utils/closed_prefix_sync.h"
 
+#include <algorithm>
 #include <array>
+#include <iterator>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
@@ -24,7 +27,9 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
+#include "src/ir/transforms/utils/retained_sync_child.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
+#include "src/ir/transforms/utils/token_sync_lowering.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -60,11 +65,18 @@ class Discover : public IRVisitor {
   std::vector<Transaction> transactions;
   std::vector<LocalCompletion> local;
   size_t logical_calls = 0;
+  std::vector<ForStmtPtr> children;
+  std::map<const ForStmt*, std::set<SyncDirection>> entries;
 
  protected:
   void VisitVarLike_(const VarPtr&) override {}
   void VisitExpr_(const IterArgPtr&) override {}
   void VisitStmt_(const ForStmtPtr& loop) override {
+    if (loop->HasAttr(kClosedSyncChildAttr)) {
+      CHECK(loop->GetAttr<int>(kClosedSyncChildAttr) == 1) << "Unsupported closed-child routing version";
+      children.push_back(loop);
+      return;  // Actual child tokens are independently parsed below.
+    }
     for (const auto& argument : loop->iter_args_) VisitExpr(argument->initValue_);
     IRVisitor::VisitStmt_(loop);
   }
@@ -73,6 +85,7 @@ class Discover : public IRVisitor {
     IRVisitor::VisitStmt_(loop);
   }
   void VisitStmt_(const SeqStmtsPtr& sequence) override {
+    std::set<SyncDirection> preceding;
     for (size_t i = 0; i < sequence->stmts_.size();) {
       const auto& statements = sequence->stmts_;
       if (i + 3 < statements.size() && Record(statements[i]) && Wait(statements[i + 1]) &&
@@ -89,6 +102,7 @@ class Discover : public IRVisitor {
           transactions.push_back({{statements[i], statements[i + 1], statements[i + 2], statements[i + 3]},
                                   source,
                                   destination});
+          preceding.emplace(source, destination);
           i += 4;
           logical_calls += 4;
           continue;
@@ -105,12 +119,18 @@ class Discover : public IRVisitor {
           continue;
         }
       }
+      const auto child = As<ForStmt>(statements[i]);
+      if (child && child->HasAttr(kClosedSyncChildAttr)) entries.emplace(child.get(), preceding);
+      preceding.clear();
       VisitStmt(statements[i++]);
     }
   }
   void VisitExpr_(const CallPtr& call) override {
-    if (GetLogicalSyncKind(call->op_) != LogicalSyncKind::None) {
-      ++logical_calls;
+    const auto kind = GetLogicalSyncKind(call->op_);
+    if (kind != LogicalSyncKind::None) {
+      // Completed initializers carry no publication, but remain in the actual
+      // child binding context until its token parser has interpreted them.
+      if (kind != LogicalSyncKind::Completed) ++logical_calls;
       IRVisitor::VisitExpr_(call);
     }
   }
@@ -286,10 +306,20 @@ class Assignment {
 
 class Emit : public IRMutator {
  public:
-  Emit(const Assignment& assignment, FunctionType core)
-      : assignment_(assignment), core_(core == FunctionType::AIV ? "aiv" : "aic") {}
+  Emit(const Assignment& assignment, FunctionType core, const std::map<const ForStmt*, StmtPtr>& children)
+      : assignment_(assignment), core_(core == FunctionType::AIV ? "aiv" : "aic"), children_(children) {}
 
  protected:
+  StmtPtr VisitStmt_(const AssignStmtPtr& assignment) override {
+    const auto call = As<Call>(assignment->value_);
+    if (call && GetLogicalSyncKind(call->op_) == LogicalSyncKind::Completed)
+      return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, assignment->span_);
+    return IRMutator::VisitStmt_(assignment);
+  }
+  StmtPtr VisitStmt_(const ForStmtPtr& loop) override {
+    const auto found = children_.find(loop.get());
+    return found == children_.end() ? IRMutator::VisitStmt_(loop) : found->second;
+  }
   StmtPtr VisitStmt_(const SeqStmtsPtr& sequence) override {
     return RewriteSyncSequence(sequence, [this](const StmtPtr& statement) {
       const auto command = assignment_.Commands().find(statement.get());
@@ -317,13 +347,14 @@ class Emit : public IRMutator {
  private:
   const Assignment& assignment_;
   std::string core_;
+  const std::map<const ForStmt*, StmtPtr>& children_;
 };
 }  // namespace
 
 bool HasOnlyClosedPrefixSyntax(const FunctionPtr& function) {
   Discover discovered;
   discovered.VisitFunction(function);
-  return (!discovered.transactions.empty() || !discovered.local.empty()) &&
+  return (!discovered.transactions.empty() || !discovered.local.empty() || !discovered.children.empty()) &&
          discovered.logical_calls == 4 * discovered.transactions.size() + 2 * discovered.local.size();
 }
 
@@ -332,7 +363,7 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     const std::optional<std::vector<int>>& eligible_ids) {
   Discover discovered;
   discovered.VisitFunction(function);
-  if ((discovered.transactions.empty() && discovered.local.empty()) ||
+  if ((discovered.transactions.empty() && discovered.local.empty() && discovered.children.empty()) ||
       discovered.logical_calls != 4 * discovered.transactions.size() + 2 * discovered.local.size())
     return std::nullopt;
   CHECK(!function->requires_runtime_binding_ && !function->HasAttr(kAttrExternalSource) &&
@@ -365,11 +396,126 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
       << "Closed prefix tokens require one within-visit consumer and no escapes";
   NativeOperations native(function->func_type_, target);
   native.VisitFunction(function);
+  const auto reservations = SyncNativeClaims(function, native.payloads, target);
+  std::map<SyncDirection, std::set<bool>> roles;
+  for (const auto& transaction : discovered.transactions) {
+    roles[{transaction.source, transaction.destination}].insert(false);
+    roles[{transaction.destination, transaction.source}].insert(true);
+  }
+  std::set<int> parent_ids;
+  for (const auto& [direction, uses] : roles) {
+    const auto available = SyncEligibleIds(function, target, direction, eligible_ids, reservations);
+    CHECK(available.size() >= uses.size())
+        << "Closed parent role reservation unavailable; this is not a fixed-plan capacity lower bound";
+    parent_ids.insert(available.begin(), available.begin() + uses.size());
+  }
+  std::map<const ForStmt*, StmtPtr> children;
+  size_t child_sets = 0, child_waits = 0, child_barriers = 0, child_lanes = 0;
+  const auto bindings = discovered.children.empty()
+                            ? std::optional<SyncRegionBindings>{}
+                            : std::optional<SyncRegionBindings>{std::in_place, function, target};
+  for (const auto& child : discovered.children) {
+    auto context = bindings->Bind(child);
+    CheckLogicalSync(context.binding_owner);
+    NativeOperations child_native(function->func_type_, target);
+    child_native.VisitFunction(context.binding_owner);
+    std::set<PipeType> pipes;
+    for (const auto& call : child_native.payloads)
+      pipes.insert(
+          backend::QualifyBufferSyncOperation(call, function->func_type_, target).Implementation().Pipe());
+    // The actual program can use command-only pipes, including a recursively
+    // recognized closed service. Payload pipes alone are not its footprint.
+    // Logical verification above confines commands to statement value roots;
+    // inspect those roots without repeatedly walking unrelated scalar DAGs.
+    class CommandPipes : public IRVisitor {
+     public:
+      std::set<PipeType> participating;
+      void VisitExpr(const ExprPtr& expression) override {
+        const auto call = As<Call>(expression);
+        if (!call) return;
+        const auto kind = GetLogicalSyncKind(call->op_);
+        if (kind == LogicalSyncKind::Record) participating.insert(Pipe(call, "pipe"));
+        if (kind == LogicalSyncKind::Wait) participating.insert(Pipe(call, "dst_pipe"));
+      }
+    } command_pipes;
+    command_pipes.VisitFunction(context.binding_owner);
+    pipes.insert(command_pipes.participating.begin(), command_pipes.participating.end());
+    const auto entry = discovered.entries.find(child.get());
+    CHECK(entry != discovered.entries.end()) << "Closed child lacks an original entry protocol cut";
+    std::optional<std::set<int>> intersection;
+    for (const auto source : pipes) {
+      for (const auto destination : pipes) {
+        if (source == destination) continue;
+        CHECK(entry->second.count({source, destination}))
+            << "Closed child entry lacks a participating-pipe acknowledgment; cross-visit rearm unproved";
+        const auto available =
+            SyncEligibleIds(function, target, {source, destination}, eligible_ids, reservations);
+        std::set<int> candidates;
+        for (const int id : available)
+          if (!parent_ids.count(id)) candidates.insert(id);
+        if (!intersection) {
+          intersection = candidates;
+        } else {
+          std::set<int> common;
+          std::set_intersection(intersection->begin(), intersection->end(), candidates.begin(),
+                                candidates.end(), std::inserter(common, common.end()));
+          intersection = std::move(common);
+        }
+      }
+    }
+    // The descriptor/caller binding is not a proof of token closure. Remove
+    // only the routing hint and lower the actual token program through the
+    // existing parser, endpoint decoder and allocator with its private pool.
+    auto unmarked = std::make_shared<ForStmt>(*child);
+    unmarked->attrs_.erase(
+        std::remove_if(unmarked->attrs_.begin(), unmarked->attrs_.end(),
+                       [](const auto& attribute) { return attribute.first == kClosedSyncChildAttr; }),
+        unmarked->attrs_.end());
+    class Replace : public IRMutator {
+     public:
+      Replace(ForStmtPtr before, ForStmtPtr after) : before_(std::move(before)), after_(std::move(after)) {}
+
+     protected:
+      StmtPtr VisitStmt_(const ForStmtPtr& loop) override {
+        return loop == before_ ? after_ : IRMutator::VisitStmt_(loop);
+      }
+
+     private:
+      ForStmtPtr before_, after_;
+    } replace(child, unmarked);
+    auto actual = replace.VisitFunction(context.binding_owner);
+    std::optional<std::vector<int>> private_ids;
+    if (intersection) private_ids = std::vector<int>(intersection->begin(), intersection->end());
+    auto lowered = LowerLogicalSync(actual, target, private_ids);
+    const auto original_body = As<SeqStmts>(actual->body_);
+    const auto lowered_body = As<SeqStmts>(lowered.function->body_);
+    INTERNAL_CHECK(original_body && lowered_body) << "Internal error: child binding body is not a sequence";
+    std::set<const Var*> descriptor_variables;
+    for (const auto& statement : original_body->stmts_)
+      if (const auto assignment = As<AssignStmt>(statement))
+        descriptor_variables.insert(assignment->var_.get());
+    std::vector<StmtPtr> recipe;
+    for (const auto& statement : lowered_body->stmts_) {
+      if (As<ReturnStmt>(statement)) continue;
+      const auto assignment = As<AssignStmt>(statement);
+      if (assignment && descriptor_variables.count(assignment->var_.get())) continue;
+      recipe.push_back(statement);
+    }
+    children.emplace(child.get(), std::make_shared<SeqStmts>(recipe, child->span_));
+    child_sets += lowered.set_sites;
+    child_waits += lowered.wait_sites;
+    for (const auto& plan : lowered.physical_cases) {
+      child_barriers += plan.barrier_sites;
+      child_lanes += plan.reserved_lanes;
+    }
+  }
   const Assignment assignment(function, discovered, native.payloads, target, eligible_ids);
   PhysicalSyncRealization result;
-  result.function = Emit(assignment, function->func_type_).VisitFunction(function);
-  result.set_sites = result.wait_sites = 2 * discovered.transactions.size();
-  result.reserved_lanes = assignment.Roles();
+  result.function = Emit(assignment, function->func_type_, children).VisitFunction(function);
+  result.set_sites = 2 * discovered.transactions.size() + child_sets;
+  result.wait_sites = 2 * discovered.transactions.size() + child_waits;
+  result.barrier_sites = child_barriers;
+  result.reserved_lanes = assignment.Roles() + child_lanes;
   for (const auto& [cut, command] : assignment.Commands())
     result.barrier_sites += command.kind == CommandKind::Barrier;
   result.finite_minimum = false;

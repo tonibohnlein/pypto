@@ -26,6 +26,7 @@ namespace pypto {
 namespace ir {
 namespace sync {
 class NativeSyncChild;
+class EventfulSyncChild;
 }  // namespace sync
 
 /**
@@ -326,11 +327,17 @@ Pass LowerTileToBuffer();
 std::vector<std::shared_ptr<const sync::NativeSyncChild>> PrepareNativeSyncChildren(
     const FunctionPtr& function, const std::vector<ForStmtPtr>& scopes);
 
+/// Explicit original-context regional request. Local static children are analyzed
+/// once independently of surrounding control, retaining their original bindings.
+std::vector<std::shared_ptr<const sync::EventfulSyncChild>> PrepareEventfulSyncChildren(
+    const FunctionPtr& function, const std::vector<ForStmtPtr>& scopes);
+
 /// Insert logical completion tokens for qualified placed Buffer demands.
 /// Strict standalone stage: unsupported exports raise without modifying input.
 /// Accepted child evidence is immutable and bound to original functions in the
 /// supplied program. It is consumed only under the explicit conservative policy.
-Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accepted_children = {});
+Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accepted_children = {},
+                std::vector<std::shared_ptr<const sync::EventfulSyncChild>> eventful_children = {});
 
 /// Verify logical completion IR; initially an identity optimization stage.
 Pass OptimizeSync();

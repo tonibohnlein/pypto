@@ -10,7 +10,10 @@
  */
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "pypto/ir/op_registry.h"
@@ -22,6 +25,63 @@
 
 namespace pypto::ir::sync {
 namespace {
+// Freshen only logical completion identities through the parent's naming owner.
+// Payload variables, original induction variables and storage descriptors retain
+// their original identities; cloning all definitions would lose region frames.
+class FreshChildTokens : public IRMutator {
+ public:
+  explicit FreshChildTokens(SyncTokenNames& names) : names_(names) {}
+
+ protected:
+  ExprPtr VisitExpr_(const VarPtr& variable) override {
+    const auto found = variables_.find(variable.get());
+    return found == variables_.end() ? variable : found->second;
+  }
+  ExprPtr VisitExpr_(const IterArgPtr& variable) override { return VisitExpr_(VarPtr(variable)); }
+  StmtPtr VisitStmt_(const AssignStmtPtr& assignment) override {
+    const auto value = VisitExpr(assignment->value_);
+    const auto variable = Fresh(assignment->var_);
+    return std::make_shared<AssignStmt>(variable, value, assignment->span_, assignment->leading_comments_);
+  }
+  StmtPtr VisitStmt_(const ForStmtPtr& loop) override {
+    std::vector<IterArgPtr> arguments;
+    for (const auto& argument : loop->iter_args_) {
+      CHECK(As<SyncTokenType>(argument->GetType()))
+          << "Eventful child scalar carries need original-frame binding evidence";
+      auto fresh = std::make_shared<IterArg>(names_.Next("sync_child_completion_"), argument->GetType(),
+                                             VisitExpr(argument->initValue_), argument->span_);
+      variables_.emplace(argument.get(), fresh);
+      arguments.push_back(fresh);
+    }
+    std::vector<VarPtr> results;
+    for (const auto& variable : loop->return_vars_) results.push_back(Fresh(variable));
+    return std::make_shared<ForStmt>(loop->loop_var_, loop->start_, loop->stop_, loop->step_, arguments,
+                                     VisitStmt(loop->body_), results, loop->span_, loop->kind_, loop->attrs_,
+                                     loop->leading_comments_, loop->hardware_loop_policy_);
+  }
+  StmtPtr VisitStmt_(const IfStmtPtr& branch) override {
+    std::vector<VarPtr> results;
+    for (const auto& variable : branch->return_vars_) results.push_back(Fresh(variable));
+    const auto other =
+        branch->else_body_ ? std::optional<StmtPtr>{VisitStmt(*branch->else_body_)} : std::nullopt;
+    return std::make_shared<IfStmt>(branch->condition_, VisitStmt(branch->then_body_), other, results,
+                                    branch->span_, branch->leading_comments_);
+  }
+
+ private:
+  SyncTokenNames& names_;
+  std::unordered_map<const Var*, VarPtr> variables_;
+  VarPtr Fresh(const VarPtr& variable) {
+    if (!As<SyncTokenType>(variable->GetType())) return variable;
+    const auto found = variables_.find(variable.get());
+    if (found != variables_.end()) return found->second;
+    auto fresh =
+        std::make_shared<Var>(names_.Next("sync_child_completion_"), variable->GetType(), variable->span_);
+    variables_.emplace(variable.get(), fresh);
+    return fresh;
+  }
+};
+
 class Insert : public IRMutator {
  public:
   explicit Insert(const ConservativeSyncAnalysis& analysis) : names_(analysis.Function()) {
@@ -37,7 +97,11 @@ class Insert : public IRMutator {
       }
       Wrap(site.cut, services);
     }
-    for (const auto& entry : analysis.ChildEntries()) Wrap(entry.scope, entry.services);
+    for (const auto& entry : analysis.ChildEntries()) {
+      const auto recipe = entry.eventful ? FreshChildTokens(names_).VisitStmt(entry.eventful->LogicalRecipe())
+                                         : StmtPtr(entry.scope);
+      Wrap(entry.scope, entry.services, recipe);
+    }
   }
   StmtPtr VisitStmt(const StmtPtr& statement) override {
     if (auto replacement = replacements_.find(statement.get()); replacement != replacements_.end())
@@ -69,8 +133,14 @@ class Insert : public IRMutator {
  private:
   SyncTokenNames names_;
   std::map<const Stmt*, StmtPtr> replacements_;
-  void Wrap(const StmtPtr& cut, const std::vector<std::pair<PipeType, PipeType>>& services) {
+  void Wrap(const StmtPtr& cut, const std::vector<std::pair<PipeType, PipeType>>& services,
+            StmtPtr retained = nullptr) {
     std::vector<StmtPtr> statements;
+    if (const auto recipe = As<SeqStmts>(retained)) {
+      CHECK(!recipe->stmts_.empty()) << "Eventful child recipe has no whole invocation";
+      statements.insert(statements.end(), recipe->stmts_.begin(), recipe->stmts_.end() - 1);
+      retained = recipe->stmts_.back();
+    }
     for (const auto& [source, destination] : services) {
       const auto forward = Record(source, statements, cut->span_);
       Wait(forward, destination, statements, cut->span_);
@@ -81,14 +151,15 @@ class Insert : public IRMutator {
         Wait(returned, source, statements, cut->span_);
       }
     }
-    statements.push_back(cut);
+    statements.push_back(retained ? std::move(retained) : cut);
     CHECK(replacements_.emplace(cut.get(), std::make_shared<SeqStmts>(statements, cut->span_)).second)
         << "Conservative prefix entries require distinct original static cuts";
   }
   VarPtr Record(PipeType pipe, std::vector<StmtPtr>& output, const Span& span) {
     const auto operation =
         OpRegistry::GetInstance().Create("sync.record", {}, {{"pipe", static_cast<int>(pipe)}}, span);
-    const auto variable = std::make_shared<Var>(names_.Next(), operation->GetType(), span);
+    const auto variable =
+        std::make_shared<Var>(names_.Next("sync_parent_completion_"), operation->GetType(), span);
     output.push_back(std::make_shared<AssignStmt>(variable, operation, span));
     return variable;
   }

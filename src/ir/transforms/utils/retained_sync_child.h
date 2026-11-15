@@ -13,6 +13,7 @@
 #define SRC_IR_TRANSFORMS_UTILS_RETAINED_SYNC_CHILD_H_
 
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -67,6 +68,67 @@ class NativeSyncChild {
   std::string target_;
   std::vector<backend::BufferSyncOperation> operations_;
 };
+
+// Routing hint only. LowerSync independently validates the marked token region,
+// lexical descriptor bindings, entry acknowledgments and directional resources.
+inline constexpr const char* kClosedSyncChildAttr = "pypto.closed_sync_child";
+
+struct SyncRegionIndexWork {
+  size_t source_nodes;
+};
+struct SyncRegionContext {
+  FunctionPtr original_owner;
+  ForStmtPtr original_scope;
+  std::vector<StmtPtr> ancestors;
+  FunctionPtr binding_owner;
+  // Shared build cost is counted once for the request batch, not per child.
+  std::shared_ptr<const SyncRegionIndexWork> index_work;
+  size_t query_scope_nodes = 0, binding_definitions = 0;
+};
+// One original-owner index per provider batch or lowering request. Queries
+// walk only the requested original scope, ancestors and necessary bindings.
+// No trip counts are unfolded and no process-global context cache is used.
+class SyncRegionBindings {
+ public:
+  SyncRegionBindings(FunctionPtr owner, std::string target);
+  SyncRegionContext Bind(const ForStmtPtr& scope) const;
+
+ private:
+  class State;
+  std::shared_ptr<State> state_;
+};
+
+class EventfulSyncChild {
+ public:
+  const FunctionPtr& Owner() const { return context_.original_owner; }
+  const ForStmtPtr& Scope() const { return context_.original_scope; }
+  const StmtPtr& LogicalRecipe() const { return logical_recipe_; }
+  const std::vector<PipeType>& Pipes() const { return pipes_; }
+  std::map<std::string, size_t> Describe() const;
+  void ValidateFor(const FunctionPtr& owner, const std::string& target) const;
+
+ private:
+  SyncRegionContext context_;
+  CompactSyncResult mathematics_;
+  StmtPtr logical_recipe_;
+  std::string target_;
+  std::vector<PipeType> pipes_;
+  EventfulSyncChild(SyncRegionContext context, CompactSyncResult mathematics, StmtPtr logical_recipe,
+                    std::string target, std::vector<PipeType> pipes)
+      : context_(std::move(context)),
+        mathematics_(std::move(mathematics)),
+        logical_recipe_(std::move(logical_recipe)),
+        target_(std::move(target)),
+        pipes_(std::move(pipes)) {}
+  friend std::shared_ptr<const EventfulSyncChild> PrepareEventfulSyncChild(const FunctionPtr&,
+                                                                           const ForStmtPtr&,
+                                                                           const std::string&,
+                                                                           const SyncRegionBindings&);
+};
+std::shared_ptr<const EventfulSyncChild> PrepareEventfulSyncChild(const FunctionPtr& owner,
+                                                                  const ForStmtPtr& scope,
+                                                                  const std::string& target,
+                                                                  const SyncRegionBindings& bindings);
 
 enum class NativeSyncChildStatus {
   Ready,

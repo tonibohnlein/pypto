@@ -13,6 +13,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/function.h>    // NOLINT(misc-include-cleaner) -- registers std::function casters
+#include <nanobind/stl/map.h>         // NOLINT(misc-include-cleaner) -- registers std::map casters
 #include <nanobind/stl/shared_ptr.h>  // NOLINT(misc-include-cleaner) -- registers shared_ptr casters
 #include <nanobind/stl/string.h>      // NOLINT(misc-include-cleaner) -- registers std::string casters
 #include <nanobind/stl/vector.h>      // NOLINT(misc-include-cleaner) -- registers std::vector casters
@@ -750,9 +751,18 @@ void BindPass(nb::module_& m) {
              nb::arg("scopes"),
              "Export native-only children from one whole original placed function. Requires an active "
              "PassContext with an explicit disjoint-GM contract; no detached analysis or partial exports.");
+  nb::class_<ir::sync::EventfulSyncChild>(passes, "EventfulSyncChild")
+      .def_prop_ro("owner", &ir::sync::EventfulSyncChild::Owner)
+      .def_prop_ro("scope", &ir::sync::EventfulSyncChild::Scope)
+      .def("describe", &ir::sync::EventfulSyncChild::Describe,
+           "Read retained construction costs; shared_index_source_nodes is shared once per batch.");
+  passes.def("prepare_eventful_sync_children", &pass::PrepareEventfulSyncChildren, nb::arg("function"),
+             nb::arg("scopes"),
+             "Prepare qualified local whole-child plans in their original lexical context.");
   passes.def(
       "insert_sync", &pass::InsertSync, nb::kw_only(),
       nb::arg("accepted_children") = std::vector<std::shared_ptr<const ir::sync::NativeSyncChild>>{},
+      nb::arg("eventful_children") = std::vector<std::shared_ptr<const ir::sync::EventfulSyncChild>>{},
       "Insert logical synchronization; accepted immutable children require conservative_prefix policy.");
   passes.def("optimize_sync", &pass::OptimizeSync,
              "Verify logical synchronization; initially an identity optimization stage.");

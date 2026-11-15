@@ -48,6 +48,7 @@ struct ConservativeSyncChildEntry {
   ConservativeAccessSet incoming, effects;
   // A child has several participating pipes, never one fabricated payload pipe.
   std::vector<std::pair<PipeType, PipeType>> services;
+  std::shared_ptr<const EventfulSyncChild> eventful;
 };
 
 struct ConservativeSyncCost {
@@ -77,7 +78,8 @@ class ConservativeSyncAnalysis {
 
  private:
   friend ConservativeSyncAnalysis AnalyzeConservativeSync(
-      const FunctionPtr&, const std::string&, const std::vector<std::shared_ptr<const NativeSyncChild>>&);
+      const FunctionPtr&, const std::string&, const std::vector<std::shared_ptr<const NativeSyncChild>>&,
+      const std::vector<std::shared_ptr<const EventfulSyncChild>>&);
   ConservativeSyncAnalysis(FunctionPtr function, std::vector<ConservativeSyncSite> sites,
                            ConservativeAccessSet exit, ConservativeSyncCost cost,
                            std::shared_ptr<const ParentStmtAnalysis> parents,
@@ -112,7 +114,8 @@ class ConservativeSyncAnalysis {
 // realization, invocation completion, and resource reuse remain separate gates.
 ConservativeSyncAnalysis AnalyzeConservativeSync(
     const FunctionPtr& function, const std::string& target = "a2a3",
-    const std::vector<std::shared_ptr<const NativeSyncChild>>& children = {});
+    const std::vector<std::shared_ptr<const NativeSyncChild>>& children = {},
+    const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful_children = {});
 // Explicit policy construction. Acknowledgment-induced order is represented
 // here in logical tokens before LowerSync; no physical resource is assigned.
 FunctionPtr InsertConservativePrefixes(const ConservativeSyncAnalysis& analysis);

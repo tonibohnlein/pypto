@@ -1,0 +1,532 @@
+{
+  "schema_version": 1,
+  "checkpoint": "original-context local eventful retained children",
+  "base_revision": "e5544af5dbfd368ba4853d464714a435eceb3eb3",
+  "review": "Independent source/validity review accepted original bindings, actual-token recertification, complete command-pipe participation, shared immutable indexing, private palette and uniform entry rearm. Final integrated build, 183-test gate and configured hooks passed.",
+  "contract": {
+    "supported": "Qualified local whole counted invocation; original scope/ancestor/physical alias identities retained inside a conservative parent.",
+    "effects": "All modeled local effects remain pending in parent; notification closure does not imply payload completion.",
+    "entry": "Explicit closed four-command services for every ordered pair of actual participating payload/record/wait pipes.",
+    "resources": "Parent directional roles first; child existing allocator receives common eligible palette excluding all parent IDs and native reservations.",
+    "rearm": "For each child p->q flag: previous WAIT on q -> entry SET(q,p) -> entry WAIT on p -> next SET(p,q).",
+    "policy": "Explicit conservative_prefix request only; default dispatch, allocator, native exemptions and expert protocols unchanged."
+  },
+  "commands": [
+    "cmake --build build-py314 --parallel 2",
+    "PYTHONPATH=python:tests/ut/ir python -m pytest -q --require-ptoas tests/ut/ir/transforms/test_eventful_sync_children.py",
+    "PYTHONPATH=python:tests/ut/ir python -m transforms.qualify_eventful_sync_children --output build-py314/eventful-child-20261115/qualification-accepted"
+  ],
+  "source_files_sha256": {
+    "src/ir/transforms/utils/retained_sync_child.h": "93321a3f30b8214060ff4d189bd50a4039f2a5169d8d82d195c1db30e166391f",
+    "src/ir/transforms/utils/retained_sync_child.cpp": "a56af05afd09141cf62c99fcc167cb1c1337fb60719a8a14f734e23afc981c3e",
+    "src/ir/transforms/utils/conservative_sync_dataflow.h": "66838332b04ce9dad76c7c95dda4fe244fd0849ba67244e8fd5e7164badcca9b",
+    "src/ir/transforms/utils/conservative_sync_dataflow.cpp": "a9c6db8d0eb2f72cf011450e0d768e229a17506f77ce3837c58f98c9991ddad9",
+    "src/ir/transforms/utils/conservative_sync_realization.cpp": "704c09bc629cfe145692d69088f6d18d9aac2bd268d5c33939bbba374585b0f2",
+    "src/ir/transforms/utils/closed_prefix_sync.cpp": "9304cee9a92002a93cd298fc2bc57dea488cdf04eab70a57e512b1042b087f15",
+    "src/ir/transforms/token_sync.cpp": "d28986a0873634c827aad642e67ffdfd08226080bdd7c1ed11f02b9ffd8a0862",
+    "include/pypto/ir/transforms/passes.h": "df44e68b3643c86eb464a0d31f4a748d8540ea3c66bd12bdb146e2e21d3a10c5",
+    "python/bindings/modules/passes.cpp": "57f8308d2360967ee933805bfbe395a19ce7c96c8711c6c93016b6f2525307ee",
+    "python/pypto/pypto_core/passes.pyi": "8a91fb1073a632a5f2b7a6033b8d1d0abc776c41b4a86287cbf96fc07b5c6a56",
+    "tests/ut/ir/transforms/test_eventful_sync_children.py": "acdcfd1f05b6fc0ee2e94c93bf840b3c59090878c76aaf96b8c92513408a3e51",
+    "tests/ut/ir/transforms/qualify_eventful_sync_children.py": "cc2c90538433b846f955731738211a2495f9beaad3598e15ae533855d3699b03",
+    "tests/ut/ir/transforms/sync_closed_command_oracle.py": "e0858f64580c91dea13a72f9e7178d2c2833242a4b877ce285afac4905266071"
+  },
+  "measured_source_files_sha256": {
+    "src/ir/transforms/utils/retained_sync_child.h": "93321a3f30b8214060ff4d189bd50a4039f2a5169d8d82d195c1db30e166391f",
+    "src/ir/transforms/utils/retained_sync_child.cpp": "a56af05afd09141cf62c99fcc167cb1c1337fb60719a8a14f734e23afc981c3e",
+    "src/ir/transforms/utils/conservative_sync_dataflow.h": "66838332b04ce9dad76c7c95dda4fe244fd0849ba67244e8fd5e7164badcca9b",
+    "src/ir/transforms/utils/conservative_sync_dataflow.cpp": "a9c6db8d0eb2f72cf011450e0d768e229a17506f77ce3837c58f98c9991ddad9",
+    "src/ir/transforms/utils/conservative_sync_realization.cpp": "704c09bc629cfe145692d69088f6d18d9aac2bd268d5c33939bbba374585b0f2",
+    "src/ir/transforms/utils/closed_prefix_sync.cpp": "9304cee9a92002a93cd298fc2bc57dea488cdf04eab70a57e512b1042b087f15",
+    "src/ir/transforms/token_sync.cpp": "d28986a0873634c827aad642e67ffdfd08226080bdd7c1ed11f02b9ffd8a0862",
+    "include/pypto/ir/transforms/passes.h": "df44e68b3643c86eb464a0d31f4a748d8540ea3c66bd12bdb146e2e21d3a10c5",
+    "python/bindings/modules/passes.cpp": "57f8308d2360967ee933805bfbe395a19ce7c96c8711c6c93016b6f2525307ee",
+    "python/pypto/pypto_core/passes.pyi": "8a91fb1073a632a5f2b7a6033b8d1d0abc776c41b4a86287cbf96fc07b5c6a56",
+    "tests/ut/ir/transforms/test_eventful_sync_children.py": "acdcfd1f05b6fc0ee2e94c93bf840b3c59090878c76aaf96b8c92513408a3e51",
+    "tests/ut/ir/transforms/qualify_eventful_sync_children.py": "cc2c90538433b846f955731738211a2495f9beaad3598e15ae533855d3699b03",
+    "tests/ut/ir/transforms/sync_closed_command_oracle.py": "e0858f64580c91dea13a72f9e7178d2c2833242a4b877ce285afac4905266071"
+  },
+  "measurement": {
+    "path": "build-py314/eventful-child-20261115/qualification-accepted/measurement.json",
+    "sha256": "1141c3d3903d276c12047bd4e9663e61f36080bc030ac4f8f0b3bd322d7ccb17",
+    "binaries": {
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "3c57d9cca1afc89bbf996adcc88616a02f0bc056c631372ad376712d43979406"
+    },
+    "python": "/usr/bin/python",
+    "python_version": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]"
+  },
+  "qualification_scope": "Final integrated workspace build also contains concurrent accepted runtime-valid and whole-module ownership work. The sparse final source hashes and full source inventory in the measurement identify this checkpoint; this is not an isolated clean-commit campaign.",
+  "results": {
+    "focused_initial_child": "16 tests passed, including command-only pipe negative, inside final integrated gate.",
+    "bounded_executions": 18,
+    "concrete_hazard_coverage": true,
+    "actual_token_payload_order_preserved": true,
+    "physical_matching_acyclic_reuse": true,
+    "same_policy_added_pairs_max": 0,
+    "same_policy_removed_pairs_total": 16,
+    "cpp": "PTOAS C++ generation passed",
+    "device": "not run",
+    "integrated_gate": "183 passed in 111.50s",
+    "configured_hooks": "All configured hooks passed, including full pyright."
+  },
+  "representative_three_visit_results": [
+    {
+      "K": 0,
+      "visits": 3,
+      "execute": true,
+      "old_prerequisites": 153,
+      "new_prerequisites": 153,
+      "removed": 0,
+      "added": 0,
+      "required": 126,
+      "old_excess": 27,
+      "new_excess": 27,
+      "old_executed_set": 72,
+      "new_executed_set": 96,
+      "old_executed_wait": 72,
+      "new_executed_wait": 96,
+      "old_executed_barrier": 19,
+      "new_executed_barrier": 25,
+      "new_directional_ids": {
+        "(PipeType.MTE1, PipeType.MTE2)": [
+          0,
+          1
+        ],
+        "(PipeType.MTE2, PipeType.MTE1)": [
+          0,
+          1
+        ],
+        "(PipeType.FIX, PipeType.MTE2)": [
+          0,
+          1
+        ],
+        "(PipeType.MTE2, PipeType.FIX)": [
+          0,
+          1
+        ],
+        "(PipeType.M, PipeType.MTE1)": [
+          0,
+          1
+        ],
+        "(PipeType.MTE1, PipeType.M)": [
+          0,
+          1
+        ],
+        "(PipeType.FIX, PipeType.M)": [
+          0,
+          1
+        ],
+        "(PipeType.M, PipeType.FIX)": [
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "K": 1,
+      "visits": 3,
+      "execute": true,
+      "old_prerequisites": 351,
+      "new_prerequisites": 348,
+      "removed": 3,
+      "added": 0,
+      "required": 325,
+      "old_excess": 26,
+      "new_excess": 23,
+      "old_executed_set": 108,
+      "new_executed_set": 99,
+      "old_executed_wait": 108,
+      "new_executed_wait": 99,
+      "old_executed_barrier": 28,
+      "new_executed_barrier": 25,
+      "new_directional_ids": {
+        "(PipeType.MTE1, PipeType.MTE2)": [
+          0,
+          1
+        ],
+        "(PipeType.MTE2, PipeType.MTE1)": [
+          0,
+          1
+        ],
+        "(PipeType.FIX, PipeType.MTE2)": [
+          0,
+          1
+        ],
+        "(PipeType.MTE2, PipeType.FIX)": [
+          0,
+          1
+        ],
+        "(PipeType.M, PipeType.MTE1)": [
+          0,
+          1
+        ],
+        "(PipeType.MTE1, PipeType.M)": [
+          0,
+          1,
+          2
+        ],
+        "(PipeType.FIX, PipeType.M)": [
+          0,
+          1
+        ],
+        "(PipeType.M, PipeType.FIX)": [
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "K": 3,
+      "visits": 3,
+      "execute": true,
+      "old_prerequisites": 990,
+      "new_prerequisites": 981,
+      "removed": 9,
+      "added": 0,
+      "required": 958,
+      "old_excess": 32,
+      "new_excess": 23,
+      "old_executed_set": 180,
+      "new_executed_set": 111,
+      "old_executed_wait": 180,
+      "new_executed_wait": 111,
+      "old_executed_barrier": 46,
+      "new_executed_barrier": 25,
+      "new_directional_ids": {
+        "(PipeType.MTE1, PipeType.MTE2)": [
+          0,
+          1
+        ],
+        "(PipeType.MTE2, PipeType.MTE1)": [
+          0,
+          1
+        ],
+        "(PipeType.FIX, PipeType.MTE2)": [
+          0,
+          1
+        ],
+        "(PipeType.MTE2, PipeType.FIX)": [
+          0,
+          1
+        ],
+        "(PipeType.M, PipeType.MTE1)": [
+          0,
+          1,
+          2
+        ],
+        "(PipeType.MTE1, PipeType.M)": [
+          0,
+          1,
+          2
+        ],
+        "(PipeType.FIX, PipeType.M)": [
+          0,
+          1
+        ],
+        "(PipeType.M, PipeType.FIX)": [
+          0,
+          1
+        ]
+      }
+    }
+  ],
+  "trip_count_scaling": [
+    {
+      "K": 0,
+      "analyzed_occurrences": 9,
+      "binding_definitions": 5,
+      "query_scope_nodes": 6,
+      "retained_cells": 5,
+      "retained_regions": 1,
+      "shared_index_source_nodes": 23,
+      "analysis_seconds": 0.0005484409630298615,
+      "baseline_cost": {
+        "logical_insertion_seconds": 0.0007416708394885063,
+        "logical_verification_seconds": 0.0007797521539032459,
+        "physical_realization_seconds": 0.0008909599855542183
+      },
+      "candidate_cost": {
+        "logical_insertion_seconds": 0.0006267931312322617,
+        "logical_verification_seconds": 0.0006356947124004364,
+        "physical_realization_seconds": 0.000980312004685402
+      },
+      "baseline_static_commands": {
+        "set": 36,
+        "wait": 36,
+        "barrier": 10
+      },
+      "candidate_static_commands": {
+        "set": 32,
+        "wait": 32,
+        "barrier": 9
+      }
+    },
+    {
+      "K": 1,
+      "analyzed_occurrences": 9,
+      "binding_definitions": 5,
+      "query_scope_nodes": 6,
+      "retained_cells": 5,
+      "retained_regions": 1,
+      "shared_index_source_nodes": 23,
+      "analysis_seconds": 0.00045775389298796654,
+      "baseline_cost": {
+        "logical_insertion_seconds": 0.0007069497369229794,
+        "logical_verification_seconds": 0.0007027303799986839,
+        "physical_realization_seconds": 0.0008752658031880856
+      },
+      "candidate_cost": {
+        "logical_insertion_seconds": 0.0006572660058736801,
+        "logical_verification_seconds": 0.0006013712845742702,
+        "physical_realization_seconds": 0.0011771535500884056
+      },
+      "baseline_static_commands": {
+        "set": 36,
+        "wait": 36,
+        "barrier": 10
+      },
+      "candidate_static_commands": {
+        "set": 33,
+        "wait": 33,
+        "barrier": 9
+      }
+    },
+    {
+      "K": 3,
+      "analyzed_occurrences": 9,
+      "binding_definitions": 5,
+      "query_scope_nodes": 6,
+      "retained_cells": 5,
+      "retained_regions": 1,
+      "shared_index_source_nodes": 23,
+      "analysis_seconds": 0.00047754403203725815,
+      "baseline_cost": {
+        "logical_insertion_seconds": 0.0007659643888473511,
+        "logical_verification_seconds": 0.0006886790506541729,
+        "physical_realization_seconds": 0.0008487249724566936
+      },
+      "candidate_cost": {
+        "logical_insertion_seconds": 0.0007158038206398487,
+        "logical_verification_seconds": 0.0007100701332092285,
+        "physical_realization_seconds": 0.0013766237534582615
+      },
+      "baseline_static_commands": {
+        "set": 36,
+        "wait": 36,
+        "barrier": 10
+      },
+      "candidate_static_commands": {
+        "set": 34,
+        "wait": 34,
+        "barrier": 9
+      },
+      "source_generation_seconds": 0.10463061789050698,
+      "generated_pto_sha256": "648cc059d9732c94569a94216fae30fa547f103162cdbede9a5bbfdaf12364a0",
+      "generated_cpp_sha256": "0938dc7cf4c9e6d0fe5d19316e1670eb231bbe3d7ac1bbac344bae5ec6834bb7"
+    },
+    {
+      "K": 2,
+      "analyzed_occurrences": 9,
+      "binding_definitions": 5,
+      "query_scope_nodes": 6,
+      "retained_cells": 5,
+      "retained_regions": 1,
+      "shared_index_source_nodes": 23,
+      "analysis_seconds": 0.0005182358436286449
+    },
+    {
+      "K": 17,
+      "analyzed_occurrences": 9,
+      "binding_definitions": 5,
+      "query_scope_nodes": 6,
+      "retained_cells": 5,
+      "retained_regions": 1,
+      "shared_index_source_nodes": 23,
+      "analysis_seconds": 0.00041453680023550987
+    },
+    {
+      "K": 1023,
+      "analyzed_occurrences": 9,
+      "binding_definitions": 5,
+      "query_scope_nodes": 6,
+      "retained_cells": 5,
+      "retained_regions": 1,
+      "shared_index_source_nodes": 23,
+      "analysis_seconds": 0.00037108175456523895
+    },
+    {
+      "K": 1000000,
+      "analyzed_occurrences": 9,
+      "binding_definitions": 5,
+      "query_scope_nodes": 6,
+      "retained_cells": 5,
+      "retained_regions": 1,
+      "shared_index_source_nodes": 23,
+      "analysis_seconds": 0.000366962980479002
+    }
+  ],
+  "static_child_scaling": [
+    {
+      "children": 1,
+      "source_nodes": 24,
+      "analysis_seconds": 0.000365362036973238,
+      "interfaces": [
+        {
+          "analyzed_occurrences": 9,
+          "binding_definitions": 5,
+          "query_scope_nodes": 6,
+          "retained_cells": 5,
+          "retained_regions": 1,
+          "shared_index_source_nodes": 24
+        }
+      ]
+    },
+    {
+      "children": 2,
+      "source_nodes": 30,
+      "analysis_seconds": 0.000640366692095995,
+      "interfaces": [
+        {
+          "analyzed_occurrences": 9,
+          "binding_definitions": 5,
+          "query_scope_nodes": 6,
+          "retained_cells": 5,
+          "retained_regions": 1,
+          "shared_index_source_nodes": 30
+        },
+        {
+          "analyzed_occurrences": 9,
+          "binding_definitions": 5,
+          "query_scope_nodes": 6,
+          "retained_cells": 5,
+          "retained_regions": 1,
+          "shared_index_source_nodes": 30
+        }
+      ]
+    },
+    {
+      "children": 4,
+      "source_nodes": 42,
+      "analysis_seconds": 0.0010754936374723911,
+      "interfaces": [
+        {
+          "analyzed_occurrences": 9,
+          "binding_definitions": 5,
+          "query_scope_nodes": 6,
+          "retained_cells": 5,
+          "retained_regions": 1,
+          "shared_index_source_nodes": 42
+        },
+        {
+          "analyzed_occurrences": 9,
+          "binding_definitions": 5,
+          "query_scope_nodes": 6,
+          "retained_cells": 5,
+          "retained_regions": 1,
+          "shared_index_source_nodes": 42
+        },
+        {
+          "analyzed_occurrences": 9,
+          "binding_definitions": 5,
+          "query_scope_nodes": 6,
+          "retained_cells": 5,
+          "retained_regions": 1,
+          "shared_index_source_nodes": 42
+        },
+        {
+          "analyzed_occurrences": 9,
+          "binding_definitions": 5,
+          "query_scope_nodes": 6,
+          "retained_cells": 5,
+          "retained_regions": 1,
+          "shared_index_source_nodes": 42
+        }
+      ]
+    },
+    {
+      "children": 8,
+      "source_nodes": 66,
+      "analysis_seconds": 0.0020147147588431835,
+      "interfaces": [
+        {
+          "analyzed_occurrences": 9,
+          "binding_definitions": 5,
+          "query_scope_nodes": 6,
+          "retained_cells": 5,
+          "retained_regions": 1,
+          "shared_index_source_nodes": 66
+        },
+        {
+          "analyzed_occurrences": 9,
+          "binding_definitions": 5,
+          "query_scope_nodes": 6,
+          "retained_cells": 5,
+          "retained_regions": 1,
+          "shared_index_source_nodes": 66
+        },
+        {
+          "analyzed_occurrences": 9,
+          "binding_definitions": 5,
+          "query_scope_nodes": 6,
+          "retained_cells": 5,
+          "retained_regions": 1,
+          "shared_index_source_nodes": 66
+        },
+        {
+          "analyzed_occurrences": 9,
+          "binding_definitions": 5,
+          "query_scope_nodes": 6,
+          "retained_cells": 5,
+          "retained_regions": 1,
+          "shared_index_source_nodes": 66
+        },
+        {
+          "analyzed_occurrences": 9,
+          "binding_definitions": 5,
+          "query_scope_nodes": 6,
+          "retained_cells": 5,
+          "retained_regions": 1,
+          "shared_index_source_nodes": 66
+        },
+        {
+          "analyzed_occurrences": 9,
+          "binding_definitions": 5,
+          "query_scope_nodes": 6,
+          "retained_cells": 5,
+          "retained_regions": 1,
+          "shared_index_source_nodes": 66
+        },
+        {
+          "analyzed_occurrences": 9,
+          "binding_definitions": 5,
+          "query_scope_nodes": 6,
+          "retained_cells": 5,
+          "retained_regions": 1,
+          "shared_index_source_nodes": 66
+        },
+        {
+          "analyzed_occurrences": 9,
+          "binding_definitions": 5,
+          "query_scope_nodes": 6,
+          "retained_cells": 5,
+          "retained_regions": 1,
+          "shared_index_source_nodes": 66
+        }
+      ]
+    }
+  ],
+  "limits": [
+    "External effects and free caller/enclosing coordinates remain refused; no whole-Qwen improvement claimed for this initial family.",
+    "Missing exact GM selectors remain unavailable.",
+    "All-pairs entry and common private palette are sufficient constructions; refusal is not a fixed-plan capacity lower bound.",
+    "Zero-trip children can pay additional entry commands without changing payload prerequisites.",
+    "Single-run timings are descriptive and stage timings must not be added if inclusive.",
+    "Bounded relation containment and native-model validation are not uniform optimality, native visibility or device qualification."
+  ],
+  "logs_sha256": {
+    "build-py314/milestone-loop-20261115/build-frozen.log": "879f37d00401255c3708835dcc6fde7f4359a27032465c4c79b12103a3bfd213",
+    "build-py314/milestone-loop-20261115/accepted-gate.log": "ab8bdf1f633e599d00ea67b3406722ee2a7b7bbfb1c964291e039c114e3286fc",
+    "build-py314/milestone-loop-20261115/hooks-accepted.log": "b1c12e7d7805d4a6b74a42dd137abc924281d6256d34ac7c9a3e90960e180640",
+    "build-py314/eventful-child-20261115/qualification-accepted.log": "1141c3d3903d276c12047bd4e9663e61f36080bc030ac4f8f0b3bd322d7ccb17"
+  }
+}

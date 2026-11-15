@@ -932,7 +932,29 @@ def prepare_native_sync_children(function: Function, scopes: list[ForStmt]) -> l
     """
     ...
 
-def insert_sync(*, accepted_children: list[NativeSyncChild] = []) -> Pass:
+class EventfulSyncChild:
+    """Immutable local child, retaining original context and compact token recipe."""
+
+    @property
+    def owner(self) -> Function: ...
+    @property
+    def scope(self) -> ForStmt: ...
+    def describe(self) -> dict[str, int]:
+        """Read retained costs without analysis or exports; index nodes are shared per batch."""
+        ...
+
+def prepare_eventful_sync_children(function: Function, scopes: list[ForStmt]) -> list[EventfulSyncChild]:
+    """Analyze each qualified local whole invocation once in its original context.
+
+    The initial family requires closed static internal frames, dominating
+    signal-free descriptors and no free caller/enclosing coordinates. No GM
+    alias premise is inherited by a conservative parent. Requests are atomic.
+    """
+    ...
+
+def insert_sync(
+    *, accepted_children: list[NativeSyncChild] = [], eventful_children: list[EventfulSyncChild] = []
+) -> Pass:
     """Insert logical tokens after placement using the explicit disjoint-GM contract.
 
     Unsupported analysis or token exports raise without modifying the input.
@@ -1261,6 +1283,7 @@ __all__ = [
     "lower_tile_to_buffer",
     "realize_sync",
     "prepare_native_sync_children",
+    "prepare_eventful_sync_children",
     "select_buffer_ir_functions",
     "flatten_call_expr",
     "inline_functions",

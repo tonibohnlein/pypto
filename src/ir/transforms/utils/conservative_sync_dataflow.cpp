@@ -57,7 +57,8 @@ struct End {
 class Builder {
  public:
   Builder(const FunctionPtr& function, std::string target,
-          const std::vector<std::shared_ptr<const NativeSyncChild>>& retained)
+          const std::vector<std::shared_ptr<const NativeSyncChild>>& retained,
+          const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful)
       : function_(function), target_(std::move(target)) {
     scopes_.emplace_back();
     for (const auto& parameter : function->params_) {
@@ -73,7 +74,14 @@ class Builder {
       child->ValidateFor(function, target_);
       CHECK(child_index_.emplace(child->Scope().get(), children.size()).second)
           << "Conservative synchronization: duplicate retained child scope";
-      children.push_back({child->Scope(), child, {}, {}, {}});
+      children.push_back({child->Scope(), child, {}, {}, {}, {}});
+    }
+    for (const auto& child : eventful) {
+      CHECK(child) << "Conservative synchronization: missing eventful child certificate";
+      child->ValidateFor(function, target_);
+      CHECK(child_index_.emplace(child->Scope().get(), children.size()).second)
+          << "Conservative synchronization: duplicate retained child scope";
+      children.push_back({child->Scope(), {}, {}, {}, {}, child});
     }
   }
 
@@ -102,6 +110,14 @@ class Builder {
       for (const auto& [space, source, write] : incoming)
         for (const auto& [consumer_space, destination, consumer_write] : entry.effects)
           if (space == consumer_space && (write || consumer_write)) services.emplace(source, destination);
+      if (entry.eventful) {
+        // Explicit selected-token entry acknowledgments rearm every child
+        // direction across arbitrary skipped/reset visits. Closed matching at
+        // child exit alone would not establish this causal path.
+        for (const auto source : entry.eventful->Pipes())
+          for (const auto destination : entry.eventful->Pipes())
+            if (source != destination) services.emplace(source, destination);
+      }
       entry.services.assign(services.begin(), services.end());
       cost.services += services.size();
       cost.retained_facts += incoming.size() + entry.effects.size();
@@ -363,13 +379,14 @@ std::vector<StmtPtr> ConservativeSyncAnalysis::ControlPath(size_t site) const {
 
 ConservativeSyncAnalysis AnalyzeConservativeSync(
     const FunctionPtr& function, const std::string& target,
-    const std::vector<std::shared_ptr<const NativeSyncChild>>& children) {
+    const std::vector<std::shared_ptr<const NativeSyncChild>>& children,
+    const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful_children) {
   CHECK(function && function->ir_stage_ == FunctionIRStage::Buffer)
       << "Conservative synchronization requires Buffer IR";
   CHECK(function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV)
       << "Conservative synchronization requires an owned local AIC/AIV domain";
   backend::RequireLocalSyncExecutionContract(target);
-  Builder builder(function, target, children);
+  Builder builder(function, target, children, eventful_children);
   builder.Build();
   auto exit = builder.Flow(function->body_, {});
   auto parents = std::make_shared<StatementParents>();

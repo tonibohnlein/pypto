@@ -477,6 +477,65 @@ Original owner, scope, target, guards and coordinates remain bound to the
 capability; clones, unsupplied caller premises and overlapping requested scopes
 refuse transactionally. Parent entry services retain may-access effects at exit;
 closed notifications do not imply completed payloads. Zero-trip child visits can
-still pay entry-service overhead. Eventful-child rearming, transport composition
-and automatic JIT child discovery remain unavailable. Exact storage selectors
+still pay entry-service overhead. Transport composition and automatic JIT child
+discovery remain unavailable. Exact storage selectors
 are neither required nor fabricated by this import.
+
+### Explicit eventful regional children
+
+A separate original-context regional request supports whole local counted
+children inside a conservative parent whose own control need not have a numerical
+trip count:
+
+```python
+with passes.PassContext([]):
+    children = passes.prepare_eventful_sync_children(original_function, [original_loop])
+with passes.PassContext([], autosync_policy="conservative_prefix"):
+    logical = passes.insert_sync(eventful_children=children)(original_program)
+    optimized = passes.optimize_sync()(logical)
+with passes.PassContext([]):
+    physical = passes.lower_sync()(optimized)
+```
+
+The immutable capability retains the original owner, requested scope, ancestor
+statements and a binding owner for one regional mathematical request. Dominating
+signal-free descriptors preserve physical root aliases. The initial family
+refuses external-storage effects, native event claims, free enclosing coordinates
+and unsupplied caller values, including values referenced by shapes or valid
+extents. Such values are never replaced by a representative zero. Original loop
+and payload coordinates remain in the retained recipe; surrounding branch guards
+and resets remain under their original wrapper. Failed batches publish no partial
+capability list, commands or resource claims.
+
+The parent retains the child's logical token recipe and all possibly pending
+child effects. It places actual closed acknowledgment services at the original
+entry for every ordered pair of participating pipes. This deliberately strengthens
+the selected parent order. For a child flag direction `p -> q`, the previous
+consumption on `q` precedes the entry publication `q -> p`; its acquisition on
+`p` precedes the next child publication. Thus reuse across nonempty, zero or
+skipped visits has a causal rearming path. Closed matching alone supplies no such
+path and does not establish payload completion at child exit.
+
+`LowerSync` interprets the supplied program, including serialized tokens. A
+versioned loop attribute routes child parsing, but is not trusted evidence.
+Lowering reestablishes lexical bindings, token confinement and the entry services.
+Its participating-pipe footprint includes actual record sources and wait
+destinations as well as payload pipes, including command-only services. It then
+uses the existing actual-token parser, endpoint decoder and physical
+allocator. Parent roles and child IDs are disjoint: the parent reserves its
+existing directional roles first; child lowering receives the remaining common
+eligible palette. Insufficient evidence or capacity refuses transactionally;
+there is no new coloring or silently added completion. Native reservations and
+unsupported directions retain their existing checks. Child commands are not
+service-pruning candidates.
+
+The first all-pairs entry construction is a sufficient contract and can refuse a
+child when a participating direction is unavailable even if fewer directions
+might suffice. Exact GM selectors remain unavailable where not provided. A request batch builds one original-owner statement/definition index using
+`ParentStmtAnalysis`; each region then visits only its own scope, ancestors and
+necessary dominating bindings. `child.describe()` reports the shared index nodes
+(counted once per batch), per-query scope nodes and captured definition count,
+without running recognition or constructing exports. Independent batches build
+their own indexes. No trip count is unfolded.
+This does not establish general symbolic-frame, eventful transport or whole-Qwen
+coverage.
