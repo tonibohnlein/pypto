@@ -454,6 +454,19 @@ per-dimension descriptors. Assemble uses the same bridge for its copy source.
 These views preserve storage and use the current explicit valid extents; they
 add no data copies or metadata updates to a window.
 
+Statically qualified casts also use this descriptor bridge. A supported cast
+with positive static valid extents may coexist with runtime-valid operations
+elsewhere in the function. Before each cast, lowering restores the original
+logical operands' valid state and, where a shared allocation handle is dynamic,
+constructs zero-offset static windows for its input and output. Output metadata
+is established before those windows and the cast. No metadata state is cached
+across branches or loop visits. This also preserves old full-valid aliases after
+another alias narrows the allocation. The existing dtype, rounding, geometry
+and disjointness requirements remain in force. Runtime-valid or empty casts,
+casts of sliced windows, and dynamic contexts containing other restricted
+conversion or scratch recipes remain unsupported. Dynamic tail guards only
+establish nonempty execution; they do not replace the input's valid-extent bounds.
+
 ```text
 # loaded = tile.load(x, [0, 0], [16, 64], [16, cols]); doubled = tile.add(loaded, loaded)
 buffer.set_validshape(loaded_buffer, (16, cols))

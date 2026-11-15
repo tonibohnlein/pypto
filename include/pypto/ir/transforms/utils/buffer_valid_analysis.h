@@ -56,10 +56,14 @@ class BufferValidAnalysis : public IRVisitor {
  public:
   explicit BufferValidAnalysis(const StmtPtr& body) : views_(body) { VisitStmt(body); }
   bool supported() const { return valid_ && !(dynamic_ && restricted_); }
+  // Diagnostic evidence from this existing scan, not an additional analysis.
+  // If dynamic metadata occurs after a restricted consumer, name that consumer.
+  const ExprPtr& first_obligation() const { return first_obligation_; }
 
   void VisitExpr(const ExprPtr& expr) override {
     if (!expr) return;
     dynamic_ |= NeedsRuntimeBufferValid(expr->GetType());
+    RecordObligation(expr);
     IRVisitor::VisitExpr(expr);
   }
 
@@ -79,13 +83,22 @@ class BufferValidAnalysis : public IRVisitor {
   void VisitExpr_(const CallPtr& call) override {
     // Empty reduction axes have different semantics from empty elementwise
     // outputs; the axis recipes deliberately require a wholly static kernel.
+    const auto* conversion = backend::FindLogicalBufferConversionRecipe(call->op_->name_);
+    // Static casts have an operation-local descriptor recipe. Lowering restores
+    // each logical alias's valid state and supplies a static use-site window
+    // even when another alias promoted its allocation handle to dynamic.
+    const bool static_cast_recipe = conversion && conversion->kind == backend::BufferConversionKind::Cast &&
+                                    backend::SupportsLogicalBufferConversion(*conversion, call);
     restricted_ |= backend::FindLogicalBufferAxisRecipe(call->op_->name_) != nullptr ||
-                   backend::FindLogicalBufferConversionRecipe(call->op_->name_) != nullptr ||
+                   (conversion && !static_cast_recipe) ||
                    backend::FindLogicalBufferIndexedRecipe(call->op_->name_) != nullptr;
     if (IsOp(call, "tile.reshape") || IsOp(call, "tile.reinterpret_view") || IsOp(call, "tile.assemble") ||
         IsOp(call, "tile.move") || IsOp(call, "tile.extract") || IsOp(call, "tile.transpose_view") ||
         IsOp(call, "tile.matmul") || IsOp(call, "tile.matmul_acc") || IsOp(call, "tile.transpose")) {
       restricted_ = true;
+    }
+    if (restricted_ && !restricted_operation_) {
+      restricted_operation_ = call;
     }
     if (IsOp(call, "tile.slice") && !call->args_.empty() &&
         NeedsRuntimeBufferValid(call->args_[0]->GetType()) && views_.IsWindow(call->args_[0])) {
@@ -93,11 +106,21 @@ class BufferValidAnalysis : public IRVisitor {
       // a flattened physical-window recipe rather than nested guarded views.
       valid_ = false;
     }
+    RecordObligation(call);
     IRVisitor::VisitExpr_(call);
   }
-  void VisitExpr_(const SubmitPtr&) override { valid_ = false; }
+  void VisitExpr_(const SubmitPtr& submit) override {
+    valid_ = false;
+    RecordObligation(submit);
+  }
 
  private:
+  void RecordObligation(const ExprPtr& expression) {
+    if (!supported() && !first_obligation_) {
+      first_obligation_ = valid_ && restricted_operation_ ? restricted_operation_ : expression;
+    }
+  }
+  ExprPtr first_obligation_, restricted_operation_;
   BufferViewAnalysis views_;
   bool valid_ = true;
   bool dynamic_ = false;

@@ -1064,8 +1064,12 @@ class TileToBufferMutator : public IRMutator {
       return Empty(call->span_);
     }
     const bool store = IsOp(call, "tile.store");
+    const auto* conversion = backend::FindLogicalBufferConversionRecipe(call->op_->name_);
+    const bool static_cast_recipe = conversion && conversion->kind == backend::BufferConversionKind::Cast &&
+                                    backend::SupportsLogicalBufferConversion(*conversion, call);
     const bool data_operation = store || IsOp(call, "tile.load") || IsOp(call, "tile.move") ||
-                                backend::FindLogicalBufferElementwiseRecipe(call->op_->name_);
+                                backend::FindLogicalBufferElementwiseRecipe(call->op_->name_) ||
+                                static_cast_recipe;
     if (!data_operation || (!store && !result)) {
       return WithValidState(call, result, LowerCall(call, result));
     }
@@ -1243,6 +1247,11 @@ class TileToBufferMutator : public IRMutator {
       CHECK_SPAN(result && backend::SupportsLogicalBufferConversion(*conversion, call), call->span_)
           << "LowerTileToBuffer: unsupported cast, comparison or selection operands";
       std::vector<ExprPtr> args;
+      std::vector<StmtPtr> out;
+      // An old static alias may share a dynamically valid allocation handle.
+      // Keep the cast's qualified static descriptor at this use; LowerDefinition
+      // restores source and destination metadata before these windows execute.
+      const bool static_cast_recipe = conversion->kind == backend::BufferConversionKind::Cast;
       for (size_t i = 0; i < call->args_.size(); ++i) {
         if (static_cast<int>(i) == conversion->scalar_index) {
           auto scalar = VisitExpr(call->args_[i]);
@@ -1253,17 +1262,18 @@ class TileToBufferMutator : public IRMutator {
                              ? scalar
                              : MakeCast(scalar, DataType::FP32, call->span_));
         } else {
-          args.push_back(Handle(call->args_[i]));
+          args.push_back(static_cast_recipe ? WindowHandle(call->args_[i], out) : Handle(call->args_[i]));
         }
       }
-      args.push_back(Handle(result));
+      args.push_back(static_cast_recipe ? WindowHandle(result, out) : Handle(result));
       auto kwargs = call->kwargs_;
       if (conversion->kind == backend::BufferConversionKind::Cast) {
         // Destination dtype is already in its descriptor. Resolve saturation
         // here so PTOAS defaults cannot change a logical float conversion.
         kwargs = {{"mode", call->GetKwarg<int>("mode", 0)}, {"saturation_mode", 0}};
       }
-      return Operation(conversion->buffer_op, args, call->span_, kwargs);
+      out.push_back(Operation(conversion->buffer_op, args, call->span_, kwargs));
+      return std::make_shared<SeqStmts>(std::move(out), call->span_);
     }
     if (IsOp(call, "tile.transpose")) {
       CHECK_SPAN(result && backend::SupportsLogicalBufferTranspose(call), call->span_)
