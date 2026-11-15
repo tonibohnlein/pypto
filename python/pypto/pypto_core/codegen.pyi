@@ -10,7 +10,7 @@
 """Code generation module for converting IR to PTO assembly (PTOCodegen)."""
 
 from pypto.pypto_core import DataType
-from pypto.pypto_core.ir import CoreType, Expr, Function, Program, Var
+from pypto.pypto_core.ir import CoreType, Expr, Function, FunctionType, Program, Var
 
 def data_type_to_mlir(dtype: DataType) -> str:
     """Return the PTO MLIR spelling of an element data type."""
@@ -114,6 +114,11 @@ class KernelRegistration:
 
 class OrchestrationResult:
     """Result of orchestration code generation."""
+
+    @property
+    def task_domains(self) -> dict[str, FunctionType]:
+        """Actually lowered task-control domains; no payload completion guarantee."""
+        ...
 
     @property
     def code(self) -> str:

@@ -346,6 +346,7 @@ static std::vector<uint64_t> pypto_graph_boundary_layout(const GraphTaskArgs& ar
 )";
   int graph_index = 0;
   for (const auto& graph_func : graph_functions) {
+    registrations->RecordTaskDomain(graph_func);
     CodegenEffectiveUseCollector use_collector;
     use_collector.VisitStmt(graph_func->body_);
 
@@ -456,6 +457,7 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   VerifyOrchestrationCodegenPreconditions(program, func);
 
   KernelRegistrations registrations;
+  registrations.RecordTaskDomain(func);
 
   OrchestrationInfoCollector info_collector;
   info_collector.VisitStmt(func->body_);
@@ -656,7 +658,8 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   oss << "}\n\n";
   oss << "}  // extern \"C\"\n";
 
-  return OrchestrationResult{oss.str(), std::move(registrations.entries), std::move(orchestration_signature)};
+  return OrchestrationResult{oss.str(), std::move(registrations.entries), std::move(orchestration_signature),
+                             std::move(registrations.task_domains)};
 }
 
 }  // namespace codegen

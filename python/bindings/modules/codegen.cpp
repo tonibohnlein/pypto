@@ -84,6 +84,9 @@ void BindCodegen(nb::module_& m) {
   nb::class_<OrchestrationResult>(codegen_module, "OrchestrationResult",
                                   "Result of orchestration code generation")
       .def_ro("code", &OrchestrationResult::code, "Generated C++ orchestration code")
+      .def_ro(
+          "task_domains", &OrchestrationResult::task_domains,
+          "Actually lowered task-control entry, fragment and wrapper domains; no payload completion claim")
       .def_ro("kernel_registrations", &OrchestrationResult::kernel_registrations,
               "Runtime registrations keyed by code, core type and final tensor signature")
       .def_ro("orchestration_signature", &OrchestrationResult::orchestration_signature,

@@ -5,7 +5,7 @@ The original six milestones and whole-model ownership remain **partially complet
 missing native and value-domain premises are not inferred from a passing capture.
 The latest unchanged two-layer Qwen capture produces 32/32 C++ leaves under both
 policies: exact owns 3, conservative prefix owns 16 and delegates 16. Another
-47 previously observed domains remain unverified. The runtime package passes
+47 existing task-control owners are now observed separately (see the M1 gate). The runtime package passes
 256 tests; the broader 52-module campaign recorded 2,669 passes and six stale
 fixture expectations, resolved by a reviewed 196-test module rerun. This is
 aggregate evidence, not a fresh single all-green 2,675-test campaign. See the
@@ -237,20 +237,28 @@ any additional sufficient certificate must be justified through existing resourc
 interfaces, or remain unavailable.
 Common-completion encoding receives a separate design subgate if needed.
 
-### M4 — Retained children and communication composition
+### M4 — Retained children and existing communication boundaries
 
 Export sound child effects without requiring exact GM selectors. Retain compact
-mathematics, original coordinates and internal token code. Prove entry readiness,
-closed notification matching, pending payload summaries, joint palette ownership
-and cross-visit rearming. A child boundary itself completes nothing.
-Extend existing cross-core transport contracts with local readiness/release
-obligations; do not replace tpush/tpop with local flags.
+mathematics, original coordinates and internal token code. Prove local entry
+readiness, closed notification matching, pending payload summaries, joint palette
+ownership and cross-visit rearming. A child boundary itself completes nothing.
+
+Scope clarification (2026-11-15): cross-core synchronization construction is
+**not** part of these milestones. Preserve explicit/native/compiler-owned
+`tpush`/`tpop`/`tfree` handshakes, peer matching and epochs. Local autosync may
+consume qualified boundary effects and resource reservations, but must neither
+synthesize peer protocols nor claim a local ALL establishes remote completion.
+Where those local boundary contracts are unavailable, preserve delegation and
+report the missing interface. Adding a new cross-core algorithm is deferred.
 
 Acceptance: exact repeated child in an irregular parent with shared storage,
-zero/skipped/reset visits, palette collisions and missing boundary evidence;
-paired AIC/AIV borrowed-buffer wraparound, unmatched peer control and reserved
-resource conflicts. Check added and removed payload prerequisite pairs, not
-only counts. Preservation of child code does not prove no added global order.
+zero/skipped/reset visits, palette collisions and missing boundary evidence.
+For an existing communication operation, preserve the original peer command
+order and ownership; test local readiness, borrowed-buffer lifetime and resource
+coexistence only where its selected contract supplies them. Check added and
+removed payload prerequisite pairs, not only counts. Preservation of child code
+does not prove no added global order.
 
 ### M5 — Relational caller facts and parameterized exact composition
 
@@ -632,10 +640,10 @@ sequence 128 and original hidden/intermediate dimensions 5120/17408.
 
 | Milestone | Delivered through reviewed gates | First remaining obligation |
 | --------- | -------------------------------- | -------------------------- |
-| M1 effects and ownership | Typed first obligations, shared effects, original owner/frame index, explicit complete-unit ownership | Some observed protocol domains remain unqualified; a leaf census is not a proof of every domain |
+| M1 effects and ownership | Typed first obligations, shared effects, original owner/frame index, explicit complete-unit ownership and complete 79-domain owner accounting | Owner observation does not supply native completion/visibility contracts; those remain separate M2/M4/M6 obligations |
 | M2 native operation and storage contracts | Column broadcast/transfer, use-site runtime metadata, FP32 row reductions/axis aliases, BF16/FP32 casts | Mixed full/partial ADD value semantics, unqualified scalar GM visibility and broader native variants |
 | M3 conservative control and actual protocols | Existing no-KILL transfer, explicit prefix/acknowledgment services, joint pruning and actual-token lowering | A general common-completion or arbitrary command protocol needs its own admitted grammar/progress proof |
-| M4 retained children | Local and read-only-GM whole invocations, original frames, pending effects, existing entry rearming and directional palettes | Cross-core borrowed-buffer readiness/release/peer ownership; missing exact GM boundaries remain unavailable |
+| M4 retained children | Local and read-only-GM whole invocations, original frames, pending effects, existing entry rearming and directional palettes | Qualified local boundaries/resource coexistence for existing hand protocols; no new cross-core construction; exact GM boundaries remain unavailable |
 | M5 caller and exact composition | Existing bounded caller evidence and compact K/replay retained; original physical-shape ABI metadata can be ready opaque coordinates | Additional symbolic relations/ranges and executable exact GM exports need actual caller evidence |
 | M6 complete-model deployment | Opt-in empty/barrier/flag module ownership, final drain, debug/cache rebuild checks; all 32 leaves generate C++ | 16 prefix leaves still delegate; no whole-model device or universal ownership qualification |
 
@@ -673,3 +681,36 @@ memory refusals remain recorded. Research interpreters can unfold bounded
 instances; production retained representations still avoid trip-count expansion.
 No allocator, ID pool, hardware exemption, expert protocol or zero-inner-body
 barrier was changed to obtain the new acceptance.
+
+## M1 completion gate: actual task-control owners
+
+The existing orchestration code generator now publishes `task_domains` in its
+read-only result. Its registration owner records only the actual emitted entry,
+Graph fragments and dispatched Spmd/Group wrappers. Unreferenced wrappers do not
+acquire an owner. Call and Submit continue through their existing shared ABI,
+launch, TaskId and dependency validation paths; no second task analysis exists.
+
+After successful whole-unit generation, the existing autosync report joins this
+map with every original IR function. Task-control ownership is reported separately
+from local PyPTO/PTOAS ownership. It certifies emission by the existing runtime
+control owner, not payload visibility, invocation completion or a peer protocol.
+An error publishes no qualified task-control report. Downstream per-PTO ownership
+and automatic insertion options are unchanged. See the [task-domain receipt](41-general-autosync-task-domains.json) for
+pinned sources, whole-model accounting and emitted-source equality checks.
+
+Task-owner status is `task_control_owner_observed`. This records successful
+selection of the existing emitter and matching original identity/type/artifact
+under its declared wrapper IR contract. It is not an independent canonical-body
+verifier or proof of arbitrary hand-assembled wrapper semantics. A strict
+`--require-domain-owners` capture checks accounting separately from
+`--require-function`/`--require-pypto` local synchronization qualification.
+
+The pinned original Qwen capture now accounts for all 79 observed domains:
+47 task-control owners observed, 16 PyPTO local leaves and 16 delegated local
+leaves. This does not increase local synchronization coverage. All 32 kernel
+C++ files and the orchestration C++ file are byte-identical to the immediate
+baseline. The strict owner-accounting gate and existing strict local-name gates
+both pass. The broader 147-test gate covers real Call/Submit/Graph/wrapper
+emission, unused wrappers, publication failures and module ownership. Two stale
+Graph test stubs were updated to the already committed compiler keyword API;
+no native or dependency check was weakened.

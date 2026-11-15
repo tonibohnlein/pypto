@@ -92,7 +92,7 @@
     "remaining_native_contracts": [
       "Mixed full/partial operation value/metadata semantics",
       "Scalar GM input visibility and readiness",
-      "Cross-core local completion, peer release and resource ownership"
+      "Local boundary effects and resource coexistence for existing communication protocols (new peer synchronization excluded)"
     ],
     "remaining_precision_contracts": [
       "Symbolic caller relations and exact GM boundary exports"
@@ -109,7 +109,9 @@
       "prefix_owned": 16,
       "exact_owned": 3,
       "prefix_delegated": 16,
-      "other_unverified_domains": 47
+      "task_control_owners_observed": 47,
+      "unverified_owner_domains": 0,
+      "historical_unverified_owner_domains": 47
     },
     "remaining": [
       "Mixed-full/partial ADD and carrier value-domain contracts",
@@ -118,8 +120,13 @@
       "Additional symbolic caller/GM export contracts",
       "Whole-model native/device qualification"
     ],
-    "all_original_milestones_complete": false
+    "all_original_milestones_complete": false,
+    "task_domain_report": "41-general-autosync-task-domains.json"
   },
   "historical_field_scope": "compiler_revision, source_sha256, historical_evidence, draft, review and validation preserve the original architecture-plan audit; they are not a current build or test claim. latest_checkpoint and its linked receipts identify current implementation and dirty-source evidence.",
-  "historical_next_gate": "M1 shared qualification and domain ownership; refresh existing pinned capture"
+  "historical_next_gate": "M1 shared qualification and domain ownership; refresh existing pinned capture",
+  "scope_clarification_20261115": {
+    "user_instruction": "Do not implement cross-core synchronization beyond existing hand/native/compiler-owned protocols; match local autosync scope.",
+    "M4": "Qualified local boundary effects and resource coexistence only; no new peer handshake, matching or rearming construction. Unknown boundaries remain delegated."
+  }
 }
