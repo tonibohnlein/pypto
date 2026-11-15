@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import traceback
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,87 @@ from .sync_physical_oracle import run_physical
 def digest(path: Path) -> str:
     """Hash a source or tool artifact without executing it."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def static_control_inventory(function: ir.Function) -> dict[str, Any]:
+    """Count original syntactic sites without unfolding loops or choosing arms."""
+    counts: Counter[str] = Counter()
+
+    class Calls(ir.IRVisitor):
+        def visit_call(self, op):
+            counts[f"call:{op.op.name}"] += 1
+            super().visit_call(op)
+
+    # Walk structural statements explicitly. Python override recursion through
+    # a native visitor trampoline must not hide a nested same-kind loop.
+    pending = [function.body]
+    while pending:
+        statement = pending.pop()
+        if isinstance(statement, ir.SeqStmts):
+            pending.extend(reversed(statement.stmts))
+        elif isinstance(statement, ir.ForStmt):
+            counts[f"for:{statement.kind}"] += 1
+            pending.append(statement.body)
+        elif isinstance(statement, ir.WhileStmt):
+            counts["while"] += 1
+            pending.append(statement.body)
+        elif isinstance(statement, ir.IfStmt):
+            counts["if"] += 1
+            pending.append(statement.then_body)
+            if statement.else_body is not None:
+                pending.append(statement.else_body)
+        elif isinstance(statement, (ir.ScopeStmt, ir.SimtScopeStmt)):
+            counts[f"scope:{type(statement).__name__}"] += 1
+            pending.append(statement.body)
+    Calls().visit_function(function)
+    return dict(sorted(counts.items()))
+
+
+def domain_ownership(receipt, kernels, cpp_names):
+    """Join observed domains, retaining absent and delegated owners explicitly."""
+    before = {f["name"]: f for f in receipt["functions_before_sync"]}
+    selected = {f["name"]: f for f in receipt["functions_after_buffer_selection"]}
+    after = {f["name"]: f for f in receipt["functions_after_sync"]}
+    reports = {k["function"]: k for k in kernels}
+    result = []
+    for name in sorted(before.keys() | selected.keys() | after.keys()):
+        source = before.get(name, selected.get(name, after.get(name)))
+        emitted = after.get(name)
+        owner = emitted.get("synchronization_owner") if emitted else None
+        report = reports.get(name, {})
+        generated = name in cpp_names
+        verified = (
+            receipt["compile_success"]
+            and owner is True
+            and generated
+            and report.get("selected_route") == "pypto"
+        )
+        result.append(
+            {
+                "function": name,
+                "original_domain": source,
+                "requested_policy": receipt["policy"],
+                "observed_after_sync": emitted is not None,
+                "synchronization_owner": owner,
+                "route_report": report,
+                "generated_cpp": generated,
+                "verified_pypto_leaf": verified,
+                "status": "verified_pypto_leaf"
+                if verified
+                else ("delegated" if owner is False else "unverified_domain"),
+            }
+        )
+    return result
+
+
+def expected_ownership_failures(domains, expected):
+    """Named qualification is independent of the whole-model ownership claim."""
+    observed = {row["function"]: row for row in domains}
+    return [
+        {"function": name, "status": observed[name]["status"] if name in observed else "not_observed"}
+        for name in sorted(set(expected))
+        if name not in observed or not observed[name]["verified_pypto_leaf"]
+    ]
 
 
 def function_inventory(program: ir.Program) -> list[dict[str, Any]]:
@@ -55,6 +137,8 @@ def function_inventory(program: ir.Program) -> list[dict[str, Any]]:
                 "type": str(function.func_type),
                 "stage": str(function.ir_stage),
                 "requires_runtime_binding": function.requires_runtime_binding,
+                "synchronization_owner": attrs.get("pypto_autosync"),
+                "static_control": static_control_inventory(function),
                 "attrs": {str(k): str(v) for k, v in attrs.items()},
                 "buffer_admission": admission,
             }
@@ -70,7 +154,14 @@ def main() -> None:
     parser.add_argument("--layers", type=int, default=1)
     parser.add_argument("--sequence", type=int, default=128)
     parser.add_argument("--mode", choices=("pypto", "ptoas"), default="pypto")
+    parser.add_argument("--policy", choices=("exact", "conservative_prefix"), default="exact")
     parser.add_argument("--require-pypto", action="store_true")
+    parser.add_argument(
+        "--require-function",
+        action="append",
+        default=[],
+        help="Require verified PyPTO ownership for this named generated domain (repeatable)",
+    )
     parser.add_argument("--tool-artifact", type=Path, action="append", default=[])
     parser.add_argument("--check-function", action="append", default=[])
     args = parser.parse_args()
@@ -97,6 +188,7 @@ def main() -> None:
         "model_sources": {p.name: digest(p) for p in sorted(model.glob("*.py"))},
         "configuration": {"layers": args.layers, "sequence": args.sequence, "batch": 1},
         "mode": args.mode,
+        "policy": args.policy,
         "command": sys.argv,
         "python": sys.version,
         "compiler_dirty_sources": {p: digest(root / p) if (root / p).is_file() else None for p in sources},
@@ -111,10 +203,17 @@ def main() -> None:
             key: os.environ.get(key)
             for key in ("PYTHONPATH", "PTOAS_ROOT", "OMP_NUM_THREADS", "PYPTO_CODEGEN_MAX_WORKERS")
         },
-        "access_contract": "Distinct input GM arguments assumed disjoint; no runtime values inferred",
+        "access_contract": (
+            "Distinct input GM arguments assumed disjoint; no runtime values inferred"
+            if args.policy == "exact"
+            else "Whole-memory-space enclosures; no GM disjointness used; "
+            "source access-validity preconditions remain"
+        ),
         "device": "not run",
         "passes": [],
         "functions_before_sync": [],
+        "functions_after_sync": [],
+        "expected_pypto_functions": sorted(set(args.require_function)),
         "functions_after_buffer_selection": [],
         "compile_success": False,
         "all_generated_leaves_pypto": False,
@@ -134,6 +233,7 @@ def main() -> None:
             receipt["functions_after_buffer_selection"] = function_inventory(program)
             ir.serialize_to_file(program, str(output / "after-buffer-selection.msgpack"))
         if pass_obj.get_name() == "RealizeSync":
+            receipt["functions_after_sync"] = function_inventory(program)
             ir.serialize_to_file(program, str(output / "after-sync.msgpack"))
 
     try:
@@ -152,7 +252,8 @@ def main() -> None:
             enable_buffer_ir=True,
             memory_planner=passes.MemoryPlanner.PYPTO,
             enable_pypto_autosync=args.mode == "pypto",
-            autosync_disjoint_gm=True,
+            autosync_disjoint_gm=args.policy == "exact",
+            autosync_policy=args.policy,
         ):
             module.prefill_fwd.compile(
                 *tensors,
@@ -173,6 +274,10 @@ def main() -> None:
         cpp = sorted((output / "compiled/kernels").rglob("*.cpp"))
         receipt["cpp"] = {str(p.relative_to(output)): digest(p) for p in cpp}
         kernels = report.get("kernels", [])
+        receipt["domains"] = domain_ownership(receipt, kernels, {p.stem for p in cpp})
+        receipt["expected_ownership_failures"] = expected_ownership_failures(
+            receipt["domains"], args.require_function
+        )
         # Source census and route census must agree; unknown/external owners are
         # unresolved here, never silently counted as successful PyPTO leaves.
         leaves = {
@@ -217,6 +322,7 @@ def main() -> None:
     if (
         not receipt["compile_success"]
         or "oracle_error" in receipt
+        or receipt["expected_ownership_failures"]
         or (args.require_pypto and not receipt["all_generated_leaves_pypto"])
     ):
         raise SystemExit(1)
