@@ -36,7 +36,7 @@ def _checked_lower(program, planner):
     ir.assert_structural_equal(lowered, ir.deserialize(ir.serialize(lowered)))
     visitor = _Calls()
     visitor.visit_function(_kernel(lowered))
-    casts = [call for call in visitor.calls if call.op.name == "buffer.cast"]
+    casts = [call for call in visitor.calls if call.op.name == ir.get_op("buffer.cast").name]
     assert casts
     # Static native qualification belongs to each actual operand, including
     # aliases whose allocation descriptor was promoted to dynamic valid state.
@@ -105,7 +105,7 @@ class CastAliases:
 """)
     lowered, calls, execute = _checked_lower(program, planner)
     # Both sides of the first cast must exercise the promoted-handle bridge.
-    windows = [call for call in calls if call.op.name == "buffer.subview"]
+    windows = [call for call in calls if call.op.name == ir.get_op("buffer.subview").name]
     promoted = [call for call in windows if any(extent < 0 for extent in call.args[0].type.valid_shape)]
     assert len(promoted) >= 2
     x = (torch.arange(512).reshape(16, 32).float() - 257) / 16
