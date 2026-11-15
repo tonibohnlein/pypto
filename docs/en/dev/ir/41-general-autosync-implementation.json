@@ -1,0 +1,624 @@
+{
+  "baseline_revision": "b5597650a75b598645b1b1d3fe05bd3aab220f09",
+  "status": "Reviewed implementation slices delivered; final broad gate2437passed4warnings. Whole plan and whole model incomplete.",
+  "milestones": {
+    "M1": {
+      "status": "accepted",
+      "scope": "static operation/effect qualification independent of numerical occurrence analysis; typed first admission obligation; actual production inventory",
+      "source_sha256": {
+        "include/pypto/backend/common/buffer_sync_contract.h": "d6a31ba34f706367286bdcd00745d2ce45388cf4516116cd1af36cf5503c2f0e",
+        "include/pypto/ir/function.h": "7d9a826f7864a3f73f43518b0601de7c16a4148c161acdeb14e30890c7e0bfce",
+        "include/pypto/ir/transforms/utils/buffer_valid_analysis.h": "100f221b4dd961e24d23904c2d45c8ab6a0c031a476a85f77546f4843d9b21ae",
+        "include/pypto/ir/transforms/utils/slot_index_qualification.h": "d5e7faf0e629f637b1fe022d27d04c3a8562057107bec9b6422cd75e0f1376d4",
+        "python/bindings/modules/testing.cpp": "f6b2342345c31efbd5fb8f3ae633cb3668a0db1f472598c7a5ed3fd60d702949",
+        "python/pypto/pypto_core/testing.pyi": "3fa0fc87f93198dc5dc46eaa755c28fbc79ff253b8d8e4c98177ab8cab53ff4d",
+        "src/backend/common/buffer_sync_contract.cpp": "b1d3313d143584bd6c3b4a4be9c6cdf993f21d7f7a62f1a4576f6fc81ac8b407",
+        "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "1c3c9b18382b8d725fb7495adb977393faa4ad55fd83f7ee4e7e23289b580901",
+        "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "17db32802b3694407fbde2dd22c15326ffbd3795e8c483d06cd3f6668dc76436",
+        "src/ir/transforms/token_sync.cpp": "fa8b5726e4749f66c9d64ea0a64a36159882a0a21b57741b12765314c99b52dc",
+        "src/ir/transforms/utils/placed_sync_import.cpp": "a8988a6a4141b0897565b0348a002ede51e4d7045ff579697336ad8d08c09dbb",
+        "tests/ut/ir/transforms/qualify_qwen_whole_model.py": "61a07e1bea452d1ed6c35e89e796b32aaa09aaf63ac31df9a1aec36de15d2928",
+        "src/ir/transforms/buffer_ir_admission.h": "d6d8189b0f3043a41a5067e09aeb96e89fdf2865c9fae696ecfaf06e7d1f3c5f",
+        "tests/ut/ir/transforms/test_buffer_admission_obligations.py": "d6fd0fed922b00287638168916cbff29bc235c89461185eb7d46c5222aecba14",
+        "tests/ut/ir/transforms/test_sync_operation_contract.py": "16540c283e51b2d63b0158fe9c10c0200fb625c2259f356eff0142bc93ac0514"
+      },
+      "validation": {
+        "focused": "984 passed in 37.31s",
+        "build": "serial build passed after macro spelling and diagnostic attribute integer codec fixes",
+        "python_types": "0 errors using unchanged project rules and explicit installed hook dependency search path",
+        "whole_qwen": {
+          "baseline_receipt": "build-py314/general-autosync-20261115/m1/baseline/receipt.json",
+          "candidate_receipt": "build-py314/general-autosync-20261115/m1/candidate/receipt.json",
+          "cpp_byte_identical": true,
+          "leaves": 32,
+          "pypto_owned": 2,
+          "delegated": 30,
+          "baseline_seconds_descriptive": 5.967713814694434,
+          "candidate_seconds_descriptive": 6.365037384908646
+        },
+        "device": false,
+        "extra_exact_token_regressions": "281 passed in 62.88s",
+        "cpp_numerical_order": "passed"
+      },
+      "review": "independent compiler reviewer accepted source and 984-test evidence",
+      "artifacts": {
+        "build-py314/general-autosync-20261115/m1/baseline.log": "0e10c0f08fad0f1028d87c8adb4cc052e203ebafd45c8078aed3d443ffed8ade",
+        "build-py314/general-autosync-20261115/m1/build-codec-fix.log": "e1c3429188b913ddb8b2c350a9d6842bd661f3b2935a928ea68b86a4ce2886ce",
+        "build-py314/general-autosync-20261115/m1/build-retry.log": "31458b884f4b34f92ae548e661eec64a0a27a1c6ee04aeb9c2e407ce3e764893",
+        "build-py314/general-autosync-20261115/m1/build.log": "7d4cfbe9af411a60fded777ddbe176a066b7111343979ed32c5d95b49d763ec8",
+        "build-py314/general-autosync-20261115/m1/candidate.log": "c54a779e358d33ecc7b2ba15e74d0c233a8a0f04eae532942069cb13fed3802b",
+        "build-py314/general-autosync-20261115/m1/focused-tests.log": "39cf0393c3fd458cc0b6a0c62a8dbbc418ee561c919deb16506df14f5b5b883c",
+        "build-py314/general-autosync-20261115/m1/new-tests-final.log": "88b8b4c3500dbd9d214f4176faf21a3a9f0ebf07fe268b8aa5ca2834d81033be",
+        "build-py314/general-autosync-20261115/m1/new-tests-retry.log": "b0fc1743757436c04bf8d1e348b53e845f5bb3dc5f5346c55ec1d7bf155ad8d2",
+        "build-py314/general-autosync-20261115/m1/new-tests.log": "1ea5566a8523f8f89bc824899da2375e29cdf8f222e63284873e9f9ed1056a03",
+        "build-py314/general-autosync-20261115/m1/pyright-final.log": "cbda50d70b451800d90a371d3dc7c24a1ec17eb4b602321697d7f92b817804de",
+        "build-py314/general-autosync-20261115/m1/pyright-resolved-final.log": "6d88a1b220adb7a3d62092b6e38431f0b3fe8babe9864fab90e5849766260332",
+        "build-py314/general-autosync-20261115/m1/pyright-resolved.log": "2153f7aa9a524cef9d0fd0108c5b33bf33376f8290489fbd906ab7049de60b5d",
+        "build-py314/general-autosync-20261115/m1/pyright.log": "25d935537e389efa8b35e58667d187db5d3bc8cdc599eb976c2f50a7f3d18de6"
+      },
+      "limitations": [
+        "No new operation/native admission",
+        "No footprint/readiness/alias/resource proof supplied by static effect qualification",
+        "No fresh native/device qualification"
+      ]
+    },
+    "M2_static_cast_family": {
+      "status": "accepted",
+      "scope": "per-use static cast descriptor adaptation; other operation families outstanding",
+      "source_sha256": {
+        "include/pypto/ir/transforms/utils/buffer_valid_analysis.h": "ca98ec251b98b355f24e749eafc1de896bc62185a7dc98595794b21e9d9ad3a7",
+        "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "d4880332e7c79f17431acaaa88e86c9828a45caf57bc2db8c0c634b4bf23f540",
+        "tests/ut/ir/transforms/test_static_cast_valid_context.py": "2aa397f4ee6567b1eecdf047dabdafeacf041a7619cd7ec3386698167846eb4b",
+        "src/ir/transforms/utils/placed_sync_import.cpp": "a8988a6a4141b0897565b0348a002ede51e4d7045ff579697336ad8d08c09dbb"
+      },
+      "tests": "21 new passed;1005 focused passed",
+      "review": "independent implementation/correctness acceptance",
+      "whole_qwen": {
+        "compile_success": true,
+        "leaves": 32,
+        "owned": 2,
+        "casts_reach_buffer_ir": true,
+        "next_cast_obligation": "missing caller coordinate range",
+        "changed_cpp": [
+          "compiled/kernels/aiv/mlp_out_cast.cpp",
+          "compiled/kernels/aiv/mlp_out_cast_0.cpp"
+        ],
+        "seconds_descriptive": 6.23463227879256
+      },
+      "artifacts": {
+        "build-py314/general-autosync-20261115/m2/build.log": "775d69f28fd434f2b83e5006b78a2202acf14ee2a7e6e87c05a0e577574d9035",
+        "build-py314/general-autosync-20261115/m2/candidate.log": "067e5d39654d21e2d174f2dcc381f43ec4ccbe4e67881e8d6fa80696e962aab9",
+        "build-py314/general-autosync-20261115/m2/focused-tests.log": "7b95a4ed4c70d29a0433ca6a26c317027ddd3151c542dff24d98a29ac5c4e20d",
+        "build-py314/general-autosync-20261115/m2/new-tests.log": "b6ea18403484cae424cadca44eac796e2adb76faa54c21e5e2539c93585acc62"
+      },
+      "device": false
+    }
+  },
+  "remaining": {
+    "M1": "Accepted static contract slice; scalar/indexed readiness and execution/visibility qualifications incomplete. Owner: shared operation/readiness producers.",
+    "M2": "Accepted qualified native families; arbitrary layouts/dynamic casts/high_precision Rsqrt and broader atomic modes remain unqualified. Owner: selected native implementation and geometry admission.",
+    "M3": "Qualified explicit conservative-prefix policy implemented; broader effects/readiness admission remains limited. Owner: conservative producer and shared contracts.",
+    "M4": "Native-only local resource-empty producer+consumer implemented; eventful rearm/palettes/transport absent. Owner: retained child and transport/resource exporters.",
+    "M5": "Bounded checked numerical producer implemented; symbolic relational/callee contracts and external assumptions unsupplied. Owner: invocation evidence and exact-provider consumers.",
+    "M6": "Strict required-name census passed for2exact/11prefix leaves; final broad gate2437passed4warnings. Whole-model ownership remains incomplete:21prefixdelegates,47unverifiedotherdomains,empty/barrier-only ownership agreement open."
+  },
+  "whole_plan_complete": false,
+  "whole_model_owned": false,
+  "components": [
+    {
+      "commit": "fb0727c53",
+      "scope": "static cast descriptor adaptation"
+    },
+    {
+      "commit": "71b83d34b",
+      "scope": "shared static operation qualification and first obligation"
+    },
+    {
+      "commit": "fad11f7f4",
+      "scope": "checked scoped numerical caller correlations"
+    },
+    {
+      "commit": "76221dc46",
+      "scope": "qualified contiguous column/row views"
+    },
+    {
+      "commit": "eff99b7de",
+      "scope": "shared implicit scratch and MUL effects"
+    },
+    {
+      "commit": "ce4d593b5",
+      "scope": "explicit conservative-prefix production policy and native-only child consumption"
+    },
+    {
+      "commit": "ed7590db9",
+      "scope": "per-use proved slot-index normalization"
+    },
+    {
+      "commit": "c4b9c237e",
+      "scope": "default Rsqrt native qualification"
+    },
+    {
+      "commit": "a111cd34ad8a48406869b33e3de43d42fd8c9319",
+      "scope": "call-qualified default A2/A3 FP32 Acc-to-GM atomic add"
+    },
+    {
+      "commit": "36271644488d94078f6ec1a6bf75ff5aa09fbd32",
+      "scope": "explicit public whole-original batch native-child provider"
+    }
+  ],
+  "final_capture_provenance": {
+    "compiler_revision": "c4b9c237ed1606fa29484504c93955c5c3002fec",
+    "compiler_dirty_sources": {
+      "include/pypto/backend/common/buffer_type_support.h": "d7dbb945a74bffb37c08f977197bb76671a456a21ec70b80cea7fdac5fbf6caa",
+      "include/pypto/ir/op_registry.h": "62b6db34bf25475dce565a5feb0d25f947bdb28b168f4c853e84bcbf7cb921da",
+      "include/pypto/ir/transforms/passes.h": "4365cf05420c61dc465811b540f018c29ddb44d5cdf17961bfabc10eaffb233b",
+      "python/bindings/modules/ir.cpp": "ac3ef6c12154e982c9d343f6677ea8bc200979229cd4d1c34b93d434f7524a76",
+      "python/bindings/modules/passes.cpp": "3923e894982373466015f99aab32229e444c6d97d94e2eec798f521b7fef99dd",
+      "python/bindings/modules/testing.cpp": "57edb240a4f9c23c7eee386d93fc8c4a9686e720b2e17a18ebc27eed4c49d2d2",
+      "python/pypto/debug/torch_codegen.py": "3720f539c6c640e8460049306fc276b8be8d7fd9ec7fdc6c1da33ff7634aa44a",
+      "python/pypto/pypto_core/ir.pyi": "06cfb280999230534186634bc10534513b684d49f127c33ce437f61ca2e690d1",
+      "python/pypto/pypto_core/passes.pyi": "d2facffa772abe2ceb70f87ef44c40e1337e53e680f86111923d45258ee5b43f",
+      "src/backend/common/buffer_sync_contract.cpp": "951602242284ce1ecf823bac70f82afc0a8c804a2fbbc09f2cbff27142aeb326",
+      "src/codegen/pto/pto_buffer_codegen.cpp": "71a5e5dbbe2f8328e5208b9861a56427530ffd872d74694b26a77a8687b69a28",
+      "src/ir/op/buffer_ops/memory.cpp": "7d0f76b142c29736fdd2cffaf25f421d60a3378d21b30b506a949be31ebc682b",
+      "src/ir/op_registry.cpp": "c0b2af0e274e822789860180d15eb58a50c504c0eb44b41bb29d95eec1b7c819",
+      "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "57710eea210cdf8e3d550e2910ea1b462dbccca79811d3b18486b21c26ad363b",
+      "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "12ea42423ba511a2433ab3b26dded565c3381112ab53e46b6554a3ae2741510a",
+      "src/ir/transforms/token_sync.cpp": "e0e948fb4f9e58ae0cc07c29a2c128515caf50309500084a160538f6b3bd1372",
+      "src/ir/transforms/utils/placed_sync_import.cpp": "0bfbae711da049add381cc79317c6cd63a349c9dc733b14454f4352a038d883d",
+      "src/ir/transforms/utils/scope_outline_utils.cpp": "c6d18eb39f54d2a6615e11cf94398e0ca36db0fb4c8853876511a5fce3cfe3f2",
+      "tests/ut/ir/operators/test_buffer_ops.py": "096527ead2724e263956e3dd671c52a50084153986a5d97889e59b6c9284291f",
+      "tests/ut/ir/transforms/qualify_qwen_whole_model.py": "504025e74e34d6eccebecabbb1825820bf8ff63791b0a28275b2f48560f58774",
+      "tests/ut/ir/transforms/qualify_shared_l0_ring.py": "8b60a621962d1461d4f0d1189977378ede619500aff51c39ea7bfd6edcb3c7e7",
+      "tests/ut/ir/transforms/sync_closed_command_oracle.py": "aa3b36d6e5852082046ad3248e9e9c5c4d1ef470147a378d3bfa51df1c35265e",
+      "tests/ut/ir/transforms/sync_matmul_oracle.py": "251a9ba8b67a1cde19637dfa6940ad5d87451b0c755d795df014d4d44f1c3f24",
+      "tests/ut/ir/transforms/test_atomic_buffer_sync.py": "0185dbd3a55474755beb7dd56583abad575985b7139e215e89a234ba3196c849",
+      "tests/ut/ir/transforms/test_autosync_inventory.py": "5939c3ef6b9304fe357a770b677ca22dc1f6731963c98aec1fae37ff0567998a",
+      "tests/ut/ir/transforms/test_conservative_sync_child_api.py": "40f9703d5ed9330d1a74bf3fc8cd29c94c18850676133480b647fa3e9de001b1",
+      "tests/ut/ir/transforms/test_conservative_sync_child_commands.py": "aa5e0af4577d16899c99afad2684a1e7877f333cef83ac2aa1691a97d952f59e"
+    },
+    "extension_hashes": {
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "9e5db8b0cbd3848edca5ad2e73ba82efdd1c812e899abfcfd9e28d4755c8e3d8"
+    },
+    "library_revision": "b72c66d9df69ba5f11982b212530a255c050988d",
+    "configuration": {
+      "layers": 2,
+      "sequence": 128,
+      "batch": 1
+    },
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "environment": {
+      "PYTHONPATH": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106",
+      "PTOAS_ROOT": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher",
+      "OMP_NUM_THREADS": "1",
+      "PYPTO_CODEGEN_MAX_WORKERS": "1"
+    },
+    "access_contract": "Whole-memory-space enclosures; no GM disjointness used; source access-validity preconditions remain",
+    "ptoas": {
+      "path": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher/ptoas",
+      "hash": "8b52c0bfe3259f37dd17331ec0b8ee534461f18e70042edce0e2b6ee2fd7adf8",
+      "version": "ptoas 0.72",
+      "additional_artifacts": {
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so": "86655444ce6e3470dbbbf061438046bc5f87c5f0f89f4145fd2a4340c8fd70e9",
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so": "0aa83ba0abbd3432c2ce9ecb6c854485b5502d51b181fa200ee87fd9254ea321"
+      }
+    },
+    "model_sources_and_arguments": "Full source hashes and 25 argument schemas remain in the pinned raw receipts; no duplicated function inventories."
+  },
+  "M6": {
+    "status": "Qualified compiler/census gate passed; whole-model ownership incomplete",
+    "captures": {
+      "exact": {
+        "path": "build-py314/general-autosync-20261115/m6-atomic/exact/receipt.json",
+        "sha256": "e2ee486722c74eb87340035c90f1b6e83f0992820cfc646bce1ea5c5f62062a5",
+        "command_argv": [
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_qwen_whole_model.py",
+          "--library",
+          "/home/toni/work/pypto3/pypto-lib",
+          "--output",
+          "build-py314/general-autosync-20261115/m6-atomic/exact",
+          "--layers",
+          "2",
+          "--policy",
+          "exact",
+          "--require-function",
+          "silu",
+          "--require-function",
+          "mlp_out_seed",
+          "--tool-artifact",
+          "build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas",
+          "--tool-artifact",
+          "build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so",
+          "--tool-artifact",
+          "build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so"
+        ],
+        "compile_success": true,
+        "generated_cpp": 32,
+        "pypto_owned": 2,
+        "delegated_leaves": 30,
+        "strict_expected_names": [
+          "mlp_out_seed",
+          "silu"
+        ],
+        "strict_failures": [],
+        "inclusive_seconds": 6.562090519815683,
+        "cpp_bytes_total": 1399234,
+        "metadata_static_set_wait_barrier": [
+          8,
+          8,
+          8
+        ]
+      },
+      "conservative_prefix": {
+        "path": "build-py314/general-autosync-20261115/m6-atomic/conservative_prefix/receipt.json",
+        "sha256": "b73da0a3b4e0952f484b919f0253634038b68c278d2f192d9d62ab9d3c6482cb",
+        "command_argv": [
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_qwen_whole_model.py",
+          "--library",
+          "/home/toni/work/pypto3/pypto-lib",
+          "--output",
+          "build-py314/general-autosync-20261115/m6-atomic/conservative_prefix",
+          "--layers",
+          "2",
+          "--policy",
+          "conservative_prefix",
+          "--require-function",
+          "down_proj",
+          "--require-function",
+          "gate_up_proj",
+          "--require-function",
+          "kv_proj",
+          "--require-function",
+          "mlp_out_cast",
+          "--require-function",
+          "mlp_out_cast_0",
+          "--require-function",
+          "mlp_out_seed",
+          "--require-function",
+          "out_proj_aic",
+          "--require-function",
+          "q_proj",
+          "--require-function",
+          "save_prefill_last_token_group",
+          "--require-function",
+          "save_prefill_last_token_single",
+          "--require-function",
+          "silu",
+          "--tool-artifact",
+          "build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas",
+          "--tool-artifact",
+          "build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so",
+          "--tool-artifact",
+          "build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so"
+        ],
+        "compile_success": true,
+        "generated_cpp": 32,
+        "pypto_owned": 11,
+        "delegated_leaves": 21,
+        "strict_expected_names": [
+          "down_proj",
+          "gate_up_proj",
+          "kv_proj",
+          "mlp_out_cast",
+          "mlp_out_cast_0",
+          "mlp_out_seed",
+          "out_proj_aic",
+          "q_proj",
+          "save_prefill_last_token_group",
+          "save_prefill_last_token_single",
+          "silu"
+        ],
+        "strict_failures": [],
+        "inclusive_seconds": 7.784730817191303,
+        "cpp_bytes_total": 1440504,
+        "metadata_static_set_wait_barrier": [
+          620,
+          620,
+          169
+        ]
+      }
+    },
+    "generated_leaves": [
+      ["attention_finalize_phase", "ptoas", "ptoas", "type_layout/Var", 15709, 15709, [0, 0, 0], [0, 0, 0], [1, 1, 0], [1, 1, 0]],
+      ["down_proj", "ptoas", "pypto", "", 23962, 31408, [0, 0, 0], [104, 104, 27], [5, 1, 0], [5, 1, 0]],
+      ["final_rmsnorm", "ptoas", "ptoas", "operation_recipe/tile.col_expand_mul", 19185, 19185, [0, 0, 0], [0, 0, 0], [2, 0, 0], [2, 0, 0]],
+      ["gate_up_proj", "ptoas", "pypto", "", 30559, 41172, [0, 0, 0], [144, 144, 37], [8, 2, 0], [8, 2, 0]],
+      ["kv_proj", "ptoas", "pypto", "", 31191, 42357, [0, 0, 0], [144, 144, 37], [7, 3, 0], [7, 3, 0]],
+      ["lm_head", "ptoas", "ptoas", "type_layout/Var", 22780, 22780, [0, 0, 0], [0, 0, 0], [4, 0, 0], [4, 0, 0]],
+      ["mlp_out_cast", "ptoas", "pypto", "", 12696, 13466, [0, 0, 0], [16, 16, 5], [1, 2, 0], [1, 2, 0]],
+      ["mlp_out_cast_0", "ptoas", "pypto", "", 12727, 13497, [0, 0, 0], [16, 16, 5], [1, 2, 0], [1, 2, 0]],
+      ["mlp_out_seed", "pypto", "pypto", "", 7371, 7714, [1, 1, 1], [4, 4, 3], [1, 0, 0], [1, 0, 0]],
+      ["out_proj_aic", "ptoas", "pypto", "", 19113, 24565, [0, 0, 0], [72, 72, 19], [4, 1, 0], [4, 1, 0]],
+      ["out_proj_aiv", "ptoas", "ptoas", "operation_recipe/tile.cast", 13110, 13110, [0, 0, 0], [0, 0, 0], [1, 0, 0], [1, 0, 0]],
+      ["out_proj_aiv_0", "ptoas", "ptoas", "operation_recipe/tile.cast", 13142, 13142, [0, 0, 0], [0, 0, 0], [1, 0, 0], [1, 0, 0]],
+      ["post_rmsnorm", "ptoas", "ptoas", "type_layout/Var", 22611, 22611, [0, 0, 0], [0, 0, 0], [3, 1, 0], [3, 1, 0]],
+      ["q_proj", "ptoas", "pypto", "", 19104, 24556, [0, 0, 0], [72, 72, 19], [4, 1, 0], [4, 1, 0]],
+      ["qk_pv_partial_merge", "ptoas", "ptoas", "type_layout/Var", 42305, 42305, [0, 0, 0], [0, 0, 0], [1, 3, 0], [1, 3, 0]],
+      ["qk_pv_partial_plan_aic", "ptoas", "ptoas", "type_layout/Var", 208297, 208297, [0, 0, 0], [0, 0, 0], [2, 13, 0], [2, 13, 0]],
+      ["qk_pv_partial_plan_aiv", "ptoas", "ptoas", "type_layout/Var", 208459, 208459, [0, 0, 0], [0, 0, 0], [4, 27, 0], [4, 27, 0]],
+      ["qk_pv_single_block_0_aic", "ptoas", "ptoas", "type_layout/Var", 85114, 85114, [0, 0, 0], [0, 0, 0], [2, 0, 0], [2, 0, 0]],
+      ["qk_pv_single_block_0_aiv", "ptoas", "ptoas", "type_layout/Var", 85276, 85276, [0, 0, 0], [0, 0, 0], [6, 1, 0], [6, 1, 0]],
+      ["qk_pv_single_block_aic", "ptoas", "ptoas", "type_layout/Var", 85106, 85106, [0, 0, 0], [0, 0, 0], [2, 0, 0], [2, 0, 0]],
+      ["qk_pv_single_block_aiv", "ptoas", "ptoas", "type_layout/Var", 85268, 85268, [0, 0, 0], [0, 0, 0], [6, 1, 0], [6, 1, 0]],
+      ["qkpv_plan", "ptoas", "ptoas", "type_layout/Var", 139663, 139663, [0, 0, 0], [0, 0, 0], [0, 385, 0], [0, 385, 0]],
+      ["rms_recip", "ptoas", "ptoas", "type_layout/Var", 15858, 15858, [0, 0, 0], [0, 0, 0], [2, 1, 0], [2, 1, 0]],
+      ["rms_recip_0", "ptoas", "ptoas", "type_layout/Var", 15892, 15892, [0, 0, 0], [0, 0, 0], [2, 1, 0], [2, 1, 0]],
+      ["rope_kv_cache", "ptoas", "ptoas", "type_layout/Var", 81374, 81374, [0, 0, 0], [0, 0, 0], [2, 1, 0], [2, 1, 0]],
+      ["save_prefill_last_token_group", "ptoas", "pypto", "", 8785, 8910, [0, 0, 0], [4, 4, 3], [1, 0, 0], [1, 0, 0]],
+      ["save_prefill_last_token_single", "ptoas", "pypto", "", 8396, 8521, [0, 0, 0], [4, 4, 3], [1, 0, 0], [1, 0, 0]],
+      ["silu", "pypto", "pypto", "", 14556, 13564, [7, 7, 7], [40, 40, 11], [1, 0, 0], [1, 0, 0]],
+      ["token_embed_group", "ptoas", "ptoas", "type_layout/Var", 12043, 12043, [0, 0, 0], [0, 0, 0], [1, 2, 0], [1, 2, 0]],
+      ["token_embed_single", "ptoas", "ptoas", "type_layout/Var", 10556, 10556, [0, 0, 0], [0, 0, 0], [1, 1, 0], [1, 1, 0]],
+      ["x_gamma", "ptoas", "ptoas", "operation_recipe/tile.cast", 14497, 14497, [0, 0, 0], [0, 0, 0], [1, 0, 0], [1, 0, 0]],
+      ["x_gamma_0", "ptoas", "ptoas", "operation_recipe/tile.cast", 14529, 14529, [0, 0, 0], [0, 0, 0], [1, 0, 0], [1, 0, 0]]
+    ],
+    "static_metrics_contract": "NOT a whole-plan optimization comparison: different owned subsets (exact2/prefix11) and missing downstream PTOAS insertions for30/21 delegates. The8/8/8 vs620/620/169 metadata totals show only static PyPTO-stage sites; no benefit/regression or dynamic inference. C++ byte sizes compare the same32 output artifacts only, not runtime. Raw before/after metadata and file hashes are pinned.",
+    "other_domains": {
+      "status": "unverified_domain",
+      "names": [
+        "attention_finalize_phase_spmd",
+        "attention_finalize_phase_spmd_0",
+        "attention_finalize_phase_spmd_1",
+        "attention_finalize_phase_spmd_2",
+        "down_proj_spmd",
+        "down_proj_spmd_0",
+        "gate_up_proj_spmd",
+        "gate_up_proj_spmd_0",
+        "kv_proj_spmd",
+        "kv_proj_spmd_0",
+        "lm_head_spmd",
+        "mlp_out_cast_spmd",
+        "mlp_out_cast_spmd_0",
+        "mlp_out_seed_spmd",
+        "mlp_out_seed_spmd_0",
+        "out_proj_aic_spmd",
+        "out_proj_aic_spmd_0",
+        "out_proj_aiv_spmd",
+        "out_proj_aiv_spmd_0",
+        "post_rmsnorm_spmd",
+        "post_rmsnorm_spmd_0",
+        "prefill_fwd",
+        "q_proj_spmd",
+        "q_proj_spmd_0",
+        "qk_pv_partial_merge_spmd",
+        "qk_pv_partial_merge_spmd_0",
+        "qk_pv_partial_merge_spmd_1",
+        "qk_pv_partial_merge_spmd_2",
+        "qk_pv_partial_plan",
+        "qk_pv_partial_plan_spmd",
+        "qk_pv_partial_plan_spmd_0",
+        "qk_pv_partial_plan_spmd_1",
+        "qk_pv_partial_plan_spmd_2",
+        "qk_pv_single_block",
+        "qk_pv_single_block_0",
+        "qk_pv_single_block_spmd",
+        "qk_pv_single_block_spmd_0",
+        "rms_recip_spmd",
+        "rms_recip_spmd_0",
+        "rope_kv_cache_spmd",
+        "rope_kv_cache_spmd_0",
+        "silu_spmd",
+        "silu_spmd_0",
+        "token_embed_group_spmd",
+        "token_embed_single_spmd",
+        "x_gamma_spmd",
+        "x_gamma_spmd_0"
+      ]
+    },
+    "other_domains_count": 47,
+    "device_execution": false,
+    "generated_leaf_columns": [
+      "function",
+      "exact_owner",
+      "prefix_owner",
+      "prefix_first_obligation",
+      "exact_cpp_bytes",
+      "prefix_cpp_bytes",
+      "exact_static_set_wait_barrier",
+      "prefix_static_set_wait_barrier",
+      "prefix_original_for_if_while",
+      "prefix_lowered_for_if_while"
+    ],
+    "owned_stage_contract": "Qualified shared effects -> selected exact/conservative policy -> actual logical command program -> certified physical lowering within eligible directional pool -> C++ for PyPTO-owned leaves. Source target catalog has8 hardware IDs before exclusions; public capture requests no6-ID restriction. Restricted-pool tests remain separate evidence. Not minimum IDs or device validation.",
+    "delegated_stage_contract": "First PyPTO obligation reported; downstream PTOAS owns its separate allocation pool. Successful delegated C++ is not certified by the PyPTO physical path.",
+    "domain_limits": "Fresh denominator is two-layer32 generated leaves; historical one-/two-layer results keep original scope. Other47 domains are unverified, not established external owners. Local atomic completion proves neither GM initialization nor cross-worker visibility/determinism.",
+    "observed_literal_ids": {
+      "path": "build-py314/general-autosync-20261115/m6-atomic/literal-id-inventory.json",
+      "sha256": "1fadcd29d8348ccae3a673c1ef295b837dcf92b09e2c957a42710b4b6347f99c",
+      "owned_leaf_counts": {
+        "exact": 2,
+        "conservative_prefix": 11
+      },
+      "used_literal_union": {
+        "exact": [
+          0,
+          1
+        ],
+        "conservative_prefix": [
+          0,
+          1
+        ]
+      },
+      "scope": "Actual owned after-sync.msgpack inserted literal event operands only. Excludes native macro internals and delegated PTOAS insertions. Observed0/1 does not establish a six-ID admission cap or a minimal physical-ID theorem."
+    }
+  },
+  "compactness": {
+    "script": {
+      "path": "build-py314/general-autosync-20261115/m6-report-draft/measure_compactness.py",
+      "sha256": "f9b8d5fe249659d277b4cbc52f11167cad22eba659a644dade3d60750f21c4ee"
+    },
+    "results": {
+      "path": "build-py314/general-autosync-20261115/m6-report-draft/compactness.jsonl",
+      "sha256": "6fd8cf9ba925085dc09d72425f8d251801aa9c924c9f5ac2ea2f7a742dd150c7"
+    },
+    "bounded_oracle_checks": 6,
+    "bounded_counts": [
+      0,
+      1,
+      3
+    ],
+    "larger_counts_static_only": [
+      31,
+      1023
+    ],
+    "scope": "Named preparation counters only; retained child export counters exclude whole-root exact analysis. No total compiler memory/runtime theorem.",
+    "columns": [
+      "kind",
+      "count",
+      "primitive_sites",
+      "children",
+      "retained_facts",
+      "services",
+      "statements",
+      "dataflow_visits",
+      "expression_visits",
+      "source_nodes",
+      "summary_nodes",
+      "demands",
+      "operations"
+    ],
+    "rows": [
+      ["primitive", 0, 6, 0, 42, 15, 17, 17, 59, null, null, null, null],
+      ["primitive", 1, 6, 0, 42, 15, 17, 17, 59, null, null, null, null],
+      ["primitive", 3, 6, 0, 42, 15, 17, 17, 59, null, null, null, null],
+      ["primitive", 31, 6, 0, 42, 15, 17, 17, 59, null, null, null, null],
+      ["primitive", 1023, 6, 0, 42, 15, 17, 17, 59, null, null, null, null],
+      ["native_child", 0, 6, 1, 94, 21, 20, 17, 51, 5, 0, 0, 1],
+      ["native_child", 1, 6, 1, 94, 21, 20, 17, 51, 5, 1, 0, 1],
+      ["native_child", 3, 6, 1, 94, 21, 20, 17, 51, 5, 1, 0, 1],
+      ["native_child", 31, 6, 1, 94, 21, 20, 17, 51, 5, 1, 0, 1],
+      ["native_child", 1023, 6, 1, 94, 21, 20, 17, 51, 5, 1, 0, 1]
+    ]
+  },
+  "validation_checkpoints": [
+    {
+      "status": "accepted historical slot gate",
+      "passed": 1791,
+      "warnings": 4,
+      "commit": "ed7590db9"
+    },
+    {
+      "status": "rejected first Rsqrt gate",
+      "passed": 1093,
+      "failed": 21,
+      "path": "build-py314/general-autosync-20261115/commits/m2-rsqrt/tests-valid.log",
+      "sha256": "61377d920e6adc5bd3cc33cd5eceee4e7dcdba240c4a2a50987d759c92638671"
+    },
+    {
+      "status": "rejected second Rsqrt fixture gate",
+      "passed": 1103,
+      "failed": 11,
+      "path": "build-py314/general-autosync-20261115/commits/m2-rsqrt/tests-fix.log",
+      "sha256": "5bb4459a4b95187b8db0ec1f1c064c9c59d041df2ff250b369d2b02a764c7b6c"
+    },
+    {
+      "status": "accepted repaired Rsqrt focused gate",
+      "passed": 24,
+      "seconds": 1.37,
+      "path": "build-py314/general-autosync-20261115/commits/m2-rsqrt/tests-final.log",
+      "sha256": "05b71d8c5228dc4c3ed15bb04315dd54937564fe8aeb0e6c3f02434adca5ec7c"
+    },
+    {
+      "status": "atomic and public-provider focused passed",
+      "passed": 444,
+      "seconds": 8.56,
+      "path": "build-py314/general-autosync-20261115/commits/m2-atomic/tests-final.log",
+      "sha256": "9f0ace5b99b68f10b5c8c59326040e7a638b202969b083d1ab502734a0abce00"
+    },
+    {
+      "status": "final broad gate passed",
+      "passed": 2437,
+      "warnings": 4,
+      "seconds": 496.55,
+      "path": "build-py314/general-autosync-20261115/final-gate/completed-tests.log",
+      "sha256": "b9beba73fd3c10848d4350672e0a12bda7d927745910f5d7e6f961bd091012e2",
+      "test_manifest": {
+        "path": "build-py314/general-autosync-20261115/final-gate/completed-tests-manifest.txt",
+        "sha256": "0d8c9391dce6adfa43579003112990e7cb5f934ed0d5384d6bc22636b86bd8ff"
+      }
+    },
+    {
+      "status": "final focused CTest passed",
+      "passed": 2,
+      "failed": 0,
+      "seconds_total": 0.35,
+      "tests": [
+        "pypto_vf_ir_contract_test",
+        "pypto_numerical_sync_order_test"
+      ],
+      "path": "build-py314/general-autosync-20261115/final-gate/completed-ctest.log",
+      "sha256": "d9e2ad9591f9081a9ac2a97b7373f643e5e8c0443e7534518a2b4dc6029bf2c1"
+    }
+  ],
+  "capture_history": [
+    {
+      "path": "build-py314/general-autosync-20261115/m6-final/exact/receipt.json",
+      "sha256": "e6e19ac8b3d761973c1bf5e176492768a9f2c5ee4cf27563a0a130d7644b977d",
+      "policy": "exact",
+      "scope": "m6-final",
+      "pypto_owned": 2,
+      "strict_expected_count": 0
+    },
+    {
+      "path": "build-py314/general-autosync-20261115/m6-final/conservative_prefix/receipt.json",
+      "sha256": "3704c3173ea2eb71f4e46330d16231af642a3b6bd45e058958efc861f8b76fa3",
+      "policy": "conservative_prefix",
+      "scope": "m6-final",
+      "pypto_owned": 10,
+      "strict_expected_count": 0
+    },
+    {
+      "path": "build-py314/general-autosync-20261115/m6-rsqrt/exact/receipt.json",
+      "sha256": "24b1c15e4f44c8e6d46027cb46fb4d34c9218d7a7f4933227473ce3a4c4d020b",
+      "policy": "exact",
+      "scope": "m6-rsqrt",
+      "pypto_owned": 2,
+      "strict_expected_count": 2
+    },
+    {
+      "path": "build-py314/general-autosync-20261115/m6-rsqrt/conservative_prefix/receipt.json",
+      "sha256": "c642dc4d10df5f089af55720c187faf3b911280b92b99e4cbe5169ba426c585a",
+      "policy": "conservative_prefix",
+      "scope": "m6-rsqrt",
+      "pypto_owned": 10,
+      "strict_expected_count": 10
+    }
+  ],
+  "native_contract_sources": [
+    {
+      "url": "https://asc.gitcode.com/api/SIMD-API/c_api/sync/intra_core_sync/asc_sync_pipe.html",
+      "premise": "A2/A3 same-pipe completion for V/M/MTE1/2/3/FIX and ALL, not S; no new primitive introduced."
+    },
+    {
+      "url": "https://asc.gitcode.com/api/SIMD-API/c_api/sync/overview.html",
+      "premise": "2201 AIC/AIV diagonal barrier and directed notify/wait combinations; local contract only."
+    },
+    {
+      "path": "docs/en/dev/ir/41-general-autosync-atomic-audit.json",
+      "sha256": "d8dd762aaad624f3525af91cc42930409cca01cbbc3bd135a203a8bf34a8c3b2"
+    }
+  ],
+  "validated_components": {
+    "public_child_provider": {
+      "commit": "36271644488d94078f6ec1a6bf75ff5aa09fbd32",
+      "source_pin": "final_capture_provenance.compiler_dirty_sources",
+      "focused_gate": {
+        "passed": 444,
+        "seconds": 8.56,
+        "path": "build-py314/general-autosync-20261115/commits/m2-atomic/tests-final.log",
+        "sha256": "9f0ace5b99b68f10b5c8c59326040e7a638b202969b083d1ab502734a0abce00"
+      },
+      "scope": "Explicit whole-original batch native-child provider; the shared focused gate also includes committed atomic family",
+      "hooks": {
+        "path": "build-py314/general-autosync-20261115/commits/m4-provider/precommit-current.log",
+        "sha256": "5c493494b1734b49a7525b435ecace874222b39324b536a46a1a74c409841dce"
+      }
+    }
+  },
+  "final_toolchain": {
+    "path": "build-py314/general-autosync-20261115/final-gate/toolchain.json",
+    "sha256": "7ed63962249d4c25902ee8f02b93c7f794961456012ce434d8a28b504b0d109c",
+    "scope": "Python executable/version/hash, C++ and CMake versions, CMakeCache/build.ninja hashes, matching extension, completed gate hashes and explicit two-worker build command."
+  }
+}

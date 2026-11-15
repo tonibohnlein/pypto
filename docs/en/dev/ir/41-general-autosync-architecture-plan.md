@@ -1,0 +1,582 @@
+# General autosync integration: architecture and Qwen acceptance plan
+
+Status: reviewed implementation slices are delivered; the six original milestones
+and whole-model ownership are **not complete**. The latest focused atomic/public
+child-provider gate passes 444 tests. The final broad gate passes 2,437 tests
+with four warnings; the earlier slot gate passed 1,791 tests. Fresh unchanged two-layer Qwen produces 32/32 C++
+leaves under either policy: exact owns 2, conservative prefix owns 11. Prefix still
+delegates 21 leaves, and 47 other observed domains remain unverified. See the
+milestone dispositions and pinned qualification below.
+Baseline: `b5597650a75b598645b1b1d3fe05bd3aab220f09`. This extends the
+[regional architecture](39-regional-sync-architecture.md). Qwen end-to-end remains
+the acceptance target, not a source of kernel-specific admission rules. Autosync
+remains default-off; the producer policy defaults to `exact`. Choosing
+`conservative_prefix` explicitly does not enable autosync or establish ownership.
+
+## Evidence and scope
+
+The current branch already has immutable published analyses, shared selected
+native contracts, checked endpoint decoding, compact flat-loop frontiers,
+indexed storage partitioning and explicit terminal completion for supported
+owned invocations. These are completed work, not new milestones.
+
+The historical whole-Qwen capture used unchanged Qwen3-14B prefill, batch one,
+sequence 128, original hidden/intermediate dimensions 5120/17408, and one/two
+layers. Its library pin was `b72c66d9df69ba5f11982b212530a255c050988d`.
+The recorded two-layer census was 2/32 PyPTO-owned leaves, 24 Buffer-admission
+refusals, five caller-coordinate refusals and one activation-partition refusal.
+Those counts belong to the old captured source snapshot, not this HEAD.
+The existing `qualify_qwen_whole_model.py` harness was refreshed at the first
+implementation gate. Its newer policy and strict named-ownership capture is recorded separately
+below; this is not a new survey.
+
+Source inspection of those captures reveals scalar planner code, data-loaded
+addresses, scratch/row operations, atomic output and paired AIC/AIV transport.
+Thus neither exact GEMM support nor local ALL barriers alone can establish
+whole-model synchronization. First refusals do not establish later feasibility.
+Native footprints, runtime visibility and device behavior remain independently
+qualified. General prefill/decode, all shapes and all targets are not implied
+by this initial model/configuration scope.
+
+## Ownership: use the compiler's existing information
+
+Paths below are relative to the checkout. The audit found these existing owners:
+
+| Responsibility | Existing service | Autosync integration |
+| -------------- | ---------------- | -------------------- |
+| Structured control | `include/pypto/ir/stmt.h`, existing visitors | Traverse `IfStmt`, `ForStmt`, `WhileStmt`, yields and returns; derive graph edges only for algorithms requiring them |
+| Effects and result ownership | `include/pypto/ir/op_registry.h`: `BufferArgEffect`, `OpArgEffectSpec`, `ExecutionMemoryAccessEvidence`, `BufferResultBehavior` | Consume data/metadata effects and allocation/alias/borrow evidence; do not create a second effect registry |
+| Placed storage and views | `buffer_root_collector.cpp`, `buffer_view_analysis.h`, `buffer_valid_analysis.h`, `buffer_indexed_analysis.h` | Preserve physical overlap, valid extents, slots and provenance; different SSA roots do not imply disjointness |
+| Operation implementations | `backend/common/buffer_{row,indexed,conversion,elementwise}_recipes.*`, `buffer_sync_contract.*` | Bind the emitted implementation to its effects, scratch, pipes, resource claims and completion behavior |
+| Arithmetic | `include/pypto/ir/arith/analyzer.h` | Reuse bounds, symbolic sets, modular facts and scoped constraints; no replacement general solver |
+| Caller/shape correspondence | `call_shape_binding.*`, `CollectSyncInvocationEvidence` in `placed_sync_import.cpp` | Retain proved relations and their caller scope, including Call/Submit distinctions |
+| Communication | `expand_mixed_kernel_pass.cpp`, `cross_core_pipe.*`, existing tpush/tpop | Preserve transport ownership; qualify local publication/acquisition/release boundaries |
+| Logical and physical sync | `token_sync.cpp`, `scoped_token_families.cpp`, assigned plans and existing emission | Keep actual-token interpretation separate from required-order analysis |
+
+The existing `StmtDependencyGraph` is an SSA def-use graph with an InOut-use
+premise and compound nodes. It is useful for its stated purpose; it does not
+replace physical conflict analysis after storage placement. No new public CFG,
+Buffer dialect or model-specific synchronization IR is proposed.
+
+## End-state and semantic boundaries
+
+```text
+Existing structured IR + placed storage + selected backend implementation
+  -> qualified effects / control / caller context
+  -> exact regional providers OR explicitly selected conservative construction
+  -> logical token program expressing the selected order
+  -> OptimizeSync (optional, correctness does not depend on it)
+  -> LowerSync: actual token and protocol order
+  -> existing resource interfaces, assignment and command emission
+  -> qualified invocation exit and domain ownership
+```
+
+Input recovery must no longer require successful exact occurrence analysis just
+to expose sound effects. Extend the existing input owners with independent
+capabilities, constructed on demand and tied to immutable input/target/context:
+
+| Capability | Required distinctions |
+| ---------- | --------------------- |
+| Effects | Exact footprint; sound enclosing footprint; unavailable operation semantics; explicit no-access |
+| Storage | Canonical physical space/root/view; possible overlap; supplied or proved disjointness and its scope |
+| Control/readiness | Original structured statement and legal cut; executable guard; value availability and visibility obligations |
+| Parameters | SSA/shape identities, assumptions and proof provenance; call/submit mappings; checked machine arithmetic |
+| Analysis | Required modeled order, demands and independent query/selector/endpoint availability |
+| Child | Sound effects per pipe; original visits; closed matching; possibly pending payloads; protocol/resource ownership |
+| Realization | Actual logical order; consuming-command protocol; physical assignment/reuse; invocation obligations |
+
+Keep `SyncStorage`'s numerical rectangle schema and `SyncSite`'s one-pipe schema
+as exact-provider views. They are not universal operation contracts. Shared
+recovery should retain original IR/storage references and optional certified
+enclosures; a compound communication operation needs its protocol adapter rather
+than an invented single-pipe payload. Factor reusable recovery out of
+`ImportPlacedSync` before numerical qualification, migrating its existing client.
+
+An operation's `Write` effect is not a full-overwrite certificate. A possible
+write never kills older obligations without a coverage proof. A descriptor
+metadata read is not automatically a payload-data read or a ready scalar value.
+Registry defaults are not evidence for missing execution semantics. Selected
+compound operations require their real pipe phases and hidden resources.
+
+An unresolved address may use its containing allocation, union of candidates,
+memory space or all classes, as justified. Enclosures cannot repair omitted
+effects, unready control or invalid program memory accesses. A selector must
+distinguish exact absence from unavailable coverage. Valid local exports remain
+available when another domain lacks an exact interface.
+
+Keep finite, rotating and numerical algorithms as precision providers. Do not
+replace them by one representation or force every consumer to build selectors.
+Retain exact mathematics after endpoint failure. An explicit coverage policy may
+make a separate conservative request; report that choice and its added order.
+
+Required order, selected logical order and physical order remain separate.
+For the existing equality-preserving LowerSync contract, a conservative
+acknowledgment must be represented in the selected logical program first:
+
+```python
+# Schematic token IR at a qualified consumer cut; not Python frontend syntax.
+forward = sync.record(p)
+sync.wait(forward, q)
+returned = sync.record(q)   # Includes the preceding imported wait and q prefix.
+sync.wait(returned, p)
+```
+
+This is intentionally stronger than the one-way prefix service. LowerSync must
+implement the supplied order, not invent reverse-prefix ordering in allocation.
+Matching, progress and consumption-before-republication are additional proofs;
+payload-order equality alone cannot justify removing command-only handshakes.
+Unknown-trip guarded protocols need structural proofs, not finite sampling.
+
+The general scoped parser retains its payload-cut contract. A separate qualified
+closed-protocol path now accepts the four-command form above and local two-command
+completion at original cuts, including empty prefixes and wait-to-record forwarding.
+It does not fabricate payload sites or broaden the general parser to arbitrary
+command programs. Its supported grammar and proof are recorded in the ledger.
+
+Regional common completion and conservative prefix services remain distinct
+policies. The six public token operators currently have no general ALL-pipe
+operator. Before adding regional completion, review whether a qualified ordered
+token protocol expresses it exactly, or whether a separate IR/RFC change is
+needed. The public terminal drain is not a general in-loop completion export.
+No implicit public IR extension is authorized by this plan.
+
+## Execution domains and ownership
+
+Buffer is the owner of tile storage geometry. Pure scalar programs must not need
+dummy Buffer loads/stores just to pass the current automatic selection heuristic.
+Their scalar memory effects, visibility, native order and invocation exits still
+need qualification. A no-sync result is an established property, not failure to
+find an effect. Barrier-only/empty-plan ownership requires an explicit supported
+PyPTO/PTOAS agreement; do not manufacture SET/WAIT markers.
+
+Mixed AIC/AIV programs keep their existing transport. Local tokens protect local
+work around publication, acquisition and release; they do not become TaskIds or
+cross-core completion tokens. Transport contracts must expose participants,
+borrowed storage lifetime, visibility, legal local cuts and overlapping resource
+claims. Paired domains are qualified together where the proof requires it; a
+partial ownership change must not invalidate the peer protocol.
+
+Atomic output needs its registered read/write modes, native implementation,
+footprint/enclosure and completion contract. Local autosync does not establish
+inter-worker atomic semantics or algorithmic race freedom. The existing eligible-ID policy,
+native scalar rule and qualified accumulator exemption remain unchanged.
+
+## Milestones and dependencies
+
+Each implementation gate requires an architecture/correctness review and
+independent bounded validation before dependent work proceeds. This is a coherent
+end-state delivered incrementally, not a minimum-diff objective. Existing
+services must be migrated when extended; delete replaced duplicate paths.
+
+### M1 — Shared qualification and domain ownership
+
+Extend `SelectBufferIRFunctions`' Boolean admission to retain a typed first
+obligation (operation, property, stage, source location) without swallowing
+internal errors. Connect registry effects, backend selection, storage and
+readiness to an input contract usable independently of exact-loop admission.
+Use existing result/diagnostic conventions rather than a universal new registry.
+Refresh the existing whole-model capture and record every generated domain,
+including externally owned communication and scalar work.
+
+Before: an unsupported atomic store leaves a function in Tile IR and autosync
+reports only "requires physically placed Buffer IR". After: the coverage report
+identifies atomic Buffer lowering/implementation qualification as the first
+obligation, distinct from any downstream mathematical or resource refusal.
+
+Acceptance: identical accepted exact outputs, complete leaf accounting, explicit
+unknown vs no-access tests, metadata vs data effects, overlapping views and
+Call/Submit scope tests. Distinguish an unavailable synchronization footprint
+from an invalid address calculation; a sound enclosure cannot discharge the
+program's memory-safety preconditions. No missing information is converted to
+an empty summary.
+
+### M2 — Complete the operation and storage contracts
+
+Use the existing Buffer recipes and analyses to connect selection, lowering,
+effect recovery, footprint or enclosure, native claims and emission. Work in
+generic families: row/scratch, partial-valid views, scalar/indexed access and
+atomic transfer. Native meaning is a prerequisite, not inferred from op names.
+Each family is independently gated; the first local conditional-buffer slice
+does not depend on completing atomic or cross-core qualification. Update
+bindings/docs only if a public contract changes.
+
+Acceptance: row reductions with scratch reuse; overlapping typed views; changing
+valid extents; scalar reads feeding addresses/control; atomic read/write effects;
+negative unsupported native variants. Check non-Qwen reduction, indexed and
+elementwise fixtures alongside the corresponding original Qwen leaves. Reject
+invalid valid-extents/overflow distinctly from uncertain but soundly enclosed
+locations; supplied memory-validity assumptions remain named caller contracts.
+
+### M3 — General structured conservative construction and protocol lowering
+
+Use the existing structured statements. For basic may-access facts, sequence
+composes transfers, branches union, and loops take a bounded monotone fixed
+point with zero-trip/backedge/final-false paths. Track class, mode and source
+pipe; protect non-storage requirements separately. Begin without KILL.
+Extend actual-token interpretation to genuine current-prefix command cuts,
+including empty prefixes, forwarded waits and command-only paths.
+
+Example: `if refresh: load(x); use(x)` must protect the use on both paths under
+the initialized-input contract; a skipped load cannot erase incoming history.
+The chosen conservative policy emits its selected protocol in logical IR,
+including any acknowledgment strengthening, before physical lowering.
+
+Acceptance: skipped/conditional writers, both service orientations, zero and
+multiple visits, counter resets, fan-out and empty-prefix semantics, command-only
+deadlocks, scalar-produced control and insufficient reverse directions/resources.
+Interpret actual emitted commands independently. Missing progress or reuse proof
+is a refusal, not permission to change allocation or add hidden synchronization.
+Prove loop-local logical matching identities, branch-compatible command visits,
+acknowledgment reset/rearming and progress for the admitted unknown-trip control
+structure. A may-access fixed point proves none of those protocol properties.
+Do not transfer direct-handoff allocation premises to command-only protocols;
+any additional sufficient certificate must be justified through existing resource
+interfaces, or remain unavailable.
+Common-completion encoding receives a separate design subgate if needed.
+
+### M4 — Retained children and communication composition
+
+Export sound child effects without requiring exact GM selectors. Retain compact
+mathematics, original coordinates and internal token code. Prove entry readiness,
+closed notification matching, pending payload summaries, joint palette ownership
+and cross-visit rearming. A child boundary itself completes nothing.
+Extend existing cross-core transport contracts with local readiness/release
+obligations; do not replace tpush/tpop with local flags.
+
+Acceptance: exact repeated child in an irregular parent with shared storage,
+zero/skipped/reset visits, palette collisions and missing boundary evidence;
+paired AIC/AIV borrowed-buffer wraparound, unmatched peer control and reserved
+resource conflicts. Check added and removed payload prerequisite pairs, not
+only counts. Preservation of child code does not prove no added global order.
+
+### M5 — Relational caller facts and parameterized exact composition
+
+This is an independent precision/coverage track after M1, not a prerequisite
+for all conservative synchronization. Extend invocation evidence using
+`CallShapeBindingPlan`, `arith::Analyzer` and existing original-coordinate
+services. Preserve established relations instead of reducing everything to
+independent numerical intervals. Extend activation partition/export only for
+declared symbolic forms with controlled size and executable predicates.
+
+Example: `offset = layer * 5120` needs a justified relation to the allocation's
+row extent and checked narrowing/arithmetic. A benchmark helper setting
+`rows = layers * 5120` is not an enforced compiler premise. Likewise `6*band`
+and `17*band` must retain their common SSA parameter rather than unrelated ranges.
+No caller-value enumeration or whole-nest expansion is allowed.
+
+Acceptance: original projection/gate-up source, invalid/missing caller relations,
+multiple callers and submits, narrowing, zero/short trips, reset identities,
+independent actual covers/all event queries/local and GM selectors. If a sound
+enclosure resolves only synchronization geometry, report the remaining program
+validity and readiness premises separately.
+
+### M6 — Whole-model acceptance and deployment
+
+Requires the applicable contracts from M1–M4 and any unresolved parameter
+requirements from M5. Establish explicit empty/barrier-only ownership with
+PTOAS before counting scalar leaves as PyPTO-owned. Preserve existing task and
+transport owners while requiring PyPTO ownership for supported local autosync
+domains. A delegated local leaf remains a coverage gap, not an external owner.
+
+Compile the unchanged pinned Qwen model with strict expected-ownership checks.
+Record input configurations, generated specializations/domains and executed
+tests as separate denominators. Test task transitions, repeated invocations and
+final stores. Compare PyPTO/PTOAS with identical terminal-completion policies.
+Host code generation, logical correctness, physical feasibility and device
+behavior are separate outcomes. Default dispatch stays unchanged until a
+separate deployment decision.
+
+Dependency order: M1 first; M2 by operation family feeds M3; M3 feeds M4; M5
+can proceed independently once caller contexts are established; M6 joins them.
+The compiler expert recommends a conditional buffered transform as the first
+vertical slice. Its generic fixture covers dynamic counts/valid extents, skipped
+stores, local reuse, zero visits and resets. The original Qwen candidate is
+`mlp_out_cast`, whose captured shape is:
+
+```text
+for hb = block; hb < 40; hb += 20:
+    load a [128,128] FP32 tile
+    if hb == 0: store a [1,8] slice to the completion tensor
+    cast the full tile to BF16
+    expose a [valid_tt,128] view
+    store that view at [m0,hb*128]
+```
+
+First diagnose its precise Buffer view/validity refusal and establish the scalar
+parameters' contracts; this is a proposed witness, not a certified admission.
+Do not specialize `valid_tt` or loop counts to captured values. The generic
+family drives the interface; passing Qwen's two-visit launch is insufficient.
+This exercises shared effects, structured conservative construction, actual-token
+lowering and physical reuse without requiring atomic or cross-core semantics in
+the first implementation. Those remain required later for the whole model.
+
+## Validation, cost and review contract
+
+All gates keep independent required-order extraction separate from compiler
+generators. Check access agreement/enclosure coverage; actual retained covers
+where exactness is claimed; all four event queries; selector absence vs
+unavailability; logical command order; physical matching/progress/reuse; and
+payload/control preservation. Recheck compact K, replay, zero-inner-body,
+scalar/Cube exemptions and terminal drains. Bounded execution tests supplement,
+not replace, parameter-uniform arguments.
+
+For dataflow, let J be the qualified class/mode/pipe fact universe. Delta
+propagation should charge O((V+E)J) fact propagation and O(VJ) retained sets,
+plus access recovery, service lookup and protocol work. This is not automatically
+O(N log N). Decide a sound class-coarsening policy or a documented complexity
+exception before broad production admission; never cap work and publish an
+incomplete result. Exact geometry/interface output sizes remain explicitly
+charged. Repeat proofs, symbolic predicates and selected command circuits must
+not unfold runtime trips.
+
+Measure static sites, class incidence, control depth, symbolic dimensions and
+trip counts independently. Record rejected attempts, conversions, retained
+interfaces, analysis/export/endpoint/allocation time, static/executed commands,
+guard work and excess payload order. Optional service pruning follows a joint
+coverage/protocol certificate and is not required for the first correct route.
+
+The previous PTOAS `PrefixInput`, `PrefixServices`, `PrefixRecipe` and child
+qualification work are sources of tested algorithms and negative cases. Reuse
+their reasoning where premises match; do not transplant their MLIR adapters,
+native assumptions or physical-order strengthening into PyPTO unchanged.
+
+Each gate's review must identify existing owners reused, duplicate code removed,
+new proof obligations, independent tests, size bounds and rollback behavior.
+Unsupported effects, geometry, readiness, mathematical/export capabilities,
+resource evidence and ownership remain distinct refusals. A whole-model promise
+is conditional on these contracts; no finite set of successful kernels proves
+arbitrary-kernel synchronization.
+
+## Design review disposition
+
+Both reviewers accepted the design after making two obligations explicit:
+unknown-trip protocol identity/progress/rearming needs its own proof, and a
+conservative enclosure cannot establish program address validity. Acceptance is
+for the plan, not the unimplemented algorithms, proposed native contracts or
+Qwen admission. No compiler source, allocation algorithm, protocol or deployment
+setting changed during that initial design assessment. The companion
+[source-audit receipt](41-general-autosync-architecture-plan.json) pins the
+inspected sources and historical evidence; it contains no new performance data.
+
+## Implementation gate ledger
+
+The [implementation receipt](41-general-autosync-implementation.json) preserves
+historical M1/static-cast evidence and adds current source/tool pins, raw logs,
+all 32 generated leaves and the 47 other domain names. Accepted slices do not
+satisfy every original milestone. No device execution or all-function ownership
+is claimed.
+
+| Milestone | Delivered scope and evidence | Remaining contract and responsible owner |
+| --------- | ---------------------------- | ---------------------------------------- |
+| M1 | `71b83d34b`: shared static operation qualification and typed first obligation; original 984-test gate and 32 byte-identical C++ leaves. | Shared readiness/operation producers still owe scalar/indexed value visibility and unsupported execution semantics. Effects alone are insufficient. |
+| M2 | `fb0727c53`, `76221dc46`, `eff99b7de`, `ed7590db9`, `c4b9c237e`: static cast, contiguous views, implicit scratch/MUL, per-use INDEX slot proof and default Rsqrt. `a111cd34a` adds the qualified atomic family. | Native implementation and geometry owners must qualify other layouts, dynamic casts, high-precision Rsqrt and broader atomic modes. Existing GM initialization, cross-worker visibility and reduction determinism are not supplied by local atomic completion. |
+| M3 | `ce4d593b5`: explicit `conservative_prefix` production policy, no-KILL effects, actual closed command protocol and physical lowering. | Admission still requires qualified effects/readiness and local execution. This is not general scalar/transport recovery. |
+| M4 | `ce4d593b5` consumer plus newly tested public `prepare_native_sync_children` batch producer (`362716444`). Handles retain one whole-original exact analysis; all-public producer → Insert → Optimize → Lower → PTOAS and independent command oracle pass in the 444-test gate. | The retained-child/resource owners still owe eventful matching, joint palettes, rearm and transport contracts. The implemented native-only resource-empty slice does not complete that broader milestone. |
+| M5 | `fad11f7f4`: checked scoped numerical caller correlations; 68 tests and fresh Qwen C++ equality. | Invocation/relational providers still need symbolic activation/shape relations, carried-state and external ABI evidence. No benchmark bounds are injected. |
+| M6 | Strict named-domain harness, final 32-leaf census, ten compactness rows and six bounded command/byte checks. The 2 exact and 11 prefix required-name sets pass. | The 2,437-test broad gate passes. Whole-model acceptance remains open: 21 prefix delegates, 47 other unverified domains, and empty/barrier-only downstream ownership agreement. |
+
+The narrow atomic recipe is default A2/A3 FP32 Acc → packed ND FP32 GM atomic
+add. It models the destination as read/write through the shared call-qualified
+effect registry, preserves its existing transfer geometry and selected native
+configuration/reset implementation, and claims no hidden flags or scratch.
+The [pinned native audit](41-general-autosync-atomic-audit.json)
+separates this local contract from initialization and cross-worker semantics.
+An unsupported variant is not treated as an ordinary write or empty effect.
+
+The public M4 factory requires an active context's target and explicit disjoint-GM
+premise for **one whole original placed-function exact analysis**. Requested loop
+scopes are original, unique and nonoverlapping; failure returns no partial list.
+There is no detached child analysis or automatic backend search. Each handle owns
+the immutable mathematics after the call returns. The exporter still rejects
+external child effects, unsupplied caller/launch premises and event resources;
+its conservative parent does not inherit the root's disjoint-GM premise. See the
+[public API contract](../passes/60-logical_sync_pipeline.md#closed-current-prefix-transactions).
+
+M5 proves original machine-width operands and intermediates before simplifying
+correlations. Bindings are valid at their definition cut; branch facts and local
+definitions are restored on exit, and unknown callers poison joined numerical
+bounds. A later branch cannot legitimize an earlier overflow. This produces
+numerical evidence for existing consumers, not a symbolic callee relation ABI.
+
+## Current qualification and reproduction
+
+The latest receipts are under
+`build-py314/general-autosync-20261115/m6-atomic/{exact,conservative_prefix}`.
+Both use compiler base `c4b9c237ed1606fa29484504c93955c5c3002fec` **plus the recorded
+dirty-source hashes and binary**, not an assumed clean commit. Library/model pin:
+`b72c66d9df69ba5f11982b212530a255c050988d`; unchanged Qwen3-14B prefill, two layers,
+batch 1, sequence 128, dimensions 5120/17408. The machine receipt records the
+Python version, matching extension hash, PTOAS 0.72 launcher/native tool hashes,
+exact argument vectors, environment and source locations. Full model input/hash
+inventories remain in the pinned raw receipts rather than being copied here.
+
+| Policy | C++ leaves | PyPTO-owned | Delegated | Required-name gate | Inclusive seconds | C++ bytes |
+| ------ | ---------: | ----------: | --------: | -----------------: | ----------------: | --------: |
+| exact | 32/32 | 2/32 | 30/32 | 2/2 | 6.5621 | 1,399,234 |
+| conservative_prefix | 32/32 | 11/32 | 21/32 | 11/11 | 7.7847 | 1,440,504 |
+
+The table describes the **fresh two-layer capture only**; historical one-/two-layer
+observations retain their own denominators. C++ sizes compare the same 32 generated
+artifacts, not runtime cost. The 47 other domains are unverified, not certified
+external owners. These single inclusive timings establish no speedup.
+C++ bytes are actual file lengths; per-file hashes were checked. No device test
+was run. Earlier pre-Rsqrt census commands requested no strict names; they remain
+historical census evidence only. The later Rsqrt capture passed explicit 2/10
+name sets without ownership gain: `final_rmsnorm` progressed from Rsqrt refusal
+to `tile.col_expand_mul`. Atomic qualification subsequently makes `down_proj`
+prefix-owned; exact still refuses its unproved caller coordinate range.
+
+Reproduce using the existing `tests/ut/ir/transforms/qualify_qwen_whole_model.py`
+with `--layers 2 --policy exact` or `--policy conservative_prefix`, the recorded
+library/tool paths and **every** recorded `--require-function` argument. Exact
+requires `mlp_out_seed` and `silu`; the eleven prefix-owned names are precisely the
+`pypto` rows below. The receipt pins the full command, required names and outcome;
+omitting names changes the qualification into a census.
+
+| Function | Exact owner | Prefix owner | Prefix first obligation | C++ bytes exact / prefix | Prefix SET / WAIT / barrier |
+| -------- | ----------- | ------------ | ----------------------- | -----------------------: | --------------------------: |
+| `attention_finalize_phase` | ptoas | ptoas | type_layout/Var | 15709 / 15709 | 0 / 0 / 0 |
+| `down_proj` | ptoas | pypto | — | 23962 / 31408 | 104 / 104 / 27 |
+| `final_rmsnorm` | ptoas | ptoas | operation_recipe/tile.col_expand_mul | 19185 / 19185 | 0 / 0 / 0 |
+| `gate_up_proj` | ptoas | pypto | — | 30559 / 41172 | 144 / 144 / 37 |
+| `kv_proj` | ptoas | pypto | — | 31191 / 42357 | 144 / 144 / 37 |
+| `lm_head` | ptoas | ptoas | type_layout/Var | 22780 / 22780 | 0 / 0 / 0 |
+| `mlp_out_cast` | ptoas | pypto | — | 12696 / 13466 | 16 / 16 / 5 |
+| `mlp_out_cast_0` | ptoas | pypto | — | 12727 / 13497 | 16 / 16 / 5 |
+| `mlp_out_seed` | pypto | pypto | — | 7371 / 7714 | 4 / 4 / 3 |
+| `out_proj_aic` | ptoas | pypto | — | 19113 / 24565 | 72 / 72 / 19 |
+| `out_proj_aiv` | ptoas | ptoas | operation_recipe/tile.cast | 13110 / 13110 | 0 / 0 / 0 |
+| `out_proj_aiv_0` | ptoas | ptoas | operation_recipe/tile.cast | 13142 / 13142 | 0 / 0 / 0 |
+| `post_rmsnorm` | ptoas | ptoas | type_layout/Var | 22611 / 22611 | 0 / 0 / 0 |
+| `q_proj` | ptoas | pypto | — | 19104 / 24556 | 72 / 72 / 19 |
+| `qk_pv_partial_merge` | ptoas | ptoas | type_layout/Var | 42305 / 42305 | 0 / 0 / 0 |
+| `qk_pv_partial_plan_aic` | ptoas | ptoas | type_layout/Var | 208297 / 208297 | 0 / 0 / 0 |
+| `qk_pv_partial_plan_aiv` | ptoas | ptoas | type_layout/Var | 208459 / 208459 | 0 / 0 / 0 |
+| `qk_pv_single_block_0_aic` | ptoas | ptoas | type_layout/Var | 85114 / 85114 | 0 / 0 / 0 |
+| `qk_pv_single_block_0_aiv` | ptoas | ptoas | type_layout/Var | 85276 / 85276 | 0 / 0 / 0 |
+| `qk_pv_single_block_aic` | ptoas | ptoas | type_layout/Var | 85106 / 85106 | 0 / 0 / 0 |
+| `qk_pv_single_block_aiv` | ptoas | ptoas | type_layout/Var | 85268 / 85268 | 0 / 0 / 0 |
+| `qkpv_plan` | ptoas | ptoas | type_layout/Var | 139663 / 139663 | 0 / 0 / 0 |
+| `rms_recip` | ptoas | ptoas | type_layout/Var | 15858 / 15858 | 0 / 0 / 0 |
+| `rms_recip_0` | ptoas | ptoas | type_layout/Var | 15892 / 15892 | 0 / 0 / 0 |
+| `rope_kv_cache` | ptoas | ptoas | type_layout/Var | 81374 / 81374 | 0 / 0 / 0 |
+| `save_prefill_last_token_group` | ptoas | pypto | — | 8785 / 8910 | 4 / 4 / 3 |
+| `save_prefill_last_token_single` | ptoas | pypto | — | 8396 / 8521 | 4 / 4 / 3 |
+| `silu` | pypto | pypto | — | 14556 / 13564 | 40 / 40 / 11 |
+| `token_embed_group` | ptoas | ptoas | type_layout/Var | 12043 / 12043 | 0 / 0 / 0 |
+| `token_embed_single` | ptoas | ptoas | type_layout/Var | 10556 / 10556 | 0 / 0 / 0 |
+| `x_gamma` | ptoas | ptoas | operation_recipe/tile.cast | 14497 / 14497 | 0 / 0 / 0 |
+| `x_gamma_0` | ptoas | ptoas | operation_recipe/tile.cast | 14529 / 14529 | 0 / 0 / 0 |
+
+**The command columns are not a whole-plan optimization comparison.** Exact and
+prefix own different leaf sets (2 versus 11), and their published PyPTO-stage
+metadata excludes downstream PTOAS insertions for 30 versus 21 delegated leaves.
+A delegated row's zero therefore does **not** mean synchronization-free C++.
+The respective 8/8/8 and 620/620/169 SET/WAIT/barrier totals describe only those
+unequal owned subsets, not a benefit or regression of complete synchronization.
+They are static sites, not executed command counts. Coarse enclosures can add
+substantial order/control work. The machine table also retains original and
+lowered For/If/While counts.
+
+For every PyPTO-owned leaf in this capture, the qualified path is shared effect
+qualification → selected exact/conservative policy → actual logical command
+program → certified physical lowering within the eligible directional pool →
+C++ emission. The current target catalog has eight hardware IDs before policy
+and native-claim exclusions; the public capture does not request a six-ID cap.
+Restricted-pool tests are separate evidence. This is a compiler certificate for
+the admitted local protocol, not minimum-ID or device validation. Delegated leaves
+report their first PyPTO obligation separately and proceed through PTOAS's own
+allocation pool; their C++ outputs are **not** certified by the PyPTO path. Neither
+local atomic completion nor this ownership flag proves GM initialization,
+cross-worker visibility or deterministic reduction.
+
+A separate inventory of actual owned `after-sync.msgpack` outputs observes only
+literal event IDs 0 and 1 across the two exact-owned and eleven prefix-owned
+leaves. The hashed `m6-atomic/literal-id-inventory.json` retains every direction.
+It excludes native macro internals and delegated insertions; this observation
+neither imposes a six-ID admission cap nor proves a minimal ID count.
+
+Validation preserves failed checkpoints: the first Rsqrt gate had 21 failures
+and 1,093 passes; a later fixture gate had 11 failures and 1,103 passes. Both were
+repaired before the final 24-test Rsqrt gate passed. The atomic/public-provider
+gate passes 444 tests in 8.56 seconds. The earlier slot gate passed 1,791 tests
+with four inherited warnings. **Final broad gate: 2,437 passed, four warnings,
+496.55 seconds.** Its exact test manifest and completed log are hashed in the
+receipt. The final focused CTest gate also passes 2/2 (VF IR contract and numerical
+sync order), 0.35 seconds total. `final-gate/toolchain.json` pins the Python
+executable/version/hash, C++/CMake versions, build cache/Ninja hashes, matching
+extension, test logs and explicit two-worker build command. Both files are hashed
+in the implementation receipt. Failed logs are not replaced by passing receipts.
+
+## Validity premises and construction cost
+
+The proof uses qualified native semantics, not merely the presence of registered
+operations. The [A2/A3 pipe-completion contract](https://asc.gitcode.com/api/SIMD-API/c_api/sync/intra_core_sync/asc_sync_pipe.html)
+permits V, M, MTE1/2/3, FIX and ALL completion and excludes S. The
+[2201 AIC/AIV synchronization tables](https://asc.gitcode.com/api/SIMD-API/c_api/sync/overview.html)
+provide the diagonal barriers and directed notification/wait combinations.
+Existing DMA/FIX completion operations consume these contracts; this work adds
+no new native primitive and supplies no device validation.
+
+1. Original operations contribute may-read/may-write facts by class and pipe.
+   Sequence propagation and branch union retain prior obligations. Loop input is
+   IN union GEN(body), covering zero visits/backedges without unfolding. There is
+   no KILL; possible writes do not erase conflicts or establish value readiness.
+2. Each cross-pipe service explicitly supplies `record(p), wait(q), record(q),
+   wait(p)`. Same-pipe services use the qualified two-command completion form.
+   Physical lowering interprets that order rather than inventing acknowledgment.
+3. Forward consumption precedes return publication; return consumption precedes
+   next forward publication. Opposite orientations use distinct roles. Sequence,
+   branch and sequential-loop structural induction establish closed notification
+   state and rearming, including skipped/zero visits. At most two eligible IDs
+   per directed namespace suffice for this protocol; a failed pool request is
+   not a hardware minimum-capacity theorem. ALL completes payloads but does not
+   consume unmatched flags.
+4. Native-only children retain original owner/target/scope, no flag lifetime and
+   pending may-effects. Native Acc protection removes its qualified hazard only;
+   it does not add an invented full completion-to-next-start edge. Eventful or
+   peer-transport ownership requires a separate certificate.
+
+Let N count original statement occurrences, C the finite space/pipe/read-write
+fact universe, E actual readiness-query DAG visits, and K selected static services.
+The implemented ordered-set no-KILL analysis has conservative accounting
+O(N C log C + N C² + E) work and O(N C) fact state; C is target-fixed. E deduplicates
+within each query, not globally. Requested control paths add their output depth
+to one original parent index. Realization retains O(K) static command sites (two
+local or four cross-pipe commands per service), with no trip-count expansion.
+This excludes exact child-provider construction, requested diagnostics, map/name
+lookup, verification and later compilation; it is not a whole-compiler linear bound.
+
+The serial compactness diagnostic covers counts 0/1/3/31/1023 in primitive and
+native-child forms. All ten rows complete; six bounded actual-command/physical-byte
+checks at counts ≤3 pass. Larger counts are static-only. Primitive rows retain
+six sites, 42 facts, 15 services and 17 statement/dataflow visits. Native-child rows
+retain six primitive sites plus one child, 94 facts, 21 services, 20 statement and
+17 dataflow visits; nonzero child exports visit five source nodes and one summary
+node. These named counters exclude whole-root exact analysis cost and peak RSS.
+Script and output hashes are in the implementation receipt.
+
+The child command oracle explicitly checks the barrier difference
+`outer_visits * (1 - inner_count)`: zero-trip imports can add entry barriers.
+Payload order containment, matching and causal reuse remain required. No universal
+compactness, fewer-command or speedup claim follows from this fixture.
+
+## Remaining contracts and paper consequences
+
+| Remaining contract | Missing evidence and owner |
+| ------------------ | -------------------------- |
+| Broader atomic modes/concurrency | Native implementation and execution-domain owners must supply variant effects, valid initial GM state, external ordering/visibility and any determinism guarantee. The admitted local atomic-add slice does not establish these. |
+| Scalar/indexed readiness | Readiness owners must prove definition-to-use visibility and valid original cuts; storage enclosures cannot make asynchronous address/control values ready. |
+| Layouts/dynamic casts | Selection/lowering/native-contract owners must agree on descriptor, valid extents, precision, scratch and resource effects. Missing recipes are not empty accesses. |
+| Eventful children/transport | Child and transport exporters must provide matching confinement, pending effects, joint palettes, rearming and acquire/release ownership. Native-only imports cannot substitute for them. |
+| Symbolic relations | Invocation and exact-interface owners must retain checked caller relations and their scope; benchmark values do not establish external ABI premises. |
+| Empty/barrier-only ownership | PyPTO and downstream compilation must agree that all obligations are discharged; absence of flags is not a fake ownership marker. |
+
+The mathematical kernels retain their qualified claims. Practical compilation
+also pays for recovery, conversion, exports, selected protocol construction,
+allocation and generated control. Compact dependence analysis alone proves none
+of their whole-compiler bounds. Conservative prefix is an explicitly stronger
+selected order, while LowerSync preserves the supplied actual-token order. Partial
+coverage identifies specific unprovided contracts; it is not evidence that the
+algorithms or hardware are inherently incapable. All six original milestones and
+whole-model ownership remain incomplete at this checkpoint.

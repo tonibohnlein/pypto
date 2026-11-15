@@ -1,0 +1,92 @@
+{
+  "kind": "source-audit-and-architecture-plan",
+  "compiler_revision": "b5597650a75b598645b1b1d3fe05bd3aab220f09",
+  "review_status": "accepted_plan_only",
+  "implementation_status": "not_started",
+  "source_sha256": {
+    "include/pypto/ir/stmt.h": "da38209dafcde1b8b0974a78053bc18fcd35831203eff8aa294ec099f934a600",
+    "include/pypto/ir/op_registry.h": "fdacd9f58b8aa1cb695e0a2a837a22cf04cda5f74c7aa1c01ab3ee6aa2845820",
+    "include/pypto/ir/arith/analyzer.h": "cac72150b06b06af34623fdc4969a9cc77452c2c6b57188628a45035ba97dc93",
+    "include/pypto/ir/transforms/utils/stmt_dependency_analysis.h": "f31b6304724299682dec11e4529ba21ecf3542377fcc1650a8f217881402ddc9",
+    "include/pypto/ir/transforms/utils/call_shape_binding.h": "63b435e523efc5f34fbbd60bf75fb198deeefa45a789b5e867e8f34a9e9470a0",
+    "include/pypto/ir/transforms/utils/buffer_view_analysis.h": "96e5e9786d2c4e47ffb8afb3f86697ddca3c24f4e361056309cca05ad0ec2b3b",
+    "include/pypto/ir/transforms/utils/buffer_valid_analysis.h": "87f94a2dd0f66af56ce65684beb712028384c6c81acf9cb380a315bc6b1a23fb",
+    "include/pypto/ir/transforms/utils/buffer_indexed_analysis.h": "0dab095e2b3d0e13f457f39bad58d8b18348a72a0cdda1ff028992dc200ad78b",
+    "include/pypto/ir/transforms/utils/cross_core_pipe.h": "7e3dcedfb0371bda0accd86a498ca55f3cca278ce2b06388bbfdf30db50b8332",
+    "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "a1170b5163ff5399c4a26e8db4ba67ff6736513f6a56c9d8b84cb5640c2da93b",
+    "src/ir/transforms/utils/placed_sync_import.cpp": "7d732d17fbf77e2a0c626073fcc9b54b5a6dda80afba2d5cba9972fc5a80a75f",
+    "src/ir/transforms/utils/scoped_token_families.cpp": "a247200da39818a95d393a51da286e89e27917a6e683c09a830149c1b2e02c13",
+    "src/ir/transforms/token_sync.cpp": "b94d730ed1c72338aa3bbdf7ca20d75365232a63a87d978118ffecfa9322a5e4",
+    "include/pypto/backend/common/buffer_sync_contract.h": "df25d7718c0d43ba53e28aad08e7770b9a9a4cdce47a7e1386f9695846f428b4",
+    "src/backend/common/buffer_sync_contract.cpp": "800d97ccfe47f1a7270a1d8c92ef00086a67b44987814b08773e11e5c8945341",
+    "docs/en/dev/ir/39-regional-sync-architecture.md": "c574511402c462ba89a4c46c4480eac3a1016d7c9a94c0f397c1c6b8c8a881ad",
+    "docs/en/dev/ir/40-sync-construction-and-completion.md": "f9dc5e398e75e0b887953f7d24b5e001ba6a364aa23c6c2861ebd818e236368f",
+    "docs/en/dev/ir/41-general-autosync-architecture-plan.md": "bfb39e0b89aefbeef463c47a963daf38ae5ab2a6752618998e750a10484e2f97",
+    "docs/zh/dev/ir/41-general-autosync-architecture-plan.md": "935dd83c470d23125dc81f524935165bf8b8fd37b126047774ec7b1c2c7bb506"
+  },
+  "historical_evidence": {
+    "capture": "build-py314/latest-qwen-20261113/final-source",
+    "receipt_sha256": "b323e0ac2c9143af1f216ae7763634d2c89aadee86682632ec31acae59ac2789",
+    "before_sync_sha256": "5a679415346a902b6fb821b8d09ba4acf08ca31840ab94094dcda56457331481",
+    "compiler_revision": "e55b323b1c9d9abefcca03fd438f725c3ac9ca47",
+    "library_revision": "b72c66d9df69ba5f11982b212530a255c050988d",
+    "model_sources": {
+      "config.py": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+      "constants.py": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+      "contract.py": "f16c43df64c42769dc365a820e5fbc0ff6e9c4d3ceada21660003869ccbeaf15",
+      "decode_fwd.py": "c2f7288ce1e45cbe9fe99d60484aed7a4cb6b4d7255701c4692692a7586dd6f3",
+      "decode_layer_a8w8.py": "4074dea2e5225818108bc088d06dc1717cb2706dd004255a96c05843ba7a5fb8",
+      "decode_ssn_draft.py": "55016c298d42f77500e87bccdf020dbc3e78210cbe1a4c526b97f59466d77705",
+      "decode_tq_draft.py": "9daf2b9b1851d646552cb75504f33aad4766569ff740462a16cdf06d99f352ec",
+      "greedy_sample.py": "8f3fc3e4c533abf01140b299cac35a11185c5151e92df5ba84327afdfa3fceb8",
+      "paged_attention_cce.py": "aafa0bc6dde1758f5518081f3814449e0ca93d137451b67065a06f4b8a375b2d",
+      "paged_attention_pypto.py": "4087a49cd0b6c6396d4fef859576a02f8c6b096e9b94f5b55560e1f4b238e843",
+      "prefill_fwd.py": "3e05b6f910055549d6f89c24743dc384acfb0134be059efe4351b72092824dcb",
+      "prefill_fwd_a8w8.py": "3f359f5b5147c025efa21152117f75291c07826d9675f0a5bc9b76c3a13c67ac",
+      "prefill_tq_draft.py": "0eb51c30bfce55eabbb3318d39542813aef8687858957e41dcfafd5b93c5d8da",
+      "rms_lm_head.py": "0cafe8226d85659afd9d1c19e3c9ae46269a109a7c3c501d846a366e3826e3ce",
+      "rope_qkv_regen.py": "17d868b0527f6555e48426d4fe74526c8d72b5126d442efd2727cf9078c94076",
+      "test_paged_attention_cce.py": "7098e2cea21d017ef6f13f0261b19d37a3af62103045543862cf51b99d793f6c",
+      "test_paged_attention_pypto.py": "9bf0d2ea18b5d995a846858df23c301e32ff79849a08a1bb4250101ff468f32d",
+      "topk_select.py": "60ddb96ee27846c0dfb23f95a59cf53701eed94cca88bf7b5eb3802a5aaef267",
+      "turboquant_kv.py": "d49c3cb4764e524b96be5bffd57cbf6138061e65c5b762ac4781741d2181bf7d",
+      "weights.py": "d23e15850574369379e8140eb7a97be000274250dd6369544cc2108132125bf5"
+    },
+    "configuration": {
+      "layers": 2,
+      "sequence": 128,
+      "batch": 1
+    },
+    "compiler_dirty_sources_in_original_receipt": true,
+    "fresh_current_head_result": false
+  },
+  "draft": {
+    "revision": "7f2f24486b4390748902558415234eff9e756819",
+    "working_file_sha256": {
+      "sections/approximate_demands.tex": "f46d85e74d4a58906c81bbb4392c9aee14675c870902eb00a7d85d1e557fe9de",
+      "sections/combined_algorithm.tex": "a9297986154c644f91b5d6500d9c1ab9ef6ff9e8ff93edc63702560db6ce2500"
+    }
+  },
+  "review": {
+    "compiler_expert": "accepted",
+    "independent_architecture_reviewer": "accepted",
+    "required_refinements": [
+      "Explicit unknown-trip matching, command visit compatibility, progress and rearming proofs",
+      "Address validity distinguished from sound enclosing synchronization effects"
+    ],
+    "generality_checks": [
+      "Reuse existing PyPTO owners; no new public CFG or effects registry",
+      "Separate coverage and exact precision tracks",
+      "Represent acknowledgment strengthening in actual logical tokens",
+      "Keep scalar, local, transport and task ownership distinct"
+    ]
+  },
+  "validation": {
+    "source_and_document_inspection": true,
+    "fresh_build": false,
+    "fresh_tests": false,
+    "fresh_whole_qwen_capture": false,
+    "device": false
+  },
+  "next_gate": "M1 shared qualification and domain ownership; refresh existing pinned capture"
+}

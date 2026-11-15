@@ -86,6 +86,7 @@ plugins:
             Backend: 后端
             Debug: 调试
             Distributed: 分布式
+            General Autosync Integration: 通用自动同步集成
   # Both locales render the same API bodies, so every mkdocstrings identifier has
   # two anchors -- one under `/api/`, one under `/zh/api/`. Without `resolve_closest`
   # autorefs cannot pick between them ("Multiple primary URLs found for ..."),
@@ -314,6 +315,7 @@ nav:
           - Autosync Branch Layout: en/dev/ir/34-autosync-branch-layout.md
           - Regional Sync Architecture: en/dev/ir/39-regional-sync-architecture.md
           - Compact Sync Construction and Completion: en/dev/ir/40-sync-construction-and-completion.md
+          - General Autosync Integration: en/dev/ir/41-general-autosync-architecture-plan.md
       - Passes:
           - en/dev/passes/index.md
           - en/dev/passes/00-pass_manager.md
