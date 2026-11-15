@@ -459,6 +459,14 @@ inline constexpr const char* kAttrAutosyncFallbackReason = "autosync_fallback_re
 // storage legalization. Read by storage passes, verifiers and final lowering;
 // retained through serialization. Absence denotes a low-level pass pipeline.
 inline constexpr const char* kAttrBufferIrSelected = "buffer_ir_selected";
+// Versioned first unmet admission obligation. Present only for selector refusals;
+// absent on accepted or low-level pipelines. Source location is explanatory,
+// never a capability identity. Plain attributes survive normal cloning/msgpack.
+inline constexpr const char* kAttrBufferAdmissionVersion = "buffer_admission_version";
+inline constexpr const char* kAttrBufferAdmissionProperty = "buffer_admission_property";
+inline constexpr const char* kAttrBufferAdmissionStage = "buffer_admission_stage";
+inline constexpr const char* kAttrBufferAdmissionOperation = "buffer_admission_operation";
+inline constexpr const char* kAttrBufferAdmissionLocation = "buffer_admission_location";
 
 /**
  * @brief Reserved Function attr key marking an AIV kernel that runs on BOTH

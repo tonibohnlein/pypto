@@ -43,6 +43,7 @@
 #include "../module.h"
 #include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_config.h"
+#include "pypto/backend/common/buffer_sync_contract.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/core_affinity_kind.h"
@@ -1412,6 +1413,45 @@ void BindTesting(nb::module_& m) {
       },
       nb::arg("function"), nb::arg("disjoint_gm"), nb::arg("target"), nb::arg("parameter_bounds"),
       nb::arg("block_bounds"), "Analyze an exhaustive analytic partition of a proved launch domain");
+  testing.def(
+      "describe_buffer_sync_operation",
+      [](const ir::CallPtr& call, ir::FunctionType core, const std::string& target) {
+        const auto qualified = backend::QualifyBufferSyncOperation(call, core, target);
+        auto name = [](ir::BufferAccess access) {
+          switch (access) {
+            case ir::BufferAccess::None:
+              return "none";
+            case ir::BufferAccess::Read:
+              return "read";
+            case ir::BufferAccess::Write:
+              return "write";
+            case ir::BufferAccess::ReadWrite:
+              return "read_write";
+          }
+          INTERNAL_CHECK(false) << "Internal error: invalid Buffer access mode";
+          return "";
+        };
+        nb::list arguments;
+        for (size_t i = 0; i < qualified.ArgumentEffects().size(); ++i) {
+          const auto& effect = qualified.ArgumentEffects()[i];
+          nb::dict argument;
+          argument["operand"] = qualified.Operation()->args_[i];
+          argument["data"] = name(effect.data);
+          argument["metadata"] = name(effect.metadata);
+          argument["non_memory"] = effect.non_memory;
+          arguments.append(argument);
+        }
+        nb::dict result;
+        result["operation"] = qualified.Operation();
+        result["pipe"] = qualified.Implementation().Pipe();
+        result["arguments"] = arguments;
+        result["footprint_available"] = false;
+        result["readiness_available"] = false;
+        result["resource_assignment_available"] = false;
+        return result;
+      },
+      nb::arg("call"), nb::arg("core"), nb::arg("target") = "a2a3",
+      "Inspect static payload effects without loop, coordinate, geometry or readiness analysis");
   testing.def(
       "describe_placed_sync_input",
       [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,

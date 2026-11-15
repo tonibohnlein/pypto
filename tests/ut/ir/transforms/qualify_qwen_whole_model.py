@@ -35,6 +35,33 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def function_inventory(program: ir.Program) -> list[dict[str, Any]]:
+    """Keep selector obligations separate from synchronization and ownership.
+
+    Every function/domain is included, even scalar or externally bound work.
+    An absent selector result means not evaluated, never successful admission.
+    """
+    result = []
+    for function in program.functions.values():
+        attrs = dict(function.attrs)
+        selected = attrs.get("buffer_ir_selected")
+        admission = {"status": "not_evaluated" if selected is None else "selected" if selected else "refused"}
+        if "buffer_admission_version" in attrs:
+            for key in ("version", "property", "stage", "operation", "location"):
+                admission[key] = attrs[f"buffer_admission_{key}"]
+        result.append(
+            {
+                "name": function.name,
+                "type": str(function.func_type),
+                "stage": str(function.ir_stage),
+                "requires_runtime_binding": function.requires_runtime_binding,
+                "attrs": {str(k): str(v) for k, v in attrs.items()},
+                "buffer_admission": admission,
+            }
+        )
+    return result
+
+
 def main() -> None:
     """Compile original model bodies with meta tensors, retaining refusal evidence."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -88,6 +115,7 @@ def main() -> None:
         "device": "not run",
         "passes": [],
         "functions_before_sync": [],
+        "functions_after_buffer_selection": [],
         "compile_success": False,
         "all_generated_leaves_pypto": False,
     }
@@ -99,18 +127,12 @@ def main() -> None:
         if name == "RealizeSync":
             (output / "before-sync.py").write_text(str(program))
             ir.serialize_to_file(program, str(output / "before-sync.msgpack"))
-            receipt["functions_before_sync"] = [
-                {
-                    "name": function.name,
-                    "type": str(function.func_type),
-                    "stage": str(function.ir_stage),
-                    "requires_runtime_binding": function.requires_runtime_binding,
-                    "attrs": {str(k): str(v) for k, v in dict(function.attrs).items()},
-                }
-                for function in program.functions.values()
-            ]
+            receipt["functions_before_sync"] = function_inventory(program)
 
     def after(pass_obj, program):
+        if pass_obj.get_name() == "SelectBufferIRFunctions":
+            receipt["functions_after_buffer_selection"] = function_inventory(program)
+            ir.serialize_to_file(program, str(output / "after-buffer-selection.msgpack"))
         if pass_obj.get_name() == "RealizeSync":
             ir.serialize_to_file(program, str(output / "after-sync.msgpack"))
 

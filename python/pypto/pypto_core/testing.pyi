@@ -22,6 +22,7 @@ from .ir import (
     Expr,
     ForStmt,
     Function,
+    FunctionType,
     OpIRStage,
     PipeType,
     Program,
@@ -329,6 +330,14 @@ def analyze_placed_sync(
     """Analyze placed Buffer IR with explicit GM aliases and a named hardware contract.
 
     Nested regions retain original frames, matching production token insertion.
+    """
+    ...
+
+def describe_buffer_sync_operation(call: Call, core: FunctionType, target: str = "a2a3") -> dict[str, Any]:
+    """Inspect validated static payload effects, retaining original operand expressions.
+
+    This neither proves geometry/readiness nor performs loop occurrence analysis.
+    Unsupported native variants and malformed registrations/IR remain failures.
     """
     ...
 

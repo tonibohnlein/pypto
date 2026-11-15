@@ -12,11 +12,14 @@
 #ifndef PYPTO_BACKEND_COMMON_BUFFER_SYNC_CONTRACT_H_
 #define PYPTO_BACKEND_COMMON_BUFFER_SYNC_CONTRACT_H_
 
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "pypto/core/logging.h"
 #include "pypto/ir/function.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/pipe.h"
 #include "pypto/sync/isa_macro_resources.h"
 
@@ -52,9 +55,68 @@ class BufferSyncImplementation {
 BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call, ir::FunctionType core,
                                                         const std::string& target);
 
+// Static payload qualification shared by exact and conservative consumers.
+// The original immutable call owns every operand, including Tensor GM operands,
+// descriptor metadata and scalar coordinate expressions. Effects come from the
+// registry after call validation; none are inferred from an operand's type or
+// from a missing effect declaration. This establishes neither footprint coverage
+// nor readiness, alias separation, loop membership or executable resource reuse.
+// Those capabilities remain separate; in particular there is no trip count or
+// normalized occurrence frame in this contract.
+enum class BufferSyncOperationKind { Payload, Descriptor, ReadyScalar };
+
+class BufferSyncOperation {
+ public:
+  const ir::CallPtr& Operation() const { return operation_; }
+  BufferSyncOperationKind Kind() const { return kind_; }
+  // Qualified metadata/SPMD recipes issue no asynchronous payload or flags.
+  bool SignalFree() const { return kind_ != BufferSyncOperationKind::Payload; }
+  const BufferSyncImplementation& Implementation() const {
+    CHECK(implementation_) << "Descriptor/scalar contracts have no payload implementation";
+    return *implementation_;
+  }
+  const std::vector<ir::BufferArgEffect>& ArgumentEffects() const { return argument_effects_; }
+  const ir::BufferResultSpec& Result() const { return result_; }
+
+ private:
+  friend BufferSyncOperation QualifyBufferSyncOperation(const ir::CallPtr&, ir::FunctionType,
+                                                        const std::string&);
+  friend std::optional<BufferSyncOperation> QualifyBufferSyncNonPayload(const ir::CallPtr&,
+                                                                        const std::string&);
+  BufferSyncOperation(ir::CallPtr operation, std::optional<BufferSyncImplementation> implementation,
+                      std::vector<ir::BufferArgEffect> effects, ir::BufferResultSpec result,
+                      BufferSyncOperationKind kind)
+      : operation_(std::move(operation)),
+        implementation_(std::move(implementation)),
+        argument_effects_(std::move(effects)),
+        result_(result),
+        kind_(kind) {}
+  ir::CallPtr operation_;
+  std::optional<BufferSyncImplementation> implementation_;
+  std::vector<ir::BufferArgEffect> argument_effects_;
+  ir::BufferResultSpec result_;
+  BufferSyncOperationKind kind_;
+};
+// Qualifies the existing single-pipe payload subset. Unsupported implementations
+// refuse; malformed IR/registration errors propagate. Allocations and views are
+// not payloads and retain their existing result/alias/metadata interpretation.
+BufferSyncOperation QualifyBufferSyncOperation(const ir::CallPtr& call, ir::FunctionType core,
+                                               const std::string& target);
+
+// Recognize the existing emitted alloc/view/valid-metadata/SPMD recipes. Registry
+// effects/result behavior remain authoritative. The selected native recipe
+// additionally establishes synchronous descriptor evaluation or an ABI-ready
+// scalar result, and no signal ownership. This never infers safety from NoAccess
+// alone. Runtime descriptor bounds remain execution preconditions. Unknown forms
+// return no contract; malformed known forms propagate validation errors.
+std::optional<BufferSyncOperation> QualifyBufferSyncNonPayload(const ir::CallPtr& call,
+                                                               const std::string& target);
+
 struct LocalSyncExecutionContract {
   bool scalar_prefix_serialized;
   const char* terminal_completion_op;
+  bool set_completes_source_prefix;
+  bool wait_consumes_before_advance;
 };
 // A missing target contract never certifies completion or physical ownership.
 const LocalSyncExecutionContract& RequireLocalSyncExecutionContract(const std::string& target);

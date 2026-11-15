@@ -747,9 +747,9 @@ class Importer {
     return access;
   }
   SyncSite Site(const CallPtr& call, const SyncSegment& segment) {
-    OpRegistry::GetInstance().ValidateBufferCall(call);
-    const auto implementation =
-        backend::SelectBufferSyncImplementation(call, result.owner->func_type_, result.hardware_target);
+    const auto operation =
+        backend::QualifyBufferSyncOperation(call, result.owner->func_type_, result.hardware_target);
+    const auto& implementation = operation.Implementation();
     SyncSite site{call, nullptr, implementation.Pipe(), {}};
     // Track modes by operand, not storage: in-place operands can share bytes
     // while retaining different registered read/write modes.
@@ -962,11 +962,12 @@ class Importer {
     } else {
       CHECK(false) << "Unavailable instruction contract in synchronization import: " << call->op_->name_;
     }
-    // Geometry above qualifies one explicit payload contract. Validate its
-    // data modes against the registry rather than guessing other op effects.
+    // Geometry above qualifies one explicit payload contract. Validate every
+    // operand's data modes against the shared static contract, including GM
+    // Tensor operands. Metadata reads are retained there but do not establish
+    // readiness or create payload-data accesses here.
     for (size_t arg = 0; arg < call->args_.size(); ++arg) {
-      if (!As<BufferType>(call->args_[arg]->GetType())) continue;
-      auto effect = OpRegistry::GetInstance().GetEntry(call->op_->name_).GetBufferArgEffect(arg).data;
+      const auto effect = operation.ArgumentEffects()[arg].data;
       const auto [reads, writes] = modes[arg];
       CHECK(reads == (effect == BufferAccess::Read || effect == BufferAccess::ReadWrite) &&
             writes == (effect == BufferAccess::Write || effect == BufferAccess::ReadWrite))

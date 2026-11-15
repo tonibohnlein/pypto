@@ -16,6 +16,7 @@ import sys
 import pypto.language as pl
 import pytest
 from pypto import DataType, backend, codegen, ir, passes
+from pypto._function_attrs import BUFFER_ADMISSION_LOCATION_ATTR
 from pypto.backend import BackendType
 from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.ir.op import system_ops
@@ -29,6 +30,30 @@ def a5_backend():
     backend.set_backend_type(BackendType.Ascend950)
     yield
     backend.reset_for_testing()
+
+
+def _normalize_admission_locations(program: ir.Program) -> ir.Program:
+    """The reference peers are authored at different lines from their mixed source."""
+    functions = []
+    for func in program.functions.values():
+        attrs = func.attrs
+        if BUFFER_ADMISSION_LOCATION_ATTR in attrs:
+            attrs[BUFFER_ADMISSION_LOCATION_ATTR] = "<source location>"
+            func = ir.Function(
+                func.name,
+                list(zip(func.params, func.param_directions, strict=True)),
+                func.return_types,
+                func.body,
+                func.span,
+                func.func_type,
+                func.level,
+                func.role,
+                attrs,
+                func.requires_runtime_binding,
+                func.ir_stage,
+            )
+        functions.append(func)
+    return ir.Program(functions, program.name, program.span)
 
 
 @pytest.mark.parametrize("action", ["set", "wait"])
@@ -175,7 +200,9 @@ def test_mixed_ownership_and_order(default_passes):
         comparison_expected = passes.infer_tile_memory_space()(passes.convert_to_ssa()(Expected))
     # Explicit peers keep the reference independent of mixed-kernel splitting.
     # Compare full signatures, operands, pipes, attributes and group calls.
-    ir.assert_structural_equal(comparison_after, comparison_expected)
+    ir.assert_structural_equal(
+        _normalize_admission_locations(comparison_after), _normalize_admission_locations(comparison_expected)
+    )
     aic = next(f for f in after.functions.values() if f.func_type == ir.FunctionType.AIC)
     aiv = next(f for f in after.functions.values() if f.func_type == ir.FunctionType.AIV)
     assert [(c.op.name, c.kwargs.get("event_id")) for c in _calls(aic)] == [
@@ -420,7 +447,9 @@ def test_default_passes_keep_payload_between_wait_and_signal():
     # Use the same implicit-return form for generated and explicitly typed peers.
     comparison_after = passes.convert_tensor_to_tile_ops()(after)
     comparison_expected = passes.convert_tensor_to_tile_ops()(expected)
-    ir.assert_structural_equal(comparison_after, comparison_expected)
+    ir.assert_structural_equal(
+        _normalize_admission_locations(comparison_after), _normalize_admission_locations(comparison_expected)
+    )
     aiv = next(f for f in after.functions.values() if f.func_type == ir.FunctionType.AIV)
     names = []
     for stmt in ir.flatten_to_stmts(aiv.body):

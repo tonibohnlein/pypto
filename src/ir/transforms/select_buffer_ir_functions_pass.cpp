@@ -59,6 +59,7 @@
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
+#include "src/ir/transforms/buffer_ir_admission.h"
 
 namespace pypto {
 namespace ir {
@@ -84,7 +85,7 @@ class BufferKernelSupport : public IRVisitor {
     }
   }
 
-  bool supported = true;
+  BufferAdmission admission;
   bool has_load = false;
   bool has_fill = false;
   bool has_store = false;
@@ -111,65 +112,86 @@ class BufferKernelSupport : public IRVisitor {
       const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
       const bool column = backend::IsColumnVectorBufferTile(tile, view);
       if (!column && !StaticShape(tile->shape_)) {
-        supported = false;
+        admission.Require(false, BufferAdmissionProperty::TileShape);
         return;
       }
       const auto cols = As<ConstInt>(tile->shape_[1])->value_;
       const auto space = tile->GetMemorySpace();
       if (space && backend::IsMatrixBufferSpace(*space)) {
         const auto box = tile_view_semantics::GetBoxedTileAlignment(view, tile->dtype_);
-        supported &= backend::IsMatrixBufferDtype(*space, tile->dtype_) && box &&
-                     (view.fractal == (*space == MemorySpace::Acc ? 1024 : 512)) &&
-                     (view.blayout == TileLayout::row_major || view.blayout == TileLayout::col_major) &&
-                     view.pad == PadValue::null && view.compact == CompactMode::null && view.stride.empty();
-        if (box) supported &= As<ConstInt>(tile->shape_[0])->value_ % box->rows == 0 && cols % box->cols == 0;
+        admission.Require(
+            backend::IsMatrixBufferDtype(*space, tile->dtype_) && box &&
+                (view.fractal == (*space == MemorySpace::Acc ? 1024 : 512)) &&
+                (view.blayout == TileLayout::row_major || view.blayout == TileLayout::col_major) &&
+                view.pad == PadValue::null && view.compact == CompactMode::null && view.stride.empty(),
+            BufferAdmissionProperty::TypeLayout);
+        if (box)
+          admission.Require(As<ConstInt>(tile->shape_[0])->value_ % box->rows == 0 && cols % box->cols == 0,
+                            BufferAdmissionProperty::TypeLayout);
       } else if (column) {
         const auto rows = As<ConstInt>(tile->shape_[0])->value_;
-        supported &= view.stride.empty() || (view.stride.size() == 2 && ConstantEquals(view.stride[0], 1) &&
-                                             ConstantEquals(view.stride[1], rows));
+        admission.Require(
+            view.stride.empty() || (view.stride.size() == 2 && ConstantEquals(view.stride[0], 1) &&
+                                    ConstantEquals(view.stride[1], rows)),
+            BufferAdmissionProperty::TypeLayout);
       } else {
-        supported &= backend::IsDenseVecBufferTile(tile, view) && cols % (256 / tile->dtype_.GetBit()) == 0;
-        supported &=
+        admission.Require(
+            backend::IsDenseVecBufferTile(tile, view) && cols % (256 / tile->dtype_.GetBit()) == 0,
+            BufferAdmissionProperty::TypeLayout);
+        admission.Require(
             view.stride.empty() || (view.stride.size() == 2 && ConstantEquals(view.stride[0], cols) &&
-                                    ConstantEquals(view.stride[1], 1));
+                                    ConstantEquals(view.stride[1], 1)),
+            BufferAdmissionProperty::TypeLayout);
       }
-      supported &= !view.start_offset || ConstantEquals(view.start_offset, 0);
+      admission.Require(!view.start_offset || ConstantEquals(view.start_offset, 0),
+                        BufferAdmissionProperty::TypeLayout);
       if (!view.valid_shape.empty()) {
-        supported &= view.valid_shape.size() == tile->shape_.size();
-        for (size_t i = 0; supported && i < view.valid_shape.size(); ++i) {
+        admission.Require(view.valid_shape.size() == tile->shape_.size(),
+                          BufferAdmissionProperty::TypeLayout);
+        for (size_t i = 0; admission.supported() && i < view.valid_shape.size(); ++i) {
           const auto valid = As<ConstInt>(view.valid_shape[i]);
           const auto scalar = As<ScalarType>(view.valid_shape[i]->GetType());
-          supported &= valid ? valid->value_ >= 0 && valid->value_ <= As<ConstInt>(tile->shape_[i])->value_
-                             : space == MemorySpace::Vec && scalar &&
-                                   (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt());
-          if (space != MemorySpace::Vec || column) supported &= valid && valid->value_ > 0;
+          admission.Require(valid
+                                ? valid->value_ >= 0 && valid->value_ <= As<ConstInt>(tile->shape_[i])->value_
+                                : space == MemorySpace::Vec && scalar &&
+                                      (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt()),
+                            BufferAdmissionProperty::TypeLayout);
+          if (space != MemorySpace::Vec || column)
+            admission.Require(valid && valid->value_ > 0, BufferAdmissionProperty::TypeLayout);
         }
       }
       if (const auto memory = tile->memref_.value_or(nullptr)) {
-        supported &= !memory->is_pinned_;
-        if (memory->slot_count_ > 1 || memory->slot_index_) supported &= QualifySlot(tile, memory);
+        admission.Require(!memory->is_pinned_, BufferAdmissionProperty::TypeLayout);
+        if (memory->slot_count_ > 1 || memory->slot_index_)
+          admission.Require(QualifySlot(tile, memory), BufferAdmissionProperty::SlotGeometry);
       }
     } else if (auto tensor = As<TensorType>(type)) {
-      supported &= backend::IsBufferTensorShape(tensor->shape_) &&
-                   (backend::IsDenseBufferTransferDtype(tensor->dtype_) || tensor->dtype_ == DataType::INT8);
-      if (supported && tensor->tensor_view_) {
+      admission.Require(
+          backend::IsBufferTensorShape(tensor->shape_) &&
+              (backend::IsDenseBufferTransferDtype(tensor->dtype_) || tensor->dtype_ == DataType::INT8),
+          BufferAdmissionProperty::TypeLayout);
+      if (admission.supported() && tensor->tensor_view_) {
         const auto& view = *tensor->tensor_view_;
-        supported &= view.layout == TensorLayout::ND && view.pad == PadValue::null;
-        supported &= view.valid_shape.empty() || SameShape(view.valid_shape, tensor->shape_);
-        supported &=
+        admission.Require(view.layout == TensorLayout::ND && view.pad == PadValue::null,
+                          BufferAdmissionProperty::TypeLayout);
+        admission.Require(view.valid_shape.empty() || SameShape(view.valid_shape, tensor->shape_),
+                          BufferAdmissionProperty::TypeLayout);
+        admission.Require(
             view.stride.empty() || (view.stride.size() == 2 &&
                                     ConstantEquals(view.stride[0], As<ConstInt>(tensor->shape_[1])->value_) &&
-                                    ConstantEquals(view.stride[1], 1));
+                                    ConstantEquals(view.stride[1], 1)),
+            BufferAdmissionProperty::TypeLayout);
       }
     } else if (!As<ScalarType>(type) && !As<PtrType>(type) && !As<VoidType>(type) && !As<TupleType>(type)) {
-      supported = false;
+      admission.Require(false, BufferAdmissionProperty::TypeLayout);
     }
   }
 
   void VisitExpr(const ExprPtr& expr) override {
-    if (!supported || !expr) return;
+    if (!admission.supported() || !expr) return;
+    auto context = admission.At(expr.get());
     if (As<TupleGetItemExpr>(expr) || As<Submit>(expr) || As<Pow>(expr)) {
-      supported = false;
+      admission.Require(false, BufferAdmissionProperty::ExpressionForm);
       return;
     }
     const auto physical_result = assigned_slot_types_.find(expr.get());
@@ -183,15 +205,17 @@ class BufferKernelSupport : public IRVisitor {
           // Only a slice with a known typed parent can carry a symbolic
           // member offset. Allocation origins themselves remain static.
           if (memory->slot_count_ > 1 || memory->slot_index_) {
-            supported &= !view.window;
-            if (supported && !loop_slots_.empty()) {
+            admission.Require(!view.window, BufferAdmissionProperty::ExpressionForm);
+            if (admission.supported() && !loop_slots_.empty()) {
               const auto index = *memory->slot_index_;
               auto [entry, inserted] = loop_slots_.front().emplace(memory->base_.get(), index);
-              supported &= inserted || structural_equal(entry->second, index);
+              admission.Require(inserted || structural_equal(entry->second, index),
+                                BufferAdmissionProperty::ExpressionForm);
             }
           } else {
-            supported &= offset ? offset->value_ >= 0 && offset->value_ % 32 == 0
-                                : view.window && view.root && view.row_bytes.has_value();
+            admission.Require(offset ? offset->value_ >= 0 && offset->value_ % 32 == 0
+                                     : view.window && view.root && view.row_bytes.has_value(),
+                              BufferAdmissionProperty::ExpressionForm);
           }
         }
       }
@@ -200,10 +224,13 @@ class BufferKernelSupport : public IRVisitor {
   }
 
   void VisitStmt(const StmtPtr& stmt) override {
-    if (!supported) return;
+    if (!admission.supported()) return;
+    const auto assign = As<AssignStmt>(stmt);
+    const auto call = assign ? As<Call>(assign->value_) : nullptr;
+    auto context = admission.At(call ? static_cast<const IRNode*>(call.get()) : stmt.get());
     if (!As<SeqStmts>(stmt) && !As<AssignStmt>(stmt) && !As<EvalStmt>(stmt) && !As<ReturnStmt>(stmt) &&
         !As<IfStmt>(stmt) && !As<ForStmt>(stmt) && !As<WhileStmt>(stmt) && !As<YieldStmt>(stmt)) {
-      supported = false;
+      admission.Require(false, BufferAdmissionProperty::StatementForm);
       return;
     }
     IRVisitor::VisitStmt(stmt);
@@ -213,8 +240,9 @@ class BufferKernelSupport : public IRVisitor {
   void VisitVarLike_(const VarPtr&) override {}
 
   void VisitBinaryExpr_(const BinaryExprPtr& expr) override {
-    supported &= !GetScalarDtype(expr).IsUnsignedInt() && !GetScalarDtype(expr->left_).IsUnsignedInt() &&
-                 !GetScalarDtype(expr->right_).IsUnsignedInt();
+    admission.Require(!GetScalarDtype(expr).IsUnsignedInt() && !GetScalarDtype(expr->left_).IsUnsignedInt() &&
+                          !GetScalarDtype(expr->right_).IsUnsignedInt(),
+                      BufferAdmissionProperty::ScalarArithmetic);
     IRVisitor::VisitBinaryExpr_(expr);
   }
 
@@ -222,12 +250,14 @@ class BufferKernelSupport : public IRVisitor {
     const auto source = GetScalarDtype(expr->operand_);
     const auto target = GetScalarDtype(expr);
     if (As<Cast>(expr)) {
-      supported &= (!source.IsUnsignedInt() && !target.IsUnsignedInt()) || source == DataType::INDEX ||
-                   source == target ||
-                   (!source.IsFloat() && target != DataType::INDEX && !target.IsFloat() &&
-                    source.GetBit() == target.GetBit());
+      admission.Require((!source.IsUnsignedInt() && !target.IsUnsignedInt()) || source == DataType::INDEX ||
+                            source == target ||
+                            (!source.IsFloat() && target != DataType::INDEX && !target.IsFloat() &&
+                             source.GetBit() == target.GetBit()),
+                        BufferAdmissionProperty::ScalarArithmetic);
     } else {
-      supported &= !source.IsUnsignedInt() && !target.IsUnsignedInt();
+      admission.Require(!source.IsUnsignedInt() && !target.IsUnsignedInt(),
+                        BufferAdmissionProperty::ScalarArithmetic);
     }
     IRVisitor::VisitUnaryExpr_(expr);
   }
@@ -263,7 +293,7 @@ class BufferKernelSupport : public IRVisitor {
             source_memory->slot_count_ != result_memory->slot_count_ ||
             !structural_equal(*source_memory->slot_index_, *result_memory->slot_index_) ||
             !structural_equal(CloneTypeWithoutMemRef(source), CloneTypeWithoutMemRef(result))) {
-          supported = false;
+          admission.Require(false, BufferAdmissionProperty::OperationRecipe);
           return;
         }
         assigned_slot_types_.emplace(call.get(), result);
@@ -276,7 +306,7 @@ class BufferKernelSupport : public IRVisitor {
         const auto lhs = As<TileType>(call->args_[1]->GetType());
         const auto rhs = As<TileType>(call->args_[2]->GetType());
         if (!lhs || !rhs) {
-          supported = false;
+          admission.Require(false, BufferAdmissionProperty::OperationRecipe);
           return;
         }
         const auto output_valid = ValidShape(output);
@@ -284,9 +314,10 @@ class BufferKernelSupport : public IRVisitor {
         const auto rhs_valid = ValidShape(rhs);
         // A narrowed product needs a write view; the initial slot adapter keeps
         // one complete descriptor rather than manufacturing partial slot aliases.
-        supported &= output_valid.size() == 2 && lhs_valid.size() == 2 && rhs_valid.size() == 2 &&
-                     structural_equal(output_valid[0], lhs_valid[0]) &&
-                     structural_equal(output_valid[1], rhs_valid[1]);
+        admission.Require(output_valid.size() == 2 && lhs_valid.size() == 2 && rhs_valid.size() == 2 &&
+                              structural_equal(output_valid[0], lhs_valid[0]) &&
+                              structural_equal(output_valid[1], rhs_valid[1]),
+                          BufferAdmissionProperty::OperationRecipe);
       }
     }
     if (auto call = As<Call>(assign->value_); IsOp(call, "tile.alloc") && call->args_.size() == 2) {
@@ -295,7 +326,7 @@ class BufferKernelSupport : public IRVisitor {
       }
     }
     IRVisitor::VisitStmt_(assign);
-    if (!supported) return;
+    if (!admission.supported()) return;
     if (As<ScalarType>(assign->var_->GetType())) {
       scalar_multiples_.emplace(assign->var_.get(), KnownAlignmentMultiple(assign->value_));
       step_proof_.Define(assign->var_, assign->value_);
@@ -323,7 +354,7 @@ class BufferKernelSupport : public IRVisitor {
   void VisitStmt_(const EvalStmtPtr& eval) override {
     if (auto call = As<Call>(eval->expr_); call && IsOp(call, "tile.set_validshape")) {
       // Conversion needs an explicit SSA result carrying the new logical valid shape.
-      supported = false;
+      admission.Require(false, BufferAdmissionProperty::OperationRecipe);
       return;
     }
     IRVisitor::VisitStmt_(eval);
@@ -334,7 +365,7 @@ class BufferKernelSupport : public IRVisitor {
     // requires the resulting parameter type to match the declared result,
     // including TensorView metadata introduced by earlier frontend passes.
     if (region_ || ret->value_.size() != return_types_.size()) {
-      supported = false;
+      admission.Require(false, BufferAdmissionProperty::OperationRecipe);
       return;
     }
     for (size_t i = 0; i < ret->value_.size(); ++i) {
@@ -343,7 +374,7 @@ class BufferKernelSupport : public IRVisitor {
       if (alias == tensor_aliases_.end() ||
           !structural_equal(CloneTypeWithoutMemRef(alias->second->GetType()),
                             CloneTypeWithoutMemRef(return_types_[i]))) {
-        supported = false;
+        admission.Require(false, BufferAdmissionProperty::OperationRecipe);
         return;
       }
     }
@@ -356,13 +387,13 @@ class BufferKernelSupport : public IRVisitor {
     CheckRegion(branch->then_body_, then_region);
     Region else_region(branch->return_vars_);
     if (branch->else_body_) CheckRegion(*branch->else_body_, else_region);
-    for (size_t i = 0; supported && i < branch->return_vars_.size(); ++i) {
+    for (size_t i = 0; admission.supported() && i < branch->return_vars_.size(); ++i) {
       const auto& result = branch->return_vars_[i];
       CheckRegionType(result->GetType());
       if (NeedsStableAlias(result->GetType())) {
         const auto& alias = then_region.aliases[i];
         if (!AliasesAgree(alias, else_region.aliases[i])) {
-          supported = false;
+          admission.Require(false, BufferAdmissionProperty::OperationRecipe);
           return;
         }
         AliasMap(result->GetType()).emplace(result.get(), alias);
@@ -372,35 +403,37 @@ class BufferKernelSupport : public IRVisitor {
 
   void VisitStmt_(const YieldStmtPtr& yield) override {
     if (!region_ || yield->value_.size() != region_->results.size()) {
-      supported = false;
+      admission.Require(false, BufferAdmissionProperty::OperationRecipe);
       return;
     }
     region_->yielded = true;
-    for (size_t i = 0; supported && i < yield->value_.size(); ++i) {
+    for (size_t i = 0; admission.supported() && i < yield->value_.size(); ++i) {
       CheckRegionType(region_->results[i]->GetType());
       VisitExpr(yield->value_[i]);
       CheckRegionValid(yield->value_[i]->GetType(), region_->results[i]->GetType());
       // A region result cannot export a branch-local window handle. Window
       // carries require scalar metadata and explicit reconstruction first.
-      supported &= !views_.IsWindow(yield->value_[i]);
+      admission.Require(!views_.IsWindow(yield->value_[i]), BufferAdmissionProperty::OperationRecipe);
       if (NeedsStableAlias(region_->results[i]->GetType())) {
         region_->aliases[i] = StableAlias(yield->value_[i]);
-        supported &= region_->aliases[i] != nullptr;
+        admission.Require(region_->aliases[i] != nullptr, BufferAdmissionProperty::OperationRecipe);
       }
     }
   }
 
   void VisitStmt_(const ForStmtPtr& loop) override {
-    supported &= GetScalarDtype(loop->loop_var_) == DataType::INDEX;
+    admission.Require(GetScalarDtype(loop->loop_var_) == DataType::INDEX,
+                      BufferAdmissionProperty::OperationRecipe);
     for (const auto& bound : {loop->start_, loop->stop_, loop->step_}) {
       VisitExpr(bound);
       const auto dtype = GetScalarDtype(bound);
-      supported &= dtype == DataType::INDEX || dtype.IsSignedInt();
+      admission.Require(dtype == DataType::INDEX || dtype.IsSignedInt(),
+                        BufferAdmissionProperty::OperationRecipe);
     }
     // Buffer conversion preserves the original loop; it needs positivity, not
     // a numerical trip count. In particular get_block_num is positive by its
     // operation contract. Unknown signed scalar steps remain unqualified.
-    supported &= step_proof_.IsPositive(loop->step_);
+    admission.Require(step_proof_.IsPositive(loop->step_), BufferAdmissionProperty::LoopStep);
     loop_slots_.emplace_back();
     CheckLoop(loop);
     loop_slots_.pop_back();
@@ -412,10 +445,12 @@ class BufferKernelSupport : public IRVisitor {
     loop_slots_.pop_back();
   }
 
-  void VisitExpr_(const SubmitPtr&) override { supported = false; }
+  void VisitExpr_(const SubmitPtr&) override {
+    admission.Require(false, BufferAdmissionProperty::OperationRecipe);
+  }
   void VisitExpr_(const CallPtr& call) override {
     if (As<GlobalVar>(call->op_)) {
-      supported = false;
+      admission.Require(false, BufferAdmissionProperty::OperationRecipe);
       return;
     }
     const bool view_operation = IsOp(call, "tile.slice") || IsOp(call, "tile.assemble") ||
@@ -426,40 +461,47 @@ class BufferKernelSupport : public IRVisitor {
         const auto tile = As<TileType>(arg->GetType());
         const auto memory = tile ? tile->memref_.value_or(nullptr) : nullptr;
         if (memory && (memory->slot_count_ > 1 || memory->slot_index_)) {
-          supported = false;
+          admission.Require(false, BufferAdmissionProperty::OperationRecipe);
           return;
         }
       }
     }
     // Selection must reject metadata that the final lowering cannot carry.
     if (!StripAttr(call->attrs_, kPipelineMembershipAttr).empty()) {
-      supported = false;
+      admission.Require(false, BufferAdmissionProperty::OperationRecipe);
       return;
     }
     if (IsOp(call, "tile.load")) {
       has_load = true;
       CheckTransferParameter(call, 0, true);
       CheckTransferTypes(call, true);
-      supported &= GetIntKwarg(call->kwargs_, "cache", 0) == 0;
+      admission.Require(GetIntKwarg(call->kwargs_, "cache", 0) == 0,
+                        BufferAdmissionProperty::OperationRecipe);
     } else if (IsOp(call, "tile.store")) {
       has_store = true;
       // The Buffer store recipe accepts only the three-operand form. Keep
       // explicit partition shapes on Tile IR before any storage is rewritten.
-      supported &= call->args_.size() == 3;
+      admission.Require(call->args_.size() == 3, BufferAdmissionProperty::OperationRecipe);
       CheckTransferParameter(call, 2, false);
       CheckTransferTypes(call, false);
-      supported &=
-          GetIntKwarg(call->kwargs_, "atomic", 0) == 0 && GetIntKwarg(call->kwargs_, "st_phase", 0) == 0 &&
-          !GetOptionalDoubleKwarg(call->kwargs_, "pre_quant") &&
-          !GetKwargOr<bool>(call->kwargs_, "pre_relu", false) && GetIntKwarg(call->kwargs_, "cache", 0) == 0;
+      const bool ordinary_store = GetIntKwarg(call->kwargs_, "atomic", 0) == 0;
+      admission.Require(ordinary_store, BufferAdmissionProperty::AtomicStore);
+      // Preserve the original conjunction's short-circuiting of kwarg checks.
+      admission.Require(ordinary_store && GetIntKwarg(call->kwargs_, "st_phase", 0) == 0 &&
+                            !GetOptionalDoubleKwarg(call->kwargs_, "pre_quant") &&
+                            !GetKwargOr<bool>(call->kwargs_, "pre_relu", false) &&
+                            GetIntKwarg(call->kwargs_, "cache", 0) == 0,
+                        BufferAdmissionProperty::TransferOptions);
     } else if (IsOp(call, "tile.set_validshape")) {
-      supported &= call->args_.size() == 3 && call->kwargs_.empty() &&
-                   As<TileType>(call->GetType())->GetMemorySpace() == MemorySpace::Vec;
-      if (supported) {
+      admission.Require(call->args_.size() == 3 && call->kwargs_.empty() &&
+                            As<TileType>(call->GetType())->GetMemorySpace() == MemorySpace::Vec,
+                        BufferAdmissionProperty::OperationRecipe);
+      if (admission.supported()) {
         const auto source = views_.Get(call->args_[0]);
         // A setter reconstructs the original slice. Relabelled windows have no
         // such coordinate recipe and need a separate typed-parent conversion.
-        supported &= !source.window || (source.root && source.slice);
+        admission.Require(!source.window || (source.root && source.slice),
+                          BufferAdmissionProperty::OperationRecipe);
       }
     } else if (IsOp(call, "tile.slice") || IsOp(call, "tile.assemble")) {
       CheckWindowCall(call);
@@ -467,45 +509,59 @@ class BufferKernelSupport : public IRVisitor {
       const auto source = call->args_.empty() ? nullptr : As<TileType>(call->args_[0]->GetType());
       const auto destination = As<TileType>(call->GetType());
       const auto source_bytes = TileBytes(source);
-      supported &= source && destination && source->GetMemorySpace() == MemorySpace::Vec &&
-                   destination->GetMemorySpace() == MemorySpace::Vec && source_bytes &&
-                   source_bytes == TileBytes(destination) && views_.HasDenseRowPitch(call->args_[0]) &&
-                   (!views_.IsWindow(call->args_[0]) || views_.Get(call->args_[0]).offsets.has_value());
+      admission.Require(
+          source && destination && source->GetMemorySpace() == MemorySpace::Vec &&
+              destination->GetMemorySpace() == MemorySpace::Vec && source_bytes &&
+              source_bytes == TileBytes(destination) && views_.HasDenseRowPitch(call->args_[0]) &&
+              (!views_.IsWindow(call->args_[0]) || views_.Get(call->args_[0]).offsets.has_value()),
+          BufferAdmissionProperty::OperationRecipe);
       if (IsOp(call, "tile.reshape")) {
-        supported &= call->args_.size() == 2 && call->kwargs_.empty() && source && destination &&
-                     source->dtype_ == destination->dtype_;
+        admission.Require(call->args_.size() == 2 && call->kwargs_.empty() && source && destination &&
+                              source->dtype_ == destination->dtype_,
+                          BufferAdmissionProperty::OperationRecipe);
       } else {
-        supported &= (call->args_.size() == 1 || call->args_.size() == 2) && call->kwargs_.size() == 1 &&
-                     call->kwargs_[0].first == "dtype";
+        admission.Require((call->args_.size() == 1 || call->args_.size() == 2) && call->kwargs_.size() == 1 &&
+                              call->kwargs_[0].first == "dtype",
+                          BufferAdmissionProperty::OperationRecipe);
       }
     } else if (IsOp(call, "tile.move") || IsOp(call, "tile.extract") || IsOp(call, "tile.transpose_view") ||
                IsOp(call, "tile.matmul") || IsOp(call, "tile.matmul_acc")) {
       CheckMatrixCall(call);
     } else if (IsOp(call, "tile.create")) {
-      supported &= As<TileType>(call->GetType()) != nullptr;
+      admission.Require(As<TileType>(call->GetType()) != nullptr, BufferAdmissionProperty::OperationRecipe);
     } else if (IsOp(call, "tile.get_block_idx") || IsOp(call, "tile.get_block_num") ||
                IsOp(call, "tile.get_subblock_idx")) {
-      supported &= call->args_.empty() && call->kwargs_.empty();
+      admission.Require(call->args_.empty() && call->kwargs_.empty(),
+                        BufferAdmissionProperty::OperationRecipe);
     } else if (const auto* indexed = backend::FindLogicalBufferIndexedRecipe(call->op_->name_)) {
-      supported &= backend::SupportsLogicalBufferIndexed(*indexed, call) &&
-                   (!indexed->scatter || indexed_.HasExclusiveZeroBase(call));
-      for (const auto& arg : call->args_) supported &= !views_.IsWindow(arg);
+      admission.Require(backend::SupportsLogicalBufferIndexed(*indexed, call) &&
+                            (!indexed->scatter || indexed_.HasExclusiveZeroBase(call)),
+                        BufferAdmissionProperty::OperationRecipe);
+      for (const auto& arg : call->args_)
+        admission.Require(!views_.IsWindow(arg), BufferAdmissionProperty::OperationRecipe);
     } else if (const auto* conversion = backend::FindLogicalBufferConversionRecipe(call->op_->name_)) {
-      supported &= backend::SupportsLogicalBufferConversion(*conversion, call);
-      for (const auto& arg : call->args_) supported &= !views_.IsWindow(arg);
+      admission.Require(backend::SupportsLogicalBufferConversion(*conversion, call),
+                        BufferAdmissionProperty::OperationRecipe);
+      for (const auto& arg : call->args_)
+        admission.Require(!views_.IsWindow(arg), BufferAdmissionProperty::OperationRecipe);
     } else if (IsOp(call, "tile.transpose")) {
-      supported &= backend::SupportsLogicalBufferTranspose(call);
+      admission.Require(backend::SupportsLogicalBufferTranspose(call),
+                        BufferAdmissionProperty::OperationRecipe);
       // A logical window can retain a wider physical pitch than its descriptor.
-      for (const auto& arg : call->args_) supported &= !views_.IsWindow(arg);
+      for (const auto& arg : call->args_)
+        admission.Require(!views_.IsWindow(arg), BufferAdmissionProperty::OperationRecipe);
     } else if (const auto* axis_recipe = backend::FindLogicalBufferAxisRecipe(call->op_->name_)) {
-      supported &= backend::SupportsLogicalBufferAxis(*axis_recipe, call);
+      admission.Require(backend::SupportsLogicalBufferAxis(*axis_recipe, call),
+                        BufferAdmissionProperty::OperationRecipe);
       // Native axis recipes below are dense allocations. A slice retains a
       // different physical pitch and needs its own reduction/broadcast recipe.
-      for (const auto& arg : call->args_) supported &= !views_.IsWindow(arg);
+      for (const auto& arg : call->args_)
+        admission.Require(!views_.IsWindow(arg), BufferAdmissionProperty::OperationRecipe);
     } else if (!IsOp(call, "tile.alloc")) {
       const auto* recipe = backend::FindLogicalBufferElementwiseRecipe(call->op_->name_);
-      supported &=
-          recipe && recipe->default_enabled && backend::SupportsLogicalBufferElementwise(*recipe, call);
+      admission.Require(
+          recipe && recipe->default_enabled && backend::SupportsLogicalBufferElementwise(*recipe, call),
+          BufferAdmissionProperty::OperationRecipe);
       if (IsOp(call, "tile.full")) has_fill = true;
     }
     IRVisitor::VisitExpr_(call);
@@ -558,7 +614,7 @@ class BufferKernelSupport : public IRVisitor {
   void CheckWindowCall(const CallPtr& call) {
     const bool slice = IsOp(call, "tile.slice");
     if (call->args_.size() < 3) {
-      supported = false;
+      admission.Require(false, BufferAdmissionProperty::WindowGeometry);
       return;
     }
     const auto parent = As<TileType>(call->args_[0]->GetType());
@@ -568,7 +624,7 @@ class BufferKernelSupport : public IRVisitor {
         window->GetMemorySpace() != MemorySpace::Vec || parent->dtype_ != window->dtype_ ||
         !StaticShape(parent->shape_) || !StaticShape(window->shape_) || !offsets ||
         offsets->elements_.size() != 2) {
-      supported = false;
+      admission.Require(false, BufferAdmissionProperty::WindowGeometry);
       return;
     }
     // Explicit-valid slices and assemble destinations bypass slice
@@ -579,35 +635,43 @@ class BufferKernelSupport : public IRVisitor {
         row_bytes ? WindowOffsetResidue(offsets->elements_[0], *row_bytes) : std::nullopt;
     const auto col_residue =
         WindowOffsetResidue(offsets->elements_[1], static_cast<int64_t>(window->dtype_.GetBit() / 8));
-    supported &= row_residue && col_residue && (*row_residue + *col_residue) % kWindowAlignmentBytes == 0;
+    admission.Require(
+        row_residue && col_residue && (*row_residue + *col_residue) % kWindowAlignmentBytes == 0,
+        BufferAdmissionProperty::WindowGeometry);
     for (size_t i = 0; i < 2; ++i) {
       const auto offset = As<ConstInt>(offsets->elements_[i]);
       const auto scalar = As<ScalarType>(offsets->elements_[i]->GetType());
       const auto limit = As<ConstInt>(parent->shape_[i])->value_ - As<ConstInt>(window->shape_[i])->value_;
       // Dynamic bounds remain the slice/assemble caller's precondition. They
       // never establish a precise range for alias analysis.
-      supported &= limit >= 0 && scalar &&
-                   (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt()) &&
-                   (!offset || (offset->value_ >= 0 && offset->value_ <= limit));
+      admission.Require(limit >= 0 && scalar &&
+                            (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt()) &&
+                            (!offset || (offset->value_ >= 0 && offset->value_ <= limit)),
+                        BufferAdmissionProperty::WindowGeometry);
     }
     if (slice) {
-      supported &= call->kwargs_.empty() && call->args_.size() <= 5;
+      admission.Require(call->kwargs_.empty() && call->args_.size() <= 5,
+                        BufferAdmissionProperty::WindowGeometry);
       const auto parent_view = views_.Get(call->args_[0]);
-      supported &= !parent_view.window || parent_view.root != nullptr;
+      admission.Require(!parent_view.window || parent_view.root != nullptr,
+                        BufferAdmissionProperty::WindowGeometry);
       if (call->args_.size() == 5) {
         const auto dropped = As<MakeTuple>(call->args_[4]);
-        supported &= dropped && dropped->elements_.empty();
+        admission.Require(dropped && dropped->elements_.empty(), BufferAdmissionProperty::WindowGeometry);
       }
     } else {
-      supported &= call->args_.size() == 3 && !views_.IsWindow(call->args_[0]) &&
-                   !GetOptionalDoubleKwarg(call->kwargs_, "pre_quant") &&
-                   !GetKwargOr<bool>(call->kwargs_, "pre_relu", false) &&
-                   GetIntKwarg(call->kwargs_, "cache", 0) == 0;
+      admission.Require(call->args_.size() == 3 && !views_.IsWindow(call->args_[0]) &&
+                            !GetOptionalDoubleKwarg(call->kwargs_, "pre_quant") &&
+                            !GetKwargOr<bool>(call->kwargs_, "pre_relu", false) &&
+                            GetIntKwarg(call->kwargs_, "cache", 0) == 0,
+                        BufferAdmissionProperty::WindowGeometry);
       // Native Vec TMOV preserves row stride; copying a strided window into
       // a destination with a different pitch needs a separate transfer recipe.
       const auto source_view = views_.Get(call->args_[1]);
-      supported &= source_view.row_bytes && source_view.row_bytes == views_.Get(call->args_[0]).row_bytes &&
-                   (!source_view.window || (source_view.root && source_view.slice));
+      admission.Require(source_view.row_bytes &&
+                            source_view.row_bytes == views_.Get(call->args_[0]).row_bytes &&
+                            (!source_view.window || (source_view.root && source_view.slice)),
+                        BufferAdmissionProperty::WindowGeometry);
     }
     if (!views_.IsWindow(call->args_[0])) {
       const auto memory = parent->memref_.value_or(nullptr);
@@ -615,8 +679,9 @@ class BufferKernelSupport : public IRVisitor {
         const auto [entry, inserted] = window_parents_.emplace(memory->base_.get(), parent);
         // One symbolic allocation can have only one native typed parent.
         // Conflicting parent interpretations need additional legalization.
-        supported &= inserted || (entry->second->dtype_ == parent->dtype_ &&
-                                  SameShape(entry->second->shape_, parent->shape_));
+        admission.Require(inserted || (entry->second->dtype_ == parent->dtype_ &&
+                                       SameShape(entry->second->shape_, parent->shape_)),
+                          BufferAdmissionProperty::WindowGeometry);
       }
     }
   }
@@ -663,24 +728,27 @@ class BufferKernelSupport : public IRVisitor {
 
   void CheckTransferTypes(const CallPtr& call, bool load) {
     if (call->args_.size() < 3) {
-      supported = false;
+      admission.Require(false, BufferAdmissionProperty::TransferTypes);
       return;
     }
     const auto tile = As<TileType>(load ? call->GetType() : call->args_[0]->GetType());
     const auto tensor = As<TensorType>(call->args_[load ? 0 : 2]->GetType());
     if (!tile || !tensor) {
-      supported = false;
+      admission.Require(false, BufferAdmissionProperty::TransferTypes);
       return;
     }
     const auto space = tile->GetMemorySpace();
     // Reduction columns are on-chip operands only. The ordinary GM recipe
     // cannot transfer a contiguous column into a strided row-major tensor.
-    supported &= !backend::IsColumnVectorBufferTile(tile, tile_view_semantics::GetEffectiveTileView(*tile));
+    admission.Require(
+        !backend::IsColumnVectorBufferTile(tile, tile_view_semantics::GetEffectiveTileView(*tile)),
+        BufferAdmissionProperty::TransferTypes);
     if (space == MemorySpace::Vec || (load && space == MemorySpace::Mat)) {
-      supported &= tile->dtype_ == tensor->dtype_;
+      admission.Require(tile->dtype_ == tensor->dtype_, BufferAdmissionProperty::TransferTypes);
     } else {
-      supported &=
-          !load && space == MemorySpace::Acc && CubeWritebackSupportsDataType(tile->dtype_, tensor->dtype_);
+      admission.Require(
+          !load && space == MemorySpace::Acc && CubeWritebackSupportsDataType(tile->dtype_, tensor->dtype_),
+          BufferAdmissionProperty::TransferTypes);
     }
   }
 
@@ -688,51 +756,60 @@ class BufferKernelSupport : public IRVisitor {
     const auto destination = As<TileType>(call->GetType());
     const auto source = call->args_.empty() ? nullptr : As<TileType>(call->args_[0]->GetType());
     if (!source || !destination) {
-      supported = false;
+      admission.Require(false, BufferAdmissionProperty::MatrixRecipe);
       return;
     }
     if (IsOp(call, "tile.move") || IsOp(call, "tile.extract")) {
-      supported &= source->GetMemorySpace() == MemorySpace::Mat &&
-                   (destination->GetMemorySpace() == MemorySpace::Left ||
-                    destination->GetMemorySpace() == MemorySpace::Right) &&
-                   source->dtype_ == destination->dtype_;
+      admission.Require(source->GetMemorySpace() == MemorySpace::Mat &&
+                            (destination->GetMemorySpace() == MemorySpace::Left ||
+                             destination->GetMemorySpace() == MemorySpace::Right) &&
+                            source->dtype_ == destination->dtype_,
+                        BufferAdmissionProperty::MatrixRecipe);
       if (IsOp(call, "tile.move")) {
-        supported &= SameShape(source->shape_, destination->shape_) &&
-                     SameShape(ValidShape(source), ValidShape(destination));
+        admission.Require(SameShape(source->shape_, destination->shape_) &&
+                              SameShape(ValidShape(source), ValidShape(destination)),
+                          BufferAdmissionProperty::MatrixRecipe);
       } else {
-        supported &= call->args_.size() == 4;
+        admission.Require(call->args_.size() == 4, BufferAdmissionProperty::MatrixRecipe);
       }
     } else if (IsOp(call, "tile.transpose_view")) {
-      supported &=
+      admission.Require(
           call->args_.size() == 1 && call->kwargs_.empty() && source->GetMemorySpace() == MemorySpace::Mat &&
-          destination->GetMemorySpace() == MemorySpace::Mat && source->dtype_ == destination->dtype_ &&
-          TileBytes(source) && TileBytes(source) == TileBytes(destination);
+              destination->GetMemorySpace() == MemorySpace::Mat && source->dtype_ == destination->dtype_ &&
+              TileBytes(source) && TileBytes(source) == TileBytes(destination),
+          BufferAdmissionProperty::MatrixRecipe);
     } else {
       const bool accumulate = IsOp(call, "tile.matmul_acc");
       const size_t lhs_index = accumulate ? 1 : 0;
       if (call->args_.size() < lhs_index + 2) {
-        supported = false;
+        admission.Require(false, BufferAdmissionProperty::MatrixRecipe);
         return;
       }
       const auto lhs = As<TileType>(call->args_[lhs_index]->GetType());
       const auto rhs = As<TileType>(call->args_[lhs_index + 1]->GetType());
-      supported &= lhs && rhs && call->kwargs_.empty() && call->args_.size() <= (accumulate ? 4 : 2) &&
-                   destination->GetMemorySpace() == MemorySpace::Acc;
-      if (!supported) return;
-      supported &= lhs->GetMemorySpace() == MemorySpace::Left &&
-                   rhs->GetMemorySpace() == MemorySpace::Right && lhs->dtype_ == rhs->dtype_ &&
-                   backend::IsCubeOperandDtype(lhs->dtype_) &&
-                   destination->dtype_ == MatmulAccumulatorDataType(lhs->dtype_, rhs->dtype_);
-      if (accumulate) supported &= source->GetMemorySpace() == MemorySpace::Acc;
+      admission.Require(lhs && rhs && call->kwargs_.empty() && call->args_.size() <= (accumulate ? 4 : 2) &&
+                            destination->GetMemorySpace() == MemorySpace::Acc,
+                        BufferAdmissionProperty::MatrixRecipe);
+      if (!admission.supported()) return;
+      admission.Require(lhs->GetMemorySpace() == MemorySpace::Left &&
+                            rhs->GetMemorySpace() == MemorySpace::Right && lhs->dtype_ == rhs->dtype_ &&
+                            backend::IsCubeOperandDtype(lhs->dtype_) &&
+                            destination->dtype_ == MatmulAccumulatorDataType(lhs->dtype_, rhs->dtype_),
+                        BufferAdmissionProperty::MatrixRecipe);
+      if (accumulate)
+        admission.Require(source->GetMemorySpace() == MemorySpace::Acc,
+                          BufferAdmissionProperty::MatrixRecipe);
     }
   }
 
   void CheckRegionType(const TypePtr& type) {
-    supported &= As<TileType>(type) || As<TensorType>(type) || As<ScalarType>(type);
+    admission.Require(As<TileType>(type) || As<TensorType>(type) || As<ScalarType>(type),
+                      BufferAdmissionProperty::RegionType);
     CheckType(type);
     if (auto tile = As<TileType>(type)) {
       const auto memory = tile->memref_.value_or(nullptr);
-      supported &= !memory || (memory->slot_count_ == 1 && !memory->slot_index_);
+      admission.Require(!memory || (memory->slot_count_ == 1 && !memory->slot_index_),
+                        BufferAdmissionProperty::RegionType);
     }
   }
 
@@ -743,7 +820,7 @@ class BufferKernelSupport : public IRVisitor {
     // Canonical storage carries bytes, not a choice of valid expressions.
     // Changing valid state must be carried explicitly as scalar SSA and used
     // to reconstruct a view; silently inheriting either arm's metadata is wrong.
-    supported &= SameShape(ValidShape(from), ValidShape(to));
+    admission.Require(SameShape(ValidShape(from), ValidShape(to)), BufferAdmissionProperty::RegionValidState);
   }
 
   struct Region {
@@ -798,30 +875,30 @@ class BufferKernelSupport : public IRVisitor {
     auto* outer = region_;
     region_ = &region;
     VisitStmt(body);
-    supported &= region.results.empty() || region.yielded;
+    admission.Require(region.results.empty() || region.yielded, BufferAdmissionProperty::RegionYield);
     region_ = outer;
   }
 
   template <typename LoopPtr>
   void CheckLoop(const LoopPtr& loop) {
-    if (!supported || loop->iter_args_.size() != loop->return_vars_.size()) {
-      supported = false;
+    if (!admission.supported() || loop->iter_args_.size() != loop->return_vars_.size()) {
+      admission.Require(false, BufferAdmissionProperty::LoopCarry);
       return;
     }
     // SSA identities are unique across regions. Retaining each normalized alias
     // once avoids copying an ever-growing map at nested branches and loops.
-    for (size_t i = 0; supported && i < loop->iter_args_.size(); ++i) {
+    for (size_t i = 0; admission.supported() && i < loop->iter_args_.size(); ++i) {
       const auto& argument = loop->iter_args_[i];
       CheckRegionType(argument->GetType());
       CheckRegionType(loop->return_vars_[i]->GetType());
       VisitExpr(argument->initValue_);
       CheckRegionValid(argument->initValue_->GetType(), argument->GetType());
       CheckRegionValid(argument->GetType(), loop->return_vars_[i]->GetType());
-      supported &= !views_.IsWindow(argument->initValue_);
+      admission.Require(!views_.IsWindow(argument->initValue_), BufferAdmissionProperty::LoopCarry);
       if (NeedsStableAlias(argument->GetType())) {
         const auto alias = StableAlias(argument->initValue_);
         if (!alias) {
-          supported = false;
+          admission.Require(false, BufferAdmissionProperty::LoopCarry);
           return;
         }
         AliasMap(argument->GetType()).emplace(argument.get(), alias);
@@ -830,12 +907,12 @@ class BufferKernelSupport : public IRVisitor {
     if constexpr (std::is_same_v<LoopPtr, WhileStmtPtr>) VisitExpr(loop->condition_);
     Region region(loop->return_vars_);
     CheckRegion(loop->body_, region);
-    for (size_t i = 0; supported && i < loop->iter_args_.size(); ++i) {
+    for (size_t i = 0; admission.supported() && i < loop->iter_args_.size(); ++i) {
       const auto& argument = loop->iter_args_[i];
       if (NeedsStableAlias(argument->GetType())) {
         const auto initial = StableAlias(argument->initValue_);
         if (!AliasesAgree(region.aliases[i], initial)) {
-          supported = false;
+          admission.Require(false, BufferAdmissionProperty::LoopCarry);
           return;
         }
         AliasMap(argument->GetType()).emplace(loop->return_vars_[i].get(), initial);
@@ -845,17 +922,18 @@ class BufferKernelSupport : public IRVisitor {
 
   void CheckTransferParameter(const CallPtr& call, size_t index, bool load) {
     if (index >= call->args_.size()) {
-      supported = false;
+      admission.Require(false, BufferAdmissionProperty::TransferParameter);
       return;
     }
     const auto value = AsVarLike(call->args_[index]);
     const auto alias = tensor_aliases_.find(value.get());
     if (alias == tensor_aliases_.end()) {
-      supported = false;
+      admission.Require(false, BufferAdmissionProperty::TransferParameter);
       return;
     }
     const auto direction = directions_.at(alias->second.get());
-    supported &= load ? direction != ParamDirection::Out : direction != ParamDirection::In;
+    admission.Require(load ? direction != ParamDirection::Out : direction != ParamDirection::In,
+                      BufferAdmissionProperty::TransferParameter);
   }
 
   std::unordered_map<const Var*, uint64_t> allocation_capacities_;
@@ -883,35 +961,48 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& function, bool device_helper
     return function;
   }
   BufferKernelSupport support(function);
+  auto function_context = support.admission.At(function.get());
   const auto* context = PassContext::Current();
-  support.supported =
-      !device_helper && (!context || context->GetEnableBufferIR()) && backend::BackendConfig::IsConfigured();
-  if (support.supported) {
+  support.admission.Require(!device_helper, BufferAdmissionProperty::DeviceHelper);
+  support.admission.Require(!context || context->GetEnableBufferIR(), BufferAdmissionProperty::Disabled);
+  support.admission.Require(backend::BackendConfig::IsConfigured(), BufferAdmissionProperty::Backend);
+  if (support.admission.supported()) {
     const auto arch = backend::BackendConfig::GetBackend()->GetHandler()->GetPtoTargetArch();
-    support.supported = arch == "a2a3";
+    support.admission.Require(arch == "a2a3", BufferAdmissionProperty::Target);
   }
   for (const auto& param : function->params_) {
+    auto parameter_context = support.admission.At(param.get());
     // Device Tile parameters still require a separate helper ABI.
-    if (!As<TensorType>(param->GetType()) && !As<ScalarType>(param->GetType())) support.supported = false;
+    support.admission.Require(As<TensorType>(param->GetType()) || As<ScalarType>(param->GetType()),
+                              BufferAdmissionProperty::ParameterABI);
     support.CheckType(param->GetType());
   }
   for (const auto& type : function->return_types_) {
-    if (!As<TensorType>(type)) support.supported = false;
+    support.admission.Require(As<TensorType>(type) != nullptr, BufferAdmissionProperty::ReturnABI);
     support.CheckType(type);
   }
   support.VisitStmt(function->body_);
-  if (support.supported) {
+  if (support.admission.supported()) {
     // Selecting Buffer must remain executable even when optional autosync later
     // declines. Share the existing downstream canonical-slot qualification.
     CanonicalSlotCollector slots;
     slots.VisitStmt(function->body_);
-    support.supported = slots.unsupported_bases.empty();
+    auto slot_context = support.admission.At(
+        slots.first_unsupported ? static_cast<const IRNode*>(slots.first_unsupported.get()) : function.get());
+    support.admission.Require(slots.unsupported_bases.empty(), BufferAdmissionProperty::CanonicalSlots);
   }
-  if (support.supported) support.supported = BufferValidAnalysis(function->body_).supported();
+  if (support.admission.supported()) {
+    const BufferValidAnalysis valid(function->body_);
+    auto valid_context = support.admission.At(valid.first_obligation()
+                                                  ? static_cast<const IRNode*>(valid.first_obligation().get())
+                                                  : function.get());
+    support.admission.Require(valid.supported(), BufferAdmissionProperty::DynamicValidRecipe);
+  }
+  support.admission.Require((support.has_load || support.has_fill) && support.has_store,
+                            BufferAdmissionProperty::KernelShape);
   auto selected = std::make_shared<Function>(*function);
-  selected->attrs_.emplace_back(kAttrBufferIrSelected, support.supported &&
-                                                           (support.has_load || support.has_fill) &&
-                                                           support.has_store);
+  selected->attrs_.emplace_back(kAttrBufferIrSelected, support.admission.supported());
+  support.admission.AppendTo(*selected);
   return selected;
 }
 
