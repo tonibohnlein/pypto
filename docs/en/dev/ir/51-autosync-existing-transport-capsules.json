@@ -1,0 +1,85 @@
+{
+  "status": "Architecture/correctness design accepted for implementation; no implementation or validation claim",
+  "scope": "local capsules for existing selected transport; no new cross-core/inter-kernel protocol",
+  "capture": "build-py314/review-repairs-20261116/qwen-pure-write-qualified/receipt.json",
+  "remaining_leaves": [
+    "qk_pv_partial_plan_aic",
+    "qk_pv_partial_plan_aiv",
+    "qk_pv_single_block_aic",
+    "qk_pv_single_block_aiv",
+    "qk_pv_single_block_0_aic",
+    "qk_pv_single_block_0_aiv"
+  ],
+  "first_obligation": "SelectBufferIRFunctions/type_layout on Var; later local transport obligations not yet reached",
+  "existing_owners": [
+    "cross_core_pipe",
+    "tpop_tfree_finalizer",
+    "gm_pipe_layout",
+    "orchestration_analysis::ComputeGMPipeWorkspaceElements",
+    "PTOCodegen::PrepareGMSlotBufferLayout",
+    "pto_ops_crosscore",
+    "isa_macro_resources_protocol",
+    "native qualification and conservative synchronization"
+  ],
+  "captured_geometry_example": {
+    "slot_bytes": 8192,
+    "slots_per_ring": 2,
+    "rings": 2,
+    "gm_bytes": 32768,
+    "local_reserve_bytes": 16384,
+    "placeholder_bytes_not_footprint": 4
+  },
+  "native_snapshot_inspected": "build-py314/physical-sync-prototype/isa/hw-native-sys-pto-isa-f83d4b7",
+  "native_snapshot_qualification": "Final selected compiler/toolchain source identity and variant correspondence must be pinned separately. Snapshot is source evidence, not runtime proof.",
+  "critical_lifetimes": [
+    "push local source read pending on FIX/MTE3",
+    "pop peer readiness distinct from MTE2 result completion",
+    "GM slot free notification distinct from local reserved slot lifetime",
+    "tile-data TFREE no-op in inspected snapshot",
+    "owner-lifetime ready/free signals distinct from local pipeline events"
+  ],
+  "required_export": [
+    "original setup and workspace parameter identity",
+    "actual selected variant, target, pipe ID, direction, split, dtype, depths",
+    "checked full GM/local enclosures and separation",
+    "borrow aliases, use intervals and rearm",
+    "local entry/output readiness and pending effects",
+    "selected resource claims and original peer progress authority"
+  ],
+  "progress_requirement": "Preserve original peer command order and ensure added local waits do not depend on later peer actions; no automatic ALL-around-transport justification",
+  "rollback": "Publish only a fully qualified local owner; retain original source and transport ownership on failure",
+  "validation_required": [
+    "one-way/two-way geometry and workspace mismatch",
+    "FIFO aliases/borrow lifetime and zero/skipped/repeated/reset visits",
+    "paired-core existing-protocol model with credits/pending DMA and adversarial edge deletion",
+    "resource collisions/variant/target mismatch",
+    "public pipeline and actual PTOAS C++ workspace offsets",
+    "original six-leaf recapture with precise first obligations"
+  ],
+  "tests_run": [],
+  "implementation_complete": false,
+  "device_validation": false,
+  "uniform_proof": [
+    "setup dominance",
+    "branch ownership/credit invariant",
+    "loop invariant for zero or arbitrary visits",
+    "all alias uses confined to borrow lifetime",
+    "no added local dependency on future peer action"
+  ],
+  "cost_contract": {
+    "recovery": "once per immutable original owner; shared setup/layout/FIFO",
+    "export": "indexed per-call facts, no repeated whole-function scans",
+    "counters": [
+      "distinct statements/expressions",
+      "setup entries",
+      "layout entries",
+      "borrow/use incidences",
+      "per-call lookups",
+      "rejected attempt work"
+    ],
+    "failure": "retain immutable failed recovery and precise unmet obligation",
+    "nonclaim": "whole compiler linearity"
+  },
+  "initial_component": "Shared original evidence export only; admission remains closed until all native/lifetime/progress proofs and production consumers are connected",
+  "review_gate": "Independent reviewer accepted with stated context/occurrence or uniform lifetime/progress/cost obligations"
+}
