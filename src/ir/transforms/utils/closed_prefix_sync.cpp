@@ -327,7 +327,7 @@ class Assignment {
   size_t roles_ = 0;
 };
 
-class Emit : public IRMutator {
+class Emit : public SyncStatementMutator {
  public:
   Emit(const Assignment& assignment, FunctionType core, const std::map<const ForStmt*, StmtPtr>& children,
        const std::set<const Var*>& completed_tokens)
@@ -340,11 +340,11 @@ class Emit : public IRMutator {
   StmtPtr VisitStmt_(const AssignStmtPtr& assignment) override {
     if (completed_tokens_.count(assignment->var_.get()))
       return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, assignment->span_);
-    return IRMutator::VisitStmt_(assignment);
+    return SyncStatementMutator::VisitStmt_(assignment);
   }
   StmtPtr VisitStmt_(const ForStmtPtr& loop) override {
     const auto found = children_.find(loop.get());
-    return found == children_.end() ? IRMutator::VisitStmt_(loop) : found->second;
+    return found == children_.end() ? SyncStatementMutator::VisitStmt_(loop) : found->second;
   }
   StmtPtr VisitStmt_(const SeqStmtsPtr& sequence) override {
     return RewriteSyncSequence(sequence, [this](const StmtPtr& statement) {
@@ -368,7 +368,6 @@ class Emit : public IRMutator {
       return StmtPtr(std::make_shared<EvalStmt>(operation, statement->span_));
     });
   }
-  ExprPtr VisitExpr(const ExprPtr& expression) override { return expression; }
 
  private:
   const Assignment& assignment_;
@@ -600,8 +599,10 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
   }
   const Assignment assignment(function, discovered, native.payloads, target, eligible_ids);
   PhysicalSyncRealization result;
-  result.function =
-      Emit(assignment, function->func_type_, children, discovered.completed_tokens).VisitFunction(function);
+  Emit emit(assignment, function->func_type_, children, discovered.completed_tokens);
+  auto rewritten = MutableCopy(function);
+  rewritten->body_ = emit.VisitStmt(function->body_);
+  result.function = std::move(rewritten);
   result.set_sites = 2 * discovered.transactions.size() + child_sets;
   result.wait_sites = 2 * discovered.transactions.size() + child_waits;
   result.barrier_sites = child_barriers;
