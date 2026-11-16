@@ -68,6 +68,7 @@ def compile_program(original, planner, *, enabled=True, buffer=True, disjoint=Fa
         memory_planner=planner,
         enable_pypto_autosync=enabled,
         autosync_policy="conservative_prefix",
+        enable_scalar_gm_dma=enabled and buffer,
         autosync_disjoint_gm=disjoint,
     ):
         return PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(original)
@@ -227,3 +228,33 @@ def test_dynamic_rank_one_extent_and_permitted_overlapping_gm_views(length, posi
         # a launch sample or a synthetic ready invocation parameter.
         reads = [call for call in execution.calls if call[0].op.name == ir.get_op("buffer.read").name]
         assert len(reads) == ((count + 1) // 2) * visits
+
+
+@pytest.mark.parametrize("staging", [False, True])
+@pytest.mark.parametrize("enabled,policy", [(False, "exact"), (True, "exact"), (True, "conservative_prefix")])
+def test_scalar_implementation_is_independent_of_sync_policy(staging, enabled, policy):
+    original = scalar_gm_program()
+    with passes.PassContext(
+        [],
+        enable_pypto_autosync=enabled,
+        autosync_policy=policy,
+        autosync_disjoint_gm=True,
+        enable_scalar_gm_dma=staging,
+    ):
+        result = PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(original)
+    function = result.get_function("kernel")
+    assert function is not None
+    assert bool(calls(result, "buffer.read")) == staging
+    assert bool(calls(result, "tensor.read")) != staging
+    if not enabled or not staging:
+        assert not function.attrs.get("pypto_autosync", False)
+
+
+def test_scalar_implementation_context_is_retained_and_checked():
+    with passes.PassContext([], enable_scalar_gm_dma=True):
+        context = passes.PassContext.current()
+        assert context is not None and context.get_enable_scalar_gm_dma()
+        manager = PassManager.get_strategy(ir.OptimizationStrategy.Default)
+    with passes.PassContext([], enable_scalar_gm_dma=False):
+        with pytest.raises(RuntimeError, match="scalar GM implementation changed"):
+            manager.run_passes(scalar_gm_program())

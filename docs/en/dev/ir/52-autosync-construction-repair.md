@@ -23,3 +23,13 @@ Original `tensor.read/write` uses `pto.load/store`. The recently introduced brid
 For qkpv_plan, source unrolling supplies 384 possible item bodies and128 executed bodies. Staging creates six payloads per item. Current conservative services cost22 flag pairs per item: static 2+384*22=8450; executed2+128*22=2818. Eight bounded trace-specific diagnostics reduce2818 to1282 while preserving staged total payload order, values, matching and reuse. This is neither a uniform optimizer nor a minimum-command claim. Evidence is under `build-py314/qkpv-cost-investigation`.
 
 Do not optimize rotating DMA carriers before deciding whether original scalar execution can be retained. Do not erase GM dependencies indiscriminately: different qualified roots may be disjoint, repeated access to the same root remains relevant. No device qualification follows from host execution.
+
+## Stage 2: explicit scalar implementation
+
+`PassContext(enable_scalar_gm_dma=False)` now preserves original scalar GM operations regardless of `autosync_policy`. Explicit `True` selects the qualified AIV/A2A3 packed rank-one INT32 DMA legalization independently of autosync enablement and producer policy. Existing exact/native qualification still decides ownership; staging grants no ownership. Context reconstruction, manager construction contracts and JIT cache identity retain this choice.
+
+The existing pinned ordinary PTOAS qkpv_plan artifact (`qwen-m2-qualified/compiled/kernels/aiv/qkpv_plan.cpp`) emits scalar pointer reads and writes with no TLOAD/TSTORE staging. Its exits contain PIPE_ALL, whole-cache dcci and dsb. This is evidence about emitted implementation, not a proved cache/native contract. The original scalar route therefore remains delegated until selected-native readiness, visibility and exit obligations are established. The default model owner count may decrease: ownership obtained solely by implicit DMA staging is no longer a default coverage claim.
+
+The staged regressions now request the implementation explicitly. A flag/autosync/policy matrix protects this separation; a cache test distinguishes both implementations and a manager test refuses a changed option after construction. These tests supplement the existing point geometry/value/matching/reuse tests.
+
+The model qualifier records `--scalar-gm-dma` explicitly in its receipt. Compare default/native and explicit-staging counts separately; historical21-owned receipts used staging.

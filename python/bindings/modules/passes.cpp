@@ -367,7 +367,7 @@ void BindPass(nb::module_& m) {
                           "verification and the diagnostic channel (warnings + performance\n"
                           "hints) for PassPipeline.")
       .def(nb::init<std::vector<PassInstrumentPtr>, VerificationLevel, DiagnosticPhase, DiagnosticCheckSet,
-                    MemoryPlanner, bool, RuntimeKind, bool, bool, bool, bool, bool, std::string>(),
+                    MemoryPlanner, bool, RuntimeKind, bool, bool, bool, bool, bool, std::string, bool>(),
            nb::arg("instruments"), nb::arg("verification_level") = VerificationLevel::Basic,
            nb::arg("diagnostic_phase") = DiagnosticPhase::PrePipeline,
            nb::arg("disabled_diagnostics") = DiagnosticCheckSet{DiagnosticCheck::UnusedControlFlowResult},
@@ -376,6 +376,7 @@ void BindPass(nb::module_& m) {
            nb::arg("enable_buffer_ir") = true, nb::arg("enable_software_pipeline") = false,
            nb::arg("report_hardware_loops") = false, nb::arg("enable_pypto_autosync") = false,
            nb::arg("autosync_disjoint_gm") = false, nb::arg("autosync_policy") = "exact",
+           nb::arg("enable_scalar_gm_dma") = false,
            "Create a PassContext with instruments, verification level, diagnostic phase gate, "
            "optional disabled diagnostic checks, memory planner selection, the stored legacy "
            "L0C double-buffer compatibility flag, the target Simpler runtime ABI, and default-on "
@@ -405,6 +406,8 @@ void BindPass(nb::module_& m) {
            "Whether to try PyPTO synchronization before PTOAS")
       .def("get_autosync_disjoint_gm", &PassContext::GetAutoSyncDisjointGM,
            "Get explicit disjoint GM contract")
+      .def("get_enable_scalar_gm_dma", &PassContext::GetEnableScalarGMDMA,
+           "Get the explicit scalar GM DMA implementation choice")
       .def("get_autosync_policy", &PassContext::GetAutoSyncPolicy,
            "Get the explicit exact or conservative_prefix logical producer policy")
       .def("get_memory_planner", &PassContext::GetMemoryPlanner,

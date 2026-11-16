@@ -322,6 +322,7 @@ class PassContext:
         enable_pypto_autosync: bool = False,
         autosync_disjoint_gm: bool = False,
         autosync_policy: str = "exact",
+        enable_scalar_gm_dma: bool = False,
     ) -> None:
         """Create a PassContext with instruments and pass configuration (incl. memory planner).
 
@@ -372,6 +373,14 @@ class PassContext:
 
     def get_autosync_disjoint_gm(self) -> bool:
         """Get the explicit distinct-GM-root disjointness contract."""
+
+    def get_enable_scalar_gm_dma(self) -> bool:
+        """Whether to stage supported scalar GM accesses through DMA.
+
+        Default-off native implementation choice, independent of sync policy.
+        Staging does not establish synchronization or invocation ownership.
+        """
+        ...
 
     def get_autosync_policy(self) -> str:
         """Get the logical producer policy: exact or conservative_prefix.
