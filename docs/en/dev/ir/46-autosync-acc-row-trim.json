@@ -1,0 +1,48 @@
+{
+  "status": "design accepted in principle; implementation/review/fresh validation pending",
+  "milestone": "M2 addressed Acc row-trim metadata/export adapter",
+  "date": "2026-11-16",
+  "baseline_head": "04965c91cf7ddb3ea606ad2225ecff316ec85010",
+  "native_pin": "5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f",
+  "dependencies": [
+    "44 GM scalar staging gate accepted/committed before shared-file implementation"
+  ],
+  "contracts": {
+    "core": "A2/A3 AIC",
+    "storage": "addressed Acc, original same complete physical window",
+    "writer": "existing qualified full-static producer/carry unchanged",
+    "trim": "ready row-only alias with proven/declared defined range0..M; columns exactly fullN",
+    "metadata": "static writer separate from dynamic-both-dimensions store handle; runtime aliases may share handle and RestoreDataOperands restores each actual(rows,N) at every use",
+    "zero_rows": "skip native store at original cut using qualified guard",
+    "packing": "CompactMode::Null; static physical row stride retained",
+    "refusals": [
+      "addressless planner",
+      "dynamic producer/carry",
+      "unproved row range/readiness",
+      "partial columns",
+      "offset/pitch/layout change",
+      "compact packing",
+      "alias escapes/unknown uses",
+      "unknown metadata observations anywhere in affected physical alias component",
+      "new atomic/quantization/activation/phase store variants"
+    ],
+    "store": "existing default two-operand TSTORE only; GM partition exactly(rows,N)"
+  },
+  "existing_owners": [
+    "StorageIndex::FinalizeTypedRoot",
+    "MatrixDescriptor",
+    "BufferValidAnalysis",
+    "BufferRuntimeValidAnalysis",
+    "shared selected native TSTORE contract"
+  ],
+  "native_source_snapshots": {
+    "build-py314/packed-column-contract/TStore.hpp": "5ac8b76106cdfa77e182d062453b7b4b2c447917113393415e032becedd697aa",
+    "build-py314/packed-column-contract/tstore_common.hpp": "d1ea6f21d2bfb88b6d0f20d28036180a814c773be41a2b0ae758599d68c7005f"
+  },
+  "implementation_changes": [],
+  "test_results": [],
+  "device_validation": false,
+  "review": {
+    "native_contract_expert": "conditional accept; document per-use shared-runtime-handle restoration, component-wide observer refusal and default-TSTORE scope before implementation"
+  }
+}
