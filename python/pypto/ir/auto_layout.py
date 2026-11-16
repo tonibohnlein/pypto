@@ -338,13 +338,18 @@ class LayoutCostModel:
     mte2_l2_reread_discount: float = 0.30
     l2_cache_line_bytes: int = 512
     mte2_vec_bytes_per_cycle: float = 192.0
-    mte1_l1_to_l0_bytes_per_cycle: float = 512.0
+    mte1_l1_to_l0_bytes_per_cycle: float = 129.7
+    mte1_l0a_bytes_per_cycle: float = 129.7
+    mte1_l0b_bytes_per_cycle: float = 85.4
     mte1_transpose_penalty_cycles: float = 8.0
     cube_macs_per_cycle: float = 4096.0
-    cube_issue_overhead_cycles: float = 28.0
+    cube_issue_overhead_cycles: float = 21.0
+    mad_fp32_passes: int | None = None
     vec_elements_per_cycle: float = 128.0
-    fixpipe_acc_to_nd_bytes_per_cycle: float = 128.0
-    fixpipe_acc_to_nz_bytes_per_cycle: float = 132.0
+    fixpipe_acc_to_nd_bytes_per_cycle: float = 118.0
+    fixpipe_acc_to_nz_bytes_per_cycle: float = 122.0
+    fixpipe_drain_fixed_cycles: float = 0.0
+    fixpipe_odd_n1_penalty_cycles: float = 2.6
     gm_pack_bytes_per_cycle: float = 64.0
     gm_pack_fixed_cycles: float = 120.0
     onchip_relayout_bytes_per_cycle: float = 256.0
@@ -363,6 +368,10 @@ class LayoutCostModel:
         """Return the PTO target architecture string (`'a2a3'` or `'a5'`)."""
         inst = core_backend.get_backend_instance(self.resolved_backend_type)
         return inst.get_handler().get_pto_target_arch()
+
+    def gm_access_granularity_bytes(self) -> int:
+        """Return the hardware GM access granularity in bytes (`512` on `a2a3`, `128` on `a5`)."""
+        return 128 if self.target_arch() == "a5" else self.l2_cache_line_bytes
 
     def supports_acc_nz_store(
         self,
@@ -474,7 +483,7 @@ class LayoutCostModel:
             bpe = _dtype_byte_width(dst_node.dtype)
             row_bytes = cols * bpe
             parent_row_bytes = parent_cols * bpe
-            line_b = float(max(1, self.l2_cache_line_bytes))
+            gran_b = float(max(1, self.gm_access_granularity_bytes()))
             wide_strided = (cols < parent_cols) and (parent_row_bytes > self.l2_cache_line_bytes)
             nd_bw = (
                 self.mte2_nd2nz_bytes_per_cycle
@@ -484,7 +493,7 @@ class LayoutCostModel:
             c0 = c0_elements(dst_node.dtype)
             col_blocks = max(1, (cols + c0 - 1) // c0)
             sub512_penalty = (
-                rows * max(0.0, (line_b - float(row_bytes)) / line_b) * self.mte2_nd2nz_sub512b_penalty_cycles
+                rows * max(0.0, (gran_b - float(row_bytes)) / gran_b) * self.mte2_nd2nz_sub512b_penalty_cycles
                 if wide_strided
                 else 0.0
             )
@@ -500,9 +509,20 @@ class LayoutCostModel:
         src_layout: LayoutChoice,
         dst_layout: LayoutChoice,
     ) -> float:
-        """Estimate on-chip `tile.move` cost (e.g. `Mat -> Left` or `Mat -> Right`)."""
+        """Estimate on-chip `tile.move` cost (e.g. `Mat -> Left` or `Mat -> Right`).
+
+        Matches `L0CostModel` in `backend_handler.h`: `L1 -> L0A` (`Left`) and
+        `L1 -> L0B` (`Right`) have distinct MTE1 port bandwidths (`129.7` vs
+        `85.4 B/cyc` on `a2a3`).
+        """
         total_bytes = float(dst_node.byte_size)
-        base = total_bytes / self.mte1_l1_to_l0_bytes_per_cycle
+        if dst_node.memory_space == core_ir.MemorySpace.Left:
+            bw = self.mte1_l0a_bytes_per_cycle
+        elif dst_node.memory_space == core_ir.MemorySpace.Right:
+            bw = self.mte1_l0b_bytes_per_cycle
+        else:
+            bw = self.mte1_l1_to_l0_bytes_per_cycle
+        base = total_bytes / bw
         if src_layout != dst_layout:
             return base + self.mte1_transpose_penalty_cycles
         return base
@@ -513,12 +533,25 @@ class LayoutCostModel:
         rhs_node: LayoutValueNode,
         out_node: LayoutValueNode,
     ) -> float:
-        """Estimate L0 `tile.matmul` (`Left` x `Right` -> `Acc`) compute cost."""
+        """Estimate L0 `tile.matmul` (`Left` x `Right` -> `Acc`) compute cost.
+
+        Follows `MadCycles` in `l0_tile_chooser.cpp`: full FP32 MMAD requires
+        `mad_fp32_passes` (`2` on `a2a3`, `8` on `a5`) per K-fractal due to
+        mantissa decomposition, while `<= 2B` dtypes (`FP16`/`BF16`) use `1` pass.
+        """
+        del out_node
         m_dim = int(lhs_node.shape[-2])
         k_dim = int(lhs_node.shape[-1])
         n_dim = int(rhs_node.shape[-1])
+        bpe = _dtype_byte_width(lhs_node.dtype)
+        fp32_passes = (
+            self.mad_fp32_passes
+            if self.mad_fp32_passes is not None
+            else (8 if self.target_arch() == "a5" else 2)
+        )
+        cpr = float(fp32_passes) if bpe == 4 else 1.0
         macs = float(m_dim * n_dim * k_dim)
-        return self.cube_issue_overhead_cycles + (macs / self.cube_macs_per_cycle)
+        return self.cube_issue_overhead_cycles + cpr * (macs / self.cube_macs_per_cycle)
 
     def estimate_store_cost(
         self,
@@ -526,11 +559,29 @@ class LayoutCostModel:
         dst_node: LayoutValueNode,
         dst_layout: LayoutChoice,
     ) -> float:
-        """Estimate `tile.store` (`Acc -> GM` or `Vec -> GM`) cost."""
+        """Estimate `tile.store` (`Acc -> GM` or `Vec -> GM`) cost.
+
+        Follows `DrainCycles` in `l0_tile_chooser.cpp` (`pto-isa fixpipe-model.md`):
+        includes optional per-drain fixed overhead and non-power-of-2 N-fractal
+        (`odd(N1) - 1`) burst serialization penalty per M-row.
+        """
+        del dst_node
         total_bytes = float(src_node.byte_size)
-        if dst_layout == core_ir.TensorLayout.NZ:
-            return total_bytes / self.fixpipe_acc_to_nz_bytes_per_cycle
-        return total_bytes / self.fixpipe_acc_to_nd_bytes_per_cycle
+        bw = (
+            self.fixpipe_acc_to_nz_bytes_per_cycle
+            if dst_layout == core_ir.TensorLayout.NZ
+            else self.fixpipe_acc_to_nd_bytes_per_cycle
+        )
+        m_rows = int(src_node.shape[-2]) if len(src_node.shape) >= 2 else 1
+        n_cols = int(src_node.shape[-1]) if len(src_node.shape) >= 1 else 1
+        bpe_c = max(1, _dtype_byte_width(src_node.dtype))
+        n0 = max(1, 32 // bpe_c)
+        n1 = max(1, (n_cols + n0 - 1) // n0)
+        odd_n1 = n1
+        while (odd_n1 & 1) == 0:
+            odd_n1 >>= 1
+        odd_penalty = float(m_rows) * self.fixpipe_odd_n1_penalty_cycles * float(odd_n1 - 1)
+        return self.fixpipe_drain_fixed_cycles + (total_bytes / bw) + odd_penalty
 
     def estimate_conversion_cost(
         self,
