@@ -175,7 +175,9 @@ def test_runtime_axis_actual_metadata_changes_across_reset_visits():
             check_runtime_commands(logical, physical, {1: rows, 2: choice})
 
 
-def recurrence_program(*, full_observation=False, varying=False, old_seed=False, inner_bound=False):
+def recurrence_program(
+    *, full_observation=False, varying=False, old_seed=False, inner_bound=False, aliases=0
+):
     """The generic full-seed/prefix recurrence used by post-normalization.
 
     The full-observation variant deliberately matches the missing value-domain
@@ -187,17 +189,22 @@ def recurrence_program(*, full_observation=False, varying=False, old_seed=False,
     # The parser keeps source-level bindings type-stable before SSA conversion.
     # Reduction and final carriers intentionally have different active metadata;
     # distinct names let the test reach the normalization/admission boundary.
+    final = f"scaled_alias_{aliases - 1}" if aliases else "scaled"
+    alias_lines = "\n                    ".join(
+        f"scaled_alias_{i} = {'scaled' if i == 0 else f'scaled_alias_{i - 1}'}" for i in range(aliases)
+    )
     observe = (
-        "final_column = pl.reshape(scaled, [8,1])\n"
+        f"final_column = pl.reshape({final}, [8,1])\n"
         "                    seed_output = pl.store(final_column, [0,0], seed_output)"
         if full_observation
-        else "final_column = pl.reshape(scaled, [8,1])\n"
+        else f"final_column = pl.reshape({final}, [8,1])\n"
         "                    output_source = pl.load(x, [0,0], [8,16], valid_shape=[active,16])\n"
         "                    result = pl.row_expand_mul(output_source, final_column)\n"
         "                    out = pl.store(result, [0,0], out)"
     )
     seed_use = (
-        "original = pl.reshape(seed, [8,1])\n"
+        "seed_alias = seed\n"
+        "                    original = pl.reshape(seed_alias, [8,1])\n"
         "                    seed_output = pl.store(original, [0,0], seed_output)"
         if old_seed
         else ""
@@ -223,6 +230,7 @@ class PrefixRecurrence:
                         part = pl.reshape(reduced_column, [1,8])
                         total = pl.add(total, part)
                     scaled = pl.add(pl.mul(total, 0.5), 1.0)
+                    {alias_lines}
                     {observe}
                     {seed_use}
         return out
@@ -230,10 +238,11 @@ class PrefixRecurrence:
 
 
 @pytest.mark.parametrize("varying", [False, True])
-def test_prefix_recurrence_values_matching_and_reset_visits(varying, tmp_path):
+@pytest.mark.parametrize("aliases", [0, 3])
+def test_prefix_recurrence_values_matching_and_reset_visits(varying, aliases, tmp_path):
     # Values and commands are checked from emitted Buffer IR, independently of
     # the normalizer's domain graph. Zero trips must retain the initialized seed.
-    program, _ = lower(recurrence_program(varying=varying))
+    program, _ = lower(recurrence_program(varying=varying, aliases=aliases))
     namespace = {}
     exec(torch_codegen(program), namespace)
     with passes.PassContext([], autosync_policy="conservative_prefix"):
@@ -318,6 +327,165 @@ def _selection_input(program):
     for transform in manager.passes[:boundary]:
         program = transform(program)
     return program
+
+
+@pytest.mark.parametrize("aliases", [1, 3])
+@pytest.mark.parametrize(
+    "planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP, passes.MemoryPlanner.PTOAS]
+)
+def test_plain_prefix_aliases_default_compilation(aliases, planner):
+    # Ordinary compilation (autosync disabled) must not select Buffer IR and
+    # then fail assignment symmetry just because an inferred prefix has aliases.
+    with passes.PassContext([], enable_buffer_ir=True, memory_planner=planner):
+        program = PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(
+            recurrence_program(aliases=aliases)
+        )
+    function = program.get_function("kernel")
+    assert function is not None
+    expected = (
+        ir.FunctionIRStage.Functional if planner == passes.MemoryPlanner.PTOAS else ir.FunctionIRStage.Buffer
+    )
+    assert function.ir_stage == expected
+
+
+@pytest.mark.parametrize("aliases", [1, 3])
+@pytest.mark.parametrize("allocation_case", ["preserved", "different_base", "different_offset"])
+def test_plain_prefix_aliases_rebind_types_and_preserve_allocation(aliases, allocation_case):
+    class AllocatedAliasSource(ir.IRMutator):
+        memory = None
+
+        def __init__(self):
+            super().__init__()
+            self.replacements = {}
+
+        def visit_var(self, op):
+            if op in self.replacements:
+                return self.replacements[op]
+            return super().visit_var(op)
+
+        def visit_assign_stmt(self, op):
+            result = super().visit_assign_stmt(op)
+            assert isinstance(result, ir.AssignStmt)
+            if not result.var.name_hint.startswith("scaled"):
+                return result
+            kind = result.var.type
+            assert isinstance(kind, ir.TileType)
+            if self.memory is None:
+                self.memory = ir.MemRef("prefix_alias_storage", 0, 32, result.span)
+            memory = self.memory
+            if result.var.name_hint.startswith("scaled_alias_0"):
+                if allocation_case == "different_base":
+                    memory = ir.MemRef("incompatible_alias_storage", 0, 32, result.span)
+                elif allocation_case == "different_offset":
+                    memory = ir.MemRef(self.memory.base_, 4, 32, result.span)
+            allocated = ir.TileType(kind.shape, kind.dtype, memory, kind.tile_view, kind.memory_space)
+            replacement = ir.Var(result.var.name_hint, allocated, result.var.span)
+            self.replacements[result.var] = replacement
+            return ir.AssignStmt(replacement, result.value, result.span)
+
+    class Assignments(ir.IRVisitor):
+        def __init__(self):
+            super().__init__()
+            self.by_name = {}
+
+        def visit_assign_stmt(self, op):
+            self.by_name[op.var.name_hint] = op
+
+    with passes.PassContext([], enable_buffer_ir=True, memory_planner=passes.MemoryPlanner.PYPTO):
+        original = _selection_input(recurrence_program(aliases=aliases))
+        allocation = AllocatedAliasSource()
+        original = allocation.visit_program(original)
+        source = original.get_function("kernel")
+        assert source is not None and allocation.memory is not None
+        saved = ir.serialize(original)
+        report = testing.normalize_buffer_active_domains(source)
+        candidate = report["candidate"]
+        if allocation_case != "preserved":
+            # Supplied placement contradicts a plain alias's existing source
+            # allocation. Descriptor narrowing cannot silently repair or
+            # redirect that storage, even if all value-domain facts are known.
+            assert not report["changed"] and candidate.body.same_as(source.body)
+            assert ir.serialize(original) == saved
+            return
+        properties = passes.IRPropertySet()
+        for prop in [
+            passes.IRProperty.AssignTypeSymmetry,
+            passes.IRProperty.SSAForm,
+            passes.IRProperty.UseAfterDef,
+        ]:
+            properties.insert(prop)
+        assert passes.PropertyVerifierRegistry.verify(properties, original) == []
+        assert (
+            passes.PropertyVerifierRegistry.verify(
+                properties, ir.Program([candidate], original.name, original.span)
+            )
+            == []
+        )
+    assert report["changed"] and ir.serialize(original) == saved
+    before, after = Assignments(), Assignments()
+    before.visit_stmt(source.body)
+    after.visit_stmt(candidate.body)
+    observed = 0
+    for name, assignment in after.by_name.items():
+        if not name.startswith("scaled_alias_"):
+            continue
+        old = before.by_name[name]
+        assert isinstance(assignment.value, ir.Var)
+        ir.assert_structural_equal(assignment.var.type, assignment.value.type)
+        assert not assignment.var.same_as(old.var)
+        kind = assignment.var.type
+        assert isinstance(kind, ir.TileType) and kind.memref is not None
+        assert kind.memref.same_as(allocation.memory)
+        assert isinstance(old.var.type, ir.TileType) and old.var.type.memref is not None
+        assert old.var.type.memref.same_as(allocation.memory)
+        observed += 1
+    assert observed == aliases
+
+
+@pytest.mark.parametrize("aliases", [1, 3])
+def test_plain_prefix_alias_metadata_observation_retains_original(aliases):
+    class ObserveAlias(ir.IRMutator):
+        changed = False
+
+        def visit_assign_stmt(self, op):
+            result = super().visit_assign_stmt(op)
+            assert isinstance(result, ir.AssignStmt)
+            if not result.var.name_hint.startswith(f"scaled_alias_{aliases - 1}"):
+                return result
+            zero = ir.ConstInt(0, ir.DataType.INDEX, result.span)
+            coordinate = ir.MakeTuple([zero, zero], result.span)
+            read = ir.create_op_call("tile.read", [result.var, coordinate], {}, result.span)
+            observed = ir.Var("observed_alias", read.type, result.span)
+            self.changed = True
+            return ir.SeqStmts([result, ir.AssignStmt(observed, read, result.span)], result.span)
+
+    with passes.PassContext([], enable_buffer_ir=True, memory_planner=passes.MemoryPlanner.PYPTO):
+        mutation = ObserveAlias()
+        original = mutation.visit_program(_selection_input(recurrence_program(aliases=aliases)))
+        source = original.get_function("kernel")
+        assert source is not None and mutation.changed
+        saved = ir.serialize(original)
+        report = testing.normalize_buffer_active_domains(source)
+        selected = passes.select_buffer_ir_functions()(original).get_function("kernel")
+    assert not report["changed"] and ir.serialize(original) == saved
+    assert selected is not None and selected.attrs["buffer_ir_selected"] is False
+    ir.assert_structural_equal(source.body, selected.body, enable_auto_mapping=False)
+
+
+@pytest.mark.parametrize("aliases", [1, 3])
+def test_plain_prefix_aliases_full_observation_retains_original(aliases):
+    # A plain alias does not license narrowing a store that still observes the
+    # full declared value, including inactive elements of the recurrence.
+    with passes.PassContext([], enable_buffer_ir=True, memory_planner=passes.MemoryPlanner.PYPTO):
+        original = _selection_input(recurrence_program(full_observation=True, aliases=aliases))
+        source = original.get_function("kernel")
+        assert source is not None
+        saved = ir.serialize(original)
+        report = testing.normalize_buffer_active_domains(source)
+        selected = passes.select_buffer_ir_functions()(original).get_function("kernel")
+    assert not report["changed"] and ir.serialize(original) == saved
+    assert selected is not None and selected.attrs["buffer_ir_selected"] is False
+    ir.assert_structural_equal(source.body, selected.body, enable_auto_mapping=False)
 
 
 def _is_static_row_vector(tile: ir.Type) -> bool:

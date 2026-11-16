@@ -684,6 +684,8 @@ class PrefixRewriter : public IRMutator {
   PrefixRewriter(const DomainIndex& index, BufferActiveDomainWork* work)
       : index_(index), names_(index.names), work_(work) {}
 
+  bool Available() const { return available_; }
+
   FunctionPtr VisitFunction(const FunctionPtr& function) override {
     // Admission preserves the function ABI and metadata: only local Tile
     // declarations can change. Avoid the base function mutator's recursive
@@ -767,6 +769,12 @@ class PrefixRewriter : public IRMutator {
     CountStatement();
     const auto old_call = As<Call>(original->value_);
     const auto found = index_.nodes.find(original->var_.get());
+    if (!old_call && AsVarLike(original->value_) && As<TileType>(original->var_->GetType())) {
+      // A plain alias has the source's descriptor, including its proved active
+      // prefix. Rebinding only its RHS leaves an overwide LHS and invalid IR;
+      // bind the new declaration before later aliases and payload uses visit it.
+      return RebindAssignment(original, VisitExpr(original->value_));
+    }
     if (!old_call || !KnownData(old_call)) return IRMutator::VisitStmt_(original);
     auto rebuilt = As<AssignStmt>(IRMutator::VisitStmt_(original));
     auto call = As<Call>(rebuilt->value_);
@@ -785,24 +793,7 @@ class PrefixRewriter : public IRMutator {
     if (!moved) return rebuilt;
     auto value = OpRegistry::GetInstance().Create(call->op_->name_, args, call->kwargs_, call->span_);
     value = transform_utils::PreserveCallAttrs(call, value);
-    auto type = WithCarriedMemRef(value->GetType(), original->var_->GetType());
-    if (structural_equal(type, original->var_->GetType())) {
-      // Rewriting operands does not require replacing the defining SSA name.
-      // In particular, a Tensor store keeps its original binding, so scalar
-      // queries of that Tensor remain valid without use-context rewriting.
-      auto assignment = MutableCopy(original);
-      assignment->value_ = value;
-      prologue.push_back(assignment);
-      return SeqStmts::Flatten(prologue, original->span_);
-    }
-    INTERNAL_CHECK_SPAN(As<TileType>(type) && As<TileType>(original->var_->GetType()), original->span_)
-        << "Internal error: prefix normalization must preserve scalar/Tensor binding types";
-    auto result = std::make_shared<Var>(original->var_->name_hint_, type, original->var_->span_);
-    Bind(original->var_.get(), result);
-    auto assignment = MutableCopy(original);
-    assignment->var_ = result;
-    assignment->value_ = value;
-    prologue.push_back(assignment);
+    prologue.push_back(RebindAssignment(original, value));
     return SeqStmts::Flatten(prologue, original->span_);
   }
 
@@ -836,6 +827,7 @@ class PrefixRewriter : public IRMutator {
   std::set<std::string> names_;
   size_t next_name_ = 0;
   BufferActiveDomainWork* work_;
+  bool available_ = true;
 
   void CountExpression() {
     if (work_) ++work_->rewrite_expression_dispatches;
@@ -847,6 +839,32 @@ class PrefixRewriter : public IRMutator {
   }
 
   void Bind(const Expr* original, const ExprPtr& replacement) { var_remap_[original] = replacement; }
+
+  StmtPtr RebindAssignment(const AssignStmtPtr& original, const ExprPtr& value) {
+    const auto type = WithCarriedMemRef(value->GetType(), original->var_->GetType());
+    const auto old_memory = GetTypeMemRef(original->var_->GetType());
+    const auto new_memory = GetTypeMemRef(type);
+    if (old_memory && new_memory &&
+        ((*old_memory)->base_ != (*new_memory)->base_ || !structural_equal(*old_memory, *new_memory))) {
+      // Descriptor normalization cannot redirect an existing allocation. Keep
+      // the entire original function when an alias cannot preserve its storage;
+      // no partially rebound candidate may escape this immutable construction.
+      available_ = false;
+      return original;
+    }
+    if (value == original->value_ && structural_equal(type, original->var_->GetType())) return original;
+    auto assignment = MutableCopy(original);
+    assignment->value_ = value;
+    if (!structural_equal(type, original->var_->GetType())) {
+      INTERNAL_CHECK_SPAN(As<TileType>(type) && As<TileType>(original->var_->GetType()), original->span_)
+          << "Internal error: prefix normalization must preserve scalar/Tensor binding types";
+      assignment->var_ = std::make_shared<Var>(original->var_->name_hint_, type, original->var_->span_);
+      Bind(original->var_.get(), assignment->var_);
+    }
+    // Same-type definitions retain their SSA identity. In particular, Tensor
+    // stores keep scalar queries of that Tensor stable without use rewriting.
+    return assignment;
+  }
 
   std::string FreshName() {
     // One shared monotonically advancing namespace avoids quadratic probing
@@ -891,7 +909,9 @@ BufferActiveDomainCandidate NormalizeBufferActiveDomains(const FunctionPtr& func
     if (!scalars.Check(expression)) return {function, function};
   for (const auto& expression : metadata.aggregate_expressions)
     if (!scalars.Check(expression)) return {function, function};
-  auto candidate = PrefixRewriter(index, work).VisitFunction(function);
+  PrefixRewriter rewriter(index, work);
+  auto candidate = rewriter.VisitFunction(function);
+  if (!rewriter.Available()) return {function, function};
   return {function, std::move(candidate)};
 }
 

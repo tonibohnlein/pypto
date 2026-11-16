@@ -423,6 +423,13 @@ std::shared_ptr<const WorkspaceContext> LayoutEvidence::InferCodegenContext() {
     data->admitted.insert(bound->data_->admitted.begin(), bound->data_->admitted.end());
   }
   if (!data->layout) data->layout = std::make_shared<LayoutResult>();
+  // Equal offsets and total bytes do not alone establish equal native ring
+  // geometry: e.g. two large slots can occupy the same bytes as four small
+  // slots. Merge validates every common pipe's slot count and size, after
+  // independent entry binding has already ruled out cumulative allocation of
+  // unrelated layouts. It supplies no additional launch/visibility contract.
+  const auto combined = WholeProgram();
+  CHECK(combined->error.empty()) << combined->error;
   return std::shared_ptr<const WorkspaceContext>(new WorkspaceContext(std::move(data)));
 }
 
