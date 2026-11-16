@@ -157,7 +157,7 @@ def test_structural_services_cover_independent_effects(kind):
     before = ir.serialize(function)
     analysis = testing.analyze_conservative_sync(function)
     assert ir.serialize(function) == before
-    assert analysis["precision"] == "storage_domain_no_kill"
+    assert analysis["precision"] == "storage_domain_refresh_kill"
     assert not analysis["exact_storage_selectors"] and not analysis["executable_protocol"]
     sites = analysis["sites"]
     assert len(sites) == 6

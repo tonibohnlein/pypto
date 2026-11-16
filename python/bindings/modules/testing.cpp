@@ -1513,9 +1513,9 @@ void BindTesting(nb::module_& m) {
       "analyze_conservative_sync",
       [](const ir::FunctionPtr& function, const std::string& target,
          const std::vector<std::shared_ptr<const ir::sync::NativeSyncChild>>& children,
-         bool retain_incoming_diagnostics, bool automatic_children) {
+         bool retain_incoming_diagnostics, bool automatic_children, bool enable_refresh_kill) {
         const auto analysis = ir::sync::AnalyzeConservativeSync(
-            function, target, children, {}, retain_incoming_diagnostics, automatic_children);
+            function, target, children, {}, retain_incoming_diagnostics, automatic_children, enable_refresh_kill);
         auto facts = [](const ir::sync::ConservativeAccessSet& accesses) {
           nb::list result;
           for (const auto& [space, pipe, write, domain] : accesses) {
@@ -1546,6 +1546,14 @@ void BindTesting(nb::module_& m) {
             record["incoming"] = nb::none();
           record["source_pipes"] = site.source_pipes;
           record["required_source_pipes"] = site.required_source_pipes;
+          nb::list refreshed;
+          for (const auto& [space, domain] : site.refreshed_domains) {
+            nb::dict entry;
+            entry["space"] = ir::MemorySpaceToString(space);
+            entry["domain"] = domain;
+            refreshed.append(entry);
+          }
+          record["refreshed_domains"] = refreshed;
           sites.append(record);
         }
         const auto& cost = analysis.Cost();
@@ -1559,6 +1567,7 @@ void BindTesting(nb::module_& m) {
         counters["suppressed_services"] = cost.suppressed_services;
         counters["certificate_visits"] = cost.certificate_visits;
         counters["certificate_omissions"] = cost.certificate_omissions;
+        counters["killed_facts"] = cost.killed_facts;
         counters["parent_links"] = cost.parent_links;
         counters["enclosure_lookups"] = cost.enclosure_lookups;
         counters["storage_domains"] = cost.storage_domains;
@@ -1633,7 +1642,7 @@ void BindTesting(nb::module_& m) {
         result["incoming_diagnostics_available"] = analysis.HasIncomingDiagnostics();
         result["disjoint_gm"] = analysis.SuppliedDisjointGM();
         result["gm_alias_contract"] = analysis.SuppliedDisjointGM() ? "supplied_disjoint_roots" : "may_alias";
-        result["precision"] = "storage_domain_no_kill";
+        result["precision"] = analysis.HasRefreshKill() ? "storage_domain_refresh_kill" : "storage_domain_no_kill";
         result["exact_storage_selectors"] = false;
         result["executable_protocol"] = false;
         return result;
@@ -1641,6 +1650,7 @@ void BindTesting(nb::module_& m) {
       nb::arg("function"), nb::arg("target") = "a2a3", nb::kw_only(),
       nb::arg("children") = std::vector<std::shared_ptr<const ir::sync::NativeSyncChild>>{},
       nb::arg("retain_incoming_diagnostics") = true, nb::arg("automatic_children") = false,
+      nb::arg("enable_refresh_kill") = true,
       "Qualify conservative effects/readiness; incoming history is an optional diagnostic export");
   testing.def(
       "insert_conservative_prefixes",
