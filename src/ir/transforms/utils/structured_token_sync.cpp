@@ -310,6 +310,24 @@ class Parse {
     cursor.pending.push_back({call->args_.at(0), Pipe(call, "dst_pipe"), guard, lag, visit});
     cursor.last.reset();
   }
+  bool HasSiteOrWait(const StmtPtr& stmt) const {
+    if (!stmt) return false;
+    if (const auto seq = As<SeqStmts>(stmt)) {
+      return std::any_of(seq->stmts_.begin(), seq->stmts_.end(),
+                         [&](const StmtPtr& child) { return HasSiteOrWait(child); });
+    }
+    if (const auto branch = As<IfStmt>(stmt)) {
+      return HasSiteOrWait(branch->then_body_) ||
+             (branch->else_body_ && HasSiteOrWait(*branch->else_body_));
+    }
+    if (const auto loop = As<ForStmt>(stmt)) return HasSiteOrWait(loop->body_);
+    if (const auto eval = As<EvalStmt>(stmt)) {
+      const auto call = As<Call>(eval->expr_);
+      return call && (sites_.count(call.get()) || IsOp(call, "sync.wait"));
+    }
+    return false;
+  }
+
   void Read(const StmtPtr& stmt, Cursor& cursor) {
     if (auto seq = As<SeqStmts>(stmt)) {
       for (const auto& child : seq->stmts_) Read(child, cursor);
@@ -335,6 +353,15 @@ class Parse {
       return;
     }
     if (auto branch = As<IfStmt>(stmt)) {
+      if (!input_.static_branches.empty() && branch->return_vars_.empty()) {
+        const bool then_live = HasSiteOrWait(branch->then_body_);
+        const bool else_live = branch->else_body_ && HasSiteOrWait(*branch->else_body_);
+        if (then_live != else_live) {
+          Read(then_live ? branch->then_body_ : *branch->else_body_, cursor);
+          return;
+        }
+        if (!then_live && !else_live) return;
+      }
       CHECK(cursor.loop) << "Conditional token transport requires its original loop";
       const auto& segment = input_.segments[*cursor.loop];
       auto binary = As<BinaryExpr>(branch->condition_);

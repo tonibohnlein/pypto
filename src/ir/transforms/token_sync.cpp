@@ -205,6 +205,40 @@ FunctionPtr InsertLogicalSync(const FunctionPtr& function, const std::string& ta
   auto input = sync::ImportPlacedSync(function, true, target, parameters, blocks);
   return sync::RealizeCompactSync(sync::AnalyzeCompactSync(std::move(input))).function;
 }
+
+// Unified region-tree dispatcher (`AnalyzeRegion(U)` from Draft Section 8):
+// - Explicit supplied children route straight to MixedCompose with those children.
+// - When disjoint GM is proven, Exact runs first (supporting guarded static
+//   IfStmts); if allow_regional_fallback is enabled and whole-function Exact
+//   rejects any construct, MixedCompose promotes maximal Exact subregions cleanly.
+// - Without disjoint GM under regional fallback, MixedCompose runs directly with
+//   ReadOnlyProjection child discovery.
+FunctionPtr AnalyzeRegionSync(
+    const FunctionPtr& function, const std::string& target, bool disjoint_gm, bool allow_regional_fallback,
+    const sync::SyncParameterBounds& parameters, std::optional<std::pair<int64_t, int64_t>> blocks,
+    std::optional<int64_t> launch_count,
+    const std::vector<std::shared_ptr<const sync::NativeSyncChild>>& accepted_children,
+    const std::vector<std::shared_ptr<const sync::EventfulSyncChild>>& eventful_children) {
+  if (!accepted_children.empty() || !eventful_children.empty()) {
+    return sync::InsertConservativePrefixes(
+        sync::AnalyzeConservativeSync(function, target, accepted_children, eventful_children, false, false));
+  }
+  if (disjoint_gm) {
+    if (!allow_regional_fallback) {
+      return InsertLogicalSync(BindLaunchCount(function, launch_count), target, parameters, blocks,
+                               launch_count);
+    }
+    try {
+      return InsertLogicalSync(BindLaunchCount(function, launch_count), target, parameters, blocks,
+                               launch_count);
+    } catch (const pypto::ValueError&) {
+      // Fall through to MixedCompose + Regional fallback.
+    }
+  }
+  CHECK(allow_regional_fallback) << "Regional synchronization fallback is unavailable under exact policy";
+  return sync::InsertConservativePrefixes(
+      sync::AnalyzeConservativeSync(function, target, {}, {}, false, true));
+}
 }  // namespace
 
 std::vector<std::shared_ptr<const sync::NativeSyncChild>> PrepareNativeSyncChildren(
@@ -316,7 +350,8 @@ Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accept
         const std::vector<std::shared_ptr<const sync::NativeSyncChild>> no_children;
         const std::vector<std::shared_ptr<const sync::EventfulSyncChild>> no_eventful;
         const auto evidence =
-            prefix ? sync::SyncInvocationEvidence{} : sync::CollectSyncInvocationEvidence(program);
+            (prefix && !context->GetAutoSyncDisjointGM()) ? sync::SyncInvocationEvidence{}
+                                                          : sync::CollectSyncInvocationEvidence(program);
         auto functions = program->functions_;
         for (auto& [global, function] : functions) {
           CheckLogicalSync(function);
@@ -325,24 +360,18 @@ Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accept
           CHECK(function->ir_stage_ == FunctionIRStage::Buffer &&
                 context->GetMemoryPlanner() != MemoryPlanner::PtoAS)
               << "InsertSync requires physically placed Buffer IR";
-          if (prefix) {
-            const auto found = children_by_owner.find(function.get());
-            const auto& children = found == children_by_owner.end() ? no_children : found->second;
-            const auto events = eventful_by_owner.find(function.get());
-            const auto& eventful = events == eventful_by_owner.end() ? no_eventful : events->second;
-            function = sync::InsertConservativePrefixes(sync::AnalyzeConservativeSync(
-                function, target, children, eventful, false, children.empty() && eventful.empty()));
-            sync::CheckGeneratedLogicalSync(function);
-            continue;
-          }
+          const auto found = children_by_owner.find(function.get());
+          const auto& children = found == children_by_owner.end() ? no_children : found->second;
+          const auto events = eventful_by_owner.find(function.get());
+          const auto& eventful = events == eventful_by_owner.end() ? no_eventful : events->second;
           auto bounds = evidence.parameters.find(global->name_);
           const auto parameters =
               bounds == evidence.parameters.end() ? sync::SyncParameterBounds{} : bounds->second;
           auto block = evidence.block_indices.find(global->name_);
           const auto blocks =
               block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second);
-          function = InsertLogicalSync(BindLaunchCount(function, FixedLaunchCount(evidence, global->name_)),
-                                       target, parameters, blocks, FixedLaunchCount(evidence, global->name_));
+          function = AnalyzeRegionSync(function, target, context->GetAutoSyncDisjointGM(), prefix, parameters,
+                                       blocks, FixedLaunchCount(evidence, global->name_), children, eventful);
           sync::CheckGeneratedLogicalSync(function);
         }
         return std::make_shared<Program>(functions, program->name_, program->span_);
@@ -436,7 +465,8 @@ Pass RealizeSync(bool require_whole_module) {
       return sync::SyncOutcome(function, false, reason);
     }
     const bool prefix = ctx->GetAutoSyncPolicy() == "conservative_prefix";
-    if (!prefix && !ctx->GetAutoSyncDisjointGM())
+    const bool disjoint_gm = ctx->GetAutoSyncDisjointGM();
+    if (!prefix && !disjoint_gm)
       return sync::SyncOutcome(function, false, "Disjoint GM argument contract was not supplied");
     auto target = ctx->GetBackendHandler()->GetPtoTargetArch();
     if (target != "a2a3")
@@ -446,14 +476,7 @@ Pass RealizeSync(bool require_whole_module) {
     // resource refusal returns the original body, never partially emitted IR.
     // Internal errors are deliberately not caught. The strict retained-result
     // APIs still throw on these user-facing input/proof refusals.
-    try {
-      // The same logical producer and actual-token consumer as the public
-      // stages. Insertion preserves callers, payloads and scalar coordinates,
-      // so this transaction may reuse its own freshly collected evidence.
-      const auto logical = prefix ? sync::InsertConservativePrefixes(
-                                        sync::AnalyzeConservativeSync(function, target, {}, {}, false, true))
-                                  : InsertLogicalSync(BindLaunchCount(function, block_count), target, bounds,
-                                                      block_bounds, block_count);
+    auto realize_logical = [&](const FunctionPtr& logical) -> FunctionPtr {
       sync::CheckGeneratedLogicalSync(logical);
       const auto optimized = sync::OptimizeLogicalSync(logical);
       sync::CheckGeneratedLogicalSync(optimized);
@@ -468,6 +491,20 @@ Pass RealizeSync(bool require_whole_module) {
           !HasPhysicalCommands(physical))
         return sync::SyncOutcome(physical.function, true, "");
       return CompleteOwnedInvocation(physical.function, target);
+    };
+    try {
+      if (disjoint_gm) {
+        try {
+          const auto exact_logical = InsertLogicalSync(BindLaunchCount(function, block_count), target, bounds,
+                                                       block_bounds, block_count);
+          return realize_logical(exact_logical);
+        } catch (const pypto::ValueError&) {
+          if (!prefix) throw;
+        }
+      }
+      const auto regional_logical =
+          sync::InsertConservativePrefixes(sync::AnalyzeConservativeSync(function, target, {}, {}, false, true));
+      return realize_logical(regional_logical);
     } catch (const pypto::ValueError& error) {
       return sync::SyncOutcome(function, false, error.what());
     }
@@ -486,7 +523,8 @@ Pass RealizeSync(bool require_whole_module) {
               << "RealizeSync cannot reprocess an owned physical plan";
         }
         const auto* context = PassContext::Current();
-        auto evidence = context && context->GetAutoSyncPolicy() == "conservative_prefix"
+        auto evidence = (context && context->GetAutoSyncPolicy() == "conservative_prefix" &&
+                         !context->GetAutoSyncDisjointGM())
                             ? sync::SyncInvocationEvidence{}
                             : sync::CollectSyncInvocationEvidence(program);
         auto functions = program->functions_;

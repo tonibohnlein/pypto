@@ -485,6 +485,129 @@ class Builder {
     }
   }
 
+  CompletionSummary ComputeEventfulCompletionSummary(const ConservativeSyncChildEntry& entry) const {
+    CompletionSummary base = CompletionSummary::Identity();
+    base.has_bypass_path = true;
+    for (const auto& fact : entry.effects) {
+      const PipeType pipe = std::get<1>(fact);
+      if (pipe != PipeType::ALL) base.active |= PipeToMask(pipe);
+    }
+    if (!entry.eventful || !entry.eventful->LogicalRecipe()) return base;
+
+    std::vector<CompletionVertex> vertices;
+    std::vector<std::pair<size_t, size_t>> edges;
+    const size_t entry_v = vertices.size();
+    vertices.push_back(CompletionVertex{});
+    std::unordered_map<const Expr*, PipeType> local_tokens;
+
+    auto find_pipe_attr = [](const CallPtr& call, const char* key) -> std::optional<PipeType> {
+      for (const auto& [name, val] : call->attrs_) {
+        if (name != key) continue;
+        if (const auto* i = std::any_cast<int>(&val)) return static_cast<PipeType>(*i);
+        if (const auto* i64 = std::any_cast<int64_t>(&val)) return static_cast<PipeType>(*i64);
+        if (const auto* p = std::any_cast<PipeType>(&val)) return *p;
+      }
+      return std::nullopt;
+    };
+
+    auto new_vertex = [&](CompletionVertex vertex) {
+      const size_t id = vertices.size();
+      vertices.push_back(std::move(vertex));
+      return id;
+    };
+
+    std::function<size_t(const StmtPtr&, size_t)> build = [&](const StmtPtr& stmt, size_t cur) -> size_t {
+      if (!stmt) return cur;
+      if (const auto seq = As<SeqStmts>(stmt)) {
+        for (const auto& child : seq->stmts_) cur = build(child, cur);
+        return cur;
+      }
+      if (const auto branch = As<IfStmt>(stmt)) {
+        const auto saved_tokens = local_tokens;
+        const size_t then_exit = build(branch->then_body_, cur);
+        const auto then_tokens = local_tokens;
+        local_tokens = saved_tokens;
+        const size_t else_exit = branch->else_body_ ? build(*branch->else_body_, cur) : cur;
+        for (auto it = local_tokens.begin(); it != local_tokens.end();) {
+          const auto found = then_tokens.find(it->first);
+          if (found == then_tokens.end() || found->second != it->second) {
+            it = local_tokens.erase(it);
+          } else {
+            ++it;
+          }
+        }
+        const size_t merge = new_vertex(CompletionVertex{});
+        edges.emplace_back(then_exit, merge);
+        edges.emplace_back(else_exit, merge);
+        return merge;
+      }
+      if (const auto loop = As<ForStmt>(stmt)) {
+        const auto saved_tokens = local_tokens;
+        const size_t hdr = new_vertex(CompletionVertex{});
+        edges.emplace_back(cur, hdr);
+        local_tokens.clear();
+        const size_t body_exit = build(loop->body_, hdr);
+        edges.emplace_back(body_exit, hdr);
+        local_tokens = saved_tokens;
+        return hdr;
+      }
+      if (const auto loop = As<WhileStmt>(stmt)) {
+        const auto saved_tokens = local_tokens;
+        const size_t hdr = new_vertex(CompletionVertex{});
+        edges.emplace_back(cur, hdr);
+        local_tokens.clear();
+        const size_t body_exit = build(loop->body_, hdr);
+        edges.emplace_back(body_exit, hdr);
+        local_tokens = saved_tokens;
+        return hdr;
+      }
+      if (const auto assign = As<AssignStmt>(stmt)) {
+        if (const auto call = As<Call>(assign->value_); call && IsOp(call, "sync.record")) {
+          if (const auto pipe = find_pipe_attr(call, "pipe")) {
+            local_tokens[assign->var_.get()] = *pipe;
+          }
+        }
+        return cur;
+      }
+      if (const auto eval = As<EvalStmt>(stmt)) {
+        if (const auto call = As<Call>(eval->expr_)) {
+          if (IsOp(call, "sync.wait") && !call->args_.empty()) {
+            if (const auto found = local_tokens.find(call->args_[0].get()); found != local_tokens.end()) {
+              if (const auto dst = find_pipe_attr(call, "dst_pipe")) {
+                CompletionVertex sync_v;
+                sync_v.pre_syncs.push_back(CompletionSyncEdge{found->second, *dst, /*bidirectional=*/false});
+                const size_t v = new_vertex(std::move(sync_v));
+                edges.emplace_back(cur, v);
+                return v;
+              }
+            }
+            return cur;
+          }
+          if (!IsOp(call, "sync.completed") && !IsOp(call, "sync.record") &&
+              !backend::QualifyBufferSyncNonPayload(call, target_)) {
+            const auto op = backend::QualifyBufferSyncOperation(call, function_->func_type_, target_);
+            const PipeMask mask = PipeToMask(op.Implementation().Pipe());
+            if (mask != 0) {
+              CompletionVertex op_v;
+              op_v.write_pipes = mask;
+              const size_t v = new_vertex(std::move(op_v));
+              edges.emplace_back(cur, v);
+              return v;
+            }
+          }
+        }
+      }
+      return cur;
+    };
+
+    const size_t tail = build(entry.eventful->LogicalRecipe(), entry_v);
+    const size_t exit_v = new_vertex(CompletionVertex{});
+    edges.emplace_back(tail, exit_v);
+    auto summary = SolveCompletionTransfer(vertices, edges, entry_v, exit_v).summary;
+    summary.active |= base.active;
+    return summary;
+  }
+
   void Build() {
     Read(function_->body_);
     RefineStorage();
@@ -493,12 +616,7 @@ class Builder {
       const auto found = generated_.find(child.scope.get());
       CHECK(found != generated_.end()) << "Retained child is outside the original semantic input";
       child.effects = found->second;
-      child.completion = CompletionSummary::Identity();
-      child.completion.has_bypass_path = true;
-      for (const auto& fact : child.effects) {
-        const PipeType pipe = std::get<1>(fact);
-        if (pipe != PipeType::ALL) child.completion.active |= PipeToMask(pipe);
-      }
+      child.completion = ComputeEventfulCompletionSummary(child);
     }
   }
 

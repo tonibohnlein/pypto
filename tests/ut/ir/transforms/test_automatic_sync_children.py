@@ -50,10 +50,10 @@ def test_public_prefix_retains_original_whole_readonly_invocation(count):
     original, scope, oracle = readonly_external_fixture(count)
     analysis = inspect(original)
     attempts = analysis["child_attempts"]
-    assert len(attempts) == 1 and attempts[0]["scope"] is scope
-    assert attempts[0]["stage"] == "logical_export_ready"
-    assert attempts[0]["physical_qualification"] == "pending_whole_plan"
-    retained = attempts[0]["mathematics"]
+    ready = [attempt for attempt in attempts if attempt["stage"] == "logical_export_ready"]
+    assert len(ready) == 1 and ready[0]["scope"] is scope
+    assert ready[0]["physical_qualification"] == "pending_whole_plan"
+    retained = ready[0]["mathematics"]
     unavailable = [
         index
         for index, domain in enumerate(retained.describe()["storage"])
@@ -149,15 +149,15 @@ def test_external_write_is_an_effect_refusal_without_invented_alias_premises():
     assert dict(logical.attrs)["autosync_retained_child_count"] == 0
 
 
-def test_automatic_preparation_does_not_unfold_count_or_retry_enclosing_loops():
+def test_automatic_preparation_does_not_unfold_count():
     signatures = []
     for count in (2, 16, 1024):
         original, scope = eventful_fixture(count)
         analysis = inspect(original)
         attempts = analysis["child_attempts"]
-        assert len(attempts) == 1 and attempts[0]["scope"] is scope
-        assert attempts[0]["stage"] == "logical_export_ready"
-        description = attempts[0]["mathematics"].describe()
+        ready = [attempt for attempt in attempts if attempt["stage"] == "logical_export_ready"]
+        assert len(ready) == 1 and ready[0]["scope"] is scope
+        description = ready[0]["mathematics"].describe()
         signatures.append(
             (
                 analysis["cost"]["child_discovery_nodes"],
@@ -344,3 +344,141 @@ def test_historical_physical_audit_does_not_fabricate_a_logical_baseline():
     assert summary["actual_token_order_checked_by_arm"] == [False, True]
     payloads = summary["payloads"]
     assert isinstance(payloads, int) and payloads > 0
+
+
+def test_top_down_region_discovery_and_guarded_exact_if():
+    span = ir.Span.unknown()
+
+    def ci(number):
+        return ir.ConstInt(number, ir.DataType.INDEX, span)
+
+    def tup(values):
+        return ir.MakeTuple([ci(v) for v in values], span)
+
+    def call(name, args, result=None):
+        return ir.Call(ir.get_op(name), args, result or ir.VoidType(), span)
+
+    def payload(name, args):
+        return ir.EvalStmt(call(name, args), span)
+
+    # 1. Nested 2-level sequential ForStmt nest inside a dynamic WhileStmt:
+    #    top-down discovery must promote the enclosing 2-level ForStmt nest once,
+    #    retiring the leaf-only heuristic.
+    gm = ir.TensorType([2, 8], ir.DataType.FP32)
+    src = ir.Var("src", gm, span)
+    out = ir.Var("out", gm, span)
+    ub = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    x = ir.Var("x", ub, span)
+    y = ir.Var("y", ub, span)
+    cond_flag = ir.Var("flag", ir.ScalarType(ir.DataType.BOOL), span)
+    i_var = ir.Var("outer_i", ir.ScalarType(ir.DataType.INDEX), span)
+    j_var = ir.Var("inner_j", ir.ScalarType(ir.DataType.INDEX), span)
+    inner_loop = ir.ForStmt(
+        j_var,
+        ci(0),
+        ci(2),
+        ci(1),
+        [],
+        ir.SeqStmts([payload("buffer.abs", [x, y]), ir.YieldStmt([], span)], span),
+        [],
+        span,
+    )
+    outer_exact_nest = ir.ForStmt(
+        i_var,
+        ci(0),
+        ci(2),
+        ci(1),
+        [],
+        ir.SeqStmts([inner_loop, ir.YieldStmt([], span)], span),
+        [],
+        span,
+    )
+    while_wrapper = ir.WhileStmt(
+        cond_flag,
+        [],
+        ir.SeqStmts([outer_exact_nest, ir.YieldStmt([], span)], span),
+        [],
+        span,
+    )
+    mixed_fn = ir.Function(
+        "nested_exact_in_while",
+        [src, cond_flag, (out, ir.ParamDirection.InOut)],
+        [out.type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(x, call("buffer.alloc", [tup([]), ci(0)], ub), span),
+                ir.AssignStmt(y, call("buffer.alloc", [tup([]), ci(128)], ub), span),
+                payload("buffer.load", [src, tup([0, 0]), tup([2, 8]), x]),
+                while_wrapper,
+                payload("buffer.store", [y, tup([0, 0]), tup([2, 8]), out]),
+                ir.ReturnStmt([out], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    analysis = inspect(mixed_fn)
+    ready = [a for a in analysis["child_attempts"] if a["stage"] == "logical_export_ready"]
+    assert len(ready) == 1 and ready[0]["scope"] is outer_exact_nest
+    assert [c["scope"] for c in analysis["children"]] == [outer_exact_nest]
+    mixed_prog = ir.Program([mixed_fn], "MixedNestedWhile", span)
+    with passes.PassContext([], enable_pypto_autosync=True, autosync_policy="conservative_prefix"):
+        mixed_logical = passes.insert_sync()(mixed_prog)
+        mixed_physical = passes.lower_sync()(mixed_logical)
+    assert dict(next(iter(mixed_logical.functions.values())).attrs)["autosync_retained_child_count"] == 1
+    assert dict(next(iter(mixed_physical.functions.values())).attrs)["pypto_autosync"] is True
+
+    # 2. Guarded statically-resolved IfStmt inside Exact (`autosync_policy="exact"`):
+    #    provably true branch (`i_var < 4` in loop 0..2) must remain 100% Exact and lower cleanly.
+    dead_store = payload("buffer.load", [src, tup([0, 0]), tup([2, 8]), y])
+    guarded_fn = ir.Function(
+        "guarded_exact_if",
+        [src, (out, ir.ParamDirection.InOut)],
+        [out.type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(x, call("buffer.alloc", [tup([]), ci(0)], ub), span),
+                ir.AssignStmt(y, call("buffer.alloc", [tup([]), ci(128)], ub), span),
+                payload("buffer.load", [src, tup([0, 0]), tup([2, 8]), x]),
+                ir.ForStmt(
+                    i_var,
+                    ci(0),
+                    ci(2),
+                    ci(1),
+                    [],
+                    ir.SeqStmts(
+                        [
+                            ir.IfStmt(
+                                ir.Lt(i_var, ci(4), ir.DataType.BOOL, span),
+                                payload("buffer.abs", [x, y]),
+                                dead_store,
+                                [],
+                                span,
+                            ),
+                            ir.YieldStmt([], span),
+                        ],
+                        span,
+                    ),
+                    [],
+                    span,
+                ),
+                payload("buffer.store", [y, tup([0, 0]), tup([2, 8]), out]),
+                ir.ReturnStmt([out], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    program = ir.Program([guarded_fn], "GuardedExactIf", span)
+    with passes.PassContext([], enable_pypto_autosync=True, autosync_disjoint_gm=True, autosync_policy="exact"):
+        physical = next(iter(passes.realize_sync()(program).functions.values()))
+    assert dict(physical.attrs)["pypto_autosync"] is True
+    with passes.PassContext(
+        [], enable_pypto_autosync=True, autosync_disjoint_gm=True, autosync_policy="conservative_prefix"
+    ):
+        unified_physical = next(iter(passes.realize_sync()(program).functions.values()))
+    assert dict(unified_physical.attrs)["pypto_autosync"] is True

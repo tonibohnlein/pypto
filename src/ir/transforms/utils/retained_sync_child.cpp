@@ -622,44 +622,40 @@ const char* EventfulSyncChildStageName(EventfulSyncChildStage stage) {
 }
 
 AutomaticSyncChildren PrepareAutomaticSyncChildren(const FunctionPtr& owner, const std::string& target) {
-  // Select scopes structurally before asking providers. Disjoint leaf loops
-  // make source inspection additive; do not repeatedly retry enclosing nests.
-  class Candidates : public IRVisitor {
-   public:
-    size_t nodes = 0;
-    std::vector<ForStmtPtr> scopes;
-    void VisitStmt(const StmtPtr& statement) override {
-      ++nodes;
-      IRVisitor::VisitStmt(statement);
-    }
-    void VisitExpr(const ExprPtr&) override {}
-
-   protected:
-    void VisitStmt_(const ForStmtPtr& loop) override {
-      if (!nested_.empty()) nested_.back() = true;
-      nested_.push_back(false);
-      IRVisitor::VisitStmt_(loop);
-      const bool leaf = !nested_.back();
-      nested_.pop_back();
-      if (leaf && loop->kind_ == ForKind::Sequential) scopes.push_back(loop);
-    }
-    void VisitStmt_(const WhileStmtPtr& loop) override {
-      if (!nested_.empty()) nested_.back() = true;
-      IRVisitor::VisitStmt_(loop);
-    }
-
-   private:
-    std::vector<bool> nested_;
-  } candidates;
-  candidates.VisitStmt(owner->body_);
+  // Top-down maximal exact subregion discovery (Draft Section 8): attempt to
+  // promote each enclosing sequential ForStmt subtree as a single Exact child
+  // before descending into inner loops only when the enclosing scope fails Exact.
   AutomaticSyncChildren result;
-  result.discovery_nodes = candidates.nodes;
-  if (candidates.scopes.empty()) return result;
-  const SyncRegionBindings bindings(owner, target);
-  result.index_nodes = bindings.SourceNodes();
-  result.parameter_nodes = bindings.ParameterNodes();
-  for (const auto& scope : candidates.scopes)
-    result.attempts.push_back(TryPrepareEventfulSyncChild(owner, scope, target, bindings));
+  std::optional<SyncRegionBindings> bindings;
+  auto ensure_bindings = [&]() -> const SyncRegionBindings& {
+    if (!bindings) {
+      bindings.emplace(owner, target);
+      result.index_nodes = bindings->SourceNodes();
+      result.parameter_nodes = bindings->ParameterNodes();
+    }
+    return *bindings;
+  };
+  std::function<void(const StmtPtr&)> discover = [&](const StmtPtr& statement) {
+    if (!statement) return;
+    ++result.discovery_nodes;
+    if (const auto seq = As<SeqStmts>(statement)) {
+      for (const auto& child : seq->stmts_) discover(child);
+    } else if (const auto branch = As<IfStmt>(statement)) {
+      discover(branch->then_body_);
+      if (branch->else_body_) discover(*branch->else_body_);
+    } else if (const auto loop = As<ForStmt>(statement)) {
+      if (loop->kind_ == ForKind::Sequential) {
+        auto attempt = TryPrepareEventfulSyncChild(owner, loop, target, ensure_bindings());
+        const bool promoted = static_cast<bool>(attempt.child);
+        result.attempts.push_back(std::move(attempt));
+        if (promoted) return;
+      }
+      discover(loop->body_);
+    } else if (const auto loop = As<WhileStmt>(statement)) {
+      discover(loop->body_);
+    }
+  };
+  discover(owner->body_);
   return result;
 }
 

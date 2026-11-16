@@ -35,6 +35,7 @@
 #include "pypto/ir/arith/analyzer.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/structural_comparison.h"
@@ -546,6 +547,143 @@ class Importer {
   ParameterIndices parameters;
   CoordinateGraph coordinates;
   std::set<size_t> translated_storage;
+  std::vector<std::pair<VarPtr, ExprPtr>> scalar_defs;
+
+  std::optional<bool> EvaluateStaticBranchCondition(const ExprPtr& condition, const SyncSegment& segment) const {
+    if (!condition) return std::nullopt;
+    arith::Analyzer analyzer;
+    if (result.owner) {
+      for (const auto& [param_idx, bound] : result.parameter_bounds) {
+        if (param_idx < result.owner->params_.size()) {
+          analyzer.const_int_bound.Update(result.owner->params_[param_idx], {bound.first, bound.second});
+        }
+      }
+    }
+    auto bind_frame = [&](const SyncLoopFrame& frame) {
+      if (!frame.loop || frame.start_expression) return;
+      if (frame.count <= 0) return;
+      const __int128 last = __int128(frame.start) + __int128(frame.count - 1) * frame.step;
+      if (last >= std::numeric_limits<int64_t>::max()) return;
+      analyzer.const_int_bound.Update(frame.loop->loop_var_, {frame.start, static_cast<int64_t>(last)});
+    };
+    for (const auto& frame : segment.nested_frames) bind_frame(frame);
+    if (segment.original_loop) {
+      bind_frame({segment.original_loop, segment.count, segment.start, segment.step});
+    }
+    for (const auto& [var, value] : scalar_defs) {
+      if (const auto st = As<ScalarType>(var->GetType());
+          st && (st->dtype_ == DataType::INDEX || st->dtype_.IsInt() || st->dtype_ == DataType::BOOL)) {
+        analyzer.rewrite_simplify.Update(var, analyzer.Simplify(value));
+      }
+    }
+
+    VarPtr block_var;
+    class SubstituteBlockIdx : public IRMutator {
+     public:
+      SubstituteBlockIdx(VarPtr bv, std::optional<std::pair<int64_t, int64_t>> bounds)
+          : block_var(std::move(bv)), bounds_(bounds) {}
+      VarPtr block_var;
+      bool used = false;
+      bool missing_bounds = false;
+
+     protected:
+      ExprPtr VisitExpr_(const CallPtr& call) override {
+        if (IsOp(call, "buffer.get_block_idx") && call->args_.empty()) {
+          if (!bounds_) {
+            missing_bounds = true;
+            return call;
+          }
+          used = true;
+          return block_var;
+        }
+        return IRMutator::VisitExpr_(call);
+      }
+      std::optional<std::pair<int64_t, int64_t>> bounds_;
+    } subst(std::make_shared<Var>("_sync_block_idx", std::make_shared<ScalarType>(DataType::INDEX),
+                                  condition->span_),
+            result.block_bounds);
+    ExprPtr normalized = subst.VisitExpr(condition);
+    if (subst.missing_bounds) return std::nullopt;
+    if (subst.used && result.block_bounds) {
+      analyzer.const_int_bound.Update(subst.block_var, {result.block_bounds->first, result.block_bounds->second});
+    }
+
+    std::function<std::optional<bool>(const ExprPtr&)> eval = [&](const ExprPtr& expr) -> std::optional<bool> {
+      const ExprPtr s = analyzer.Simplify(expr);
+      if (const auto c = As<ConstBool>(s)) return c->value_;
+      if (const auto c = As<ConstInt>(s)) return c->value_ != 0;
+      if (const auto n = As<Not>(s)) {
+        const auto v = eval(n->operand_);
+        return v ? std::optional<bool>(!*v) : std::nullopt;
+      }
+      if (const auto a = As<And>(s)) {
+        const auto lv = eval(a->left_);
+        if (lv == false) return false;
+        const auto rv = eval(a->right_);
+        if (rv == false) return false;
+        if (lv == true && rv == true) return true;
+        return std::nullopt;
+      }
+      if (const auto o = As<Or>(s)) {
+        const auto lv = eval(o->left_);
+        if (lv == true) return true;
+        const auto rv = eval(o->right_);
+        if (rv == true) return true;
+        if (lv == false && rv == false) return false;
+        return std::nullopt;
+      }
+      auto eval_cmp = [&](const BinaryExprPtr& cmp, int kind) -> std::optional<bool> {
+        const auto lt = As<ScalarType>(cmp->left_->GetType());
+        const auto rt = As<ScalarType>(cmp->right_->GetType());
+        if (!lt || !rt || lt->dtype_ != rt->dtype_ || (!lt->dtype_.IsInt() && lt->dtype_ != DataType::INDEX))
+          return std::nullopt;
+        const ExprPtr diff =
+            analyzer.Simplify(std::make_shared<Sub>(cmp->left_, cmp->right_, lt->dtype_, cmp->span_));
+        const auto b = analyzer.const_int_bound(diff);
+        if (b.min_value > b.max_value) return std::nullopt;
+        const bool non_neg = b.min_value >= 0;
+        const bool pos = b.min_value > 0;
+        const bool non_pos = b.max_value <= 0;
+        const bool neg = b.max_value < 0;
+        switch (kind) {
+          case 0:  // Eq
+            if (non_neg && non_pos) return true;
+            if (pos || neg) return false;
+            return std::nullopt;
+          case 1:  // Ne
+            if (pos || neg) return true;
+            if (non_neg && non_pos) return false;
+            return std::nullopt;
+          case 2:  // Lt
+            if (neg) return true;
+            if (non_neg) return false;
+            return std::nullopt;
+          case 3:  // Le
+            if (non_pos) return true;
+            if (pos) return false;
+            return std::nullopt;
+          case 4:  // Gt
+            if (pos) return true;
+            if (non_pos) return false;
+            return std::nullopt;
+          case 5:  // Ge
+            if (non_neg) return true;
+            if (neg) return false;
+            return std::nullopt;
+          default:
+            return std::nullopt;
+        }
+      };
+      if (const auto c = As<Eq>(s)) return eval_cmp(c, 0);
+      if (const auto c = As<Ne>(s)) return eval_cmp(c, 1);
+      if (const auto c = As<Lt>(s)) return eval_cmp(c, 2);
+      if (const auto c = As<Le>(s)) return eval_cmp(c, 3);
+      if (const auto c = As<Gt>(s)) return eval_cmp(c, 4);
+      if (const auto c = As<Ge>(s)) return eval_cmp(c, 5);
+      return std::nullopt;
+    };
+    return eval(normalized);
+  }
   AffineCoordinate Coordinate(const ExprPtr& e, const SyncSegment& segment) {
     RequireIndex(e);
     auto out = coordinates.Flatten(coordinates.Build(e, segment, parameters, result), result);
@@ -586,6 +724,7 @@ class Importer {
       }
       ready_scalars.insert(assign->var_.get());
     }
+    scalar_defs.emplace_back(assign->var_, assign->value_);
     coordinates.Define(assign->var_, assign->value_, segment, parameters, result, readonly_external);
   }
   void SelectSlot(const AssignStmtPtr& assign, const SyncSegment& segment) {
@@ -1189,6 +1328,17 @@ class Importer {
         segment.sites.push_back(Site(call, segment));
         preceding_matrix |= segment.sites.back().pipe == PipeType::M;
       } else if (auto branch = As<IfStmt>(s)) {
+        if (branch->return_vars_.empty()) {
+          if (const auto verdict = EvaluateStaticBranchCondition(branch->condition_, segment)) {
+            result.static_branches[branch.get()] = *verdict;
+            if (*verdict) {
+              Body(branch->then_body_, segment);
+            } else if (branch->else_body_) {
+              Body(*branch->else_body_, segment);
+            }
+            continue;
+          }
+        }
         // Admit exactly a suffix of first-visit frame tests. Testing only an
         // outer coordinate would reinitialize on every untested inner visit.
         std::map<const Expr*, int64_t> first_visits;
@@ -1366,6 +1516,33 @@ SyncRegion ImportStructuredBody(Importer& importer, const StmtPtr& statement,
         add(std::move(segment));
       }
       parents.pop_back();
+    } else if (auto branch = As<IfStmt>(child)) {
+      if (branch->return_vars_.empty()) {
+        if (const auto verdict = importer.EvaluateStaticBranchCondition(branch->condition_, finite)) {
+          importer.result.static_branches[branch.get()] = *verdict;
+          const std::optional<StmtPtr> live_arm =
+              *verdict ? std::optional<StmtPtr>(branch->then_body_) : branch->else_body_;
+          if (live_arm) {
+            std::function<bool(const StmtPtr&)> has_for = [&](const StmtPtr& st) {
+              if (As<ForStmt>(st) || As<WhileStmt>(st)) return true;
+              if (const auto s = As<SeqStmts>(st))
+                return std::any_of(s->stmts_.begin(), s->stmts_.end(), has_for);
+              if (const auto b = As<IfStmt>(st))
+                return has_for(b->then_body_) || (b->else_body_ && has_for(*b->else_body_));
+              return false;
+            };
+            if (has_for(*live_arm)) {
+              flush();
+              auto sub = ImportStructuredBody(importer, *live_arm, parents, nested);
+              for (auto& c : sub.children) sequence.children.push_back(std::move(c));
+            } else {
+              importer.Body(*live_arm, finite);
+            }
+          }
+          continue;
+        }
+      }
+      importer.Body(child, finite);
     } else if (auto assign = As<AssignStmt>(child)) {
       importer.Definition(assign, finite, true);
     } else if (!As<YieldStmt>(child) && !As<ReturnStmt>(child)) {
