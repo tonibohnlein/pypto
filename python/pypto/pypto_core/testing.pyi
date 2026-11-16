@@ -364,6 +364,8 @@ def analyze_conservative_sync(
 
     Incoming history snapshots are an optional diagnostic export. When disabled,
     incoming fields are unavailable (None), rather than exact empty histories.
+    required_source_pipes retains baseline storage obligations; source_pipes is
+    the certified ordered subset constructed from established payload completions.
     """
     ...
 
