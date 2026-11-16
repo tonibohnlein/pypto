@@ -16,6 +16,7 @@ from pypto import ir, passes
 
 from .test_autosync_switch import clone
 from .test_conservative_sync_children import loop_scopes, resident_child_fixture
+from .test_vec_sync_analysis import vec_fixture
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
 
@@ -29,6 +30,37 @@ def prepare(function, scopes):
     # Production factory is independent of the later conservative policy.
     with passes.PassContext([], autosync_disjoint_gm=True):
         return passes.prepare_native_sync_children(function, scopes)
+
+
+@pytest.mark.parametrize("name", ["system.sync_set", "system.sync_wait"])
+def test_manual_peer_boundary_remains_owned_and_unchanged_on_refusal(name):
+    # An explicit peer command is not a local payload or an empty footprint.
+    # No peer protocol is synthesized; this negative case intentionally does
+    # not claim that an isolated peer endpoint is a complete executable program.
+    source = vec_fixture()
+    command = ir.EvalStmt(
+        ir.create_op_call(
+            name,
+            [],
+            {"pipe": int(ir.PipeType.V), "event_id": 3, "core_type": "aiv"},
+            source.span,
+        ),
+        source.span,
+    )
+    assert isinstance(source.body, ir.SeqStmts)
+    source = clone(source, body=ir.SeqStmts([command, *source.body.stmts], source.span))
+    program = ir.Program([source], "ManualPeerBoundary", source.span)
+    before = ir.serialize(program)
+    with pytest.raises(ValueError):
+        apply(program, passes.insert_sync())
+    with passes.PassContext(
+        [], enable_pypto_autosync=True, autosync_policy="conservative_prefix", autosync_disjoint_gm=True
+    ):
+        result = passes.realize_sync()(program)
+    preserved = next(iter(result.functions.values()))
+    ir.assert_structural_equal(preserved.body, source.body)
+    assert not dict(preserved.attrs).get("pypto_autosync", False)
+    assert ir.serialize(program) == before
 
 
 def test_public_child_capability_has_no_mutable_or_fabricated_constructor():
