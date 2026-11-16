@@ -15,6 +15,8 @@ import hashlib
 import json
 import os
 import resource
+import subprocess
+import sys
 import threading
 import time
 from collections import defaultdict, deque
@@ -153,16 +155,26 @@ def crosscheck_graph_storage():
     assert all(((a, b) in old) == ((a, b) in new) for a in state.vertices for b in state.vertices)
 
 
+def logical_plan(function, *, children=None, automatic=False, disjoint_gm=False):
+    """Select the producer explicitly: empty public requests now select children."""
+    assert not (automatic and children is not None)
+    with passes.PassContext([], autosync_policy="conservative_prefix", autosync_disjoint_gm=disjoint_gm):
+        program = ir.Program([function], "ActualChild", function.span)
+        if automatic:
+            return passes.insert_sync()(program)
+        if children is not None:
+            return passes.insert_sync(eventful_children=children)(program)
+        primitive = testing.insert_conservative_prefixes(function)
+        return ir.Program([primitive], "PrimitivePrefix", function.span)
+
+
 def crosscheck_command_prefixes():
     """Compare every original event pair, not only payloads or reuse counts."""
     function, scope = eventful_fixture(1)
     with passes.PassContext([]):
         child = passes.prepare_eventful_sync_children(function, [scope])[0]
-    for children in [[], [child]]:
-        with passes.PassContext([], autosync_policy="conservative_prefix"):
-            logical = passes.insert_sync(eventful_children=children)(
-                ir.Program([function], "PrefixCrosscheck", function.span)
-            )
+    for children in [None, [child]]:
+        logical = logical_plan(function, children=children)
         with passes.PassContext([]):
             physical = passes.lower_sync()(logical)
         for program in [logical, physical]:
@@ -515,17 +527,22 @@ def execution_case(original, plans, parameters, shape_values, bases, block_index
     projections = []
     physical_summaries = []
     arm = 1
+    token_checks = []
     for logical, physical in plans:
-        state = interpret(logical, arm)
-        assert state.payloads == source.payloads, "changed original payload/bytes"
-        assert state.descriptors == source.descriptors, "changed storage descriptors"
-        expressed = payload_rows(state)
-        del state
-        gc.collect()
+        expressed = None
+        if logical is not None:
+            state = interpret(logical, arm)
+            assert state.payloads == source.payloads, "changed original payload/bytes"
+            assert state.descriptors == source.descriptors, "changed storage descriptors"
+            expressed = payload_rows(state)
+            del state
+            gc.collect()
+        token_checks.append(expressed is not None)
         state = interpret(physical, arm + 1)
         assert state.payloads == source.payloads, "changed original payload/bytes"
         assert state.descriptors == source.descriptors, "changed storage descriptors"
-        assert expressed == payload_rows(state), "changed actual logical payload event order"
+        if expressed is not None:
+            assert expressed == payload_rows(state), "changed actual logical payload event order"
         selected = completion_rows(state.reachability, len(source.payloads))
         assert all(needed & ~actual == 0 for needed, actual in zip(required, selected, strict=True)), (
             "uncovered physical-byte prerequisite"
@@ -563,7 +580,8 @@ def execution_case(original, plans, parameters, shape_values, bases, block_index
         "new_commands": physical_summaries[1]["commands"],
         "new_directional_ids": physical_summaries[1]["directional_ids"],
         "checked_reuses": physical_summaries[1]["checked_reuses"],
-        "actual_token_all_event_order_preserved": True,
+        "actual_token_all_event_order_preserved": True if all(token_checks) else None,
+        "actual_token_order_checked_by_arm": token_checks,
     }
 
 
@@ -589,16 +607,23 @@ def start_memory_guard(output, limit_mib):
     threading.Thread(target=watch, daemon=True, name="audit-rss-limit").start()
 
 
-def main():
+def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--function", required=True)
-    parser.add_argument("--scope", required=True)
+    parser.add_argument("--scope", help="Original loop name for explicit-child mode")
+    parser.add_argument("--automatic", action="store_true", help="Audit the public automatic child producer")
+    parser.add_argument(
+        "--disjoint-gm",
+        action="store_true",
+        help="Supply the explicit disjoint-GM contract to both producers",
+    )
     parser.add_argument("--parameters", required=True, help="JSON original scalar parameter index -> value")
     parser.add_argument(
         "--shape-values", required=True, help="JSON original physical ABI shape name -> value"
     )
     parser.add_argument("--block-index", action="append", type=int, required=True)
+    parser.add_argument("--baseline-physical", type=Path, help="Previously emitted owned physical Program")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--memory-limit-mib", type=int, default=2048)
     parser.add_argument(
@@ -606,9 +631,51 @@ def main():
         action="store_true",
         help="Also audit actual retained covers/all queries/selectors; expensive, use one execution",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.automatic and (args.scope is not None or args.check_retained):
+        parser.error("--automatic cannot be combined with --scope or --check-retained")
+    if not args.automatic and args.scope is None:
+        parser.error("explicit-child mode requires --scope")
     if args.output.exists():
         parser.error("output must be a new directory; preserve previous audit evidence")
+    return args
+
+
+def source_identity() -> dict[str, Any]:
+    """Pin the compiler actually loaded, including dirty source and Python."""
+    root = Path(__file__).resolve().parents[4]
+    assert __spec__ is not None, "Run the qualification module with python -m"
+
+    def git(*arguments: str) -> str:
+        return subprocess.check_output(["git", *arguments], cwd=root, text=True).strip()
+
+    changed = git("diff", "--name-only", "HEAD").splitlines()
+    untracked = git("ls-files", "--others", "--exclude-standard").splitlines()
+    sources = sorted(set(changed + untracked))
+    binaries = {}
+    for name, module in sys.modules.copy().items():
+        filename = getattr(module, "__file__", None)
+        if name.startswith("pypto") and isinstance(filename, str) and filename.endswith(".so"):
+            path = Path(filename).resolve()
+            binaries[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return {
+        "source_revision": git("rev-parse", "HEAD"),
+        "dirty_source_sha256": {
+            name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+            for name in sources
+            if name.startswith(("src/", "include/", "python/", "tests/")) and (root / name).is_file()
+        },
+        "audit_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "python": sys.executable,
+        "python_version": sys.version,
+        "binaries": binaries,
+        "command": [sys.executable, "-m", __spec__.name, *sys.argv[1:]],
+        "native_tool_execution": "No PTOAS, CCEC or device execution in this actual-command audit",
+    }
+
+
+def main():
+    args = parse_arguments()
     args.output.mkdir(parents=True)
     start_memory_guard(args.output, args.memory_limit_mib)
     backend.reset_for_testing()
@@ -621,24 +688,51 @@ def main():
     assert isinstance(original_program, ir.Program)
     original = original_program.get_function(args.function)
     assert original is not None
-    scope = scope_named(original.body, args.scope)
+    scope = scope_named(original.body, args.scope) if args.scope is not None else None
     parameters = {int(key): value for key, value in json.loads(args.parameters).items()}
     shape_values = json.loads(args.shape_values)
     started = time.perf_counter()
-    print(json.dumps({"audit_stage": "prepare_retained_child"}), flush=True)
-    with passes.PassContext([]):
-        child = passes.prepare_eventful_sync_children(original, [scope])[0]
-    retained = testing.inspect_eventful_sync_child(child)
+    child = None
+    retained = None
+    if not args.automatic:
+        assert scope is not None
+        print(json.dumps({"audit_stage": "prepare_retained_child"}), flush=True)
+        with passes.PassContext([]):
+            child = passes.prepare_eventful_sync_children(original, [scope])[0]
+        retained = testing.inspect_eventful_sync_child(child)
     math_reference = retained if args.check_retained else None
-    plans = []
-    for children in [[], [child]]:
-        with passes.PassContext([], autosync_policy="conservative_prefix"):
-            logical = passes.insert_sync(eventful_children=children)(
-                ir.Program([original], "ActualChild", original.span)
-            )
+    logical_programs = [
+        logical_plan(original, disjoint_gm=args.disjoint_gm),
+        logical_plan(
+            original,
+            children=None if args.automatic else [child],
+            automatic=args.automatic,
+            disjoint_gm=args.disjoint_gm,
+        ),
+    ]
+    plans: list[tuple[ir.Function | None, ir.Function]] = []
+    for logical in logical_programs:
         with passes.PassContext([]):
             physical = passes.lower_sync()(logical)
         plans.append((next(iter(logical.functions.values())), next(iter(physical.functions.values()))))
+    baseline_identity = None
+    if args.baseline_physical is not None:
+        baseline_program = ir.deserialize_from_file(str(args.baseline_physical))
+        assert isinstance(baseline_program, ir.Program)
+        baseline = baseline_program.get_function(args.function)
+        assert baseline is not None and dict(baseline.attrs).get("pypto_autosync") is True
+        # The old actual token program is unavailable. Do not substitute its
+        # physical commands as a fake logical arm or claim token-order equality.
+        # Both emitted plans still undergo independent byte/order/reuse checks.
+        plans[0] = (None, baseline)
+        baseline_identity = {
+            "path": str(args.baseline_physical.resolve()),
+            "sha256": hashlib.sha256(args.baseline_physical.read_bytes()).hexdigest(),
+            "logical_program": "unavailable",
+        }
+    candidate_logical = plans[1][0]
+    assert candidate_logical is not None
+    candidate_attributes = dict(candidate_logical.attrs)
     results = []
     bases = {
         index: index << 40
@@ -654,21 +748,37 @@ def main():
         (args.output / "completed-executions.json").write_text(json.dumps(results, indent=2) + "\n")
         gc.collect()
     receipt: dict[str, Any] = {
+        **source_identity(),
         "input_sha256": hashlib.sha256(args.input.read_bytes()).hexdigest(),
+        "input": str(args.input.resolve()),
+        "function": args.function,
+        "baseline_producer": "captured_physical_plan"
+        if baseline_identity
+        else "primitive_conservative_prefix",
+        "baseline_identity": baseline_identity,
+        "candidate_producer": "public_automatic_children" if args.automatic else "explicit_retained_child",
+        "alias_contract": "explicit_disjoint_gm" if args.disjoint_gm else "may_alias",
+        "tensor_bases": bases,
+        "backend": "Ascend910/a2a3",
+        "candidate_child_diagnostics": {
+            name: value
+            for name, value in candidate_attributes.items()
+            if name.startswith("autosync_child_") or name == "autosync_retained_child_count"
+        },
         "scope": args.scope,
         "parameters": parameters,
         "shape_values": shape_values,
         "caller_qualification": (
             "Finite explicitly supplied ABI executions; these values are not compiler assumptions."
         ),
-        "retained": child.describe(),
+        "retained": child.describe() if child is not None else None,
         "executions": results,
         "seconds_inclusive": time.perf_counter() - started,
         "device": "not run",
         "memory_limit_mib": args.memory_limit_mib,
         "observed_peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         "graph_lifetime": "One logical or physical arm at a time; no graph/cache retained across executions",
-        "retained_mathematics": retained.describe()["guarantee"],
+        "retained_mathematics": retained.describe()["guarantee"] if retained is not None else None,
         "retained_mathematics_checked": args.check_retained,
     }
     (args.output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")

@@ -18,7 +18,7 @@ import sys
 import time
 from typing import Any
 
-from pypto import backend, codegen, ir, passes
+from pypto import backend, codegen, ir, passes, testing
 from pypto.backend.pto_backend import _run_ptoas
 
 from .sync_closed_command_oracle import ClosedCommands, check_closed_commands
@@ -147,9 +147,13 @@ def describe_witness(pair, state):
 def build(function, children):
     start = time.perf_counter()
     with passes.PassContext([], autosync_policy="conservative_prefix"):
-        logical_program = passes.insert_sync(eventful_children=children)(
-            ir.Program([function], "MeasuredChild", function.span)
-        )
+        if children:
+            logical_program = passes.insert_sync(eventful_children=children)(
+                ir.Program([function], "MeasuredChild", function.span)
+            )
+        else:
+            primitive = testing.insert_conservative_prefixes(function)
+            logical_program = ir.Program([primitive], "PrimitivePrefix", function.span)
     inserted = time.perf_counter()
     verify(next(iter(logical_program.functions.values())))
     verified = time.perf_counter()
@@ -312,6 +316,8 @@ for name, module in sys.modules.copy().items():
     if name.startswith("pypto") and isinstance(filename, str) and filename.endswith(".so"):
         binaries[str(pathlib.Path(filename).resolve())] = digest(pathlib.Path(filename))
 result = {
+    "baseline_producer": "primitive_conservative_prefix",
+    "candidate_producer": "explicit_retained_child",
     "source_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
     "working_tree_sha256": {path: digest(ROOT / path) for path in source_paths if (ROOT / path).is_file()},
     "python": sys.executable,

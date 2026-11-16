@@ -12,6 +12,7 @@
 import pytest
 from pypto import ir, passes, testing
 
+from .qualify_captured_child_commands import execution_case, logical_plan, parse_arguments
 from .sync_closed_command_oracle import check_closed_commands
 from .sync_matmul_oracle import sequence_stmts, validate
 from .sync_qwen_prefill_cases import capture_qwen_projection
@@ -273,3 +274,73 @@ def test_original_qwen_projection_uses_original_leaf_loop_boundaries():
     logical, physical = construct(original)
     assert dict(logical.attrs)["autosync_retained_child_count"] > 0
     assert dict(physical.attrs)["pypto_autosync"] is True
+
+
+@pytest.mark.parametrize("extra", [["--automatic", "--scope", "k"], ["--automatic", "--check-retained"], []])
+def test_command_audit_refuses_ambiguous_mode_before_output(tmp_path, extra):
+    output = tmp_path / "not_created"
+    argv = [
+        "--input",
+        str(tmp_path / "not_read"),
+        "--function",
+        "kernel",
+        "--parameters",
+        "{}",
+        "--shape-values",
+        "{}",
+        "--block-index",
+        "0",
+        "--output",
+        str(output),
+        *extra,
+    ]
+    with pytest.raises(SystemExit) as error:
+        parse_arguments(argv)
+    assert error.value.code == 2 and not output.exists()
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+def test_command_audit_mode_is_explicit_and_does_not_create_output(tmp_path, automatic):
+    output = tmp_path / "not_created"
+    argv = [
+        "--input",
+        str(tmp_path / "not_read"),
+        "--function",
+        "kernel",
+        "--parameters",
+        "{}",
+        "--shape-values",
+        "{}",
+        "--block-index",
+        "0",
+        "--output",
+        str(output),
+    ]
+    argv += ["--automatic"] if automatic else ["--scope", "k"]
+    args = parse_arguments(argv)
+    assert args.automatic == automatic and args.check_retained is False
+    assert not output.exists()
+
+
+def test_historical_physical_audit_does_not_fabricate_a_logical_baseline():
+    original, _ = eventful_fixture(1)
+    baseline = logical_plan(original)
+    candidate = logical_plan(original, automatic=True)
+    with passes.PassContext([]):
+        old = passes.lower_sync()(baseline)
+        new = passes.lower_sync()(candidate)
+    summary = execution_case(
+        original,
+        [
+            (None, next(iter(old.functions.values()))),
+            (next(iter(candidate.functions.values())), next(iter(new.functions.values()))),
+        ],
+        {3: 1, 4: True},
+        {},
+        BASES,
+        0,
+    )
+    assert summary["actual_token_all_event_order_preserved"] is None
+    assert summary["actual_token_order_checked_by_arm"] == [False, True]
+    payloads = summary["payloads"]
+    assert isinstance(payloads, int) and payloads > 0
