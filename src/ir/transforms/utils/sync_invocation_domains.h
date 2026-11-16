@@ -12,6 +12,7 @@
 #ifndef SRC_IR_TRANSFORMS_UTILS_SYNC_INVOCATION_DOMAINS_H_
 #define SRC_IR_TRANSFORMS_UTILS_SYNC_INVOCATION_DOMAINS_H_
 
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -23,9 +24,11 @@ namespace pypto::ir::sync {
 struct SyncInvocationDomains {
   std::vector<std::pair<int64_t, int64_t>> intervals;
   size_t coordinate_nodes = 0, coordinate_pieces = 0;
+  std::shared_ptr<const SyncInvocationCoordinate> coordinate;
 };
 SyncInvocationDomains PartitionSyncInvocation(const FunctionPtr& owner, const SyncParameterBounds& parameters,
-                                              std::pair<int64_t, int64_t> blocks);
+                                              std::pair<int64_t, int64_t> blocks,
+                                              std::optional<int64_t> launch_count = std::nullopt);
 ExprPtr DominatingSyncBlock(const FunctionPtr& owner);
 ExprPtr SyncInvocationGuard(const ExprPtr& block, std::pair<int64_t, int64_t> all,
                             std::pair<int64_t, int64_t> selected, const Span& span);

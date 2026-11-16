@@ -363,11 +363,13 @@ LogicalSyncRealization RealizeScopedLogicalSync(const CompactSyncResult& analysi
 LogicalSyncRealization RealizeLogicalInvocation(const SyncInvocationAnalysis& analysis) {
   CHECK(analysis.owner && !analysis.cases.empty()) << "Missing logical invocation owner";
   ScopedRealizer realizer(analysis.owner);
-  const auto block = DominatingSyncBlock(analysis.owner);
+  const auto block =
+      analysis.coordinate ? analysis.coordinate->Expression() : DominatingSyncBlock(analysis.owner);
   auto next = analysis.block_bounds.first;
   for (const auto& item : analysis.cases) {
     CHECK(item.mathematics && item.mathematics->State().input.owner == analysis.owner &&
           item.mathematics->State().input.parameter_bounds == analysis.parameter_bounds &&
+          item.mathematics->State().input.invocation_coordinate == analysis.coordinate &&
           item.mathematics->State().input.block_bounds == std::make_pair(item.block_first, item.block_last) &&
           item.block_first == next && item.block_last >= next &&
           item.block_last < std::numeric_limits<int64_t>::max())

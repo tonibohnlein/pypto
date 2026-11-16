@@ -48,6 +48,9 @@ class SourceIndex : public IRVisitor {
  public:
   std::map<const Expr*, ExprPtr> definitions;
   std::vector<ForStmtPtr> loops;
+  // The index owns statement definitions and loop identities, not scalar
+  // evaluation. Expression DAGs are inspected by their memoized consumers.
+  void VisitExpr(const ExprPtr&) override {}
   void VisitStmt_(const AssignStmtPtr& assignment) override {
     if (As<ScalarType>(assignment->var_->GetType()))
       CHECK(definitions.emplace(assignment->var_.get(), assignment->value_).second)
@@ -109,6 +112,7 @@ class ActivationPartition {
   std::map<const Expr*, Pieces> memo_;
   std::set<const Expr*> active_;
   size_t pieces_ = 0;
+  std::shared_ptr<const SyncInvocationCoordinate> coordinate_;
 
   void Check(const ExprPtr& expression, const Pieces& pieces) const {
     const auto maximum = SyncCoordinateMaximum(expression);
@@ -148,12 +152,15 @@ class ActivationPartition {
     }
     CHECK(active_.insert(expression.get()).second) << "Cyclic invocation coordinate is unavailable";
     Pieces out;
-    if (auto value = As<ConstInt>(expression)) {
+    if (coordinate_ && (expression == coordinate_->Expression() || expression == coordinate_->Definition())) {
+      out.push_back({blocks_.first, blocks_.second, 1, 0});
+    } else if (auto value = As<ConstInt>(expression)) {
       out.push_back({blocks_.first, blocks_.second, 0, value->value_});
     } else if (auto found = source_.definitions.find(expression.get()); found != source_.definitions.end()) {
       out = Evaluate(found->second);
     } else if (auto call = As<Call>(expression);
                call && IsOp(call, "buffer.get_block_idx") && call->args_.empty()) {
+      CHECK(!coordinate_) << "Invocation activation uses an unrelated original block coordinate";
       out.push_back({blocks_.first, blocks_.second, 1, 0});
     } else if (auto cast = As<Cast>(expression)) {
       out = Evaluate(cast->operand_);
@@ -200,8 +207,9 @@ class ActivationPartition {
 
  public:
   ActivationPartition(const FunctionPtr& owner, const SyncParameterBounds& parameters,
-                      std::pair<int64_t, int64_t> blocks)
-      : owner_(owner), parameters_(parameters), blocks_(blocks) {
+                      std::pair<int64_t, int64_t> blocks,
+                      std::shared_ptr<const SyncInvocationCoordinate> coordinate)
+      : owner_(owner), parameters_(parameters), blocks_(blocks), coordinate_(std::move(coordinate)) {
     for (size_t i = 0; i < owner->params_.size(); ++i) parameter_indices_.emplace(owner->params_[i].get(), i);
     source_.VisitStmt(owner->body_);
   }
@@ -245,15 +253,146 @@ class ActivationPartition {
   size_t Nodes() const { return memo_.size() + block_dependency_.Nodes(); }
   size_t PieceCount() const { return pieces_; }
 };
+// Follow only original single-assignment aliases. One immutable source index
+// supports path compression across all loop starts and candidate operands.
+// Arithmetic is not simplified, and this cache proves no lexical dominance:
+// the admitted candidate's original expressions are checked separately below.
+class InvocationAliases {
+  const SourceIndex& source_;
+  std::map<const Expr*, ExprPtr> memo_;
+
+ public:
+  explicit InvocationAliases(const SourceIndex& source) : source_(source) {}
+  ExprPtr Resolve(ExprPtr expression) {
+    std::vector<ExprPtr> path;
+    std::set<const Expr*> active;
+    while (const auto variable = As<Var>(expression)) {
+      if (const auto cached = memo_.find(variable.get()); cached != memo_.end()) {
+        expression = cached->second;
+        break;
+      }
+      CHECK(active.insert(variable.get()).second) << "Cyclic invocation coordinate is unavailable";
+      path.push_back(expression);
+      const auto definition = source_.definitions.find(variable.get());
+      if (definition == source_.definitions.end()) break;
+      expression = definition->second;
+    }
+    for (const auto& alias : path) memo_.emplace(alias.get(), expression);
+    return expression;
+  }
+};
+bool IsIndexCoordinate(const ExprPtr& expression) {
+  const auto type = As<ScalarType>(expression->GetType());
+  return type && type->dtype_ == DataType::INDEX;
+}
+struct RotationCandidate {
+  ExprPtr expression, definition;
+  size_t parameter;
+  int64_t modulus;
+  std::set<const Expr*> supporting;
+};
+std::optional<RotationCandidate> FindRotation(const FunctionPtr& owner, const SourceIndex& source,
+                                              const SyncParameterBounds& parameters) {
+  const auto sequence = As<SeqStmts>(owner->body_);
+  if (!sequence) return std::nullopt;
+  InvocationAliases aliases(source);
+  std::set<const Expr*> starts;
+  for (const auto& loop : source.loops) starts.insert(aliases.Resolve(loop->start_).get());
+  std::map<const Expr*, size_t> parameter_indices;
+  for (size_t i = 0; i < owner->params_.size(); ++i) parameter_indices.emplace(owner->params_[i].get(), i);
+  SourceIndex dominating;
+  for (const auto& statement : sequence->stmts_) {
+    const auto assignment = As<AssignStmt>(statement);
+    if (!assignment) break;  // The named coordinate must dominate the payload tree.
+    dominating.VisitStmt(statement);
+    const auto mod = As<FloorMod>(assignment->value_);
+    if (!mod || !starts.count(mod.get())) continue;
+    const auto add = As<Add>(aliases.Resolve(mod->left_));
+    const auto divisor = As<ConstInt>(mod->right_);
+    if (!add || !divisor || divisor->value_ <= 0) continue;
+    auto left = aliases.Resolve(add->left_);
+    auto right = aliases.Resolve(add->right_);
+    auto block = As<Call>(left);
+    if (!block || !IsOp(block, "buffer.get_block_idx")) {
+      std::swap(left, right);
+      block = As<Call>(left);
+    }
+    if (!block || !IsOp(block, "buffer.get_block_idx") || !block->args_.empty()) continue;
+    const auto parameter = parameter_indices.find(right.get());
+    if (parameter == parameter_indices.end()) continue;
+    const size_t index = parameter->second;
+    auto bound = parameters.find(index);
+    if (bound == parameters.end() || bound->second.first == bound->second.second) continue;
+    CHECK(IsIndexCoordinate(assignment->var_) && IsIndexCoordinate(mod) && IsIndexCoordinate(mod->left_) &&
+          IsIndexCoordinate(mod->right_) && IsIndexCoordinate(add) && IsIndexCoordinate(add->left_) &&
+          IsIndexCoordinate(add->right_) && IsIndexCoordinate(left) && IsIndexCoordinate(right))
+        << "Effective invocation coordinate requires matching original index types";
+    CHECK(bound->second.first >= 0 && bound->second.second >= bound->second.first &&
+          Wide(bound->second.second) + divisor->value_ - 1 <= *SyncCoordinateMaximum(add))
+        << "Effective invocation coordinate may overflow its original addition";
+    std::set<const Expr*> supporting, seen;
+    std::vector<ExprPtr> pending{mod};
+    while (!pending.empty()) {
+      auto expression = pending.back();
+      pending.pop_back();
+      if (!seen.insert(expression.get()).second) continue;
+      CHECK(IsIndexCoordinate(expression))
+          << "Effective coordinate aliases must preserve original index types";
+      if (const auto definition = dominating.definitions.find(expression.get());
+          definition != dominating.definitions.end()) {
+        supporting.insert(expression.get());
+        pending.push_back(definition->second);
+      } else if (AsVarLike(expression)) {
+        // Global alias discovery must not turn a future or nested definition
+        // into an available invocation parameter. Only the original prefix
+        // above dominates this candidate and its payload tree.
+        CHECK(parameter_indices.count(expression.get()))
+            << "Effective invocation coordinate requires dominating original definitions";
+      } else if (const auto binary = As<BinaryExpr>(expression)) {
+        pending.push_back(binary->left_);
+        pending.push_back(binary->right_);
+      }
+    }
+    return RotationCandidate{assignment->var_, mod, index, divisor->value_, std::move(supporting)};
+  }
+  return std::nullopt;
+}
 }  // namespace
+std::shared_ptr<const SyncInvocationCoordinate> SyncInvocationCoordinate::Qualify(
+    const FunctionPtr& owner, const SyncParameterBounds& parameters, std::pair<int64_t, int64_t> blocks,
+    std::optional<int64_t> launch_count) {
+  CHECK(owner) << "Missing effective invocation owner";
+  SourceIndex source;
+  source.VisitStmt(owner->body_);
+  const auto candidate = FindRotation(owner, source, parameters);
+  if (!candidate) return nullptr;
+  CHECK(launch_count && *launch_count == candidate->modulus && blocks.first == 0 &&
+        blocks.second == candidate->modulus - 1)
+      << "Effective invocation coordinate requires an independent full launch cardinality";
+  return std::shared_ptr<const SyncInvocationCoordinate>(
+      new SyncInvocationCoordinate(owner, candidate->expression, candidate->definition, parameters,
+                                   candidate->parameter, candidate->modulus, candidate->supporting));
+}
+std::optional<int64_t> SyncInvocationCoordinate::Map(int64_t original_block,
+                                                     const std::map<size_t, int64_t>& parameters) const {
+  if (original_block < 0 || original_block >= count_) return std::nullopt;
+  for (const auto& [index, bound] : parameters_) {
+    const auto value = parameters.find(index);
+    if (value == parameters.end() || value->second < bound.first || value->second > bound.second)
+      return std::nullopt;
+  }
+  return static_cast<int64_t>((Wide(original_block) + parameters.at(rotation_)) % count_);
+}
 SyncInvocationDomains PartitionSyncInvocation(const FunctionPtr& owner, const SyncParameterBounds& parameters,
-                                              std::pair<int64_t, int64_t> blocks) {
+                                              std::pair<int64_t, int64_t> blocks,
+                                              std::optional<int64_t> launch_count) {
   CHECK(owner && blocks.first >= 0 && blocks.second >= blocks.first &&
         blocks.second < std::numeric_limits<int64_t>::max())
       << "Invalid invocation launch contract";
-  ActivationPartition partition(owner, parameters, blocks);
+  auto coordinate = SyncInvocationCoordinate::Qualify(owner, parameters, blocks, launch_count);
+  ActivationPartition partition(owner, parameters, blocks, coordinate);
   auto intervals = partition.Build();
-  return {std::move(intervals), partition.Nodes(), partition.PieceCount()};
+  return {std::move(intervals), partition.Nodes(), partition.PieceCount(), std::move(coordinate)};
 }
 ExprPtr DominatingSyncBlock(const FunctionPtr& owner) {
   const auto sequence = As<SeqStmts>(owner->body_);
@@ -290,18 +429,20 @@ ExprPtr SyncInvocationGuard(const ExprPtr& block, std::pair<int64_t, int64_t> al
 }
 SyncInvocationAnalysis AnalyzeSyncInvocation(const FunctionPtr& function, bool disjoint_gm,
                                              const std::string& target, const SyncParameterBounds& parameters,
-                                             std::pair<int64_t, int64_t> blocks) {
+                                             std::pair<int64_t, int64_t> blocks,
+                                             std::optional<int64_t> launch_count) {
   CHECK(function && blocks.first >= 0 && blocks.second >= blocks.first &&
         blocks.second < std::numeric_limits<int64_t>::max())
       << "Invalid invocation launch contract";
-  const auto domains = PartitionSyncInvocation(function, parameters, blocks);
+  const auto domains = PartitionSyncInvocation(function, parameters, blocks, launch_count);
   SyncInvocationAnalysis result{function, parameters, blocks, {}};
+  result.coordinate = domains.coordinate;
   result.coordinate_nodes = domains.coordinate_nodes;
   result.coordinate_pieces = domains.coordinate_pieces;
   for (const auto& domain : domains.intervals) {
     // Publish the whole owner only when EVERY nonempty case is qualified.
     // No successful subcase is a substitute for the original caller contract.
-    auto input = ImportPlacedSync(function, disjoint_gm, target, parameters, domain);
+    auto input = ImportPlacedSync(function, disjoint_gm, target, parameters, domain, domains.coordinate);
     auto mathematics = std::make_shared<CompactSyncResult>(AnalyzeCompactSync(std::move(input)));
     result.cases.push_back({domain.first, domain.second, std::move(mathematics)});
   }
@@ -314,6 +455,11 @@ std::shared_ptr<const CompactSyncResult> SyncInvocationAnalysis::SelectCase(
     auto value = parameters.find(parameter);
     if (value == parameters.end() || value->second < bound.first || value->second > bound.second)
       return nullptr;
+  }
+  if (coordinate) {
+    const auto mapped = coordinate->Map(block, parameters);
+    if (!mapped) return nullptr;
+    block = *mapped;
   }
   auto found = std::upper_bound(cases.begin(), cases.end(), block, [](int64_t value, const auto& candidate) {
     return value < candidate.block_first;

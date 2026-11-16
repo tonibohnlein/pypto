@@ -67,8 +67,10 @@ DemandInvocation RealizeDemandInvocation(const SyncInvocationAnalysis& analysis,
     CHECK(item.mathematics && item.mathematics->State().input.hardware_target == target)
         << "Synchronization hardware contract differs from lowering target";
   auto logical = RealizeLogicalInvocation(analysis);
-  auto lowered = LowerLogicalSync(OptimizeLogicalSync(logical.function), target, eligible_ids,
-                                  analysis.parameter_bounds, analysis.block_bounds, policy);
+  auto lowered =
+      LowerLogicalSync(OptimizeLogicalSync(logical.function), target, eligible_ids, analysis.parameter_bounds,
+                       analysis.block_bounds, policy, ir::sync::SyncExternalPolicy::Geometry,
+                       analysis.coordinate ? std::make_optional(analysis.coordinate->Count()) : std::nullopt);
   return {std::move(lowered.function), std::move(lowered.physical_cases)};
 }
 

@@ -153,7 +153,7 @@ class CutDomains : public IRVisitor {
 
  public:
   CutDomains(const FunctionPtr& owner, const AbsentLoops& absent, CutInventory& cuts,
-             std::pair<int64_t, int64_t> blocks, PhysicalSyncRealization& work)
+             std::pair<int64_t, int64_t> blocks, PhysicalSyncRealization& work, ExprPtr coordinate = nullptr)
       : absent_(absent), cuts_(cuts), domain_{blocks}, work_(work), scope_{owner, nullptr, {}} {
     auto entry = std::make_shared<std::set<const Var*>>();
     for (const auto& parameter : owner->params_) {
@@ -161,9 +161,10 @@ class CutDomains : public IRVisitor {
       if (type && (type->dtype_ == DataType::INDEX || type->dtype_ == DataType::BOOL))
         entry->insert(parameter.get());
     }
-    // This helper returns only the original leading launch lookup, which
+    // The retained invocation coordinate (or original leading launch lookup)
     // dominates every payload. Other scalar assignments confer no evidence.
-    if (auto block = As<Var>(DominatingSyncBlock(owner))) entry->insert(block.get());
+    if (auto block = As<Var>(coordinate ? coordinate : DominatingSyncBlock(owner)))
+      entry->insert(block.get());
     scope_.entry_ready = std::move(entry);
     for (auto& [anchor, cut] : cuts_) cut->domain = domain_;
   }
@@ -254,7 +255,11 @@ class AssignedRegionSchedule {
   const std::vector<AssignedSyncCase> cases;
   std::vector<AssignedCut> cuts;
   AssignedRegionSchedule(FunctionPtr function, std::vector<AssignedSyncCase> supplied)
-      : owner(std::move(function)), block(DominatingSyncBlock(owner)), cases(std::move(supplied)) {
+      : owner(std::move(function)),
+        block(!supplied.empty() && supplied.front().input && supplied.front().input->invocation_coordinate
+                  ? supplied.front().input->invocation_coordinate->Expression()
+                  : DominatingSyncBlock(owner)),
+        cases(std::move(supplied)) {
     for (size_t c = 0; c < cases.size(); ++c) {
       CHECK(cases[c].input && cases[c].assignment && cases[c].work) << "Missing assigned schedule case";
       const auto& input = *cases[c].input;
@@ -263,6 +268,8 @@ class AssignedRegionSchedule {
       cases[c].assignment->ValidateFor(input, input.hardware_target);
       const auto& families = cases[c].assignment->Families();
       INTERNAL_CHECK(input.owner == owner) << "Foreign assigned schedule owner";
+      CHECK(input.invocation_coordinate == cases.front().input->invocation_coordinate)
+          << "Assigned cases disagree on their invocation coordinate owner";
       ScheduleDomains domains(input);
       if (const auto& protocol = cases[c].assignment->Protocol()) {
         protocol->ValidateFor(input);
@@ -2129,7 +2136,7 @@ FunctionPtr CompileAssignedSyncSchedule(const FunctionPtr& owner, const std::vec
     if (!facts) facts = std::make_shared<PhysicalCuts>();
     if (cut.continuation) domains[cut.continuation.get()] = facts;
   }
-  CutDomains(schedule.owner, absent, domains, blocks, work).VisitStmt(schedule.owner->body_);
+  CutDomains(schedule.owner, absent, domains, blocks, work, schedule.block).VisitStmt(schedule.owner->body_);
   const auto inventory = CollectRegularLoops(schedule, work);
   auto plans = PlanLoopSchedules(schedule, domains, inventory, blocks, work, policy);
   std::set<const Call*> specialized;

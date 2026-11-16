@@ -181,6 +181,22 @@ class CoordinateGraph {
                         const ParameterIndices& parameters, CompactSyncInput& input) {
     const auto maximum = SyncCoordinateMaximum(e);
     CHECK(maximum) << "Synchronization coordinates require integer arithmetic";
+    if (input.invocation_coordinate &&
+        (e == input.invocation_coordinate->Expression() || e == input.invocation_coordinate->Definition())) {
+      const auto key = std::make_pair(e.get(), &segment);
+      if (auto found = memo_.find(key); found != memo_.end()) {
+        return found->second;
+      }
+      Node node{Kind::Block};
+      node.lower = input.block_bounds->first;
+      node.upper = input.block_bounds->second;
+      const auto id = nodes_.size();
+      nodes_.push_back(node);
+      affine_.push_back(true);
+      memo_.emplace(key, id);
+      ++input.coordinate_nodes;
+      return id;
+    }
     if (const auto found = deferred_.find(e.get()); found != deferred_.end()) {
       if (const auto materialized = definitions_.find(e.get()); materialized != definitions_.end())
         return materialized->second;
@@ -213,6 +229,7 @@ class CoordinateGraph {
       n.lower = n.upper = n.factor = Constant(c);
       n.constant = true;
     } else if (auto call = As<Call>(e); call && IsOp(call, "buffer.get_block_idx")) {
+      CHECK(!input.invocation_coordinate) << "Access uses an unrelated original block coordinate";
       CHECK(input.block_bounds && call->args_.empty()) << "Launch coordinate has no established caller range";
       n.kind = Kind::Block;
       n.lower = input.block_bounds->first;
@@ -343,8 +360,12 @@ class CoordinateGraph {
   void Define(const ExprPtr& var, const ExprPtr& value, const SyncSegment& segment,
               const ParameterIndices& parameters, CompactSyncInput& input, bool lazy = false) {
     CHECK(SameCoordinateType(var, value)) << "Coordinate definition requires an explicit type conversion";
-    if (lazy) {
+    if (lazy || (input.invocation_coordinate && input.invocation_coordinate->SupportsDefinition(var))) {
       deferred_.emplace(var.get(), Deferred{value, ContextFor(segment)});
+      return;
+    }
+    if (input.invocation_coordinate && var == input.invocation_coordinate->Expression()) {
+      definitions_.emplace(var.get(), Build(value, segment, parameters, input));
       return;
     }
     if (auto mod = As<FloorMod>(value); mod && As<ConstInt>(mod->right_)) {
@@ -1829,10 +1850,11 @@ static void QualifyPhysicalIntervals(CompactSyncInput& input) {
   }
 }
 
-static CompactSyncInput ImportQualifiedSync(const FunctionPtr& function, const std::string& target,
-                                            const SyncParameterBounds& parameter_bounds,
-                                            const std::optional<std::pair<int64_t, int64_t>>& block_bounds,
-                                            bool recover_accesses, SyncExternalPolicy external_policy) {
+static CompactSyncInput ImportQualifiedSync(
+    const FunctionPtr& function, const std::string& target, const SyncParameterBounds& parameter_bounds,
+    const std::optional<std::pair<int64_t, int64_t>>& block_bounds, bool recover_accesses,
+    SyncExternalPolicy external_policy,
+    std::shared_ptr<const SyncInvocationCoordinate> coordinate = nullptr) {
   CHECK(function && (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV))
       << "Synchronization prototype requires one AIC or AIV leaf";
   if (function->func_type_ == FunctionType::AIV) {
@@ -1855,6 +1877,12 @@ static CompactSyncInput ImportQualifiedSync(const FunctionPtr& function, const s
     CHECK(block_bounds->first >= 0 && block_bounds->second >= block_bounds->first &&
           block_bounds->second < std::numeric_limits<int64_t>::max())
         << "Invalid logical launch range";
+  if (coordinate) {
+    CHECK(coordinate->Owner() == function && coordinate->Parameters() == parameter_bounds && block_bounds &&
+          block_bounds->first >= 0 && block_bounds->second < coordinate->Count())
+        << "Foreign effective invocation coordinate or case contract";
+  }
+  importer.result.invocation_coordinate = std::move(coordinate);
   importer.result.block_bounds = block_bounds;
   for (const auto& [index, range] : parameter_bounds) {
     CHECK(index < function->params_.size() && As<ScalarType>(function->params_[index]->GetType()))
@@ -1985,16 +2013,20 @@ static CompactSyncInput ImportQualifiedSync(const FunctionPtr& function, const s
 }
 CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm, const std::string& target,
                                   const SyncParameterBounds& parameters,
-                                  const std::optional<std::pair<int64_t, int64_t>>& blocks) {
+                                  const std::optional<std::pair<int64_t, int64_t>>& blocks,
+                                  std::shared_ptr<const SyncInvocationCoordinate> coordinate) {
   CHECK(disjoint_gm)
       << "Disjoint GM argument contract must be explicitly supplied; may-alias import unavailable";
-  return ImportQualifiedSync(function, target, parameters, blocks, true, SyncExternalPolicy::Geometry);
+  return ImportQualifiedSync(function, target, parameters, blocks, true, SyncExternalPolicy::Geometry,
+                             std::move(coordinate));
 }
 CompactSyncInput ImportSyncPayloads(const FunctionPtr& function, const std::string& target,
                                     const SyncParameterBounds& parameters,
                                     const std::optional<std::pair<int64_t, int64_t>>& blocks,
-                                    SyncExternalPolicy external_policy) {
-  return ImportQualifiedSync(function, target, parameters, blocks, false, external_policy);
+                                    SyncExternalPolicy external_policy,
+                                    std::shared_ptr<const SyncInvocationCoordinate> coordinate) {
+  return ImportQualifiedSync(function, target, parameters, blocks, false, external_policy,
+                             std::move(coordinate));
 }
 CompactSyncInput ImportReadonlyExternalSync(const FunctionPtr& function, const std::string& target) {
   return ImportQualifiedSync(function, target, {}, std::nullopt, true,

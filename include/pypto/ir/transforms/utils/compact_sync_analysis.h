@@ -185,6 +185,41 @@ struct SyncStorageClass {
 // external memory is distinct from local spaces and every external effect reads.
 // It does not provide an exact external storage interface.
 enum class SyncExternalPolicy { Geometry, ReadOnlyProjection };
+// Checked change of invocation coordinates. Only Qualify can construct this
+// owner; it retains original IR and independent launch-cardinality evidence.
+// Payload expressions and loop frames always remain in original coordinates.
+class SyncInvocationCoordinate {
+ public:
+  static std::shared_ptr<const SyncInvocationCoordinate> Qualify(const FunctionPtr& owner,
+                                                                 const SyncParameterBounds& parameters,
+                                                                 std::pair<int64_t, int64_t> blocks,
+                                                                 std::optional<int64_t> launch_count);
+  const FunctionPtr& Owner() const { return owner_; }
+  const ExprPtr& Expression() const { return expression_; }
+  const ExprPtr& Definition() const { return definition_; }
+  const SyncParameterBounds& Parameters() const { return parameters_; }
+  int64_t Count() const { return count_; }
+  bool SupportsDefinition(const ExprPtr& expression) const { return supporting_.count(expression.get()); }
+  std::optional<int64_t> Map(int64_t original_block, const std::map<size_t, int64_t>& parameters) const;
+
+ private:
+  SyncInvocationCoordinate(FunctionPtr owner, ExprPtr expression, ExprPtr definition,
+                           SyncParameterBounds parameters, size_t rotation, int64_t count,
+                           std::set<const Expr*> supporting)
+      : owner_(std::move(owner)),
+        expression_(std::move(expression)),
+        definition_(std::move(definition)),
+        parameters_(std::move(parameters)),
+        rotation_(rotation),
+        count_(count),
+        supporting_(std::move(supporting)) {}
+  const FunctionPtr owner_;
+  const ExprPtr expression_, definition_;
+  const SyncParameterBounds parameters_;
+  const size_t rotation_;
+  const int64_t count_;
+  const std::set<const Expr*> supporting_;
+};
 struct CompactSyncInput {
   FunctionPtr owner;
   std::string hardware_target;
@@ -194,6 +229,7 @@ struct CompactSyncInput {
   std::vector<SyncSegment> segments;
   SyncParameterBounds parameter_bounds;
   std::optional<std::pair<int64_t, int64_t>> block_bounds;
+  std::shared_ptr<const SyncInvocationCoordinate> invocation_coordinate;
   std::optional<SyncRegion> region_tree;
   size_t coordinate_nodes = 0, coordinate_flatten_visits = 0, coordinate_coefficient_entries = 0;
   size_t interval_access_visits = 0, qualified_intervals = 0;
@@ -204,7 +240,8 @@ struct CompactSyncInput {
 CompactSyncInput ImportPlacedSync(
     const FunctionPtr& function, bool disjoint_gm, const std::string& target = "a2a3",
     const SyncParameterBounds& parameter_bounds = {},
-    const std::optional<std::pair<int64_t, int64_t>>& block_bounds = std::nullopt);
+    const std::optional<std::pair<int64_t, int64_t>>& block_bounds = std::nullopt,
+    std::shared_ptr<const SyncInvocationCoordinate> coordinate = nullptr);
 CompactSyncInput ImportReadonlyExternalSync(const FunctionPtr& function, const std::string& target);
 
 using Occurrence = std::tuple<size_t, int64_t, size_t>;  // segment, visit, site
@@ -396,12 +433,14 @@ struct SyncInvocationAnalysis {
   std::pair<int64_t, int64_t> block_bounds;
   std::vector<SyncInvocationCase> cases;
   size_t coordinate_nodes = 0, coordinate_pieces = 0;
+  std::shared_ptr<const SyncInvocationCoordinate> coordinate;
   std::shared_ptr<const CompactSyncResult> SelectCase(int64_t block_index,
                                                       const std::map<size_t, int64_t>& parameters) const;
 };
 SyncInvocationAnalysis AnalyzeSyncInvocation(const FunctionPtr& function, bool disjoint_gm,
                                              const std::string& target, const SyncParameterBounds& parameters,
-                                             std::pair<int64_t, int64_t> block_bounds);
+                                             std::pair<int64_t, int64_t> block_bounds,
+                                             std::optional<int64_t> launch_count = std::nullopt);
 struct LogicalSyncRealization {
   FunctionPtr function;
   size_t record_sites = 0, wait_sites = 0, guarded_wait_sites = 0, carried_tokens = 0;
