@@ -326,6 +326,7 @@ nav:
           - GM Scalar Staging Design: en/dev/ir/44-autosync-gm-scalar-staging.md
           - Effective Invocation Coordinates: en/dev/ir/45-autosync-effective-invocation-coordinate.md
           - Addressed Accumulator Row Trims: en/dev/ir/46-autosync-acc-row-trim.md
+          - GM Scalar Write Staging: en/dev/ir/47-autosync-gm-scalar-write-staging.md
       - Passes:
           - en/dev/passes/index.md
           - en/dev/passes/00-pass_manager.md
