@@ -163,6 +163,76 @@ class ConflictSources {
   std::map<MemorySpace, Summary> all_;
 };
 
+// Payload-completion knowledge only. These facts do not claim that a complete
+// logical command prefix (including arbitrary waits) is interchangeable with
+// another prefix. Epoch zero denotes unknown incoming payload work, and is not
+// initially established on any destination.
+class PayloadCompletions {
+ public:
+  void Reset() {
+    issued_.clear();
+    established_.clear();
+  }
+  bool Covers(PipeType source, PipeType destination) const {
+    const auto receiver = established_.find(destination);
+    if (receiver == established_.end()) return false;
+    const auto known = receiver->second.find(source);
+    return known != receiver->second.end() && known->second >= Issued(source);
+  }
+  // Select an inclusion-minimal cover under the facts available at this cut.
+  // Distinct source descriptors occur once and have the same destination. No
+  // payload executes between them, so their advertised initial completions
+  // determine the destination's final knowledge. Removal is sequential: two
+  // mutually covering descriptors may not both disappear.
+  std::vector<PipeType> Select(const std::vector<PipeType>& required, PipeType destination) const {
+    const size_t count = required.size();
+    std::vector<bool> base(count);
+    std::vector<std::vector<bool>> coverage(count, std::vector<bool>(count));
+    for (size_t requirement = 0; requirement < count; ++requirement) {
+      base[requirement] = Covers(required[requirement], destination);
+      for (size_t candidate = 0; candidate < count; ++candidate)
+        coverage[candidate][requirement] = required[candidate] == required[requirement] ||
+                                           Covers(required[requirement], required[candidate]);
+    }
+    std::vector<PipeType> selected;
+    for (const auto candidate : SelectConservativeCompletionCover(base, coverage))
+      selected.push_back(required[candidate]);
+    return selected;
+  }
+  void Service(PipeType source, PipeType destination) {
+    if (source == destination) {
+      established_[source][source] = Issued(source);
+      return;
+    }
+    // Forward WAIT imports source payload completion and facts already known
+    // on that source. The return WAIT additionally establishes destination
+    // payload completion on SOURCE. Issuing the return SET does not establish
+    // destination's own payload completion on destination.
+    Import(destination, source);
+    established_[destination][source] = Issued(source);
+    Import(source, destination);
+    established_[source][destination] = Issued(destination);
+  }
+  void Issue(PipeType pipe) { ++issued_[pipe]; }
+
+ private:
+  size_t Issued(PipeType pipe) const {
+    const auto found = issued_.find(pipe);
+    return found == issued_.end() ? 0 : found->second;
+  }
+  void Import(PipeType destination, PipeType source) {
+    const auto sender = established_.find(source);
+    if (sender == established_.end()) return;
+    auto& receiver = established_[destination];
+    for (const auto& [pipe, epoch] : sender->second) {
+      auto [known, inserted] = receiver.emplace(pipe, epoch);
+      if (!inserted) known->second = std::max(known->second, epoch);
+    }
+  }
+  std::map<PipeType, size_t> issued_;
+  std::map<PipeType, std::map<PipeType, size_t>> established_;
+};
+
 struct FlowState {
   explicit FlowState(ConservativeSyncCost& cost) : sources(cost) {}
   void Add(const ConservativeAccessSet& added) {
@@ -171,6 +241,7 @@ struct FlowState {
   }
   ConservativeAccessSet effects;
   ConflictSources sources;
+  PayloadCompletions completions;
 };
 
 struct End {
@@ -209,14 +280,14 @@ class Builder {
       child->ValidateFor(function, target_);
       CHECK(child_index_.emplace(child->Scope().get(), children.size()).second)
           << "Conservative synchronization: duplicate retained child scope";
-      children.push_back({child->Scope(), child, {}, {}, {}, {}});
+      children.push_back({child->Scope(), child, {}, {}, {}, {}, {}});
     }
     for (const auto& child : eventful) {
       CHECK(child) << "Conservative synchronization: missing eventful child certificate";
       child->ValidateFor(function, target_);
       CHECK(child_index_.emplace(child->Scope().get(), children.size()).second)
           << "Conservative synchronization: duplicate retained child scope";
-      children.push_back({child->Scope(), {}, {}, {}, {}, child});
+      children.push_back({child->Scope(), {}, {}, {}, {}, child, {}});
     }
   }
 
@@ -240,6 +311,10 @@ class Builder {
 
   ConservativeAccessSet Solve() {
     auto solved = Flow(function_->body_, FlowState(cost));
+    PayloadCompletions certificate;
+    Certify(function_->body_, certificate);
+    INTERNAL_CHECK(cost.certificate_omissions == cost.suppressed_services)
+        << "Internal error: conservative service certificate omitted a proposed deletion";
     return std::move(solved.effects);
   }
 
@@ -247,6 +322,7 @@ class Builder {
     ++cost.dataflow_visits;
     if (const auto found = child_index_.find(statement.get()); found != child_index_.end()) {
       auto& entry = children[found->second];
+      incoming.completions.Reset();
       if (retain_incoming_diagnostics_) {
         entry.incoming = incoming.effects;
         cost.incoming_diagnostic_facts += entry.incoming.size();
@@ -264,16 +340,20 @@ class Builder {
             if (source != destination) services.emplace(source, destination);
       }
       entry.services.assign(services.begin(), services.end());
+      entry.required_services = entry.services;
+      cost.baseline_services += services.size();
       cost.services += services.size();
 
       // Empty notification state does not complete any payload. All child
       // effects remain possibly pending, including across zero/skipped visits.
       incoming.Add(entry.effects);
+      incoming.completions.Reset();
       return incoming;
     }
     if (const auto seq = As<SeqStmts>(statement)) {
       for (const auto& child : seq->stmts_) incoming = Flow(child, std::move(incoming));
     } else if (const auto branch = As<IfStmt>(statement)) {
+      incoming.completions.Reset();
       cost.control_snapshot_facts += incoming.effects.size();
       auto then_exit = Flow(branch->then_body_, incoming);
       if (branch->else_body_) {
@@ -285,12 +365,17 @@ class Builder {
         then_exit.Add(incoming.effects);
       }
       incoming = std::move(then_exit);
+      incoming.completions.Reset();
     } else if (const auto loop = As<ForStmt>(statement)) {
       incoming.Add(generated_.at(loop->body_.get()));
+      incoming.completions.Reset();
       incoming = Flow(loop->body_, std::move(incoming));
+      incoming.completions.Reset();
     } else if (const auto loop = As<WhileStmt>(statement)) {
       incoming.Add(generated_.at(loop->body_.get()));
+      incoming.completions.Reset();
       incoming = Flow(loop->body_, std::move(incoming));
+      incoming.completions.Reset();
     } else if (const auto found = site_index_.find(statement.get()); found != site_index_.end()) {
       auto& site = sites[found->second];
       if (retain_incoming_diagnostics_) {
@@ -302,9 +387,16 @@ class Builder {
         const auto conflicting = incoming.sources.Query(effect);
         sources.insert(conflicting.begin(), conflicting.end());
       }
-      site.source_pipes.assign(sources.begin(), sources.end());
-      cost.services += sources.size();
-
+      site.required_source_pipes.assign(sources.begin(), sources.end());
+      cost.baseline_services += sources.size();
+      const auto destination = site.operation.Implementation().Pipe();
+      site.source_pipes = incoming.completions.Select(site.required_source_pipes, destination);
+      cost.suppressed_services += site.required_source_pipes.size() - site.source_pipes.size();
+      cost.services += site.source_pipes.size();
+      // Replay only the retained descriptors. Deleted acknowledgments cannot
+      // establish source-side facts used by another consumer cut.
+      for (const auto source : site.source_pipes) incoming.completions.Service(source, destination);
+      incoming.completions.Issue(destination);
       incoming.Add(site.effects);
     }
     return incoming;
@@ -317,6 +409,59 @@ class Builder {
   bool disjoint_gm_ = false;
 
  private:
+  // Verify the complete immutable selection over original cuts and guards.
+  // Required vectors come from the no-KILL storage analysis; only a retained
+  // service can establish facts used by later omissions. This pass never adds
+  // commands, changes an assignment, or inspects an emitted physical program.
+  void Certify(const StmtPtr& statement, PayloadCompletions& known) {
+    ++cost.certificate_visits;
+    if (const auto child = child_index_.find(statement.get()); child != child_index_.end()) {
+      const auto& entry = children[child->second];
+      INTERNAL_CHECK(entry.services == entry.required_services)
+          << "Internal error: protected child/rearming services changed";
+      known.Reset();
+      return;
+    }
+    if (const auto site = site_index_.find(statement.get()); site != site_index_.end()) {
+      const auto& selected = sites[site->second];
+      size_t next = 0;
+      const auto destination = selected.operation.Implementation().Pipe();
+      for (const auto source : selected.required_source_pipes) {
+        if (next < selected.source_pipes.size() && selected.source_pipes[next] == source) {
+          known.Service(source, destination);
+          ++next;
+        }
+      }
+      INTERNAL_CHECK(next == selected.source_pipes.size())
+          << "Internal error: conservative service selection added or reordered a service";
+      // Every requested completion must hold at the payload start. It may be
+      // supplied by a later retained descriptor at this SAME consumer cut.
+      for (const auto source : selected.required_source_pipes)
+        INTERNAL_CHECK(known.Covers(source, destination))
+            << "Internal error: conservative service selection omits a payload prerequisite";
+      cost.certificate_omissions += selected.required_source_pipes.size() - selected.source_pipes.size();
+      known.Issue(destination);
+      return;
+    }
+    if (const auto sequence = As<SeqStmts>(statement)) {
+      for (const auto& child : sequence->stmts_) Certify(child, known);
+    } else if (const auto branch = As<IfStmt>(statement)) {
+      known.Reset();
+      Certify(branch->then_body_, known);
+      known.Reset();
+      if (branch->else_body_) Certify(*branch->else_body_, known);
+      known.Reset();
+    } else if (const auto loop = As<ForStmt>(statement)) {
+      known.Reset();
+      Certify(loop->body_, known);
+      known.Reset();
+    } else if (const auto loop = As<WhileStmt>(statement)) {
+      known.Reset();
+      Certify(loop->body_, known);
+      known.Reset();
+    }
+  }
+
   void RefineStorage() {
     std::vector<std::vector<RawEffect>> raw(sites.size());
     for (size_t site = 0; site < sites.size(); ++site) {
@@ -449,7 +594,7 @@ class Builder {
     CHECK_SPAN(inserted, cut->span_)
         << "Conservative synchronization: shared statement identity has ambiguous insertion cuts";
     generated_[cut.get()] = effects;
-    sites.push_back({cut, std::move(operation), std::move(effects), {}, {}});
+    sites.push_back({cut, std::move(operation), std::move(effects), {}, {}, {}});
     inside_child_.push_back(native_child_depth_ != 0);
     // The ordinary service protects the scalar instruction's storage read.
     // Only its selected blocking native return then makes the original SSA

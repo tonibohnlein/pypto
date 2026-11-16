@@ -22,12 +22,48 @@
 #include <vector>
 
 #include "pypto/backend/common/buffer_sync_contract.h"
+#include "pypto/core/logging.h"
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/utils/parent_stmt_analysis.h"
 #include "src/ir/transforms/utils/retained_sync_child.h"
 
 namespace pypto::ir::sync {
+
+// Select an inclusion-minimal ordered subset of advertised completion rows.
+// The producer owns the meaning and compatibility of rows/requirements. This
+// arithmetic kernel proves only coverage under that supplied immutable matrix.
+// O(rows*requirements), with no subset search or minimum-cardinality claim.
+inline std::vector<size_t> SelectConservativeCompletionCover(
+    const std::vector<bool>& base, const std::vector<std::vector<bool>>& advertised) {
+  std::vector<size_t> counts(base.size());
+  for (const auto& row : advertised) {
+    INTERNAL_CHECK(row.size() == base.size()) << "Internal error: completion advertisement arity mismatch";
+    for (size_t requirement = 0; requirement < base.size(); ++requirement)
+      counts[requirement] += row[requirement];
+  }
+  for (size_t requirement = 0; requirement < base.size(); ++requirement)
+    INTERNAL_CHECK(base[requirement] || counts[requirement] > 0)
+        << "Internal error: completion advertisements do not cover a requested prerequisite";
+  std::vector<size_t> selected;
+  for (size_t candidate = 0; candidate < advertised.size(); ++candidate) {
+    const auto& row = advertised[candidate];
+    bool removable = true;
+    for (size_t requirement = 0; requirement < base.size(); ++requirement) {
+      if (!base[requirement] && row[requirement] && counts[requirement] == 1) {
+        removable = false;
+        break;
+      }
+    }
+    if (removable) {
+      for (size_t requirement = 0; requirement < base.size(); ++requirement)
+        if (row[requirement]) --counts[requirement];
+    } else {
+      selected.push_back(candidate);
+    }
+  }
+  return selected;
+}
 
 // A provider-owned conservative storage class, never an exact selector.
 // Domain zero is a wildcard over its whole memory space. Nonzero IDs name this
@@ -48,7 +84,10 @@ struct ConservativeSyncSite {
   backend::BufferSyncOperation operation;
   ConservativeAccessSet effects;
   ConservativeAccessSet incoming;  // Unavailable unless HasIncomingDiagnostics() is true.
+  // Baseline storage obligations and the ordered selected subset. Non-storage
+  // child/rearming services are protected separately and never filtered here.
   std::vector<PipeType> source_pipes;
+  std::vector<PipeType> required_source_pipes;
 };
 
 struct ConservativeSyncChildEntry {
@@ -58,6 +97,7 @@ struct ConservativeSyncChildEntry {
   // A child has several participating pipes, never one fabricated payload pipe.
   std::vector<std::pair<PipeType, PipeType>> services;
   std::shared_ptr<const EventfulSyncChild> eventful;
+  std::vector<std::pair<PipeType, PipeType>> required_services;
 };
 
 struct ConservativeSyncCost {
@@ -66,6 +106,10 @@ struct ConservativeSyncCost {
   size_t dataflow_visits = 0;
   size_t retained_facts = 0;
   size_t services = 0;
+  size_t baseline_services = 0;
+  size_t suppressed_services = 0;
+  size_t certificate_visits = 0;
+  size_t certificate_omissions = 0;
   size_t parent_links = 0;
   size_t enclosure_lookups = 0;
   size_t storage_domains = 0;

@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "pypto/core/error.h"
+#include "src/ir/transforms/utils/conservative_sync_dataflow.h"
 #include "src/ir/transforms/utils/numerical_sync_merge.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 
@@ -34,6 +35,62 @@ static_assert(!std::is_copy_assignable_v<CompactSyncView>);
 static_assert(!std::is_move_assignable_v<CompactSyncView>);
 static_assert(std::is_copy_constructible_v<CompactSyncResult>);
 static_assert(std::is_const_v<std::remove_reference_t<decltype(std::declval<CompactSyncResult&>().State())>>);
+
+void CheckCompletionCover() {
+  using pypto::ir::sync::SelectConservativeCompletionCover;
+  const std::vector<bool> no_base{false, false};
+  const std::vector<std::vector<bool>> mutual{{true, true}, {true, true}};
+  // Either descriptor alone suffices. Independent deletion of both loses both
+  // requirements; the actual production kernel must retain exactly one.
+  assert(SelectConservativeCompletionCover(no_base, mutual) == std::vector<size_t>{1});
+  assert(SelectConservativeCompletionCover(no_base, {{true, false}, {false, true}, {true, true}}) ==
+         std::vector<size_t>{2});
+  bool malformed = false;
+  try {
+    (void)SelectConservativeCompletionCover(no_base, {{true}});
+  } catch (const pypto::InternalError&) {
+    malformed = true;
+  }
+  assert(malformed);
+  bool uncovered = false;
+  try {
+    (void)SelectConservativeCompletionCover(no_base, {{true, false}});
+  } catch (const pypto::InternalError&) {
+    uncovered = true;
+  }
+  assert(uncovered);
+  // Independently enumerate every 3x3 advertisement and base mask. Compare
+  // coverage and individual necessity, not the implementation's count state.
+  for (unsigned base_bits = 0; base_bits < 8; ++base_bits) {
+    for (unsigned bits = 0; bits < 512; ++bits) {
+      std::vector<bool> base(3);
+      std::vector<std::vector<bool>> matrix(3, std::vector<bool>(3));
+      bool admissible = true;
+      for (size_t column = 0; column < 3; ++column) {
+        base[column] = (base_bits & (1U << column)) != 0;
+        bool covered = base[column];
+        for (size_t row = 0; row < 3; ++row) {
+          matrix[row][column] = (bits & (1U << (row * 3 + column))) != 0;
+          covered = covered || matrix[row][column];
+        }
+        admissible = admissible && covered;
+      }
+      if (!admissible) continue;
+      const auto selected = SelectConservativeCompletionCover(base, matrix);
+      const auto complete = [&](std::optional<size_t> omitted) {
+        for (size_t column = 0; column < 3; ++column) {
+          bool covered = base[column];
+          for (const auto row : selected)
+            if (!omitted || row != *omitted) covered = covered || matrix[row][column];
+          if (!covered) return false;
+        }
+        return true;
+      };
+      assert(complete(std::nullopt));
+      for (const auto row : selected) assert(!complete(row));
+    }
+  }
+}
 
 void CheckPublishedLifetime() {
   // Returning a copy destroys both the builder and the first published owner.
@@ -262,6 +319,7 @@ struct Fixture {
 }  // namespace
 
 int main() {
+  CheckCompletionCover();
   CheckPublishedLifetime();
   CheckFamilyEndpointCoordinates();
   size_t comparisons = 0;

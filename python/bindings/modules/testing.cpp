@@ -1545,6 +1545,7 @@ void BindTesting(nb::module_& m) {
           else
             record["incoming"] = nb::none();
           record["source_pipes"] = site.source_pipes;
+          record["required_source_pipes"] = site.required_source_pipes;
           sites.append(record);
         }
         const auto& cost = analysis.Cost();
@@ -1554,6 +1555,10 @@ void BindTesting(nb::module_& m) {
         counters["dataflow_visits"] = cost.dataflow_visits;
         counters["retained_facts"] = cost.retained_facts;
         counters["services"] = cost.services;
+        counters["baseline_services"] = cost.baseline_services;
+        counters["suppressed_services"] = cost.suppressed_services;
+        counters["certificate_visits"] = cost.certificate_visits;
+        counters["certificate_omissions"] = cost.certificate_omissions;
         counters["parent_links"] = cost.parent_links;
         counters["enclosure_lookups"] = cost.enclosure_lookups;
         counters["storage_domains"] = cost.storage_domains;
@@ -1576,6 +1581,7 @@ void BindTesting(nb::module_& m) {
             entry["incoming"] = nb::none();
           entry["effects"] = facts(child.effects);
           entry["services"] = child.services;
+          entry["required_services"] = child.required_services;
           child_entries.append(entry);
         }
         result["children"] = child_entries;
