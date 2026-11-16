@@ -329,6 +329,8 @@ nav:
           - GM Scalar Write Staging: en/dev/ir/47-autosync-gm-scalar-write-staging.md
           - Contiguous Vector Identity Reshape: en/dev/ir/48-autosync-vector-identity-reshape.md
           - Statement-only Synchronization Rewriting: en/dev/ir/49-autosync-statement-rewrite.md
+          - Verifier Expression DAG Plan: en/dev/ir/50-autosync-verifier-expression-dag.md
+          - Existing Transport Capsule Plan: en/dev/ir/51-autosync-existing-transport-capsules.md
       - Passes:
           - en/dev/passes/index.md
           - en/dev/passes/00-pass_manager.md

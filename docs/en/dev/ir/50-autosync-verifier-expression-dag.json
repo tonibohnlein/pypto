@@ -1,0 +1,49 @@
+{
+  "status": "Architecture/correctness design accepted for implementation; no implementation or validation claim",
+  "date": "2026-11-16",
+  "parent_milestones": [
+    "R4",
+    "M6"
+  ],
+  "prior_checkpoint": "49-autosync-statement-rewrite.md",
+  "reproduction": {
+    "log": "build-py314/review-repairs-20261116/acc-guard-buffer-verify-isolation.log",
+    "watchdog_seconds": 10,
+    "stage": "entered public BufferIR verification",
+    "shared_scalar_depth": 28
+  },
+  "owner": "Internal verifier-only per-expression-use/context DAG traversal utility; no global IRVisitor/IRMutator change",
+  "cache_lifetime": "Fresh at outermost expression-use entry; RAII recursive depth; destroyed at final exit. No entries survive another top-level use, definition or scope transition.",
+  "context_clients": {
+    "BufferIRVisitor": "actual attribute/type/window role + direct statement result/call role",
+    "SSAVerifier": "one use under unchanged active definitions",
+    "UseAfterDefChecker": "one use, ordinary versus type-visiting mode",
+    "TypeChecker": "one use, unchanged per-function provenance state",
+    "ManualDepsOnSubmitOnly": "one use, all statement occurrences retained",
+    "AssignmentCountAndSymmetry": "statement-only traversal; preserve every definition and existing type comparison",
+    "NoNestedCallVerifier": "separate public client with original SIMT/declarative predicate exemptions"
+  },
+  "type_collection": "Only local set-producing type-var request may use context-independent DAG summaries; preserve metadata field policy and lexical use checks",
+  "diagnostics": "Preserve function name/category/span/text; remove automatic whole-function expansion from SSA errors; explicit printer unchanged",
+  "forbidden": [
+    "Global Expr seen set across statements/scopes",
+    "Skipping native/definition/statement occurrences",
+    "Changing normal visitor/mutator or allocation semantics",
+    "Assuming caller ranges or alias separation",
+    "Increasing watchdogs to claim success"
+  ],
+  "validation": [
+    "Public valid/invalid depth0/4/28 BufferIR + SSA/use-after-def",
+    "Shared expression before/after definition both orders",
+    "Sibling/join/loop binder and reset scope failures",
+    "Type/attribute context and hidden Buffer references",
+    "Repeated native Call Expr/assignment/side-effect occurrences",
+    "Nested call after exempt context still refused",
+    "Existing malformed/type/lexical window and synchronization regressions"
+  ],
+  "complexity_claim": "Per expression-use/context distinct-DAG work only; no arbitrary shared-Tuple/printer/global-linear claim",
+  "fresh_results": [],
+  "all_original_milestones_complete": false,
+  "device_validation": false,
+  "review_gate": "Independent reviewer accepted with stated context/occurrence or uniform lifetime/progress/cost obligations"
+}
