@@ -27,6 +27,7 @@ Verifies:
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pypto.language as pl
 import pytest
@@ -39,11 +40,13 @@ from pypto.ir.auto_layout import (
     FRACTAL_NZ,
     FRACTAL_ZN,
     CalibrationMeasurement,
+    CostBreakdown,
     LayoutAssignment,
     LayoutCostModel,
     LayoutOperationNode,
     LayoutProblemInstance,
     LayoutValueNode,
+    LayoutVariantArtifact,
     OperatorConfig,
     apply_layout_assignment,
     c0_elements,
@@ -493,7 +496,7 @@ class TestPassPipelineIntegrationAndCalibration:
 
     def test_fit_cost_model_from_synthetic_measurements(self):
         set_backend_type(BackendType.Ascend910)
-        shapes = [(64, 128, 64), (64, 256, 64), (64, 256, 128), (128, 128, 128)]
+        shapes = [(64, 128, 64), (64, 256, 64), (128, 128, 64), (128, 128, 128)]
         true_overhead_us = 5.0
         true_us_per_cycle = 1.0 / 1500.0
         true_nd2nz_bpc = 16.0
@@ -586,6 +589,147 @@ class TestPassPipelineIntegrationAndCalibration:
         assert len(chain_variants) == 32
         assert any(v["gm_layouts"].get("mid") == "NZ" for v in chain_variants)
         assert any(v["gm_layouts"].get("mid") == "ND" for v in chain_variants)
+
+    def test_default_suite_all_single_matmuls_fit_l0_with_8_variants(self, tmp_path: Path):
+        cases = auto_layout_bench.default_a2_calibration_suite(include_chain=False, expected_uses=100)
+        summary = auto_layout_bench.run_calibration_suite(
+            cases,
+            output_dir=tmp_path / "single_suite",
+            platform="a2a3",
+            compile_only=True,
+        )
+        assert len(summary["cases"]) == 4
+        for case_rec in summary["cases"]:
+            variants = case_rec["variants"]
+            assert len(variants) == 8, f"{case_rec['case_id']} unexpectedly split L0: {len(variants)}"
+            assert any(v["gm_output_layouts"].get("out") == "NZ" for v in variants)
+            assert any(v["gm_output_layouts"].get("out") == "ND" for v in variants)
+
+    def test_prepare_variant_tensors_uses_entry_param_order_for_chain(self, tmp_path: Path):
+        chain = auto_layout_bench.build_two_matmul_chain_case(64, 128, 64, 64, seed=7)
+        # Verify mixed in-layouts: only `w2` is NZ while `x` and `w1` are ND.
+        # Entry signature is `(x, w1, w2, out)`; previously mm_stage1's params caused sorted ['w1','w2','x']!
+        dummy_bd = CostBreakdown(
+            assignment=LayoutAssignment(value_layouts={}),
+            total_cost_cycles=1.0,
+            operator_cost_cycles=1.0,
+            conversion_cost_cycles=0.0,
+            per_op_costs={},
+            per_value_conversion_costs={},
+        )
+        variant_w2_nz = LayoutVariantArtifact(
+            variant_id="variant_w2_nz",
+            breakdown=dummy_bd,
+            build_dir=tmp_path,
+            pto_files=(),
+            gm_input_layouts={"x": "ND", "w1": "ND", "w2": "NZ"},
+            gm_output_layouts={"out": "ND"},
+            gm_layouts={"x": "ND", "w1": "ND", "w2": "NZ", "mid": "ND", "out": "ND"},
+        )
+        tensors, out_buf = auto_layout_bench.prepare_variant_tensors(chain, variant_w2_nz)
+        assert len(tensors) == 3
+        assert torch.equal(tensors[0], chain.inputs[0])
+        assert torch.equal(tensors[1], chain.inputs[1])
+        assert torch.equal(unpack_nz(tensors[2]), chain.inputs[2])
+        assert out_buf.shape == chain.output_shape
+
+    def test_run_calibration_suite_isolates_benchmark_before_swimlane(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        cases = [
+            auto_layout_bench.build_single_matmul_case(64, 128, 64, expected_uses=100, seed=0),
+            auto_layout_bench.build_single_matmul_case(64, 256, 64, expected_uses=100, seed=1),
+            auto_layout_bench.build_single_matmul_case(128, 128, 64, expected_uses=100, seed=2),
+            auto_layout_bench.build_single_matmul_case(128, 128, 128, expected_uses=100, seed=3),
+        ]
+        # Skip ptoas during compilation while exercising the non-compile-only runtime orchestration loop.
+        original_compile_variants = auto_layout_bench.compile_layout_variants
+
+        def _compile_no_ptoas(*args, **kwargs):
+            kwargs["skip_ptoas"] = True
+            return original_compile_variants(*args, **kwargs)
+
+        monkeypatch.setattr(auto_layout_bench, "compile_layout_variants", _compile_no_ptoas)
+
+        expected_by_dir: dict[str, tuple[torch.Tensor, bool]] = {}
+        call_events: list[str] = []
+
+        def _make_fake_compiled(build_dir: Path, **kwargs):
+            def _runner(*all_args, config=None):
+                nonlocal expected_by_dir
+                in_args = all_args[:-1]
+                out_buf = all_args[-1]
+                m_dim, k_dim = in_args[0].shape
+                n_dim = in_args[1].shape[0]
+                case_key = f"matmul_{m_dim}x{k_dim}x{n_dim}"
+                # Match case_dir lookup from variant build_dir parent.
+                case = next(c for c in cases if c.case_id == case_key)
+                out_buf.copy_(
+                    pack_nz(case.expected_output)
+                    if expected_by_dir[str(build_dir)][1]
+                    else case.expected_output
+                )
+                if getattr(config, "enable_chip_swimlane", 0):
+                    call_events.append("swimlane")
+                    dfx = Path(build_dir) / "dfx_outputs"
+                    dfx.mkdir(parents=True, exist_ok=True)
+                    (dfx / "chip_swimlane_records.json").write_text(
+                        json.dumps([{"ph": "X", "dur": 4.25 + 0.01 * (m_dim + n_dim)}])
+                    )
+                else:
+                    call_events.append("accuracy")
+
+            return _runner
+
+        def _fake_from_dir(build_dir: Path, **kwargs):
+            manifest = json.loads((Path(build_dir).parent / "manifest.json").read_text())
+            v_entry = next(v for v in manifest["variants"] if v["build_dir"] == str(build_dir))
+            is_out_nz = v_entry["gm_output_layouts"].get("out") == "NZ"
+            expected_by_dir[str(build_dir)] = (torch.empty(0), is_out_nz)
+            return _make_fake_compiled(build_dir, **kwargs)
+
+        def _fake_benchmark(compiled, all_args, *, rounds=100, warmup=3, **kwargs):
+            # Must not pass platform= or device_id= alongside config= (benchmark() rejects both).
+            assert "platform" not in kwargs
+            assert "device_id" not in kwargs
+            assert kwargs.get("config") is not None
+            call_events.append("benchmark")
+            base_us = 12.0 + 0.05 * all_args[-1].shape[0]
+            return SimpleNamespace(
+                device_us_median=base_us,
+                device_us_min=base_us - 0.5,
+                device_us_mean=base_us,
+                device_us_max=base_us + 0.5,
+                device_us_stdev=0.2,
+                all_zero_device=False,
+                invocations=[SimpleNamespace(effective_us=base_us - 1.0)],
+            )
+
+        monkeypatch.setattr(auto_layout_bench.CompiledProgram, "from_dir", staticmethod(_fake_from_dir))
+        monkeypatch.setattr(auto_layout_bench, "benchmark", _fake_benchmark)
+
+        summary = auto_layout_bench.run_calibration_suite(
+            cases,
+            output_dir=tmp_path / "full_mock_suite",
+            platform="a2a3",
+            rounds=10,
+            warmup=2,
+            compile_only=False,
+            capture_swimlane=True,
+        )
+
+        # Strictly every benchmark() finishes before the first enable_chip_swimlane=1 run.
+        first_swimlane = call_events.index("swimlane")
+        last_benchmark = max(i for i, ev in enumerate(call_events) if ev == "benchmark")
+        assert last_benchmark < first_swimlane
+        assert call_events.count("benchmark") == 32
+        assert call_events.count("swimlane") == 32
+        assert summary["calibration"]["num_measurements"] == 32
+        assert summary["calibration_swimlane"]["num_measurements"] == 32
+        for c_rec in summary["cases"]:
+            for v in c_rec["variants"]:
+                assert v["accuracy_ok"] is True
+                assert v["swimlane_aicore_us"] > 0.0
 
 
 if __name__ == "__main__":

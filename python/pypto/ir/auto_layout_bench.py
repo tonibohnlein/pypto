@@ -44,6 +44,7 @@ from pypto.ir.auto_layout import (
     CalibrationMeasurement,
     CalibrationReport,
     LayoutCostModel,
+    LayoutProblemInstance,
     LayoutVariantArtifact,
     compile_layout_variants,
     fit_cost_model_from_measurements,
@@ -197,19 +198,32 @@ def build_two_matmul_chain_case(
     )
 
 
+def _entry_function(program: core_ir.Program) -> core_ir.Function:
+    """Return the `Orchestration` entry function of *program* (falling back to the last function)."""
+    orch_funcs = [
+        fn for fn in program.functions.values() if fn.func_type == core_ir.FunctionType.Orchestration
+    ]
+    if orch_funcs:
+        return orch_funcs[-1]
+    return next(reversed(list(program.functions.values())))
+
+
 def prepare_variant_tensors(
     case: CalibrationCaseSpec,
     variant: LayoutVariantArtifact,
 ) -> tuple[list[torch.Tensor], torch.Tensor]:
-    """Pack any `NZ`-assigned GM inputs via `pack_nz` and allocate output tensor."""
-    in_names = sorted(variant.gm_input_layouts)
-    # Preserve parameter order using function parameter list if available; fallback to positional.
-    call_inputs: list[torch.Tensor] = []
-    param_order = [p.name_hint for p in next(iter(case.program.functions.values())).params]
+    """Pack any `NZ`-assigned GM inputs via `pack_nz` in entry-parameter order and allocate output."""
+    entry = _entry_function(case.program)
+    param_order = [p.name_hint for p in entry.params]
     input_param_names = [n for n in param_order if n in variant.gm_input_layouts]
     if len(input_param_names) != len(case.inputs):
-        input_param_names = in_names[: len(case.inputs)]
+        raise ValueError(
+            f"{case.case_id}/{variant.variant_id}: entry params {param_order} matched "
+            f"{input_param_names} in gm_input_layouts={sorted(variant.gm_input_layouts)}, "
+            f"expected {len(case.inputs)} inputs."
+        )
 
+    call_inputs: list[torch.Tensor] = []
     for p_name, tensor in zip(input_param_names, case.inputs, strict=True):
         if variant.gm_input_layouts.get(p_name) == "NZ":
             call_inputs.append(pack_nz(tensor))
@@ -258,15 +272,41 @@ def default_a2_calibration_suite(
     expected_uses: int = 100,
 ) -> list[CalibrationCaseSpec]:
     """Return the default L0-fitting Ascend A2 (`Ascend910`) calibration workload suite."""
+    # All single-matmul operand tiles stay <= 32 KiB in L0A/L0B so AutoTileMatmulL0 is bypassed
+    # cleanly while preserving full rank across [1, load_bytes, store_bytes, macs].
     cases = [
         build_single_matmul_case(64, 128, 64, expected_uses=expected_uses, seed=0),
         build_single_matmul_case(64, 256, 64, expected_uses=expected_uses, seed=1),
-        build_single_matmul_case(64, 256, 128, expected_uses=expected_uses, seed=2),
+        build_single_matmul_case(128, 128, 64, expected_uses=expected_uses, seed=2),
         build_single_matmul_case(128, 128, 128, expected_uses=expected_uses, seed=3),
     ]
     if include_chain:
         cases.append(build_two_matmul_chain_case(64, 128, 64, 64, expected_uses=expected_uses, seed=4))
     return cases
+
+
+def _serialize_calibration_report(
+    measurements: Sequence[CalibrationMeasurement],
+    base_model: LayoutCostModel,
+) -> dict[str, Any] | None:
+    if not measurements:
+        return None
+    report: CalibrationReport = fit_cost_model_from_measurements(measurements, base_model)
+    return {
+        "num_measurements": len(measurements),
+        "fixed_overhead_us": report.fixed_overhead_us,
+        "effective_freq_ghz": report.effective_freq_ghz,
+        "r2": report.r2,
+        "spearman_rho": report.spearman_rho,
+        "mape_percent": report.mape_percent,
+        "fitted_params": {
+            "mte2_nd2nz_bytes_per_cycle": report.fitted_model.mte2_nd2nz_bytes_per_cycle,
+            "mte2_nz2nz_bytes_per_cycle": report.fitted_model.mte2_nz2nz_bytes_per_cycle,
+            "fixpipe_acc_to_nd_bytes_per_cycle": report.fitted_model.fixpipe_acc_to_nd_bytes_per_cycle,
+            "fixpipe_acc_to_nz_bytes_per_cycle": report.fitted_model.fixpipe_acc_to_nz_bytes_per_cycle,
+        },
+        "residuals_us": report.residuals_us,
+    }
 
 
 def run_calibration_suite(  # noqa: PLR0913
@@ -294,8 +334,23 @@ def run_calibration_suite(  # noqa: PLR0913
 
     base_model = cost_model or LayoutCostModel(backend_type=backend_type)
     measurements: list[CalibrationMeasurement] = []
+    swimlane_measurements: list[CalibrationMeasurement] = []
     suite_records: list[dict[str, Any]] = []
+    pending_swimlanes: list[
+        tuple[
+            CalibrationCaseSpec,
+            LayoutProblemInstance,
+            LayoutVariantArtifact,
+            CompiledProgram,
+            list[torch.Tensor],
+            torch.Tensor,
+            bool,
+            dict[str, Any],
+        ]
+    ] = []
 
+    # Pass A: compile all variants, check numerical accuracy, and run benchmark()
+    # before any enable_chip_swimlane=1 launch redirects host stderr logs away from [STRACE].
     for case in cases:
         case_dir = out_root / case.case_id
         model_for_case = LayoutCostModel(
@@ -354,14 +409,12 @@ def run_calibration_suite(  # noqa: PLR0913
                 all_args = [*in_tensors, out_buf]
 
                 # 1. Correctness validation
-                compiled(
-                    *all_args,
-                    config=RunConfig(
-                        backend_type=backend_type,
-                        execution_mode=execution_mode,
-                        device_id=device_id,
-                    ),
+                run_cfg = RunConfig(
+                    backend_type=backend_type,
+                    execution_mode=execution_mode,
+                    device_id=device_id,
                 )
+                compiled(*all_args, config=run_cfg)
                 actual = (
                     unpack_nz(out_buf)
                     if next(iter(variant.gm_output_layouts.values()), "ND") == "NZ"
@@ -372,20 +425,13 @@ def run_calibration_suite(  # noqa: PLR0913
                 rec["accuracy_ok"] = ok
                 rec["max_abs_err"] = max_err
 
-                # 2. Device benchmark
-                bench_cfg = RunConfig(
-                    backend_type=backend_type,
-                    execution_mode=execution_mode,
-                    device_id=device_id,
-                )
+                # 2. Device benchmark (do not mix config= with platform=/device_id=).
                 stats = benchmark(
                     compiled,
                     all_args,
                     rounds=rounds,
                     warmup=warmup,
-                    platform=platform,
-                    device_id=device_id,
-                    config=bench_cfg,
+                    config=run_cfg,
                 )
                 eff_samples = [inv.effective_us for inv in stats.invocations if inv.effective_us > 0.0]
                 eff_median = statistics.median(eff_samples) if eff_samples else 0.0
@@ -398,19 +444,6 @@ def run_calibration_suite(  # noqa: PLR0913
                 rec["effective_us_median"] = eff_median
                 rec["all_zero_device"] = stats.all_zero_device
 
-                # 3. Optional level-1 chip swimlane capture for AICore task cycles
-                if capture_swimlane:
-                    compiled(
-                        *all_args,
-                        config=RunConfig(
-                            backend_type=backend_type,
-                            execution_mode=execution_mode,
-                            device_id=device_id,
-                            enable_chip_swimlane=1,
-                        ),
-                    )
-                    rec["swimlane_aicore_us"] = _extract_swimlane_aicore_us(variant.build_dir)
-
                 measured_metric = stats.device_us_median if stats.device_us_median > 0.0 else eff_median
                 if ok and measured_metric > 0.0:
                     measurements.append(
@@ -422,29 +455,39 @@ def run_calibration_suite(  # noqa: PLR0913
                             label=f"{case.case_id}:{variant.gm_input_layouts}->{variant.gm_output_layouts}",
                         )
                     )
+                if capture_swimlane:
+                    pending_swimlanes.append((case, instance, variant, compiled, all_args, out_buf, ok, rec))
 
             variant_records.append(rec)
 
         suite_records.append({"case_id": case.case_id, "variants": variant_records})
 
-    calibration: dict[str, Any] | None = None
-    if measurements:
-        report: CalibrationReport = fit_cost_model_from_measurements(measurements, base_model)
-        calibration = {
-            "num_measurements": len(measurements),
-            "fixed_overhead_us": report.fixed_overhead_us,
-            "effective_freq_ghz": report.effective_freq_ghz,
-            "r2": report.r2,
-            "spearman_rho": report.spearman_rho,
-            "mape_percent": report.mape_percent,
-            "fitted_params": {
-                "mte2_nd2nz_bytes_per_cycle": report.fitted_model.mte2_nd2nz_bytes_per_cycle,
-                "mte2_nz2nz_bytes_per_cycle": report.fitted_model.mte2_nz2nz_bytes_per_cycle,
-                "fixpipe_acc_to_nd_bytes_per_cycle": report.fitted_model.fixpipe_acc_to_nd_bytes_per_cycle,
-                "fixpipe_acc_to_nz_bytes_per_cycle": report.fitted_model.fixpipe_acc_to_nz_bytes_per_cycle,
-            },
-            "residuals_us": report.residuals_us,
-        }
+    # Pass B: level-1 chip swimlane capture after all benchmark() invocations complete.
+    if capture_swimlane and not compile_only:
+        swimlane_cfg = RunConfig(
+            backend_type=backend_type,
+            execution_mode=execution_mode,
+            device_id=device_id,
+            enable_chip_swimlane=1,
+        )
+        for case, instance, variant, compiled, all_args, out_buf, ok, rec in pending_swimlanes:
+            out_buf.zero_()
+            compiled(*all_args, config=swimlane_cfg)
+            aicore_us = _extract_swimlane_aicore_us(variant.build_dir)
+            rec["swimlane_aicore_us"] = aicore_us
+            if ok and isinstance(aicore_us, float) and aicore_us > 0.0:
+                swimlane_measurements.append(
+                    CalibrationMeasurement(
+                        variant_id=f"{case.case_id}/{variant.variant_id}",
+                        measured_us=aicore_us,
+                        instance=instance,
+                        breakdown=variant.breakdown,
+                        label=f"{case.case_id}:{variant.gm_input_layouts}->{variant.gm_output_layouts}",
+                    )
+                )
+
+    calibration = _serialize_calibration_report(measurements, base_model)
+    calibration_swimlane = _serialize_calibration_report(swimlane_measurements, base_model)
 
     summary: dict[str, Any] = {
         "platform": platform,
@@ -454,8 +497,21 @@ def run_calibration_suite(  # noqa: PLR0913
         "compile_only": compile_only,
         "cases": suite_records,
         "calibration": calibration,
+        "calibration_swimlane": calibration_swimlane,
     }
     return summary
+
+
+def _print_calibration_block(title: str, cal: dict[str, Any] | None) -> None:
+    if cal is None:
+        return
+    print(f"\n=== {title} ===")
+    print(
+        f"  measurements={cal['num_measurements']} R2={cal['r2']:.4f} "
+        f"Spearman={cal['spearman_rho']:.4f} MAPE={cal['mape_percent']:.2f}% "
+        f"overhead={cal['fixed_overhead_us']:.2f}us eff_freq={cal['effective_freq_ghz']:.3f}GHz"
+    )
+    print(f"  fitted_params={cal['fitted_params']}")
 
 
 def _print_summary(summary: dict[str, Any]) -> None:
@@ -464,22 +520,19 @@ def _print_summary(summary: dict[str, Any]) -> None:
         for v in case["variants"]:
             dev = v.get("device_us_median")
             dev_str = f"dev_med={dev:.2f}us" if isinstance(dev, float) and not math.isnan(dev) else "compiled"
+            sw = v.get("swimlane_aicore_us")
+            sw_str = f" swim={sw:.2f}us" if isinstance(sw, float) and not math.isnan(sw) else ""
             acc = v.get("accuracy_ok")
             acc_str = f" acc={'PASS' if acc else 'FAIL'}" if acc is not None else ""
             print(
                 f"  {v['variant_id']} gm={v['gm_layouts']} "
                 f"pred_op={v['predicted_op_cycles']:.1f}cyc pred_total={v['predicted_total_cycles']:.1f}cyc "
-                f"{dev_str}{acc_str}"
+                f"{dev_str}{sw_str}{acc_str}"
             )
-    cal = summary.get("calibration")
-    if cal is not None:
-        print("\n=== Calibrated LayoutCostModel ===")
-        print(
-            f"  measurements={cal['num_measurements']} R2={cal['r2']:.4f} "
-            f"Spearman={cal['spearman_rho']:.4f} MAPE={cal['mape_percent']:.2f}% "
-            f"overhead={cal['fixed_overhead_us']:.2f}us eff_freq={cal['effective_freq_ghz']:.3f}GHz"
-        )
-        print(f"  fitted_params={cal['fitted_params']}")
+    _print_calibration_block("Calibrated LayoutCostModel (device_us_median)", summary.get("calibration"))
+    _print_calibration_block(
+        "Calibrated LayoutCostModel (swimlane_aicore_us)", summary.get("calibration_swimlane")
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
