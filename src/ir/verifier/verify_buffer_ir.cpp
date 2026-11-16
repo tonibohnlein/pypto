@@ -42,6 +42,7 @@
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/transforms/utils/type_metadata.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/verifier/expression_use_cache.h"
 #include "pypto/ir/verifier/verifier.h"
 
 namespace pypto {
@@ -86,6 +87,8 @@ class BufferIRVisitor : public IRVisitor {
 
   void VisitExpr(const ExprPtr& expr) override {
     if (!expr) return;
+    auto use = expression_uses_.Enter(expr, attribute_context_, statement_call_, statement_assigns_result_);
+    if (!use.inspect()) return;
     CheckType(expr->GetType(), expr->span_);
     if (!attribute_context_.empty()) CheckNoBufferValue(expr, attribute_context_);
     if (ContainsBuffer(expr->GetType()) && !AsVarLike(expr) && !As<Call>(expr) &&
@@ -668,6 +671,7 @@ class BufferIRVisitor : public IRVisitor {
   bool statement_assigns_result_ = false;
   std::string attribute_context_;
   bool malformed_structure_ = false;
+  verifier_detail::ExpressionUseCache expression_uses_;
 };
 
 class BufferIRPropertyVerifierImpl : public PropertyVerifier {

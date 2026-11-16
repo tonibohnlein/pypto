@@ -30,6 +30,7 @@
 #include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/verifier/expression_use_cache.h"
 #include "pypto/ir/verifier/verification_error.h"
 #include "pypto/ir/verifier/verifier.h"
 
@@ -71,9 +72,13 @@ namespace {
  */
 class SSAVerifier : public IRVisitor {
  public:
-  SSAVerifier(std::vector<Diagnostic>& diagnostics, std::string func_name, FunctionPtr func)
-      : diagnostics_(diagnostics), func_name_(std::move(func_name)), func_(std::move(func)) {}
+  SSAVerifier(std::vector<Diagnostic>& diagnostics, std::string func_name)
+      : diagnostics_(diagnostics), func_name_(std::move(func_name)) {}
 
+  void VisitExpr(const ExprPtr& expression) override {
+    auto use = expression_uses_.Enter(expression);
+    if (use.inspect()) IRVisitor::VisitExpr(expression);
+  }
   void VisitVarLike_(const VarPtr& op) override;
   void VisitStmt_(const AssignStmtPtr& op) override;
   void VisitStmt_(const SimtLaunchStmtPtr& op) override;
@@ -112,8 +117,7 @@ class SSAVerifier : public IRVisitor {
  private:
   std::vector<Diagnostic>& diagnostics_;
   std::string func_name_;
-  FunctionPtr func_;
-  mutable std::string cached_func_str_;
+  verifier_detail::ExpressionUseCache expression_uses_;
   std::unordered_map<const Var*, int> var_assignment_count_;
 
   struct ScopeDefinition {
@@ -244,12 +248,7 @@ void SSAVerifier::CheckVariableAssignment(const VarPtr& var) {
 void SSAVerifier::RecordError(ssa::ErrorType type, const std::string& message, const Span& span) {
   std::ostringstream full_msg;
   full_msg << message << "\n  In function '" << func_name_ << "'";
-  if (func_) {
-    if (cached_func_str_.empty()) {
-      cached_func_str_ = PythonPrint(func_);
-    }
-    full_msg << ":\n" << cached_func_str_;
-  }
+  // Explicit IR dumps remain available; diagnostics must not expand shared DAGs.
   diagnostics_.emplace_back(DiagnosticSeverity::Error, "SSAVerify", static_cast<int>(type), full_msg.str(),
                             span);
 }
@@ -580,7 +579,7 @@ class SSAPropertyVerifierImpl : public PropertyVerifier {
       }
 
       // Create verifier and run verification per function
-      SSAVerifier verifier(diagnostics, func->name_, func);
+      SSAVerifier verifier(diagnostics, func->name_);
 
       // Register function parameters (and their type-embedded vars) in the outermost scope
       verifier.RegisterParams(func->params_);

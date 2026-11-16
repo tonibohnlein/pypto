@@ -23,6 +23,7 @@
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/verifier/expression_use_cache.h"
 #include "pypto/ir/verifier/verification_error.h"
 #include "pypto/ir/verifier/verifier.h"
 
@@ -61,6 +62,11 @@ namespace {
  */
 class NoNestedCallVerifier : public IRVisitor {
  public:
+  void VisitExpr(const ExprPtr& expression) override {
+    auto use = expression_uses_.Enter(expression);
+    if (use.inspect()) IRVisitor::VisitExpr(expression);
+  }
+
   NoNestedCallVerifier(std::vector<Diagnostic>& diagnostics, bool preserve_while_conditions)
       : diagnostics_(diagnostics), preserve_while_conditions_(preserve_while_conditions) {}
 
@@ -104,6 +110,7 @@ class NoNestedCallVerifier : public IRVisitor {
   void VisitStmt_(const WhileStmtPtr& op) override;
 
  private:
+  verifier_detail::ExpressionUseCache expression_uses_;
   std::vector<Diagnostic>& diagnostics_;
   bool preserve_while_conditions_;
 
