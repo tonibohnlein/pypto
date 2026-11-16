@@ -2226,8 +2226,10 @@ CompactSyncInput ImportSyncPayloads(const FunctionPtr& function, const std::stri
   return ImportQualifiedSync(function, target, parameters, blocks, false, external_policy,
                              std::move(coordinate));
 }
-CompactSyncInput ImportReadonlyExternalSync(const FunctionPtr& function, const std::string& target) {
-  return ImportQualifiedSync(function, target, {}, std::nullopt, true,
+CompactSyncInput ImportReadonlyExternalSync(const FunctionPtr& function, const std::string& target,
+                                            const SyncParameterBounds& parameters,
+                                            const std::optional<std::pair<int64_t, int64_t>>& blocks) {
+  return ImportQualifiedSync(function, target, parameters, blocks, true,
                              SyncExternalPolicy::ReadOnlyProjection);
 }
 }  // namespace pypto::ir::sync

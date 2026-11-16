@@ -229,15 +229,20 @@ FunctionPtr AnalyzeRegionSync(
                                launch_count);
     }
     try {
-      return InsertLogicalSync(BindLaunchCount(function, launch_count), target, parameters, blocks,
-                               launch_count);
+      const auto logical =
+          InsertLogicalSync(BindLaunchCount(function, launch_count), target, parameters, blocks, launch_count);
+      // Mirror RealizeSync's late lowering fallback so 3-pass InsertSync -> OptimizeSync -> LowerSync
+      // switches to MixedCompose + Regional before committing an exact plan that cannot lower.
+      sync::LowerLogicalSync(sync::OptimizeLogicalSync(logical), target, std::nullopt, parameters, blocks,
+                             {}, sync::SyncExternalPolicy::Geometry, launch_count);
+      return logical;
     } catch (const pypto::ValueError&) {
       // Fall through to MixedCompose + Regional fallback.
     }
   }
   CHECK(allow_regional_fallback) << "Regional synchronization fallback is unavailable under exact policy";
   return sync::InsertConservativePrefixes(
-      sync::AnalyzeConservativeSync(function, target, {}, {}, false, true));
+      sync::AnalyzeConservativeSync(function, target, {}, {}, false, true, true, parameters, blocks));
 }
 }  // namespace
 
@@ -396,14 +401,15 @@ Pass LowerSync(bool require_whole_module) {
         // Re-establish caller facts from this token program. Neither insertion's
         // old analysis nor a process-global sidecar authorizes physical lowering.
         for (const auto& [global, function] : program->functions_) CheckLogicalSync(function);
+        auto* context = PassContext::Current();
+        CHECK(context) << "LowerSync requires a target PassContext";
+        const bool disjoint_gm = context->GetAutoSyncDisjointGM();
         bool needs_occurrences = false;
         for (const auto& [global, function] : program->functions_)
           needs_occurrences |= IsOwnedLeaf(function) && sync::HasLogicalSync(function) &&
-                               !sync::HasOnlyClosedPrefixSyntax(function);
+                               (disjoint_gm || !sync::HasOnlyClosedPrefixSyntax(function));
         const auto evidence =
             needs_occurrences ? sync::CollectSyncInvocationEvidence(program) : sync::SyncInvocationEvidence{};
-        auto* context = PassContext::Current();
-        CHECK(context) << "LowerSync requires a target PassContext";
         auto functions = program->functions_;
         for (auto& [global, function] : functions) {
           if (!IsOwnedLeaf(function)) continue;
@@ -502,8 +508,8 @@ Pass RealizeSync(bool require_whole_module) {
           if (!prefix) throw;
         }
       }
-      const auto regional_logical =
-          sync::InsertConservativePrefixes(sync::AnalyzeConservativeSync(function, target, {}, {}, false, true));
+      const auto regional_logical = sync::InsertConservativePrefixes(
+          sync::AnalyzeConservativeSync(function, target, {}, {}, false, true, true, bounds, block_bounds));
       return realize_logical(regional_logical);
     } catch (const pypto::ValueError& error) {
       return sync::SyncOutcome(function, false, error.what());

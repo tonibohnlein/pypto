@@ -149,7 +149,8 @@ class ConservativeSyncAnalysis {
  private:
   friend ConservativeSyncAnalysis AnalyzeConservativeSync(
       const FunctionPtr&, const std::string&, const std::vector<std::shared_ptr<const NativeSyncChild>>&,
-      const std::vector<std::shared_ptr<const EventfulSyncChild>>&, bool, bool, bool);
+      const std::vector<std::shared_ptr<const EventfulSyncChild>>&, bool, bool, bool,
+      const SyncParameterBounds&, const std::optional<std::pair<int64_t, int64_t>>&);
   ConservativeSyncAnalysis(FunctionPtr function, std::vector<ConservativeSyncSite> sites,
                            ConservativeAccessSet exit, ConservativeSyncCost cost,
                            std::shared_ptr<const ParentStmtAnalysis> parents,
@@ -188,7 +189,8 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
     const std::vector<std::shared_ptr<const NativeSyncChild>>& children = {},
     const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful_children = {},
     bool retain_incoming_diagnostics = false, bool automatic_children = false,
-    bool enable_refresh_kill = true);
+    bool enable_refresh_kill = true, const SyncParameterBounds& parameters = {},
+    const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt);
 // Explicit policy construction. Acknowledgment-induced order is represented
 // here in logical tokens before LowerSync; no physical resource is assigned.
 FunctionPtr InsertConservativePrefixes(const ConservativeSyncAnalysis& analysis);

@@ -243,7 +243,10 @@ CompactSyncInput ImportPlacedSync(
     const SyncParameterBounds& parameter_bounds = {},
     const std::optional<std::pair<int64_t, int64_t>>& block_bounds = std::nullopt,
     std::shared_ptr<const SyncInvocationCoordinate> coordinate = nullptr);
-CompactSyncInput ImportReadonlyExternalSync(const FunctionPtr& function, const std::string& target);
+CompactSyncInput ImportReadonlyExternalSync(
+    const FunctionPtr& function, const std::string& target,
+    const SyncParameterBounds& parameter_bounds = {},
+    const std::optional<std::pair<int64_t, int64_t>>& block_bounds = std::nullopt);
 
 using Occurrence = std::tuple<size_t, int64_t, size_t>;  // segment, visit, site
 using Crossing = std::pair<Occurrence, Occurrence>;

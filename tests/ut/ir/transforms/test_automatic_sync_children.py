@@ -482,3 +482,262 @@ def test_top_down_region_discovery_and_guarded_exact_if():
     ):
         unified_physical = next(iter(passes.realize_sync()(program).functions.values()))
     assert dict(unified_physical.attrs)["pypto_autosync"] is True
+
+
+def test_parent_scalar_parameter_and_var_alias_promote_disjoint_gm_ddr_store_child():
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+    ci = lambda v: ir.ConstInt(v, idx, span)
+    tup = lambda vals: ir.MakeTuple([ci(v) for v in vals], span)
+    vec_t = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    gm_t = ir.TensorType([2, 8], ir.DataType.FP32)
+
+    src = ir.Var("src", gm_t, span)
+    out = ir.Var("out", gm_t, span)
+    cond = ir.Var("cond", ir.ScalarType(ir.DataType.BOOL), span)
+    n = ir.Var("n", ir.ScalarType(idx), span)
+    n_alias = ir.Var("n_alias", ir.ScalarType(idx), span)
+    k = ir.Var("k", ir.ScalarType(idx), span)
+    x = ir.Var("x", vec_t, span)
+    y = ir.Var("y", vec_t, span)
+
+    # Sequential child loop using parent scalar param `n`, `Var`-to-`Var` alias `n_alias = n`,
+    # and performing a DDR store under autosync_disjoint_gm=True.
+    child = ir.ForStmt(
+        k,
+        n,
+        ci(4),
+        ci(1),
+        [],
+        ir.SeqStmts(
+            [
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+                ir.IfStmt(
+                    ir.Gt(n_alias, ci(0), ir.DataType.BOOL, span),
+                    ir.SeqStmts([ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [x, y], ir.VoidType(), span), span)], span),
+                    None,
+                    [],
+                    span,
+                ),
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.store"), [y, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span), span),
+                ir.YieldStmt([], span),
+            ],
+            span,
+        ),
+        [],
+        span,
+    )
+    # WhileStmt forces MixedCompose + automatic child discovery instead of whole-function Exact.
+    while_stmt = ir.WhileStmt(
+        cond,
+        [],
+        ir.SeqStmts(
+            [
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+                ir.YieldStmt([], span),
+            ],
+            span,
+        ),
+        [],
+        span,
+    )
+    worker = ir.Function(
+        "worker_ddr_store_child",
+        [src, (out, ir.ParamDirection.InOut), cond, n],
+        [out.type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(n_alias, n, span),
+                ir.AssignStmt(x, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(0)], vec_t, span), span),
+                ir.AssignStmt(y, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(128)], vec_t, span), span),
+                while_stmt,
+                child,
+                ir.ReturnStmt([out], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        level=ir.Level.AIV,
+        role=ir.Role.SubWorker,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    gv_worker = ir.GlobalVar(worker.name)
+    entry_src = ir.Var("e_src", gm_t, span)
+    entry_out = ir.Var("e_out", gm_t, span)
+    called_res = ir.Var("called_res", out.type, span)
+    entry = ir.Function(
+        "entry_caller",
+        [entry_src, (entry_out, ir.ParamDirection.InOut)],
+        [entry_out.type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(
+                    called_res,
+                    ir.Call(
+                        gv_worker,
+                        [entry_src, entry_out, ir.ConstBool(False, span), ci(2)],
+                        out.type,
+                        span,
+                    ),
+                    span,
+                ),
+                ir.ReturnStmt([called_res], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.Opaque,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    prog = ir.Program([worker, entry], "DisjointGmDdrStoreChild", span)
+
+    with passes.PassContext([], autosync_disjoint_gm=True, autosync_policy="conservative_prefix"):
+        logical = passes.insert_sync()(prog)
+        optimized = passes.optimize_sync()(logical)
+    with passes.PassContext([], autosync_disjoint_gm=True):
+        physical_3pass = passes.lower_sync()(optimized)
+    with passes.PassContext(
+        [], enable_pypto_autosync=True, autosync_disjoint_gm=True, autosync_policy="conservative_prefix"
+    ):
+        physical_1pass = passes.realize_sync()(prog)
+
+    log_fn = next(f for g, f in optimized.functions.items() if g.name == "worker_ddr_store_child")
+    assert dict(log_fn.attrs)["autosync_retained_child_count"] == 1
+    p3 = next(f for g, f in physical_3pass.functions.items() if g.name == "worker_ddr_store_child")
+    p1 = next(f for g, f in physical_1pass.functions.items() if g.name == "worker_ddr_store_child")
+    assert dict(p3.attrs)["pypto_autosync"] is True
+    assert dict(p1.attrs)["pypto_autosync"] is True
+    for phys in (p3, p1):
+        check_closed_commands(
+            log_fn,
+            phys,
+            {2: False, 3: 2},
+            range(6),
+            tensor_bases={0: 0, 1: 1 << 20},
+            compare_commands=False,
+            hardware_source=worker,
+        )
+
+
+def test_prescreen_skips_outer_loop_with_while_without_losing_inner_promotion():
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+    ci = lambda v: ir.ConstInt(v, idx, span)
+    tup = lambda vals: ir.MakeTuple([ci(v) for v in vals], span)
+    vec_t = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    gm_t = ir.TensorType([2, 8], ir.DataType.FP32)
+
+    src = ir.Var("src", gm_t, span)
+    out = ir.Var("out", gm_t, span)
+    cond = ir.Var("cond", ir.ScalarType(ir.DataType.BOOL), span)
+    x = ir.Var("x", vec_t, span)
+    y = ir.Var("y", vec_t, span)
+    outer_i = ir.Var("outer_i", ir.ScalarType(idx), span)
+    inner_k = ir.Var("inner_k", ir.ScalarType(idx), span)
+
+    # Eligible inner ForStmt inside a WhileStmt wrapped in an outer ForStmt.
+    inner_child = ir.ForStmt(
+        inner_k,
+        ci(0),
+        ci(2),
+        ci(1),
+        [],
+        ir.SeqStmts(
+            [
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [x, y], ir.VoidType(), span), span),
+                ir.YieldStmt([], span),
+            ],
+            span,
+        ),
+        [],
+        span,
+    )
+    outer_for = ir.ForStmt(
+        outer_i,
+        ci(0),
+        ci(2),
+        ci(1),
+        [],
+        ir.SeqStmts(
+            [
+                ir.WhileStmt(cond, [], ir.SeqStmts([inner_child, ir.YieldStmt([], span)], span), [], span),
+                ir.YieldStmt([], span),
+            ],
+            span,
+        ),
+        [],
+        span,
+    )
+    fn = ir.Function(
+        "outer_for_wrapping_while",
+        [src, (out, ir.ParamDirection.InOut), cond],
+        [out.type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(x, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(0)], vec_t, span), span),
+                ir.AssignStmt(y, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(128)], vec_t, span), span),
+                outer_for,
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.store"), [y, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span), span),
+                ir.ReturnStmt([out], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    analysis = inspect(fn)
+    attempts = analysis["child_attempts"]
+    # Outer loop containing WhileStmt must be skipped by pre-screen without attempting Bind/Analysis,
+    # while inner eligible ForStmt inside WhileStmt is promoted cleanly.
+    assert len(attempts) == 1
+    assert attempts[0]["scope"] is inner_child
+    assert attempts[0]["stage"] == "logical_export_ready"
+
+    # Outer loop containing only WhileStmt with no inner ForStmt builds zero SyncRegionBindings index.
+    empty_outer = ir.ForStmt(
+        outer_i,
+        ci(0),
+        ci(2),
+        ci(1),
+        [],
+        ir.SeqStmts(
+            [
+                ir.WhileStmt(
+                    cond,
+                    [],
+                    ir.SeqStmts(
+                        [
+                            ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+                            ir.YieldStmt([], span),
+                        ],
+                        span,
+                    ),
+                    [],
+                    span,
+                ),
+                ir.YieldStmt([], span),
+            ],
+            span,
+        ),
+        [],
+        span,
+    )
+    no_inner_fn = clone(
+        fn,
+        body=ir.SeqStmts(
+            [
+                ir.AssignStmt(x, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(0)], vec_t, span), span),
+                ir.AssignStmt(y, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(128)], vec_t, span), span),
+                empty_outer,
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.store"), [y, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span), span),
+                ir.ReturnStmt([out], span),
+            ],
+            span,
+        ),
+    )
+    no_inner_analysis = inspect(no_inner_fn)
+    assert no_inner_analysis["child_attempts"] == []
+    assert no_inner_analysis["cost"]["child_index_nodes"] == 0

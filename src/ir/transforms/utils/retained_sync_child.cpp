@@ -29,6 +29,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/sync.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/utils/parent_stmt_analysis.h"
 #include "pypto/ir/transforms/utils/signature_symbols.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
@@ -41,8 +42,12 @@ namespace pypto::ir::sync {
 namespace {
 class Operations : public IRVisitor {
  public:
-  Operations(const CompactSyncResult& mathematics, const std::string& target, NativeSyncChildExport& result)
-      : mathematics_(mathematics), target_(target), result_(result) {
+  Operations(const CompactSyncResult& mathematics, const std::string& target, NativeSyncChildExport& result,
+             bool allow_disjoint_gm = false)
+      : mathematics_(mathematics),
+        target_(target),
+        result_(result),
+        allow_disjoint_gm_(allow_disjoint_gm) {
     for (const auto& segment : mathematics.State().input.segments)
       for (const auto& site : segment.sites) {
         modeled_.insert(site.original.get());
@@ -113,7 +118,9 @@ class Operations : public IRVisitor {
         const auto buffer = As<BufferType>(type);
         const bool projected = mathematics_.State().input.unavailable_storage_spaces.count(MemorySpace::DDR);
         const bool external = As<TensorType>(type) || (buffer && buffer->memory_space_ == MemorySpace::DDR);
-        if (projected && external && operation.ArgumentEffects()[index].data == BufferAccess::Read) continue;
+        if (external && (allow_disjoint_gm_ ||
+                         (projected && operation.ArgumentEffects()[index].data == BufferAccess::Read)))
+          continue;
         if (!buffer || buffer->memory_space_ == MemorySpace::DDR) {
           result_.status = NativeSyncChildStatus::AccessPremises;
           result_.reason = "Native child needs an external-storage alias premise not supplied to its parent";
@@ -128,8 +135,9 @@ class Operations : public IRVisitor {
         return;
       }
       for (const auto& effect : operation.Implementation().ImplicitEffects()) {
-        if (mathematics_.State().input.unavailable_storage_spaces.count(MemorySpace::DDR) &&
-            effect.space == MemorySpace::DDR && effect.data == BufferAccess::Read)
+        if (effect.space == MemorySpace::DDR &&
+            (allow_disjoint_gm_ || (mathematics_.State().input.unavailable_storage_spaces.count(MemorySpace::DDR) &&
+                                    effect.data == BufferAccess::Read)))
           continue;
         if (effect.space != MemorySpace::Vec || effect.begin < 0 || effect.end <= effect.begin) {
           result_.status = NativeSyncChildStatus::AccessPremises;
@@ -157,6 +165,7 @@ class Operations : public IRVisitor {
   NativeSyncChildExport& result_;
   std::unordered_set<const Call*> modeled_;
   std::unordered_set<const Expr*> seen_;
+  bool allow_disjoint_gm_ = false;
 };
 }  // namespace
 
@@ -275,12 +284,17 @@ NativeSyncChildExport ExportNativeSyncChild(const CompactSyncResult& mathematics
   return result;
 }
 bool HasReadonlyExternalSyncEffects(const ForStmtPtr& scope, FunctionType core, const std::string& target,
-                                    SyncChildEffectWork* work) {
+                                    SyncChildEffectWork* work, bool allow_disjoint_gm_writes) {
   class Effects : public IRVisitor {
    public:
-    Effects(FunctionType core, const std::string& target, SyncChildEffectWork* work)
-        : core_(core), target_(target), work_(work) {}
+    Effects(FunctionType core, const std::string& target, SyncChildEffectWork* work,
+            bool allow_disjoint_gm_writes)
+        : core_(core),
+          target_(target),
+          work_(work),
+          allow_disjoint_gm_writes_(allow_disjoint_gm_writes) {}
     bool external = false;
+    bool has_write = false;
     void VisitStmt(const StmtPtr& statement) override {
       if (work_) ++work_->statements;
       IRVisitor::VisitStmt(statement);
@@ -303,13 +317,19 @@ bool HasReadonlyExternalSyncEffects(const ForStmtPtr& scope, FunctionType core, 
         const auto type = call->args_[index]->GetType();
         const auto buffer = As<BufferType>(type);
         if (As<TensorType>(type) || (buffer && buffer->memory_space_ == MemorySpace::DDR)) {
-          CHECK(effect == BufferAccess::Read) << "Closed child external effects are not uniformly read-only";
+          if (effect != BufferAccess::Read) {
+            CHECK(allow_disjoint_gm_writes_) << "Closed child external effects are not uniformly read-only";
+            has_write = true;
+          }
           external = true;
         }
       }
       for (const auto& effect : operation.Implementation().ImplicitEffects()) {
         if (effect.space != MemorySpace::DDR) continue;
-        CHECK(effect.data == BufferAccess::Read) << "Closed child implicit external effect is not read-only";
+        if (effect.data != BufferAccess::Read) {
+          CHECK(allow_disjoint_gm_writes_) << "Closed child implicit external effect is not read-only";
+          has_write = true;
+        }
         external = true;
       }
     }
@@ -319,9 +339,28 @@ bool HasReadonlyExternalSyncEffects(const ForStmtPtr& scope, FunctionType core, 
     const std::string& target_;
     std::unordered_set<const Expr*> seen_;
     SyncChildEffectWork* work_;
-  } effects(core, target, work);
+    bool allow_disjoint_gm_writes_;
+  } effects(core, target, work, allow_disjoint_gm_writes);
   effects.VisitStmt(scope);
-  return effects.external;
+  return effects.external && !effects.has_write;
+}
+
+SyncParameterBounds ProjectSyncParameterBounds(const FunctionPtr& owner, const FunctionPtr& binding_owner,
+                                               const SyncParameterBounds& owner_bounds) {
+  SyncParameterBounds projected;
+  if (!owner || !binding_owner || owner_bounds.empty()) return projected;
+  std::unordered_map<const Var*, std::pair<int64_t, int64_t>> by_var;
+  for (const auto& [idx, range] : owner_bounds) {
+    if (idx < owner->params_.size()) {
+      by_var.emplace(owner->params_[idx].get(), range);
+    }
+  }
+  if (by_var.empty()) return projected;
+  for (size_t c_idx = 0; c_idx < binding_owner->params_.size(); ++c_idx) {
+    const auto found = by_var.find(binding_owner->params_[c_idx].get());
+    if (found != by_var.end()) projected.emplace(c_idx, found->second);
+  }
+  return projected;
 }
 
 class SyncRegionBindings::State : public ParentStmtAnalysis {
@@ -387,7 +426,7 @@ class SyncRegionBindings::State : public ParentStmtAnalysis {
               (descriptor && descriptor->SignalFree());
     } else {
       ready = As<ConstInt>(assignment->value_) || As<ConstBool>(assignment->value_) ||
-              As<ConstFloat>(assignment->value_);
+              As<ConstFloat>(assignment->value_) || AsVarLike(assignment->value_);
       if (policy == SyncExternalPolicy::ReadOnlyProjection) {
         CheckSyncScalarReadiness(assignment->value_, [](const VarPtr&) { return true; });
         ready = true;  // Every operand is separately bound at this original cut below.
@@ -458,12 +497,10 @@ SyncRegionContext SyncRegionBindings::Bind(const ForStmtPtr& scope, SyncExternal
     pending.pop_back();
     // Invocation parameters are indexed once, not copied into every candidate.
     // Only actual referenced captures contribute to a binding's output size.
-    if (policy == SyncExternalPolicy::ReadOnlyProjection) {
-      const auto parameter = state_->ready_parameters.find(variable);
-      if (parameter != state_->ready_parameters.end()) {
-        captures.emplace(variable, parameter->second);
-        continue;
-      }
+    const auto parameter = state_->ready_parameters.find(variable);
+    if (parameter != state_->ready_parameters.end()) {
+      captures.emplace(variable, parameter->second);
+      continue;
     }
     if (const auto captured = available.find(variable); captured != available.end()) {
       if (const auto frame = invocation_frames.find(variable); frame != invocation_frames.end()) {
@@ -516,9 +553,10 @@ SyncRegionContext SyncRegionBindings::Bind(const ForStmtPtr& scope, SyncExternal
           uses.scope_nodes, ordered.size()};
 }
 
-EventfulSyncChildAttempt TryPrepareEventfulSyncChild(const FunctionPtr& owner, const ForStmtPtr& scope,
-                                                     const std::string& target,
-                                                     const SyncRegionBindings& bindings) {
+EventfulSyncChildAttempt TryPrepareEventfulSyncChild(
+    const FunctionPtr& owner, const ForStmtPtr& scope, const std::string& target,
+    const SyncRegionBindings& bindings, const SyncParameterBounds& parameters,
+    const std::optional<std::pair<int64_t, int64_t>>& blocks) {
   EventfulSyncChildAttempt attempt;
   attempt.scope = scope;
   auto started = std::chrono::steady_clock::now();
@@ -532,7 +570,10 @@ EventfulSyncChildAttempt TryPrepareEventfulSyncChild(const FunctionPtr& owner, c
     attempt.stage = next;
   };
   try {
-    const auto policy = HasReadonlyExternalSyncEffects(scope, owner->func_type_, target, &attempt.effect_work)
+    const auto* ctx = PassContext::Current();
+    const bool disjoint_gm = ctx && ctx->GetAutoSyncDisjointGM();
+    const auto policy = HasReadonlyExternalSyncEffects(scope, owner->func_type_, target,
+                                                       &attempt.effect_work, disjoint_gm)
                             ? SyncExternalPolicy::ReadOnlyProjection
                             : SyncExternalPolicy::Geometry;
     enter_phase(EventfulSyncChildStage::Binding);
@@ -540,14 +581,15 @@ EventfulSyncChildAttempt TryPrepareEventfulSyncChild(const FunctionPtr& owner, c
     CHECK(context.original_owner == owner)
         << "Regional synchronization index belongs to another original owner";
     enter_phase(EventfulSyncChildStage::Analysis);
+    const auto child_bounds = ProjectSyncParameterBounds(owner, context.binding_owner, parameters);
     attempt.mathematics = std::make_shared<const CompactSyncResult>(
         AnalyzeCompactSync(policy == SyncExternalPolicy::ReadOnlyProjection
-                               ? ImportReadonlyExternalSync(context.binding_owner, target)
-                               : ImportPlacedSync(context.binding_owner, true, target)));
+                               ? ImportReadonlyExternalSync(context.binding_owner, target, child_bounds, blocks)
+                               : ImportPlacedSync(context.binding_owner, true, target, child_bounds, blocks)));
     const auto& mathematics = *attempt.mathematics;
     enter_phase(EventfulSyncChildStage::Qualification);
     NativeSyncChildExport qualification;
-    Operations operations(mathematics, target, qualification);
+    Operations operations(mathematics, target, qualification, disjoint_gm);
     operations.VisitStmt(scope);
     CHECK(operations.available) << "Eventful child native/effect qualification unavailable: "
                                 << qualification.reason;
@@ -634,7 +676,92 @@ const char* EventfulSyncChildStageName(EventfulSyncChildStage stage) {
   return "";
 }
 
-AutomaticSyncChildren PrepareAutomaticSyncChildren(const FunctionPtr& owner, const std::string& target) {
+AutomaticSyncChildren PrepareAutomaticSyncChildren(
+    const FunctionPtr& owner, const std::string& target, const SyncParameterBounds& parameters,
+    const std::optional<std::pair<int64_t, int64_t>>& blocks) {
+  // O(N) bottom-up syntactic pre-screen filters outer loops containing
+  // While/Parallel/Return/Submit or empty bodies without building Bind/Analysis.
+  struct ScopeSummary {
+    bool has_payload = false;
+    bool has_disqualifying_control = false;
+    bool has_ddr_write = false;
+    bool has_unqualified_call = false;
+    void MergeFrom(const ScopeSummary& other) {
+      has_payload |= other.has_payload;
+      has_disqualifying_control |= other.has_disqualifying_control;
+      has_ddr_write |= other.has_ddr_write;
+      has_unqualified_call |= other.has_unqualified_call;
+    }
+  };
+  std::unordered_map<const ForStmt*, ScopeSummary> loop_summaries;
+  std::function<ScopeSummary(const StmtPtr&)> prescreen = [&](const StmtPtr& stmt) -> ScopeSummary {
+    ScopeSummary sum;
+    if (!stmt) return sum;
+    if (const auto seq = As<SeqStmts>(stmt)) {
+      for (const auto& child : seq->stmts_) sum.MergeFrom(prescreen(child));
+      return sum;
+    }
+    if (const auto branch = As<IfStmt>(stmt)) {
+      sum.MergeFrom(prescreen(branch->then_body_));
+      if (branch->else_body_) sum.MergeFrom(prescreen(*branch->else_body_));
+      return sum;
+    }
+    if (const auto loop = As<ForStmt>(stmt)) {
+      const auto body_sum = prescreen(loop->body_);
+      loop_summaries.emplace(loop.get(), body_sum);
+      sum = body_sum;
+      if (loop->kind_ != ForKind::Sequential) sum.has_disqualifying_control = true;
+      return sum;
+    }
+    if (const auto loop = As<WhileStmt>(stmt)) {
+      prescreen(loop->body_);
+      sum.has_disqualifying_control = true;
+      return sum;
+    }
+    if (As<ReturnStmt>(stmt)) {
+      sum.has_disqualifying_control = true;
+      return sum;
+    }
+    auto scan_call = [&](const CallPtr& call) {
+      if (!call || GetLogicalSyncKind(call->op_) != LogicalSyncKind::None) return;
+      try {
+        if (backend::QualifyBufferSyncNonPayload(call, target)) return;
+        sum.has_payload = true;
+        const auto operation = backend::QualifyBufferSyncOperation(call, owner->func_type_, target);
+        for (size_t i = 0; i < operation.ArgumentEffects().size(); ++i) {
+          const auto eff = operation.ArgumentEffects()[i].data;
+          if (eff == BufferAccess::None || eff == BufferAccess::Read) continue;
+          const auto type = call->args_[i]->GetType();
+          const auto buf = As<BufferType>(type);
+          if (As<TensorType>(type) || (buf && buf->memory_space_ == MemorySpace::DDR)) {
+            sum.has_ddr_write = true;
+          }
+        }
+        for (const auto& eff : operation.Implementation().ImplicitEffects()) {
+          if (eff.space == MemorySpace::DDR && eff.data != BufferAccess::Read) sum.has_ddr_write = true;
+        }
+      } catch (const pypto::ValueError&) {
+        sum.has_unqualified_call = true;
+      }
+    };
+    if (const auto eval = As<EvalStmt>(stmt)) {
+      if (const auto call = As<Call>(eval->expr_))
+        scan_call(call);
+      else if (As<Submit>(eval->expr_))
+        sum.has_disqualifying_control = true;
+    } else if (const auto assign = As<AssignStmt>(stmt)) {
+      if (const auto call = As<Call>(assign->value_))
+        scan_call(call);
+      else if (As<Submit>(assign->value_))
+        sum.has_disqualifying_control = true;
+    }
+    return sum;
+  };
+  prescreen(owner->body_);
+
+  const auto* ctx = PassContext::Current();
+  const bool disjoint_gm = ctx && ctx->GetAutoSyncDisjointGM();
+
   // Top-down maximal exact subregion discovery (Draft Section 8): attempt to
   // promote each enclosing sequential ForStmt subtree as a single Exact child
   // before descending into inner loops only when the enclosing scope fails Exact.
@@ -658,10 +785,22 @@ AutomaticSyncChildren PrepareAutomaticSyncChildren(const FunctionPtr& owner, con
       if (branch->else_body_) discover(*branch->else_body_);
     } else if (const auto loop = As<ForStmt>(statement)) {
       if (loop->kind_ == ForKind::Sequential) {
-        auto attempt = TryPrepareEventfulSyncChild(owner, loop, target, ensure_bindings());
-        const bool promoted = static_cast<bool>(attempt.child);
-        result.attempts.push_back(std::move(attempt));
-        if (promoted) return;
+        const auto sit = loop_summaries.find(loop.get());
+        const ScopeSummary sub = sit != loop_summaries.end() ? sit->second : ScopeSummary{};
+        if (!sub.has_disqualifying_control && sub.has_payload) {
+          if (sub.has_ddr_write && !sub.has_unqualified_call && !disjoint_gm) {
+            EventfulSyncChildAttempt failed;
+            failed.scope = loop;
+            failed.stage = EventfulSyncChildStage::Effects;
+            failed.reason = "Closed child external effects are not uniformly read-only";
+            result.attempts.push_back(std::move(failed));
+          } else {
+            auto attempt = TryPrepareEventfulSyncChild(owner, loop, target, ensure_bindings(), parameters, blocks);
+            const bool promoted = static_cast<bool>(attempt.child);
+            result.attempts.push_back(std::move(attempt));
+            if (promoted) return;
+          }
+        }
       }
       discover(loop->body_);
     } else if (const auto loop = As<WhileStmt>(statement)) {
