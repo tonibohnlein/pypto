@@ -14,9 +14,11 @@
 #include <algorithm>
 #include <array>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
+#include <queue>
 #include <set>
 #include <string>
 #include <tuple>
@@ -27,10 +29,12 @@
 
 #include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
+#include "pypto/core/any_cast.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memref.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/sync.h"
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/type.h"
 #include "src/ir/transforms/utils/native_sync_placement.h"
@@ -323,6 +327,38 @@ class DebtState {
     DeliverOneWay(src, dst);
   }
 
+  // Batched 1-way relay from all sources in `sources_mask` to `dst` in one pass.
+  void DeliverSources(PipeMask sources_mask, PipeType dst) {
+    const PipeMask dst_mask = PipeToMask(dst);
+    if (sources_mask == 0 || dst_mask == 0) return;
+    for (auto it = pending_.begin(); it != pending_.end();) {
+      const PipeMask ready = (~it->second & kAllPhysicalPipesMask) | PipeToMask(it->first.src);
+      if ((ready & sources_mask) != 0) it->second &= ~dst_mask;
+      if (it->second == 0) {
+        it = pending_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  // Apply a precomputed sequential relay matrix in one pass over `pending_`.
+  void ApplyServiceMatrix(const std::array<PipeMask, kPhysicalPipeCount>& matrix) {
+    for (auto it = pending_.begin(); it != pending_.end();) {
+      const PipeMask ready = (~it->second & kAllPhysicalPipesMask) | PipeToMask(it->first.src);
+      PipeMask cleared = 0;
+      for (size_t p = 0; p < kPhysicalPipeCount; ++p) {
+        if ((ready & (PipeMask{1} << p)) != 0) cleared |= matrix[p];
+      }
+      it->second &= ~cleared;
+      if (it->second == 0) {
+        it = pending_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
   void ApplySummary(const CompletionSummary& summary) {
     for (auto it = pending_.begin(); it != pending_.end();) {
       PipeMask next = it->second;
@@ -367,9 +403,7 @@ class DebtState {
         }
       }
       if (initial != 0) {
-        pending_[{space, domain, write, pipe}] = initial;
-      } else {
-        pending_.erase({space, domain, write, pipe});
+        pending_[{space, domain, write, pipe}] |= initial;
       }
     }
   }
@@ -493,14 +527,17 @@ class Builder {
     std::vector<std::pair<size_t, size_t>> edges;
     const size_t entry_v = vertices.size();
     vertices.push_back(CompletionVertex{});
-    std::unordered_map<const Expr*, PipeType> local_tokens;
+    std::unordered_map<const Expr*, PipeMask> local_tokens;
+    PipeMask written_pipes = 0;
 
-    auto find_pipe_attr = [](const CallPtr& call, const char* key) -> std::optional<PipeType> {
+    auto find_pipe_arg = [](const CallPtr& call, const char* key) -> std::optional<PipeType> {
+      for (const auto& [name, val] : call->kwargs_) {
+        if (name != key) continue;
+        return static_cast<PipeType>(AnyCast<int>(val, name));
+      }
       for (const auto& [name, val] : call->attrs_) {
         if (name != key) continue;
-        if (const auto* i = std::any_cast<int>(&val)) return static_cast<PipeType>(*i);
-        if (const auto* i64 = std::any_cast<int64_t>(&val)) return static_cast<PipeType>(*i64);
-        if (const auto* p = std::any_cast<PipeType>(&val)) return *p;
+        return static_cast<PipeType>(AnyCast<int>(val, name));
       }
       return std::nullopt;
     };
@@ -511,6 +548,22 @@ class Builder {
       return id;
     };
 
+    auto emit_payload = [&](const CallPtr& call, size_t cur) -> size_t {
+      if (!call || GetLogicalSyncKind(call->op_) != LogicalSyncKind::None ||
+          backend::QualifyBufferSyncNonPayload(call, target_))
+        return cur;
+      const auto op = backend::QualifyBufferSyncOperation(call, function_->func_type_, target_);
+      const PipeMask mask = PipeToMask(op.Implementation().Pipe());
+      if (mask == 0) return cur;
+      written_pipes |= mask;
+      for (auto& [tok, tok_mask] : local_tokens) tok_mask &= ~mask;
+      CompletionVertex op_v;
+      op_v.write_pipes = mask;
+      const size_t v = new_vertex(std::move(op_v));
+      edges.emplace_back(cur, v);
+      return v;
+    };
+
     std::function<size_t(const StmtPtr&, size_t)> build = [&](const StmtPtr& stmt, size_t cur) -> size_t {
       if (!stmt) return cur;
       if (const auto seq = As<SeqStmts>(stmt)) {
@@ -519,15 +572,22 @@ class Builder {
       }
       if (const auto branch = As<IfStmt>(stmt)) {
         const auto saved_tokens = local_tokens;
+        const PipeMask saved_written = written_pipes;
+        written_pipes = 0;
         const size_t then_exit = build(branch->then_body_, cur);
         const auto then_tokens = local_tokens;
+        const PipeMask then_written = written_pipes;
         local_tokens = saved_tokens;
+        written_pipes = 0;
         const size_t else_exit = branch->else_body_ ? build(*branch->else_body_, cur) : cur;
+        const PipeMask else_written = written_pipes;
+        written_pipes = saved_written | then_written | else_written;
         for (auto it = local_tokens.begin(); it != local_tokens.end();) {
           const auto found = then_tokens.find(it->first);
-          if (found == then_tokens.end() || found->second != it->second) {
+          if (found == then_tokens.end()) {
             it = local_tokens.erase(it);
           } else {
+            it->second &= found->second;
             ++it;
           }
         }
@@ -538,58 +598,91 @@ class Builder {
       }
       if (const auto loop = As<ForStmt>(stmt)) {
         const auto saved_tokens = local_tokens;
+        const PipeMask outer_written = written_pipes;
+        written_pipes = 0;
         const size_t hdr = new_vertex(CompletionVertex{});
         edges.emplace_back(cur, hdr);
         local_tokens.clear();
         const size_t body_exit = build(loop->body_, hdr);
         edges.emplace_back(body_exit, hdr);
+        const PipeMask loop_written = written_pipes;
         local_tokens = saved_tokens;
+        for (auto& [tok, tok_mask] : local_tokens) tok_mask &= ~loop_written;
+        written_pipes = outer_written | loop_written;
         return hdr;
       }
       if (const auto loop = As<WhileStmt>(stmt)) {
         const auto saved_tokens = local_tokens;
+        const PipeMask outer_written = written_pipes;
+        written_pipes = 0;
         const size_t hdr = new_vertex(CompletionVertex{});
         edges.emplace_back(cur, hdr);
         local_tokens.clear();
         const size_t body_exit = build(loop->body_, hdr);
         edges.emplace_back(body_exit, hdr);
+        const PipeMask loop_written = written_pipes;
         local_tokens = saved_tokens;
+        for (auto& [tok, tok_mask] : local_tokens) tok_mask &= ~loop_written;
+        written_pipes = outer_written | loop_written;
         return hdr;
       }
       if (const auto assign = As<AssignStmt>(stmt)) {
-        if (const auto call = As<Call>(assign->value_); call && IsOp(call, "sync.record")) {
-          if (const auto pipe = find_pipe_attr(call, "pipe")) {
-            local_tokens[assign->var_.get()] = *pipe;
+        if (As<SyncTokenType>(assign->var_->GetType())) {
+          if (const auto rhs = AsVarLike(assign->value_)) {
+            const auto found = local_tokens.find(rhs.get());
+            local_tokens[assign->var_.get()] = found == local_tokens.end() ? 0 : found->second;
+          } else if (const auto call = As<Call>(assign->value_)) {
+            if (IsOp(call, "sync.record")) {
+              if (const auto pipe = find_pipe_arg(call, "pipe")) {
+                local_tokens[assign->var_.get()] = PipeToMask(*pipe);
+              }
+            } else if (IsOp(call, "sync.completed")) {
+              local_tokens[assign->var_.get()] = 0;
+            } else if (IsOp(call, "sync.join")) {
+              PipeMask mask = 0;
+              bool all_known = !call->args_.empty();
+              for (const auto& arg : call->args_) {
+                const auto v = AsVarLike(arg);
+                const auto found = v ? local_tokens.find(v.get()) : local_tokens.end();
+                if (found == local_tokens.end()) {
+                  all_known = false;
+                  break;
+                }
+                mask |= found->second;
+              }
+              local_tokens[assign->var_.get()] = all_known ? mask : 0;
+            } else {
+              local_tokens.erase(assign->var_.get());
+            }
+          } else {
+            local_tokens.erase(assign->var_.get());
           }
+          return cur;
         }
-        return cur;
+        return emit_payload(As<Call>(assign->value_), cur);
       }
       if (const auto eval = As<EvalStmt>(stmt)) {
         if (const auto call = As<Call>(eval->expr_)) {
           if (IsOp(call, "sync.wait") && !call->args_.empty()) {
-            if (const auto found = local_tokens.find(call->args_[0].get()); found != local_tokens.end()) {
-              if (const auto dst = find_pipe_attr(call, "dst_pipe")) {
+            const auto v = AsVarLike(call->args_[0]);
+            if (const auto found = v ? local_tokens.find(v.get()) : local_tokens.end();
+                found != local_tokens.end() && found->second != 0) {
+              if (const auto dst = find_pipe_arg(call, "dst_pipe")) {
                 CompletionVertex sync_v;
-                sync_v.pre_syncs.push_back(CompletionSyncEdge{found->second, *dst, /*bidirectional=*/false});
-                const size_t v = new_vertex(std::move(sync_v));
-                edges.emplace_back(cur, v);
-                return v;
+                for (size_t p = 0; p < kPhysicalPipeCount; ++p) {
+                  if ((found->second & (PipeMask{1} << p)) != 0) {
+                    sync_v.pre_syncs.push_back(
+                        CompletionSyncEdge{static_cast<PipeType>(p), *dst, /*bidirectional=*/false});
+                  }
+                }
+                const size_t node = new_vertex(std::move(sync_v));
+                edges.emplace_back(cur, node);
+                return node;
               }
             }
             return cur;
           }
-          if (!IsOp(call, "sync.completed") && !IsOp(call, "sync.record") &&
-              !backend::QualifyBufferSyncNonPayload(call, target_)) {
-            const auto op = backend::QualifyBufferSyncOperation(call, function_->func_type_, target_);
-            const PipeMask mask = PipeToMask(op.Implementation().Pipe());
-            if (mask != 0) {
-              CompletionVertex op_v;
-              op_v.write_pipes = mask;
-              const size_t v = new_vertex(std::move(op_v));
-              edges.emplace_back(cur, v);
-              return v;
-            }
-          }
+          return emit_payload(call, cur);
         }
       }
       return cur;
@@ -599,6 +692,12 @@ class Builder {
     const size_t exit_v = new_vertex(CompletionVertex{});
     edges.emplace_back(tail, exit_v);
     auto summary = SolveCompletionTransfer(vertices, edges, entry_v, exit_v).summary;
+    const PipeMask added_active = base.active & ~summary.active;
+    for (size_t p = 0; p < kPhysicalPipeCount; ++p) {
+      if ((added_active & (PipeMask{1} << p)) != 0) {
+        summary.post_write_safe[p] = PipeMask{1} << p;
+      }
+    }
     summary.active |= base.active;
     return summary;
   }
@@ -606,11 +705,9 @@ class Builder {
   void Build() {
     Read(function_->body_);
     RefineStorage();
-    RebuildGenerated(function_->body_);
     for (auto& child : children) {
-      const auto found = generated_.find(child.scope.get());
-      CHECK(found != generated_.end()) << "Retained child is outside the original semantic input";
-      child.effects = found->second;
+      CHECK(seen_children_.count(child.scope.get()) != 0) << "Retained child is outside the original semantic input";
+      CollectChildEffects(child.scope, child.effects);
       child.completion = ComputeEventfulCompletionSummary(child);
     }
   }
@@ -751,8 +848,16 @@ class Builder {
     live_in.assign(n, LiveStorageState{});
     live_out.assign(n, LiveStorageState{});
     std::vector<bool> visited(n, false);
-    std::deque<size_t> queue;
+    std::priority_queue<std::pair<size_t, size_t>, std::vector<std::pair<size_t, size_t>>,
+                        std::greater<std::pair<size_t, size_t>>>
+        worklist;
     std::vector<bool> in_queue(n, false);
+    auto push_vertex = [&](size_t v) {
+      if (!in_queue[v]) {
+        worklist.emplace(rpo_pos[v], v);
+        in_queue[v] = true;
+      }
+    };
 
     auto eval = [&](size_t u) {
       LiveStorageState in_u;
@@ -767,12 +872,7 @@ class Builder {
       visited[u] = true;
       live_out[u] = out_u;
       if (out_changed) {
-        for (const size_t v : cfg[u].succs) {
-          if (!in_queue[v]) {
-            queue.push_back(v);
-            in_queue[v] = true;
-          }
-        }
+        for (const size_t v : cfg[u].succs) push_vertex(v);
       }
     };
 
@@ -782,15 +882,12 @@ class Builder {
     }
     for (const size_t u : rpo) {
       for (const size_t v : cfg[u].succs) {
-        if (rpo_pos[v] <= rpo_pos[u] && !in_queue[v]) {
-          queue.push_back(v);
-          in_queue[v] = true;
-        }
+        if (rpo_pos[v] <= rpo_pos[u]) push_vertex(v);
       }
     }
-    while (!queue.empty()) {
-      const size_t u = queue.front();
-      queue.pop_front();
+    while (!worklist.empty()) {
+      const size_t u = worklist.top().second;
+      worklist.pop();
       in_queue[u] = false;
       eval(u);
     }
@@ -835,6 +932,18 @@ class Builder {
         entry.required_services = entry.services;
         cost.baseline_services += services.size();
         cost.services += services.size();
+        std::array<PipeMask, kPhysicalPipeCount> matrix{};
+        for (const auto& [src, dst] : entry.services) {
+          const PipeMask sm = PipeToMask(src);
+          const PipeMask dm = PipeToMask(dst);
+          if (sm == 0 || dm == 0) continue;
+          for (size_t p = 0; p < kPhysicalPipeCount; ++p) {
+            const PipeMask p_bit = PipeMask{1} << p;
+            if (((p_bit | matrix[p]) & sm) != 0) matrix[p] |= dm;
+          }
+        }
+        if (child_service_matrices_.size() <= v.index) child_service_matrices_.resize(v.index + 1);
+        child_service_matrices_[v.index] = matrix;
         continue;
       }
       if (v.kind == CfgVertex::Kind::Site) {
@@ -865,14 +974,16 @@ class Builder {
   DebtState TransferDebt(const CfgVertex& vertex, DebtState state, bool use_selected) const {
     if (vertex.kind == CfgVertex::Kind::Child) {
       const auto& entry = children[vertex.index];
-      for (const auto& [src, dst] : entry.services) state.DeliverService(src, dst);
+      state.ApplyServiceMatrix(child_service_matrices_[vertex.index]);
       state.ApplySummary(entry.completion);
       state.AddEffects(entry.effects, &entry.completion);
     } else if (vertex.kind == CfgVertex::Kind::Site) {
       const auto& site = sites[vertex.index];
       const auto destination = site.operation.Implementation().Pipe();
       const auto& pipes = use_selected ? site.source_pipes : site.required_source_pipes;
-      for (const auto source : pipes) state.DeliverService(source, destination);
+      PipeMask sources_mask = 0;
+      for (const auto source : pipes) sources_mask |= PipeToMask(source);
+      state.DeliverSources(sources_mask, destination);
       if (enable_refresh_kill_) {
         for (const auto& [space, domain] : site.refreshed_domains) state.KillDomain(space, domain);
       }
@@ -881,59 +992,77 @@ class Builder {
     return state;
   }
 
-  void SolveDebtFixedPoint(bool use_selected, const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo,
-                           const std::vector<size_t>& rpo_pos, std::vector<DebtState>& debt_in,
-                           std::vector<DebtState>& debt_out) const {
+  void RunDebtWorklist(bool use_selected, const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo_pos,
+                       std::vector<size_t> initial_dirty, std::vector<DebtState>& debt_in,
+                       std::vector<DebtState>& debt_out, std::vector<bool>& visited) const {
     const size_t n = cfg.size();
-    debt_in.assign(n, DebtState{});
-    debt_out.assign(n, DebtState{});
-    std::vector<bool> visited(n, false);
-    std::deque<size_t> queue;
+    std::priority_queue<std::pair<size_t, size_t>, std::vector<std::pair<size_t, size_t>>,
+                        std::greater<std::pair<size_t, size_t>>>
+        worklist;
     std::vector<bool> in_queue(n, false);
-
-    auto eval = [&](size_t u) {
+    for (const size_t u : initial_dirty) {
+      if (!in_queue[u]) {
+        worklist.emplace(rpo_pos[u], u);
+        in_queue[u] = true;
+      }
+    }
+    while (!worklist.empty()) {
+      const size_t u = worklist.top().second;
+      worklist.pop();
+      in_queue[u] = false;
       DebtState in_u;
       for (const size_t p : cfg[u].preds) {
         if (visited[p]) in_u.MergeFrom(debt_out[p]);
       }
-      if (visited[u] && !(in_u != debt_in[u])) return;
-      debt_in[u] = in_u;
-      const DebtState out_u = TransferDebt(cfg[u], std::move(in_u), use_selected);
+      const DebtState out_u = TransferDebt(cfg[u], in_u, use_selected);
+      const bool in_changed = !visited[u] || (in_u != debt_in[u]);
       const bool out_changed = !visited[u] || (out_u != debt_out[u]);
+      if (!in_changed && !out_changed) continue;
       visited[u] = true;
-      debt_out[u] = out_u;
+      debt_in[u] = std::move(in_u);
+      debt_out[u] = std::move(out_u);
       if (out_changed) {
         for (const size_t v : cfg[u].succs) {
           if (!in_queue[v]) {
-            queue.push_back(v);
+            worklist.emplace(rpo_pos[v], v);
             in_queue[v] = true;
           }
         }
       }
-    };
+    }
+  }
 
-    for (const size_t u : rpo) eval(u);
+  void SolveDebtFixedPoint(bool use_selected, const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo,
+                           const std::vector<size_t>& rpo_pos, std::vector<DebtState>& debt_in,
+                           std::vector<DebtState>& debt_out, std::vector<bool>& visited) const {
+    const size_t n = cfg.size();
+    debt_in.assign(n, DebtState{});
+    debt_out.assign(n, DebtState{});
+    visited.assign(n, false);
+
+    std::vector<size_t> back_targets;
     for (const size_t u : rpo) {
+      DebtState in_u;
+      for (const size_t p : cfg[u].preds) {
+        if (visited[p]) in_u.MergeFrom(debt_out[p]);
+      }
+      debt_in[u] = in_u;
+      const DebtState out_u = TransferDebt(cfg[u], std::move(in_u), use_selected);
+      visited[u] = true;
+      debt_out[u] = out_u;
       for (const size_t v : cfg[u].succs) {
-        if (rpo_pos[v] <= rpo_pos[u] && !in_queue[v]) {
-          queue.push_back(v);
-          in_queue[v] = true;
-        }
+        if (rpo_pos[v] <= rpo_pos[u]) back_targets.push_back(v);
       }
     }
-    while (!queue.empty()) {
-      const size_t u = queue.front();
-      queue.pop_front();
-      in_queue[u] = false;
-      eval(u);
-    }
+    RunDebtWorklist(use_selected, cfg, rpo_pos, std::move(back_targets), debt_in, debt_out, visited);
   }
 
   void SelectAndCertifyDebts(const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo,
                              const std::vector<size_t>& rpo_pos, size_t entry) {
     (void)entry;
     std::vector<DebtState> base_in, base_out;
-    SolveDebtFixedPoint(/*use_selected=*/false, cfg, rpo, rpo_pos, base_in, base_out);
+    std::vector<bool> base_visited;
+    SolveDebtFixedPoint(/*use_selected=*/false, cfg, rpo, rpo_pos, base_in, base_out, base_visited);
 
     // Greedy forward RPO selection, pulling back-edge baselines so loop-carried
     // demands are visible at loop headers prior to certification.
@@ -953,65 +1082,74 @@ class Builder {
       rpo_done[u] = true;
     }
 
-    // Closed-loop certification + monotone restoration until full CFG fixed point holds.
+    // Closed-loop certification + incremental monotone restoration until full CFG fixed point holds.
+    std::vector<DebtState> sel_in, sel_out;
+    std::vector<bool> sel_visited;
+    SolveDebtFixedPoint(/*use_selected=*/true, cfg, rpo, rpo_pos, sel_in, sel_out, sel_visited);
+    std::vector<size_t> dirty = rpo;
     for (;;) {
-      std::vector<DebtState> sel_in, sel_out;
-      SolveDebtFixedPoint(/*use_selected=*/true, cfg, rpo, rpo_pos, sel_in, sel_out);
-      bool restored = false;
-      for (const size_t u : rpo) {
+      std::vector<size_t> changed_vertices;
+      for (const size_t u : dirty) {
         if (cfg[u].kind != CfgVertex::Kind::Site) continue;
         auto& site = sites[cfg[u].index];
         const auto destination = site.operation.Implementation().Pipe();
         DebtState after_services = sel_in[u];
-        for (const auto source : site.source_pipes) after_services.DeliverService(source, destination);
+        PipeMask sources_mask = 0;
+        for (const auto source : site.source_pipes) sources_mask |= PipeToMask(source);
+        after_services.DeliverSources(sources_mask, destination);
         std::vector<PipeType> missing;
         for (const auto req : site.required_source_pipes) {
           if (!after_services.CoversConflicts(req, destination, site.effects)) missing.push_back(req);
         }
         if (!missing.empty()) {
-          restored = true;
           std::set<PipeType> unioned(site.source_pipes.begin(), site.source_pipes.end());
           unioned.insert(missing.begin(), missing.end());
           site.source_pipes.clear();
           for (const auto req : site.required_source_pipes) {
             if (unioned.count(req)) site.source_pipes.push_back(req);
           }
+          changed_vertices.push_back(u);
         }
       }
-      if (!restored) {
-        for (const size_t u : rpo) {
-          ++cost.certificate_visits;
-          if (cfg[u].kind == CfgVertex::Kind::Child) {
-            const auto& entry_child = children[cfg[u].index];
-            INTERNAL_CHECK(entry_child.services == entry_child.required_services)
-                << "Internal error: protected child/rearming services changed";
-          } else if (cfg[u].kind == CfgVertex::Kind::Site) {
-            const auto& selected = sites[cfg[u].index];
-            size_t next = 0;
-            const auto destination = selected.operation.Implementation().Pipe();
-            DebtState known = sel_in[u];
-            for (const auto source : selected.required_source_pipes) {
-              if (next < selected.source_pipes.size() && selected.source_pipes[next] == source) {
-                known.DeliverService(source, destination);
-                ++next;
-              }
+      if (!changed_vertices.empty()) {
+        RunDebtWorklist(/*use_selected=*/true, cfg, rpo_pos, changed_vertices, sel_in, sel_out, sel_visited);
+        dirty = rpo;
+        continue;
+      }
+      for (const size_t u : rpo) {
+        ++cost.certificate_visits;
+        if (cfg[u].kind == CfgVertex::Kind::Child) {
+          const auto& entry_child = children[cfg[u].index];
+          INTERNAL_CHECK(entry_child.services == entry_child.required_services)
+              << "Internal error: protected child/rearming services changed";
+        } else if (cfg[u].kind == CfgVertex::Kind::Site) {
+          const auto& selected = sites[cfg[u].index];
+          size_t next = 0;
+          const auto destination = selected.operation.Implementation().Pipe();
+          DebtState known = sel_in[u];
+          PipeMask sources_mask = 0;
+          for (const auto source : selected.required_source_pipes) {
+            if (next < selected.source_pipes.size() && selected.source_pipes[next] == source) {
+              sources_mask |= PipeToMask(source);
+              ++next;
             }
-            INTERNAL_CHECK(next == selected.source_pipes.size())
-                << "Internal error: conservative service selection added or reordered a service";
-            for (const auto source : selected.required_source_pipes) {
-              INTERNAL_CHECK(known.CoversConflicts(source, destination, selected.effects))
-                  << "Internal error: conservative service selection omits a payload prerequisite";
-            }
-            const size_t omitted = selected.required_source_pipes.size() - selected.source_pipes.size();
-            cost.certificate_omissions += omitted;
-            cost.suppressed_services += omitted;
-            cost.services += selected.source_pipes.size();
           }
+          known.DeliverSources(sources_mask, destination);
+          INTERNAL_CHECK(next == selected.source_pipes.size())
+              << "Internal error: conservative service selection added or reordered a service";
+          for (const auto source : selected.required_source_pipes) {
+            INTERNAL_CHECK(known.CoversConflicts(source, destination, selected.effects))
+                << "Internal error: conservative service selection omits a payload prerequisite";
+          }
+          const size_t omitted = selected.required_source_pipes.size() - selected.source_pipes.size();
+          cost.certificate_omissions += omitted;
+          cost.suppressed_services += omitted;
+          cost.services += selected.source_pipes.size();
         }
-        INTERNAL_CHECK(cost.certificate_omissions == cost.suppressed_services)
-            << "Internal error: conservative service certificate omitted a proposed deletion";
-        break;
       }
+      INTERNAL_CHECK(cost.certificate_omissions == cost.suppressed_services)
+          << "Internal error: conservative service certificate omitted a proposed deletion";
+      break;
     }
   }
 
@@ -1085,22 +1223,20 @@ class Builder {
     cost.storage_domains = domains.size();
   }
 
-  const ConservativeAccessSet& RebuildGenerated(const StmtPtr& statement) {
-    auto& summary = generated_.at(statement.get());
-    summary.clear();
+  void CollectChildEffects(const StmtPtr& statement, ConservativeAccessSet& out) const {
+    if (!statement) return;
     if (const auto site = site_index_.find(statement.get()); site != site_index_.end()) {
-      summary = sites[site->second].effects;
+      Union(out, sites[site->second].effects);
     } else if (const auto sequence = As<SeqStmts>(statement)) {
-      for (const auto& child : sequence->stmts_) Union(summary, RebuildGenerated(child));
+      for (const auto& child : sequence->stmts_) CollectChildEffects(child, out);
     } else if (const auto branch = As<IfStmt>(statement)) {
-      Union(summary, RebuildGenerated(branch->then_body_));
-      if (branch->else_body_) Union(summary, RebuildGenerated(*branch->else_body_));
+      CollectChildEffects(branch->then_body_, out);
+      if (branch->else_body_) CollectChildEffects(*branch->else_body_, out);
     } else if (const auto loop = As<ForStmt>(statement)) {
-      Union(summary, RebuildGenerated(loop->body_));
+      CollectChildEffects(loop->body_, out);
     } else if (const auto loop = As<WhileStmt>(statement)) {
-      Union(summary, RebuildGenerated(loop->body_));
+      CollectChildEffects(loop->body_, out);
     }
-    return summary;
   }
 
   void Bind(const VarPtr& variable) {
@@ -1166,7 +1302,6 @@ class Builder {
     const auto inserted = site_index_.emplace(cut.get(), sites.size()).second;
     CHECK_SPAN(inserted, cut->span_)
         << "Conservative synchronization: shared statement identity has ambiguous insertion cuts";
-    generated_[cut.get()] = effects;
     sites.push_back({cut, std::move(operation), std::move(effects), {}, {}, {}, {}});
     inside_child_.push_back(native_child_depth_ != 0);
     // The ordinary service protects the scalar instruction's storage read.
@@ -1176,15 +1311,14 @@ class Builder {
   }
 
   End Read(const StmtPtr& statement) {
+    if (child_index_.count(statement.get())) seen_children_.insert(statement.get());
     ++cost.statements;
-    generated_.try_emplace(statement.get());
     if (const auto seq = As<SeqStmts>(statement)) {
       End end;
       for (const auto& child : seq->stmts_) {
         CHECK_SPAN(!end.Terminal(), child->span_)
             << "Conservative synchronization: statements after a terminal cut are unavailable";
         end = Read(child);
-        Union(generated_.at(statement.get()), generated_.at(child.get()));
       }
       return end;
     }
@@ -1217,7 +1351,6 @@ class Builder {
         scopes_.emplace_back();
         else_end = Read(*branch->else_body_);
         PopScope();
-        Union(generated_.at(statement.get()), generated_.at(branch->else_body_->get()));
       }
       --control_depth_;
       CHECK_SPAN(!then_end.returned && !else_end.returned, statement->span_)
@@ -1226,7 +1359,6 @@ class Builder {
       CHECK_SPAN(then_end.yield.value_or(0) == count && else_end.yield.value_or(0) == count, statement->span_)
           << "Conservative synchronization: branch result/yield arity mismatch";
       for (const auto& variable : branch->return_vars_) Bind(variable);
-      Union(generated_.at(statement.get()), generated_.at(branch->then_body_.get()));
       return {};
     }
     if (const auto loop = As<ForStmt>(statement)) {
@@ -1279,7 +1411,6 @@ class Builder {
         << "Conservative synchronization: loop backedge lacks matching ready yields";
     PopScope();
     for (const auto& result : results) Bind(result);
-    Union(generated_.at(loop.get()), generated_.at(body.get()));
   }
 
   FunctionPtr function_;
@@ -1294,7 +1425,8 @@ class Builder {
   size_t native_child_depth_ = 0;
   std::vector<bool> inside_child_;
   std::unordered_map<const Stmt*, size_t> child_index_;
-  std::unordered_map<const Stmt*, ConservativeAccessSet> generated_;
+  std::unordered_set<const Stmt*> seen_children_;
+  std::vector<std::array<PipeMask, kPhysicalPipeCount>> child_service_matrices_;
   std::unordered_map<const Stmt*, size_t> site_index_;
 };
 }  // namespace

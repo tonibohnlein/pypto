@@ -748,3 +748,241 @@ def test_opaque_shape_readiness_requires_original_physical_abi_identity(kind):
         with pytest.raises(ValueError, match="unavailable enclosing coordinate|ND descriptor"):
             passes.prepare_eventful_sync_children(original, [scope])
     assert ir.serialize(original) == before
+
+
+def test_eventful_child_preserves_preexisting_debt_across_partial_completion():
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+    vec_t = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    gm_t = ir.TensorType([2, 8], ir.DataType.FP32)
+    src = ir.Var("src", gm_t, span)
+    out = ir.Var("out", gm_t, span)
+    flag = ir.Var("flag", ir.ScalarType(ir.DataType.BOOL), span)
+    x = ir.Var("x", vec_t, span)
+    y = ir.Var("y", vec_t, span)
+    k = ir.Var("k", ir.ScalarType(idx), span)
+
+    def ci(val):
+        return ir.ConstInt(val, idx, span)
+
+    def tup(vals):
+        return ir.MakeTuple([ci(v) for v in vals], span)
+
+    child = ir.ForStmt(
+        k,
+        ci(0),
+        ci(2),
+        ci(1),
+        [],
+        ir.SeqStmts(
+            [
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [x, y], ir.VoidType(), span), span),
+                ir.YieldStmt([], span),
+            ],
+            span,
+        ),
+        [],
+        span,
+    )
+    fn = ir.Function(
+        "partial_child_debt",
+        [src, (out, ir.ParamDirection.InOut), flag],
+        [out.type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(x, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(0)], vec_t, span), span),
+                ir.AssignStmt(y, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(128)], vec_t, span), span),
+                # Prior MTE2 write on y (must remain live for MTE3 store even across child).
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), y], ir.VoidType(), span), span),
+                ir.IfStmt(flag, child, None, [], span),
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.store"), [y, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span), span),
+                ir.ReturnStmt([out], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with passes.PassContext([]):
+        ev = passes.prepare_eventful_sync_children(fn, [child])[0]
+    program = ir.Program([fn], "PartialChildDebt", span)
+    with passes.PassContext([], autosync_policy="conservative_prefix"):
+        logical = passes.insert_sync(eventful_children=[ev])(program)
+        optimized = passes.optimize_sync()(logical)
+    with passes.PassContext([]):
+        physical = passes.lower_sync()(optimized)
+    log_fn = next(iter(optimized.functions.values()))
+    phys_fn = next(iter(physical.functions.values()))
+    for cond in (False, True):
+        check_closed_commands(
+            log_fn,
+            phys_fn,
+            {2: cond},
+            range(6),
+            tensor_bases={0: 0, 1: 1 << 20},
+            compare_commands=False,
+            hardware_source=fn,
+        )
+
+
+def test_eventful_child_does_not_claim_post_record_write_complete():
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+    vec_t = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    gm_t = ir.TensorType([2, 8], ir.DataType.FP32)
+    src = ir.Var("src", gm_t, span)
+    out = ir.Var("out", gm_t, span)
+    a = ir.Var("a", vec_t, span)
+    b = ir.Var("b", vec_t, span)
+    c = ir.Var("c", vec_t, span)
+    z = ir.Var("z", vec_t, span)
+    k = ir.Var("k", ir.ScalarType(idx), span)
+
+    def ci(val):
+        return ir.ConstInt(val, idx, span)
+
+    def tup(vals):
+        return ir.MakeTuple([ci(v) for v in vals], span)
+
+    # Inside child: load(a) -> record(MTE2); load(c) on MTE2 AFTER record;
+    # wait(MTE2 -> V) on a's earlier record; abs(a, b) on V.
+    # Because load(c) executed after a's sync.record(MTE2), exiting child does
+    # NOT guarantee post_write_safe[MTE2] covers V for parent's subsequent abs(c, z).
+    child = ir.ForStmt(
+        k,
+        ci(0),
+        ci(1),
+        ci(1),
+        [],
+        ir.SeqStmts(
+            [
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), a], ir.VoidType(), span), span),
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), c], ir.VoidType(), span), span),
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [a, b], ir.VoidType(), span), span),
+                ir.YieldStmt([], span),
+            ],
+            span,
+        ),
+        [],
+        span,
+    )
+    fn = ir.Function(
+        "post_record_write_child",
+        [src, (out, ir.ParamDirection.InOut)],
+        [out.type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(a, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(0)], vec_t, span), span),
+                ir.AssignStmt(b, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(128)], vec_t, span), span),
+                ir.AssignStmt(c, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(256)], vec_t, span), span),
+                ir.AssignStmt(z, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(384)], vec_t, span), span),
+                child,
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [c, z], ir.VoidType(), span), span),
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.store"), [z, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span), span),
+                ir.ReturnStmt([out], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with passes.PassContext([]):
+        ev = passes.prepare_eventful_sync_children(fn, [child])[0]
+    program = ir.Program([fn], "PostRecordWriteChild", span)
+    with passes.PassContext([], autosync_policy="conservative_prefix"):
+        logical = passes.insert_sync(eventful_children=[ev])(program)
+        optimized = passes.optimize_sync()(logical)
+    with passes.PassContext([]):
+        physical = passes.lower_sync()(optimized)
+    phys_fn = next(iter(physical.functions.values()))
+    check_closed_commands(
+        next(iter(optimized.functions.values())),
+        phys_fn,
+        {},
+        range(4),
+        tensor_bases={0: 0, 1: 1 << 20},
+        compare_commands=False,
+        hardware_source=fn,
+    )
+
+
+def test_eventful_child_preserves_unrelated_self_pipe_debt():
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+    vec_t = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    gm_t = ir.TensorType([2, 8], ir.DataType.FP32)
+    src = ir.Var("src", gm_t, span)
+    out = ir.Var("out", gm_t, span)
+    a = ir.Var("a", vec_t, span)
+    x = ir.Var("x", vec_t, span)
+    y = ir.Var("y", vec_t, span)
+    z = ir.Var("z", vec_t, span)
+    k = ir.Var("k", ir.ScalarType(idx), span)
+
+    def ci(val):
+        return ir.ConstInt(val, idx, span)
+
+    def tup(vals):
+        return ir.MakeTuple([ci(v) for v in vals], span)
+
+    child = ir.ForStmt(
+        k,
+        ci(0),
+        ci(1),
+        ci(1),
+        [],
+        ir.SeqStmts(
+            [
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+                ir.YieldStmt([], span),
+            ],
+            span,
+        ),
+        [],
+        span,
+    )
+    fn = ir.Function(
+        "self_pipe_debt_across_child",
+        [src, (out, ir.ParamDirection.InOut)],
+        [out.type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(a, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(0)], vec_t, span), span),
+                ir.AssignStmt(x, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(128)], vec_t, span), span),
+                ir.AssignStmt(y, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(256)], vec_t, span), span),
+                ir.AssignStmt(z, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(384)], vec_t, span), span),
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), a], ir.VoidType(), span), span),
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [a, y], ir.VoidType(), span), span),
+                child,
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [y, z], ir.VoidType(), span), span),
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.store"), [z, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span), span),
+                ir.ReturnStmt([out], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with passes.PassContext([]):
+        ev = passes.prepare_eventful_sync_children(fn, [child])[0]
+    program = ir.Program([fn], "SelfPipeDebtAcrossChild", span)
+    with passes.PassContext([], autosync_policy="conservative_prefix"):
+        logical = passes.insert_sync(eventful_children=[ev])(program)
+        optimized = passes.optimize_sync()(logical)
+    with passes.PassContext([]):
+        physical = passes.lower_sync()(optimized)
+    phys_fn = next(iter(physical.functions.values()))
+    check_closed_commands(
+        next(iter(optimized.functions.values())),
+        phys_fn,
+        {},
+        range(4),
+        tensor_bases={0: 0, 1: 1 << 20},
+        compare_commands=False,
+        hardware_source=fn,
+    )
+    assert "pl.system.barrier(pipe=pl.PipeType.V" in str(phys_fn)
