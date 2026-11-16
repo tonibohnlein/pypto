@@ -150,3 +150,11 @@ timeout 120s python -m transforms.qualify_qwen_point_planner \
 Buffer-codegen 保留不支持几何的负例并更新诊断；已支持 packed singleton-column 改为正向发射检查。随各里程碑结束，续篇收据记录命令、源码/工具及最终评审。
 
 P1 独立源码评审已接受所有权、正确性和成本边界。最终回归通过187个不同用例（组合186项及 workspace 重跑新增的原根 offset 负例），包含真实 PTOAS。命令和源码哈希见英文[续篇收据](../../../en/dev/ir/52-autosync-regional-repair.json)。
+
+### P2 契约检查点
+
+生产比较独立选择分析策略、别名承诺与标量实现。qualifier 默认 may-alias 和原标量；disjoint 必须提供非空调用契约工件并记录原字节哈希与来源。这只是显式输入假设，不是指针名字证明；同根 views、局部物理重叠及未知来源保持现有处理。
+
+源码确认共享 `SelectBufferSyncImplementation` 仅将 `buffer.read/write` 限定为 A2/A3 AIV Vec 的 TGETVAL/TSETVAL，直接 Buffer codegen 使用相同注册配方与载荷切点。它不限定 cacheable GM 标量。旧 qkpv_plan 的原标量 C++ 含指针及 cache/exit 操作，但不能证明跨管线可见性和数据加载就绪。缺少这些契约或 Buffer admission 时继续委托；显式 DMA 独立报告 carrier 效应和成本。S→S 与累加器原生顺序规则保留。
+
+P5 对两个策略同样显式使用 `--gm-alias-policy disjoint --gm-contract <caller-contract>`，或默认 may-alias。比较 PTOAS 不能证明调用承诺；不删除全部 GM 效应，也不改变默认 ABI。

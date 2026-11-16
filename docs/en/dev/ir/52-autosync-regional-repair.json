@@ -41,11 +41,28 @@
         "pyright": "p1-pyright-final.log: passed",
         "docs_receipt": "p1-receipt-hooks.log: passed"
       }
+    },
+    "P2": {
+      "implementation": "accepted",
+      "tests": {
+        "command": "timeout 120s python3.14 -m pytest tests/ut/ir/transforms/test_autosync_inventory.py tests/ut/ir/transforms/test_autosync_policy.py tests/ut/ir/transforms/test_conservative_sync_storage.py tests/ut/ir/transforms/test_sync_scalar_payload.py -q --require-ptoas",
+        "result": "112 passed in 1.40s",
+        "log": "build-py314/regional-repair/p2-tests.log"
+      },
+      "source_sha256": {
+        "tests/ut/ir/transforms/qualify_qwen_whole_model.py": "229cc1c30a933673e5eff3be888523a8c358c65f435c419caac86db96f974ed7",
+        "tests/ut/ir/transforms/test_autosync_inventory.py": "c0fbf8b5e503a4f1652a7d968a85227d21694326f3a33e6293cf98d276adb4f0",
+        "src/backend/common/buffer_sync_contract.cpp": "20a5eecae4c148ed275e8f59ce04afe4f9c26065bedbe5f20d485019177e3498",
+        "src/codegen/pto/pto_buffer_codegen.cpp": "c6d5fd74ae3006a2b8ee34126916606f777a3d2b5ded900cc864395c51be4101"
+      },
+      "native_scalar": "Shared local Vec recipe qualified; cacheable GM scalar readiness/visibility not established, ownership continues to refuse where unavailable. Explicit staging is separate.",
+      "alias": "Explicit caller artifact required for disjoint campaign; no proof from SSA names.",
+      "review": "repair_reviewer: architecture/correctness/cost accepted; 112 tests and all hooks pass",
+      "hooks": "build-py314/regional-repair/p2-hooks.log"
     }
   },
   "device_validation": false,
   "remaining_milestones": [
-    "P2",
     "P3",
     "P4",
     "P5"

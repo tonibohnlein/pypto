@@ -192,3 +192,11 @@ Ungrouped codegen now binds the exact emitted peer inventory using existing inde
 The Buffer-codegen gate retains unsupported-geometry negatives with current diagnostics and positively emits the supported packed singleton-column parameter. Detailed commands, source/tool identities and final review outcomes are recorded in the continuation receipt as milestones finish.
 
 P1 independent source review accepted the ownership, correctness and cost boundaries. The final focused runs pass 187 distinct cases (186 in the combined gate, plus the added original-root offset regression in the 12-case workspace rerun), including real PTOAS generation. The [continuation receipt](52-autosync-regional-repair.json) records commands and source hashes.
+
+### P2 contract checkpoint
+
+The production comparison must independently select analysis policy, alias promise and scalar implementation. The qualifier's default is may-alias with original scalar operations. A disjoint campaign requires a nonempty caller-contract artifact; its exact bytes/hash and provenance are recorded. This supplies an assumption to analysis, without proving it from pointer names. Same-root views, physical local overlap and unsupported roots keep their existing treatment.
+
+The source audit confirms `SelectBufferSyncImplementation` qualifies `buffer.read/write` only as A2/A3 AIV local Vec TGETVAL/TSETVAL. Direct Buffer codegen uses that same registered recipe and payload cut. This does not qualify cacheable GM scalar accesses. The earlier original-scalar qkpv_plan C++ contains scalar pointer accesses and cache/exit operations, but that observation establishes neither cross-pipe visibility nor data-loaded readiness. Native scalar ownership remains refused where those contracts or Buffer admission are unavailable. Explicit DMA remains a separate implementation, with its carrier effects and costs. Existing S→S and accumulator native-order rules are preserved.
+
+For the P5 comparison, supply `--gm-alias-policy disjoint --gm-contract <caller-contract>` to either analysis policy, or use the default may-alias campaign. The former is conditional on the recorded caller promise; comparing to PTOAS does not establish that promise. No broad GM-effect deletion or default ABI change is included.
