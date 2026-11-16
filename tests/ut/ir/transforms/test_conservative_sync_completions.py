@@ -236,3 +236,90 @@ def test_public_lowering_preserves_three_pipe_wait_record_forwarding(optimize):
     assert expected.payloads == actual.payloads
     assert expected.trace == actual.trace
     assert not actual.live and all(pair in after for pair in actual.reuses)
+
+
+def branch_completion_fixture(kind):
+    """Distinct original payload nodes make equal per-arm issue counts adversarial."""
+    original = scalar_payload_fixture()
+    assert isinstance(original.body, ir.SeqStmts)
+    span = original.span
+    definition, load = original.body.stmts[:2]
+    assert isinstance(definition, ir.AssignStmt)
+    assert isinstance(load, ir.EvalStmt) and isinstance(load.expr, ir.Call)
+    load_arguments = list(load.expr.args)
+    local = definition.var
+    index = ir.DataType.INDEX
+    point = ir.MakeTuple([ir.ConstInt(0, index, span)] * 2, span)
+
+    def payload(name, args):
+        return ir.EvalStmt(ir.Call(ir.get_op(name), args, ir.VoidType(), span), span)
+
+    def write():
+        return payload("buffer.write", [local, point, ir.ConstFloat(1.0, ir.DataType.FP32, span)])
+
+    def read(name):
+        value = ir.Var(name, ir.ScalarType(ir.DataType.FP32), span)
+        return ir.AssignStmt(value, ir.Call(ir.get_op("buffer.read"), [local, point], value.type, span), span)
+
+    def reload():
+        return payload("buffer.load", load_arguments)
+
+    def sequence(*statements):
+        return ir.SeqStmts(list(statements), span)
+
+    condition = ir.Gt(original.params[2], ir.ConstInt(0, index, span), ir.DataType.BOOL, span)
+    harmless = ir.AssignStmt(
+        ir.Var("unrelated", ir.ScalarType(index), span), ir.ConstInt(7, index, span), span
+    )
+    prefix = [definition, load, write()]
+    final = write()
+    alternate = None
+    if kind == "unrelated":
+        arm = harmless
+    elif kind == "nested":
+        arm = ir.IfStmt(condition, harmless, None, [], span)
+    elif kind == "new_write":
+        arm = reload()
+    elif kind == "new_read":
+        # The reload acknowledges the first S read. A later pure S read must
+        # invalidate that completion before another MTE2 overwrite (WAR).
+        prefix = [definition, load, read("first_read"), reload()]
+        arm, final = read("branch_read"), reload()
+    elif kind == "both_complete":
+        arm = sequence(reload(), write())
+        alternate = sequence(reload(), write())
+    elif kind == "equal_count_one_complete":
+        arm = sequence(reload(), write())
+        alternate = reload()
+    else:
+        raise AssertionError(kind)
+    branch = ir.IfStmt(condition, arm, alternate, [], span)
+    body = sequence(*prefix, branch, final, *original.body.stmts[-2:])
+    return clone(original, body=body), final
+
+
+@pytest.mark.parametrize(
+    "kind,source,required",
+    [
+        ("unrelated", ir.PipeType.MTE2, False),
+        ("nested", ir.PipeType.MTE2, False),
+        ("new_write", ir.PipeType.MTE2, True),
+        ("new_read", ir.PipeType.S, True),
+        ("both_complete", ir.PipeType.MTE2, False),
+        ("equal_count_one_complete", ir.PipeType.MTE2, True),
+    ],
+)
+def test_branch_must_completion_uses_current_prefix_on_every_path(kind, source, required):
+    original, final = branch_completion_fixture(kind)
+    result = programs(original, True)
+    site = next(site for site in result[0]["sites"] if site["cut"] == final)
+    assert source in site["required_source_pipes"]
+    assert (source in site["source_pipes"]) == required
+    for choice in (0, 1):
+        # The independent interpreter replays the actual logical AND physical
+        # packets, checks every original byte conflict, and matches/reuses IDs.
+        check_execution(result, {2: choice, 3: 0}, memory={("gm", i): 7.0 for i in range(64)})
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

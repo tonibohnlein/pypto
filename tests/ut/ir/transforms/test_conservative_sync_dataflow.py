@@ -119,22 +119,36 @@ def _coverage(sites, trace, overlap):
         (ir.PipeType.V, {("vec", byte) for byte in x}, {("vec", byte) for byte in x}),
         (ir.PipeType.MTE3, {("vec", byte) for byte in x}, {("gm", byte) for byte in out}),
     ]
-    # Model current-prefix services directly: every earlier source-pipe payload
-    # completes before this consumer starts. No generated demand facts are read.
+    # Replay payload identities carried by each actual closed service. Forward
+    # WAIT imports the source publication; return WAIT imports the destination
+    # publication AFTER that acquire. The return SET alone does not complete
+    # destination payloads on their own pipe. Unlike the compiler's must matrix,
+    # these sets contain individual executed payload IDs on one concrete trace.
     ancestors = []
+    issued, imported = {}, {}
+
+    def publication(pipe):
+        completed = set(imported.get(pipe, ()))
+        for payload in issued.get(pipe, ()):
+            completed.add(payload)
+            completed.update(ancestors[payload])
+        return completed
+
     for index, label in enumerate(trace):
         pipe, reads, writes = operations[label]
         assert sites[label]["pipe"] == pipe
-        sources = set(sites[label]["source_pipes"])
-        predecessors = {previous for previous in range(index) if operations[trace[previous]][0] in sources}
-        for previous in tuple(predecessors):
-            predecessors.update(ancestors[previous])
+        for source in sites[label]["source_pipes"]:
+            imported.setdefault(pipe, set()).update(publication(source))
+            if source != pipe:
+                imported.setdefault(source, set()).update(publication(pipe))
+        predecessors = set(imported.get(pipe, ()))
         assert all(previous < index for previous in predecessors)
         for previous in range(index):
             _, prior_reads, prior_writes = operations[trace[previous]]
             if prior_writes & (reads | writes) or prior_reads & writes:
                 assert previous in predecessors, (previous, index, trace)
         ancestors.append(predecessors)
+        issued.setdefault(pipe, []).append(index)
 
 
 @pytest.mark.parametrize("kind", ["for", "while"])
