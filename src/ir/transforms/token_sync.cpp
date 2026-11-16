@@ -330,8 +330,8 @@ Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accept
             const auto& children = found == children_by_owner.end() ? no_children : found->second;
             const auto events = eventful_by_owner.find(function.get());
             const auto& eventful = events == eventful_by_owner.end() ? no_eventful : events->second;
-            function = sync::InsertConservativePrefixes(
-                sync::AnalyzeConservativeSync(function, target, children, eventful));
+            function = sync::InsertConservativePrefixes(sync::AnalyzeConservativeSync(
+                function, target, children, eventful, false, children.empty() && eventful.empty()));
             sync::CheckGeneratedLogicalSync(function);
             continue;
           }
@@ -450,10 +450,10 @@ Pass RealizeSync(bool require_whole_module) {
       // The same logical producer and actual-token consumer as the public
       // stages. Insertion preserves callers, payloads and scalar coordinates,
       // so this transaction may reuse its own freshly collected evidence.
-      const auto logical =
-          prefix ? sync::InsertConservativePrefixes(sync::AnalyzeConservativeSync(function, target))
-                 : InsertLogicalSync(BindLaunchCount(function, block_count), target, bounds, block_bounds,
-                                     block_count);
+      const auto logical = prefix ? sync::InsertConservativePrefixes(
+                                        sync::AnalyzeConservativeSync(function, target, {}, {}, false, true))
+                                  : InsertLogicalSync(BindLaunchCount(function, block_count), target, bounds,
+                                                      block_bounds, block_count);
       sync::CheckGeneratedLogicalSync(logical);
       const auto optimized = sync::OptimizeLogicalSync(logical);
       sync::CheckGeneratedLogicalSync(optimized);

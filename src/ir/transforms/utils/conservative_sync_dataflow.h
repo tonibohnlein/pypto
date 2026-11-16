@@ -130,6 +130,7 @@ class ConservativeSyncAnalysis {
   const FunctionPtr& Function() const { return function_; }
   const std::vector<ConservativeSyncSite>& Sites() const { return sites_; }
   const std::vector<ConservativeSyncChildEntry>& ChildEntries() const { return children_; }
+  const AutomaticSyncChildren& ChildSelection() const { return selection_; }
   const ConservativeAccessSet& ExitEffects() const { return exit_; }
   const ConservativeSyncCost& Cost() const { return cost_; }
   const std::vector<ConservativeStorageDomain>& StorageDomains() const { return domains_; }
@@ -142,13 +143,13 @@ class ConservativeSyncAnalysis {
  private:
   friend ConservativeSyncAnalysis AnalyzeConservativeSync(
       const FunctionPtr&, const std::string&, const std::vector<std::shared_ptr<const NativeSyncChild>>&,
-      const std::vector<std::shared_ptr<const EventfulSyncChild>>&, bool);
+      const std::vector<std::shared_ptr<const EventfulSyncChild>>&, bool, bool);
   ConservativeSyncAnalysis(FunctionPtr function, std::vector<ConservativeSyncSite> sites,
                            ConservativeAccessSet exit, ConservativeSyncCost cost,
                            std::shared_ptr<const ParentStmtAnalysis> parents,
                            std::vector<ConservativeSyncChildEntry> children,
                            std::vector<ConservativeStorageDomain> domains, bool incoming_diagnostics,
-                           bool disjoint_gm)
+                           bool disjoint_gm, AutomaticSyncChildren selection)
       : function_(std::move(function)),
         sites_(std::move(sites)),
         exit_(std::move(exit)),
@@ -157,7 +158,8 @@ class ConservativeSyncAnalysis {
         children_(std::move(children)),
         domains_(std::move(domains)),
         incoming_diagnostics_(incoming_diagnostics),
-        disjoint_gm_(disjoint_gm) {}
+        disjoint_gm_(disjoint_gm),
+        selection_(std::move(selection)) {}
   FunctionPtr function_;
   std::vector<ConservativeSyncSite> sites_;
   ConservativeAccessSet exit_;
@@ -167,6 +169,7 @@ class ConservativeSyncAnalysis {
   std::vector<ConservativeStorageDomain> domains_;
   bool incoming_diagnostics_;
   bool disjoint_gm_;
+  AutomaticSyncChildren selection_;
 };
 
 // No-KILL may-dataflow over the original structured IR. GEN is computed bottom
@@ -191,11 +194,15 @@ class ConservativeSyncAnalysis {
 // realization, invocation completion, and resource reuse remain separate gates.
 // Production omits copied incoming snapshots; explicit diagnostic requests pay
 // their output size and publish availability separately from empty histories.
+// Automatic production requests select disjoint whole child invocations through
+// existing providers. Attempts (including mathematics whose export failed) stay
+// owned by this result. Ready denotes a logical export, not physical acceptance;
+// joint lowering is transactional and retains its normal refusal behavior.
 ConservativeSyncAnalysis AnalyzeConservativeSync(
     const FunctionPtr& function, const std::string& target = "a2a3",
     const std::vector<std::shared_ptr<const NativeSyncChild>>& children = {},
     const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful_children = {},
-    bool retain_incoming_diagnostics = false);
+    bool retain_incoming_diagnostics = false, bool automatic_children = false);
 // Explicit policy construction. Acknowledgment-induced order is represented
 // here in logical tokens before LowerSync; no physical resource is assigned.
 FunctionPtr InsertConservativePrefixes(const ConservativeSyncAnalysis& analysis);

@@ -12,6 +12,7 @@
 #include "src/ir/transforms/utils/retained_sync_child.h"
 
 #include <algorithm>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <optional>
@@ -22,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
@@ -259,15 +261,28 @@ NativeSyncChildExport ExportNativeSyncChild(const CompactSyncResult& mathematics
   result.reason = "Retained internal order is native-only, with no notification resources";
   return result;
 }
-bool HasReadonlyExternalSyncEffects(const ForStmtPtr& scope, FunctionType core, const std::string& target) {
+bool HasReadonlyExternalSyncEffects(const ForStmtPtr& scope, FunctionType core, const std::string& target,
+                                    SyncChildEffectWork* work) {
   class Effects : public IRVisitor {
    public:
-    Effects(FunctionType core, const std::string& target) : core_(core), target_(target) {}
+    Effects(FunctionType core, const std::string& target, SyncChildEffectWork* work)
+        : core_(core), target_(target), work_(work) {}
     bool external = false;
+    void VisitStmt(const StmtPtr& statement) override {
+      if (work_) ++work_->statements;
+      IRVisitor::VisitStmt(statement);
+    }
+    void VisitExpr(const ExprPtr& expression) override {
+      if (expression && seen_.insert(expression.get()).second) {
+        if (work_) ++work_->expressions;
+        IRVisitor::VisitExpr(expression);
+      }
+    }
     void VisitExpr_(const CallPtr& call) override {
       if (GetLogicalSyncKind(call->op_) != LogicalSyncKind::None ||
           backend::QualifyBufferSyncNonPayload(call, target_))
         return;
+      if (work_) ++work_->native_qualifications;
       const auto operation = backend::QualifyBufferSyncOperation(call, core_, target_);
       for (size_t index = 0; index < operation.ArgumentEffects().size(); ++index) {
         const auto effect = operation.ArgumentEffects()[index].data;
@@ -289,7 +304,9 @@ bool HasReadonlyExternalSyncEffects(const ForStmtPtr& scope, FunctionType core, 
    private:
     FunctionType core_;
     const std::string& target_;
-  } effects(core, target);
+    std::unordered_set<const Expr*> seen_;
+    SyncChildEffectWork* work_;
+  } effects(core, target, work);
   effects.VisitStmt(scope);
   return effects.external;
 }
@@ -305,7 +322,7 @@ class SyncRegionBindings::State : public ParentStmtAnalysis {
   // capabilities do not depend on later mutations of this index.
   std::map<std::pair<const AssignStmt*, SyncExternalPolicy>, bool> qualified;
   std::shared_ptr<const SyncRegionIndexWork> work;
-  std::vector<VarPtr> ready_shape_symbols;
+  std::map<const Var*, std::pair<VarPtr, ParamDirection>> ready_parameters;
 
   State(FunctionPtr function, std::string native) : owner(std::move(function)), target(std::move(native)) {
     CHECK(owner) << "Regional synchronization requires an original owner";
@@ -314,9 +331,13 @@ class SyncRegionBindings::State : public ParentStmtAnalysis {
     // by the invocation ABI. This is readiness, never a numerical bound or a
     // valid-shape-only/tensor.read visibility premise.
     const auto physical_symbols = CollectParamDimSymbols(owner->params_);
+    for (size_t index = 0; index < owner->params_.size(); ++index)
+      ready_parameters.emplace(owner->params_[index].get(),
+                               std::make_pair(owner->params_[index], owner->param_directions_[index]));
     for (const auto& symbol : ClassifySignatureSymbols(owner).bound)
-      if (physical_symbols.count(symbol.get())) ready_shape_symbols.push_back(symbol);
-    work = std::make_shared<const SyncRegionIndexWork>(SyncRegionIndexWork{clock});
+      if (physical_symbols.count(symbol.get()))
+        ready_parameters.emplace(symbol.get(), std::make_pair(symbol, ParamDirection::In));
+    work = std::make_shared<const SyncRegionIndexWork>(SyncRegionIndexWork{clock, ready_parameters.size()});
   }
   void VisitStmt(const StmtPtr& statement) override {
     ++occurrences[statement.get()];
@@ -367,27 +388,38 @@ class SyncRegionBindings::State : public ParentStmtAnalysis {
 SyncRegionBindings::SyncRegionBindings(FunctionPtr owner, std::string target)
     : state_(std::make_shared<State>(std::move(owner), std::move(target))) {}
 
-SyncRegionContext SyncRegionBindings::Bind(const ForStmtPtr& scope, SyncExternalPolicy policy) const {
+size_t SyncRegionBindings::SourceNodes() const { return state_->work->source_nodes; }
+size_t SyncRegionBindings::ParameterNodes() const { return state_->work->parameter_nodes; }
+
+SyncRegionContext SyncRegionBindings::Bind(const ForStmtPtr& scope, SyncExternalPolicy policy,
+                                           SyncRegionBindWork* work) const {
   CHECK(scope && state_->occurrences.count(scope.get()) && state_->occurrences.at(scope.get()) == 1)
       << "Regional synchronization scope must occur exactly once in its original owner";
   std::vector<StmtPtr> ancestors;
   for (auto parent = state_->GetParent(scope); parent; parent = state_->GetParent(parent))
     ancestors.push_back(parent);
   std::reverse(ancestors.begin(), ancestors.end());
+  if (work) work->ancestor_links += ancestors.size();
   class Uses : public var_collectors::VarDefUseCollector {
    public:
+    explicit Uses(SyncRegionBindWork* work) : work_(work) {}
     size_t scope_nodes = 0;
     void VisitStmt(const StmtPtr& statement) override {
       ++scope_nodes;
+      if (work_) ++work_->scope_nodes;
       IRVisitor::VisitStmt(statement);
     }
     void VisitExpr(const ExprPtr& expression) override {
-      if (expression && seen_.insert(expression.get()).second) IRVisitor::VisitExpr(expression);
+      if (expression && seen_.insert(expression.get()).second) {
+        if (work_) ++work_->expression_nodes;
+        IRVisitor::VisitExpr(expression);
+      }
     }
 
    private:
     std::unordered_set<const Expr*> seen_;
-  } uses;
+    SyncRegionBindWork* work_;
+  } uses(work);
   uses.VisitStmt(scope);
   std::vector<std::pair<const Var*, StmtPtr>> pending;
   for (const auto* variable : uses.var_uses)
@@ -401,12 +433,6 @@ SyncRegionContext SyncRegionBindings::Bind(const ForStmtPtr& scope, SyncExternal
   std::map<const Var*, std::pair<VarPtr, ParamDirection>> available;
   std::map<const Var*, ForStmtPtr> invocation_frames;
   if (policy == SyncExternalPolicy::ReadOnlyProjection) {
-    for (size_t index = 0; index < state_->owner->params_.size(); ++index)
-      available.emplace(
-          state_->owner->params_[index].get(),
-          std::make_pair(state_->owner->params_[index], state_->owner->param_directions_[index]));
-    for (const auto& symbol : state_->ready_shape_symbols)
-      available.emplace(symbol.get(), std::make_pair(symbol, ParamDirection::In));
     for (const auto& ancestor : ancestors) {
       if (const auto loop = As<ForStmt>(ancestor)) {
         available.emplace(loop->loop_var_.get(), std::make_pair(loop->loop_var_, ParamDirection::In));
@@ -417,6 +443,15 @@ SyncRegionContext SyncRegionBindings::Bind(const ForStmtPtr& scope, SyncExternal
   while (!pending.empty()) {
     const auto [variable, use] = pending.back();
     pending.pop_back();
+    // Invocation parameters are indexed once, not copied into every candidate.
+    // Only actual referenced captures contribute to a binding's output size.
+    if (policy == SyncExternalPolicy::ReadOnlyProjection) {
+      const auto parameter = state_->ready_parameters.find(variable);
+      if (parameter != state_->ready_parameters.end()) {
+        captures.emplace(variable, parameter->second);
+        continue;
+      }
+    }
     if (const auto captured = available.find(variable); captured != available.end()) {
       if (const auto frame = invocation_frames.find(variable); frame != invocation_frames.end()) {
         const auto& loop = frame->second;
@@ -442,7 +477,8 @@ SyncRegionContext SyncRegionBindings::Bind(const ForStmtPtr& scope, SyncExternal
         << "Regional synchronization requires a signal-free original binding";
     if (!required.insert(variable).second) continue;
     ordered.push_back(definition);
-    Uses dependencies;
+    if (work) ++work->binding_definitions;
+    Uses dependencies(work);
     dependencies.VisitExpr(definition->value_);
     for (const auto* dependency : dependencies.var_uses) pending.emplace_back(dependency, definition);
     for (const auto* metadata : var_collectors::CollectTypeVars(variable->GetType()))
@@ -467,65 +503,164 @@ SyncRegionContext SyncRegionBindings::Bind(const ForStmtPtr& scope, SyncExternal
           uses.scope_nodes, ordered.size()};
 }
 
+EventfulSyncChildAttempt TryPrepareEventfulSyncChild(const FunctionPtr& owner, const ForStmtPtr& scope,
+                                                     const std::string& target,
+                                                     const SyncRegionBindings& bindings) {
+  EventfulSyncChildAttempt attempt;
+  attempt.scope = scope;
+  auto started = std::chrono::steady_clock::now();
+  auto finish_phase = [&] {
+    const auto now = std::chrono::steady_clock::now();
+    attempt.seconds[attempt.stage] += std::chrono::duration<double>(now - started).count();
+    started = now;
+  };
+  auto enter_phase = [&](EventfulSyncChildStage next) {
+    finish_phase();
+    attempt.stage = next;
+  };
+  try {
+    const auto policy = HasReadonlyExternalSyncEffects(scope, owner->func_type_, target, &attempt.effect_work)
+                            ? SyncExternalPolicy::ReadOnlyProjection
+                            : SyncExternalPolicy::Geometry;
+    enter_phase(EventfulSyncChildStage::Binding);
+    auto context = bindings.Bind(scope, policy, &attempt.binding_work);
+    CHECK(context.original_owner == owner)
+        << "Regional synchronization index belongs to another original owner";
+    enter_phase(EventfulSyncChildStage::Analysis);
+    attempt.mathematics = std::make_shared<const CompactSyncResult>(
+        AnalyzeCompactSync(policy == SyncExternalPolicy::ReadOnlyProjection
+                               ? ImportReadonlyExternalSync(context.binding_owner, target)
+                               : ImportPlacedSync(context.binding_owner, true, target)));
+    const auto& mathematics = *attempt.mathematics;
+    enter_phase(EventfulSyncChildStage::Qualification);
+    NativeSyncChildExport qualification;
+    Operations operations(mathematics, target, qualification);
+    operations.VisitStmt(scope);
+    CHECK(operations.available) << "Eventful child native/effect qualification unavailable: "
+                                << qualification.reason;
+    std::set<PipeType> participating;
+    for (const auto& operation : operations.payloads) participating.insert(operation.Implementation().Pipe());
+    enter_phase(EventfulSyncChildStage::ExecutableExport);
+    const auto realized = RealizeCompactSync(mathematics);
+    attempt.logical_record_sites = realized.record_sites;
+    attempt.logical_wait_sites = realized.wait_sites;
+    auto logical = realized.function;
+    class FindLogical : public IRVisitor {
+     public:
+      explicit FindLogical(const VarPtr& coordinate) : coordinate_(coordinate) {}
+      ForStmtPtr found;
+
+     protected:
+      void VisitStmt_(const ForStmtPtr& loop) override {
+        if (loop->loop_var_ == coordinate_) {
+          CHECK(!found) << "Eventful child has ambiguous original loop coordinates";
+          found = loop;
+        }
+        IRVisitor::VisitStmt_(loop);
+      }
+      void VisitExpr(const ExprPtr&) override {}
+
+     private:
+      VarPtr coordinate_;
+    } selected(scope->loop_var_);
+    selected.VisitFunction(logical);
+    CHECK(selected.found) << "Eventful child logical recipe lost its original invocation frame";
+    CheckLogicalSync(logical);
+    const SyncRegionBindings logical_bindings(logical, target);
+    attempt.binding_work.logical_index_nodes = logical_bindings.SourceNodes();
+    const auto logical_context = logical_bindings.Bind(selected.found, policy, &attempt.binding_work);
+    std::vector<StmtPtr> recipe;
+    const auto bound = As<SeqStmts>(logical_context.binding_owner->body_);
+    INTERNAL_CHECK(bound) << "Internal error: region bindings are not a sequence";
+    for (const auto& statement : bound->stmts_) {
+      const auto assignment = As<AssignStmt>(statement);
+      if (assignment && As<SyncTokenType>(assignment->var_->GetType())) recipe.push_back(statement);
+    }
+    auto marked = std::make_shared<ForStmt>(*selected.found);
+    CHECK(!marked->HasAttr(kClosedSyncChildAttr))
+        << "Original child already contains synchronization routing metadata";
+    marked->attrs_.emplace_back(kClosedSyncChildAttr, 1);
+    recipe.push_back(marked);
+    auto logical_recipe = std::make_shared<SeqStmts>(recipe, scope->span_);
+    attempt.child = std::shared_ptr<const EventfulSyncChild>(
+        new EventfulSyncChild(std::move(context), mathematics, logical_recipe, target,
+                              std::vector<PipeType>(participating.begin(), participating.end())));
+    enter_phase(EventfulSyncChildStage::Ready);
+  } catch (const pypto::ValueError& error) {
+    finish_phase();
+    attempt.reason = error.what();
+  }
+  return attempt;
+}
+
 std::shared_ptr<const EventfulSyncChild> PrepareEventfulSyncChild(const FunctionPtr& owner,
                                                                   const ForStmtPtr& scope,
                                                                   const std::string& target,
                                                                   const SyncRegionBindings& bindings) {
-  const auto policy = HasReadonlyExternalSyncEffects(scope, owner->func_type_, target)
-                          ? SyncExternalPolicy::ReadOnlyProjection
-                          : SyncExternalPolicy::Geometry;
-  auto context = bindings.Bind(scope, policy);
-  CHECK(context.original_owner == owner)
-      << "Regional synchronization index belongs to another original owner";
-  auto mathematics = AnalyzeCompactSync(policy == SyncExternalPolicy::ReadOnlyProjection
-                                            ? ImportReadonlyExternalSync(context.binding_owner, target)
-                                            : ImportPlacedSync(context.binding_owner, true, target));
-  NativeSyncChildExport qualification;
-  Operations operations(mathematics, target, qualification);
-  operations.VisitStmt(scope);
-  CHECK(operations.available) << "Eventful child native/effect qualification unavailable: "
-                              << qualification.reason;
-  std::set<PipeType> participating;
-  for (const auto& operation : operations.payloads) participating.insert(operation.Implementation().Pipe());
-  auto logical = RealizeCompactSync(mathematics).function;
-  class FindLogical : public IRVisitor {
-   public:
-    explicit FindLogical(const VarPtr& coordinate) : coordinate_(coordinate) {}
-    ForStmtPtr found;
+  auto attempt = TryPrepareEventfulSyncChild(owner, scope, target, bindings);
+  CHECK(attempt.child) << attempt.reason;
+  return std::move(attempt.child);
+}
 
-   protected:
-    void VisitStmt_(const ForStmtPtr& loop) override {
-      if (loop->loop_var_ == coordinate_) {
-        CHECK(!found) << "Eventful child has ambiguous original loop coordinates";
-        found = loop;
-      }
-      IRVisitor::VisitStmt_(loop);
+const char* EventfulSyncChildStageName(EventfulSyncChildStage stage) {
+  switch (stage) {
+    case EventfulSyncChildStage::Effects:
+      return "effects";
+    case EventfulSyncChildStage::Binding:
+      return "binding";
+    case EventfulSyncChildStage::Analysis:
+      return "analysis";
+    case EventfulSyncChildStage::Qualification:
+      return "qualification";
+    case EventfulSyncChildStage::ExecutableExport:
+      return "executable_export";
+    case EventfulSyncChildStage::Ready:
+      return "logical_export_ready";
+  }
+  INTERNAL_CHECK(false) << "Internal error: unknown eventful child attempt stage";
+  return "";
+}
+
+AutomaticSyncChildren PrepareAutomaticSyncChildren(const FunctionPtr& owner, const std::string& target) {
+  // Select scopes structurally before asking providers. Disjoint leaf loops
+  // make source inspection additive; do not repeatedly retry enclosing nests.
+  class Candidates : public IRVisitor {
+   public:
+    size_t nodes = 0;
+    std::vector<ForStmtPtr> scopes;
+    void VisitStmt(const StmtPtr& statement) override {
+      ++nodes;
+      IRVisitor::VisitStmt(statement);
     }
     void VisitExpr(const ExprPtr&) override {}
 
+   protected:
+    void VisitStmt_(const ForStmtPtr& loop) override {
+      if (!nested_.empty()) nested_.back() = true;
+      nested_.push_back(false);
+      IRVisitor::VisitStmt_(loop);
+      const bool leaf = !nested_.back();
+      nested_.pop_back();
+      if (leaf && loop->kind_ == ForKind::Sequential) scopes.push_back(loop);
+    }
+    void VisitStmt_(const WhileStmtPtr& loop) override {
+      if (!nested_.empty()) nested_.back() = true;
+      IRVisitor::VisitStmt_(loop);
+    }
+
    private:
-    VarPtr coordinate_;
-  } selected(scope->loop_var_);
-  selected.VisitFunction(logical);
-  CHECK(selected.found) << "Eventful child logical recipe lost its original invocation frame";
-  CheckLogicalSync(logical);
-  const auto logical_context = SyncRegionBindings(logical, target).Bind(selected.found, policy);
-  std::vector<StmtPtr> recipe;
-  const auto bound = As<SeqStmts>(logical_context.binding_owner->body_);
-  INTERNAL_CHECK(bound) << "Internal error: region bindings are not a sequence";
-  for (const auto& statement : bound->stmts_) {
-    const auto assignment = As<AssignStmt>(statement);
-    if (assignment && As<SyncTokenType>(assignment->var_->GetType())) recipe.push_back(statement);
-  }
-  auto marked = std::make_shared<ForStmt>(*selected.found);
-  CHECK(!marked->HasAttr(kClosedSyncChildAttr))
-      << "Original child already contains synchronization routing metadata";
-  marked->attrs_.emplace_back(kClosedSyncChildAttr, 1);
-  recipe.push_back(marked);
-  auto logical_recipe = std::make_shared<SeqStmts>(recipe, scope->span_);
-  return std::shared_ptr<const EventfulSyncChild>(
-      new EventfulSyncChild(std::move(context), std::move(mathematics), logical_recipe, target,
-                            std::vector<PipeType>(participating.begin(), participating.end())));
+    std::vector<bool> nested_;
+  } candidates;
+  candidates.VisitStmt(owner->body_);
+  AutomaticSyncChildren result;
+  result.discovery_nodes = candidates.nodes;
+  if (candidates.scopes.empty()) return result;
+  const SyncRegionBindings bindings(owner, target);
+  result.index_nodes = bindings.SourceNodes();
+  result.parameter_nodes = bindings.ParameterNodes();
+  for (const auto& scope : candidates.scopes)
+    result.attempts.push_back(TryPrepareEventfulSyncChild(owner, scope, target, bindings));
+  return result;
 }
 
 std::map<std::string, size_t> EventfulSyncChild::Describe() const {

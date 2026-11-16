@@ -75,10 +75,22 @@ inline constexpr const char* kClosedSyncChildAttr = "pypto.closed_sync_child";
 
 // Inspect actual selected instruction effects, including implicit effects.
 // Returns true only when external effects exist and every such effect reads.
-bool HasReadonlyExternalSyncEffects(const ForStmtPtr& scope, FunctionType core, const std::string& target);
+struct SyncChildEffectWork {
+  size_t statements = 0, expressions = 0, native_qualifications = 0;
+};
+bool HasReadonlyExternalSyncEffects(const ForStmtPtr& scope, FunctionType core, const std::string& target,
+                                    SyncChildEffectWork* work = nullptr);
 
 struct SyncRegionIndexWork {
   size_t source_nodes;
+  size_t parameter_nodes = 0;
+};
+struct SyncRegionBindWork {
+  size_t scope_nodes = 0;
+  size_t expression_nodes = 0;
+  size_t binding_definitions = 0;
+  size_t ancestor_links = 0;
+  size_t logical_index_nodes = 0;
 };
 struct SyncRegionContext {
   FunctionPtr original_owner;
@@ -96,13 +108,17 @@ class SyncRegionBindings {
  public:
   SyncRegionBindings(FunctionPtr owner, std::string target);
   SyncRegionContext Bind(const ForStmtPtr& scope,
-                         SyncExternalPolicy external_policy = SyncExternalPolicy::Geometry) const;
+                         SyncExternalPolicy external_policy = SyncExternalPolicy::Geometry,
+                         SyncRegionBindWork* work = nullptr) const;
+  size_t SourceNodes() const;
+  size_t ParameterNodes() const;
 
  private:
   class State;
   std::shared_ptr<State> state_;
 };
 
+struct EventfulSyncChildAttempt;
 class EventfulSyncChild {
  public:
   const FunctionPtr& Owner() const { return context_.original_owner; }
@@ -130,11 +146,43 @@ class EventfulSyncChild {
                                                                            const ForStmtPtr&,
                                                                            const std::string&,
                                                                            const SyncRegionBindings&);
+  friend EventfulSyncChildAttempt TryPrepareEventfulSyncChild(const FunctionPtr&, const ForStmtPtr&,
+                                                              const std::string&, const SyncRegionBindings&);
 };
 std::shared_ptr<const EventfulSyncChild> PrepareEventfulSyncChild(const FunctionPtr& owner,
                                                                   const ForStmtPtr& scope,
                                                                   const std::string& target,
                                                                   const SyncRegionBindings& bindings);
+
+enum class EventfulSyncChildStage { Effects, Binding, Analysis, Qualification, ExecutableExport, Ready };
+const char* EventfulSyncChildStageName(EventfulSyncChildStage stage);
+// An export refusal retains its successful immutable mathematics. These are
+// provider-owned attempt results, not a change to the exact analysis guarantee.
+struct EventfulSyncChildAttempt {
+  ForStmtPtr scope;
+  EventfulSyncChildStage stage = EventfulSyncChildStage::Effects;
+  std::string reason;
+  SyncRegionBindWork binding_work;
+  SyncChildEffectWork effect_work;
+  // Descriptive inclusive phase times also account for refused attempts.
+  std::map<EventfulSyncChildStage, double> seconds;
+  size_t logical_record_sites = 0, logical_wait_sites = 0;
+  std::shared_ptr<const CompactSyncResult> mathematics;
+  std::shared_ptr<const EventfulSyncChild> child;
+};
+EventfulSyncChildAttempt TryPrepareEventfulSyncChild(const FunctionPtr& owner, const ForStmtPtr& scope,
+                                                     const std::string& target,
+                                                     const SyncRegionBindings& bindings);
+struct AutomaticSyncChildren {
+  std::vector<EventfulSyncChildAttempt> attempts;
+  size_t discovery_nodes = 0;
+  size_t index_nodes = 0;
+  size_t parameter_nodes = 0;
+};
+// One discovery and one binding index per owner; candidates are disjoint whole
+// sequential For invocations without nested For/While scopes. Costs additionally
+// include each provider attempt and the requested binding/interface output.
+AutomaticSyncChildren PrepareAutomaticSyncChildren(const FunctionPtr& owner, const std::string& target);
 
 enum class NativeSyncChildStatus {
   Ready,
