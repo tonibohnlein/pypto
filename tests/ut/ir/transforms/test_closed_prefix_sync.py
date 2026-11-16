@@ -639,3 +639,281 @@ def test_parent_child_per_direction_reservations_allow_disjoint_direction_id_reu
     assert after.ids[ir.PipeType.MTE2, ir.PipeType.MTE3] == {0, 1}
     assert after.ids[ir.PipeType.MTE2, ir.PipeType.V].issubset({0, 1})
 
+
+
+def test_zero_trip_loop_prevents_post_loop_id_reuse():
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+    n = ir.Var("n", ir.ScalarType(idx), span)
+    k = ir.Var("k", ir.ScalarType(idx), span)
+    ci = lambda v: ir.ConstInt(v, idx, span)
+
+    t0 = ir.Var("t0", ir.SyncTokenType(ir.PipeType.MTE2), span)
+    t_loop = ir.Var("t_loop", ir.SyncTokenType(ir.PipeType.V), span)
+    t1 = ir.Var("t1", ir.SyncTokenType(ir.PipeType.MTE2), span)
+
+    # Reverse edge V -> MTE2 lives ONLY inside a symbolic-bound ForStmt that may run 0 trips.
+    # Post-loop MTE2 -> V must NOT reuse t0's event_id=0 assuming V -> MTE2 ran inside the loop.
+    loop = ir.ForStmt(
+        k,
+        ci(0),
+        n,
+        ci(1),
+        [],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(t_loop, sync.record(ir.PipeType.V), span),
+                ir.EvalStmt(sync.wait(t_loop, ir.PipeType.MTE2), span),
+                ir.YieldStmt([], span),
+            ],
+            span,
+        ),
+        [],
+        span,
+    )
+    fn = ir.Function(
+        "zero_trip_no_reuse",
+        [n],
+        [],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(t0, sync.record(ir.PipeType.MTE2), span),
+                ir.EvalStmt(sync.wait(t0, ir.PipeType.V), span),
+                loop,
+                ir.AssignStmt(t1, sync.record(ir.PipeType.MTE2), span),
+                ir.EvalStmt(sync.wait(t1, ir.PipeType.V), span),
+                ir.ReturnStmt([], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        attrs={"autosync_analysis_policy": "conservative_prefix"},
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    program = ir.Program([fn], "ZeroTripNoReuse", span)
+    with passes.PassContext([]):
+        physical = passes.lower_sync()(program)
+    phys_fn = next(iter(physical.functions.values()))
+    text = str(phys_fn)
+    assert "event_id=0" in text
+    assert "event_id=1" in text
+    for trips in (0, 2):
+        check_closed_commands(fn, phys_fn, {0: trips}, range(6), compare_commands=False)
+
+
+def test_unbalanced_bare_unwaited_and_carried_syntax_routed_safely():
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+    cond = ir.Var("cond", ir.ScalarType(ir.DataType.BOOL), span)
+    k = ir.Var("k", ir.ScalarType(idx), span)
+    ci = lambda v: ir.ConstInt(v, idx, span)
+
+    # 1a. Bare EvalStmt(sync.wait) directly inside IfStmt (no SeqStmts wrapper) must be flagged unsupported.
+    t0 = ir.Var("t0", ir.SyncTokenType(ir.PipeType.MTE2), span)
+    t_other = ir.Var("t_other", ir.SyncTokenType(ir.PipeType.MTE2), span)
+    bare_if = ir.Function(
+        "bare_arm_wait",
+        [cond],
+        [],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(t0, sync.record(ir.PipeType.MTE2), span),
+                ir.IfStmt(
+                    cond,
+                    ir.EvalStmt(sync.wait(t0, ir.PipeType.V), span),
+                    None,
+                    [],
+                    span,
+                ),
+                ir.ReturnStmt([], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        attrs={"autosync_analysis_policy": "conservative_prefix"},
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with pytest.raises(ValueError, match="LowerSync structured token transport"):
+        with passes.PassContext([]):
+            passes.lower_sync()(ir.Program([bare_if], "BareArmWait", span))
+
+    # 1b. Cross-control record/wait (record outside IfStmt, wait inside SeqStmts arm) routes to fallback cleanly.
+    t_cross = ir.Var("t_cross", ir.SyncTokenType(ir.PipeType.MTE2), span)
+    cross_if = ir.Function(
+        "cross_arm_wait",
+        [cond],
+        [],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(t_cross, sync.record(ir.PipeType.MTE2), span),
+                ir.IfStmt(
+                    cond,
+                    ir.SeqStmts([ir.EvalStmt(sync.wait(t_cross, ir.PipeType.V), span)], span),
+                    None,
+                    [],
+                    span,
+                ),
+                ir.ReturnStmt([], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        attrs={"autosync_analysis_policy": "conservative_prefix"},
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with pytest.raises(ValueError, match="LowerSync structured token transport"):
+        with passes.PassContext([]):
+            passes.lower_sync()(ir.Program([cross_if], "CrossArmWait", span))
+
+    # 2. Un-waited sync.record must refuse closed-prefix syntax and still lower cleanly via fallback.
+    t_used = ir.Var("t_used", ir.SyncTokenType(ir.PipeType.MTE2), span)
+    unwaited = ir.Function(
+        "unwaited_rec",
+        [],
+        [],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(t_used, sync.record(ir.PipeType.MTE2), span),
+                ir.EvalStmt(sync.wait(t_used, ir.PipeType.V), span),
+                ir.AssignStmt(t_other, sync.record(ir.PipeType.MTE2), span),
+                ir.ReturnStmt([], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        attrs={"autosync_analysis_policy": "conservative_prefix"},
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with passes.PassContext([]):
+        phys_unwaited = passes.lower_sync()(ir.Program([unwaited], "UnwaitedRec", span))
+    assert "sync.record" not in str(next(iter(phys_unwaited.functions.values())))
+    assert "sync.wait" not in str(next(iter(phys_unwaited.functions.values())))
+
+    # 3. ForStmt carrying a SyncTokenType iter_arg routes away from closed prefix to structured lowering.
+    idx_vec = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    gm_t = ir.TensorType([2, 8], ir.DataType.FP32)
+    src = ir.Var("src", gm_t, span)
+    out = ir.Var("out", gm_t, span)
+    x = ir.Var("x", idx_vec, span)
+    y = ir.Var("y", idx_vec, span)
+    tup = lambda vals: ir.MakeTuple([ci(v) for v in vals], span)
+    t_init = ir.Var("t_init", ir.SyncTokenType(ir.PipeType.MTE2), span)
+    t_iter = ir.IterArg("t_iter", ir.SyncTokenType(ir.PipeType.MTE2), t_init, span)
+    t_out = ir.Var("t_out", ir.SyncTokenType(ir.PipeType.MTE2), span)
+    t_next = ir.Var("t_next", ir.SyncTokenType(ir.PipeType.MTE2), span)
+    carried = ir.Function(
+        "carried_loop_token",
+        [src, (out, ir.ParamDirection.InOut)],
+        [out.type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(x, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(0)], idx_vec, span), span),
+                ir.AssignStmt(y, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(128)], idx_vec, span), span),
+                ir.AssignStmt(t_init, sync.completed(ir.PipeType.MTE2), span),
+                ir.ForStmt(
+                    k,
+                    ci(0),
+                    ci(2),
+                    ci(1),
+                    [t_iter],
+                    ir.SeqStmts(
+                        [
+                            ir.EvalStmt(sync.wait(t_iter, ir.PipeType.V), span),
+                            ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [x, y], ir.VoidType(), span), span),
+                            ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+                            ir.AssignStmt(t_next, sync.record(ir.PipeType.MTE2), span),
+                            ir.YieldStmt([t_next], span),
+                        ],
+                        span,
+                    ),
+                    [t_out],
+                    span,
+                ),
+                ir.EvalStmt(sync.wait(t_out, ir.PipeType.V), span),
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [x, y], ir.VoidType(), span), span),
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.store"), [y, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span), span),
+                ir.ReturnStmt([out], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        attrs={"autosync_analysis_policy": "conservative_prefix"},
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with pytest.raises(ValueError, match="Unsupported token activation"):
+        with passes.PassContext([]):
+            passes.lower_sync()(ir.Program([carried], "CarriedLoopToken", span))
+
+    # 4. TupleType([SyncTokenType]) containers (e.g. MakeTuple([completed])) must also be rejected
+    # consistently by both HasOnlyClosedPrefixSyntax and TryLowerClosedPrefixSync.
+    c_tok = ir.Var("c_tok", ir.SyncTokenType(ir.PipeType.MTE2), span)
+    t_pair = ir.Var("t_pair", ir.SyncTokenType(ir.PipeType.MTE2), span)
+    tup_var = ir.Var("tup_tok", ir.TupleType([ir.SyncTokenType(ir.PipeType.MTE2)]), span)
+    tup_fn = ir.Function(
+        "tuple_token_container",
+        [],
+        [],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(t_pair, sync.record(ir.PipeType.MTE2), span),
+                ir.EvalStmt(sync.wait(t_pair, ir.PipeType.V), span),
+                ir.AssignStmt(c_tok, sync.completed(ir.PipeType.MTE2), span),
+                ir.AssignStmt(tup_var, ir.MakeTuple([c_tok], span), span),
+                ir.ReturnStmt([], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        attrs={"autosync_analysis_policy": "conservative_prefix"},
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with pytest.raises(ValueError):
+        with passes.PassContext([]):
+            passes.lower_sync()(ir.Program([tup_fn], "TupleTokenContainer", span))
+
+
+def test_intra_loop_set_wait_ack_reuses_ids_without_exhaustion():
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+    n = ir.Var("n", ir.ScalarType(idx), span)
+    k = ir.Var("k", ir.ScalarType(idx), span)
+    ci = lambda v: ir.ConstInt(v, idx, span)
+
+    # 10 open MTE2 -> V edges inside one loop body exceed the 8-ID hardware pool without intra-loop reuse.
+    stmts = []
+    for i in range(10):
+        tok = ir.Var(f"tok_{i}", ir.SyncTokenType(ir.PipeType.MTE2), span)
+        stmts.append(ir.AssignStmt(tok, sync.record(ir.PipeType.MTE2), span))
+        stmts.append(ir.EvalStmt(sync.wait(tok, ir.PipeType.V), span))
+    stmts.append(ir.YieldStmt([], span))
+
+    fn = ir.Function(
+        "intra_loop_reuse",
+        [n],
+        [],
+        ir.SeqStmts(
+            [
+                ir.ForStmt(k, ci(0), n, ci(1), [], ir.SeqStmts(stmts, span), [], span),
+                ir.ReturnStmt([], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        attrs={"autosync_analysis_policy": "conservative_prefix"},
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with passes.PassContext([]):
+        physical = passes.lower_sync()(ir.Program([fn], "IntraLoopReuse", span))
+    phys_fn = next(iter(physical.functions.values()))
+    # All 10 SetWaitAck sites inside the loop should reuse event_id=0 without exhausting the pool.
+    text = str(phys_fn)
+    assert "event_id=0" in text
+    assert "event_id=9" not in text
+    check_closed_commands(fn, phys_fn, {0: 3}, range(8), compare_commands=False)
