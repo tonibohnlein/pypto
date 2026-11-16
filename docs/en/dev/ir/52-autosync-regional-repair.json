@@ -59,11 +59,300 @@
       "alias": "Explicit caller artifact required for disjoint campaign; no proof from SSA names.",
       "review": "repair_reviewer: architecture/correctness/cost accepted; 112 tests and all hooks pass",
       "hooks": "build-py314/regional-repair/p2-hooks.log"
+    },
+    "P3": {
+      "implementation": "accepted",
+      "review": "repair_reviewer: architecture/correctness/cost final accepted",
+      "tests": [
+        {
+          "command": "timeout 120s python3.14 -m pytest tests/ut/ir/transforms/test_automatic_sync_children.py -q --require-ptoas",
+          "result": "12 passed",
+          "log": "build-py314/regional-repair/p3-tests-accepted.log"
+        },
+        {
+          "command": "timeout 120s python3.14 -m pytest tests/ut/ir/transforms/test_conservative_sync_child_api.py tests/ut/ir/transforms/test_conservative_sync_child_commands.py tests/ut/ir/transforms/test_conservative_sync_child_implicit_effects.py tests/ut/ir/transforms/test_conservative_sync_children.py tests/ut/ir/transforms/test_eventful_sync_children.py -q --require-ptoas",
+          "result": "75 passed in 32.13s",
+          "log": "build-py314/regional-repair/p3-child-regressions.log"
+        }
+      ],
+      "source_sha256": {
+        "python/bindings/modules/testing.cpp": "d1ffad1f03052bd5a0f16a7980e39d2a7a3c1f02df0c8e29d0f9df0e7ba84842",
+        "python/pypto/pypto_core/testing.pyi": "d888a0ffc63dccd5e02c0f7e3aee41cba767d8ab44d2ec5352e5b070dfd975ac",
+        "src/ir/transforms/token_sync.cpp": "a6607bff08d391f40a82e5d519f98491310e20633910fd0e2d809696b10d5640",
+        "src/ir/transforms/utils/conservative_sync_dataflow.cpp": "fc2adda51d9da0e0cab32644962f8a2b4c82b52f19ae9e8c95be28a7a0f3ff6c",
+        "src/ir/transforms/utils/conservative_sync_dataflow.h": "83d30d9bee430cb5bf2c08900427e65b3d77f75d0b04a92c5c689e56ae59a8b7",
+        "src/ir/transforms/utils/conservative_sync_realization.cpp": "40338e9e143ee72e8fca41b07473f7b37126c4cdb41d38bc564adaa1817c60a0",
+        "src/ir/transforms/utils/retained_sync_child.cpp": "f273bf2966c9788f2d550a970333116acda05f3f73047706342bdf318f847643",
+        "src/ir/transforms/utils/retained_sync_child.h": "d39b3cf5002eb5443cbb315ce3e89f8c8d1a68357ee37064684e311391e3bdf5",
+        "tests/ut/ir/transforms/test_automatic_sync_children.py": "269c872408f695915ab5f35bbfe81b2572f74655f103b85fca537b65df63664e"
+      },
+      "extension_sha256": {
+        "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "7609e8503ab9500e5cb71f24b8408c16448125f58d9ade5c5b4ebfa7ec9e1d8c"
+      },
+      "hooks": "build-py314/regional-repair/p3-hooks.log: all passed",
+      "scaling": [
+        {
+          "trip_count": 2,
+          "seconds": 0.0010443669743835926,
+          "scope": "k",
+          "cost": {
+            "statements": 23,
+            "expression_visits": 56,
+            "dataflow_visits": 18,
+            "retained_facts": 42,
+            "services": 17,
+            "baseline_services": 24,
+            "suppressed_services": 7,
+            "certificate_visits": 18,
+            "certificate_omissions": 7,
+            "parent_links": 22,
+            "enclosure_lookups": 17,
+            "storage_domains": 5,
+            "conflict_summary_facts": 13,
+            "conflict_queries": 21,
+            "incoming_diagnostic_facts": 0,
+            "control_snapshot_facts": 13,
+            "control_merge_facts": 13,
+            "diagnostic_control_output_nodes": 6,
+            "child_discovery_nodes": 23,
+            "child_index_nodes": 23,
+            "child_parameter_nodes": 5
+          },
+          "attempt": {
+            "stage": "logical_export_ready",
+            "reason": "",
+            "scope_nodes": 17,
+            "expression_nodes": 64,
+            "binding_definitions": 11,
+            "ancestor_links": 5,
+            "logical_index_nodes": 19,
+            "effect_statements": 6,
+            "effect_expressions": 7,
+            "native_qualifications": 3,
+            "logical_record_sites": 2,
+            "logical_wait_sites": 2,
+            "physical_qualification": "pending_whole_plan",
+            "seconds": {
+              "effects": 4.3157e-05,
+              "binding": 0.000120372,
+              "analysis": 0.000129783,
+              "qualification": 0.00012995,
+              "executable_export": 0.000265558
+            }
+          },
+          "cells": 5,
+          "analyzed_occurrences": 9,
+          "regions": [
+            [
+              3,
+              2
+            ]
+          ]
+        },
+        {
+          "trip_count": 16,
+          "seconds": 0.0007864329963922501,
+          "scope": "k",
+          "cost": {
+            "statements": 23,
+            "expression_visits": 56,
+            "dataflow_visits": 18,
+            "retained_facts": 42,
+            "services": 17,
+            "baseline_services": 24,
+            "suppressed_services": 7,
+            "certificate_visits": 18,
+            "certificate_omissions": 7,
+            "parent_links": 22,
+            "enclosure_lookups": 17,
+            "storage_domains": 5,
+            "conflict_summary_facts": 13,
+            "conflict_queries": 21,
+            "incoming_diagnostic_facts": 0,
+            "control_snapshot_facts": 13,
+            "control_merge_facts": 13,
+            "diagnostic_control_output_nodes": 6,
+            "child_discovery_nodes": 23,
+            "child_index_nodes": 23,
+            "child_parameter_nodes": 5
+          },
+          "attempt": {
+            "stage": "logical_export_ready",
+            "reason": "",
+            "scope_nodes": 17,
+            "expression_nodes": 64,
+            "binding_definitions": 11,
+            "ancestor_links": 5,
+            "logical_index_nodes": 19,
+            "effect_statements": 6,
+            "effect_expressions": 7,
+            "native_qualifications": 3,
+            "logical_record_sites": 2,
+            "logical_wait_sites": 2,
+            "physical_qualification": "pending_whole_plan",
+            "seconds": {
+              "effects": 1.5407e-05,
+              "binding": 9.4344e-05,
+              "analysis": 0.000123478,
+              "qualification": 1.7547e-05,
+              "executable_export": 0.000230168
+            }
+          },
+          "cells": 5,
+          "analyzed_occurrences": 9,
+          "regions": [
+            [
+              3,
+              2
+            ]
+          ]
+        },
+        {
+          "trip_count": 1024,
+          "seconds": 0.0008035278879106045,
+          "scope": "k",
+          "cost": {
+            "statements": 23,
+            "expression_visits": 56,
+            "dataflow_visits": 18,
+            "retained_facts": 42,
+            "services": 17,
+            "baseline_services": 24,
+            "suppressed_services": 7,
+            "certificate_visits": 18,
+            "certificate_omissions": 7,
+            "parent_links": 22,
+            "enclosure_lookups": 17,
+            "storage_domains": 5,
+            "conflict_summary_facts": 13,
+            "conflict_queries": 21,
+            "incoming_diagnostic_facts": 0,
+            "control_snapshot_facts": 13,
+            "control_merge_facts": 13,
+            "diagnostic_control_output_nodes": 6,
+            "child_discovery_nodes": 23,
+            "child_index_nodes": 23,
+            "child_parameter_nodes": 5
+          },
+          "attempt": {
+            "stage": "logical_export_ready",
+            "reason": "",
+            "scope_nodes": 17,
+            "expression_nodes": 64,
+            "binding_definitions": 11,
+            "ancestor_links": 5,
+            "logical_index_nodes": 19,
+            "effect_statements": 6,
+            "effect_expressions": 7,
+            "native_qualifications": 3,
+            "logical_record_sites": 2,
+            "logical_wait_sites": 2,
+            "physical_qualification": "pending_whole_plan",
+            "seconds": {
+              "effects": 1.7176e-05,
+              "binding": 0.000101852,
+              "analysis": 0.000123302,
+              "qualification": 1.8818e-05,
+              "executable_export": 0.000244683
+            }
+          },
+          "cells": 5,
+          "analyzed_occurrences": 9,
+          "regions": [
+            [
+              3,
+              2
+            ]
+          ]
+        }
+      ],
+      "original_down": {
+        "analysis_seconds": 0.18156452802941203,
+        "attempts": [
+          {
+            "stage": "binding",
+            "reason": "Regional synchronization child has an unavailable enclosing coordinate, caller value or descriptor binding: cb_inline1641__idx_v0\nCheck failed: found != state_->definitions.end() && found->second.size() == 1 at /home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/src/ir/transforms/utils/retained_sync_child.cpp:467",
+            "scope_nodes": 11,
+            "expression_nodes": 50,
+            "binding_definitions": 7,
+            "ancestor_links": 5,
+            "logical_index_nodes": 0,
+            "effect_statements": 11,
+            "effect_expressions": 17,
+            "native_qualifications": 7,
+            "logical_record_sites": 0,
+            "logical_wait_sites": 0,
+            "physical_qualification": "pending_whole_plan",
+            "seconds": {
+              "effects": 5.8645e-05,
+              "binding": 0.178867688
+            },
+            "scope": "down_acc_inline1640__tile_mn0_l0_ko",
+            "retained_math": false
+          },
+          {
+            "stage": "logical_export_ready",
+            "reason": "",
+            "scope_nodes": 28,
+            "expression_nodes": 108,
+            "binding_definitions": 16,
+            "ancestor_links": 6,
+            "logical_index_nodes": 30,
+            "effect_statements": 9,
+            "effect_expressions": 10,
+            "native_qualifications": 6,
+            "logical_record_sites": 4,
+            "logical_wait_sites": 4,
+            "physical_qualification": "pending_whole_plan",
+            "seconds": {
+              "effects": 7.1147e-05,
+              "binding": 0.000162557,
+              "analysis": 0.000190832,
+              "qualification": 0.00012759,
+              "executable_export": 0.000413353
+            },
+            "scope": "down_acc_inline1640__tile_mn0_l0_ko",
+            "retained_math": true
+          },
+          {
+            "stage": "logical_export_ready",
+            "reason": "",
+            "scope_nodes": 28,
+            "expression_nodes": 108,
+            "binding_definitions": 16,
+            "ancestor_links": 4,
+            "logical_index_nodes": 30,
+            "effect_statements": 9,
+            "effect_expressions": 10,
+            "native_qualifications": 6,
+            "logical_record_sites": 4,
+            "logical_wait_sites": 4,
+            "physical_qualification": "pending_whole_plan",
+            "seconds": {
+              "effects": 2.624e-05,
+              "binding": 3.1626e-05,
+              "analysis": 0.000157681,
+              "qualification": 3.3049e-05,
+              "executable_export": 0.000340989
+            },
+            "scope": "down_acc_inline1640__tile_mn0_l0_ko",
+            "retained_math": true
+          }
+        ],
+        "logical_seconds": 0.0033207549713552,
+        "physical_seconds": 0.004445577040314674,
+        "cpp_seconds": 0.11923904996365309,
+        "status": "ready"
+      },
+      "original_input": {
+        "path": "build-py314/regional-repair/before-conservative_prefix-may-alias-native/before-sync.msgpack",
+        "sha256": "62751fcfb99424e2ae271ab207199549333ddef0a84fa669f6d0fd49f51795e5"
+      },
+      "physical_refusal_policy": "Discard entire candidate and delegate original kernel with precise resource/proof refusal. No infeasibility claim; no partial child removal or implicit retry."
     }
   },
   "device_validation": false,
   "remaining_milestones": [
-    "P3",
     "P4",
     "P5"
   ]

@@ -158,3 +158,13 @@ P1 独立源码评审已接受所有权、正确性和成本边界。最终回�
 源码确认共享 `SelectBufferSyncImplementation` 仅将 `buffer.read/write` 限定为 A2/A3 AIV Vec 的 TGETVAL/TSETVAL，直接 Buffer codegen 使用相同注册配方与载荷切点。它不限定 cacheable GM 标量。旧 qkpv_plan 的原标量 C++ 含指针及 cache/exit 操作，但不能证明跨管线可见性和数据加载就绪。缺少这些契约或 Buffer admission 时继续委托；显式 DMA 独立报告 carrier 效应和成本。S→S 与累加器原生顺序规则保留。
 
 P5 对两个策略同样显式使用 `--gm-alias-policy disjoint --gm-contract <caller-contract>`，或默认 may-alias。比较 PTOAS 不能证明调用承诺；不删除全部 GM 效应，也不改变默认 ABI。
+
+### P3 区域构造检查点
+
+显式保守生产请求一次发现互不重叠的整个 sequential leaf-For 调用，复用现有 eventful-child provider；公开 InsertSync 与 RealizeSync 共用选择，显式提供子能力保持原语义，精确策略不变。每 owner 仅建立一次发现/绑定及参数维度索引，逐尝试统计引用绑定、效应、分析与导出工作，不展开 trip count。
+
+带类型尝试区分 effects/binding/analysis 与 executable export；后者失败仍在发布的分析中保留成功不可变数学结果。只读外部投影的 GM boundary 明确 unavailable，父区域保留所有原 GM 效应。子 token 配方、原始坐标与 guards 保留；入口确认与物理证明复用现有服务，出口 pending effects 不被删除。
+
+逻辑导出就绪不等于物理证书。后续整计划匹配/palette/reuse 失败时带原因委托整个原内核，不自动丢弃某个子区域后重试。因此可选导入可能比 primitive prefix 少所有权，P5 必须报告。GM 写、未知控制和缺失 caller 证据继续拒绝。选择整个 leaf loop 不代表保留所有外层嵌套 K 管线。common-completion `(A,E,S,t)` 仍是独立缺失能力，不从 prefix 摘要推断。
+
+P3 经独立评审接受；12项新增、75项既有子区域回归、串行构建及全部 hooks 通过。count=2/16/1024 时保留9个分析 occurrence、5 cells及2 demands。原完整模型 down_proj 的3个 leaf 候选有2个逻辑导出，首个明确拒绝缺失外围坐标 cb_inline1641__idx_v0；联合计划成功分配并经真实 PTOAS 生成 C++。不声称保留所有外层 K 区域，精确命令及源码/工具见续篇收据。

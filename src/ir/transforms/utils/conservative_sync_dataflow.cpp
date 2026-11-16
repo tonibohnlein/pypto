@@ -739,14 +739,23 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
     const FunctionPtr& function, const std::string& target,
     const std::vector<std::shared_ptr<const NativeSyncChild>>& children,
     const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful_children,
-    bool retain_incoming_diagnostics) {
+    bool retain_incoming_diagnostics, bool automatic_children) {
   CHECK(function && function->ir_stage_ == FunctionIRStage::Buffer)
       << "Conservative synchronization requires Buffer IR";
   CHECK(function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV)
       << "Conservative synchronization requires an owned local AIC/AIV domain";
   backend::RequireLocalSyncExecutionContract(target);
   RequireBufferRuntimeValid(function);
-  Builder builder(function, target, children, eventful_children, retain_incoming_diagnostics);
+  CHECK(!automatic_children || (children.empty() && eventful_children.empty()))
+      << "Automatic child selection cannot replace explicitly supplied child capabilities";
+  AutomaticSyncChildren selection;
+  std::vector<std::shared_ptr<const EventfulSyncChild>> selected = eventful_children;
+  if (automatic_children) {
+    selection = PrepareAutomaticSyncChildren(function, target);
+    for (const auto& attempt : selection.attempts)
+      if (attempt.child) selected.push_back(attempt.child);
+  }
+  Builder builder(function, target, children, selected, retain_incoming_diagnostics);
   builder.Build();
   auto exit = builder.Solve();
   builder.cost.retained_facts = exit.size();
@@ -759,6 +768,6 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
   builder.cost.parent_links = builder.cost.statements ? builder.cost.statements - 1 : 0;
   return ConservativeSyncAnalysis(function, builder.PrimitiveSites(), std::move(exit), builder.cost,
                                   std::move(parents), std::move(builder.children), std::move(builder.domains),
-                                  retain_incoming_diagnostics, builder.disjoint_gm_);
+                                  retain_incoming_diagnostics, builder.disjoint_gm_, std::move(selection));
 }
 }  // namespace pypto::ir::sync

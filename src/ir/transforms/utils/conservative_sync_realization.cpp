@@ -179,6 +179,20 @@ FunctionPtr InsertConservativePrefixes(const ConservativeSyncAnalysis& analysis)
   reported->attrs_.emplace_back(kAttrAutosyncAnalysisPolicy, std::string("conservative_prefix"));
   reported->attrs_.emplace_back(kAttrAutosyncAccessPrecision, std::string("qualified_storage_enclosures"));
   reported->attrs_.emplace_back(kAttrAutosyncRealizationOrder, std::string("preserves_selected_token_order"));
+  // Reporting only: the immutable analysis owns the actual mathematics and
+  // original scopes. LowerSync never treats these counters as certificates.
+  const auto& selection = analysis.ChildSelection();
+  reported->attrs_.emplace_back("autosync_child_attempt_count", static_cast<int>(selection.attempts.size()));
+  reported->attrs_.emplace_back("autosync_retained_child_count",
+                                static_cast<int>(analysis.ChildEntries().size()));
+  std::string refusals;
+  for (const auto& attempt : selection.attempts) {
+    if (attempt.child) continue;
+    if (!refusals.empty()) refusals += "\n";
+    refusals += attempt.scope->loop_var_->name_hint_ + ": " + EventfulSyncChildStageName(attempt.stage) +
+                ": " + attempt.reason;
+  }
+  if (!refusals.empty()) reported->attrs_.emplace_back("autosync_child_refusals", refusals);
   return reported;
 }
 }  // namespace pypto::ir::sync

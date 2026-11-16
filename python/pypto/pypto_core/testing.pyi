@@ -359,6 +359,7 @@ def analyze_conservative_sync(
     *,
     children: list[NativeSyncChild] = [],
     retain_incoming_diagnostics: bool = True,
+    automatic_children: bool = False,
 ) -> dict[str, Any]:
     """Qualify structured no-KILL effects/readiness without insertion.
 

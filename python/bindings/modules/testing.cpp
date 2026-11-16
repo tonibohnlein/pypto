@@ -1513,9 +1513,9 @@ void BindTesting(nb::module_& m) {
       "analyze_conservative_sync",
       [](const ir::FunctionPtr& function, const std::string& target,
          const std::vector<std::shared_ptr<const ir::sync::NativeSyncChild>>& children,
-         bool retain_incoming_diagnostics) {
-        const auto analysis =
-            ir::sync::AnalyzeConservativeSync(function, target, children, {}, retain_incoming_diagnostics);
+         bool retain_incoming_diagnostics, bool automatic_children) {
+        const auto analysis = ir::sync::AnalyzeConservativeSync(
+            function, target, children, {}, retain_incoming_diagnostics, automatic_children);
         auto facts = [](const ir::sync::ConservativeAccessSet& accesses) {
           nb::list result;
           for (const auto& [space, pipe, write, domain] : accesses) {
@@ -1585,6 +1585,36 @@ void BindTesting(nb::module_& m) {
           child_entries.append(entry);
         }
         result["children"] = child_entries;
+        const auto& selection = analysis.ChildSelection();
+        nb::list attempts;
+        for (const auto& attempt : selection.attempts) {
+          nb::dict record;
+          record["scope"] = attempt.scope;
+          record["stage"] = ir::sync::EventfulSyncChildStageName(attempt.stage);
+          record["reason"] = attempt.reason;
+          record["mathematics"] = attempt.mathematics ? nb::cast(*attempt.mathematics) : nb::none();
+          record["child"] = attempt.child ? nb::cast(attempt.child) : nb::none();
+          record["scope_nodes"] = attempt.binding_work.scope_nodes;
+          record["expression_nodes"] = attempt.binding_work.expression_nodes;
+          record["binding_definitions"] = attempt.binding_work.binding_definitions;
+          record["ancestor_links"] = attempt.binding_work.ancestor_links;
+          record["logical_index_nodes"] = attempt.binding_work.logical_index_nodes;
+          record["effect_statements"] = attempt.effect_work.statements;
+          record["effect_expressions"] = attempt.effect_work.expressions;
+          record["native_qualifications"] = attempt.effect_work.native_qualifications;
+          record["logical_record_sites"] = attempt.logical_record_sites;
+          record["logical_wait_sites"] = attempt.logical_wait_sites;
+          record["physical_qualification"] = "pending_whole_plan";
+          nb::dict seconds;
+          for (const auto& [phase, elapsed] : attempt.seconds)
+            seconds[ir::sync::EventfulSyncChildStageName(phase)] = elapsed;
+          record["seconds"] = seconds;
+          attempts.append(record);
+        }
+        result["child_attempts"] = attempts;
+        counters["child_discovery_nodes"] = selection.discovery_nodes;
+        counters["child_index_nodes"] = selection.index_nodes;
+        counters["child_parameter_nodes"] = selection.parameter_nodes;
         result["exit_effects"] = facts(analysis.ExitEffects());
         result["cost"] = counters;
         nb::list domains;
@@ -1610,7 +1640,7 @@ void BindTesting(nb::module_& m) {
       },
       nb::arg("function"), nb::arg("target") = "a2a3", nb::kw_only(),
       nb::arg("children") = std::vector<std::shared_ptr<const ir::sync::NativeSyncChild>>{},
-      nb::arg("retain_incoming_diagnostics") = true,
+      nb::arg("retain_incoming_diagnostics") = true, nb::arg("automatic_children") = false,
       "Qualify conservative effects/readiness; incoming history is an optional diagnostic export");
   testing.def(
       "insert_conservative_prefixes",
