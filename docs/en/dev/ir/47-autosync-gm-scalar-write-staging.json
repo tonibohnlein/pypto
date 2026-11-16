@@ -1,0 +1,103 @@
+{
+  "status": "design accepted with selected-TSTORE native qualification; implementation and validation pending",
+  "date": "2026-11-16",
+  "baseline_head": "34b7b551871975e9b93dabbd89a98a39554b7ef2",
+  "parent_milestones": [
+    "M2 operation contracts",
+    "M3 executable local synchronization"
+  ],
+  "dependencies": [
+    "43 local scalar write contract",
+    "44 private GM scalar-read carrier and immutable stager"
+  ],
+  "native_pin": "5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f",
+  "contract": {
+    "target": "A2/A3 AIV",
+    "policy": "Buffer IR and autosync enabled; conservative_prefix only",
+    "original": "direct Eval or assigned tensor.write on ordinary packed unpadded ND rank-one INT32 GM",
+    "preserved": [
+      "original root and ABI rank",
+      "original ready index/value and machine semantics",
+      "statement execution cut and control",
+      "assigned result alias and parameter direction"
+    ],
+    "carrier": {
+      "space": "Vec",
+      "dtype": "INT32",
+      "physical_shape": [
+        1,
+        8
+      ],
+      "valid_shape": [
+        1,
+        1
+      ],
+      "allocation_bytes": 32,
+      "reuse": "existing S/MTE3 ordering per executed visit"
+    },
+    "destination_write_bytes": 4,
+    "address_premise": "original defined in-bounds nonwrapping access; no guessed bounds",
+    "assigned_result": "same original destination storage, not copy",
+    "external_visibility": "none inferred"
+  },
+  "native_gates": [
+    "write-specific selected TSTORE supports four-byte GM write at element-aligned offsets",
+    "no adjacent GM read-modify-write/overwrite",
+    "qualified S SetValue to MTE3 visibility and completion before carrier rewrite",
+    "padding cannot affect transferred value or destination bytes"
+  ],
+  "source_findings": {
+    "stager": "StageBufferScalarReads handles direct Assign reads and currently skips Eval",
+    "rank_one_contract": "native/codegen currently require load; directional store proof absent",
+    "original_effect": "tensor.write declares scalar WriteChannel and aliases argument zero",
+    "existing_early_refusal": "gm_access rejects mixed scalar/MTE3 writes to one root before candidate staging"
+  },
+  "existing_owners": [
+    "buffer_scalar_recipes",
+    "buffer_scalar_staging",
+    "SelectBufferIRFunctions",
+    "Buffer memory deduction",
+    "LowerTileToBuffer",
+    "PTO Buffer codegen",
+    "buffer_sync_contract",
+    "existing operation-effect and result-alias services"
+  ],
+  "refusals": [
+    "unknown attrs/kwargs or atomic/publication variants",
+    "peer/distributed tensors",
+    "unsupported dtype/core/layout",
+    "unready index/value",
+    "nested effectful write without original statement cut",
+    "existing mixed scalar-D-cache/MTE3 root conflict",
+    "missing justified selected-TSTORE byte-length/alignment/visibility contract"
+  ],
+  "validation_required": [
+    "independent value and exact GM byte oracle with adjacent poison",
+    "Eval and assigned alias/recurrence behavior",
+    "zero/multiple/skipped visits and outer resets",
+    "actual commands, matching, acyclicity, physical consumption-before-reuse, final drain",
+    "PYPTO/DSA/PTOAS real C++ plus disabled/exact/refusal paths",
+    "shared-DAG and runtime-trip-independent construction",
+    "existing scalar suites and original model capture"
+  ],
+  "complexity_scope": "one private carrier and constant added operations per static staged write; original statement occurrences/distinct expression/type nodes; not a whole-compiler bound",
+  "tests_run": [],
+  "device_validation": false,
+  "implementation_complete": false,
+  "nonclaims": [
+    "peer or cross-core publication",
+    "atomicity or deterministic races",
+    "exact GM selector export",
+    "minimum demands or IDs",
+    "complete model ownership",
+    "device speedup"
+  ],
+  "native_source_snapshots": {
+    "build-py314/packed-column-contract/tstore_common.hpp": "d1ea6f21d2bfb88b6d0f20d28036180a814c773be41a2b0ae758599d68c7005f",
+    "build-py314/packed-column-contract/TStore.hpp": "5ac8b76106cdfa77e182d062453b7b4b2c447917113393415e032becedd697aa"
+  },
+  "native_source_finding": "TStoreUb2gmNd2nd yields nBurst1,lenBurst4 for unit INT32 view; A2/A3 TStoreUb2gmInstr selects copy_ubuf_to_gm_align_b32. Normative selected-TSTORE premise retained; private CCE/public-API correspondence not independently reproduced.",
+  "early_channel_candidate_contract": "Initial late-only staging preserves mixed-root rejection. Any support for an originally mixed root requires complete qualified immutable staging before gm_access channel classification, actual candidate effects, original rollback owner through whole-function admission, and refusal of unstaged/unproved mixtures; no channel tag override.",
+  "native_qualification": "Refuse without a justified selected-TSTORE contract. The private CCE/public-API correspondence remains unverified under the existing normative selected-TSTORE premise, as in design44; lack of independent mapping reproduction alone does not invalidate that premise.",
+  "implementation_scope": "Late-selection staging only; preserve all existing early mixed-root channel refusals. No early candidate relocation is approved in this increment."
+}
