@@ -417,3 +417,30 @@ def test_completed_alias_chain_is_eliminated_before_ownership(payloads, optimize
     assert "empty_alias" not in str(physical)
     parameters = {3: 3, 4: 2, 5: 1} if payloads else {0: 3, 1: 2, 2: 1}
     check_closed_commands(logical, physical, parameters, range(8), compare_commands=False)
+
+
+@pytest.mark.parametrize("depth", [0, 28])
+def test_closed_lowering_preserves_shared_signature_metadata(depth):
+    """Signatures stay original even when rewriting a command-bearing body."""
+    original = command_fixture()
+    length = ir.Var("length", ir.ScalarType(ir.DataType.INDEX), SPAN)
+    extent = length
+    for _ in range(depth):
+        extent = ir.Min(extent, extent, ir.DataType.INDEX, SPAN)
+    tensor = ir.Var("metadata_only", ir.TensorType([extent, ci(8)], ir.DataType.FP32), SPAN)
+    logical = ir.Function(
+        original.name,
+        [*original.params, length, tensor],
+        original.return_types,
+        original.body,
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    verify(logical)
+    physical = lower(logical)
+    verify(physical)
+    assert physical.params[-1].same_as(tensor)
+    result_type = physical.params[-1].type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.shape[0].same_as(extent)

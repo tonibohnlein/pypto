@@ -201,3 +201,10 @@ def test_one_call_root_distinguishes_ordinary_operand_from_hidden_attribute():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_direct_buffer_call_cannot_borrow_statement_role_in_result_metadata():
+    scalar = ir.Call(ir.Op("buffer.get_block_idx"), [], {}, None, INDEX, SPAN)
+    result = ir.Var("result", ir.TensorType([scalar, ci(8)], ir.DataType.FP32), SPAN)
+    diagnostics = verify(program([ir.AssignStmt(result, scalar, SPAN)]))
+    assert any("require a direct AssignStmt" in item.message for item in diagnostics)

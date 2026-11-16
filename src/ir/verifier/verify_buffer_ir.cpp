@@ -189,7 +189,8 @@ class BufferIRVisitor : public IRVisitor {
       Error("Logical tile operation '" + name + "' remains in buffer IR", op->span_);
     } else if (buffer_stage) {
       const bool produces_result = registry.GetEntry(name).GetOutputArity() != 0;
-      if (statement_call_ != op.get() || statement_assigns_result_ != produces_result) {
+      if (!attribute_context_.empty() || statement_call_ != op.get() ||
+          statement_assigns_result_ != produces_result) {
         Error(
             "Buffer operations with SSA results require a direct AssignStmt; "
             "zero-result buffer operations require a direct EvalStmt",
