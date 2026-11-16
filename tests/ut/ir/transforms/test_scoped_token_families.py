@@ -19,6 +19,7 @@ from pypto.ir.op import sync
 
 from .sync_matmul_oracle import hardware_reference, integer, interpret
 from .test_collective_sync_realization import nested_collective, repeat_collective
+from .test_logical_sync_realization import verify
 from .test_nested_phase_sync import nested_matrix_fixture
 from .test_nested_sync_repetition import resident_pipeline_tree
 from .test_scoped_logical_sync import wrapped_collective
@@ -403,9 +404,34 @@ def test_unsupported_equations_refuse_without_mutation(mode):
 @pytest.mark.parametrize("mode", ["record_cut", "wait_cut", "intermediate_capture"])
 def test_unsupported_cuts(mode):
     logical = _apply(passes.insert_sync, wrapped_collective(3))
+    verify(logical)
 
     class Invalid(ir.IRMutator):
         done = False
+
+        # This fixture changes cuts only. Generic container mutation can
+        # remap carry/capture bindings while our leaf hooks retain original
+        # Assigns; that tests malformed SSA rather than unsupported cuts.
+        def visit_for_stmt(self, op):
+            return ir.ForStmt(
+                op.loop_var,
+                op.start,
+                op.stop,
+                op.step,
+                op.iter_args,
+                self.visit_stmt(op.body),
+                op.return_vars,
+                op.span,
+                kind=op.kind,
+                attrs=dict(op.attrs),
+                hardware_loop_policy=op.hardware_loop_policy,
+            )
+
+        def visit_yield_stmt(self, op):
+            return op
+
+        def visit_return_stmt(self, op):
+            return op
 
         def scalar(self, span):
             var = ir.Var("intervening", ir.ScalarType(ir.DataType.INDEX), span)
@@ -435,11 +461,29 @@ def test_unsupported_cuts(mode):
 
                     wait = ir.EvalStmt(sync.wait(op.return_vars[0], ir.PipeType.MTE2), op.span)
                     return ir.SeqStmts([op, wait], op.span)
-            return super().visit_if_stmt(op)
+            return ir.IfStmt(
+                op.condition,
+                self.visit_stmt(op.then_body),
+                self.visit_stmt(op.else_body) if op.else_body is not None else None,
+                op.return_vars,
+                op.span,
+            )
 
     edit = Invalid()
-    invalid = edit.visit_function(logical)
+    invalid = ir.Function(
+        logical.name,
+        list(zip(logical.params, logical.param_directions, strict=True)),
+        logical.return_types,
+        edit.visit_stmt(logical.body),
+        logical.span,
+        logical.func_type,
+        attrs=dict(logical.attrs),
+        ir_stage=logical.ir_stage,
+    )
     assert edit.done
+    # The parser refusal below must be a capability refusal on valid actual
+    # token IR, never an accidental SSA failure matched by a function dump.
+    verify(invalid)
     with pytest.raises(ValueError, match="cut|wait|Wait|capture|Scalar"):
         testing.inspect_scoped_token_families(invalid)
 
@@ -668,3 +712,62 @@ def test_retained_protocol_rejects_an_equivalent_but_different_token_owner():
     ir.assert_structural_equal(logical, replacement)
     with pytest.raises(ValueError, match="different token IR"):
         order.validate_token_owner(replacement)
+
+
+@pytest.mark.parametrize("payload", [False, True])
+def test_guarded_nonempty_loop_with_only_completed_token_carry_refuses_before_import(payload):
+    span = ir.Span.unknown()
+    condition = ir.Var("condition", ir.ScalarType(ir.DataType.BOOL), span)
+    completed_call = sync.completed(ir.PipeType.MTE2)
+    completed = ir.Var("completed", completed_call.type, span)
+    carried = ir.IterArg("carried", completed.type, completed, span)
+    returned = ir.Var("returned", completed.type, span)
+    index = ir.Var("index", ir.ScalarType(ir.DataType.INDEX), span)
+    destination = ir.Var("destination", ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec), span)
+    if payload:
+        effect = ir.EvalStmt(
+            ir.Call(
+                ir.get_op("buffer.full"),
+                [ir.ConstFloat(1.0, ir.DataType.FP32, span), destination],
+                {},
+                None,
+                ir.VoidType(),
+                span,
+            ),
+            span,
+        )
+    else:
+        effect = ir.AssignStmt(
+            ir.Var("scalar", index.type, span), ir.ConstInt(0, ir.DataType.INDEX, span), span
+        )
+    loop = ir.ForStmt(
+        index,
+        ir.ConstInt(0, ir.DataType.INDEX, span),
+        ir.ConstInt(2, ir.DataType.INDEX, span),
+        ir.ConstInt(1, ir.DataType.INDEX, span),
+        [carried],
+        ir.SeqStmts([effect, ir.YieldStmt([carried], span)], span),
+        [returned],
+        span,
+    )
+    branch = ir.IfStmt(condition, loop, None, [], span)
+    function = ir.Function(
+        "GuardedCarryCut",
+        [condition, destination],
+        [],
+        ir.SeqStmts([ir.AssignStmt(completed, completed_call, span), branch, ir.ReturnStmt(span)], span),
+        span,
+        ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    verify(function)
+    snapshot = ir.serialize(ir.Program([function], "GuardedCarryCut", span))
+    # There are no record/wait statements to trigger an erasure counter: the
+    # token loop binders and Yield operands must also mark structural removal.
+    with pytest.raises(ValueError, match="guarded logical-token cut"):
+        testing.inspect_scoped_token_families(function)
+    assert ir.serialize(ir.Program([function], "GuardedCarryCut", span)) == snapshot
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

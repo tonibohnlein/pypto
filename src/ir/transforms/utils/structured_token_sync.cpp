@@ -71,10 +71,14 @@ class Erase : public IRMutator {
     return RewriteSyncSequence(op, [this](const StmtPtr& child) { return VisitStmt(child); });
   }
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
-    return As<SyncTokenType>(op->var_->GetType()) ? Empty(op->span_) : op;
+    if (!As<SyncTokenType>(op->var_->GetType())) return op;
+    ++erased_tokens_;
+    return Empty(op->span_);
   }
   StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
-    return IsOp(As<Call>(op->expr_), "sync.wait") ? Empty(op->span_) : op;
+    if (!IsOp(As<Call>(op->expr_), "sync.wait")) return op;
+    ++erased_tokens_;
+    return Empty(op->span_);
   }
   StmtPtr VisitStmt_(const IfStmtPtr& op) override {
     for (const auto& result : op->return_vars_) {
@@ -82,11 +86,18 @@ class Erase : public IRMutator {
       CHECK(op->return_vars_.size() == 1 && op->else_body_ && TokenYield(op->then_body_) &&
             TokenYield(*op->else_body_))
           << "Token capture cannot contain payload or scalar effects";
+      ++erased_tokens_;
       return Empty(op->span_);  // Pure token selection; the parser must qualify its recurrence.
     }
+    const size_t before = erased_tokens_;
     auto body = VisitStmt(op->then_body_);
     auto other = op->else_body_ ? VisitStmt(*op->else_body_) : nullptr;
     if (EmptyBody(body) && (!other || EmptyBody(other))) return Empty(op->span_);
+    // Keeping the original macro after stripping only part of its arms would
+    // resurrect token uses whose enclosing carries were removed. Refuse this
+    // unsupported cut before importing the erased payload; never publish invalid SSA.
+    CHECK_SPAN(erased_tokens_ == before, op->span_)
+        << "Scalar or payload effects in a guarded logical-token cut are unavailable";
     // Non-token branches remain original macros, including both arms.
     return op;
   }
@@ -99,6 +110,7 @@ class Erase : public IRMutator {
       const bool token = static_cast<bool>(As<SyncTokenType>(op->iter_args_[i]->GetType()));
       CHECK(token == static_cast<bool>(As<SyncTokenType>(op->return_vars_[i]->GetType())))
           << "Token loop argument/result kinds disagree";
+      if (token) ++erased_tokens_;
       if (!token) {
         arguments.push_back(op->iter_args_[i]);
         results.push_back(op->return_vars_[i]);
@@ -116,14 +128,20 @@ class Erase : public IRMutator {
   }
   StmtPtr VisitStmt_(const YieldStmtPtr& op) override {
     std::vector<ExprPtr> values;
-    for (const auto& value : op->value_)
-      if (!As<SyncTokenType>(value->GetType())) values.push_back(value);
+    for (const auto& value : op->value_) {
+      if (As<SyncTokenType>(value->GetType())) {
+        ++erased_tokens_;
+      } else {
+        values.push_back(value);
+      }
+    }
     return std::make_shared<YieldStmt>(values, op->span_, op->leading_comments_);
   }
 
  private:
   bool active_ = false;
   bool allow_nested_;
+  size_t erased_tokens_ = 0;
 };
 enum class BindingKind { Completed, Current, Previous, Final, Captured };
 struct Binding {

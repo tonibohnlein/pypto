@@ -23,6 +23,7 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
+#include "pypto/ir/verifier/expression_use_cache.h"
 #include "pypto/ir/verifier/verification_error.h"
 #include "pypto/ir/verifier/verifier.h"
 
@@ -74,6 +75,12 @@ class UseAfterDefChecker : public IRVisitor {
     if (inserted && lexical_scopes_) introduced_definitions_.push_back(var);
   }
 
+ public:
+  void VisitExpr(const ExprPtr& expression) override {
+    auto use = expression_uses_.Enter(expression, visiting_type_ ? "type metadata" : "ordinary use");
+    if (use.inspect()) IRVisitor::VisitExpr(expression);
+  }
+
  protected:
   void VisitExpr_(const WindowBufferPtr& op) override {
     // Window sizes are uses at each lexical site, even for shared windows.
@@ -97,7 +104,7 @@ class UseAfterDefChecker : public IRVisitor {
     // don't contain further view expressions, but the flag ensures safety.
     if (!visiting_type_) {
       visiting_type_ = true;
-      var_collectors::VisitTypeExprFields(*this, op->GetType());
+      var_collectors::VisitTypeExprFieldsOnce(*this, op->GetType());
       visiting_type_ = false;
     }
   }
@@ -271,6 +278,7 @@ class UseAfterDefChecker : public IRVisitor {
   std::string func_name_;
   bool lexical_scopes_;
   bool visiting_type_ = false;
+  verifier_detail::ExpressionUseCache expression_uses_;
 };
 
 class UseAfterDefPropertyVerifierImpl : public PropertyVerifier {

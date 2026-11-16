@@ -18,6 +18,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/verifier/expression_use_cache.h"
 #include "pypto/ir/verifier/verifier.h"
 
 namespace pypto {
@@ -34,6 +35,11 @@ namespace {
 /// ObjectKind, so it never dispatches into this handler.
 class ManualDepsOnSubmitOnlyChecker : public IRVisitor {
  public:
+  void VisitExpr(const ExprPtr& expression) override {
+    auto use = expression_uses_.Enter(expression);
+    if (use.inspect()) IRVisitor::VisitExpr(expression);
+  }
+
   ManualDepsOnSubmitOnlyChecker(std::vector<Diagnostic>& diagnostics, const std::string& func_name)
       : diagnostics_(diagnostics), func_name_(func_name) {}
 
@@ -63,6 +69,7 @@ class ManualDepsOnSubmitOnlyChecker : public IRVisitor {
   }
 
  private:
+  verifier_detail::ExpressionUseCache expression_uses_;
   std::vector<Diagnostic>& diagnostics_;
   const std::string& func_name_;
 };

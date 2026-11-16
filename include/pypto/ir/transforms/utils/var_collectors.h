@@ -176,14 +176,15 @@ inline std::unordered_set<const Var*> CollectStmtDefinedVars(const StmtPtr& stmt
 /// Allocation bases, resolved byte offsets and window descriptors deliberately
 /// remain outside this contract. Metadata validators use the shallow enumerator
 /// directly when they must inspect those additional fields.
-inline void VisitTypeExprFields(IRVisitor& visitor, const TypePtr& type) {
-  if (!type) return;
+inline void VisitTypeExprFieldsImpl(IRVisitor& visitor, const TypePtr& type,
+                                    std::unordered_set<const Type*>* seen) {
+  if (!type || (seen && !seen->insert(type.get()).second)) return;
   // Keep the existing SSA contract restricted to tensor, tile and tuple types;
   // the broader metadata enumerator also accepts bare ShapedType.
   if (!AsTensorTypeLike(type) && !As<TileType>(type) && !As<TupleType>(type)) return;
 
   type_metadata::ForEachTypeMetadataChild(
-      type, [&visitor](const TypePtr& element) { VisitTypeExprFields(visitor, element); },
+      type, [&visitor, seen](const TypePtr& element) { VisitTypeExprFieldsImpl(visitor, element, seen); },
       [&visitor](const ExprPtr& expression) { visitor.VisitExpr(expression); },
       [&visitor](const ExprPtr& descriptor) {
         if (!As<MemRef>(descriptor)) return;
@@ -196,12 +197,36 @@ inline void VisitTypeExprFields(IRVisitor& visitor, const TypePtr& type) {
       });
 }
 
+inline void VisitTypeExprFields(IRVisitor& visitor, const TypePtr& type) {
+  VisitTypeExprFieldsImpl(visitor, type, nullptr);
+}
+
+inline void VisitTypeExprFieldsOnce(IRVisitor& visitor, const TypePtr& type) {
+  std::unordered_set<const Type*> seen;
+  VisitTypeExprFieldsImpl(visitor, type, &seen);
+}
+
 /// Collect all Var pointers from a type's expression fields (shape, view, etc.).
 /// Operates on types (not IR statements), so kept as a free function.
 inline std::unordered_set<const Var*> CollectTypeVars(const TypePtr& type) {
-  VarDefUseCollector collector;
-  VisitTypeExprFields(collector, type);
-  return collector.var_uses;
+  // This API returns a set, not an occurrence list. Its request-local graph
+  // cache is context independent; general VarDefUseCollector remains unchanged.
+  class TypeVars : public IRVisitor {
+   public:
+    std::unordered_set<const Var*> variables;
+    void VisitExpr(const ExprPtr& expression) override {
+      if (expression && seen_.insert(expression.get()).second) IRVisitor::VisitExpr(expression);
+    }
+
+   protected:
+    void VisitExpr_(const VarPtr& variable) override { variables.insert(variable.get()); }
+    void VisitExpr_(const IterArgPtr& variable) override { variables.insert(variable.get()); }
+
+   private:
+    std::unordered_set<const Expr*> seen_;
+  } collector;
+  VisitTypeExprFieldsOnce(collector, type);
+  return collector.variables;
 }
 
 // ============================================================================

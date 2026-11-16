@@ -36,6 +36,7 @@
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
+#include "pypto/ir/verifier/expression_use_cache.h"
 #include "pypto/ir/verifier/verification_error.h"
 #include "pypto/ir/verifier/verifier.h"
 #include "src/ir/transforms/utils/var_value_collector.h"
@@ -124,6 +125,7 @@ class TypeChecker : public IRVisitor {
   std::unordered_map<const Var*, std::vector<ExprPtr>> var_values_;
   std::unordered_set<const Var*> func_params_;
   bool var_values_built_ = false;
+  verifier_detail::ExpressionUseCache expression_uses_;
   /// Memoized ``ClassifyNzDispatchArg`` result per Var.
   std::unordered_map<const Var*, NzDispatchArg> nz_dispatch_args_;
 
@@ -209,6 +211,8 @@ void TypeChecker::VisitFunction(const FunctionPtr& func) {
 
 void TypeChecker::VisitExpr(const ExprPtr& expr) {
   if (!expr) return;
+  auto use = expression_uses_.Enter(expr);
+  if (!use.inspect()) return;
 
   std::string context = expr->TypeName() + " expression";
   if (auto var = AsVarLike(expr)) {

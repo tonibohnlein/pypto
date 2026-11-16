@@ -40,6 +40,7 @@ namespace {
 /// value to agree with.
 class AssignCountVisitor : public IRVisitor {
  public:
+  void VisitExpr(const ExprPtr&) override {}
   explicit AssignCountVisitor(const std::vector<VarPtr>& params) {
     // A parameter is already defined on entry; its first assignment is a
     // pre-SSA rebind, even when it is the only AssignStmt targeting that Var.
@@ -81,6 +82,7 @@ class AssignCountVisitor : public IRVisitor {
 /// (see its comment): a rebound Var has no single defining value to agree with.
 class AssignTypeSymmetryVisitor : public IRVisitor {
  public:
+  void VisitExpr(const ExprPtr&) override {}
   AssignTypeSymmetryVisitor(std::vector<Diagnostic>& diagnostics, std::string func_name,
                             const std::unordered_map<const Var*, size_t>& assign_counts)
       : diagnostics_(diagnostics), func_name_(std::move(func_name)), assign_counts_(assign_counts) {}
