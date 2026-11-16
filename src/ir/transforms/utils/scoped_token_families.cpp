@@ -129,7 +129,8 @@ class Parser {
             << "Scoped token payload anchors must be distinct";
     }
     Register(*input.region_tree);
-    block_ = DominatingSyncBlock(function);
+    block_ = input.invocation_coordinate ? input.invocation_coordinate->Expression()
+                                         : DominatingSyncBlock(function);
     for (const auto& [original, erased] : stripped) {
       // Import deliberately omits bodies of proved zero-trip frames. A
       // reachable missing frame is still rejected by Read, before its body.

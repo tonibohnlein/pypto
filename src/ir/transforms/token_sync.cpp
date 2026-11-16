@@ -189,9 +189,11 @@ class NativeChildScopeRequests : public IRVisitor {
 
 FunctionPtr InsertLogicalSync(const FunctionPtr& function, const std::string& target,
                               const sync::SyncParameterBounds& parameters,
-                              std::optional<std::pair<int64_t, int64_t>> blocks) {
+                              std::optional<std::pair<int64_t, int64_t>> blocks,
+                              std::optional<int64_t> launch_count) {
   if (blocks) {
-    const auto invocation = sync::AnalyzeSyncInvocation(function, true, target, parameters, *blocks);
+    const auto invocation =
+        sync::AnalyzeSyncInvocation(function, true, target, parameters, *blocks, launch_count);
     return invocation.cases.size() == 1
                ? sync::RealizeCompactSync(*invocation.cases.front().mathematics).function
                : sync::RealizeLogicalInvocation(invocation).function;
@@ -336,7 +338,7 @@ Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accept
           const auto blocks =
               block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second);
           function = InsertLogicalSync(BindLaunchCount(function, FixedLaunchCount(evidence, global->name_)),
-                                       target, parameters, blocks);
+                                       target, parameters, blocks, FixedLaunchCount(evidence, global->name_));
           sync::CheckGeneratedLogicalSync(function);
         }
         return std::make_shared<Program>(functions, program->name_, program->span_);
@@ -381,8 +383,9 @@ Pass LowerSync(bool require_whole_module) {
           const bool payloads =
               require_whole_module &&
               sync::QualifyLocalSyncInvocation(function, context->GetBackendHandler()->GetPtoTargetArch());
-          auto result = sync::LowerLogicalSync(function, context->GetBackendHandler()->GetPtoTargetArch(),
-                                               std::nullopt, parameters, blocks);
+          auto result = sync::LowerLogicalSync(
+              function, context->GetBackendHandler()->GetPtoTargetArch(), std::nullopt, parameters, blocks,
+              {}, sync::SyncExternalPolicy::Geometry, FixedLaunchCount(evidence, global->name_));
           // Default deployment still delegates plans lacking literal flags.
           // The explicit request also qualifies resource-empty/native-only
           // plans. A genuinely empty program has no asynchronous exit debt.
@@ -445,11 +448,13 @@ Pass RealizeSync(bool require_whole_module) {
       // so this transaction may reuse its own freshly collected evidence.
       const auto logical =
           prefix ? sync::InsertConservativePrefixes(sync::AnalyzeConservativeSync(function, target))
-                 : InsertLogicalSync(BindLaunchCount(function, block_count), target, bounds, block_bounds);
+                 : InsertLogicalSync(BindLaunchCount(function, block_count), target, bounds, block_bounds,
+                                     block_count);
       sync::CheckGeneratedLogicalSync(logical);
       const auto optimized = sync::OptimizeLogicalSync(logical);
       sync::CheckGeneratedLogicalSync(optimized);
-      const auto physical = sync::LowerLogicalSync(optimized, target, std::nullopt, bounds, block_bounds);
+      const auto physical = sync::LowerLogicalSync(optimized, target, std::nullopt, bounds, block_bounds, {},
+                                                   sync::SyncExternalPolicy::Geometry, block_count);
       // PTOAS recognizes literal flags, not empty plans or barriers, as manual
       // ownership. Do not fabricate a dummy flag or mix partial ownership.
       if (!require_whole_module && (!physical.set_sites || !physical.wait_sites))

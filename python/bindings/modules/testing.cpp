@@ -1275,9 +1275,11 @@ void BindTesting(nb::module_& m) {
       "lower_sync_schedule",
       [](const ir::FunctionPtr& function, const std::string& target,
          const ir::sync::SyncParameterBounds& parameters, std::optional<std::pair<int64_t, int64_t>> blocks,
-         const ir::sync::SyncSchedulePolicy& policy, const std::optional<std::vector<int>>& eligible_ids) {
+         const ir::sync::SyncSchedulePolicy& policy, const std::optional<std::vector<int>>& eligible_ids,
+         std::optional<int64_t> launch_count) {
         const auto result =
-            ir::sync::LowerLogicalSync(function, target, eligible_ids, parameters, blocks, policy);
+            ir::sync::LowerLogicalSync(function, target, eligible_ids, parameters, blocks, policy,
+                                       ir::sync::SyncExternalPolicy::Geometry, launch_count);
         nb::dict out;
         out["function"] = result.function;
         out["set_sites"] = result.set_sites;
@@ -1293,7 +1295,7 @@ void BindTesting(nb::module_& m) {
       nb::arg("function"), nb::arg("target") = "a2a3",
       nb::arg("parameter_bounds") = ir::sync::SyncParameterBounds{}, nb::arg("block_bounds") = nb::none(),
       nb::kw_only(), nb::arg("schedule_policy") = ir::sync::SyncSchedulePolicy{},
-      nb::arg("eligible_ids") = nb::none(),
+      nb::arg("eligible_ids") = nb::none(), nb::arg("launch_count") = nb::none(),
       "Run the production actual-token lowering with explicit current invocation evidence");
   testing.def(
       "analyze_scoped_token_order",
@@ -1430,6 +1432,8 @@ void BindTesting(nb::module_& m) {
             nb::dict out;
             out["block_bounds"] = result.block_bounds;
             out["parameter_bounds"] = result.parameter_bounds;
+            out["effective_coordinate"] =
+                result.coordinate ? nb::cast(result.coordinate->Expression()) : nb::none();
             out["coordinate_nodes"] = result.coordinate_nodes;
             out["coordinate_pieces"] = result.coordinate_pieces;
             nb::list cases;
@@ -1446,11 +1450,14 @@ void BindTesting(nb::module_& m) {
   testing.def(
       "analyze_sync_invocation",
       [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,
-         const ir::sync::SyncParameterBounds& parameters, std::pair<int64_t, int64_t> blocks) {
-        return ir::sync::AnalyzeSyncInvocation(function, disjoint_gm, target, parameters, blocks);
+         const ir::sync::SyncParameterBounds& parameters, std::pair<int64_t, int64_t> blocks,
+         std::optional<int64_t> launch_count) {
+        return ir::sync::AnalyzeSyncInvocation(function, disjoint_gm, target, parameters, blocks,
+                                               launch_count);
       },
       nb::arg("function"), nb::arg("disjoint_gm"), nb::arg("target"), nb::arg("parameter_bounds"),
-      nb::arg("block_bounds"), "Analyze an exhaustive analytic partition of a proved launch domain");
+      nb::arg("block_bounds"), nb::kw_only(), nb::arg("launch_count") = nb::none(),
+      "Analyze an exhaustive analytic partition of a proved launch domain");
   testing.def(
       "describe_buffer_sync_operation",
       [](const ir::CallPtr& call, ir::FunctionType core, const std::string& target) {

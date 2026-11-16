@@ -386,7 +386,6 @@ void CheckGeneratedLogicalSync(const FunctionPtr& function) {
 }
 FunctionPtr OptimizeLogicalSync(const FunctionPtr& function) {
   CheckLogicalSync(function);
-  RequireBufferSyncScalarLayout(function);
   // No logical rewrites are enabled yet. Assigned-ID control optimization is
   // deliberately later, after physical handoffs and resource proofs exist.
   return function;
@@ -395,7 +394,8 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
                                     const std::optional<std::vector<int>>& eligible_ids,
                                     const SyncParameterBounds& parameters,
                                     std::optional<std::pair<int64_t, int64_t>> blocks,
-                                    const SyncSchedulePolicy& policy, SyncExternalPolicy external_policy) {
+                                    const SyncSchedulePolicy& policy, SyncExternalPolicy external_policy,
+                                    std::optional<int64_t> launch_count) {
   CheckLogicalSync(function);
   RequireBufferSyncScalarLayout(function);
   if (!HasLogicalSync(function)) {
@@ -422,7 +422,7 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
   structure.VisitFunction(function);
   if (structure.loop) {
     auto result = LowerStructuredLogicalSync(function, target, eligible_ids, parameters, blocks, policy,
-                                             external_policy);
+                                             external_policy, launch_count);
     CheckPhysicalSyncResult(result.function);
     return result;
   }

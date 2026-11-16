@@ -470,6 +470,13 @@ std::optional<PointBoundary> CompactSyncView::BoundarySlot(size_t storage, int64
   if (storage >= State().input.storage.size() || slot < 0 ||
       slot >= State().input.storage[storage].slot_count)
     return std::nullopt;
+  if (const auto& coordinate = State().input.invocation_coordinate) {
+    if (!block_index) return std::nullopt;
+    block_index = coordinate->Map(*block_index, parameters);
+    if (!block_index || *block_index < State().input.block_bounds->first ||
+        *block_index > State().input.block_bounds->second)
+      return std::nullopt;
+  }
   const auto& domain = State().input.storage[storage];
   if (!domain.boundary_available || State().input.unavailable_storage_spaces.count(domain.space))
     return std::nullopt;

@@ -412,6 +412,8 @@ def analyze_sync_invocation(
     target: str,
     parameter_bounds: dict[int, tuple[int, int]],
     block_bounds: tuple[int, int],
+    *,
+    launch_count: int | None = None,
 ) -> SyncInvocationAnalysis:
     """Construct qualified cases over the entire supplied launch contract."""
     ...
@@ -497,6 +499,7 @@ def lower_sync_schedule(
     *,
     schedule_policy: SyncSchedulePolicy = SyncSchedulePolicy(),
     eligible_ids: list[int] | None = None,
+    launch_count: int | None = None,
 ) -> SyncScheduleLoweringResult:
     """Run production token lowering with explicit current invocation evidence."""
     ...

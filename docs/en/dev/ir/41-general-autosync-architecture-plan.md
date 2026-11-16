@@ -33,8 +33,10 @@ existing manual/runtime/compiler owners and qualify only local boundaries.
 The external review covers `bef68ac84` through `ef3572fd2`. Inspection of the
 current sources supports its four reported defect mechanisms; this plan update
 does not claim a fresh reproduction or adopt its aggregated test counts as our
-own green run. HEAD is `3521d7f64`; the subsequent active-domain, scalar-payload
-and effective-coordinate edits are **paused, uncommitted and unqualified**.
+own green run. At this historical repair-scheduling checkpoint, HEAD was
+`3521d7f64`; the subsequent active-domain, scalar-payload and effective-coordinate
+edits were **paused, uncommitted and unqualified**. The later resume ledger below
+records their subsequent acceptance status.
 Keep those edits intact and separately owned while repairing the reviewed base.
 Do not run the interrupted milestone build or resume coverage work implicitly.
 
@@ -881,8 +883,30 @@ test executions with zero failures; the three resource/native/order C++ tests
 and applicable hooks also pass. See [repair report](42-autosync-review-repairs.md)
 and its machine-readable receipt for proof scope, commands, pins and costs.
 
-The preserved active-domain, scalar, effective-coordinate and local-boundary
-packages remain uncommitted and unqualified. Restore them after this accepted
-repair commit, rebuild coherently, then resume their original individual review
-gates. M1–M6 and whole-Qwen local ownership remain incomplete. R4 adds no general
+At the repair acceptance checkpoint, the preserved active-domain, scalar,
+effective-coordinate and local-boundary packages were still uncommitted and
+unqualified. The next section records the later coherent rebuilds and individual
+review gates; this paragraph preserves the repair-time status. M1–M6 and whole-Qwen local ownership remain incomplete. R4 adds no general
 CFG capability, new allocator, default dispatch or cross-core construction.
+
+## Resumed bounded package gates (2026-11-16)
+
+The earlier paused-work statements are historical. Accepted M2 commit
+`da5f6cd660` adds the qualified active-prefix value normalizer and local UB scalar
+bridge documented in [checkpoint 43](43-autosync-value-and-scalar-contracts.md).
+M4's local-boundary regression-only follow-up is accepted as `7702ad6ab`;
+it adds no new child services or peer synchronization. The GM scalar staging design is separately accepted
+as `c4ba7a142`; design acceptance is not implementation qualification.
+
+| Milestone | Resumed delivery | Remaining original obligation |
+| --------- | ---------------- | ----------------------------- |
+| M2 | Qualified invariant-prefix accumulator normalization, original SSA local scalar access and physical-pitch checks; 152-test isolated gate, source hooks and three CTests pass | Unsupported full observations, operation variants and GM scalar visibility/staging remain separate; no inferred padding or caller bounds |
+| M4 | Accepted regression-only local-boundary follow-up; existing child/owner services unchanged | Existing hand protocols remain their own owners; unproved local readiness, borrowed lifecycle, palettes or boundary exports still refuse |
+| M5 | Provider-owned original `e=(block+r)%B` under an independently proved fixed full launch; original frames/guards/query valuation retained; 72 tests and source hooks pass | One coordinate family only; general symbolic shape relations, carried-state relations, dynamic launch domains and exact GM exports remain incomplete |
+| M6 | Fresh unchanged two-layer prefix capture generates 32 C++ leaves; 47 task-control owners, 17 PyPTO leaves and 15 delegated leaves | Complete local ownership, broader configurations and native/device qualification remain open |
+
+See [checkpoint 45](45-autosync-effective-invocation-coordinate.md) and its receipt
+for the frozen M5 source/build hashes, original-coordinate proof, multitrip
+covers/queries/selectors/reuse checks and retained earlier failures. This slice
+adds no backend, allocator, launch transformation, larger resource pool or
+whole-nest expansion. M5 and the original M1–M6 programme are not complete.
