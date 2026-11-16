@@ -36,6 +36,67 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def qualification_context(
+    policy: str,
+    *,
+    gm_alias_policy: str = "may-alias",
+    gm_contract: Path | None = None,
+    scalar_gm_dma: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build independent policy, alias and native-implementation settings.
+
+    A supplied contract records a caller promise; this host qualifier cannot
+    establish the ABI or infer disjointness from distinct SSA/pointer names.
+    Read its bytes once so the retained promise and its hash describe the same
+    input, including when the original file later changes.
+    """
+    if policy not in {"exact", "conservative_prefix"}:
+        raise ValueError("Unknown autosync policy")
+    if gm_alias_policy not in {"may-alias", "disjoint"}:
+        raise ValueError("Unknown GM alias policy")
+    provenance = None
+    if gm_alias_policy == "disjoint":
+        if gm_contract is None:
+            raise ValueError("Disjoint GM qualification requires --gm-contract caller/ABI provenance")
+        try:
+            contract_path = gm_contract.resolve(strict=True)
+            contents = contract_path.read_bytes()
+            promise = contents.decode("utf-8")
+        except (OSError, UnicodeError) as error:
+            raise ValueError("GM contract must be a readable UTF-8 caller/ABI provenance file") from error
+        if not promise.strip():
+            raise ValueError("GM contract caller/ABI provenance must not be empty")
+        provenance = {
+            "kind": "explicit_caller_promise",
+            "path": str(contract_path),
+            "sha256": hashlib.sha256(contents).hexdigest(),
+            "promise": promise,
+        }
+    elif gm_contract is not None:
+        raise ValueError("--gm-contract requires --gm-alias-policy=disjoint")
+    disjoint = gm_alias_policy == "disjoint"
+    options: dict[str, Any] = {
+        "autosync_policy": policy,
+        "autosync_disjoint_gm": disjoint,
+        "enable_scalar_gm_dma": scalar_gm_dma,
+    }
+    access_contract = {
+        "gm_alias_policy": gm_alias_policy,
+        "autosync_disjoint_gm": disjoint,
+        "provenance": provenance,
+        "scope": (
+            "Supplied disjointness of distinct original external GM roots only; "
+            "same-root overlaps, canonical aliases/views and local physical reuse remain dependencies. "
+            "Unresolved roots require the importer's conservative coverage or refusal."
+            if disjoint
+            else "No distinct-GM-root disjointness supplied; retain may-alias coverage or refusal."
+        ),
+        "qualification": "Caller promise is not an analysis proof and is never inferred from SSA names.",
+        "access_validity": "Original source/caller access-validity preconditions remain required.",
+    }
+    return options, access_contract
+
+
 def static_control_inventory(function: ir.Function) -> dict[str, Any]:
     """Count original syntactic sites without unfolding loops or choosing arms."""
     counts: Counter[str] = Counter()
@@ -183,6 +244,13 @@ def main() -> None:
     parser.add_argument("--sequence", type=int, default=128)
     parser.add_argument("--mode", choices=("pypto", "ptoas"), default="pypto")
     parser.add_argument("--policy", choices=("exact", "conservative_prefix"), default="exact")
+    parser.add_argument(
+        "--gm-alias-policy",
+        choices=("may-alias", "disjoint"),
+        default="may-alias",
+        help="Independent GM alias contract; disjoint requires explicit caller/ABI provenance",
+    )
+    parser.add_argument("--gm-contract", type=Path, help="Pinned UTF-8 caller/ABI disjointness promise")
     parser.add_argument("--require-pypto", action="store_true")
     parser.add_argument("--scalar-gm-dma", action="store_true", help="Explicit DMA scalar implementation")
     parser.add_argument(
@@ -199,6 +267,15 @@ def main() -> None:
     parser.add_argument("--tool-artifact", type=Path, action="append", default=[])
     parser.add_argument("--check-function", action="append", default=[])
     args = parser.parse_args()
+    try:
+        context_options, access_contract = qualification_context(
+            args.policy,
+            gm_alias_policy=args.gm_alias_policy,
+            gm_contract=args.gm_contract,
+            scalar_gm_dma=args.scalar_gm_dma,
+        )
+    except ValueError as error:
+        parser.error(str(error))
     library, output = args.library.resolve(), args.output.resolve()
     if output.exists():
         parser.error("output must be a new directory; stale artifacts cannot establish coverage")
@@ -223,6 +300,8 @@ def main() -> None:
         "configuration": {"layers": args.layers, "sequence": args.sequence, "batch": 1},
         "mode": args.mode,
         "policy": args.policy,
+        "gm_alias_policy": args.gm_alias_policy,
+        "autosync_disjoint_gm": context_options["autosync_disjoint_gm"],
         "enable_scalar_gm_dma": args.scalar_gm_dma,
         "command": sys.argv,
         "python": sys.version,
@@ -238,12 +317,7 @@ def main() -> None:
             key: os.environ.get(key)
             for key in ("PYTHONPATH", "PTOAS_ROOT", "OMP_NUM_THREADS", "PYPTO_CODEGEN_MAX_WORKERS")
         },
-        "access_contract": (
-            "Distinct input GM arguments assumed disjoint; no runtime values inferred"
-            if args.policy == "exact"
-            else "Qualified storage enclosures; no GM disjointness used; "
-            "source access-validity preconditions remain"
-        ),
+        "access_contract": access_contract,
         "device": "not run",
         "passes": [],
         "functions_before_sync": [],
@@ -287,9 +361,7 @@ def main() -> None:
             enable_buffer_ir=True,
             memory_planner=passes.MemoryPlanner.PYPTO,
             enable_pypto_autosync=args.mode == "pypto",
-            autosync_disjoint_gm=args.policy == "exact",
-            autosync_policy=args.policy,
-            enable_scalar_gm_dma=args.scalar_gm_dma,
+            **context_options,
         ):
             module.prefill_fwd.compile(
                 *tensors,
