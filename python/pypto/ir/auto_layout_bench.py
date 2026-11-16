@@ -32,7 +32,7 @@ import json
 import math
 import statistics
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -111,20 +111,89 @@ def _matmul_tiled_nk(
     return c
 
 
-def build_single_matmul_case(
+@pl.jit.incore
+def _matmul_tiled_mk(
+    a: pl.Tensor,
+    b: pl.Tensor,
+    c: pl.Out[pl.Tensor],
+    m_dim: pl.constexpr,
+    red_dim: pl.constexpr,
+    out_cols: pl.constexpr,
+    m_tile: pl.constexpr,
+    red_tile: pl.constexpr,
+) -> pl.Tensor:
+    for m0 in pl.range(0, m_dim, m_tile):
+        initial = pl.tile.create([m_tile, out_cols], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc)
+        for r0, (carry,) in pl.pipeline(0, red_dim, red_tile, init_values=(initial,), stage=2):
+            at = pl.load(a, [m0, r0], [m_tile, red_tile], target_memory=pl.MemorySpace.Mat)
+            bt = pl.load(b, [0, r0], [out_cols, red_tile], target_memory=pl.MemorySpace.Mat)
+            bt_t = pl.tile.transpose_view(bt)
+            cur = pl.tile.matmul_acc(carry, at, bt_t, r0 == 0)
+            acc = pl.yield_(cur)
+        pl.store(acc, [m0, 0], c)  # pyright: ignore[reportPossiblyUnboundVariable]
+    return c
+
+
+@pl.jit.incore
+def _matmul_stationary_a(
+    a: pl.Tensor,
+    b: pl.Tensor,
+    c: pl.Out[pl.Tensor],
+    m_dim: pl.constexpr,
+    red_dim: pl.constexpr,
+    out_cols: pl.constexpr,
+    col_tile: pl.constexpr,
+) -> pl.Tensor:
+    at = pl.load(a, [0, 0], [m_dim, red_dim], target_memory=pl.MemorySpace.Mat)
+    for c0 in pl.range(0, out_cols, col_tile):
+        bt = pl.load(b, [c0, 0], [col_tile, red_dim], target_memory=pl.MemorySpace.Mat)
+        bt_t = pl.tile.transpose_view(bt)
+        acc = pl.matmul(at, bt_t)
+        pl.store(acc, [0, c0], c)
+    return c
+
+
+@pl.jit.incore
+def _matmul_stationary_a_2step(
+    a: pl.Tensor,
+    b: pl.Tensor,
+    c: pl.Out[pl.Tensor],
+    m_dim: pl.constexpr,
+    out_cols: pl.constexpr,
+    red_tile: pl.constexpr,
+    col_tile: pl.constexpr,
+) -> pl.Tensor:
+    at0 = pl.load(a, [0, 0], [m_dim, red_tile], target_memory=pl.MemorySpace.Mat)
+    at1 = pl.load(a, [0, red_tile], [m_dim, red_tile], target_memory=pl.MemorySpace.Mat)
+    for c0 in pl.range(0, out_cols, col_tile):
+        bt0 = pl.load(b, [c0, 0], [col_tile, red_tile], target_memory=pl.MemorySpace.Mat)
+        bt0_t = pl.tile.transpose_view(bt0)
+        acc0 = pl.matmul(at0, bt0_t)
+        bt1 = pl.load(b, [c0, red_tile], [col_tile, red_tile], target_memory=pl.MemorySpace.Mat)
+        bt1_t = pl.tile.transpose_view(bt1)
+        acc = pl.tile.matmul_acc(acc0, at1, bt1_t, False)
+        pl.store(acc, [0, c0], c)
+    return c
+
+
+def build_single_matmul_case(  # noqa: PLR0913
     m_dim: int,
     k_dim: int,
     n_dim: int,
     *,
+    m_tile: int | None = None,
     k_tile: int | None = None,
     n_tile: int | None = None,
+    stationary: str = "output",
+    case_id: str | None = None,
     expected_uses: int = 100,
     seed: int = 0,
 ) -> CalibrationCaseSpec:
     """Build an L0-fitting `C[M, N] = X[M, K] @ W[N, K].T` FP16->FP32 `@pl.jit` workload."""
+    m_step = m_tile if m_tile is not None else m_dim
     k_step = k_tile if k_tile is not None else k_dim
     n_step = n_tile if n_tile is not None else n_dim
-    is_single_tile = k_step == k_dim and n_step == n_dim
+    is_single_tile = m_step == m_dim and k_step == k_dim and n_step == n_dim
 
     @pl.jit
     def matmul_single_entry(
@@ -142,7 +211,38 @@ def build_single_matmul_case(
     ) -> pl.Tensor:
         return _matmul_tiled_nk(x, w, out, m_dim, k_dim, n_dim, k_step, n_step)
 
-    entry_fn = matmul_single_entry if is_single_tile else matmul_tiled_entry
+    @pl.jit
+    def matmul_tiled_mk_entry(
+        x: pl.Tensor,
+        w: pl.Tensor,
+        out: pl.Out[pl.Tensor],
+    ) -> pl.Tensor:
+        return _matmul_tiled_mk(x, w, out, m_dim, k_dim, n_dim, m_step, k_step)
+
+    @pl.jit
+    def matmul_stationary_a_entry(
+        x: pl.Tensor,
+        w: pl.Tensor,
+        out: pl.Out[pl.Tensor],
+    ) -> pl.Tensor:
+        return _matmul_stationary_a(x, w, out, m_dim, k_dim, n_dim, n_step)
+
+    @pl.jit
+    def matmul_stationary_a_2step_entry(
+        x: pl.Tensor,
+        w: pl.Tensor,
+        out: pl.Out[pl.Tensor],
+    ) -> pl.Tensor:
+        return _matmul_stationary_a_2step(x, w, out, m_dim, n_dim, k_step, n_step)
+
+    if stationary == "a":
+        entry_fn = matmul_stationary_a_entry if k_step == k_dim else matmul_stationary_a_2step_entry
+    elif m_step < m_dim:
+        entry_fn = matmul_tiled_mk_entry
+    elif is_single_tile:
+        entry_fn = matmul_single_entry
+    else:
+        entry_fn = matmul_tiled_entry
 
     gen = torch.Generator().manual_seed(seed)
     scale = 0.05 if k_dim >= 1024 else 0.25
@@ -153,8 +253,9 @@ def build_single_matmul_case(
     program = entry_fn.specialize(x_host, w_host, out_stub)
     expected = x_host.float() @ w_host.float().T
 
+    resolved_id = case_id or f"matmul_{m_dim}x{k_dim}x{n_dim}"
     return CalibrationCaseSpec(
-        case_id=f"matmul_{m_dim}x{k_dim}x{n_dim}",
+        case_id=resolved_id,
         program=program,
         inputs=(x_host, w_host),
         expected_output=expected,
@@ -369,14 +470,19 @@ def _extract_swimlane_aicore_us(work_dir: Path) -> float | None:
 def default_a2_calibration_suite(
     *,
     include_chain: bool = True,
+    include_variations: bool = True,
     expected_uses: int = 100,
 ) -> list[CalibrationCaseSpec]:
     """Return a high-volume L0-fitting Ascend A2 (`Ascend910`) calibration workload suite.
 
     Each inner loop step keeps operand tiles <= 32 KiB in L0A/L0B (bypassing
-    `AutoTileMatmulL0`) while outer N/K tiling amplifies GM/L1 MTE2 loads and
-    L0C->GM FIXPIPE stores to 0.5-4.0 MiB per launch across linearly independent
-    (load_bytes, store_bytes, macs) shapes.
+    `AutoTileMatmulL0`) while outer N/K/M tiling amplifies GM/L1 MTE2 loads and
+    L0C->GM FIXPIPE stores across:
+    - Problem-size & aspect-ratio sweeps (`0.5-4.0 MiB` per launch),
+    - Inner `k_tile` granularity sweeps (`64`, `128`, `256` -> `128 B`, `256 B`, `512 B` row width)
+      at fixed `(M, K, N) = (64, 4096, 64)`, and
+    - Stationarity / loop-order variations (L1-hoisted A-stationary `x` vs output-stationary
+      outer-`N` vs outer-`M` B-reused `w`).
     """
     cases = [
         # MTE2 K-accumulation sweep (loads 0.5 MiB -> 2.0 MiB, stores 16-64 KiB)
@@ -390,6 +496,72 @@ def default_a2_calibration_suite(
             128, 1024, 1024, k_tile=128, n_tile=128, expected_uses=expected_uses, seed=5
         ),
     ]
+    if include_variations:
+        cases.extend(
+            [
+                # Tile inner-width sweep on identical 64x4096x64 tensors (128B vs 256B vs 512B L2 line)
+                build_single_matmul_case(
+                    64,
+                    4096,
+                    64,
+                    k_tile=64,
+                    case_id="matmul_64x4096x64_kt64",
+                    expected_uses=expected_uses,
+                    seed=7,
+                ),
+                build_single_matmul_case(
+                    64,
+                    4096,
+                    64,
+                    k_tile=128,
+                    case_id="matmul_64x4096x64_kt128",
+                    expected_uses=expected_uses,
+                    seed=7,
+                ),
+                build_single_matmul_case(
+                    64,
+                    4096,
+                    64,
+                    k_tile=256,
+                    case_id="matmul_64x4096x64_kt256",
+                    expected_uses=expected_uses,
+                    seed=7,
+                ),
+                # Stationarity variations: L1-hoisted A-stationary (`x` loaded once) & outer-M (`w` reused)
+                build_single_matmul_case(
+                    64,
+                    256,
+                    2048,
+                    k_tile=256,
+                    n_tile=64,
+                    stationary="a",
+                    case_id="matmul_64x256x2048_stationary_a",
+                    expected_uses=expected_uses,
+                    seed=3,
+                ),
+                build_single_matmul_case(
+                    128,
+                    256,
+                    2048,
+                    k_tile=128,
+                    n_tile=128,
+                    stationary="a",
+                    case_id="matmul_128x256x2048_stationary_a",
+                    expected_uses=expected_uses,
+                    seed=4,
+                ),
+                build_single_matmul_case(
+                    1024,
+                    1024,
+                    128,
+                    m_tile=128,
+                    k_tile=128,
+                    case_id="matmul_1024x1024x128_outer_m",
+                    expected_uses=expected_uses,
+                    seed=8,
+                ),
+            ]
+        )
     if include_chain:
         # Large chained matmul moving 128 KiB into GM `mid` and reading 2.0 MiB back out.
         cases.append(
@@ -481,24 +653,10 @@ def run_calibration_suite(  # noqa: PLR0913
     # before any enable_chip_swimlane=1 launch redirects host stderr logs away from [STRACE].
     for case in cases:
         case_dir = out_root / case.case_id
-        model_for_case = LayoutCostModel(
+        model_for_case = replace(
+            base_model,
             expected_uses=case.expected_uses,
             backend_type=backend_type,
-            mte2_nz2nz_bytes_per_cycle=base_model.mte2_nz2nz_bytes_per_cycle,
-            mte2_nd2nz_bytes_per_cycle=base_model.mte2_nd2nz_bytes_per_cycle,
-            mte2_nd2nz_row_penalty_cycles=base_model.mte2_nd2nz_row_penalty_cycles,
-            mte2_vec_bytes_per_cycle=base_model.mte2_vec_bytes_per_cycle,
-            mte1_l1_to_l0_bytes_per_cycle=base_model.mte1_l1_to_l0_bytes_per_cycle,
-            mte1_transpose_penalty_cycles=base_model.mte1_transpose_penalty_cycles,
-            cube_macs_per_cycle=base_model.cube_macs_per_cycle,
-            cube_issue_overhead_cycles=base_model.cube_issue_overhead_cycles,
-            vec_elements_per_cycle=base_model.vec_elements_per_cycle,
-            fixpipe_acc_to_nd_bytes_per_cycle=base_model.fixpipe_acc_to_nd_bytes_per_cycle,
-            fixpipe_acc_to_nz_bytes_per_cycle=base_model.fixpipe_acc_to_nz_bytes_per_cycle,
-            gm_pack_bytes_per_cycle=base_model.gm_pack_bytes_per_cycle,
-            gm_pack_fixed_cycles=base_model.gm_pack_fixed_cycles,
-            onchip_relayout_bytes_per_cycle=base_model.onchip_relayout_bytes_per_cycle,
-            allow_external_output_relayout=base_model.allow_external_output_relayout,
         )
 
         instance, variants = compile_layout_variants(

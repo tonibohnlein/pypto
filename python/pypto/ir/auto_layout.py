@@ -45,7 +45,7 @@ import json
 import math
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -330,9 +330,13 @@ class LayoutCostModel:
 
     expected_uses: int = 1
     backend_type: core_backend.BackendType | None = None
-    mte2_nz2nz_bytes_per_cycle: float = 192.0
-    mte2_nd2nz_bytes_per_cycle: float = 96.0
-    mte2_nd2nz_row_penalty_cycles: float = 0.5
+    mte2_nz2nz_bytes_per_cycle: float = 123.0
+    mte2_nd2nz_bytes_per_cycle: float = 77.0
+    mte2_nd2nz_contiguous_bytes_per_cycle: float = 102.0
+    mte2_nd2nz_row_penalty_cycles: float = 0.0
+    mte2_nd2nz_sub512b_penalty_cycles: float = 2.5
+    mte2_l2_reread_discount: float = 0.30
+    l2_cache_line_bytes: int = 512
     mte2_vec_bytes_per_cycle: float = 192.0
     mte1_l1_to_l0_bytes_per_cycle: float = 512.0
     mte1_transpose_penalty_cycles: float = 8.0
@@ -340,7 +344,7 @@ class LayoutCostModel:
     cube_issue_overhead_cycles: float = 28.0
     vec_elements_per_cycle: float = 128.0
     fixpipe_acc_to_nd_bytes_per_cycle: float = 128.0
-    fixpipe_acc_to_nz_bytes_per_cycle: float = 192.0
+    fixpipe_acc_to_nz_bytes_per_cycle: float = 132.0
     gm_pack_bytes_per_cycle: float = 64.0
     gm_pack_fixed_cycles: float = 120.0
     onchip_relayout_bytes_per_cycle: float = 256.0
@@ -378,6 +382,8 @@ class LayoutCostModel:
         rows, cols = dst_node.shape[-2], dst_node.shape[-1]
         return (
             src_node.memory_space == core_ir.MemorySpace.Acc
+            and len(src_node.shape) >= 2
+            and src_node.shape[-2] == rows
             and src_node.dtype == DataType.FP32
             and dst_node.dtype == DataType.FP32
             and rows % 16 == 0
@@ -434,6 +440,22 @@ class LayoutCostModel:
             return core_backend.get_input_tile_layout(op_name, input_index)
         return None
 
+    def effective_mte2_load_multiplier(
+        self,
+        src_node: LayoutValueNode,
+        dst_node: LayoutValueNode,
+        per_run_inv: float,
+    ) -> float:
+        """Discount outer-loop MTE2 re-reads that hit L2 (`loaded_bytes > src_node.byte_size`)."""
+        if per_run_inv <= 1.0 or self.mte2_l2_reread_discount >= 1.0:
+            return 1.0
+        tile_b = float(dst_node.byte_size)
+        uniq_b = float(src_node.byte_size)
+        load_b = per_run_inv * tile_b
+        if load_b <= uniq_b or load_b <= 0.0:
+            return 1.0
+        return (uniq_b + self.mte2_l2_reread_discount * (load_b - uniq_b)) / load_b
+
     def estimate_load_cost(
         self,
         src_node: LayoutValueNode,
@@ -448,11 +470,26 @@ class LayoutCostModel:
                 return total_bytes / self.mte2_nz2nz_bytes_per_cycle
             rows = dst_node.shape[-2] if len(dst_node.shape) >= 2 else 1
             cols = dst_node.shape[-1] if len(dst_node.shape) >= 1 else 1
+            parent_cols = src_node.shape[-1] if len(src_node.shape) >= 1 else cols
+            bpe = _dtype_byte_width(dst_node.dtype)
+            row_bytes = cols * bpe
+            parent_row_bytes = parent_cols * bpe
+            line_b = float(max(1, self.l2_cache_line_bytes))
+            wide_strided = (cols < parent_cols) and (parent_row_bytes > self.l2_cache_line_bytes)
+            nd_bw = (
+                self.mte2_nd2nz_bytes_per_cycle
+                if wide_strided
+                else max(self.mte2_nd2nz_bytes_per_cycle, self.mte2_nd2nz_contiguous_bytes_per_cycle)
+            )
             c0 = c0_elements(dst_node.dtype)
             col_blocks = max(1, (cols + c0 - 1) // c0)
+            sub512_penalty = (
+                rows * max(0.0, (line_b - float(row_bytes)) / line_b) * self.mte2_nd2nz_sub512b_penalty_cycles
+                if wide_strided
+                else 0.0
+            )
             return (
-                total_bytes / self.mte2_nd2nz_bytes_per_cycle
-                + rows * col_blocks * self.mte2_nd2nz_row_penalty_cycles
+                total_bytes / nd_bw + rows * col_blocks * self.mte2_nd2nz_row_penalty_cycles + sub512_penalty
             )
         return total_bytes / self.mte2_vec_bytes_per_cycle
 
@@ -1055,19 +1092,6 @@ class _PostInferInstanceExtractor:
             return
         op_id = f"op_{self._op_counter}_{dst_name}_store"
         self._op_counter += 1
-        # Mark `dst_node` as produced by this store so downstream consumers see it
-        # as an intermediate GM result rather than an unconstrained input.
-        self.values[dst_name] = LayoutValueNode(
-            name=dst_node.name,
-            shape=dst_node.shape,
-            dtype=dst_node.dtype,
-            memory_space=dst_node.memory_space,
-            current_layout=dst_node.current_layout,
-            admissible_layouts=dst_node.admissible_layouts,
-            producer_op_id=op_id,
-            is_reusable_weight=dst_node.is_reusable_weight,
-            is_external_output=dst_node.is_external_output,
-        )
         configs: list[OperatorConfig] = []
         for s_lay in src_node.admissible_layouts:
             for d_lay in dst_node.admissible_layouts:
@@ -1087,6 +1111,26 @@ class _PostInferInstanceExtractor:
                         notes=f"FIXPIPE {src_node.memory_space.name}->GM({dst_label})",
                     )
                 )
+        supported_out_layouts = tuple(
+            d_lay for d_lay in dst_node.admissible_layouts if any(c.output_layout == d_lay for c in configs)
+        )
+        # Mark `dst_node` as produced by this store and restrict its admissible layouts
+        # to those actually supported by the store when external output relayout is off.
+        self.values[dst_name] = LayoutValueNode(
+            name=dst_node.name,
+            shape=dst_node.shape,
+            dtype=dst_node.dtype,
+            memory_space=dst_node.memory_space,
+            current_layout=dst_node.current_layout,
+            admissible_layouts=(
+                supported_out_layouts
+                if (supported_out_layouts and not self._model.allow_external_output_relayout)
+                else dst_node.admissible_layouts
+            ),
+            producer_op_id=op_id,
+            is_reusable_weight=dst_node.is_reusable_weight,
+            is_external_output=dst_node.is_external_output,
+        )
         self.operations.append(
             LayoutOperationNode(
                 op_id=op_id,
@@ -1345,7 +1389,18 @@ def evaluate_assignment(
             chosen_cfg = min(matching, key=lambda c: c.op_cost_cycles)
 
         resolved_configs[op.op_id] = chosen_cfg
-        cost = float(op.invocations) * chosen_cfg.op_cost_cycles
+        load_scale = 1.0
+        if op.op_name == _TILE_LOAD_OP and op.inputs:
+            src_val = instance.values.get(op.inputs[0])
+            dst_val = instance.values.get(op.output)
+            if (
+                src_val is not None
+                and dst_val is not None
+                and dst_val.memory_space == core_ir.MemorySpace.Mat
+            ):
+                per_run_inv = float(op.invocations) / float(max(1, model.expected_uses))
+                load_scale = model.effective_mte2_load_multiplier(src_val, dst_val, per_run_inv)
+        cost = float(op.invocations) * load_scale * chosen_cfg.op_cost_cycles
         per_op_costs[op.op_id] = cost
         op_cost_total += cost
         produced_layout[op.output] = chosen_cfg.output_layout
@@ -2120,9 +2175,8 @@ def fit_cost_model_from_measurements(
             return fallback
         return max(1.0, bpc)
 
-    fitted = LayoutCostModel(
-        expected_uses=model.expected_uses,
-        backend_type=model.backend_type,
+    fitted = replace(
+        model,
         mte2_nd2nz_bytes_per_cycle=_slope_to_bpc(
             "mte2_nd2nz_bytes_per_cycle", 1, model.mte2_nd2nz_bytes_per_cycle
         ),
@@ -2130,22 +2184,12 @@ def fit_cost_model_from_measurements(
             "mte2_nz2nz_bytes_per_cycle", 2, model.mte2_nz2nz_bytes_per_cycle
         ),
         mte2_nd2nz_row_penalty_cycles=0.0,
-        mte2_vec_bytes_per_cycle=model.mte2_vec_bytes_per_cycle,
-        mte1_l1_to_l0_bytes_per_cycle=model.mte1_l1_to_l0_bytes_per_cycle,
-        mte1_transpose_penalty_cycles=model.mte1_transpose_penalty_cycles,
-        cube_macs_per_cycle=model.cube_macs_per_cycle,
-        cube_issue_overhead_cycles=model.cube_issue_overhead_cycles,
-        vec_elements_per_cycle=model.vec_elements_per_cycle,
         fixpipe_acc_to_nd_bytes_per_cycle=_slope_to_bpc(
             "fixpipe_acc_to_nd_bytes_per_cycle", 3, model.fixpipe_acc_to_nd_bytes_per_cycle
         ),
         fixpipe_acc_to_nz_bytes_per_cycle=_slope_to_bpc(
             "fixpipe_acc_to_nz_bytes_per_cycle", 4, model.fixpipe_acc_to_nz_bytes_per_cycle
         ),
-        gm_pack_bytes_per_cycle=model.gm_pack_bytes_per_cycle,
-        gm_pack_fixed_cycles=model.gm_pack_fixed_cycles,
-        onchip_relayout_bytes_per_cycle=model.onchip_relayout_bytes_per_cycle,
-        allow_external_output_relayout=model.allow_external_output_relayout,
     )
 
     ss_res = float(np.sum((y_vec - y_pred) ** 2))

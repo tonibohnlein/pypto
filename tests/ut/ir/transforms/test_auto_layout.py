@@ -601,12 +601,19 @@ class TestPassPipelineIntegrationAndCalibration:
             platform="a2a3",
             compile_only=True,
         )
-        assert len(summary["cases"]) == 6
+        assert len(summary["cases"]) == 12
         for case_rec in summary["cases"]:
             variants = case_rec["variants"]
-            assert len(variants) == 8, f"{case_rec['case_id']} unexpectedly split L0: {len(variants)}"
-            assert any(v["gm_output_layouts"].get("out") == "NZ" for v in variants)
-            assert any(v["gm_output_layouts"].get("out") == "ND" for v in variants)
+            if case_rec["case_id"].endswith("_outer_m"):
+                # Outer-M tiling (`m_tile < M` on 2D output) legally restricts `out` to `ND` (4 variants).
+                assert len(variants) == 4, (
+                    f"{case_rec['case_id']} expected 4 ND-out variants: {len(variants)}"
+                )
+                assert all(v["gm_output_layouts"].get("out") == "ND" for v in variants)
+            else:
+                assert len(variants) == 8, f"{case_rec['case_id']} unexpectedly split L0: {len(variants)}"
+                assert any(v["gm_output_layouts"].get("out") == "NZ" for v in variants)
+                assert any(v["gm_output_layouts"].get("out") == "ND" for v in variants)
 
     def test_tiled_loop_multiplicity_and_large_chain_extraction(self):
         set_backend_type(BackendType.Ascend910)
@@ -647,6 +654,85 @@ class TestPassPipelineIntegrationAndCalibration:
         gm_names = {n for n, v in inst_chain.values.items() if v.memory_space == ir.MemorySpace.DDR}
         assert gm_names == {"x", "w1", "mid", "w2", "out"}
         assert len(enumerate_assignments(inst_chain, deduplicate=True)) == 32
+
+        # Verify k_tile granularity sensitivity: kt64 (128B) > kt128 (256B) > kt256 (512B) ND->NZ delta.
+        kt_deltas: list[float] = []
+        for kt in (64, 128, 256):
+            c_kt = auto_layout_bench.build_single_matmul_case(64, 4096, 64, k_tile=kt, expected_uses=1)
+            inst_kt = extract_layout_instance(
+                run_pre_layout_passes(c_kt.program), cost_model=LayoutCostModel(expected_uses=1)
+            )
+            by_gm = {
+                (
+                    bd.assignment.tensor_layouts["x"],
+                    bd.assignment.tensor_layouts["w"],
+                    bd.assignment.tensor_layouts["out"],
+                ): bd.operator_cost_cycles
+                for bd in enumerate_assignments(inst_kt, deduplicate=True)
+            }
+            kt_deltas.append(
+                by_gm[(ir.TensorLayout.ND, ir.TensorLayout.ND, ir.TensorLayout.ND)]
+                - by_gm[(ir.TensorLayout.NZ, ir.TensorLayout.NZ, ir.TensorLayout.ND)]
+            )
+        assert kt_deltas[0] > kt_deltas[1] > kt_deltas[2] > 0.0
+
+        # Verify stationarity sensitivity:
+        # 1. Outer-N 128x1024x1024 (`x` 256KiB re-read 8x in L2, `w` 2MiB streamed 1x) -> delta(w) > delta(x)
+        by_gm_n = {
+            (
+                bd.assignment.tensor_layouts["x"],
+                bd.assignment.tensor_layouts["w"],
+                bd.assignment.tensor_layouts["out"],
+            ): bd.operator_cost_cycles
+            for bd in enumerate_assignments(inst_tiled, deduplicate=True)
+        }
+        dx_n = (
+            by_gm_n[(ir.TensorLayout.ND, ir.TensorLayout.NZ, ir.TensorLayout.ND)]
+            - by_gm_n[(ir.TensorLayout.NZ, ir.TensorLayout.NZ, ir.TensorLayout.ND)]
+        )
+        dw_n = (
+            by_gm_n[(ir.TensorLayout.NZ, ir.TensorLayout.ND, ir.TensorLayout.ND)]
+            - by_gm_n[(ir.TensorLayout.NZ, ir.TensorLayout.NZ, ir.TensorLayout.ND)]
+        )
+        assert dw_n > dx_n > 0.0
+
+        # 2. Outer-M 1024x1024x128 (`x` 2MiB streamed 1x, `w` 256KiB re-read 8x in L2) -> delta(x) > delta(w)
+        outer_m = auto_layout_bench.build_single_matmul_case(
+            1024, 1024, 128, m_tile=128, k_tile=128, expected_uses=100, seed=8
+        )
+        inst_m = extract_layout_instance(
+            run_pre_layout_passes(outer_m.program),
+            cost_model=model,
+            reusable_tensors=outer_m.reusable_tensors,
+        )
+        by_gm_m = {
+            (
+                bd.assignment.tensor_layouts["x"],
+                bd.assignment.tensor_layouts["w"],
+                bd.assignment.tensor_layouts["out"],
+            ): bd.operator_cost_cycles
+            for bd in enumerate_assignments(inst_m, deduplicate=True)
+        }
+        assert len(by_gm_m) == 4
+        dx_m = (
+            by_gm_m[(ir.TensorLayout.ND, ir.TensorLayout.NZ, ir.TensorLayout.ND)]
+            - by_gm_m[(ir.TensorLayout.NZ, ir.TensorLayout.NZ, ir.TensorLayout.ND)]
+        )
+        dw_m = (
+            by_gm_m[(ir.TensorLayout.NZ, ir.TensorLayout.ND, ir.TensorLayout.ND)]
+            - by_gm_m[(ir.TensorLayout.NZ, ir.TensorLayout.NZ, ir.TensorLayout.ND)]
+        )
+        assert dx_m > dw_m > 0.0
+
+        # 3. Stationary-A 64x256x2048 (`x` hoisted in L1 Mat once, `w` loaded 32x)
+        stat_a = auto_layout_bench.build_single_matmul_case(
+            64, 256, 2048, k_tile=256, n_tile=64, stationary="a", expected_uses=100, seed=3
+        )
+        inst_sa = extract_layout_instance(
+            run_pre_layout_passes(stat_a.program), cost_model=model, reusable_tensors=stat_a.reusable_tensors
+        )
+        sa_loads = [op for op in inst_sa.operations if op.op_name == "tile.load"]
+        assert [op.invocations for op in sa_loads] == [100, 3200]
 
     def test_prepare_variant_tensors_uses_entry_param_order_for_chain(self, tmp_path: Path):
         chain = auto_layout_bench.build_two_matmul_chain_case(64, 128, 64, 64, seed=7)
