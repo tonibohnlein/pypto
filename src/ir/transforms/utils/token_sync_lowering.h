@@ -50,6 +50,7 @@ struct StrippedLogicalSync {
   std::map<const IfStmt*, IfStmtPtr> branches;
 };
 StrippedLogicalSync StripStructuredLogicalSync(const FunctionPtr& function, bool allow_nested);
+FunctionPtr StripAllLogicalSync(const FunctionPtr& function);
 bool HasLogicalSync(const FunctionPtr& function);
 // Executable summary only. Case-specific family coordinates are never flattened
 // into one misleading inventory; their immutable owners live through emission.
@@ -65,7 +66,7 @@ LoweredLogicalSync LowerStructuredLogicalSync(
     std::optional<std::pair<int64_t, int64_t>> blocks = std::nullopt, const SyncSchedulePolicy& policy = {},
     SyncExternalPolicy external_policy = SyncExternalPolicy::Geometry,
     std::optional<int64_t> launch_count = std::nullopt,
-    const SyncNativeReservations& extra_reservations = {});
+    const SyncNativeReservations& extra_reservations = {}, bool dry_run_only = false);
 // Interpret actual logical token uses without substituting minimum demands.
 // The finite adapter keeps actual command cuts and has no payload families;
 // canonical structured transport certifies and retains direct-cut families.
@@ -76,6 +77,7 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
                                     const SyncSchedulePolicy& policy = {},
                                     SyncExternalPolicy external_policy = SyncExternalPolicy::Geometry,
                                     std::optional<int64_t> launch_count = std::nullopt,
-                                    const SyncNativeReservations& extra_reservations = {});
+                                    const SyncNativeReservations& extra_reservations = {},
+                                    bool dry_run_only = false);
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_TOKEN_SYNC_LOWERING_H_

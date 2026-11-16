@@ -72,6 +72,8 @@ class NativeSyncChild {
 // Routing hint only. LowerSync independently validates the marked token region,
 // lexical descriptor bindings, entry acknowledgments and directional resources.
 inline constexpr const char* kClosedSyncChildAttr = "pypto.closed_sync_child";
+inline constexpr const char* kClosedSyncChildExternalPolicyAttr =
+    "pypto.closed_sync_child_external_policy";
 
 // Inspect actual selected instruction effects, including implicit effects.
 // Returns true only when external effects exist and every such effect reads.

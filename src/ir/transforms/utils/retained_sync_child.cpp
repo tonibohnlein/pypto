@@ -635,6 +635,9 @@ EventfulSyncChildAttempt TryPrepareEventfulSyncChild(
     CHECK(!marked->HasAttr(kClosedSyncChildAttr))
         << "Original child already contains synchronization routing metadata";
     marked->attrs_.emplace_back(kClosedSyncChildAttr, 1);
+    marked->attrs_.emplace_back(
+        kClosedSyncChildExternalPolicyAttr,
+        std::string(policy == SyncExternalPolicy::ReadOnlyProjection ? "readonly_projection" : "geometry"));
     recipe.push_back(marked);
     auto logical_recipe = std::make_shared<SeqStmts>(recipe, scope->span_);
     attempt.child = std::shared_ptr<const EventfulSyncChild>(

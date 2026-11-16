@@ -42,6 +42,7 @@
 #include "src/ir/transforms/utils/closed_prefix_sync.h"
 #include "src/ir/transforms/utils/native_sync_placement.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
+#include "src/ir/transforms/utils/retained_sync_child.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
 
 namespace pypto::ir::sync {
@@ -152,7 +153,7 @@ class FiniteLowering {
       }
     }
   }
-  PhysicalSyncRealization Run() {
+  PhysicalSyncRealization Run(bool dry_run_only = false) {
     scalar_native_order_ = backend::RequireLocalSyncExecutionContract(target_).scalar_prefix_serialized;
     Read(function_->body_);
     auto reservations = SyncNativeClaims(input_, target_);
@@ -180,6 +181,10 @@ class FiniteLowering {
           // no alternative fanout protocol or hardware timing claim is made.
           SyncEligibleIds(input_, target_, direction, eligible_, reservations), true);
       for (size_t i = 0; i < lanes.size(); ++i) handoffs_[lanes[i]].id = colors[i];
+    }
+    if (dry_run_only) {
+      result_.function = function_;
+      return std::move(result_);
     }
     std::map<const Stmt*, std::vector<StmtPtr>> emitted;
     for (const auto& record : records_) emitted[record.cut.get()];
@@ -860,17 +865,122 @@ FunctionPtr OptimizeLogicalSync(const FunctionPtr& function) {
   CheckLogicalSync(result);
   return result;
 }
+FunctionPtr StripAllLogicalSync(const FunctionPtr& function) {
+  class StripAll : public SyncStatementMutator {
+   protected:
+    StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+      return As<SyncTokenType>(op->var_->GetType()) ? Empty(op->span_) : op;
+    }
+    StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
+      return IsOp(As<Call>(op->expr_), "sync.wait") ? Empty(op->span_) : op;
+    }
+    StmtPtr VisitStmt_(const IfStmtPtr& op) override {
+      std::vector<VarPtr> return_vars;
+      return_vars.reserve(op->return_vars_.size());
+      for (const auto& rv : op->return_vars_) {
+        if (!As<SyncTokenType>(rv->GetType())) return_vars.push_back(rv);
+      }
+      auto then_body = VisitStmt(op->then_body_);
+      auto else_body = op->else_body_ ? std::optional<StmtPtr>(VisitStmt(*op->else_body_)) : std::nullopt;
+      auto is_empty = [](const StmtPtr& s) {
+        const auto seq = As<SeqStmts>(s);
+        return seq && seq->stmts_.empty();
+      };
+      if (return_vars.empty() && is_empty(then_body) && (!else_body || is_empty(*else_body))) {
+        return Empty(op->span_);
+      }
+      if (return_vars.size() == op->return_vars_.size() && then_body == op->then_body_ &&
+          else_body == op->else_body_) {
+        return op;
+      }
+      return std::make_shared<IfStmt>(op->condition_, std::move(then_body), std::move(else_body),
+                                      std::move(return_vars), op->span_, op->leading_comments_);
+    }
+    StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+      std::vector<IterArgPtr> iter_args;
+      std::vector<VarPtr> return_vars;
+      for (size_t i = 0; i < op->iter_args_.size(); ++i) {
+        if (As<SyncTokenType>(op->iter_args_[i]->GetType())) continue;
+        iter_args.push_back(op->iter_args_[i]);
+        if (i < op->return_vars_.size()) return_vars.push_back(op->return_vars_[i]);
+      }
+      auto body = VisitStmt(op->body_);
+      auto attrs = op->attrs_;
+      attrs.erase(std::remove_if(attrs.begin(), attrs.end(),
+                                 [](const auto& attr) {
+                                   return attr.first == kClosedSyncChildAttr ||
+                                          attr.first == kClosedSyncChildExternalPolicyAttr ||
+                                          attr.first == "pypto.closed_sync_child_first_visit";
+                                 }),
+                  attrs.end());
+      if (iter_args.size() == op->iter_args_.size() && return_vars.size() == op->return_vars_.size() &&
+          body == op->body_ && attrs.size() == op->attrs_.size()) {
+        return op;
+      }
+      return std::make_shared<ForStmt>(op->loop_var_, op->start_, op->stop_, op->step_,
+                                       std::move(iter_args), std::move(body), std::move(return_vars),
+                                       op->span_, op->kind_, std::move(attrs), op->leading_comments_,
+                                       op->hardware_loop_policy_);
+    }
+    StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
+      std::vector<IterArgPtr> iter_args;
+      std::vector<VarPtr> return_vars;
+      for (size_t i = 0; i < op->iter_args_.size(); ++i) {
+        if (As<SyncTokenType>(op->iter_args_[i]->GetType())) continue;
+        iter_args.push_back(op->iter_args_[i]);
+        if (i < op->return_vars_.size()) return_vars.push_back(op->return_vars_[i]);
+      }
+      auto body = VisitStmt(op->body_);
+      if (iter_args.size() == op->iter_args_.size() && return_vars.size() == op->return_vars_.size() &&
+          body == op->body_) {
+        return op;
+      }
+      return std::make_shared<WhileStmt>(op->condition_, std::move(iter_args), std::move(body),
+                                         std::move(return_vars), op->span_, op->leading_comments_);
+    }
+    StmtPtr VisitStmt_(const YieldStmtPtr& op) override {
+      std::vector<ExprPtr> values;
+      values.reserve(op->value_.size());
+      for (const auto& v : op->value_) {
+        if (!As<SyncTokenType>(v->GetType())) values.push_back(v);
+      }
+      if (values.size() == op->value_.size()) return op;
+      return std::make_shared<YieldStmt>(std::move(values), op->span_, op->leading_comments_);
+    }
+  } strip;
+  auto body = strip.VisitStmt(function->body_);
+  auto attrs = function->attrs_;
+  attrs.erase(std::remove_if(attrs.begin(), attrs.end(),
+                             [](const auto& attr) {
+                               return attr.first == kAttrAutosyncAnalysisPolicy ||
+                                      attr.first == kAttrAutosyncAccessPrecision ||
+                                      attr.first == kAttrAutosyncRealizationOrder ||
+                                      attr.first == "autosync_child_attempt_count" ||
+                                      attr.first == "autosync_retained_child_count" ||
+                                      attr.first == "autosync_child_refusals" ||
+                                      attr.first == kAttrPyptoAutosync ||
+                                      attr.first == kAttrAutosyncFallbackReason;
+                             }),
+              attrs.end());
+  return std::make_shared<Function>(function->name_, function->params_, function->param_directions_,
+                                    function->return_types_, std::move(body), function->span_,
+                                    function->func_type_, function->level_, function->role_,
+                                    std::move(attrs), function->requires_runtime_binding_,
+                                    function->ir_stage_);
+}
+
 LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::string& target,
                                     const std::optional<std::vector<int>>& eligible_ids,
                                     const SyncParameterBounds& parameters,
                                     std::optional<std::pair<int64_t, int64_t>> blocks,
                                     const SyncSchedulePolicy& policy, SyncExternalPolicy external_policy,
                                     std::optional<int64_t> launch_count,
-                                    const SyncNativeReservations& extra_reservations) {
+                                    const SyncNativeReservations& extra_reservations, bool dry_run_only) {
   CheckLogicalSync(function);
   RequireBufferSyncScalarLayout(function);
   RequireBufferRuntimeValid(function);
   if (!HasLogicalSync(function)) {
+    if (dry_run_only) return {function, 0, 0, {}};
     PhysicalSyncRealization result;
     result.function = function;
     CheckPhysicalSyncResult(result.function);
@@ -881,6 +991,7 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
   if (HasOnlyClosedPrefixSyntax(function)) {
     if (auto closed = TryLowerClosedPrefixSync(function, target, eligible_ids, extra_reservations,
                                                parameters, blocks)) {
+      if (dry_run_only) return {closed->function, closed->set_sites, closed->wait_sites, {}};
       CheckPhysicalSyncResult(closed->function);
       FinishSyncScheduleReceipt(closed->function, *closed, policy);
       return {closed->function, closed->set_sites, closed->wait_sites, {std::move(*closed)}};
@@ -897,8 +1008,8 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
   structure.VisitFunction(function);
   if (structure.loop) {
     auto result = LowerStructuredLogicalSync(function, target, eligible_ids, parameters, blocks, policy,
-                                             external_policy, launch_count, extra_reservations);
-    CheckPhysicalSyncResult(result.function);
+                                             external_policy, launch_count, extra_reservations, dry_run_only);
+    if (!dry_run_only) CheckPhysicalSyncResult(result.function);
     return result;
   }
   auto stripped = StripTokens().VisitFunction(function);
@@ -906,9 +1017,11 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
   // Actual token uses, including manually supplied ordering, are authoritative.
   auto input = ImportSyncPayloads(stripped, target, parameters, blocks, external_policy);
   auto result =
-      FiniteLowering(function, std::move(input), target, eligible_ids, extra_reservations).Run();
-  CheckPhysicalSyncResult(result.function);
-  FinishSyncScheduleReceipt(result.function, result, policy);
+      FiniteLowering(function, std::move(input), target, eligible_ids, extra_reservations).Run(dry_run_only);
+  if (!dry_run_only) {
+    CheckPhysicalSyncResult(result.function);
+    FinishSyncScheduleReceipt(result.function, result, policy);
+  }
   return {result.function, result.set_sites, result.wait_sites, {std::move(result)}};
 }
 }  // namespace pypto::ir::sync

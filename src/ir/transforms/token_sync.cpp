@@ -234,7 +234,7 @@ FunctionPtr AnalyzeRegionSync(
       // Mirror RealizeSync's late lowering fallback so 3-pass InsertSync -> OptimizeSync -> LowerSync
       // switches to MixedCompose + Regional before committing an exact plan that cannot lower.
       sync::LowerLogicalSync(sync::OptimizeLogicalSync(logical), target, std::nullopt, parameters, blocks,
-                             {}, sync::SyncExternalPolicy::Geometry, launch_count);
+                             {}, sync::SyncExternalPolicy::Geometry, launch_count, {}, /*dry_run_only=*/true);
       return logical;
     } catch (const pypto::ValueError&) {
       // Fall through to MixedCompose + Regional fallback.
@@ -354,9 +354,7 @@ Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accept
         }
         const std::vector<std::shared_ptr<const sync::NativeSyncChild>> no_children;
         const std::vector<std::shared_ptr<const sync::EventfulSyncChild>> no_eventful;
-        const auto evidence =
-            (prefix && !context->GetAutoSyncDisjointGM()) ? sync::SyncInvocationEvidence{}
-                                                          : sync::CollectSyncInvocationEvidence(program);
+        const auto evidence = sync::CollectSyncInvocationEvidence(program);
         auto functions = program->functions_;
         for (auto& [global, function] : functions) {
           CheckLogicalSync(function);
@@ -407,12 +405,17 @@ Pass LowerSync(bool require_whole_module) {
         bool needs_occurrences = false;
         for (const auto& [global, function] : program->functions_)
           needs_occurrences |= IsOwnedLeaf(function) && sync::HasLogicalSync(function) &&
-                               (disjoint_gm || !sync::HasOnlyClosedPrefixSyntax(function));
+                               (disjoint_gm || !sync::HasOnlyClosedPrefixSyntax(function) ||
+                                sync::HasClosedSyncChild(function));
         const auto evidence =
             needs_occurrences ? sync::CollectSyncInvocationEvidence(program) : sync::SyncInvocationEvidence{};
         auto functions = program->functions_;
         for (auto& [global, function] : functions) {
           if (!IsOwnedLeaf(function)) continue;
+          if (!require_whole_module && function->GetAttr<bool>(kAttrPyptoAutosync) &&
+              !sync::HasLogicalSync(function)) {
+            continue;
+          }
           auto bound = evidence.parameters.find(global->name_);
           const auto parameters =
               bound == evidence.parameters.end() ? sync::SyncParameterBounds{} : bound->second;
@@ -430,11 +433,15 @@ Pass LowerSync(bool require_whole_module) {
           // plans. A genuinely empty program has no asynchronous exit debt.
           if (require_whole_module && !payloads && !HasPhysicalCommands(result))
             function = sync::SyncOutcome(result.function, true, "");
+          else if (!require_whole_module && (!result.set_sites || !result.wait_sites))
+            function =
+                HasPhysicalCommands(result)
+                    ? sync::SyncOutcome(sync::StripAllLogicalSync(function), false,
+                                        "Candidate has no SET/WAIT marker; delegate the original kernel")
+                    : result.function;
           else
-            function = (require_whole_module || (result.set_sites && result.wait_sites))
-                           ? CompleteOwnedInvocation(result.function,
-                                                     context->GetBackendHandler()->GetPtoTargetArch())
-                           : result.function;
+            function = CompleteOwnedInvocation(result.function,
+                                               context->GetBackendHandler()->GetPtoTargetArch());
         }
         auto result = std::make_shared<Program>(functions, program->name_, program->span_);
         return require_whole_module ? PublishWholeModuleOutcome(result) : result;
@@ -528,11 +535,7 @@ Pass RealizeSync(bool require_whole_module) {
           CHECK(!function->GetAttr<bool>(kAttrPyptoAutosync))
               << "RealizeSync cannot reprocess an owned physical plan";
         }
-        const auto* context = PassContext::Current();
-        auto evidence = (context && context->GetAutoSyncPolicy() == "conservative_prefix" &&
-                         !context->GetAutoSyncDisjointGM())
-                            ? sync::SyncInvocationEvidence{}
-                            : sync::CollectSyncInvocationEvidence(program);
+        auto evidence = sync::CollectSyncInvocationEvidence(program);
         auto functions = program->functions_;
         for (auto& [global, function] : functions) {
           auto block = evidence.block_indices.find(global->name_);
