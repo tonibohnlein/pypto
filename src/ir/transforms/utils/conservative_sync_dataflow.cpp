@@ -12,6 +12,7 @@
 #include "src/ir/transforms/utils/conservative_sync_dataflow.h"
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <memory>
 #include <optional>
@@ -165,19 +166,25 @@ class ConflictSources {
 
 // Payload-completion knowledge only. These facts do not claim that a complete
 // logical command prefix (including arbitrary waits) is interchangeable with
-// another prefix. Epoch zero denotes unknown incoming payload work, and is not
-// initially established on any destination.
+// another prefix. A matrix entry (destination, source) means the source's
+// entire CURRENT payload prefix is complete on that destination on every path
+// reaching this cut. Prefixes are path-dependent at joins, not branch-local
+// epoch numbers. False includes unknown incoming work, not an empty prefix.
+// The fixed pipe universe bounds state by k*k Boolean cells and transfer/join by O(k*k);
+// structured traversal needs no worklist, dynamic history, or trip unfolding.
 class PayloadCompletions {
  public:
-  void Reset() {
-    issued_.clear();
-    established_.clear();
-  }
+  void Reset() { established_ = {}; }
   bool Covers(PipeType source, PipeType destination) const {
-    const auto receiver = established_.find(destination);
-    if (receiver == established_.end()) return false;
-    const auto known = receiver->second.find(source);
-    return known != receiver->second.end() && known->second >= Issued(source);
+    return established_[Index(destination)][Index(source)];
+  }
+  void Intersect(const PayloadCompletions& other) {
+    for (size_t destination = 0; destination < kPipeCount; ++destination) {
+      for (size_t source = 0; source < kPipeCount; ++source) {
+        established_[destination][source] =
+            established_[destination][source] && other.established_[destination][source];
+      }
+    }
   }
   // Select an inclusion-minimal cover under the facts available at this cut.
   // Distinct source descriptors occur once and have the same destination. No
@@ -201,7 +208,7 @@ class PayloadCompletions {
   }
   void Service(PipeType source, PipeType destination) {
     if (source == destination) {
-      established_[source][source] = Issued(source);
+      established_[Index(source)][Index(source)] = true;
       return;
     }
     // Forward WAIT imports source payload completion and facts already known
@@ -209,28 +216,32 @@ class PayloadCompletions {
     // payload completion on SOURCE. Issuing the return SET does not establish
     // destination's own payload completion on destination.
     Import(destination, source);
-    established_[destination][source] = Issued(source);
+    established_[Index(destination)][Index(source)] = true;
     Import(source, destination);
-    established_[source][destination] = Issued(destination);
+    established_[Index(source)][Index(destination)] = true;
   }
-  void Issue(PipeType pipe) { ++issued_[pipe]; }
-
- private:
-  size_t Issued(PipeType pipe) const {
-    const auto found = issued_.find(pipe);
-    return found == issued_.end() ? 0 : found->second;
-  }
-  void Import(PipeType destination, PipeType source) {
-    const auto sender = established_.find(source);
-    if (sender == established_.end()) return;
-    auto& receiver = established_[destination];
-    for (const auto& [pipe, epoch] : sender->second) {
-      auto [known, inserted] = receiver.emplace(pipe, epoch);
-      if (!inserted) known->second = std::max(known->second, epoch);
+  void Issue(PipeType pipe) {
+    // A read also creates pending work (WAR). Never kill only on writes.
+    for (auto& destination : established_) {
+      destination[Index(pipe)] = false;
     }
   }
-  std::map<PipeType, size_t> issued_;
-  std::map<PipeType, std::map<PipeType, size_t>> established_;
+
+ private:
+  static constexpr size_t kPipeCount = static_cast<size_t>(PipeType::ALL) + 1;
+  static size_t Index(PipeType pipe) {
+    const auto index = static_cast<size_t>(pipe);
+    INTERNAL_CHECK(index < kPipeCount) << "Internal error: invalid completion pipe";
+    return index;
+  }
+  void Import(PipeType destination, PipeType source) {
+    auto& receiver = established_[Index(destination)];
+    const auto& sender = established_[Index(source)];
+    for (size_t pipe = 0; pipe < kPipeCount; ++pipe) {
+      receiver[pipe] = receiver[pipe] || sender[pipe];
+    }
+  }
+  std::array<std::array<bool, kPipeCount>, kPipeCount> established_{};
 };
 
 struct FlowState {
@@ -353,19 +364,21 @@ class Builder {
     if (const auto seq = As<SeqStmts>(statement)) {
       for (const auto& child : seq->stmts_) incoming = Flow(child, std::move(incoming));
     } else if (const auto branch = As<IfStmt>(statement)) {
-      incoming.completions.Reset();
+      // Each arm starts from the same must facts. May-access history still
+      // unions; delivery intersects, including the skipped edge without else.
       cost.control_snapshot_facts += incoming.effects.size();
       auto then_exit = Flow(branch->then_body_, incoming);
       if (branch->else_body_) {
         auto else_exit = Flow(*branch->else_body_, std::move(incoming));
         cost.control_merge_facts += else_exit.effects.size();
         then_exit.Add(else_exit.effects);
+        then_exit.completions.Intersect(else_exit.completions);
       } else {
         cost.control_merge_facts += incoming.effects.size();
         then_exit.Add(incoming.effects);
+        then_exit.completions.Intersect(incoming.completions);
       }
       incoming = std::move(then_exit);
-      incoming.completions.Reset();
     } else if (const auto loop = As<ForStmt>(statement)) {
       incoming.Add(generated_.at(loop->body_.get()));
       incoming.completions.Reset();
@@ -446,11 +459,12 @@ class Builder {
     if (const auto sequence = As<SeqStmts>(statement)) {
       for (const auto& child : sequence->stmts_) Certify(child, known);
     } else if (const auto branch = As<IfStmt>(statement)) {
-      known.Reset();
+      auto alternate = known;
       Certify(branch->then_body_, known);
-      known.Reset();
-      if (branch->else_body_) Certify(*branch->else_body_, known);
-      known.Reset();
+      if (branch->else_body_) {
+        Certify(*branch->else_body_, alternate);
+      }
+      known.Intersect(alternate);
     } else if (const auto loop = As<ForStmt>(statement)) {
       known.Reset();
       Certify(loop->body_, known);

@@ -349,11 +349,535 @@
         "sha256": "62751fcfb99424e2ae271ab207199549333ddef0a84fa669f6d0fd49f51795e5"
       },
       "physical_refusal_policy": "Discard entire candidate and delegate original kernel with precise resource/proof refusal. No infeasibility claim; no partial child removal or implicit retry."
+    },
+    "P4": {
+      "implementation": "accepted",
+      "test_command": "timeout 120s python3.14 -m pytest tests/ut/ir/transforms/test_conservative_sync_completions.py tests/ut/ir/transforms/test_automatic_sync_children.py tests/ut/ir/transforms/test_conservative_sync_dataflow.py tests/ut/ir/transforms/test_sync_scalar_payload.py -q --require-ptoas",
+      "test_result": "67 passed in 12.85s",
+      "test_log": "build-py314/regional-repair/p4-tests-accepted.log",
+      "build": "build-py314/regional-repair/p4-build-final.log",
+      "point_audit": {
+        "status": "all bounded original planner executions passed",
+        "input_hashes": {
+          "build-py314/regional-repair/delivery-conservative_prefix-may-alias-staged/receipt.json": "9745e2e497d57022ce9554f50f38dec897525d034dab0a7aa160712f870bdbb5",
+          "build-py314/regional-repair/delivery-conservative_prefix-may-alias-staged/before-sync.msgpack": "0825000f187dd10721a3378981125b4be4a8781d6fed7bd39325144ee1c0507d",
+          "build-py314/regional-repair/delivery-conservative_prefix-may-alias-staged/after-sync.msgpack": "2a53fc6f248959033dfd7ede63ea2b828ca7d3ade25f9f02d9bcfe54459c99a4",
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_qwen_point_planner.py": "082edd6e9131bb7c446159200e1131b2d68faf53988607a3b7d5f53239127be9",
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/sync_closed_command_oracle.py": "f7a045cbd05fb457d1c36fc00d2d86940b5c2fed8a7b0313a008c90632aa6a9a",
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/sync_logical_oracle.py": "72e2e34e557bd6221f86954ad0626cd882d47162726784b38328767087f967e0",
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/sync_matmul_oracle.py": "b44730abe973eba32bb8616f2666d563b816eb1167ff4366cdf38cccf02c0ebc",
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/test_finite_sync_analysis.py": "06b23574955950a7686f32774345f3d4ca9df9ae4d09a65716288c2dceddc534",
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_captured_child_commands.py": "8c1972eefee9741b0200b7b15b7cdc5c706be3ab146bcf425f0cfae80d035e47",
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/test_gm_scalar_write_staging.py": "9731fab5152a274c14f64bd01f8391487eb159626ca8c7a285e2ce8827b66708",
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/test_gm_scalar_staging.py": "9dec3fe2cfe12c324f1c532c64b23081ec5293401f2243ef2063bb0586aef315",
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/test_eventful_sync_children.py": "23d61fe41f93fe3c8fe485026fd38e2ba816edbf3cd4bedb44a4699598955ae8",
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/buffer_test_utils.py": "86f2763eff1bea0cdf5c3f2ab9286cc1011e37c32b5272841673c74d407a0e06",
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "587bbf9c9665359c64df1f1b8aca40fb92b595d6b10b7fb50d1ae6113d861d25",
+          "/usr/bin/python3.14": "9a2d26e5dcbd8e7ff6c1e3cfa37a45a5b83dff8ebba39cbae293cb9e94f15a55"
+        },
+        "python": {
+          "version": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+          "executable": "/usr/bin/python3.14"
+        },
+        "loaded_extension": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so",
+        "model_sources": {
+          "config.py": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+          "constants.py": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+          "contract.py": "f16c43df64c42769dc365a820e5fbc0ff6e9c4d3ceada21660003869ccbeaf15",
+          "decode_fwd.py": "c2f7288ce1e45cbe9fe99d60484aed7a4cb6b4d7255701c4692692a7586dd6f3",
+          "decode_layer_a8w8.py": "4074dea2e5225818108bc088d06dc1717cb2706dd004255a96c05843ba7a5fb8",
+          "decode_ssn_draft.py": "55016c298d42f77500e87bccdf020dbc3e78210cbe1a4c526b97f59466d77705",
+          "decode_tq_draft.py": "9daf2b9b1851d646552cb75504f33aad4766569ff740462a16cdf06d99f352ec",
+          "greedy_sample.py": "8f3fc3e4c533abf01140b299cac35a11185c5151e92df5ba84327afdfa3fceb8",
+          "paged_attention_cce.py": "aafa0bc6dde1758f5518081f3814449e0ca93d137451b67065a06f4b8a375b2d",
+          "paged_attention_pypto.py": "4087a49cd0b6c6396d4fef859576a02f8c6b096e9b94f5b55560e1f4b238e843",
+          "prefill_fwd.py": "3e05b6f910055549d6f89c24743dc384acfb0134be059efe4351b72092824dcb",
+          "prefill_fwd_a8w8.py": "3f359f5b5147c025efa21152117f75291c07826d9675f0a5bc9b76c3a13c67ac",
+          "prefill_tq_draft.py": "0eb51c30bfce55eabbb3318d39542813aef8687858957e41dcfafd5b93c5d8da",
+          "rms_lm_head.py": "0cafe8226d85659afd9d1c19e3c9ae46269a109a7c3c501d846a366e3826e3ce",
+          "rope_qkv_regen.py": "17d868b0527f6555e48426d4fe74526c8d72b5126d442efd2727cf9078c94076",
+          "test_paged_attention_cce.py": "7098e2cea21d017ef6f13f0261b19d37a3af62103045543862cf51b99d793f6c",
+          "test_paged_attention_pypto.py": "9bf0d2ea18b5d995a846858df23c301e32ff79849a08a1bb4250101ff468f32d",
+          "topk_select.py": "60ddb96ee27846c0dfb23f95a59cf53701eed94cca88bf7b5eb3802a5aaef267",
+          "turboquant_kv.py": "d49c3cb4764e524b96be5bffd57cbf6138061e65c5b762ac4781741d2181bf7d",
+          "weights.py": "d23e15850574369379e8140eb7a97be000274250dd6369544cc2108132125bf5"
+        },
+        "source_constants": {
+          "QKPV_PLAN_SB_BATCH": 1,
+          "QKPV_PLAN_WORK_ITEMS": 128,
+          "ATTN_GI_BLOCKS": 8,
+          "ATTN_TOK_GROUP": 8
+        },
+        "cases": [
+          {
+            "finalize_tok": 1,
+            "domain": "admitted positive caller execution",
+            "parameters": {
+              "1": 0,
+              "2": 1,
+              "3": 1
+            },
+            "invocations": 1,
+            "payloads": 770,
+            "publications": 1282,
+            "acquisitions": 1282,
+            "reuse_checks": 1274,
+            "byte_conflict_checks": 230401,
+            "staged_payload_order": {
+              "reference_completion_to_start_pairs": 296065,
+              "physical_completion_to_start_pairs": 296065,
+              "missing_pairs": 0,
+              "excess_pairs": 0,
+              "comparison_seconds": 0.38177892193198204,
+              "reference_integer_bytes": 297220,
+              "domain": "Every ordered staged payload C-to-I pair, including required invocation completion across replay; no pair set materialized"
+            },
+            "vertices": 9622,
+            "edges": 22304,
+            "reachability_integer_bytes": 11565642,
+            "ids": {
+              "S->MTE3": [
+                0,
+                1
+              ],
+              "MTE3->S": [
+                0,
+                1
+              ],
+              "MTE3->MTE2": [
+                0
+              ],
+              "MTE2->MTE3": [
+                0
+              ],
+              "MTE2->S": [
+                0
+              ],
+              "S->MTE2": [
+                0
+              ]
+            },
+            "execution_seconds": 0.06644979305565357,
+            "reachability_seconds": 0.012282593175768852,
+            "seconds": 0.6730467230081558,
+            "output_sha256": "3ce0ca491e412e8041637b6305c34b132ee27b502ab0803ecb4f9ee1a798fab6"
+          },
+          {
+            "finalize_tok": 8,
+            "domain": "admitted positive caller execution",
+            "parameters": {
+              "1": 0,
+              "2": 1,
+              "3": 8
+            },
+            "invocations": 1,
+            "payloads": 770,
+            "publications": 1282,
+            "acquisitions": 1282,
+            "reuse_checks": 1274,
+            "byte_conflict_checks": 230401,
+            "staged_payload_order": {
+              "reference_completion_to_start_pairs": 296065,
+              "physical_completion_to_start_pairs": 296065,
+              "missing_pairs": 0,
+              "excess_pairs": 0,
+              "comparison_seconds": 0.38238405995070934,
+              "reference_integer_bytes": 297220,
+              "domain": "Every ordered staged payload C-to-I pair, including required invocation completion across replay; no pair set materialized"
+            },
+            "vertices": 9622,
+            "edges": 22304,
+            "reachability_integer_bytes": 11565642,
+            "ids": {
+              "S->MTE3": [
+                0,
+                1
+              ],
+              "MTE3->S": [
+                0,
+                1
+              ],
+              "MTE3->MTE2": [
+                0
+              ],
+              "MTE2->MTE3": [
+                0
+              ],
+              "MTE2->S": [
+                0
+              ],
+              "S->MTE2": [
+                0
+              ]
+            },
+            "execution_seconds": 0.06040755799040198,
+            "reachability_seconds": 0.011155678890645504,
+            "seconds": 0.6602551387622952,
+            "output_sha256": "3ce0ca491e412e8041637b6305c34b132ee27b502ab0803ecb4f9ee1a798fab6"
+          },
+          {
+            "finalize_tok": 9,
+            "domain": "admitted positive caller execution",
+            "parameters": {
+              "1": 0,
+              "2": 1,
+              "3": 9
+            },
+            "invocations": 2,
+            "payloads": 1540,
+            "publications": 2564,
+            "acquisitions": 2564,
+            "reuse_checks": 2556,
+            "byte_conflict_checks": 922246,
+            "staged_payload_order": {
+              "reference_completion_to_start_pairs": 1185030,
+              "physical_completion_to_start_pairs": 1185030,
+              "missing_pairs": 0,
+              "excess_pairs": 0,
+              "comparison_seconds": 2.412979786749929,
+              "reference_integer_bytes": 1189266,
+              "domain": "Every ordered staged payload C-to-I pair, including required invocation completion across replay; no pair set materialized"
+            },
+            "vertices": 19244,
+            "edges": 44632,
+            "reachability_integer_bytes": 46279410,
+            "ids": {
+              "S->MTE3": [
+                0,
+                1
+              ],
+              "MTE3->S": [
+                0,
+                1
+              ],
+              "MTE3->MTE2": [
+                0
+              ],
+              "MTE2->MTE3": [
+                0
+              ],
+              "MTE2->S": [
+                0
+              ],
+              "S->MTE2": [
+                0
+              ]
+            },
+            "execution_seconds": 0.12962520401924849,
+            "reachability_seconds": 0.03182795597240329,
+            "seconds": 3.5933195198886096,
+            "output_sha256": "3ce0ca491e412e8041637b6305c34b132ee27b502ab0803ecb4f9ee1a798fab6"
+          },
+          {
+            "finalize_tok": 16,
+            "domain": "admitted positive caller execution",
+            "parameters": {
+              "1": 0,
+              "2": 1,
+              "3": 16
+            },
+            "invocations": 1,
+            "payloads": 770,
+            "publications": 1282,
+            "acquisitions": 1282,
+            "reuse_checks": 1274,
+            "byte_conflict_checks": 230401,
+            "staged_payload_order": {
+              "reference_completion_to_start_pairs": 296065,
+              "physical_completion_to_start_pairs": 296065,
+              "missing_pairs": 0,
+              "excess_pairs": 0,
+              "comparison_seconds": 0.6423147297464311,
+              "reference_integer_bytes": 297220,
+              "domain": "Every ordered staged payload C-to-I pair, including required invocation completion across replay; no pair set materialized"
+            },
+            "vertices": 9622,
+            "edges": 22304,
+            "reachability_integer_bytes": 11565642,
+            "ids": {
+              "S->MTE3": [
+                0,
+                1
+              ],
+              "MTE3->S": [
+                0,
+                1
+              ],
+              "MTE3->MTE2": [
+                0
+              ],
+              "MTE2->MTE3": [
+                0
+              ],
+              "MTE2->S": [
+                0
+              ],
+              "S->MTE2": [
+                0
+              ]
+            },
+            "execution_seconds": 0.11640603607520461,
+            "reachability_seconds": 0.02170318877324462,
+            "seconds": 1.1734708109870553,
+            "output_sha256": "3ce0ca491e412e8041637b6305c34b132ee27b502ab0803ecb4f9ee1a798fab6"
+          },
+          {
+            "finalize_tok": 17,
+            "domain": "admitted positive caller execution",
+            "parameters": {
+              "1": 0,
+              "2": 1,
+              "3": 17
+            },
+            "invocations": 1,
+            "payloads": 770,
+            "publications": 1282,
+            "acquisitions": 1282,
+            "reuse_checks": 1274,
+            "byte_conflict_checks": 230401,
+            "staged_payload_order": {
+              "reference_completion_to_start_pairs": 296065,
+              "physical_completion_to_start_pairs": 296065,
+              "missing_pairs": 0,
+              "excess_pairs": 0,
+              "comparison_seconds": 0.6950657973065972,
+              "reference_integer_bytes": 297220,
+              "domain": "Every ordered staged payload C-to-I pair, including required invocation completion across replay; no pair set materialized"
+            },
+            "vertices": 9622,
+            "edges": 22304,
+            "reachability_integer_bytes": 11565642,
+            "ids": {
+              "S->MTE3": [
+                0,
+                1
+              ],
+              "MTE3->S": [
+                0,
+                1
+              ],
+              "MTE3->MTE2": [
+                0
+              ],
+              "MTE2->MTE3": [
+                0
+              ],
+              "MTE2->S": [
+                0
+              ],
+              "S->MTE2": [
+                0
+              ]
+            },
+            "execution_seconds": 0.1071600909344852,
+            "reachability_seconds": 0.026183650363236666,
+            "seconds": 1.219631940126419,
+            "output_sha256": "3ce0ca491e412e8041637b6305c34b132ee27b502ab0803ecb4f9ee1a798fab6"
+          },
+          {
+            "finalize_tok": 127,
+            "domain": "admitted positive caller execution",
+            "parameters": {
+              "1": 0,
+              "2": 1,
+              "3": 127
+            },
+            "invocations": 1,
+            "payloads": 770,
+            "publications": 1282,
+            "acquisitions": 1282,
+            "reuse_checks": 1274,
+            "byte_conflict_checks": 230401,
+            "staged_payload_order": {
+              "reference_completion_to_start_pairs": 296065,
+              "physical_completion_to_start_pairs": 296065,
+              "missing_pairs": 0,
+              "excess_pairs": 0,
+              "comparison_seconds": 0.6455485289916396,
+              "reference_integer_bytes": 297220,
+              "domain": "Every ordered staged payload C-to-I pair, including required invocation completion across replay; no pair set materialized"
+            },
+            "vertices": 9622,
+            "edges": 22304,
+            "reachability_integer_bytes": 11565642,
+            "ids": {
+              "S->MTE3": [
+                0,
+                1
+              ],
+              "MTE3->S": [
+                0,
+                1
+              ],
+              "MTE3->MTE2": [
+                0
+              ],
+              "MTE2->MTE3": [
+                0
+              ],
+              "MTE2->S": [
+                0
+              ],
+              "S->MTE2": [
+                0
+              ]
+            },
+            "execution_seconds": 0.12075175996869802,
+            "reachability_seconds": 0.02214233623817563,
+            "seconds": 1.1708708880469203,
+            "output_sha256": "3ce0ca491e412e8041637b6305c34b132ee27b502ab0803ecb4f9ee1a798fab6"
+          },
+          {
+            "finalize_tok": 128,
+            "domain": "admitted positive caller execution",
+            "parameters": {
+              "1": 0,
+              "2": 1,
+              "3": 128
+            },
+            "invocations": 1,
+            "payloads": 770,
+            "publications": 1282,
+            "acquisitions": 1282,
+            "reuse_checks": 1274,
+            "byte_conflict_checks": 230401,
+            "staged_payload_order": {
+              "reference_completion_to_start_pairs": 296065,
+              "physical_completion_to_start_pairs": 296065,
+              "missing_pairs": 0,
+              "excess_pairs": 0,
+              "comparison_seconds": 0.5640241741202772,
+              "reference_integer_bytes": 297220,
+              "domain": "Every ordered staged payload C-to-I pair, including required invocation completion across replay; no pair set materialized"
+            },
+            "vertices": 9622,
+            "edges": 22304,
+            "reachability_integer_bytes": 11565642,
+            "ids": {
+              "S->MTE3": [
+                0,
+                1
+              ],
+              "MTE3->S": [
+                0,
+                1
+              ],
+              "MTE3->MTE2": [
+                0
+              ],
+              "MTE2->MTE3": [
+                0
+              ],
+              "MTE2->S": [
+                0
+              ],
+              "S->MTE2": [
+                0
+              ]
+            },
+            "execution_seconds": 0.10163875389844179,
+            "reachability_seconds": 0.018977127969264984,
+            "seconds": 1.0024506617337465,
+            "output_sha256": "3ce0ca491e412e8041637b6305c34b132ee27b502ab0803ecb4f9ee1a798fab6"
+          },
+          {
+            "finalize_tok": 0,
+            "domain": "zero structural stress; outside positive caller",
+            "parameters": {
+              "1": 0,
+              "2": 1,
+              "3": 0
+            },
+            "invocations": 1,
+            "payloads": 770,
+            "publications": 1282,
+            "acquisitions": 1282,
+            "reuse_checks": 1274,
+            "byte_conflict_checks": 230401,
+            "staged_payload_order": {
+              "reference_completion_to_start_pairs": 296065,
+              "physical_completion_to_start_pairs": 296065,
+              "missing_pairs": 0,
+              "excess_pairs": 0,
+              "comparison_seconds": 0.8114339141175151,
+              "reference_integer_bytes": 297220,
+              "domain": "Every ordered staged payload C-to-I pair, including required invocation completion across replay; no pair set materialized"
+            },
+            "vertices": 9625,
+            "edges": 22309,
+            "reachability_integer_bytes": 11578868,
+            "ids": {
+              "S->MTE3": [
+                0,
+                1
+              ],
+              "MTE3->S": [
+                0,
+                1
+              ],
+              "MTE3->MTE2": [
+                0
+              ],
+              "MTE2->MTE3": [
+                0
+              ],
+              "MTE2->S": [
+                0
+              ],
+              "S->MTE2": [
+                0
+              ]
+            },
+            "execution_seconds": 0.1035277177579701,
+            "reachability_seconds": 0.018953179009258747,
+            "seconds": 1.3140821568667889,
+            "output_sha256": "3ce0ca491e412e8041637b6305c34b132ee27b502ab0803ecb4f9ee1a798fab6"
+          }
+        ],
+        "observed_peak_rss_kib": 680896,
+        "memory_limit_mib": 1024,
+        "graph": "Existing actual-command interpreter plus crosschecked indexed DAG reachability; no compiler relations or injected reuse edges",
+        "value_limitation": "With SB_BATCH1 active work is already a prefix; outputs are0..127. Cases exercise distinct branch/readiness paths, not a nonidentity permutation.",
+        "guarantee": "Bounded modeled access/value preservation, byte-conflict coverage, matching, acyclicity, eligible IDs, causal reuse including replay, and terminal completion",
+        "order_diagnostic": "Reference is actual before-sync native-pipe/SSA/control order plus independently extracted staged-byte conflicts and explicit invocation completion. It models MTE2/S/MTE3 with a private32B UB enclosure; it is not original scalar-DCache order, an exact minimum-cover result, or a native theorem.",
+        "not_established": [
+          "uniform symbolic caller theorem",
+          "minimum demands",
+          "minimum IDs",
+          "native/device execution",
+          "general model completion"
+        ]
+      },
+      "point_audit_command": "timeout 120s python3.14 -m transforms.qualify_qwen_point_planner --capture build-py314/regional-repair/delivery-conservative_prefix-may-alias-staged --library /home/toni/work/pypto3/pypto-lib --output build-py314/regional-repair/p4-point-audit",
+      "source_sha256": {
+        "src/ir/transforms/utils/conservative_sync_dataflow.cpp": "3f03679572e56a8f5dfba04b261a511f082fce8dc170a7b7999dd6d60ec1c60e",
+        "tests/ut/ir/transforms/test_conservative_sync_completions.py": "2c9d9d626056a0b6ac8035643487a37dc5cc293d101759e306bf734dd2c5ed3a",
+        "tests/ut/ir/transforms/test_conservative_sync_dataflow.py": "2590b571d0419741c2b087605bff8fa8b539e6c8ee779326b73af02d83b9adbb"
+      },
+      "limitation": "Must completion of current whole pipe prefixes; loops/children reset. No global minimum-command or minimum-order claim for conservative route.",
+      "diagnostic_runs": [
+        {
+          "log": "build-py314/regional-repair/p4-tests.log",
+          "result": "15 passed, one new fixture lacked independent memory input; fixed fixture only"
+        },
+        {
+          "log": "build-py314/regional-repair/p4-tests-final.log",
+          "result": "65 passed, two old structural-oracle failures due omitted return ACK facts; corrected concrete packet model"
+        }
+      ],
+      "review": "repair_reviewer: final architecture/correctness/cost acceptance",
+      "hooks": {
+        "full": "build-py314/regional-repair/p4-hooks.log: all non-pyright passed",
+        "pyright": "build-py314/regional-repair/p4-pyright-accepted.log: passed"
+      },
+      "final_fixture_rerun": {
+        "log": "build-py314/regional-repair/p4-completions-final.log",
+        "result": "16 passed; subset of the 67-case gate, not added to total"
+      }
     }
   },
   "device_validation": false,
   "remaining_milestones": [
-    "P4",
     "P5"
   ]
 }
