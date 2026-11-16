@@ -18,9 +18,9 @@ The fresh gate passes 130 tests, including depth28 shared signature metadata wit
 
 ## Why scalar staging needs a separate decision
 
-Original `tensor.read/write` uses `pto.load/store`. The recently introduced bridge selects DMA load/local scalar read and local scalar write/DMA store instead. It currently depends on `conservative_prefix`; that coupling is the stage2 repair target. S-to-S native order does not establish GM cache visibility, and changing implementation can introduce cross-pipe obligations.
+Original `tensor.read/write` uses `pto.load/store`. At the starting checkpoint, the bridge selected DMA load/local scalar read and local scalar write/DMA store when `conservative_prefix` was requested. Stage2 removes that coupling. S-to-S native order does not establish GM cache visibility, and changing implementation can introduce cross-pipe obligations.
 
-For qkpv_plan, source unrolling supplies 384 possible item bodies and128 executed bodies. Staging creates six payloads per item. Current conservative services cost22 flag pairs per item: static 2+384*22=8450; executed2+128*22=2818. Eight bounded trace-specific diagnostics reduce2818 to1282 while preserving staged total payload order, values, matching and reuse. This is neither a uniform optimizer nor a minimum-command claim. Evidence is under `build-py314/qkpv-cost-investigation`.
+For qkpv_plan, source unrolling supplies 384 possible item bodies and128 executed bodies. Staging creates six payloads per item. Before service selection, conservative services cost22 flag pairs per item: static 2+384*22=8450; executed2+128*22=2818. Eight earlier trace-specific diagnostics reduced2818 to1282. That diagnostic was neither the implemented uniform algorithm nor a minimum-command claim. Its evidence remains under `build-py314/qkpv-cost-investigation`; stage5 below measures the actual production repair.
 
 Do not optimize rotating DMA carriers before deciding whether original scalar execution can be retained. Do not erase GM dependencies indiscriminately: different qualified roots may be disjoint, repeated access to the same root remains relevant. No device qualification follows from host execution.
 
@@ -51,3 +51,64 @@ The selected four-command packets are replayed asymmetrically: forward WAIT impo
 A separate whole-candidate AST traversal checks the ordered subset, all required completions at each final payload cut, protected child services and every omission. Existing physical lowering must still certify matching, resource eligibility and causal reuse. Failure is never repaired by deleting or adding emitted flags. The cover count kernel is shared by production and the existing C++ numerical test, including exhaustive small matrices; no test-only production API is added.
 
 For k participating pipes, coverage matrices/count updates use O(k²) cells/work; establishing and querying completion maps additionally pays their ordered-map factors. Retained per-site request/selection vectors use O(k) entries. The target pipe universe is fixed. This is cut-local inclusion minimality, not a globally minimum protocol or an optimum over alternative handshakes. Unknown-trip correctness follows the block invariant starting with no knowledge, including epoch0, and the existing closed-packet reuse premise; bounded tests supplement that argument.
+
+## Stage 5: matched production qualification
+
+The five repair stages are complete within the qualified subset; original M1–M6 whole-model ownership is still incomplete. The [machine receipt](52-autosync-construction-repair.json) pins commits, binary/tool hashes, model sources, commands and durable local evidence. Baseline source is `7fd98e54a`, candidate source `89a481d46`, both clean at capture. Both use library `b72c66d9`, unchanged two-layer Qwen3-14B, batch1/sequence128, A2/A3, may-alias, PYPTO placement and conservative-prefix policy. Each kernel capture/audit keeps its 120-second watchdog. No device was used.
+
+| Scalar implementation | PyPTO local owners before → after | Delegated local leaves | C++ leaves | Inclusive compile seconds before → after |
+| --------------------- | --------------------------------- | ---------------------- | ---------- | ---------------------------------------- |
+| Original native, default | 18 → 18 | 14 | 32/32 | 6.661 → 6.659 |
+| Explicit DMA staging | 21 → 21 | 11 | 32/32 | 9.972 → 12.175 |
+
+All47 existing task-control owners are separately observed, not newly synthesized synchronization. Pre-sync serialized IR is byte-identical within each comparison. Every post-sync payload/control inventory is unchanged. C++ is byte-identical for19 native leaves and16 staged leaves; the other leaves have changed synchronization inventories, with unchanged payload/control inventories. The staged compile increase is descriptive single-run evidence, not a speedup or a controlled attribution experiment.
+
+The11 common delegates remain four mixed-valid ADD leaves, one RoPE MUL leaf requiring qualified partial-column descriptors, and six peer-transport leaves with unavailable local Buffer contracts. Default/native additionally delegates qkpv_plan and two token-embedding leaves at scalar-operation admission. Those three do not regain implicit staging. Native scalar cache visibility, readiness, exit qualification and admission/export support remain separate unfinished obligations. Cross-core and inter-kernel owners are preserved.
+
+### Actual commands and ordering
+
+| Staged qkpv_plan measurement | Before | After |
+| ---------------------------- | ------ | ----- |
+| Static SET sites, equally many WAIT sites | 8450 | 4610 |
+| Static MTE3 same-pipe barriers | 768 | 0 |
+| Static MTE2 barriers / terminal ALL | 383 / 1 | 383 / 1 |
+| Executed pairs per invocation | 2818 | 1538 |
+| Executed payloads per invocation | 770 | 770 |
+| Payload completion-to-start prerequisites | 296065 | 296065 |
+
+Eight actual-command audits cover finalized token counts1,8,9,16,17,127,128 and0; count9 executes two invocations. Zero is structural stress outside the positive caller domain. Both emitted programs equal the same independent staged-byte/native-pipe reference: no added **or** removed payload prerequisites, not merely equal counts. Replay checks1,185,030 prerequisites on1540 payloads. Values, original allocation windows, guards, matching, acyclicity, notification closure, terminal completion and causal consumption-before-republication pass; directional IDs are subsets of `{0,1}` within the unchanged six-ID pool.
+
+The reference derives conflicts from executed byte effects, not compiler storage classes or generators. Its command graph/indexed reachability implementation is crosschecked against an expanded small graph. This validates the supplied staged model, not native scalar-DCache equivalence. The shared carrier already makes this reference totally ordered. With SB_BATCH1, outputs are0..127: branch/readiness paths vary, but these cases do not test a nonidentity permutation. Peak host audit RSS was806/657MiB before/after under the same1024MiB guard. Neither this nor command reduction establishes device speedup or minimum protocol size.
+
+The construction also reduces commands in13 native-mode and16 staged-mode leaves, including down/gate/up projection, normalization and attention-finalize. Their static inventories and ownership are checked; the eight-case full relation claim above applies specifically to qkpv_plan. Generic bounded fixtures separately compare complete baseline/candidate relations, original bytes/control, skipped writers, for/while loops, zero/multiple visits, reset counters, scalar control and physical reuse. Arbitrary supplied forwarding tokens remain unchanged.
+
+### Cost and compactness
+
+For flat independent groups N=8,32,128, fresh candidate production retained facts are57,225,897; incremental conflict-summary additions25,97,385 and indexed requests32,128,512. Requested diagnostic snapshots were191,3071,49151. Production does not retain these snapshots. The source and tests expose the remaining control-join/subtree O(VJ) dependence; no whole-pass linearity claim follows.
+
+A candidate-only qkpv_plan shared-service probe records2306 payload sites, one known local domain plus wildcard GM,3465 retained facts and no incoming diagnostic snapshots. Of6528 baseline service requests,3072 remain and3456 are suppressed; service counts include same-pipe requests and are not physical flag-pair counts. Analysis with Python diagnostic export takes0.042s, analysis/selection/certification/logical construction0.085s, and physical qualification/allocation/emission0.265s. These are separate descriptive calls: the analysis work repeats inside logical construction, and the physical call includes native checks/export. Do not add them or infer isolated allocation cost. Whole-model source generation is included only in the capture's inclusive compile time.
+
+The final gate retains exact covers, selectors, four-kind event queries, compact repetition, resident/rotating storage, resets, actual-token order and physical reuse. The final fresh gate passes692 distinct Python tests in eight bounded subgroups and3 C++ targets. Results and the preserved combined-batch timeout are recorded in the receipt. All selected checks complete in bounded subgroups; the watchdog is never increased. The previously reported small-GEMM test also passes freshly; that observation does not establish universal Buffer admission.
+
+### Reproduction
+
+From this worktree, load `.claude/skills/testing/load-env.sh`, set `PYPTO_BUILD_JOBS=1`, `PYPTO_TEST_JOBS=1`, `PYPTO_CODEGEN_MAX_WORKERS=1` and BLAS/OpenMP threads to1. Use the pinned Linux Python/compiler extension and PTOAS0.72 launcher from the receipt; do not source stale macOS paths. `PYTHONPATH` includes this checkout's `python`, `tests/ut/ir`, `tests/ut/codegen` and root. Durable outputs are below `build-py314/production-repair`.
+
+```bash
+timeout 120s python -m transforms.qualify_qwen_whole_model \
+  --library "$PYPTO_LIB" --output "$NEW_CAPTURE" --layers 2 \
+  --policy conservative_prefix --require-domain-owners
+# A separate capture adds --scalar-gm-dma; never overwrite old receipts.
+timeout 120s python -m transforms.qualify_qwen_point_planner \
+  --capture "$STAGED_CAPTURE" --library "$PYPTO_LIB" --output "$NEW_AUDIT"
+```
+
+The receipt lists the exact pytest subgroup arguments, hashes and source identities. Accepted stages1–4 have separate commits; this final evidence commit retains the original architecture plan and records its current limitations.
+
+| Established result | Remaining premise or limitation | Appropriate paper claim |
+| ------------------ | ------------------------------- | ----------------------- |
+| Shared-DAG-safe body rewrites; source-owned enclosure domains and explicit alias assumptions | Unknown accesses remain wildcard; selectors are not exact physical selectors | Sound conservative modeled effects with separately stated precision |
+| Cut-local service selection before tokens; complete candidate certificate | Reset at control/child boundaries; no global minimum-command theorem | Certified reduction of conservative storage services under the existing protocol |
+| Matched staged qkpv_plan has fewer commands and identical bounded payload order | Staged reference is already total; original scalar qualification incomplete | Bounded realization validation, not a stronger exact-demand or native theorem |
+| Exact compact provider regressions and supplied-token lowering retained | General §8 completion and full model ownership remain incomplete | Exact and conservative providers share interfaces without conflating guarantees |
+| Existing six-ID realization and C++ generation pass | Host only; compilation increase measured, no device performance result | Physical feasibility for qualified plans, separately from native execution |
