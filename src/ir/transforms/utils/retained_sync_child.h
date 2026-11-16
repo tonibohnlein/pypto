@@ -79,7 +79,10 @@ struct SyncChildEffectWork {
   size_t statements = 0, expressions = 0, native_qualifications = 0;
 };
 bool HasReadonlyExternalSyncEffects(const ForStmtPtr& scope, FunctionType core, const std::string& target,
-                                    SyncChildEffectWork* work = nullptr);
+                                    SyncChildEffectWork* work = nullptr,
+                                    bool allow_disjoint_gm_writes = false);
+SyncParameterBounds ProjectSyncParameterBounds(const FunctionPtr& owner, const FunctionPtr& binding_owner,
+                                               const SyncParameterBounds& owner_bounds);
 
 struct SyncRegionIndexWork {
   size_t source_nodes;
@@ -146,8 +149,9 @@ class EventfulSyncChild {
                                                                            const ForStmtPtr&,
                                                                            const std::string&,
                                                                            const SyncRegionBindings&);
-  friend EventfulSyncChildAttempt TryPrepareEventfulSyncChild(const FunctionPtr&, const ForStmtPtr&,
-                                                              const std::string&, const SyncRegionBindings&);
+  friend EventfulSyncChildAttempt TryPrepareEventfulSyncChild(
+      const FunctionPtr&, const ForStmtPtr&, const std::string&, const SyncRegionBindings&,
+      const SyncParameterBounds&, const std::optional<std::pair<int64_t, int64_t>>&);
 };
 std::shared_ptr<const EventfulSyncChild> PrepareEventfulSyncChild(const FunctionPtr& owner,
                                                                   const ForStmtPtr& scope,
@@ -170,9 +174,10 @@ struct EventfulSyncChildAttempt {
   std::shared_ptr<const CompactSyncResult> mathematics;
   std::shared_ptr<const EventfulSyncChild> child;
 };
-EventfulSyncChildAttempt TryPrepareEventfulSyncChild(const FunctionPtr& owner, const ForStmtPtr& scope,
-                                                     const std::string& target,
-                                                     const SyncRegionBindings& bindings);
+EventfulSyncChildAttempt TryPrepareEventfulSyncChild(
+    const FunctionPtr& owner, const ForStmtPtr& scope, const std::string& target,
+    const SyncRegionBindings& bindings, const SyncParameterBounds& parameters = {},
+    const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt);
 struct AutomaticSyncChildren {
   std::vector<EventfulSyncChildAttempt> attempts;
   size_t discovery_nodes = 0;
@@ -182,7 +187,9 @@ struct AutomaticSyncChildren {
 // One discovery and one binding index per owner; candidates are disjoint whole
 // sequential For invocations without nested For/While scopes. Costs additionally
 // include each provider attempt and the requested binding/interface output.
-AutomaticSyncChildren PrepareAutomaticSyncChildren(const FunctionPtr& owner, const std::string& target);
+AutomaticSyncChildren PrepareAutomaticSyncChildren(
+    const FunctionPtr& owner, const std::string& target, const SyncParameterBounds& parameters = {},
+    const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt);
 
 enum class NativeSyncChildStatus {
   Ready,

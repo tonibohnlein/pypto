@@ -1445,7 +1445,8 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
     const FunctionPtr& function, const std::string& target,
     const std::vector<std::shared_ptr<const NativeSyncChild>>& children,
     const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful_children,
-    bool retain_incoming_diagnostics, bool automatic_children, bool enable_refresh_kill) {
+    bool retain_incoming_diagnostics, bool automatic_children, bool enable_refresh_kill,
+    const SyncParameterBounds& parameters, const std::optional<std::pair<int64_t, int64_t>>& blocks) {
   CHECK(function && function->ir_stage_ == FunctionIRStage::Buffer)
       << "Conservative synchronization requires Buffer IR";
   CHECK(function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV)
@@ -1457,7 +1458,7 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
   AutomaticSyncChildren selection;
   std::vector<std::shared_ptr<const EventfulSyncChild>> selected = eventful_children;
   if (automatic_children) {
-    selection = PrepareAutomaticSyncChildren(function, target);
+    selection = PrepareAutomaticSyncChildren(function, target, parameters, blocks);
     for (const auto& attempt : selection.attempts)
       if (attempt.child) selected.push_back(attempt.child);
   }

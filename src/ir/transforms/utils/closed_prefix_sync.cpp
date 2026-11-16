@@ -32,6 +32,7 @@
 #include "pypto/ir/sync.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
@@ -1087,7 +1088,8 @@ bool HasOnlyClosedPrefixSyntax(const FunctionPtr& function) {
 
 std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     const FunctionPtr& function, const std::string& target,
-    const std::optional<std::vector<int>>& eligible_ids, const SyncNativeReservations& extra_reservations) {
+    const std::optional<std::vector<int>>& eligible_ids, const SyncNativeReservations& extra_reservations,
+    const SyncParameterBounds& parameters, const std::optional<std::pair<int64_t, int64_t>>& blocks) {
   Discover discovered;
   discovered.VisitFunction(function);
   if (!HasMatchingClosedPrefixUses(function, discovered)) return std::nullopt;
@@ -1105,10 +1107,13 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
   const auto bindings = discovered.children.empty()
                             ? std::optional<SyncRegionBindings>{}
                             : std::optional<SyncRegionBindings>{std::in_place, function, target};
+  const auto* ctx = PassContext::Current();
+  const bool disjoint_gm = ctx && ctx->GetAutoSyncDisjointGM();
   for (const auto& child : discovered.children) {
-    const auto external_policy = HasReadonlyExternalSyncEffects(child, function->func_type_, target)
-                                     ? SyncExternalPolicy::ReadOnlyProjection
-                                     : SyncExternalPolicy::Geometry;
+    const auto external_policy =
+        HasReadonlyExternalSyncEffects(child, function->func_type_, target, nullptr, disjoint_gm)
+            ? SyncExternalPolicy::ReadOnlyProjection
+            : SyncExternalPolicy::Geometry;
     auto context = bindings->Bind(child, external_policy);
     CheckLogicalSync(context.binding_owner);
     NativeOperations child_native(function->func_type_, target);
@@ -1160,7 +1165,8 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     actual->body_ = replace.VisitStmt(context.binding_owner->body_);
     // Unified per-direction resource management: forward `eligible_ids` along
     // with per-direction parent reservations instead of a flat global subtraction.
-    auto lowered = LowerLogicalSync(actual, target, eligible_ids, {}, std::nullopt, {}, external_policy,
+    const auto child_bounds = ProjectSyncParameterBounds(function, actual, parameters);
+    auto lowered = LowerLogicalSync(actual, target, eligible_ids, child_bounds, blocks, {}, external_policy,
                                     std::nullopt, assignment.Reservations());
     const auto original_body = As<SeqStmts>(actual->body_);
     const auto lowered_body = As<SeqStmts>(lowered.function->body_);
