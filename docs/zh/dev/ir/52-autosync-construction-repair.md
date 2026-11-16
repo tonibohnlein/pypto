@@ -93,7 +93,7 @@ timeout 120s python -m transforms.qualify_qwen_point_planner \
 
 ## 后续修复计划：区域构造与生产契约
 
-计划基线为 `a19c1ead6`。上文五阶段保留为已接受的有界结果，没有完成原 M1–M6，也未消除所有服务冗余。以下 P1–P5 均为**计划中**，不是已实现或已接受。英文版本为完整权威计划，继续现有[区域架构](39-regional-sync-architecture.md)。参考草稿 `7f2f244` 和 PTOAS Frontier `fe32dacf3`。
+计划基线为 `a19c1ead6`。上文五阶段保留为已接受的有界结果，没有完成原 M1–M6，也未消除所有服务冗余。计划批准时 P1–P5 均未实施；以下检查点及续篇收据记录后续接受状态。英文版本为完整权威计划，继续现有[区域架构](39-regional-sync-architecture.md)。参考草稿 `7f2f244` 和 PTOAS Frontier `fe32dacf3`。
 
 最新有限诊断在8个实际执行上将1538对减少到1282对，保持 staging 值、全序及重用；不构成统一生产变换。已复现普通 Tile alias 的类型不对称及7个旧 Buffer-codegen 测试期望。复用 Group 的 reciprocal-peer 集成还需完整新复现；已有拒绝测试不是其修复。
 
@@ -180,3 +180,48 @@ P3 经独立评审接受；12项新增、75项既有子区域回归、串行构�
 扩展 P4 回归发现旧结构 oracle 只模拟前向交付，遗漏返回 ACK 的完成导入。现以具体动态 payload-ID 集合执行既定协议并传递先决条件，保留原字节冲突断言；不复用生产 Boolean 矩阵或分支连接规则，实际 token/flag 解释器不变。
 
 P4 不变量、具体集合 oracle 修正和实际命令结果经独立评审接受。最终67项通过，随后16项夹具重跑是重叠子集。8个原 staged qkpv_plan 执行每770载荷调用的标志对1538→1282，保持全部296065 staged C→I 顺序（包括重复调用完成）、值和因果重用。7个正调用例与单独标注的零 stress 区分；全部 hooks 通过。原生标量语义及全局最少命令仍未建立。
+
+### P5 最终验证与剩余义务
+
+十一个120秒门禁组通过1193个不同 Python 用例（无重复 node ID）及3个 C++ 测试，保留 finite/compact/parameterized/nested/replay/zero-body、token/reuse、ownership、codegen 与修复回归。含 Buffer-codegen、新 qualifier/自动子区域及全部8种适用 schedule ablation。额外 control 门禁发现旧测试混淆公开退出 drain 与内部 pending 退出；现比较内部 schedule 并单独要求公开尾部恰一个 ALL，保留70/31 guard检查及旧失败日志。既有 inline direction 弃用告警保留，无设备执行。
+
+未修改双层 Qwen 库 b72c66d9、batch1/sequence128、A2/A3、PYPTO 布局，8组对应 before/after 的同步前序列化 IR 与模型源码哈希一致。47个既有 task-control 所有者与32个局部叶分别统计；disjoint 是哈希固定的显式调用承诺，不证明所有调用方。
+
+| 策略 | GM 契约 | 标量实现 | 自有叶 before → after | C++ | 结果 |
+| ---- | ------- | -------- | --------------------- | --- | ---- |
+| Exact | may-alias | 原始 | 0 → 0 | 32/32 | 缺 disjoint 输入前提，委托 |
+| Exact | disjoint | 原始 | 3 → 3 | 32/32 | 保留既有精确覆盖 |
+| Exact | may-alias | 显式 DMA | 0 → 0 | 31/32 | 委托 qkpv_plan 触及原 PTOAS60秒超时 |
+| Exact | disjoint | 显式 DMA | 3 → 3 | 31/32 | 同一委托超时 |
+| Prefix | may-alias | 原始 | 18 → 18 | 32/32 | 保守并保留子区域 |
+| Prefix | disjoint | 原始 | 18 → 18 | 32/32 | 显式调用承诺下同覆盖 |
+| Prefix | may-alias | 显式 DMA | 21 → 21 | 32/32 | 非默认原生结果 |
+| Prefix | disjoint | 显式 DMA | 21 → 21 | 32/32 | 同条件覆盖 |
+
+Exact 原生 C++ 字节一致；Prefix 原生12叶、staged14叶代码变化，没有隐藏所有权变化。六叶保留10个子循环：down/gate-up/KV各2，LM-head/output-AIC/Q各1；不代表导出所有外层嵌套 K。
+
+原 down blocks0/19 各443载荷，与当前 primitive prefix 比较，额外顺序2229→1716、删除513对且无新增；执行 SET/WAIT 各584→494，屏障376→214，474次重用通过，各方向最多 IDs0–3。静态旗标却44→48，屏障25→17，不能只看数量。通用测试独立检查 retained covers、四种查询、局部及 unavailable GM selector；自动整函数命令审计明确未检查 retained 数学。
+
+独立 historical 审计比较实际捕获的 P2 物理计划与当前自动计划：两个 block 同样删除513对、无新增，flags712→494、屏障408→214。旧 logical token 程序 unavailable，明确不声称该臂 token 顺序等价；仍验证物理 coverage/matching/reuse，当前候选实际 token 顺序另验。
+
+Guard 取舍可见：down 的 If1→9、gate/up2→10、Q1→5；staged qkpv_plan385→385。这是源码控制站点，不是设备指令。子降低仍共用 LowerLogicalSync/assigned scheduler；control/ablation 通过不证明全局 guard 最少。
+
+显式 staged qkpv_plan 静态 SET/WAIT 各4610→3842，每770载荷调用执行1538→1282对。7个正调用例及单独的零 stress 通过，finalize9含两次调用/reset；每次全部296065 staged C→I 顺序保留，重复执行检查1185030对。匹配、字节冲突、值、退出完成和重用通过。carrier 模型已全序，不证明原生标量等价或全局最少协议；MTE2屏障383、ALL1不变。
+
+单次描述性计时：staged分析约0.044秒、包含重复分析的逻辑构造0.127秒、物理限定/分配/发射0.293秒、PTO/C++生成0.365秒。不能相加包含性时间；分配准备/求解及完整共享表达式保留节点计数不可用，不等于零。最终模型捕获与一个回归 worker 并行，before/after 不是受控加速证据。
+
+剩余：4个 mixed-valid ADD 缺值/active-domain语义；RoPE MUL缺 active-row/pitched-column 契约；原生 qkpv_plan与2个 embedding缺 GM标量 admission/readiness/cache限定；6个 peer叶缺现有手动 transport 周围的局部 Buffer/borrow/ready/release 契约。地址包络不能修复这些语义。首个 down 自动候选缺原始外围坐标绑定，是接口/选择能力缺口，不是数学不可行证明。通用 common-completion `(A,E,S,t)` 仍缺，不能从 prefix 假定。
+
+下一可复用改进应加强较大已支持闭合区域的原始 frame 绑定与 capability 选择，共享成本；自动 down 仍有1716额外顺序。原生 GM标量限定另设 backend-contract 里程碑。当前 must-fact 仅覆盖整个当前管线前缀，新无关工作仍可能丢失更细粒度完成知识。
+
+| 已建立 | 剩余前提或限制 | 论文适当陈述 |
+| ------ | -------------- | ------------ |
+| 精确 covers/四种事件查询/限定 selector 保留 | 模型 footprint；GM unavailable 明确 | 支持的紧凑精确类及已测接口 |
+| 保守分支事实和闭合子组合覆盖要求 | wrapper 可加序；通用 completion 未完 | 可靠可选保守构造，精度单独报告 |
+| down 删除513对而无新增 | 仍1716额外序，仅两个 ABI block | 有限执行的保序质量改进 |
+| staged planner 每次少256旗标对 | carrier 已串行；原生未限定 | 选定 staging 模型的协议构造改进 |
+| 现有6-ID及 C++通过 | 未证明不代表不可行；仅宿主 | 模型内物理实现与原生/设备结论区分 |
+
+五项有界修复均已实施并通过独立评审；原 M1–M6 全模型目标仍部分完成。精确命令、源码/工具/输入、逐叶结果、超时和独立证据见英文[续篇收据](../../../en/dev/ir/52-autosync-regional-repair.json)及磁盘路径；P5 最终报告门禁已接受。
+
+通用性受契约限定：生产改动消费 storage/type 身份、原生效应、结构化 occurrence 切点及管线关系，没有内核名或 benchmark 数字 dispatch；Vector 与 Cube 共用子服务。它证明可复用的已准入类，不证明任意控制、tiling、原生指令或全模型所有权。另一个显式 disjoint historical down 的 block0 检查也删除513对无新增，执行692→474对；两个比较臂使用同一不相交物理布局。

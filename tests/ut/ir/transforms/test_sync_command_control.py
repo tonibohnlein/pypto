@@ -235,7 +235,14 @@ def test_residue_selection_stays_compact_and_matches_original_accesses(count):
         )["function"]
         run_physical(original, specialized, range(6))
         optimized = trace_control(specialized)
-        assert optimized.trace == state.trace
+        # The research helper lowers an internal plan with pending payloads.
+        # Public ownership separately completes the invocation. Compare the
+        # schedules at equal boundaries and explicitly retain that final drain.
+        internal = testing.lower_sync_schedule(logical)["function"]
+        internal_state = trace_control(internal)
+        assert state.trace[-1] == ("system.bar_all", internal_state.payload_count)
+        assert state.trace[:-1] == internal_state.trace
+        assert optimized.trace == internal_state.trace
         assert optimized.counts["conditions"] == 31
 
 

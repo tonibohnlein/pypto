@@ -115,7 +115,7 @@ The receipt lists the exact pytest subgroup arguments, hashes and source identit
 
 ## Next repair plan: regional construction and production contracts
 
-Planning baseline: `a19c1ead6`. The five accepted stages above remain historical, scoped results; they did not complete original M1–M6 or eliminate conservative service redundancy. This continuation preserves those goals and the architecture in [39](39-regional-sync-architecture.md). Status of every milestone below is **planned**, not implemented or accepted.
+Planning baseline: `a19c1ead6`. The five accepted stages above remain historical, scoped results; they did not complete original M1–M6 or eliminate conservative service redundancy. This continuation preserves those goals and the architecture in [39](39-regional-sync-architecture.md). At plan approval every milestone below was planned; the implementation checkpoints and continuation receipt record subsequent acceptance.
 
 The latest source audit used draft `7f2f244` and PTOAS Frontier `fe32dacf3`. The draft distinguishes exact selector/query composition, conservative prefix entry wrappers, and regional common completion. The latter two preserve a child's internal implementation but can strengthen crossings. Basic prefix summaries intentionally retain pending effects; exploiting internal delivery requires additional evidence. A child boundary never implies completion or physical rearming.
 
@@ -222,3 +222,55 @@ For k fixed hardware pipes this uses k² Boolean cells, O(k²) transfer/selectio
 The expanded P4 gate exposed an older structural-oracle limitation: it modeled forward handoffs but omitted return-acknowledgment imports. The checker now executes the same declared packet schema over concrete dynamic payload-ID sets, including transitive prerequisites; original byte-conflict checks remain intact. It shares neither the producer Boolean matrix nor its branch-join logic. The actual-token/flag interpreter is unchanged.
 
 P4 independent review accepted the invariant, concrete-set oracle correction and actual-command results. The final gate passes 67 distinct cases; the final 16-case fixture rerun is an overlapping subset. Eight original staged qkpv_plan executions reduce 1538→1282 pairs per 770-payload invocation while preserving all 296065 staged C→I prerequisites (including repeated-invocation completion), values and causal flag reuse. Seven positive caller cases and the separately labeled zero stress remain distinct. All hooks pass. Native scalar semantics and global minimum-command claims remain unestablished.
+
+### P5 final qualification and remaining obligations
+
+The final eleven bounded regression groups pass **1193 distinct Python cases**, with no duplicated node IDs, plus **three C++ tests**. The prior finite/compact/parameterized/nested/replay/zero-body, token-order/reuse, ownership, source-generation and repair gates retain their original 120-second watchdog. This includes Buffer-codegen, the new qualifier/automatic-child tests and all eight applicable scheduling ablations. The extra control gate initially exposed a stale public-versus-internal exit comparison: tests now compare internal schedules and separately require exactly one public terminal ALL, preserving the 70-versus-31 guard checks. The failed run remains recorded. Existing inline-direction deprecation warnings remain. No device campaign was run.
+
+The unchanged two-layer Qwen source is library `b72c66d9`, batch 1/sequence 128, A2/A3 and PYPTO placement. All eight matched before/after cases have identical pre-sync serialized IR within their selected scalar implementation and unchanged model-source hashes. The 47 existing task-control owners remain separate from 32 local leaves. Disjoint rows are conditional on the supplied, hash-pinned caller promise; they are not a proof about every model caller.
+
+| Policy | GM contract | Scalar implementation | PyPTO local IR owners before → after | C++ leaves | Outcome |
+| ------ | ----------- | --------------------- | ------------------------------------ | ---------- | ------- |
+| Exact | may-alias | original | 0 → 0 | 32/32 | Missing exact-policy disjointness premise; delegation |
+| Exact | disjoint | original | 3 → 3 | 32/32 | Existing exact coverage preserved |
+| Exact | may-alias | explicit DMA | 0 → 0 | 31/32 | Delegated qkpv_plan hits existing PTOAS 60s timeout |
+| Exact | disjoint | explicit DMA | 3 → 3 | 31/32 | Same delegated timeout; other leaves retain stage results |
+| Prefix | may-alias | original | 18 → 18 | 32/32 | Sound conservative route with retained children |
+| Prefix | disjoint | original | 18 → 18 | 32/32 | Same ownership under explicit caller contract |
+| Prefix | may-alias | explicit DMA | 21 → 21 | 32/32 | Staged derivative, not default-native coverage |
+| Prefix | disjoint | explicit DMA | 21 → 21 | 32/32 | Same conditional ownership |
+
+Exact native C++ is byte-identical before/after. Prefix native changes 12 generated leaves; staged changes 14. No ownership change is hidden. Ten loop children are retained across six leaves: down/gate-up/KV each 2, LM-head/output-AIC/Q each 1. The scope selector does not export every enclosing nested K region.
+
+Independent automatic down-projection checks on original ABI blocks 0 and 19 each execute 443 payloads. Relative to the **current primitive prefix producer**, required-order excess falls 2229→1716; 513 prerequisites disappear and none are added. Executed SET and WAIT counts each fall 584→494, barriers 376→214; 474 causal reuses pass, using at most IDs 0–3 in a direction. Static flag sites nevertheless increase 44→48 while barriers 25→17. Counts and ordering are different measurements. Covers/all-event queries/local and unavailable-GM selectors are checked separately by the generic retained-model tests; the automatic full-function command audit explicitly reports retained mathematics unchecked.
+
+The separate historical-plan audit compares the actually captured P2 emitted physical plan against the current automatic plan on the same original input. On both blocks it also removes 513 prerequisites and adds none; flags fall 712→494 and barriers 408→214. The old logical token program is unavailable, so that arm's token-order equality is explicitly unavailable; physical matching/reuse/coverage are still checked. The current candidate's actual-token order is checked. These figures are distinct from the current-primitive comparison above.
+
+Guard control is a visible tradeoff: down projection's If sites grow 1→9, gate/up 2→10 and Q projection 1→5; staged qkpv_plan remains 385→385. These are original plus inserted control sites, not optimized device instruction counts. Child lowering still uses the shared LowerLogicalSync/assigned scheduler. Passing the control/ablation gates establishes preserved semantics and supported optimizations, not global guard-code minimality.
+
+The explicit-staging qkpv_plan result is 3842 static SET and3842 WAIT sites, down from 4610 each. Each 770-payload invocation executes1282 pairs, down from1538. Seven positive caller cases and a separately labeled zero stress pass, including two invocations/reset at finalize 9. All 296065 staged C→I pairs are preserved per invocation; the repeated execution checks 1185030 pairs. Matching, original-byte hazards, values, terminal completion and causal reuse pass. The staged carrier model is already totally ordered; this does not establish original native-scalar equivalence or minimum protocol-command count. MTE2 barriers 383 and terminal ALL 1 remain unchanged.
+
+Single measured costs are descriptive. On the staged planner, standalone analysis is about 0.044s, logical construction including repeated analysis 0.127s, physical qualification/allocation/emission 0.293s and PTO plus C++ generation 0.365s. The backend exposes no separate allocation-preparation/solver clocks here. Independent calls and inclusive timers cannot be summed. Final whole-model captures ran alongside one regression worker; before/after wall times are not controlled speedup evidence. Shared expression-node retention is not exported as a complete metric; it is unavailable, not zero. Binding/expression/native-qualification counters, retained models, static control and phase clocks are recorded where available.
+
+Remaining causes retain precise boundaries:
+
+- Four mixed-valid ADD leaves: value/active-domain semantics, first rejected in Buffer selection. Enclosing their addresses cannot establish inactive values.
+- RoPE MUL: active-row/pitched partial-column descriptor contract. Preserve delegation.
+- Native qkpv_plan and two embedding leaves: GM scalar operation admission, readiness and cache-visibility qualification; broader GM enclosures cannot supply missing native semantics.
+- Six peer leaves: local Buffer/borrowed-lifetime/ready/release contracts around existing manual transport. Cross-core synchronization synthesis remains outside this task.
+- The first automatic down child: unavailable original enclosing coordinate binding. Retained local mathematics elsewhere does not resolve it. This is an interface/candidate-selection limitation, not a proved obstruction to demand analysis.
+- General common-completion `(A,E,S,t)` transfer and its executable capability remain absent. Prefix composition must not advertise that guarantee.
+
+The next reusable improvement should strengthen original-frame binding and capability selection for larger already-supported closed regions, with shared construction-cost accounting. The automatic down witness still adds 1716 prerequisites and misses a larger scope; address that interface evidence before adding recognizers. Native GM scalar qualification is a separate backend-contract milestone. Current conservative delivery facts intentionally concern current whole-pipe prefixes; new unrelated work on a pipe can still discard useful finer-grained completion knowledge.
+
+| Established result | Remaining premise or limitation | Appropriate manuscript claim |
+| ------------------ | ------------------------------- | ---------------------------- |
+| Exact provider covers, four-kind queries and qualified selectors survive refactoring | Qualified modeled footprints; unavailable GM boundaries remain explicit | Implemented supported compact exact classes and their tested interfaces |
+| Conservative branch facts and closed-child composition preserve modeled requirements | Prefix wrappers can add order; general common completion incomplete | Sound optional conservative construction with separately measured precision |
+| Down automatic plan removes 513 prerequisites with no added pair on checked executions | Still 1716 excess; two finite ABI blocks, no global dominance theorem | Bounded ordering improvement through retained children |
+| Staged planner removes 256 executed flag pairs per invocation | Carrier already serializes payloads; native scalar semantics unqualified | Protocol-construction improvement for the selected staged model |
+| Existing six-ID machinery and C++ generation pass qualified plans | Refusal can mean unproved reuse, not infeasibility; host only | Certified modeled physical realization, separate from native/device correctness |
+
+All five bounded repairs are accepted after independent review; the original M1–M6 whole-model goal remains partially complete. Exact commands, source/tool/input hashes, per-leaf outcomes, timeout evidence and independent receipts are in [the continuation receipt](52-autosync-regional-repair.json) and its disk-backed evidence paths. The final P5 report gate is accepted.
+
+Generality is scoped by contracts: production changes consume storage/type identity, selected native effects, structured occurrence cuts and pipe relations. No kernel-name or benchmark-count dispatch was introduced. Vector and Cube fixtures exercise the same child service. This establishes reusable admitted families; it does not establish arbitrary control, tilings, native instructions or complete model ownership. A separate disjoint historical down check on block0 also removes513 prerequisites without added order, with692→474 executed pairs under the explicitly supplied distinct-root contract; the physical input layout is disjoint in both compared arms.
