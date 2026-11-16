@@ -408,7 +408,7 @@ namespace {
 class ForwardSyncOptimizer : public IRMutator {
  public:
   StmtPtr Run(const StmtPtr& body) {
-    waited_.clear();
+    waited_masks_.clear();
     completed_.clear();
     local_record_.clear();
     alias_of_.clear();
@@ -453,18 +453,18 @@ class ForwardSyncOptimizer : public IRMutator {
         bundle.push_back({rewritten[j], info->first.get(), info->second, false});
         ++j;
       }
-      for (size_t a = 0; a < bundle.size(); ++a) {
-        const auto rec_a = local_record_.find(bundle[a].tok);
-        if (rec_a == local_record_.end()) continue;
-        for (size_t b = a + 1; b < bundle.size(); ++b) {
-          if (bundle[b].dst != bundle[a].dst) continue;
-          const auto rec_b = local_record_.find(bundle[b].tok);
-          if (rec_b == local_record_.end()) continue;
-          if (rec_a->second.pipe == rec_b->second.pipe &&
-              rec_a->second.scope_id == rec_b->second.scope_id &&
-              rec_a->second.seq < rec_b->second.seq) {
-            bundle[a].drop = true;
-            break;
+      // Single reverse pass per (dst_pipe, src_pipe, scope_id) drops earlier dominated waits in O(K).
+      std::map<std::tuple<PipeType, PipeType, size_t>, size_t> max_seq_after;
+      for (size_t k = bundle.size(); k-- > 0;) {
+        const auto rec = local_record_.find(bundle[k].tok);
+        if (rec == local_record_.end()) continue;
+        const auto key = std::make_tuple(bundle[k].dst, rec->second.pipe, rec->second.scope_id);
+        const auto [it, inserted] = max_seq_after.emplace(key, rec->second.seq);
+        if (!inserted) {
+          if (rec->second.seq < it->second) {
+            bundle[k].drop = true;
+          } else if (rec->second.seq > it->second) {
+            it->second = rec->second.seq;
           }
         }
       }
@@ -479,12 +479,9 @@ class ForwardSyncOptimizer : public IRMutator {
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     if (!As<SyncTokenType>(op->var_->GetType())) return op;
     alias_of_.erase(op->var_.get());
-    for (auto it = waited_.begin(); it != waited_.end();) {
-      if (it->first == op->var_.get())
-        it = waited_.erase(it);
-      else
-        ++it;
-    }
+    completed_.erase(op->var_.get());
+    local_record_.erase(op->var_.get());
+    waited_masks_.erase(op->var_.get());
     auto bind_alias = [&](const VarPtr& target, const VarPtr& rhs) -> StmtPtr {
       const VarPtr root = Canonical(rhs);
       alias_of_[target.get()] = root;
@@ -492,11 +489,9 @@ class ForwardSyncOptimizer : public IRMutator {
       if (const auto rec = local_record_.find(root.get()); rec != local_record_.end()) {
         local_record_[target.get()] = rec->second;
       }
-      return rhs.get() == root.get()
-                 ? StmtPtr(std::make_shared<AssignStmt>(target, root, op->span_, op->leading_comments_))
-                 : StmtPtr(std::make_shared<AssignStmt>(target, root, op->span_, op->leading_comments_));
+      return std::make_shared<AssignStmt>(target, root, op->span_, op->leading_comments_);
     };
-    if (const auto rhs_var = As<Var>(op->value_)) {
+    if (const auto rhs_var = AsVarLike(op->value_)) {
       const VarPtr root = Canonical(rhs_var);
       alias_of_[op->var_.get()] = root;
       if (completed_.count(root.get())) completed_.insert(op->var_.get());
@@ -517,8 +512,8 @@ class ForwardSyncOptimizer : public IRMutator {
         return op;
       }
       if (IsOp(call, "sync.join") && call->args_.size() == 2) {
-        const auto a = As<Var>(call->args_[0]);
-        const auto b = As<Var>(call->args_[1]);
+        const auto a = AsVarLike(call->args_[0]);
+        const auto b = AsVarLike(call->args_[1]);
         const VarPtr ca = a ? Canonical(a) : VarPtr{};
         const VarPtr cb = b ? Canonical(b) : VarPtr{};
         if (ca && cb && ca.get() == cb.get()) {
@@ -532,6 +527,21 @@ class ForwardSyncOptimizer : public IRMutator {
           if (ca) return bind_alias(op->var_, ca);
           return std::make_shared<AssignStmt>(op->var_, call->args_[0], op->span_, op->leading_comments_);
         }
+        bool changed = false;
+        std::vector<ExprPtr> next_args = call->args_;
+        if (ca && a && ca.get() != a.get()) {
+          next_args[0] = ca;
+          changed = true;
+        }
+        if (cb && b && cb.get() != b.get()) {
+          next_args[1] = cb;
+          changed = true;
+        }
+        if (changed) {
+          auto next_call = OpRegistry::GetInstance().Create(call->op_->name_, std::move(next_args),
+                                                            call->kwargs_, call->span_);
+          return std::make_shared<AssignStmt>(op->var_, std::move(next_call), op->span_, op->leading_comments_);
+        }
       }
     }
     return op;
@@ -541,9 +551,14 @@ class ForwardSyncOptimizer : public IRMutator {
     const auto info = ParseWait(op);
     if (!info) return op;
     const VarPtr root = Canonical(info->first);
-    if (completed_.count(root.get()) || !waited_.emplace(root.get(), info->second).second) {
+    const size_t pipe_idx = static_cast<size_t>(info->second);
+    INTERNAL_CHECK(pipe_idx < 32) << "Pipe index out of bitmask range";
+    const uint32_t pipe_bit = uint32_t{1} << pipe_idx;
+    uint32_t& mask = waited_masks_[root.get()];
+    if (completed_.count(root.get()) || (mask & pipe_bit) != 0) {
       return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, op->span_);
     }
+    mask |= pipe_bit;
     if (root.get() != info->first.get()) {
       const auto old_call = As<Call>(op->expr_);
       auto new_call = OpRegistry::GetInstance().Create(old_call->op_->name_, {root}, old_call->kwargs_,
@@ -553,14 +568,30 @@ class ForwardSyncOptimizer : public IRMutator {
     return op;
   }
 
+  StmtPtr VisitStmt_(const YieldStmtPtr& op) override {
+    bool changed = false;
+    std::vector<ExprPtr> values = op->value_;
+    for (auto& value : values) {
+      if (const auto tok = AsVarLike(value); tok && As<SyncTokenType>(tok->GetType())) {
+        const VarPtr root = Canonical(tok);
+        if (root.get() != tok.get()) {
+          value = root;
+          changed = true;
+        }
+      }
+    }
+    if (!changed) return op;
+    return std::make_shared<YieldStmt>(std::move(values), op->span_, op->leading_comments_);
+  }
+
   StmtPtr VisitStmt_(const IfStmtPtr& op) override {
-    const auto saved_waited = waited_;
+    const auto saved_waited = waited_masks_;
     const auto saved_completed = completed_;
     const auto saved_aliases = alias_of_;
     scope_depth_ = next_scope_id_++;
     StmtPtr then_body = VisitStmt(op->then_body_);
-    const auto then_waited = waited_;
-    waited_ = saved_waited;
+    const auto then_waited = std::move(waited_masks_);
+    waited_masks_ = saved_waited;
     completed_ = saved_completed;
     alias_of_ = saved_aliases;
     std::optional<StmtPtr> else_body;
@@ -568,11 +599,15 @@ class ForwardSyncOptimizer : public IRMutator {
       scope_depth_ = next_scope_id_++;
       else_body = VisitStmt(*op->else_body_);
     }
-    const auto& else_waited = op->else_body_ ? waited_ : saved_waited;
-    waited_.clear();
-    for (const auto& entry : then_waited) {
-      if (else_waited.count(entry)) waited_.insert(entry);
+    const auto& else_waited = op->else_body_ ? waited_masks_ : saved_waited;
+    std::unordered_map<const Var*, uint32_t> intersected;
+    for (const auto& [tok, then_mask] : then_waited) {
+      const auto eit = else_waited.find(tok);
+      if (eit == else_waited.end()) continue;
+      const uint32_t merged = then_mask & eit->second;
+      if (merged != 0) intersected.emplace(tok, merged);
     }
+    waited_masks_ = std::move(intersected);
     completed_ = saved_completed;
     alias_of_ = saved_aliases;
     scope_depth_ = next_scope_id_++;
@@ -581,22 +616,23 @@ class ForwardSyncOptimizer : public IRMutator {
   }
 
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
-    std::set<const Var*> loop_vars;
-    loop_vars.insert(op->loop_var_.get());
-    for (const auto& arg : op->iter_args_) loop_vars.insert(arg.get());
-    const auto saved_waited = waited_;
+    const auto saved_waited = waited_masks_;
     const auto saved_completed = completed_;
     const auto saved_aliases = alias_of_;
-    for (auto it = waited_.begin(); it != waited_.end();) {
-      if (loop_vars.count(it->first))
-        it = waited_.erase(it);
-      else
-        ++it;
+    waited_masks_.erase(op->loop_var_.get());
+    completed_.erase(op->loop_var_.get());
+    alias_of_.erase(op->loop_var_.get());
+    local_record_.erase(op->loop_var_.get());
+    for (const auto& arg : op->iter_args_) {
+      waited_masks_.erase(arg.get());
+      completed_.erase(arg.get());
+      alias_of_.erase(arg.get());
+      local_record_.erase(arg.get());
     }
     const size_t outer_scope = next_scope_id_++;
     scope_depth_ = next_scope_id_++;
     StmtPtr body = VisitStmt(op->body_);
-    waited_ = saved_waited;
+    waited_masks_ = saved_waited;
     completed_ = saved_completed;
     alias_of_ = saved_aliases;
     scope_depth_ = outer_scope;
@@ -606,21 +642,19 @@ class ForwardSyncOptimizer : public IRMutator {
   }
 
   StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
-    std::set<const Var*> loop_vars;
-    for (const auto& arg : op->iter_args_) loop_vars.insert(arg.get());
-    const auto saved_waited = waited_;
+    const auto saved_waited = waited_masks_;
     const auto saved_completed = completed_;
     const auto saved_aliases = alias_of_;
-    for (auto it = waited_.begin(); it != waited_.end();) {
-      if (loop_vars.count(it->first))
-        it = waited_.erase(it);
-      else
-        ++it;
+    for (const auto& arg : op->iter_args_) {
+      waited_masks_.erase(arg.get());
+      completed_.erase(arg.get());
+      alias_of_.erase(arg.get());
+      local_record_.erase(arg.get());
     }
     const size_t outer_scope = next_scope_id_++;
     scope_depth_ = next_scope_id_++;
     StmtPtr body = VisitStmt(op->body_);
-    waited_ = saved_waited;
+    waited_masks_ = saved_waited;
     completed_ = saved_completed;
     alias_of_ = saved_aliases;
     scope_depth_ = outer_scope;
@@ -646,11 +680,11 @@ class ForwardSyncOptimizer : public IRMutator {
     const auto eval = As<EvalStmt>(stmt);
     const auto call = eval ? As<Call>(eval->expr_) : nullptr;
     if (!call || !IsOp(call, "sync.wait") || call->args_.empty()) return std::nullopt;
-    const auto tok = As<Var>(call->args_[0]);
+    const auto tok = AsVarLike(call->args_[0]);
     if (!tok) return std::nullopt;
     return std::make_pair(tok, Pipe(call, "dst_pipe"));
   }
-  std::set<std::pair<const Var*, PipeType>> waited_;
+  std::unordered_map<const Var*, uint32_t> waited_masks_;
   std::unordered_set<const Var*> completed_;
   std::unordered_map<const Var*, RecordInfo> local_record_;
   std::unordered_map<const Var*, VarPtr> alias_of_;
@@ -681,13 +715,17 @@ class SyncLivenessCollector : public IRVisitor {
     if (As<SyncTokenType>(var->GetType())) live_.insert(var.get());
   }
 
+  void VisitExpr_(const IterArgPtr& arg) override {
+    if (As<SyncTokenType>(arg->GetType())) live_.insert(arg.get());
+  }
+
   void VisitStmt_(const AssignStmtPtr& op) override {
     if (!As<SyncTokenType>(op->var_->GetType())) {
       IRVisitor::VisitStmt_(op);
       return;
     }
     auto& dst = deps_[op->var_.get()];
-    if (const auto v = As<Var>(op->value_)) {
+    if (const auto v = AsVarLike(op->value_)) {
       dst.push_back(v.get());
       return;
     }
@@ -695,7 +733,7 @@ class SyncLivenessCollector : public IRVisitor {
       if (IsOp(call, "sync.completed") || IsOp(call, "sync.record")) return;
       if (IsOp(call, "sync.join")) {
         for (const auto& arg : call->args_) {
-          if (const auto v = As<Var>(arg)) dst.push_back(v.get());
+          if (const auto v = AsVarLike(arg)) dst.push_back(v.get());
         }
         return;
       }
@@ -734,7 +772,7 @@ class SyncLivenessCollector : public IRVisitor {
     }
     const auto& targets = active_yield_targets_.back();
     for (size_t i = 0; i < targets.size(); ++i) {
-      if (const auto v = As<Var>(op->value_[i]); v && As<SyncTokenType>(v->GetType())) {
+      if (const auto v = AsVarLike(op->value_[i]); v && As<SyncTokenType>(v->GetType())) {
         for (const Var* target : targets[i]) deps_[target].push_back(v.get());
       }
     }
@@ -748,11 +786,11 @@ class SyncLivenessCollector : public IRVisitor {
       const auto& arg = iter_args[i];
       VisitExpr(arg->initValue_);
       if (As<SyncTokenType>(arg->GetType())) {
-        if (const auto init_v = As<Var>(arg->initValue_)) deps_[arg.get()].push_back(init_v.get());
+        if (const auto init_v = AsVarLike(arg->initValue_)) deps_[arg.get()].push_back(init_v.get());
         targets[i].push_back(arg.get());
         if (i < return_vars.size()) {
           deps_[return_vars[i].get()].push_back(arg.get());
-          if (const auto init_v = As<Var>(arg->initValue_))
+          if (const auto init_v = AsVarLike(arg->initValue_))
             deps_[return_vars[i].get()].push_back(init_v.get());
           targets[i].push_back(return_vars[i].get());
         }
@@ -795,7 +833,7 @@ class DeadSyncTokenEraser : public IRMutator {
             kind == LogicalSyncKind::Join) {
           return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, op->span_);
         }
-      } else if (As<Var>(op->value_)) {
+      } else if (AsVarLike(op->value_)) {
         return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, op->span_);
       }
     }

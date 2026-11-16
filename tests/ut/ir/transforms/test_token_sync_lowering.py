@@ -511,3 +511,72 @@ def test_public_ownership_completes_final_store_before_return(producer, count):
     with pytest.raises(ValueError):
         apply_hybrid([physical])
     assert ir.python_print(physical) == before
+
+
+def test_optimize_sync_iter_arg_carried_alias_and_wait_bundle():
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+    ci = lambda v: ir.ConstInt(v, idx, span)
+    k = ir.Var("k", ir.ScalarType(idx), span)
+
+    t_init = ir.Var("t_init", ir.SyncTokenType(ir.PipeType.MTE2), span)
+    t_iter = ir.IterArg("t_iter", ir.SyncTokenType(ir.PipeType.MTE2), t_init, span)
+    t_alias = ir.Var("t_alias", ir.SyncTokenType(ir.PipeType.MTE2), span)
+    t_join = ir.Var("t_join", ir.SyncTokenType(ir.PipeType.MTE2), span)
+    t_out = ir.Var("t_out", ir.SyncTokenType(ir.PipeType.MTE2), span)
+
+    loop = ir.ForStmt(
+        k,
+        ci(0),
+        ci(2),
+        ci(1),
+        [t_iter],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(t_alias, t_iter, span),
+                ir.EvalStmt(sync.wait(t_alias, ir.PipeType.V), span),
+                ir.EvalStmt(sync.wait(t_iter, ir.PipeType.V), span),
+                ir.AssignStmt(t_join, sync.join(t_iter, t_iter), span),
+                ir.YieldStmt([t_join], span),
+            ],
+            span,
+        ),
+        [t_out],
+        span,
+    )
+
+    bundle_recs = []
+    bundle_waits = []
+    for i in range(25):
+        ti = ir.Var(f"tb_{i}", ir.SyncTokenType(ir.PipeType.MTE2), span)
+        bundle_recs.append(ir.AssignStmt(ti, sync.record(ir.PipeType.MTE2), span))
+        bundle_waits.append(ir.EvalStmt(sync.wait(ti, ir.PipeType.V), span))
+
+    fn = ir.Function(
+        "opt_iter_arg_and_bundle",
+        [],
+        [],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(t_init, sync.record(ir.PipeType.MTE2), span),
+                loop,
+                ir.EvalStmt(sync.wait(t_out, ir.PipeType.V), span),
+                *bundle_recs,
+                *bundle_waits,
+                ir.ReturnStmt([], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+
+    optimized = _apply(passes.optimize_sync, fn)
+    text = str(optimized)
+    # IterArg initial token must stay live; dead IterArg alias & duplicate wait are removed.
+    assert "t_init" in text
+    assert "t_alias" not in text
+    # Inside the loop only one sync.wait(t_iter, ...) remains, plus wait(t_out) and 1 surviving bundle wait.
+    assert text.count("sync.wait") == 3
+    assert "sync.join" not in text
