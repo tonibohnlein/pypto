@@ -311,7 +311,7 @@ PassContext::PassContext(std::vector<PassInstrumentPtr> instruments, Verificatio
                          MemoryPlanner memory_planner, bool enable_pypto_l0c_double_buffer,
                          RuntimeKind runtime, bool enable_buffer_ir, bool enable_software_pipeline,
                          bool report_hardware_loops, bool enable_pypto_autosync, bool autosync_disjoint_gm,
-                         std::string autosync_policy)
+                         std::string autosync_policy, bool enable_scalar_gm_dma)
     : report_hardware_loops_(report_hardware_loops),
       instruments_(std::move(instruments)),
       verification_level_(verification_level),
@@ -325,6 +325,7 @@ PassContext::PassContext(std::vector<PassInstrumentPtr> instruments, Verificatio
       enable_pypto_autosync_(enable_pypto_autosync),
       autosync_disjoint_gm_(autosync_disjoint_gm),
       autosync_policy_(std::move(autosync_policy)),
+      enable_scalar_gm_dma_(enable_scalar_gm_dma),
       previous_(nullptr) {
   CHECK(autosync_policy_ == "exact" || autosync_policy_ == "conservative_prefix")
       << "autosync_policy must be exact or conservative_prefix";
@@ -343,6 +344,7 @@ bool PassContext::GetEnablePyptoAutoSync() const { return enable_pypto_autosync_
 bool PassContext::GetAutoSyncDisjointGM() const { return autosync_disjoint_gm_; }
 
 const std::string& PassContext::GetAutoSyncPolicy() const { return autosync_policy_; }
+bool PassContext::GetEnableScalarGMDMA() const { return enable_scalar_gm_dma_; }
 
 RuntimeKind PassContext::GetRuntime() const { return runtime_; }
 

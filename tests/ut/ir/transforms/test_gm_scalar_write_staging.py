@@ -78,6 +78,7 @@ def lower(program, planner, *, disjoint=False, enabled=True, buffer=True, before
         enable_pypto_autosync=enabled,
         enable_buffer_ir=buffer,
         autosync_policy="conservative_prefix",
+        enable_scalar_gm_dma=enabled and buffer,
         autosync_disjoint_gm=disjoint,
     ):
         manager = PassManager.get_strategy(ir.OptimizationStrategy.Default)
@@ -294,7 +295,9 @@ def test_may_alias_reads_and_point_writes_share_original_physical_bytes():
 
 @pytest.mark.parametrize("operand", ["value", "index", "casted_value"])
 def test_nested_effectful_write_operands_keep_original_function_on_refusal(operand):
-    with passes.PassContext([], enable_pypto_autosync=True, autosync_policy="conservative_prefix"):
+    with passes.PassContext(
+        [], enable_pypto_autosync=True, autosync_policy="conservative_prefix", enable_scalar_gm_dma=True
+    ):
         program = write_program()
         manager = PassManager.get_strategy(ir.OptimizationStrategy.Default)
         boundary = manager.get_pass_names().index("SelectBufferIRFunctions")
@@ -430,7 +433,9 @@ class MixedChannels:
 
 @pytest.mark.parametrize("foreign", ["root", "offset"])
 def test_explicit_inconsistent_write_result_storage_is_not_rebound(foreign):
-    with passes.PassContext([], enable_pypto_autosync=True, autosync_policy="conservative_prefix"):
+    with passes.PassContext(
+        [], enable_pypto_autosync=True, autosync_policy="conservative_prefix", enable_scalar_gm_dma=True
+    ):
         program = write_program()
         manager = PassManager.get_strategy(ir.OptimizationStrategy.Default)
         boundary = manager.get_pass_names().index("SelectBufferIRFunctions")

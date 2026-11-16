@@ -382,6 +382,7 @@ class PassManager:
         self._construction_autosync = ctx.get_enable_pypto_autosync() if ctx else False
         self._construction_sync_contract = ctx.get_autosync_disjoint_gm() if ctx else False
         self._construction_sync_policy = ctx.get_autosync_policy() if ctx else "exact"
+        self._construction_scalar_gm_dma = ctx.get_enable_scalar_gm_dma() if ctx else False
         self._construction_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
         self._construction_buffer_ir = ctx.get_enable_buffer_ir() if ctx else True
         skipped_mem_planning_passes: tuple[str, ...]
@@ -452,6 +453,8 @@ class PassManager:
         run_autosync = ctx.get_enable_pypto_autosync() if ctx else False
         run_contract = ctx.get_autosync_disjoint_gm() if ctx else False
         run_policy = ctx.get_autosync_policy() if ctx else "exact"
+        if (ctx.get_enable_scalar_gm_dma() if ctx else False) != self._construction_scalar_gm_dma:
+            raise RuntimeError("PassManager scalar GM implementation changed after construction")
         if (run_autosync, run_contract, run_policy) != (
             self._construction_autosync,
             self._construction_sync_contract,
@@ -623,6 +626,7 @@ class PassManager:
             enable_pypto_autosync=ctx.get_enable_pypto_autosync() if ctx else False,
             autosync_disjoint_gm=ctx.get_autosync_disjoint_gm() if ctx else False,
             autosync_policy=ctx.get_autosync_policy() if ctx else "exact",
+            enable_scalar_gm_dma=ctx.get_enable_scalar_gm_dma() if ctx else False,
         ):
             try:
                 return self._pipeline.run(input_ir)
@@ -682,6 +686,7 @@ class PassManager:
             enable_pypto_autosync=ctx.get_enable_pypto_autosync() if ctx else False,
             autosync_disjoint_gm=ctx.get_autosync_disjoint_gm() if ctx else False,
             autosync_policy=ctx.get_autosync_policy() if ctx else "exact",
+            enable_scalar_gm_dma=ctx.get_enable_scalar_gm_dma() if ctx else False,
         ):
             try:
                 return self._pipeline.run(input_ir)

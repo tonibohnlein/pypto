@@ -1044,8 +1044,7 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper
     // Staging changes the selected native implementation and is initially
     // explicit/default-off. Ordinary whole-function admission must accept the
     // complete candidate, otherwise the original Functional body is retained.
-    if (context && context->GetEnablePyptoAutoSync() &&
-        context->GetAutoSyncPolicy() == "conservative_prefix" && function->func_type_ == FunctionType::AIV)
+    if (context && context->GetEnableScalarGMDMA() && function->func_type_ == FunctionType::AIV)
       function = StageBufferScalarAccesses(function);
   }
   const BufferAccTrimAnalysis acc_trims(function,

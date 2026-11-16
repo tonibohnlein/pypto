@@ -184,6 +184,7 @@ def main() -> None:
     parser.add_argument("--mode", choices=("pypto", "ptoas"), default="pypto")
     parser.add_argument("--policy", choices=("exact", "conservative_prefix"), default="exact")
     parser.add_argument("--require-pypto", action="store_true")
+    parser.add_argument("--scalar-gm-dma", action="store_true", help="Explicit DMA scalar implementation")
     parser.add_argument(
         "--require-domain-owners",
         action="store_true",
@@ -222,6 +223,7 @@ def main() -> None:
         "configuration": {"layers": args.layers, "sequence": args.sequence, "batch": 1},
         "mode": args.mode,
         "policy": args.policy,
+        "enable_scalar_gm_dma": args.scalar_gm_dma,
         "command": sys.argv,
         "python": sys.version,
         "compiler_dirty_sources": {p: digest(root / p) if (root / p).is_file() else None for p in sources},
@@ -287,6 +289,7 @@ def main() -> None:
             enable_pypto_autosync=args.mode == "pypto",
             autosync_disjoint_gm=args.policy == "exact",
             autosync_policy=args.policy,
+            enable_scalar_gm_dma=args.scalar_gm_dma,
         ):
             module.prefill_fwd.compile(
                 *tensors,

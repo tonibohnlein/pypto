@@ -182,6 +182,7 @@ class TestMakeCacheKey:
             ("enable_pypto_autosync", False),
             ("autosync_disjoint_gm", False),
             ("autosync_policy", "exact"),
+            ("enable_scalar_gm_dma", False),
         )
 
     def test_tensor_shape_in_key(self):
@@ -1564,6 +1565,15 @@ def test_nonfinite_math_constant_cache_respects_shadowing(monkeypatch):
     initial = kernel._get_source_hash()
     monkeypatch.setattr(math, "inf", 1.0)
     assert kernel._get_source_hash() == initial
+
+
+def test_scalar_gm_implementation_participates_in_cache_identity():
+    arguments: dict[str, Any] = dict(
+        source_hash="scalar", param_names=[], tensor_shapes={}, tensor_dtypes={}, dynamic_dims=set()
+    )
+    assert make_cache_key(**arguments, enable_scalar_gm_dma=False) != make_cache_key(
+        **arguments, enable_scalar_gm_dma=True
+    )
 
 
 if __name__ == "__main__":
