@@ -2612,6 +2612,28 @@ def _generate_multi_chip(
     return result_files
 
 
+def _ungrouped_workspace_context(
+    layout: _codegen_core.GMPipeLayoutEvidence | None,
+    root: _ir_core.Function,
+    emitted_program: _ir_core.Program,
+    has_peers: bool,
+) -> _codegen_core.GMPipeWorkspaceContext | None:
+    """Bind bundled definitions without changing the entry's allocated layout."""
+    if layout is None:
+        return None
+    workspace = layout.bind_root(root)
+    if not has_peers:
+        return workspace
+    # Original public entries can survive Group ABI adaptation. Their PTO unit
+    # includes peer definitions for address lookup, outside the entry call graph.
+    # Each entry must independently have the same native layout. This does not
+    # share independent launch allocations or establish peer completion.
+    emitted = _codegen_core.GMPipeLayoutEvidence(emitted_program).infer_codegen_context()
+    if emitted.bytes != workspace.bytes or emitted.offsets != workspace.offsets:
+        raise ValueError(f"{root.name}: emitted peer workspace layout differs from the original launch root")
+    return emitted
+
+
 def _generate_pto_bundle(
     program: _ir_core.Program,
     *,
@@ -2972,6 +2994,7 @@ def _generate_single_chip(
                 func.name,
                 transformed_program.span,
             )
+            workspace = _ungrouped_workspace_context(gm_layout, func, single_program, bool(peer_funcs))
             stage = StageRecord(name=f"kernel_codegen:{func.name}", start=time.perf_counter())
             ir_record = StageRecord(name="ir_to_mlir", start=time.perf_counter())
             pto_code, helpers, entry_helpers = _generate_pto_bundle(
@@ -2979,7 +3002,7 @@ def _generate_single_chip(
                 skip_ptoas=skip_ptoas,
                 memory_planner=memory_planner,
                 emit_source_loc=emit_source_loc,
-                workspace=gm_layout.bind_root(func) if gm_layout is not None else None,
+                workspace=workspace,
             )
             ir_record.end = time.perf_counter()
             stage.children.append(ir_record)

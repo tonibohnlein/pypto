@@ -74,7 +74,9 @@ class LayoutEvidence {
   // Failed bindings are cached; malformed IR exceptions remain exceptions.
   std::shared_ptr<const WorkspaceContext> BindRoot(const ir::FunctionPtr& root);
   // Direct codegen without a launch owner requires identical independently
-  // bound entry layouts. It never silently unions incompatible workspaces.
+  // bound entry layouts and native slot geometry. This qualifies codegen of
+  // bundled definitions, not shared launch ownership or peer synchronization.
+  // It never silently unions incompatible workspaces.
   std::shared_ptr<const WorkspaceContext> InferCodegenContext();
   // Includes ambiguous or malformed occurrences of the managed formal role.
   // Absence permits legacy spelling only, never a managed layout certificate.

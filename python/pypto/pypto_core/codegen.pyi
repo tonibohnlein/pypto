@@ -36,6 +36,8 @@ class GMPipeLayoutEvidence:
     def has_setup(self, function: Function, cut: Stmt) -> bool: ...
     def bind_root(self, root: Function) -> GMPipeWorkspaceContext:
         """Bind original workspace forwarding, or refuse without publishing a context."""
+    def infer_codegen_context(self) -> GMPipeWorkspaceContext:
+        """Bind equivalent independent entry layouts without merging their allocations."""
 
 class VFHelper:
     """No-Bridge VF/SIMT helper and adapter with ordered storage effects."""

@@ -112,3 +112,83 @@ The receipt lists the exact pytest subgroup arguments, hashes and source identit
 | Matched staged qkpv_plan has fewer commands and identical bounded payload order | Staged reference is already total; original scalar qualification incomplete | Bounded realization validation, not a stronger exact-demand or native theorem |
 | Exact compact provider regressions and supplied-token lowering retained | General §8 completion and full model ownership remain incomplete | Exact and conservative providers share interfaces without conflating guarantees |
 | Existing six-ID realization and C++ generation pass | Host only; compilation increase measured, no device performance result | Physical feasibility for qualified plans, separately from native execution |
+
+## Next repair plan: regional construction and production contracts
+
+Planning baseline: `a19c1ead6`. The five accepted stages above remain historical, scoped results; they did not complete original M1–M6 or eliminate conservative service redundancy. This continuation preserves those goals and the architecture in [39](39-regional-sync-architecture.md). Status of every milestone below is **planned**, not implemented or accepted.
+
+The latest source audit used draft `7f2f244` and PTOAS Frontier `fe32dacf3`. The draft distinguishes exact selector/query composition, conservative prefix entry wrappers, and regional common completion. The latter two preserve a child's internal implementation but can strengthen crossings. Basic prefix summaries intentionally retain pending effects; exploiting internal delivery requires additional evidence. A child boundary never implies completion or physical rearming.
+
+Fresh diagnostics on the current staged qkpv_plan remove one whole service per executed item: 1538→1282 pairs on eight bounded executions, preserving values, total staged payload order and causal reuse. This is a trace-specific diagnostic, not an implemented uniform optimization. The remaining protocol/staging cost is not proved necessary. The same investigation reproduces the active-prefix plain-alias type mismatch and the seven stale Buffer-codegen test expectations. The supported reciprocal-peer Group integration still needs a fresh end-to-end reproduction; the existing refusal-only test is not its repair.
+
+### P1. Repair default-compilation integration
+
+Owners: `buffer_active_domain_analysis.cpp`, `pto_backend.py`, `gm_pipe_layout_evidence.cpp`, and existing Group ABI normalization services.
+
+For `alias = scaled`, normalization must retype/rebind every affected Tile alias while preserving allocation identity, then propagate the binding to later uses. Candidate publication must satisfy assignment symmetry and all required IR properties. If a use cannot be represented, decline the entire normalization without publishing partially rewritten IR.
+
+For reused Group adapters, derive the emission inventory and workspace context from the same actual owner. Reproduce reciprocal peer transport through the Default pipeline and real backend generation with autosync disabled. Determine whether originals remain legitimate public entries before considering their exclusion; neither blindly union independent allocations nor bypass workspace validation.
+
+Gate: plain aliases and chains, negative allocation/metadata cases, both Group adapters and legitimate original entrypoints, independent workspace layouts, all three planners where applicable. Run `test_buffer_codegen.py` including the seven corrected expectations: retain the six semantic negatives with current diagnostics and replace the obsolete singleton-column rejection with a positive qualified emission check. Ordinary compilation with autosync disabled must pass.
+
+### P2. Separate policy, alias contract and native implementation
+
+Owners: existing `PassContext`, selected-native contracts and `qualify_qwen_whole_model.py`. Reuse the existing knobs; add no independent memory model.
+
+The qualifier currently derives `autosync_disjoint_gm` from `policy == exact`. Replace this coupling with an explicit alias-policy input and receipt field. The primary PTOAS-comparable campaign supplies the established distinct-GM-root disjointness contract to both producers; a separate may-alias campaign exercises conservative geometry. Pin the caller/ABI source and enforcement or explicit caller promise for each admitted case. PTOAS comparability itself establishes no disjointness: without that premise retain may-alias treatment or delegation. This is an explicit caller premise, never a proof from SSA names. Same-root overlaps, aliased views and local physical reuse remain dependencies. Unknown roots remain unavailable/conservative unless the contract actually covers them.
+
+Keep `enable_scalar_gm_dma=False` for the main acceptance matrix. Audit the selected original scalar load/store implementation for source readiness, cache visibility and owned return behavior using the existing backend contract. Scalar S→S native ordering stays active; it does not establish cross-pipe visibility. Where original scalar ownership cannot be justified, preserve delegation and name the missing premise. DMA staging remains an explicit diagnostic alternative, not a coverage requirement or automatic fallback.
+
+Gate: exact/prefix × supplied-disjoint/may-alias × native/explicit-DMA matrix on small generic views and the unchanged original kernels. Compare PyPTO/PTOAS only under matched payload, alias and exit contracts. Do not remove all GM effects to imitate disjoint-root treatment.
+
+### P3. Make retained regions the unit of composition
+
+Owners: existing immutable regional analysis, `retained_sync_child.*`, `conservative_sync_realization.cpp` and `token_sync.cpp`. First inventory the current automatic child selection and refusal reasons; reuse accepted providers rather than introducing a parallel dispatcher.
+
+For each original structured region, request only the capabilities required by its parent:
+
+- Exact composition consumes occurrence identities, activity domains, all four event queries and covered writer/reader selectors. Construct and jointly reduce crossings using existing numerical services.
+- Conservative prefix composition consumes closed child commands, sound per-pipe effects, legal entry cuts and the existing palette/rearming certificate. Keep pending effects visible after exit.
+- Common-completion composition requires its distinct `(A,E,S,t)` transfer and qualified completion commands. Do not reinterpret prefix summaries as this interface or silently select this policy.
+
+Example: an irregular outer branch containing a qualified K loop should retain one whole K invocation, with services at its qualified entry and crossings outside it. It must not receive primitive parent services throughout an already synchronized child. Open iterations with cross-iteration notifications do not qualify independently.
+
+Use PTOAS `ChainComposition`, `CompletionTransfer`, `CompletionPrefixChild` and `PrefixChildren` as algorithm/interface references. Preserve PyPTO's public InsertSync → OptimizeSync → LowerSync ownership: exact results survive failed exports; explicit conservative requests may choose a separately labeled plan. LowerSync continues interpreting the actual token program.
+
+Gate: first a generic nested/guarded fixture, then an existing Qwen projection and one vector region. Validate actual covers for exact results, coverage for conservative results, selectors including unavailable GM domains, child internal order, crossing order, guards, zero/skipped/repeated visits, reset coordinates, matching and reuse. Measure retained state versus trip count and nesting; include failed attempts and interface construction. A missing provider capability is a precise checkpoint result, not authorization for another recognizer.
+
+### P4. Carry justified delivery facts through control flow
+
+Owner: existing conservative producer and whole-candidate certificate. This is a targeted precision extension for residual conservative regions after P3, not a replacement for regional composition.
+
+Keep two distinct analyses: may-access obligations propagate by union; guaranteed delivery facts describe work known complete on a destination pipe. Preserve incoming delivery through branches when neither path invalidates it. At a join retain only semantic facts valid on every reachable incoming edge, including the skipped edge of an if without else. Do not compare branch-local epoch integers as if they identified the same work.
+
+Before implementation, specify finite fact identities, transfer/kill rules, lattice height and worklist cost. Use original occurrences/frames or a proved finite class-based delivery relation; no private runtime history, branch-valuation enumeration or unknown-trip unfolding. Loops require entry/backedge/zero-trip reasoning; retained children contribute only facts justified by an explicit command-transfer capability. Without that capability, retain conservative facts and protected entry/rearming services.
+
+Example: after `complete(A); if(c) unrelated(); use(A)`, completion of A survives. If one arm issues a new write to A, the old completion does not establish completion of that new write. Likewise, a new read of A creates a reader-completion obligation before a later overwrite: old delivery cannot discharge that WAR obligation. Track access mode and newly issued work, rather than invalidating facts only on writes. If both arms establish the same semantic delivery, the join may retain it even when their token names differ, but only with a proof relating those facts.
+
+Select service descriptors before emitting tokens. Extend the independent whole-candidate verifier to the same admitted control-flow domain, and validate it against an independent execution oracle with adversarial joins/loops. A failed certificate retains the baseline. Protect scalar-control, invocation and physical-reuse obligations separately. Arbitrary supplied tokens remain outside this producer transformation.
+
+Gate: the generic examples above, skipped writes, newly issued reads before overwrites, nested branches, loop backedges, empty visits, child pending effects and mutually dependent omissions. Compare complete prerequisite relations, not counts alone. The staged qkpv_plan diagnostic is an additional regression; 1282 is neither a target constant nor an optimality claim. Require a documented uniform argument and bounded independent matching/reuse checks before acceptance.
+
+### P5. Qualify quality and finish with an explicit remaining-obligation list
+
+Re-run the unchanged supported kernel corpus and two-layer model under matched policies. Record native scalar and staged derivatives separately. For each leaf report selected provider/child boundaries, effect precision, ownership/refusal, logical construction, physical allocation and C++ outcome. Preserve the original end-to-end target and all delegated leaves in the denominator.
+
+Account separately for: minimum modeled demands; excess payload prerequisites; forward handoffs; acknowledgment/rearming pairs; same-pipe and invocation barriers; guards and static alternatives. Compare full relation inclusion on bounded original executions. Measure analysis, failed provider attempts, exports, certificates, physical preparation and codegen where instrumentation permits; do not sum overlapping timers. Retain watchdog evidence and static-size/trip-count scaling. No further protocol rewrite follows merely from a large count: first establish which cost remains and which existing realization premises permit improvement.
+
+Gate: P1 public default-off regressions, compact K/replay/zero-body tests, scalar and accumulator native exemptions, actual-token preservation, six-ID eligibility, terminal completion and production C++ generation. Publish reproducible commands/hashes and a machine receipt. Native/device qualification remains separate; no speedup is inferred from host counts. No allocator, tiling, cross-core protocol, ID-pool or admission-limit changes are included.
+
+### Review and commit loop
+
+Execute P1→P2→P3→P4→P5. For each milestone: pin input/source/tools; present the invariant and owned interface; implement; run focused independent checks; obtain independent architecture/correctness/cost review; repair findings; commit only the accepted milestone. Dependent implementation waits for acceptance. A verified missing native/mathematical premise is reported explicitly and may close a bounded investigation, but is never reported as implemented coverage. Review gates must distinguish a correctness pass from an ordering-quality or complexity limitation. Respect the machine-wide two-worker limit and disk-backed artifacts.
+
+### P1 implementation checkpoint
+
+The alias bridge rebinds plain Tile assignments and known-operation results through one helper, preserving existing physical storage and later-use identities. An incompatible allocation causes the complete normalization candidate to be declined. Public Default-pipeline regressions cover alias chains and all three planners with autosync disabled.
+
+Ungrouped codegen now binds the exact emitted peer inventory using existing independent-entry context inference, while checking agreement with the original root layout. Equivalent layouts permit definition bundling; they establish no shared launch allocation or transport completion. Inference also checks native slot geometry, so equal total bytes cannot conceal incompatible rings. Explicit original-root contexts still reject unrelated setup definitions. The reused reciprocal-Group regression retains legitimate originals and adapters and runs real PTOAS under all three planners.
+
+The Buffer-codegen gate retains unsupported-geometry negatives with current diagnostics and positively emits the supported packed singleton-column parameter. Detailed commands, source/tool identities and final review outcomes are recorded in the continuation receipt as milestones finish.
+
+P1 independent source review accepted the ownership, correctness and cost boundaries. The final focused runs pass 187 distinct cases (186 in the combined gate, plus the added original-root offset regression in the 12-case workspace rerun), including real PTOAS generation. The [continuation receipt](52-autosync-regional-repair.json) records commands and source hashes.

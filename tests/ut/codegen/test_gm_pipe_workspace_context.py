@@ -14,9 +14,10 @@ import re
 
 import pypto.language as pl
 import pytest
-from pypto import DataType, backend, codegen, ir
+from pypto import DataType, backend, codegen, ir, passes
 from pypto.backend import BackendType
-from pypto.backend.pto_backend import _build_group_mapping
+from pypto.backend._ptoas_locate import find_ptoas_binary
+from pypto.backend.pto_backend import _build_group_mapping, _ungrouped_workspace_context
 
 
 @pytest.fixture
@@ -242,3 +243,130 @@ def test_unrelated_peer_definition_does_not_acquire_workspace_ownership(gm_backe
     context = codegen.GMPipeLayoutEvidence(original).bind_root(root)
     with pytest.raises(ValueError, match="does not cover an emitted original setup"):
         codegen.PTOCodegen().generate(original, workspace=context)
+
+
+def test_equivalent_peer_definitions_have_independent_codegen_bindings(gm_backend):
+    root = _function("root", [_workspace()], [_setup(pipe_id=0)])
+    peer = _function("peer", [_workspace()], [_setup(pipe_id=0)])
+    program = _program([root, peer])
+    evidence = codegen.GMPipeLayoutEvidence(program)
+    with pytest.raises(ValueError, match="does not cover"):
+        codegen.PTOCodegen().generate(program, workspace=evidence.bind_root(root))
+    context = evidence.infer_codegen_context()
+    assert context.bytes == evidence.bind_root(root).bytes
+    assert codegen.PTOCodegen().generate(program, workspace=context).count("pto.aic_initialize_pipe") == 2
+
+
+def test_equal_workspace_extent_does_not_prove_equal_native_ring_geometry(gm_backend):
+    root = _function("root", [_workspace()], [_setup(slot_bytes=512)])
+    span = ir.Span.unknown()
+    zero = ir.ConstInt(0, DataType.INT32, span)
+    different_geometry = ir.EvalStmt(
+        ir.create_op_call(
+            "system.aic_initialize_pipe",
+            [zero, zero],
+            {"id": 0, "dir_mask": 3, "slot_size": 256, "slot_num": 4},
+            span,
+        ),
+        span,
+    )
+    peer = _function("peer", [_workspace()], [different_geometry])
+    evidence = codegen.GMPipeLayoutEvidence(_program([root, peer]))
+    assert evidence.bind_root(root).bytes == evidence.bind_root(peer).bytes
+    with pytest.raises(ValueError, match="inconsistent slot counts"):
+        evidence.infer_codegen_context()
+
+
+def test_peer_inventory_cannot_shrink_the_original_root_layout(gm_backend):
+    root_workspace = _workspace()
+    helper = _function("helper", [_workspace()], [_setup(pipe_id=0)])
+    root = _function("root", [root_workspace], [_setup(pipe_id=1), _edge("helper", root_workspace)])
+    peer = _function("peer", [_workspace()], [_setup(pipe_id=1)])
+    evidence = codegen.GMPipeLayoutEvidence(_program([root, helper, peer]))
+    assert evidence.bind_root(root).offsets[(1, 3)] == 2048
+    # A narrowed inventory could independently place both visible setups at
+    # offset zero. It must not override the actual root's larger allocation.
+    narrowed = _program([root, peer])
+    with pytest.raises(ValueError, match="differs from the original launch root"):
+        _ungrouped_workspace_context(evidence, root, narrowed, True)
+
+
+@pl.program
+class ReusedReciprocalGroups:
+    @pl.function(type=pl.FunctionType.AIC)
+    def cube(self, weight: pl.Tensor[[16, 16], pl.FP16]):
+        local = pl.reserve_buffer(name="to_cube", size=4096, base=pl.AUTO)
+        peer = pl.import_peer_buffer(name="to_vector", peer_func="vector")
+        pl.aic_initialize_pipe(peer, local, dir_mask=3, slot_size=1024, slot_num=2)
+        value: pl.Tile[[16, 16], pl.FP16, pl.MemorySpace.Mat] = pl.tpop_from_aiv(split=0)
+        matrix = pl.load(weight, [0, 0], [16, 16])
+        result = pl.matmul(value, matrix)
+        pl.tfree_to_aiv(value)
+        pl.tpush_to_aiv(result, split=0)
+
+    @pl.function(type=pl.FunctionType.AIV)
+    def vector(self, source: pl.Tensor[[16, 16], pl.FP16], output: pl.Out[pl.Tensor[[16, 16], pl.FP32]]):
+        local = pl.reserve_buffer(name="to_vector", size=4096, base=pl.AUTO)
+        peer = pl.import_peer_buffer(name="to_cube", peer_func="cube")
+        pl.aiv_initialize_pipe(local, peer, dir_mask=3, slot_size=1024, slot_num=2)
+        value = pl.load(source, [0, 0], [16, 16])
+        pl.tpush_to_aic(value, split=0)
+        result: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
+        output = pl.store(result, [0, 0], output)
+        pl.tfree_to_aic(result)
+        return output
+
+    @pl.function(type=pl.FunctionType.Group)
+    def first(
+        self,
+        source: pl.Tensor[[16, 16], pl.FP16],
+        weight: pl.Tensor[[16, 16], pl.FP16],
+        output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ):
+        self.cube(weight)
+        return self.vector(source, output)
+
+    @pl.function(type=pl.FunctionType.Group)
+    def second(
+        self,
+        source: pl.Tensor[[16, 16], pl.FP16],
+        weight: pl.Tensor[[16, 16], pl.FP16],
+        output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ):
+        self.cube(weight)
+        return self.vector(source, output)
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        source: pl.Tensor[[16, 16], pl.FP16],
+        weight: pl.Tensor[[16, 16], pl.FP16],
+        first_output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        second_output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ):
+        first_output = self.first(source, weight, first_output)
+        second_output = self.second(source, weight, second_output)
+        return first_output, second_output
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize(
+    "planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP, passes.MemoryPlanner.PTOAS]
+)
+def test_default_codegen_reused_reciprocal_groups_preserves_original_entries(gm_backend, tmp_path, planner):
+    """Peer definitions in original public units use equivalent layouts, not the Group's allocation."""
+    if find_ptoas_binary() is None:
+        pytest.skip("PTOAS is required for the public backend integration regression")
+    with passes.PassContext([], memory_planner=planner, enable_pypto_autosync=False):
+        transformed = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(
+            ReusedReciprocalGroups
+        )
+        groups, ungrouped = _build_group_mapping(transformed)
+        assert {"first", "second"} <= groups.keys()
+        assert {"cube", "vector"} <= {function.name for function in ungrouped}
+        for members in groups.values():
+            assert all(function.name not in {"cube", "vector"} for function in members)
+        ir.compile(ReusedReciprocalGroups, output_dir=str(tmp_path), dump_passes=False, skip_ptoas=False)
+    emitted = {path.stem for path in (tmp_path / "ptoas").glob("*.pto")}
+    assert {"first", "second", "cube", "vector"} <= emitted
+    assert list((tmp_path / "kernels").rglob("*.cpp"))

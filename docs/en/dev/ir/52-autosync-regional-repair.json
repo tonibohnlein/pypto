@@ -1,0 +1,53 @@
+{
+  "baseline": "a19c1ead6970671533a436e42e538c14c94ae9e8",
+  "milestones": {
+    "P1": {
+      "implementation": "accepted",
+      "tests": [
+        {
+          "command": "timeout 120s python3.14 -m pytest tests/ut/codegen/test_buffer_codegen.py tests/ut/codegen/test_gm_pipe_workspace_context.py tests/ut/codegen/test_gm_pipe_layout_evidence.py tests/ut/ir/transforms/test_runtime_valid_reduction_axis.py -q --require-ptoas",
+          "result": "187 passed in 22.42s",
+          "log": "build-py314/regional-repair/p1-tests-accepted.log"
+        },
+        {
+          "command": "timeout 120s python3.14 -m pytest tests/ut/codegen/test_gm_pipe_workspace_context.py -q --require-ptoas",
+          "result": "12 passed; includes one new guard after combined collection (187 distinct total)",
+          "log": "build-py314/regional-repair/p1-workspace-final.log"
+        }
+      ],
+      "source_sha256": {
+        "include/pypto/codegen/gm_pipe_layout_evidence.h": "255fdd528880ac9988ccda9be0bddf081dfa779b82098742b5f0d69614bca34b",
+        "python/bindings/modules/codegen.cpp": "2281eb0eae4fea5d65f131a9621b103c8ea7a5302394d8cab7b0e7110238e0c5",
+        "python/pypto/backend/pto_backend.py": "636389b4128324d00ed735ab4b5faf6fd49fbe254bc534ce72c60dc8906ceaea",
+        "python/pypto/pypto_core/codegen.pyi": "72d0aeb8245c8e50cbf58cd9db75c9a45f8497d66762f29a22f6d6cb88ca09c3",
+        "src/codegen/gm_pipe_layout_evidence.cpp": "8c3a4955b4fcd7416dc4fb7173f29311f285b084f9702609fa128eeb84db441c",
+        "src/ir/transforms/utils/buffer_active_domain_analysis.cpp": "8f5dba1ea405b02e4646c6e9435d213144622b1bd301bebd63e0c5771b96317e",
+        "tests/ut/codegen/test_buffer_codegen.py": "d693b105b1f6a49c369d2164ea0cce3ba7badf9e3cd578b67faefc87d5044d6f",
+        "tests/ut/codegen/test_gm_pipe_workspace_context.py": "00f70cbae2caf2a8983c2aa8172abaa60fa60168fecb97ea8303cdc41413f7f4",
+        "tests/ut/ir/transforms/test_runtime_valid_reduction_axis.py": "66cc741ce527caa524517b0d7a0ba57c020b8904414c961d96a7a143ed439a26"
+      },
+      "build_log": "build-py314/regional-repair/p1-build-final.log",
+      "tools": {
+        "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "0bf1116d6771e73e2533b977ce204ff2a10b034c06881f00abbbd312ddf89331",
+        "build-py314/architecture-correction/ptoas-launcher/ptoas": "8b52c0bfe3259f37dd17331ec0b8ee534461f18e70042edce0e2b6ee2fd7adf8",
+        "build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3"
+      },
+      "review": "repair_reviewer: architecture, correctness and cost accepted; final hooks/pins required",
+      "candidate_extensions": {
+        "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "36cbbf90476b323bb5ec3e9b0e35e1ac2e3e6a893138fede945f16fc06f9665c"
+      },
+      "hooks": {
+        "full": "all non-pyright checks passed; see p1-hooks-accepted.log",
+        "pyright": "p1-pyright-final.log: passed",
+        "docs_receipt": "p1-receipt-hooks.log: passed"
+      }
+    }
+  },
+  "device_validation": false,
+  "remaining_milestones": [
+    "P2",
+    "P3",
+    "P4",
+    "P5"
+  ]
+}

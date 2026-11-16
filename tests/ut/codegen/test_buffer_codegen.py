@@ -300,7 +300,7 @@ def test_gm_transfers_reject_reduction_columns(name):
         [allocation, _eval(name, source, _window(0, 0), _window(16, 1), destination)],
         [(tensor, ir.ParamDirection.InOut)],
     )
-    with pytest.raises(ValueError, match="GM transfers do not support reduction column vectors"):
+    with pytest.raises(ValueError, match="column transfers require packed singleton-column GM"):
         _emit(program)
 
 
@@ -308,7 +308,6 @@ def test_gm_transfers_reject_reduction_columns(name):
     "tensor_type,message",
     [
         (ir.TensorType([16, 32], DataType.INT16), "rank-2 FP16/BF16/FP32/INT32"),
-        (ir.TensorType([16, 1], DataType.FP32), "columns > 1"),
         (
             ir.TensorType([16, 32], DataType.FP32, None, ir.TensorView([1, 16], ir.TensorLayout.DN)),
             "ND layout",
@@ -317,7 +316,7 @@ def test_gm_transfers_reject_reduction_columns(name):
             ir.TensorType([16, 32], DataType.FP32, None, ir.TensorView([64, 1], ir.TensorLayout.ND)),
             "packed row-major",
         ),
-        (ir.TensorType([_int(32), _scalar("columns")], DataType.FP32), "static columns > 1"),
+        (ir.TensorType([_int(32), _scalar("columns")], DataType.FP32), "positive static columns"),
     ],
 )
 def test_unsupported_gm_parameter_recipes_fail_before_emission(tensor_type, message):
@@ -325,6 +324,16 @@ def test_unsupported_gm_parameter_recipes_fail_before_emission(tensor_type, mess
     _, allocation = _alloc("buffer")
     with pytest.raises(ValueError, match=message):
         _emit(_program([allocation], [tensor]))
+
+
+def test_packed_singleton_column_gm_parameter_emits(tmp_path):
+    tensor = ir.Var("tensor", ir.TensorType([16, 1], DataType.FP32), SPAN)
+    buffer, allocate = _alloc("column", _type((16, 1), blayout=ir.TileLayout.col_major))
+    text = _emit(
+        _program([allocate, _eval("buffer.load", tensor, _window(0, 0), _window(16, 1), buffer)], [tensor])
+    )
+    assert "pto.tload" in text
+    _compile_native(tmp_path, text, addressed=False)
 
 
 def test_gm_tensor_carries_cannot_enter_legacy_control_flow_emission():
@@ -1021,7 +1030,7 @@ def test_unsupported_dynamic_gm_geometry_remains_unavailable(kind):
         [source],
         ir.FunctionIRStage.Buffer,
     )
-    with pytest.raises(ValueError, match="static columns > 1"):
+    with pytest.raises(ValueError, match="positive static columns"):
         _emit(program)
 
 

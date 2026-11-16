@@ -90,3 +90,63 @@ timeout 120s python -m transforms.qualify_qwen_point_planner \
 | staged qkpv_plan 命令减少、有限载荷顺序等价 | staging参考已全序；原生标量仍未限定 | 有限实现验证，不声称更强精确或原生定理 |
 | 精确提供者及用户令牌降低保留 | 通用§8与全模型所有权仍不完整 | 共用接口，区分精确与保守保证 |
 | 六ID与 C++生成通过 | 仅宿主；单次编译增加，无设备性能结论 | 限定协议的物理可行性 |
+
+## 后续修复计划：区域构造与生产契约
+
+计划基线为 `a19c1ead6`。上文五阶段保留为已接受的有界结果，没有完成原 M1–M6，也未消除所有服务冗余。以下 P1–P5 均为**计划中**，不是已实现或已接受。英文版本为完整权威计划，继续现有[区域架构](39-regional-sync-architecture.md)。参考草稿 `7f2f244` 和 PTOAS Frontier `fe32dacf3`。
+
+最新有限诊断在8个实际执行上将1538对减少到1282对，保持 staging 值、全序及重用；不构成统一生产变换。已复现普通 Tile alias 的类型不对称及7个旧 Buffer-codegen 测试期望。复用 Group 的 reciprocal-peer 集成还需完整新复现；已有拒绝测试不是其修复。
+
+### P1：修复普通编译集成
+
+修改现有 `buffer_active_domain_analysis.cpp`、`pto_backend.py`、`gm_pipe_layout_evidence.cpp` 和 Group ABI 服务。`alias = scaled` 必须随 RHS 更新类型及后续绑定，保持分配身份；不能处理时原子拒绝候选。发布前验证 assignment symmetry 等必要属性。
+
+完整发射单元与 workspace context 必须来自同一个实际所有者。先用 autosync 关闭的默认管线、复用 Group、双向 GM transport 和真实 PTOAS 复现。不能任意合并独立分配，也不能删除合法公开入口或绕过验证器。验收覆盖 alias chain、负例、Group adapters/originals、独立布局及适用的三种 planner。修正 `test_buffer_codegen.py` 六个旧诊断期望，保留语义负例；将已支持 singleton-column 改为正例。
+
+### P2：分离策略、别名契约与原生实现
+
+复用 PassContext、原生契约及 qualifier。移除 `policy == exact` 决定 `autosync_disjoint_gm` 的耦合，增加显式 campaign 输入和收据。主要 PTOAS 可比检查对两个生产者都显式提供不同已建立 GM 根不相交的调用契约；另做 may-alias 检查。每例必须固定调用方/ABI 契约来源及其强制执行或显式承诺；仅为比较 PTOAS 不能证明不相交。缺少前提时保持 may-alias 或委托。相同根重叠、别名 view、局部存储复用仍保留；未知根不被 SSA 名字证明独立。
+
+主矩阵保持 `enable_scalar_gm_dma=False`。审计原标量 load/store 的就绪、缓存可见性和退出契约；S→S 原生顺序不代表跨管线可见性。无法证明时委托并明确原因，不靠自动 staging 增加覆盖。显式 staging 仅为独立诊断。验收 exact/prefix × disjoint/may-alias × native/DMA，匹配载荷、别名及退出契约。
+
+### P3：以保留区域作为组合单位
+
+复用不可变区域分析、`retained_sync_child.*`、`conservative_sync_realization.cpp`、`token_sync.cpp`；先清点现有子区域选择与拒绝原因，不新建并行 dispatcher。
+
+精确组合消费原始坐标、guards、四种事件查询和完整 writer/reader selectors，构造并联合归约 crossings。保守 prefix 组合消费闭合子命令、每管线访问、合法入口和 palette/rearming 证明，保持出口 pending effects。common-completion 必须使用独立 `(A,E,S,t)` 语义及限定命令，不能假装 prefix 摘要具有该能力。
+
+不规则外层里的 K loop 应保留完整闭合调用，内部已有同步不再被逐载荷父服务覆盖。不能把跨迭代通知的开放 iteration 当闭合 child。参考 PTOAS ChainComposition、CompletionTransfer、CompletionPrefixChild、PrefixChildren；保留三个公共 pass 及实际令牌降低语义。精确导出失败保留数学结果，显式保守请求另标保证。
+
+验收先通用嵌套/分支夹具，再原有 Qwen projection 和一个 vector 区域。验证精确 covers 或保守 coverage、selectors 的 unavailable、子内部及跨边界顺序、空/跳过/重复访问、坐标重置、匹配重用与 trip-count 紧凑性。缺失能力明确报告，不能因此添加内核专用识别器。
+
+### P4：沿控制流保留已证明的交付事实
+
+在 P3 后剩余保守区域中，扩展现有 producer 与整候选证书。may-access 使用并集；must-delivery 仅保留每个可达入口都成立的语义事实。无 else 的跳过路径不能忽略。不得比较分支局部 epoch 数字并误当同一工作。
+
+先说明有限事实身份、transfer/kill、格高度和 worklist 成本；使用原始 occurrence/frame 或已证明的有限 class delivery。禁止运行时私有历史、分支赋值枚举、未知次数展开。循环必须处理入口、backedge 和 zero-trip；子区域仅通过显式 command-transfer 能力贡献完成事实，否则保持保守及受保护 rearming。
+
+例：`complete(A); if(c) unrelated(); use(A)` 保留完成；若一臂新写 A，旧完成不能证明新写完成。新读 A 也会在后续覆盖前产生读完成义务；旧交付不能消除 WAR，事实必须区分访问模式和新发出的工作。两臂语义相同而 token 名不同的交付，必须有对应证明才可合并。生成 token 前选择服务，独立整候选检查失败则保留基线；控制、调用和物理重用独立保护，不重写用户令牌。
+
+验收 adversarial joins/loops、跳过写、新读之后的覆盖、空/重复、子 pending effects、联合省略；比较完整前提关系及实际匹配重用。qkpv_plan 仅附加回归，1282不是硬编码目标或最优数。
+
+### P5：质量验证与剩余义务
+
+重跑现有内核及未修改双层模型，分离原生与 staging。逐叶记录区域提供者、边界、精度、所有权/拒绝、逻辑、分配、C++，保留所有委托分母。
+
+分别统计 modeled minimum demands、额外载荷顺序、forward handoffs、ack/rearming、同管线/退出屏障、guards和静态 alternatives。有限执行比较关系包含。计时包括失败尝试、导出和证书，不能相加包含性时间；保留 watchdog 与静态/动态规模证据。计数大不自动授权新协议，先说明成本及可复用的实现前提。
+
+验收 P1 默认关闭回归、compact K/replay/zero-body、标量与累加器原生豁免、用户令牌、6-ID、终止完成及 C++。输出命令/哈希/收据；宿主计数不代表设备速度。范围不含 allocator、tiling、跨核协议、ID池和 admission-limit 修改。
+
+### 评审与提交循环
+
+按 P1→P2→P3→P4→P5：固定输入和工具，说明不变量与接口，实施，独立验证，再作架构/正确性/成本评审；修复意见后仅提交已接受里程碑，再进入依赖步骤。明确证明缺失可结束有界调查，但不能标为已实现覆盖。正确性通过不等于质量/复杂度通过。遵守全机2个资源密集 worker 与磁盘持久工件规则。
+
+### P1 实施检查点
+
+普通 Tile alias 与已知调用结果共用重绑定服务，保留原物理存储及后续引用；分配不兼容时整体拒绝候选。默认关闭 autosync 的公开 Default 回归覆盖 alias chain 和三种 planner。
+
+非分组 codegen 使用已有的独立入口推断绑定完整 peer 发射清单，并检查它与原根布局一致。相同布局只允许定义打包，不证明共享 launch 分配或 transport 完成；额外检查原生 slot 几何，避免相同总字节掩盖不同 ring。原根 context 对无关 setup 的拒绝仍保留。复用双向 Group 的真实 PTOAS 回归保留合法 originals 与 adapters，覆盖三种 planner。
+
+Buffer-codegen 保留不支持几何的负例并更新诊断；已支持 packed singleton-column 改为正向发射检查。随各里程碑结束，续篇收据记录命令、源码/工具及最终评审。
+
+P1 独立源码评审已接受所有权、正确性和成本边界。最终回归通过187个不同用例（组合186项及 workspace 重跑新增的原根 offset 负例），包含真实 PTOAS。命令和源码哈希见英文[续篇收据](../../../en/dev/ir/52-autosync-regional-repair.json)。

@@ -80,6 +80,7 @@ void BindCodegen(nb::module_& m) {
       .def("layout", &DescribeGMPipeLayout, nb::arg("root") = nb::none())
       .def("work", &DescribeGMPipeLayoutWork)
       .def("bind_root", &codegen::gm_pipe::LayoutEvidence::BindRoot, nb::arg("root"))
+      .def("infer_codegen_context", &codegen::gm_pipe::LayoutEvidence::InferCodegenContext)
       .def(
           "has_setup",
           [](const codegen::gm_pipe::LayoutEvidence& evidence, const ir::FunctionPtr& function,
