@@ -97,12 +97,15 @@ std::string ColorRefusal(SyncDirection direction, const LaneColorAttempt& attemp
 class Allocator {
  public:
   Allocator(const CompactSyncInput& input, std::vector<Family> families, const DirectSyncOrder& order,
-            const std::string& target, const std::optional<std::vector<int>>& restricted)
+            const std::string& target, const std::optional<std::vector<int>>& restricted,
+            const SyncNativeReservations& extra_reservations = {})
       : input_(input),
         order_(order),
         catalog_(pypto::sync::FindResourceCatalog(target)),
         restricted_(restricted),
         claimed_(SyncNativeClaims(input, target)) {
+    for (const auto& [direction, ids] : extra_reservations)
+      claimed_[direction].insert(ids.begin(), ids.end());
     families_ = std::move(families);
     result_.finite_minimum = order_.finite_minimum && !input_.region_tree;
     CHECK(order_.precedes && order_.reference_before && order_.threshold)
@@ -667,13 +670,14 @@ const std::vector<PhysicalSyncFamily>& PhysicalSyncRealization::Families() const
 
 PhysicalSyncRealization AllocateDirectSync(const CompactSyncInput& input, std::vector<Family> families,
                                            const DirectSyncOrder& order, const std::string& target,
-                                           const std::optional<std::vector<int>>& restricted) {
+                                           const std::optional<std::vector<int>>& restricted,
+                                           const SyncNativeReservations& extra_reservations) {
   if (order.protocol) {
     CHECK(order.validate_families) << "Missing retained protocol inventory validation";
     order.protocol->ValidateFor(input);
     order.validate_families(families);
   }
-  Allocator allocator(input, std::move(families), order, target, restricted);
+  Allocator allocator(input, std::move(families), order, target, restricted, extra_reservations);
   auto result = allocator.Run();
   result.assignment = std::shared_ptr<const AssignedSyncPlan>(
       new AssignedSyncPlan(input, allocator.TakeFamilies(), allocator.TakeEligible(),

@@ -318,14 +318,9 @@ class DebtState {
     }
   }
 
-  // Four-command hardware sync `(src, dst)`: forward WAIT then return WAIT.
+  // Ordered 1-way service relay `src -> dst` (matching #3375 SyncToken IR).
   void DeliverService(PipeType src, PipeType dst) {
-    if (src == dst) {
-      DeliverOneWay(src, dst);
-      return;
-    }
     DeliverOneWay(src, dst);
-    DeliverOneWay(dst, src);
   }
 
   void ApplySummary(const CompletionSummary& summary) {

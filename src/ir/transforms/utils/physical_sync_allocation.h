@@ -54,13 +54,15 @@ PhysicalSyncRealization RealizeDirectSync(const CompactSyncInput& input,
                                           std::vector<PhysicalSyncFamily> families,
                                           const DirectSyncOrder& order, const std::string& target,
                                           const std::optional<std::vector<int>>& restricted,
-                                          const SyncSchedulePolicy& policy = {});
+                                          const SyncSchedulePolicy& policy = {},
+                                          const SyncNativeReservations& extra_reservations = {});
 
 // Separate allocation from shared cut application for mutually exclusive cases.
 PhysicalSyncRealization AllocateDirectSync(const CompactSyncInput& input,
                                            std::vector<PhysicalSyncFamily> families,
                                            const DirectSyncOrder& order, const std::string& target,
-                                           const std::optional<std::vector<int>>& restricted);
+                                           const std::optional<std::vector<int>>& restricted,
+                                           const SyncNativeReservations& extra_reservations = {});
 struct AssignedSyncCase {
   const CompactSyncInput* input;
   std::shared_ptr<const AssignedSyncPlan> assignment;

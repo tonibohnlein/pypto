@@ -515,7 +515,8 @@ class AssignedSyncPlan {
                    std::vector<AssignedScopedPalette> palettes);
   friend PhysicalSyncRealization AllocateDirectSync(const CompactSyncInput&, std::vector<PhysicalSyncFamily>,
                                                     const DirectSyncOrder&, const std::string&,
-                                                    const std::optional<std::vector<int>>&);
+                                                    const std::optional<std::vector<int>>&,
+                                                    const std::map<std::pair<PipeType, PipeType>, std::set<int>>&);
 };
 // Immutable defaults for production; explicit overrides are diagnostic inputs
 // to the same compiler. Forced modes bypass profitability, never qualification

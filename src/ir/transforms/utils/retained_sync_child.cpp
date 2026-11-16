@@ -75,6 +75,19 @@ class Operations : public IRVisitor {
  protected:
   void VisitVarLike_(const VarPtr&) override {}
   void VisitExpr_(const IterArgPtr&) override {}
+  void VisitStmt_(const IfStmtPtr& branch) override {
+    VisitExpr(branch->condition_);
+    const auto& static_branches = mathematics_.State().input.static_branches;
+    if (const auto resolved = static_branches.find(branch.get()); resolved != static_branches.end()) {
+      if (resolved->second)
+        VisitStmt(branch->then_body_);
+      else if (branch->else_body_)
+        VisitStmt(*branch->else_body_);
+      return;
+    }
+    VisitStmt(branch->then_body_);
+    if (branch->else_body_) VisitStmt(*branch->else_body_);
+  }
   void VisitStmt_(const ForStmtPtr& loop) override {
     if (loop->kind_ != ForKind::Sequential) {
       Refuse("Child needs a sequential execution-domain contract after scheduling");

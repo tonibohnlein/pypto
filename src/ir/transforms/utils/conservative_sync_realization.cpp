@@ -144,12 +144,6 @@ class Insert : public IRMutator {
     for (const auto& [source, destination] : services) {
       const auto forward = Record(source, statements, cut->span_);
       Wait(forward, destination, statements, cut->span_);
-      if (source != destination) {
-        // The selected logical program includes the acknowledgment order;
-        // allocation must not introduce reverse dependencies as a repair.
-        const auto returned = Record(destination, statements, cut->span_);
-        Wait(returned, source, statements, cut->span_);
-      }
     }
     statements.push_back(retained ? std::move(retained) : cut);
     CHECK(replacements_.emplace(cut.get(), std::make_shared<SeqStmts>(statements, cut->span_)).second)

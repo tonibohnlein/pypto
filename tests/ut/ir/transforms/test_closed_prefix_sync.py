@@ -444,3 +444,198 @@ def test_closed_lowering_preserves_shared_signature_metadata(depth):
     result_type = physical.params[-1].type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.shape[0].same_as(extent)
+
+
+def test_straight_line_and_branch_one_way_tokens_lower_to_two_commands():
+    cond = ir.Var("cond", ir.ScalarType(ir.DataType.BOOL), SPAN)
+    t0 = ir.Var("t0", ir.SyncTokenType(ir.PipeType.MTE2), SPAN)
+    t1 = ir.Var("t1", ir.SyncTokenType(ir.PipeType.V), SPAN)
+    branch = ir.IfStmt(
+        cond,
+        seq(ir.AssignStmt(t1, sync.record(ir.PipeType.V), SPAN), ir.EvalStmt(sync.wait(t1, ir.PipeType.MTE3), SPAN)),
+        None,
+        [],
+        SPAN,
+    )
+    logical = ir.Function(
+        "one_way_straight",
+        [cond],
+        [],
+        seq(
+            ir.AssignStmt(t0, sync.record(ir.PipeType.MTE2), SPAN),
+            ir.EvalStmt(sync.wait(t0, ir.PipeType.V), SPAN),
+            branch,
+            ir.ReturnStmt([], SPAN),
+        ),
+        SPAN,
+        ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    result = testing.lower_sync_schedule(logical, eligible_ids=[0])
+    assert result["set_sites"] == 2 and result["wait_sites"] == 2
+    physical = result["function"]
+    for flag in (False, True):
+        before, after = check_closed_commands(logical, physical, {0: flag}, [0], compare_commands=True)
+        expected_pairs = 2 if flag else 1
+        assert len(after.publications) == expected_pairs
+        assert len(after.acquisitions) == expected_pairs
+
+
+def test_optimize_sync_eliminates_redundant_waits_joins_and_dead_bindings():
+    c = ir.Var("empty_fact", ir.SyncTokenType(ir.PipeType.MTE2), SPAN)
+    c_alias = ir.Var("empty_alias", c.type, SPAN)
+    r1 = ir.Var("rec1", ir.SyncTokenType(ir.PipeType.MTE2), SPAN)
+    r2 = ir.Var("rec2", ir.SyncTokenType(ir.PipeType.MTE2), SPAN)
+    j = ir.Var("joined", ir.SyncTokenType(ir.PipeType.MTE2), SPAN)
+    dead_r = ir.Var("dead_vec_rec", ir.SyncTokenType(ir.PipeType.V), SPAN)
+    logical = ir.Function(
+        "opt_tokens",
+        [],
+        [],
+        seq(
+            ir.AssignStmt(c, sync.completed(ir.PipeType.MTE2), SPAN),
+            ir.AssignStmt(c_alias, c, SPAN),
+            ir.EvalStmt(sync.wait(c_alias, ir.PipeType.V), SPAN),
+            ir.AssignStmt(r1, sync.record(ir.PipeType.MTE2), SPAN),
+            ir.AssignStmt(r2, sync.record(ir.PipeType.MTE2), SPAN),
+            ir.AssignStmt(j, sync.join(c, r2), SPAN),
+            # Adjacent same-pipe waits: later wait on `j` (`r2`) FIFO-subsumes wait on `r1`.
+            ir.EvalStmt(sync.wait(r1, ir.PipeType.V), SPAN),
+            ir.EvalStmt(sync.wait(j, ir.PipeType.V), SPAN),
+            # Dominated duplicate wait on `r2`.
+            ir.EvalStmt(sync.wait(r2, ir.PipeType.V), SPAN),
+            ir.AssignStmt(dead_r, sync.record(ir.PipeType.V), SPAN),
+            ir.ReturnStmt([], SPAN),
+        ),
+        SPAN,
+        ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    verify(logical)
+    program = ir.Program([logical], "OptimizeTokens", SPAN)
+    with passes.PassContext([], enable_pypto_autosync=True):
+        optimized = passes.optimize_sync()(program)
+        lowered = passes.lower_sync()(optimized)
+    opt_fn = next(iter(optimized.functions.values()))
+    opt_text = str(opt_fn)
+    assert "empty_alias" not in opt_text
+    assert "sync.completed" not in opt_text
+    assert "sync.join" not in opt_text
+    assert "dead_vec_rec" not in opt_text
+    assert opt_text.count("sync.wait") == 1
+    phys_fn = next(iter(lowered.functions.values()))
+    verify(phys_fn)
+    _, after = check_closed_commands(opt_fn, phys_fn, {}, range(8), compare_commands=False)
+    assert len(after.publications) == 1 and len(after.acquisitions) == 1
+
+
+@pytest.mark.parametrize("closed_cycle", [True, False])
+def test_loop_one_way_closed_cycle_stays_two_cmd_and_unclosed_falls_back(closed_cycle):
+    count = ir.Var("count", ir.ScalarType(ir.DataType.INDEX), SPAN)
+    iv = ir.Var("i", ir.ScalarType(ir.DataType.INDEX), SPAN)
+    t_fwd = ir.Var("t_fwd", ir.SyncTokenType(ir.PipeType.MTE2), SPAN)
+    body_stmts: list[ir.Stmt] = [
+        ir.AssignStmt(t_fwd, sync.record(ir.PipeType.MTE2), SPAN),
+        ir.EvalStmt(sync.wait(t_fwd, ir.PipeType.V), SPAN),
+    ]
+    if closed_cycle:
+        t_rev = ir.Var("t_rev", ir.SyncTokenType(ir.PipeType.V), SPAN)
+        body_stmts.extend(
+            [
+                ir.AssignStmt(t_rev, sync.record(ir.PipeType.V), SPAN),
+                ir.EvalStmt(sync.wait(t_rev, ir.PipeType.MTE2), SPAN),
+            ]
+        )
+    body_stmts.append(ir.YieldStmt([], SPAN))
+    loop = ir.ForStmt(iv, ci(0), count, ci(1), [], seq(*body_stmts), [], SPAN)
+    logical = ir.Function(
+        "loop_cycle_mode",
+        [count],
+        [],
+        seq(loop, ir.ReturnStmt([], SPAN)),
+        SPAN,
+        ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    result = testing.lower_sync_schedule(logical, eligible_ids=[0, 1])
+    # Both cases emit 2 set_flag + 2 wait_flag in body: closed_cycle via two 1-way edges,
+    # unclosed via one 1-way edge plus its constant-role SetWaitAck fallback.
+    assert result["set_sites"] == 2 and result["wait_sites"] == 2
+    physical = result["function"]
+    for c in (0, 1, 3):
+        _, after = check_closed_commands(logical, physical, {0: c}, [0, 1], compare_commands=False)
+        assert len(after.publications) == 2 * c and len(after.acquisitions) == 2 * c
+
+
+def test_parent_child_per_direction_reservations_allow_disjoint_direction_id_reuse():
+    # Parent overlaps two concurrent 1-way (MTE2 -> MTE3) edges, occupying BOTH IDs [0, 1]
+    # on (MTE2, MTE3). Child operates on disjoint direction (MTE2 -> V) with entry acks
+    # {(MTE2, V), (V, MTE2)} using ID 0 on (V, MTE2); with per-direction reservations,
+    # eligible_ids=[0, 1] still suffices without false global ID subtraction.
+    p0 = ir.Var("p0", ir.SyncTokenType(ir.PipeType.MTE2), SPAN)
+    p1 = ir.Var("p1", ir.SyncTokenType(ir.PipeType.MTE2), SPAN)
+    e0 = ir.Var("e0", ir.SyncTokenType(ir.PipeType.MTE2), SPAN)
+    e1 = ir.Var("e1", ir.SyncTokenType(ir.PipeType.V), SPAN)
+    c_init = ir.Var("c_init", ir.SyncTokenType(ir.PipeType.V), SPAN)
+    c_carry = ir.IterArg("c_carry", ir.SyncTokenType(ir.PipeType.V), c_init, SPAN)
+    c_tok = ir.Var("c_tok", ir.SyncTokenType(ir.PipeType.MTE2), SPAN)
+    c_end = ir.Var("c_end", ir.SyncTokenType(ir.PipeType.V), SPAN)
+    c_ret = ir.Var("c_ret", ir.SyncTokenType(ir.PipeType.V), SPAN)
+
+    vec_t = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    gm_t = ir.TensorType([2, 8], ir.DataType.FP32)
+    a = ir.Var("a", gm_t, SPAN)
+    buf = ir.Var("buf", vec_t, SPAN)
+    out_buf = ir.Var("out_buf", vec_t, SPAN)
+    out_gm = ir.Var("out_gm", gm_t, SPAN)
+    iv = ir.Var("k", ir.ScalarType(ir.DataType.INDEX), SPAN)
+
+    child = ir.ForStmt(
+        iv,
+        ci(0),
+        ci(2),
+        ci(1),
+        [c_carry],
+        seq(
+            ir.IfStmt(ir.Gt(iv, ci(0), ir.DataType.BOOL, SPAN), ir.EvalStmt(sync.wait(c_carry, ir.PipeType.MTE2), SPAN), None, [], SPAN),
+            ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [a, ir.MakeTuple([ci(0), ci(0)], SPAN), ir.MakeTuple([ci(2), ci(8)], SPAN), buf], ir.VoidType(), SPAN), SPAN),
+            ir.AssignStmt(c_tok, sync.record(ir.PipeType.MTE2), SPAN),
+            ir.EvalStmt(sync.wait(c_tok, ir.PipeType.V), SPAN),
+            ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [buf, out_buf], ir.VoidType(), SPAN), SPAN),
+            ir.AssignStmt(c_end, sync.record(ir.PipeType.V), SPAN),
+            ir.YieldStmt([c_end], SPAN),
+        ),
+        [c_ret],
+        SPAN,
+        attrs={"pypto.closed_sync_child": 1},
+    )
+    logical = ir.Function(
+        "per_dir_child_res",
+        [a, (out_gm, ir.ParamDirection.InOut)],
+        [out_gm.type],
+        seq(
+            ir.AssignStmt(buf, ir.Call(ir.get_op("buffer.alloc"), [ir.MakeTuple([], SPAN), ci(0)], vec_t, SPAN), SPAN),
+            ir.AssignStmt(out_buf, ir.Call(ir.get_op("buffer.alloc"), [ir.MakeTuple([], SPAN), ci(128)], vec_t, SPAN), SPAN),
+            ir.AssignStmt(p0, sync.record(ir.PipeType.MTE2), SPAN),
+            ir.AssignStmt(p1, sync.record(ir.PipeType.MTE2), SPAN),
+            ir.EvalStmt(sync.wait(p0, ir.PipeType.MTE3), SPAN),
+            ir.EvalStmt(sync.wait(p1, ir.PipeType.MTE3), SPAN),
+            ir.AssignStmt(c_init, sync.completed(ir.PipeType.V), SPAN),
+            ir.AssignStmt(e0, sync.record(ir.PipeType.MTE2), SPAN),
+            ir.EvalStmt(sync.wait(e0, ir.PipeType.V), SPAN),
+            ir.AssignStmt(e1, sync.record(ir.PipeType.V), SPAN),
+            ir.EvalStmt(sync.wait(e1, ir.PipeType.MTE2), SPAN),
+            child,
+            ir.ReturnStmt([out_gm], SPAN),
+        ),
+        SPAN,
+        ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    result = testing.lower_sync_schedule(logical, eligible_ids=[0, 1])
+    physical = result["function"]
+    verify(physical)
+    _, after = check_closed_commands(logical, physical, {}, [0, 1], compare_commands=False)
+    assert after.ids[ir.PipeType.MTE2, ir.PipeType.MTE3] == {0, 1}
+    assert after.ids[ir.PipeType.MTE2, ir.PipeType.V].issubset({0, 1})
+

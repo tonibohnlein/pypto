@@ -539,7 +539,8 @@ LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const
                                               std::optional<std::pair<int64_t, int64_t>> blocks,
                                               const SyncSchedulePolicy& policy,
                                               SyncExternalPolicy external_policy,
-                                              std::optional<int64_t> launch_count) {
+                                              std::optional<int64_t> launch_count,
+                                              const SyncNativeReservations& extra_reservations) {
   auto stripped = StripStructuredLogicalSync(function, true);
   if (blocks) {
     const auto partition = PartitionSyncInvocation(stripped.function, parameters, *blocks, launch_count);
@@ -555,7 +556,8 @@ LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const
         auto families = ParseScopedTokenProtocol(function, std::move(input), stripped.loops);
         owners.push_back(PrepareScopedTokenOrder(std::move(families)));
         const auto& order = *owners.back();
-        plans.push_back(AllocateDirectSync(order.Input(), order.Families(), order.View(), target, eligible));
+        plans.push_back(
+            AllocateDirectSync(order.Input(), order.Families(), order.View(), target, eligible, extra_reservations));
         cases.push_back({&order.Input(), plans.back().assignment, &plans.back()});
       }
       result.function = EmitAssignedSyncCases(stripped.function, parameters, *blocks, cases, policy);
@@ -574,12 +576,14 @@ LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const
     const auto& order = *prepared;
     // The callbacks borrow this owner until shared allocation/emission finishes.
     // An unavailable proof refuses; it never substitutes a new demand analysis.
-    auto result = RealizeDirectSync(order.Input(), order.Families(), order.View(), target, eligible, policy);
+    auto result = RealizeDirectSync(order.Input(), order.Families(), order.View(), target, eligible, policy,
+                                    extra_reservations);
     return {result.function, result.set_sites, result.wait_sites, {std::move(result)}};
   }
   auto families = Parse(function, input, stripped.loops).Run();
   Order order(input, families);
-  auto result = RealizeDirectSync(input, std::move(families), order.View(), target, eligible, policy);
+  auto result =
+      RealizeDirectSync(input, std::move(families), order.View(), target, eligible, policy, extra_reservations);
   return {result.function, result.set_sites, result.wait_sites, {std::move(result)}};
 }
 }  // namespace pypto::ir::sync
