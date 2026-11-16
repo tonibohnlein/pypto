@@ -598,12 +598,52 @@ class TestPassPipelineIntegrationAndCalibration:
             platform="a2a3",
             compile_only=True,
         )
-        assert len(summary["cases"]) == 4
+        assert len(summary["cases"]) == 6
         for case_rec in summary["cases"]:
             variants = case_rec["variants"]
             assert len(variants) == 8, f"{case_rec['case_id']} unexpectedly split L0: {len(variants)}"
             assert any(v["gm_output_layouts"].get("out") == "NZ" for v in variants)
             assert any(v["gm_output_layouts"].get("out") == "ND" for v in variants)
+
+    def test_tiled_loop_multiplicity_and_large_chain_extraction(self):
+        set_backend_type(BackendType.Ascend910)
+        model = LayoutCostModel(expected_uses=100, backend_type=BackendType.Ascend910)
+
+        tiled = auto_layout_bench.build_single_matmul_case(
+            128, 1024, 1024, k_tile=128, n_tile=128, expected_uses=100, seed=0
+        )
+        pre_tiled = run_pre_layout_passes(tiled.program)
+        inst_tiled = extract_layout_instance(
+            pre_tiled, cost_model=model, reusable_tensors=tiled.reusable_tensors
+        )
+        assert set(inst_tiled.values) >= {"x", "w", "out"}
+        loads = [op for op in inst_tiled.operations if op.op_name == "tile.load"]
+        stores = [op for op in inst_tiled.operations if op.op_name == "tile.store"]
+        assert len(loads) == 2
+        assert all(op.invocations == 6400 for op in loads)
+        assert len(stores) == 1
+        assert stores[0].invocations == 800
+        assert len(enumerate_assignments(inst_tiled, deduplicate=True)) == 8
+
+        large_chain = auto_layout_bench.build_two_matmul_chain_case(
+            64,
+            2048,
+            512,
+            1024,
+            k_tile=256,
+            h_tile_s1=64,
+            h_tile_s2=128,
+            n_tile=64,
+            expected_uses=100,
+            seed=1,
+        )
+        pre_chain = run_pre_layout_passes(large_chain.program)
+        inst_chain = extract_layout_instance(
+            pre_chain, cost_model=model, reusable_tensors=large_chain.reusable_tensors
+        )
+        gm_names = {n for n, v in inst_chain.values.items() if v.memory_space == ir.MemorySpace.DDR}
+        assert gm_names == {"x", "w1", "mid", "w2", "out"}
+        assert len(enumerate_assignments(inst_chain, deduplicate=True)) == 32
 
     def test_prepare_variant_tensors_uses_entry_param_order_for_chain(self, tmp_path: Path):
         chain = auto_layout_bench.build_two_matmul_chain_case(64, 128, 64, 64, seed=7)

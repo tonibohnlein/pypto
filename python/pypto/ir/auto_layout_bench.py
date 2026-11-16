@@ -71,43 +71,86 @@ class CalibrationCaseSpec:
     expected_uses: int = 100
 
 
+@pl.jit.incore
+def _matmul_single_tile(
+    a: pl.Tensor,
+    b: pl.Tensor,
+    c: pl.Out[pl.Tensor],
+    m_dim: pl.constexpr,
+    red_dim: pl.constexpr,
+    out_cols: pl.constexpr,
+) -> pl.Tensor:
+    at = pl.load(a, [0, 0], [m_dim, red_dim], target_memory=pl.MemorySpace.Mat)
+    bt = pl.load(b, [0, 0], [out_cols, red_dim], target_memory=pl.MemorySpace.Mat)
+    bt_t = pl.tile.transpose_view(bt)
+    acc = pl.matmul(at, bt_t)
+    pl.store(acc, [0, 0], c)
+    return c
+
+
+@pl.jit.incore
+def _matmul_tiled_nk(
+    a: pl.Tensor,
+    b: pl.Tensor,
+    c: pl.Out[pl.Tensor],
+    m_dim: pl.constexpr,
+    red_dim: pl.constexpr,
+    out_cols: pl.constexpr,
+    red_tile: pl.constexpr,
+    col_tile: pl.constexpr,
+) -> pl.Tensor:
+    for c0 in pl.range(0, out_cols, col_tile):
+        initial = pl.tile.create([m_dim, col_tile], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc)
+        for r0, (carry,) in pl.pipeline(0, red_dim, red_tile, init_values=(initial,), stage=2):
+            at = pl.load(a, [0, r0], [m_dim, red_tile], target_memory=pl.MemorySpace.Mat)
+            bt = pl.load(b, [c0, r0], [col_tile, red_tile], target_memory=pl.MemorySpace.Mat)
+            bt_t = pl.tile.transpose_view(bt)
+            cur = pl.tile.matmul_acc(carry, at, bt_t, r0 == 0)
+            acc = pl.yield_(cur)
+        pl.store(acc, [0, c0], c)  # pyright: ignore[reportPossiblyUnboundVariable]
+    return c
+
+
 def build_single_matmul_case(
     m_dim: int,
     k_dim: int,
     n_dim: int,
     *,
+    k_tile: int | None = None,
+    n_tile: int | None = None,
     expected_uses: int = 100,
     seed: int = 0,
 ) -> CalibrationCaseSpec:
     """Build an L0-fitting `C[M, N] = X[M, K] @ W[N, K].T` FP16->FP32 `@pl.jit` workload."""
-
-    @pl.jit.incore
-    def matmul_kernel(
-        x: pl.Tensor,
-        w: pl.Tensor,
-        out: pl.Out[pl.Tensor],
-    ) -> pl.Tensor:
-        xt = pl.load(x, [0, 0], [m_dim, k_dim], target_memory=pl.MemorySpace.Mat)
-        wt = pl.load(w, [0, 0], [n_dim, k_dim], target_memory=pl.MemorySpace.Mat)
-        wt_t = pl.tile.transpose_view(wt)
-        acc = pl.matmul(xt, wt_t)
-        pl.store(acc, [0, 0], out)
-        return out
+    k_step = k_tile if k_tile is not None else k_dim
+    n_step = n_tile if n_tile is not None else n_dim
+    is_single_tile = k_step == k_dim and n_step == n_dim
 
     @pl.jit
-    def matmul_calib_entry(
+    def matmul_single_entry(
         x: pl.Tensor,
         w: pl.Tensor,
         out: pl.Out[pl.Tensor],
     ) -> pl.Tensor:
-        return matmul_kernel(x, w, out)
+        return _matmul_single_tile(x, w, out, m_dim, k_dim, n_dim)
+
+    @pl.jit
+    def matmul_tiled_entry(
+        x: pl.Tensor,
+        w: pl.Tensor,
+        out: pl.Out[pl.Tensor],
+    ) -> pl.Tensor:
+        return _matmul_tiled_nk(x, w, out, m_dim, k_dim, n_dim, k_step, n_step)
+
+    entry_fn = matmul_single_entry if is_single_tile else matmul_tiled_entry
 
     gen = torch.Generator().manual_seed(seed)
-    x_host = torch.randn((m_dim, k_dim), generator=gen, dtype=torch.float16) * 0.25
-    w_host = torch.randn((n_dim, k_dim), generator=gen, dtype=torch.float16) * 0.25
+    scale = 0.05 if k_dim >= 1024 else 0.25
+    x_host = torch.randn((m_dim, k_dim), generator=gen, dtype=torch.float16) * scale
+    w_host = torch.randn((n_dim, k_dim), generator=gen, dtype=torch.float16) * scale
     out_stub = torch.zeros((m_dim, n_dim), dtype=torch.float32)
 
-    program = matmul_calib_entry.specialize(x_host, w_host, out_stub)
+    program = entry_fn.specialize(x_host, w_host, out_stub)
     expected = x_host.float() @ w_host.float().T
 
     return CalibrationCaseSpec(
@@ -122,12 +165,16 @@ def build_single_matmul_case(
     )
 
 
-def build_two_matmul_chain_case(
+def build_two_matmul_chain_case(  # noqa: PLR0913
     m_dim: int = 64,
     k_dim: int = 128,
     h_dim: int = 64,
     n_dim: int = 64,
     *,
+    k_tile: int | None = None,
+    h_tile_s1: int | None = None,
+    h_tile_s2: int | None = None,
+    n_tile: int | None = None,
     expected_uses: int = 100,
     seed: int = 1,
 ) -> CalibrationCaseSpec:
@@ -137,49 +184,46 @@ def build_two_matmul_chain_case(
     by `mm_stage2`, allowing calibration of intra-program `ND` vs. `NZ`
     intermediate GM storage without host packing.
     """
+    k_step = k_tile if k_tile is not None else k_dim
+    h1_step = h_tile_s1 if h_tile_s1 is not None else h_dim
+    h2_step = h_tile_s2 if h_tile_s2 is not None else h_dim
+    n_step = n_tile if n_tile is not None else n_dim
+    s1_single = k_step == k_dim and h1_step == h_dim
+    s2_single = h2_step == h_dim and n_step == n_dim
 
-    @pl.jit.incore
-    def mm_stage1(
-        x: pl.Tensor,
-        w1: pl.Tensor,
-        mid: pl.Out[pl.Tensor],
-    ) -> pl.Tensor:
-        xt = pl.load(x, [0, 0], [m_dim, k_dim], target_memory=pl.MemorySpace.Mat)
-        w1t = pl.load(w1, [0, 0], [h_dim, k_dim], target_memory=pl.MemorySpace.Mat)
-        w1_t = pl.tile.transpose_view(w1t)
-        acc1 = pl.matmul(xt, w1_t)
-        pl.store(acc1, [0, 0], mid)
-        return mid
+    if s1_single and s2_single:
 
-    @pl.jit.incore
-    def mm_stage2(
-        mid: pl.Tensor,
-        w2: pl.Tensor,
-        out: pl.Out[pl.Tensor],
-    ) -> pl.Tensor:
-        mt = pl.load(mid, [0, 0], [m_dim, h_dim], target_memory=pl.MemorySpace.Mat)
-        w2t = pl.load(w2, [0, 0], [n_dim, h_dim], target_memory=pl.MemorySpace.Mat)
-        w2_t = pl.tile.transpose_view(w2t)
-        acc2 = pl.matmul(mt, w2_t)
-        pl.store(acc2, [0, 0], out)
-        return out
+        @pl.jit
+        def two_matmul_chain_entry(
+            x: pl.Tensor,
+            w1: pl.Tensor,
+            w2: pl.Tensor,
+            out: pl.Out[pl.Tensor],
+        ) -> pl.Tensor:
+            mid = pl.create_tensor([m_dim, h_dim], dtype=pl.FP32)
+            mid = _matmul_single_tile(x, w1, mid, m_dim, k_dim, h_dim)
+            out = _matmul_single_tile(mid, w2, out, m_dim, h_dim, n_dim)
+            return out
+    else:
 
-    @pl.jit
-    def two_matmul_chain_entry(
-        x: pl.Tensor,
-        w1: pl.Tensor,
-        w2: pl.Tensor,
-        out: pl.Out[pl.Tensor],
-    ) -> pl.Tensor:
-        mid = pl.create_tensor([m_dim, h_dim], dtype=pl.FP32)
-        mid = mm_stage1(x, w1, mid)
-        out = mm_stage2(mid, w2, out)
-        return out
+        @pl.jit
+        def two_matmul_chain_entry(
+            x: pl.Tensor,
+            w1: pl.Tensor,
+            w2: pl.Tensor,
+            out: pl.Out[pl.Tensor],
+        ) -> pl.Tensor:
+            mid = pl.create_tensor([m_dim, h_dim], dtype=pl.FP32)
+            mid = _matmul_tiled_nk(x, w1, mid, m_dim, k_dim, h_dim, k_step, h1_step)
+            out = _matmul_tiled_nk(mid, w2, out, m_dim, h_dim, n_dim, h2_step, n_step)
+            return out
 
     gen = torch.Generator().manual_seed(seed)
-    x_host = torch.randn((m_dim, k_dim), generator=gen, dtype=torch.float16) * 0.25
-    w1_host = torch.randn((h_dim, k_dim), generator=gen, dtype=torch.float16) * 0.25
-    w2_host = torch.randn((n_dim, h_dim), generator=gen, dtype=torch.float32) * 0.25
+    s1_scale = 0.05 if k_dim >= 1024 else 0.25
+    s2_scale = 0.05 if h_dim >= 256 else 0.25
+    x_host = torch.randn((m_dim, k_dim), generator=gen, dtype=torch.float16) * s1_scale
+    w1_host = torch.randn((h_dim, k_dim), generator=gen, dtype=torch.float16) * s1_scale
+    w2_host = torch.randn((n_dim, h_dim), generator=gen, dtype=torch.float32) * s2_scale
     out_stub = torch.zeros((m_dim, n_dim), dtype=torch.float32)
 
     program = two_matmul_chain_entry.specialize(x_host, w1_host, w2_host, out_stub)
@@ -327,17 +371,41 @@ def default_a2_calibration_suite(
     include_chain: bool = True,
     expected_uses: int = 100,
 ) -> list[CalibrationCaseSpec]:
-    """Return the default L0-fitting Ascend A2 (`Ascend910`) calibration workload suite."""
-    # All single-matmul operand tiles stay <= 32 KiB in L0A/L0B so AutoTileMatmulL0 is bypassed
-    # cleanly while preserving full rank across [1, load_bytes, store_bytes, macs].
+    """Return a high-volume L0-fitting Ascend A2 (`Ascend910`) calibration workload suite.
+
+    Each inner loop step keeps operand tiles <= 32 KiB in L0A/L0B (bypassing
+    `AutoTileMatmulL0`) while outer N/K tiling amplifies GM/L1 MTE2 loads and
+    L0C->GM FIXPIPE stores to 0.5-4.0 MiB per launch across linearly independent
+    (load_bytes, store_bytes, macs) shapes.
+    """
     cases = [
-        build_single_matmul_case(64, 128, 64, expected_uses=expected_uses, seed=0),
-        build_single_matmul_case(64, 256, 64, expected_uses=expected_uses, seed=1),
-        build_single_matmul_case(128, 128, 64, expected_uses=expected_uses, seed=2),
-        build_single_matmul_case(128, 128, 128, expected_uses=expected_uses, seed=3),
+        # MTE2 K-accumulation sweep (loads 0.5 MiB -> 2.0 MiB, stores 16-64 KiB)
+        build_single_matmul_case(64, 2048, 64, k_tile=256, expected_uses=expected_uses, seed=0),
+        build_single_matmul_case(64, 8192, 64, k_tile=256, expected_uses=expected_uses, seed=1),
+        build_single_matmul_case(128, 4096, 128, k_tile=128, expected_uses=expected_uses, seed=2),
+        # FIXPIPE store-heavy & balanced N/K-tiled matmuls (stores 512 KiB - 1.0 MiB)
+        build_single_matmul_case(64, 256, 2048, k_tile=256, n_tile=64, expected_uses=expected_uses, seed=3),
+        build_single_matmul_case(128, 256, 2048, k_tile=128, n_tile=128, expected_uses=expected_uses, seed=4),
+        build_single_matmul_case(
+            128, 1024, 1024, k_tile=128, n_tile=128, expected_uses=expected_uses, seed=5
+        ),
     ]
     if include_chain:
-        cases.append(build_two_matmul_chain_case(64, 128, 64, 64, expected_uses=expected_uses, seed=4))
+        # Large chained matmul moving 128 KiB into GM `mid` and reading 2.0 MiB back out.
+        cases.append(
+            build_two_matmul_chain_case(
+                64,
+                2048,
+                512,
+                1024,
+                k_tile=256,
+                h_tile_s1=64,
+                h_tile_s2=128,
+                n_tile=64,
+                expected_uses=expected_uses,
+                seed=6,
+            )
+        )
     return cases
 
 

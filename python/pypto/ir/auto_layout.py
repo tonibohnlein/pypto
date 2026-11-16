@@ -586,6 +586,7 @@ class LayoutProblemInstance:
 
 
 _TENSOR_CREATE_OP = core_ir.get_op("tensor.create").name
+_TILE_CREATE_OP = core_ir.get_op("tile.create").name
 _TILE_LOAD_OP = core_ir.get_op("tile.load").name
 _TILE_STORE_OP = core_ir.get_op("tile.store").name
 _TILE_MOVE_OP = core_ir.get_op("tile.move").name
@@ -683,7 +684,96 @@ def run_post_layout_passes(program: core_ir.Program) -> core_ir.Program:
     return pipe.run(program)
 
 
-class _PostInferInstanceExtractor(core_ir.IRVisitor):
+def _for_trip_count(op: core_ir.ForStmt) -> int:
+    """Return constant trip count of *op* when static, otherwise 1."""
+    if (
+        isinstance(op.start, core_ir.ConstInt)
+        and isinstance(op.stop, core_ir.ConstInt)
+        and isinstance(op.step, core_ir.ConstInt)
+        and int(op.step.value) > 0
+    ):
+        span = int(op.stop.value) - int(op.start.value)
+        step = int(op.step.value)
+        return max(1, (span + step - 1) // step)
+    return 1
+
+
+def _iter_child_stmts(stmt: core_ir.Stmt) -> Sequence[core_ir.Stmt]:
+    """Return immediate child body statements for any compound IR statement."""
+    if isinstance(stmt, core_ir.SeqStmts):
+        return stmt.stmts
+    if isinstance(stmt, core_ir.IfStmt):
+        branches = [stmt.then_body]
+        if stmt.else_body is not None:
+            branches.append(stmt.else_body)
+        return branches
+    body = getattr(stmt, "body", None)
+    return (body,) if isinstance(body, core_ir.Stmt) else ()
+
+
+class _OrchCallMultiplierVisitor:
+    """Count static invocation multiplicity and resolve caller GM aliases per InCore callee."""
+
+    def __init__(self, func_by_name: dict[str, core_ir.Function] | None = None) -> None:
+        self._func_by_name = func_by_name or {}
+        self._mult = 1
+        self._alias_by_uid: dict[int, str] = {}
+        self.call_counts: dict[str, int] = {}
+        self.call_arg_names: dict[str, list[str | None]] = {}
+
+    def walk(self, func: core_ir.Function) -> None:
+        for param in func.params:
+            self._alias_by_uid[param.unique_id] = _clean_ssa_name(param.name_hint)
+        self._walk_stmt(func.body)
+
+    def _resolve_arg_name(self, expr: core_ir.Expr) -> str | None:
+        if not isinstance(expr, core_ir.Var):
+            return None
+        return self._alias_by_uid.get(expr.unique_id, _clean_ssa_name(expr.name_hint))
+
+    def _record_calls(self, expr: core_ir.Expr, assign_var: core_ir.Var | None = None) -> None:
+        if isinstance(expr, core_ir.Call):
+            if isinstance(expr.op, core_ir.GlobalVar):
+                name = expr.op.name
+                self.call_counts[name] = self.call_counts.get(name, 0) + self._mult
+                resolved = [self._resolve_arg_name(arg) for arg in expr.args]
+                self.call_arg_names.setdefault(name, resolved)
+                if assign_var is not None:
+                    callee = self._func_by_name.get(name)
+                    if callee is not None:
+                        for arg_name, direction in zip(resolved, callee.param_directions, strict=True):
+                            if (
+                                direction in (core_ir.ParamDirection.Out, core_ir.ParamDirection.InOut)
+                                and arg_name is not None
+                            ):
+                                self._alias_by_uid[assign_var.unique_id] = arg_name
+                                break
+            elif assign_var is not None and expr.op.name == _TENSOR_CREATE_OP:
+                self._alias_by_uid[assign_var.unique_id] = _clean_ssa_name(assign_var.name_hint)
+            for arg in expr.args:
+                self._record_calls(arg)
+
+    def _walk_stmt(self, stmt: core_ir.Stmt) -> None:
+        if isinstance(stmt, core_ir.ForStmt):
+            prev = self._mult
+            self._mult = prev * _for_trip_count(stmt)
+            try:
+                self._walk_stmt(stmt.body)
+            finally:
+                self._mult = prev
+            return
+        if isinstance(stmt, core_ir.AssignStmt):
+            self._record_calls(stmt.value, assign_var=stmt.var)
+        elif isinstance(stmt, core_ir.EvalStmt):
+            self._record_calls(stmt.expr)
+        elif isinstance(stmt, core_ir.ReturnStmt):
+            for val in stmt.value:
+                self._record_calls(val)
+        for child in _iter_child_stmts(stmt):
+            self._walk_stmt(child)
+
+
+class _PostInferInstanceExtractor:
     """Extract `LayoutValueNode`s and `LayoutOperationNode`s from post-Pass-22 IR."""
 
     def __init__(
@@ -695,8 +785,9 @@ class _PostInferInstanceExtractor(core_ir.IRVisitor):
         shared_values: dict[str, LayoutValueNode] | None = None,
         op_offset: int = 0,
         tile_prefix: str = "",
+        call_multiplier: int = 1,
+        param_name_overrides: Sequence[str | None] | None = None,
     ) -> None:
-        super().__init__()
         self._model = cost_model
         self._reusable = reusable_tensors
         self._external_out_names = external_out_names
@@ -705,19 +796,23 @@ class _PostInferInstanceExtractor(core_ir.IRVisitor):
         self.operations: list[LayoutOperationNode] = []
         self._uid_to_name: dict[int, str] = {}
         self._op_counter = op_offset
+        self._loop_multiplier = max(1, call_multiplier)
+        self._yield_stack: list[list[int]] = []
+        self._param_overrides = list(param_name_overrides) if param_name_overrides is not None else []
 
     @property
     def op_counter(self) -> int:
         return self._op_counter
 
     def extract(self, func: core_ir.Function) -> None:
-        for param, direction in zip(func.params, func.param_directions, strict=True):
+        for idx, (param, direction) in enumerate(zip(func.params, func.param_directions, strict=True)):
             if not isinstance(param.type, core_ir.TensorType):
                 continue
             shape = _static_shape(param.type.shape)
             if shape is None:
                 continue
-            name = _clean_ssa_name(param.name_hint)
+            override = self._param_overrides[idx] if idx < len(self._param_overrides) else None
+            name = override or _clean_ssa_name(param.name_hint)
             self._uid_to_name[param.unique_id] = name
             if name in self.values:
                 continue
@@ -743,9 +838,9 @@ class _PostInferInstanceExtractor(core_ir.IRVisitor):
                 is_reusable_weight=(name in self._reusable or param.name_hint in self._reusable),
                 is_external_output=is_ext_out,
             )
-        self.visit_function(func)
+        self._walk_stmt(func.body)
 
-    def _register_tile_var(self, var: core_ir.Var, producer_op_id: str) -> LayoutValueNode | None:
+    def _register_tile_var(self, var: core_ir.Var, producer_op_id: str | None) -> LayoutValueNode | None:
         if not isinstance(var.type, core_ir.TileType):
             return None
         shape = _static_shape(var.type.shape)
@@ -806,7 +901,7 @@ class _PostInferInstanceExtractor(core_ir.IRVisitor):
                 op_name=rhs.op.name,
                 inputs=(src_name,),
                 output=dst_node.name,
-                invocations=self._model.expected_uses,
+                invocations=self._model.expected_uses * self._loop_multiplier,
                 configs=tuple(configs),
             )
         )
@@ -848,7 +943,7 @@ class _PostInferInstanceExtractor(core_ir.IRVisitor):
                 op_name=rhs.op.name,
                 inputs=(src_name,),
                 output=dst_node.name,
-                invocations=self._model.expected_uses,
+                invocations=self._model.expected_uses * self._loop_multiplier,
                 configs=configs,
             )
         )
@@ -888,7 +983,7 @@ class _PostInferInstanceExtractor(core_ir.IRVisitor):
                 op_name=rhs.op.name,
                 inputs=(src_name,),
                 output=dst_node.name,
-                invocations=self._model.expected_uses,
+                invocations=self._model.expected_uses * self._loop_multiplier,
                 configs=tuple(configs),
             )
         )
@@ -935,7 +1030,7 @@ class _PostInferInstanceExtractor(core_ir.IRVisitor):
                 op_name=rhs.op.name,
                 inputs=(lhs_name, rhs_name),
                 output=dst_node.name,
-                invocations=self._model.expected_uses,
+                invocations=self._model.expected_uses * self._loop_multiplier,
                 configs=configs,
             )
         )
@@ -998,7 +1093,7 @@ class _PostInferInstanceExtractor(core_ir.IRVisitor):
                 op_name=rhs.op.name,
                 inputs=(tile_name,),
                 output=dst_name,
-                invocations=self._model.expected_uses,
+                invocations=self._model.expected_uses * self._loop_multiplier,
                 configs=tuple(configs),
             )
         )
@@ -1079,16 +1174,18 @@ class _PostInferInstanceExtractor(core_ir.IRVisitor):
                 op_name=rhs.op.name,
                 inputs=tuple(name for _, name, _ in tile_inputs),
                 output=dst_node.name,
-                invocations=self._model.expected_uses,
+                invocations=self._model.expected_uses * self._loop_multiplier,
                 configs=tuple(configs),
             )
         )
 
-    def visit_assign_stmt(self, op: core_ir.AssignStmt) -> None:
+    def _walk_assign_stmt(self, op: core_ir.AssignStmt) -> None:
         rhs = op.value
         if isinstance(rhs, core_ir.Call):
             op_name = rhs.op.name
-            if op_name == _TILE_LOAD_OP:
+            if op_name == _TILE_CREATE_OP:
+                self._register_tile_var(op.var, producer_op_id=None)
+            elif op_name == _TILE_LOAD_OP:
                 self._extract_load(op, rhs)
             elif op_name == _TILE_TRANSPOSE_VIEW_OP:
                 self._extract_transpose_view(op, rhs)
@@ -1100,18 +1197,51 @@ class _PostInferInstanceExtractor(core_ir.IRVisitor):
                 self._extract_store(rhs)
             elif op_name.startswith("tile."):
                 self._extract_generic_tile_op(op, rhs)
-        super().visit_assign_stmt(op)
 
-    def visit_eval_stmt(self, op: core_ir.EvalStmt) -> None:
-        if isinstance(op.expr, core_ir.Call) and op.expr.op.name == _TILE_STORE_OP:
-            self._extract_store(op.expr)
-        super().visit_eval_stmt(op)
+    def _walk_for_stmt(self, op: core_ir.ForStmt) -> None:
+        for iter_arg in op.iter_args:
+            init_val = getattr(iter_arg, "initValue", None)
+            if isinstance(init_val, core_ir.Var) and init_val.unique_id in self._uid_to_name:
+                self._uid_to_name[iter_arg.unique_id] = self._uid_to_name[init_val.unique_id]
+        self._yield_stack.append([])
+        prev_mult = self._loop_multiplier
+        self._loop_multiplier = prev_mult * _for_trip_count(op)
+        try:
+            self._walk_stmt(op.body)
+        finally:
+            self._loop_multiplier = prev_mult
+            yielded_uids = self._yield_stack.pop()
 
-    def visit_return_stmt(self, op: core_ir.ReturnStmt) -> None:
-        for val in op.value:
-            if isinstance(val, core_ir.Call) and val.op.name == _TILE_STORE_OP:
-                self._extract_store(val)
-        super().visit_return_stmt(op)
+        for idx, rv in enumerate(op.return_vars):
+            mapped_name: str | None = None
+            if idx < len(yielded_uids):
+                mapped_name = self._uid_to_name.get(yielded_uids[idx])
+            if mapped_name is None and idx < len(op.iter_args):
+                mapped_name = self._uid_to_name.get(op.iter_args[idx].unique_id)
+            if mapped_name is not None:
+                self._uid_to_name[rv.unique_id] = mapped_name
+
+    def _walk_stmt(self, stmt: core_ir.Stmt) -> None:
+        if isinstance(stmt, core_ir.AssignStmt):
+            self._walk_assign_stmt(stmt)
+        elif isinstance(stmt, core_ir.ForStmt):
+            self._walk_for_stmt(stmt)
+            return
+        elif isinstance(stmt, core_ir.YieldStmt):
+            if self._yield_stack:
+                self._yield_stack[-1] = [
+                    val.unique_id if isinstance(val, core_ir.Var) else -1 for val in stmt.value
+                ]
+        elif isinstance(stmt, core_ir.EvalStmt):
+            if isinstance(stmt.expr, core_ir.Call) and stmt.expr.op.name == _TILE_STORE_OP:
+                self._extract_store(stmt.expr)
+        elif isinstance(stmt, core_ir.ReturnStmt):
+            for val in stmt.value:
+                if isinstance(val, core_ir.Call) and val.op.name == _TILE_STORE_OP:
+                    self._extract_store(val)
+
+        for child in _iter_child_stmts(stmt):
+            self._walk_stmt(child)
 
 
 def extract_layout_instance(
@@ -1134,6 +1264,8 @@ def extract_layout_instance(
     incore_funcs = [f for f in program.functions.values() if core_ir.is_incore_type(f.func_type)]
     orch_funcs = [f for f in program.functions.values() if not core_ir.is_incore_type(f.func_type)]
     ext_out_names: set[str] | None = None
+    call_counts: dict[str, int] = {}
+    call_arg_names: dict[str, list[str | None]] = {}
     if orch_funcs:
         ext_out_names = {
             _clean_ssa_name(p.name_hint)
@@ -1141,6 +1273,12 @@ def extract_layout_instance(
             for p, d in zip(fn.params, fn.param_directions, strict=True)
             if d in (core_ir.ParamDirection.Out, core_ir.ParamDirection.InOut)
         }
+        func_by_name = {f.name: f for f in program.functions.values()}
+        call_counter = _OrchCallMultiplierVisitor(func_by_name)
+        for fn in orch_funcs:
+            call_counter.walk(fn)
+        call_counts = call_counter.call_counts
+        call_arg_names = call_counter.call_arg_names
 
     multi_incore = len(incore_funcs) > 1
     op_offset = 0
@@ -1153,6 +1291,8 @@ def extract_layout_instance(
             shared_values=values,
             op_offset=op_offset,
             tile_prefix=prefix,
+            call_multiplier=call_counts.get(func.name, 1),
+            param_name_overrides=call_arg_names.get(func.name),
         )
         extractor.extract(func)
         values = extractor.values
@@ -1388,14 +1528,38 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         super().__init__()
         self._tensor_layouts = assignment.tensor_layouts
         self._tile_layouts = assignment.tile_layouts
+        self._scoped_tensor_layouts: dict[tuple[str, str], core_ir.TensorLayout] = {}
         self._var_remap: dict[int, core_ir.Var] = {}
         self._func_return_types: dict[str, list[core_ir.Type]] = {}
         self._current_func_name = ""
+
+    def _lookup_tensor_layout(self, name_hint: str) -> core_ir.TensorLayout | None:
+        clean_name = _clean_ssa_name(name_hint)
+        if self._current_func_name:
+            scoped = self._scoped_tensor_layouts.get((self._current_func_name, clean_name))
+            if scoped is not None:
+                return scoped
+        return self._tensor_layouts.get(clean_name, self._tensor_layouts.get(name_hint))
 
     def rewrite(self, program: core_ir.Program) -> core_ir.Program:
         funcs = list(program.functions.values())
         incore_funcs = [f for f in funcs if core_ir.is_incore_type(f.func_type)]
         other_funcs = [f for f in funcs if not core_ir.is_incore_type(f.func_type)]
+        func_by_name = {f.name: f for f in funcs}
+        if other_funcs:
+            visitor = _OrchCallMultiplierVisitor(func_by_name)
+            for fn in other_funcs:
+                visitor.walk(fn)
+            for callee_name, arg_names in visitor.call_arg_names.items():
+                callee = func_by_name.get(callee_name)
+                if callee is None:
+                    continue
+                for param, arg_name in zip(callee.params, arg_names, strict=True):
+                    if arg_name is None:
+                        continue
+                    lay = self._tensor_layouts.get(arg_name)
+                    if lay is not None:
+                        self._scoped_tensor_layouts[(callee_name, _clean_ssa_name(param.name_hint))] = lay
 
         rewritten_by_name: dict[str, core_ir.Function] = {}
         for func in incore_funcs + other_funcs:
@@ -1419,8 +1583,7 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         new_params: list[tuple[core_ir.Var, core_ir.ParamDirection]] = []
         changed = False
         for param, direction in zip(func.params, func.param_directions, strict=True):
-            clean_name = _clean_ssa_name(param.name_hint)
-            target_layout = self._tensor_layouts.get(clean_name, self._tensor_layouts.get(param.name_hint))
+            target_layout = self._lookup_tensor_layout(param.name_hint)
             if (
                 isinstance(param.type, core_ir.TensorType)
                 and target_layout is not None
@@ -1439,10 +1602,7 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         if len(new_return_types) == 1 and isinstance(new_return_types[0], core_ir.TensorType):
             for param, direction in new_params:
                 if direction in (core_ir.ParamDirection.Out, core_ir.ParamDirection.InOut):
-                    clean_name = _clean_ssa_name(param.name_hint)
-                    target_layout = self._tensor_layouts.get(
-                        clean_name, self._tensor_layouts.get(param.name_hint)
-                    )
+                    target_layout = self._lookup_tensor_layout(param.name_hint)
                     if (
                         target_layout is not None
                         and isinstance(param.type, core_ir.TensorType)
