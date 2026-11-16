@@ -253,6 +253,19 @@ class ClosedCommands:
                     self.bytes(args[0], rect),
                     self.bytes(args[3], (0, 0, 1, 8)),
                 )
+            elif name == opname("buffer.store") and len(args[3].type.shape) == 1:
+                # The write-specific selected TSTORE contract transfers one
+                # INT32, even at an element-aligned GM offset. Model its full
+                # private UB read enclosure separately from its four GM bytes;
+                # the seven inactive carrier lanes never become GM writes.
+                assert len(rect) == 2 and rect[1] == 1
+                assert list(args[0].type.shape) == [1, 8] and args[0].type.dtype == ir.DataType.INT32
+                rect = (0, rect[0], 1, 1)
+                pipe, reads, writes = (
+                    ir.PipeType.MTE3,
+                    self.bytes(args[0], (0, 0, 1, 8)),
+                    self.bytes(args[3], rect),
+                )
             elif name == opname("buffer.load"):
                 pipe, reads, writes = ir.PipeType.MTE2, self.bytes(args[0], rect), self.bytes(args[3])
             else:

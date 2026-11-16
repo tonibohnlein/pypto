@@ -37,9 +37,9 @@ std::optional<size_t> ResultAliasedArgIndex(const CallPtr& call) {
     return aliased(*reused);
   }
 
-  // tensor.write(tensor, indices, value) and tensor.assemble(target, source,
-  // offsets) both return the updated tensor.
-  if (IsOp(call, "tensor.write") || IsOp(call, "tensor.assemble")) {
+  // tensor.assemble(target, source, offsets) returns the updated tensor.
+  // tensor.write declares its physical destination reuse in the registry.
+  if (IsOp(call, "tensor.assemble")) {
     return aliased(0);
   }
   // `tensor.expand_clone(input, target)` writes the expansion into `target`

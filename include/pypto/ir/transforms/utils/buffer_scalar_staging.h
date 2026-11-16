@@ -18,6 +18,6 @@ namespace pypto::ir {
 // Immutable candidate for the explicitly selected conservative request. Original
 // source ABI, scalar SSA and executed control cuts are retained. The caller must
 // run complete Buffer admission and publish Original on any refusal.
-FunctionPtr StageBufferScalarReads(const FunctionPtr& original);
+FunctionPtr StageBufferScalarAccesses(const FunctionPtr& original);
 }  // namespace pypto::ir
 #endif  // PYPTO_IR_TRANSFORMS_UTILS_BUFFER_SCALAR_STAGING_H_

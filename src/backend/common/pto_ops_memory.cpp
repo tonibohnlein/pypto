@@ -933,8 +933,13 @@ static std::string MakeTensorWriteCodegenPTO(const CallPtr& op, codegen::Codegen
 
   auto result_var = codegen.GetCurrentResultVar();
   if (result_var != nullptr) {
-    codegen.RegisterTensorView(result_var, tensor);
-    codegen.RegisterVarToMlir(result_var, tensor);
+    // The scalar store uses a raw pointer, but its assigned tensor result
+    // aliases the destination's existing view. Keep the two identities
+    // separate so an unchanged branch and a writing branch yield the same
+    // backing tensor view, as they do for ordinary tile.store.
+    const auto tensor_view = codegen.GetOrCreateTensorView(AsVarLike(op->args_[0]));
+    codegen.RegisterTensorView(result_var, tensor_view);
+    codegen.RegisterVarToMlir(result_var, tensor_view);
     codegen.RegisterBasePtr(result_var, tensor);
     codegen.RegisterCommCtxFor(result_var, codegen.GetCommCtxSSAFor(AsVarLike(op->args_[0]).get()));
   }

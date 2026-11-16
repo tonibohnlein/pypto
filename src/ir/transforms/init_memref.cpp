@@ -1011,7 +1011,7 @@ class InitMemRefMutator : public IRMutator {
       // occupy, so the LHS can be bound to it — and only the registry
       // declaration states that.  `ResultAliasedArgIndex` additionally covers
       // host-level ops whose result names an argument for *lineage* purposes
-      // (`tensor.write`, and the `pld.tensor.*` collectives, whose result is
+      // (the `pld.tensor.*` collectives, whose result is
       // the window they reduced or gathered into).  A window's storage belongs
       // to the distributed runtime and is materialized later by
       // LowerHostTensorCollectives, so binding the SSA result to it here

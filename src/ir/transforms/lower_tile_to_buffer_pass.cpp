@@ -1558,8 +1558,14 @@ class TileToBufferMutator : public IRMutator {
           << "LowerTileToBuffer: fix-pipe pre_quant/pre_relu stores require a Buffer transfer recipe";
       auto output = VisitExpr(call->args_[2]);
       if (result) tensor_aliases_[result.get()] = output;
-      return Operation("buffer.store",
-                       {Handle(call->args_[0]), VisitExpr(call->args_[1]), Valid(call->args_[0]), output},
+      auto valid = Valid(call->args_[0]);
+      if (backend::SupportsLogicalBufferScalarTransfer(call)) {
+        // Keep the original GM rank and one-element extent. The separate
+        // carrier descriptor remains rank two with physical capacity [1,8].
+        valid = std::make_shared<MakeTuple>(
+            std::vector<ExprPtr>{std::make_shared<ConstInt>(1, DataType::INDEX, call->span_)}, call->span_);
+      }
+      return Operation("buffer.store", {Handle(call->args_[0]), VisitExpr(call->args_[1]), valid, output},
                        call->span_,
                        atomic == 0 ? std::vector<std::pair<std::string, std::any>>{}
                                    : std::vector<std::pair<std::string, std::any>>{{"atomic", atomic}});

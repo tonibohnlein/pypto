@@ -473,7 +473,7 @@ class BufferEmissionPreflight : public ir::IRVisitor {
       const auto buffer = As<ir::BufferType>(call->args_[load ? 3 : 0]->GetType());
       const auto tensor_type = As<ir::TensorType>(call->args_[load ? 0 : 3]->GetType());
       const auto tensor_columns = tensor_type ? As<ir::ConstInt>(tensor_type->shape_.back()) : nullptr;
-      const bool scalar_point = load && backend::SupportsBufferScalarTransfer(call->args_);
+      const bool scalar_point = backend::SupportsBufferScalarTransfer(call->args_, load);
       CHECK_SPAN(!scalar_point || (conversion_supported_ && function_->func_type_ == ir::FunctionType::AIV),
                  call->span_)
           << "Rank-one scalar point transfers require A2/A3 AIV execution";
