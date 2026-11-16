@@ -97,3 +97,18 @@ target_include_directories(pypto_numerical_sync_order_test PRIVATE
 target_link_libraries(pypto_numerical_sync_order_test PRIVATE libbacktrace)
 target_compile_options(pypto_numerical_sync_order_test PRIVATE -UNDEBUG)
 add_test(NAME pypto_numerical_sync_order_test COMMAND pypto_numerical_sync_order_test)
+
+add_executable(pypto_conservative_sync_completion_test
+    conservative_sync_completion_test.cpp
+    ${CMAKE_SOURCE_DIR}/src/ir/transforms/utils/conservative_sync_completion.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/backtrace.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/error.cpp
+    ${CMAKE_SOURCE_DIR}/src/ir/core.cpp
+)
+target_include_directories(pypto_conservative_sync_completion_test PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(pypto_conservative_sync_completion_test PRIVATE libbacktrace)
+target_compile_options(pypto_conservative_sync_completion_test PRIVATE -UNDEBUG)
+add_test(NAME pypto_conservative_sync_completion_test COMMAND pypto_conservative_sync_completion_test)

@@ -127,7 +127,7 @@ def check_runtime_commands(logical, physical, parameters):
 def test_runtime_row_broadcast_preserves_payloads_and_closed_prefixes(visits, replay, tmp_path):
     program, original = lower(runtime_program(visits, replay))
     summary = testing.analyze_conservative_sync(original)
-    assert summary["precision"] == "storage_domain_no_kill"
+    assert summary["precision"] == "storage_domain_refresh_kill"
     assert not summary["exact_storage_selectors"]
     declared = {}
     for site in summary["sites"]:

@@ -74,12 +74,35 @@ class NativeSyncPlacement : public IRVisitor {
   explicit NativeSyncPlacement(const FunctionPtr& owner) {
     RequireBufferSyncScalarLayout(owner);
     VisitStmt(owner->body_);
+    for (const auto& target : dynamic_valid_targets_) {
+      if (const auto window = windows_.find(target); window != windows_.end()) {
+        const auto space = MemorySpaceOf(target);
+        if (space) dynamic_valid_windows_.push_back({*space, window->second});
+      }
+    }
   }
   // Sound enclosing allocation bytes, never an exact access footprint.
   std::optional<backend::BufferSyncByteWindow> Window(const ExprPtr& value) const {
     const auto found = windows_.find(value.get());
     return found == windows_.end() ? std::optional<backend::BufferSyncByteWindow>{}
                                    : std::optional<backend::BufferSyncByteWindow>{found->second};
+  }
+  // Exact full physical allocation bytes for certified whole-buffer overwrites.
+  // Excludes multi-buffer slots, subviews, partial valid shapes, and handles
+  // touched by buffer.set_validshape.
+  std::optional<backend::BufferSyncByteWindow> ExactFullWindow(const ExprPtr& value) const {
+    if (!value || dynamic_valid_targets_.count(value.get())) return std::nullopt;
+    const auto found = exact_full_windows_.find(value.get());
+    if (found == exact_full_windows_.end()) return std::nullopt;
+    const auto space = MemorySpaceOf(value.get());
+    if (!space) return std::nullopt;
+    for (const auto& entry : dynamic_valid_windows_) {
+      if (entry.first == *space && entry.second.begin < found->second.end &&
+          found->second.begin < entry.second.end) {
+        return std::nullopt;
+      }
+    }
+    return found->second;
   }
   void Require(const backend::BufferSyncOperation& operation) const {
     backend::RequireBufferSyncWorkspaceSeparation(operation,
@@ -88,10 +111,22 @@ class NativeSyncPlacement : public IRVisitor {
 
  protected:
   void VisitExpr(const ExprPtr&) override {}
+  void VisitStmt_(const EvalStmtPtr& statement) override {
+    const auto call = As<Call>(statement->expr_);
+    if (call && IsOp(call, "buffer.set_validshape") && !call->args_.empty()) {
+      dynamic_valid_targets_.insert(call->args_[0].get());
+    }
+  }
   void VisitStmt_(const AssignStmtPtr& statement) override {
     const auto& value = statement->value_;
     if (const auto existing = windows_.find(value.get()); existing != windows_.end()) {
       windows_.emplace(statement->var_.get(), existing->second);
+      if (const auto full = exact_full_windows_.find(value.get());
+          full != exact_full_windows_.end() &&
+          HasFullStaticValidShape(As<BufferType>(statement->var_->GetType()))) {
+        exact_full_windows_.emplace(statement->var_.get(), full->second);
+        spaces_.emplace(statement->var_.get(), As<BufferType>(statement->var_->GetType())->memory_space_);
+      }
       return;
     }
     const auto call = As<Call>(value);
@@ -115,8 +150,12 @@ class NativeSyncPlacement : public IRVisitor {
       }
       const __int128 end = __int128(address->value_) + length;
       if (end > std::numeric_limits<int64_t>::max()) return;
-      windows_.emplace(statement->var_.get(),
-                       backend::BufferSyncByteWindow{address->value_, static_cast<int64_t>(end)});
+      const backend::BufferSyncByteWindow window{address->value_, static_cast<int64_t>(end)};
+      windows_.emplace(statement->var_.get(), window);
+      if (!multi && HasFullStaticValidShape(type)) {
+        exact_full_windows_.emplace(statement->var_.get(), window);
+        spaces_.emplace(statement->var_.get(), type->memory_space_);
+      }
       return;
     }
     if ((IsOp(call, "buffer.subview") || IsOp(call, "buffer.reshape") || IsOp(call, "buffer.slot")) &&
@@ -133,11 +172,36 @@ class NativeSyncPlacement : public IRVisitor {
       // Slots have no corresponding automatic index proof: retain their
       // parent enclosure only after qualifying the selector above.
       windows_.emplace(statement->var_.get(), parent->second);
+      if (IsOp(call, "buffer.reshape")) {
+        const auto type = As<BufferType>(statement->var_->GetType());
+        const auto bytes = backend::PhysicalBufferBytes(type);
+        const auto full = exact_full_windows_.find(call->args_[0].get());
+        if (full != exact_full_windows_.end() && HasFullStaticValidShape(type) && bytes &&
+            __int128(full->second.end) - full->second.begin == *bytes) {
+          exact_full_windows_.emplace(statement->var_.get(), full->second);
+          spaces_.emplace(statement->var_.get(), type->memory_space_);
+        }
+      }
     }
   }
 
  private:
+  static bool HasFullStaticValidShape(const BufferTypePtr& type) {
+    return type && type->memory_space_ != MemorySpace::DDR && type->shape_.size() == 2 &&
+           type->shape_[0] > 0 && type->shape_[1] > 0 &&
+           (type->valid_shape_.empty() || type->valid_shape_ == type->shape_) &&
+           type->compact_ == CompactMode::null;
+  }
+  std::optional<MemorySpace> MemorySpaceOf(const Expr* expr) const {
+    if (const auto found = spaces_.find(expr); found != spaces_.end()) return found->second;
+    if (const auto buffer = As<BufferType>(expr->GetType())) return buffer->memory_space_;
+    return std::nullopt;
+  }
   std::unordered_map<const Expr*, backend::BufferSyncByteWindow> windows_;
+  std::unordered_map<const Expr*, backend::BufferSyncByteWindow> exact_full_windows_;
+  std::unordered_map<const Expr*, MemorySpace> spaces_;
+  std::unordered_set<const Expr*> dynamic_valid_targets_;
+  std::vector<std::pair<MemorySpace, backend::BufferSyncByteWindow>> dynamic_valid_windows_;
 };
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_NATIVE_SYNC_PLACEMENT_H_

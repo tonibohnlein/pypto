@@ -113,7 +113,11 @@ def test_gm_root_independence_requires_the_supplied_contract(disjoint, same_root
     summary = analyze(fixture(same_gm_root=same_root), disjoint)
     # Local source z is separate from both MTE2 destinations. Thus the MTE2
     # prerequisite at the final store is solely the GM read/write possibility.
-    assert (ir.PipeType.MTE2 in summary["sites"][3]["source_pipes"]) == (not disjoint or same_root)
+    # When disjoint=True and same_root=True, Site 1 (MTE2->V) already completed
+    # Site 0's read of GM `a` and Site 2 only touches disjoint GM `b`, so V->MTE3
+    # transitively covers Site 0 without re-emitting MTE2->MTE3.
+    assert (ir.PipeType.MTE2 in summary["sites"][3]["required_source_pipes"]) == (not disjoint or same_root)
+    assert (ir.PipeType.MTE2 in summary["sites"][3]["source_pipes"]) == (not disjoint)
     assert bool(domains_for(summary, "DDR")) == disjoint
 
 
@@ -397,3 +401,291 @@ def test_repeated_native_fixed_claims_remain_reserved_after_storage_refinement()
             (ir.PipeType.S, ir.PipeType.V, 0),
         }
     check_closed_commands(logical, result["function"], {}, range(6), compare_commands=False)
+
+
+def test_certified_full_overwrite_kill_and_unsafe_refusals():
+    def ci(number):
+        return ir.ConstInt(number, ir.DataType.INDEX, SPAN)
+
+    def tup(values):
+        return ir.MakeTuple([ci(v) for v in values], SPAN)
+
+    def call(name, args, result=None):
+        return ir.Call(ir.get_op(name), args, result or ir.VoidType(), SPAN)
+
+    def payload(name, args):
+        return ir.EvalStmt(call(name, args), SPAN)
+
+    gm = ir.TensorType([2, 8], ir.DataType.FP32)
+    a, out = ir.Var("a", gm, SPAN), ir.Var("out", gm, SPAN)
+    ub2d = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    x = ir.Var("x", ub2d, SPAN)
+    y = ir.Var("y", ub2d, SPAN)
+    alloc_x = ir.AssignStmt(x, call("buffer.alloc", [tup([]), ci(0)], ub2d), SPAN)
+    alloc_y = ir.AssignStmt(y, call("buffer.alloc", [tup([]), ci(128)], ub2d), SPAN)
+
+    # Full overwrite of x on V (`buffer.abs(y, x)`) after MTE2 load kills MTE2 obligation for later store.
+    full_fn = ir.Function(
+        "full_kill",
+        [a, (out, ir.ParamDirection.InOut)],
+        [out.type],
+        ir.SeqStmts(
+            [
+                alloc_x,
+                alloc_y,
+                payload("buffer.load", [a, tup([0, 0]), tup([2, 8]), x]),
+                payload("buffer.abs", [y, x]),
+                payload("buffer.store", [x, tup([0, 0]), tup([2, 8]), out]),
+                ir.ReturnStmt([out], SPAN),
+            ],
+            SPAN,
+        ),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with passes.PassContext([], autosync_disjoint_gm=True):
+        with_kill = testing.analyze_conservative_sync(full_fn, enable_refresh_kill=True)
+        no_kill = testing.analyze_conservative_sync(full_fn, enable_refresh_kill=False)
+    assert with_kill["precision"] == "storage_domain_refresh_kill"
+    assert no_kill["precision"] == "storage_domain_no_kill"
+    assert with_kill["cost"]["killed_facts"] > 0
+    assert no_kill["cost"]["killed_facts"] == 0
+    assert len(with_kill["sites"][1]["refreshed_domains"]) == 1
+    assert ir.PipeType.MTE2 in no_kill["sites"][2]["required_source_pipes"]
+    assert ir.PipeType.MTE2 not in with_kill["sites"][2]["required_source_pipes"]
+
+    # Conditional full overwrite without else must NOT kill MTE2 before post-branch store.
+    cond_fn = ir.Function(
+        "cond_no_kill",
+        [a, (out, ir.ParamDirection.InOut)],
+        [out.type],
+        ir.SeqStmts(
+            [
+                alloc_x,
+                alloc_y,
+                payload("buffer.load", [a, tup([0, 0]), tup([2, 8]), x]),
+                ir.IfStmt(ir.ConstBool(True, SPAN), payload("buffer.abs", [y, x]), None, [], SPAN),
+                payload("buffer.store", [x, tup([0, 0]), tup([2, 8]), out]),
+                ir.ReturnStmt([out], SPAN),
+            ],
+            SPAN,
+        ),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with passes.PassContext([], autosync_disjoint_gm=True):
+        cond_summary = testing.analyze_conservative_sync(cond_fn, enable_refresh_kill=True)
+    assert ir.PipeType.MTE2 in cond_summary["sites"][2]["required_source_pipes"]
+
+    # Subview partial overwrite must refuse KILL.
+    sub_type = ir.BufferType([1, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    sx = ir.Var("sx", sub_type, SPAN)
+    sub_src = ir.Var("sub_src", sub_type, SPAN)
+    sub_fn = ir.Function(
+        "subview_no_kill",
+        [a, (out, ir.ParamDirection.InOut)],
+        [out.type],
+        ir.SeqStmts(
+            [
+                alloc_x,
+                ir.AssignStmt(sx, call("buffer.subview", [x, tup([0, 0])], sub_type), SPAN),
+                ir.AssignStmt(sub_src, call("buffer.alloc", [tup([]), ci(256)], sub_type), SPAN),
+                payload("buffer.load", [a, tup([0, 0]), tup([2, 8]), x]),
+                payload("buffer.abs", [sub_src, sx]),
+                payload("buffer.store", [x, tup([0, 0]), tup([2, 8]), out]),
+                ir.ReturnStmt([out], SPAN),
+            ],
+            SPAN,
+        ),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with passes.PassContext([], autosync_disjoint_gm=True):
+        sub_summary = testing.analyze_conservative_sync(sub_fn, enable_refresh_kill=True)
+    assert not sub_summary["sites"][1]["refreshed_domains"]
+    assert ir.PipeType.MTE2 in sub_summary["sites"][2]["required_source_pipes"]
+
+    # set_validshape / dynamic valid_shape view must refuse KILL.
+    dyn_ub = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec, valid_shape=[-1, -1])
+    vx = ir.Var("vx", dyn_ub, SPAN)
+    vy = ir.Var("vy", dyn_ub, SPAN)
+    alloc_vx = ir.AssignStmt(vx, call("buffer.alloc", [tup([1, 8]), ci(0)], dyn_ub), SPAN)
+    alloc_vy = ir.AssignStmt(vy, call("buffer.alloc", [tup([1, 8]), ci(128)], dyn_ub), SPAN)
+    valid_fn = ir.Function(
+        "set_validshape_no_kill",
+        [a, (out, ir.ParamDirection.InOut)],
+        [out.type],
+        ir.SeqStmts(
+            [
+                alloc_vx,
+                alloc_vy,
+                payload("buffer.load", [a, tup([0, 0]), tup([2, 8]), vx]),
+                payload("buffer.set_validshape", [vx, tup([2, 8])]),
+                payload("buffer.abs", [vy, vx]),
+                payload("buffer.store", [vx, tup([0, 0]), tup([2, 8]), out]),
+                ir.ReturnStmt([out], SPAN),
+            ],
+            SPAN,
+        ),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with passes.PassContext([], autosync_disjoint_gm=True):
+        valid_summary = testing.analyze_conservative_sync(valid_fn, enable_refresh_kill=True)
+    assert not valid_summary["sites"][1]["refreshed_domains"]
+    assert ir.PipeType.MTE2 in valid_summary["sites"][2]["required_source_pipes"]
+
+    # Scalar point store (`buffer.write`) must refuse KILL.
+    scalar_fn = ir.Function(
+        "scalar_write_no_kill",
+        [a, (out, ir.ParamDirection.InOut)],
+        [out.type],
+        ir.SeqStmts(
+            [
+                alloc_x,
+                payload("buffer.load", [a, tup([0, 0]), tup([2, 8]), x]),
+                payload("buffer.write", [x, tup([0, 0]), ir.ConstFloat(1.0, ir.DataType.FP32, SPAN)]),
+                payload("buffer.store", [x, tup([0, 0]), tup([2, 8]), out]),
+                ir.ReturnStmt([out], SPAN),
+            ],
+            SPAN,
+        ),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with passes.PassContext([], autosync_disjoint_gm=True):
+        scalar_summary = testing.analyze_conservative_sync(scalar_fn, enable_refresh_kill=True)
+    assert not scalar_summary["sites"][1]["refreshed_domains"]
+    assert ir.PipeType.MTE2 in scalar_summary["sites"][2]["required_source_pipes"]
+
+
+def test_disjoint_domain_delivery_and_loop_invariant_pruning():
+    def ci(number):
+        return ir.ConstInt(number, ir.DataType.INDEX, SPAN)
+
+    def tup(values):
+        return ir.MakeTuple([ci(v) for v in values], SPAN)
+
+    def call(name, args, result=None):
+        return ir.Call(ir.get_op(name), args, result or ir.VoidType(), SPAN)
+
+    def payload(name, args):
+        return ir.EvalStmt(call(name, args), SPAN)
+
+    gm = ir.TensorType([2, 8], ir.DataType.FP32)
+    a, b, out = ir.Var("a", gm, SPAN), ir.Var("b", gm, SPAN), ir.Var("out", gm, SPAN)
+    ub = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    x, y, z1, z2 = [ir.Var(n, ub, SPAN) for n in ("x", "y", "z1", "z2")]
+    allocs = [ir.AssignStmt(v, call("buffer.alloc", [tup([]), ci(addr)], ub), SPAN) for v, addr in ((x, 0), (y, 128), (z1, 256), (z2, 384))]
+
+    # Intervening MTE2 load to disjoint `y`/`b` must not wipe already-delivered MTE2->V completion on `x`.
+    disjoint_fn = ir.Function(
+        "disjoint_delivery",
+        [a, b, (out, ir.ParamDirection.InOut)],
+        [out.type],
+        ir.SeqStmts(
+            [
+                *allocs,
+                payload("buffer.load", [a, tup([0, 0]), tup([2, 8]), x]),
+                payload("buffer.abs", [x, z1]),
+                payload("buffer.load", [b, tup([0, 0]), tup([2, 8]), y]),
+                payload("buffer.abs", [x, z2]),
+                payload("buffer.store", [z2, tup([0, 0]), tup([2, 8]), out]),
+                ir.ReturnStmt([out], SPAN),
+            ],
+            SPAN,
+        ),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with passes.PassContext([], autosync_disjoint_gm=True):
+        summary = testing.analyze_conservative_sync(disjoint_fn)
+    assert ir.PipeType.MTE2 in summary["sites"][3]["required_source_pipes"]
+    assert ir.PipeType.MTE2 not in summary["sites"][3]["source_pipes"]
+    assert summary["cost"]["suppressed_services"] >= 1
+    assert summary["cost"]["certificate_omissions"] == summary["cost"]["suppressed_services"]
+
+    # Loop-invariant delivery: x is synced MTE2->V before the loop and only read inside the loop.
+    idx = ir.Var("i", ir.ScalarType(ir.DataType.INDEX), SPAN)
+    loop_clean = ir.Function(
+        "loop_invariant_delivery",
+        [a, (out, ir.ParamDirection.InOut)],
+        [out.type],
+        ir.SeqStmts(
+            [
+                *allocs,
+                payload("buffer.load", [a, tup([0, 0]), tup([2, 8]), x]),
+                payload("buffer.abs", [x, z1]),
+                ir.ForStmt(
+                    idx,
+                    ci(0),
+                    ci(4),
+                    ci(1),
+                    [],
+                    ir.SeqStmts([payload("buffer.abs", [x, z2]), ir.YieldStmt([], SPAN)], SPAN),
+                    [],
+                    SPAN,
+                ),
+                payload("buffer.store", [z2, tup([0, 0]), tup([2, 8]), out]),
+                ir.ReturnStmt([out], SPAN),
+            ],
+            SPAN,
+        ),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with passes.PassContext([], autosync_disjoint_gm=True):
+        clean_summary = testing.analyze_conservative_sync(loop_clean)
+    assert ir.PipeType.MTE2 in clean_summary["sites"][2]["required_source_pipes"]
+    assert ir.PipeType.MTE2 not in clean_summary["sites"][2]["source_pipes"]
+    assert clean_summary["cost"]["suppressed_services"] >= 1
+    assert clean_summary["cost"]["certificate_omissions"] == clean_summary["cost"]["suppressed_services"]
+
+    # Back-edge re-dirtied loop: x is overwritten on MTE2 after loop consumer, forcing MTE2->V to remain.
+    loop_dirty = ir.Function(
+        "loop_dirty_delivery",
+        [a, (out, ir.ParamDirection.InOut)],
+        [out.type],
+        ir.SeqStmts(
+            [
+                *allocs,
+                payload("buffer.load", [a, tup([0, 0]), tup([2, 8]), x]),
+                payload("buffer.abs", [x, z1]),
+                ir.ForStmt(
+                    idx,
+                    ci(0),
+                    ci(4),
+                    ci(1),
+                    [],
+                    ir.SeqStmts(
+                        [
+                            payload("buffer.abs", [x, z2]),
+                            payload("buffer.load", [a, tup([0, 0]), tup([2, 8]), x]),
+                            ir.YieldStmt([], SPAN),
+                        ],
+                        SPAN,
+                    ),
+                    [],
+                    SPAN,
+                ),
+                payload("buffer.store", [z2, tup([0, 0]), tup([2, 8]), out]),
+                ir.ReturnStmt([out], SPAN),
+            ],
+            SPAN,
+        ),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with passes.PassContext([], autosync_disjoint_gm=True):
+        dirty_summary = testing.analyze_conservative_sync(loop_dirty)
+    assert ir.PipeType.MTE2 in dirty_summary["sites"][2]["required_source_pipes"]
+    assert ir.PipeType.MTE2 in dirty_summary["sites"][2]["source_pipes"]
+    assert dirty_summary["cost"]["certificate_omissions"] == dirty_summary["cost"]["suppressed_services"]
