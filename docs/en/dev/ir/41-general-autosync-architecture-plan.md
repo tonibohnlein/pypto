@@ -1,9 +1,9 @@
 # General autosync integration: architecture and Qwen acceptance plan
 
-Current priority (2026-11-16): complete the resumed bounded implementation and
-review gates after R1–R4. The original milestones and whole-model target remain
-in force; the review repairs extend them. Earlier test receipts are historical
-evidence and do not replace the final coherent regression gate.
+Current checkpoint (2026-11-16): the [five construction repairs](52-autosync-construction-repair.md)
+extend the resumed R1–R4 work. Native scalar implementation is now preserved by
+default; DMA staging is an independent explicit choice. The original milestones
+and whole-model target remain in force. Earlier receipts remain historical.
 
 Status: the continued operation, ownership and retained-child gates are reviewed.
 The original six milestones and whole-model ownership remain **partially complete**:
@@ -15,9 +15,12 @@ policies: exact owns 3, conservative prefix owns 16 and delegates 16. Another
 fixture expectations, resolved by a reviewed 196-test module rerun. This is
 aggregate evidence, not a fresh single all-green 2,675-test campaign. See the
 continued ledger and [retained-child checkpoint](41-general-autosync-readonly-child.md).
-The latest combined prefix capture has 21 owned / 11 delegated local leaves;
-all 32 generate C++. The final combined regression and publication gate is
-recorded below separately from this capture.
+Fresh matched prefix captures have 18 owned / 14 delegated local leaves with
+default native scalar access, or21 owned /11 delegated with explicit staging;
+all32 generate C++. The stage5 receipt records reduced service construction,
+bounded order comparisons, compile cost and remaining qualification gaps.
+The21-owned historical captures below used staging; they are not default-native
+coverage results. Original full-model ownership remains incomplete.
 Baseline: `b5597650a75b598645b1b1d3fe05bd3aab220f09`. This extends the
 [regional architecture](39-regional-sync-architecture.md). Qwen end-to-end remains
 the acceptance target, not a source of kernel-specific admission rules. Autosync

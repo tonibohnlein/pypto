@@ -1,0 +1,1308 @@
+{
+  "format_version": 1,
+  "checkpoint": "five-stage autosync construction repair",
+  "scope": "Host-only shared construction and conservative service selection; original full-model ownership remains incomplete",
+  "captured_source": {
+    "starting_revision": "bd8000fca",
+    "reviewed_implementation_commits": [
+      "ac063eda057fa4413630e069ced91cf05bdac95f",
+      "cb405307cba637bbf90cdf577d1b5a66b35c3791",
+      "7fd98e54aae4c9c0cb7e9f13aaec4f73961be77d",
+      "89a481d4637c02ea839bddbe99d66ccfb51b0936"
+    ],
+    "matched_baseline_revision": "7fd98e54aae4c9c0cb7e9f13aaec4f73961be77d",
+    "matched_candidate_revision": "89a481d4637c02ea839bddbe99d66ccfb51b0936",
+    "capture_worktrees_clean": true,
+    "current_task_code_sha256": {
+      "include/pypto/ir/transforms/pass_context.h": "8ef0368cb783b20670af673ab707ae20be3742a355a74fdda8f737afe5f8e23b",
+      "python/bindings/modules/passes.cpp": "928f6da2ab7f1d39396f6a3d71c2c0f5ceba218c94fbe765b5a8cd65ec436e0d",
+      "python/bindings/modules/testing.cpp": "76c380dab6d2a78a0bd684b575ad54121c2be9022e046038939b0bc1a2e921b0",
+      "python/pypto/ir/compile.py": "c5d67d0a279397d18163fa7082ef3c6bdc94ec3e3cd4823b9b9edbfdc2e674f9",
+      "python/pypto/ir/pass_manager.py": "b7ac2ce54a0449ce9d13a3ce2b5ae75662be1698f37d977f8403b610365a1894",
+      "python/pypto/jit/cache.py": "3c566f5a3eca376050d0cd7e82f94f3d51e864ef0a6029f75113a54262f98bbc",
+      "python/pypto/jit/decorator.py": "b4cea1bfb7569c4dbb267c4d16c44bc88c66108f03f97af494e5fa8702f70934",
+      "python/pypto/pypto_core/passes.pyi": "909bf2c183d19d369eb58f23c41ab4a7ff1ef9a177f742ea7899e3df5d36acdb",
+      "python/pypto/pypto_core/testing.pyi": "07b06c08b058dcf71e2ff4ed40088d98bbd4e663a39d38b8671a4eaa30f53230",
+      "src/ir/transforms/pass_context.cpp": "31b587f5e7be6d75a4c4ca23d39ef3711b53772f6f3a82a2edc1e28c74204784",
+      "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "5b1c5d638c5d3b5a4161ee2aca15817d0cd6f8523a38e2f5636494f006d213dd",
+      "src/ir/transforms/utils/closed_prefix_sync.cpp": "c199d4511f5dc35dec5958945c2ec7bc4a37876d1e18e0b9f431f0a643550077",
+      "src/ir/transforms/utils/conservative_sync_dataflow.cpp": "6313b99c2a90103f21c60fa060d547012a52711c70785f0d12a32a053a51b83f",
+      "src/ir/transforms/utils/conservative_sync_dataflow.h": "defa2b61f36db841482f6ad4daf53554ce6e79b6427f1f47782f70f8cc72dee5",
+      "src/ir/transforms/utils/conservative_sync_realization.cpp": "40429c792a9ed2f706a1626a5ba2f3e67c0c4163d52204925dae0fd3d62d8dfb",
+      "src/ir/transforms/utils/native_sync_placement.h": "09366576ea0af79e169cb095be309d56e958aff3cd6f9ef1a359233976c1a699",
+      "src/ir/transforms/utils/structured_token_sync.cpp": "e02065dfbf6a381b06c9a597fc4201dddd66dbfa8ea7ae91db72b477723589a8",
+      "src/ir/verifier/verify_buffer_ir.cpp": "bd3b55a6b8e6e60bc4bc6bb17292a3c310abe868c560c72696f5ea68369e2ace",
+      "tests/ut/codegen/test_gm_pipe_workspace_context.py": "9c3328b0aa9461edc8eb7d5c3415595e3858b2e30d3fb037e4b0a78a25d41993",
+      "tests/ut/cpp/numerical_sync_order_test.cpp": "cab87c808455d04e10a60321fdeeb7ea7dc8fb650be7e730eecea42f88ce9cfd",
+      "tests/ut/ir/transforms/qualify_qwen_whole_model.py": "b26786d31fc0c88bef92fdc8721c4172ada225aef8ea306d396e7f098e2657bd",
+      "tests/ut/ir/transforms/sync_closed_command_oracle.py": "f7a045cbd05fb457d1c36fc00d2d86940b5c2fed8a7b0313a008c90632aa6a9a",
+      "tests/ut/ir/transforms/test_closed_prefix_sync.py": "6f77657c5f7e8c31015eed0546cb4fbc4488bedd8b84355224d517a9ba7a146a",
+      "tests/ut/ir/transforms/test_conservative_sync_completions.py": "7f65b100bc5be94091d69970e509f44b4282cc6384d2f30c3a4a10d34d96c26e",
+      "tests/ut/ir/transforms/test_conservative_sync_dataflow.py": "33f096e5b6bff001a96cd5203bf86b433e63532cba4f69a2eebd6cdbeb9ea3d7",
+      "tests/ut/ir/transforms/test_conservative_sync_storage.py": "16600be51a2df7bd1f4bdd746d29d8d72cb93d0cb0403651799a1512f8df8a74",
+      "tests/ut/ir/transforms/test_gm_scalar_staging.py": "9dec3fe2cfe12c324f1c532c64b23081ec5293401f2243ef2063bb0586aef315",
+      "tests/ut/ir/transforms/test_gm_scalar_write_staging.py": "9731fab5152a274c14f64bd01f8391487eb159626ca8c7a285e2ce8827b66708",
+      "tests/ut/ir/transforms/test_runtime_valid_broadcast.py": "7fff704daca93884f3850fdce99e5cc7dacdb02c732d0d9c08a13eb64603d41f",
+      "tests/ut/ir/transforms/test_verifier_expression_dag.py": "7e82e8e28c1c776a73f9efad58c6f1b33cfda38ed3f4fbf68144e567edae243b",
+      "tests/ut/jit/test_cache.py": "7512a9350d05b8529c5f179a204602fb77331393bb67279c16d5939daf75a2b7"
+    }
+  },
+  "tools": {
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "extension_hashes": {
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "0bf1116d6771e73e2533b977ce204ff2a10b034c06881f00abbbd312ddf89331"
+    },
+    "baseline_extension_hashes": {
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "1a08cc28151b7697403f5d522af7622017b27756ea186ec03c216e355c868d23"
+    },
+    "ptoas": {
+      "path": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher/ptoas",
+      "hash": "8b52c0bfe3259f37dd17331ec0b8ee534461f18e70042edce0e2b6ee2fd7adf8",
+      "version": "ptoas 0.72",
+      "additional_artifacts": {}
+    },
+    "underlying_ptoas_path": "build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas",
+    "underlying_ptoas_sha256": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+    "environment": {
+      "PYTHONPATH": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/codegen:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106",
+      "PTOAS_ROOT": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher",
+      "OMP_NUM_THREADS": "1",
+      "PYPTO_CODEGEN_MAX_WORKERS": "1"
+    }
+  },
+  "input": {
+    "library_revision": "b72c66d9df69ba5f11982b212530a255c050988d",
+    "model_sources": {
+      "config.py": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+      "constants.py": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+      "contract.py": "f16c43df64c42769dc365a820e5fbc0ff6e9c4d3ceada21660003869ccbeaf15",
+      "decode_fwd.py": "c2f7288ce1e45cbe9fe99d60484aed7a4cb6b4d7255701c4692692a7586dd6f3",
+      "decode_layer_a8w8.py": "4074dea2e5225818108bc088d06dc1717cb2706dd004255a96c05843ba7a5fb8",
+      "decode_ssn_draft.py": "55016c298d42f77500e87bccdf020dbc3e78210cbe1a4c526b97f59466d77705",
+      "decode_tq_draft.py": "9daf2b9b1851d646552cb75504f33aad4766569ff740462a16cdf06d99f352ec",
+      "greedy_sample.py": "8f3fc3e4c533abf01140b299cac35a11185c5151e92df5ba84327afdfa3fceb8",
+      "paged_attention_cce.py": "aafa0bc6dde1758f5518081f3814449e0ca93d137451b67065a06f4b8a375b2d",
+      "paged_attention_pypto.py": "4087a49cd0b6c6396d4fef859576a02f8c6b096e9b94f5b55560e1f4b238e843",
+      "prefill_fwd.py": "3e05b6f910055549d6f89c24743dc384acfb0134be059efe4351b72092824dcb",
+      "prefill_fwd_a8w8.py": "3f359f5b5147c025efa21152117f75291c07826d9675f0a5bc9b76c3a13c67ac",
+      "prefill_tq_draft.py": "0eb51c30bfce55eabbb3318d39542813aef8687858957e41dcfafd5b93c5d8da",
+      "rms_lm_head.py": "0cafe8226d85659afd9d1c19e3c9ae46269a109a7c3c501d846a366e3826e3ce",
+      "rope_qkv_regen.py": "17d868b0527f6555e48426d4fe74526c8d72b5126d442efd2727cf9078c94076",
+      "test_paged_attention_cce.py": "7098e2cea21d017ef6f13f0261b19d37a3af62103045543862cf51b99d793f6c",
+      "test_paged_attention_pypto.py": "9bf0d2ea18b5d995a846858df23c301e32ff79849a08a1bb4250101ff468f32d",
+      "topk_select.py": "60ddb96ee27846c0dfb23f95a59cf53701eed94cca88bf7b5eb3802a5aaef267",
+      "turboquant_kv.py": "d49c3cb4764e524b96be5bffd57cbf6138061e65c5b762ac4781741d2181bf7d",
+      "weights.py": "d23e15850574369379e8140eb7a97be000274250dd6369544cc2108132125bf5"
+    },
+    "configuration": {
+      "layers": 2,
+      "sequence": 128,
+      "batch": 1
+    },
+    "access_contract": "Qualified storage enclosures; no GM disjointness used; source access-validity preconditions remain",
+    "target": "A2/A3 Ascend910",
+    "planner": "PYPTO",
+    "policy": "conservative_prefix",
+    "default_scalar_implementation": "Original native; DMA staging explicitly requested in separate capture"
+  },
+  "production_comparison": {
+    "native": {
+      "enable_scalar_gm_dma": false,
+      "owner_counts_before_and_after": {
+        "verified_pypto_leaf": 18,
+        "task_control_owner_observed": 47,
+        "delegated": 14
+      },
+      "cpp_leaves": 32,
+      "byte_identical_cpp_leaves": 19,
+      "compile_seconds_inclusive": {
+        "before": 6.661208712961525,
+        "after": 6.6587760001420975
+      },
+      "matching_pre_sync_ir_sha256": "62751fcfb99424e2ae271ab207199549333ddef0a84fa669f6d0fd49f51795e5",
+      "payload_control_inventory_equal": true,
+      "static_sync_changes": {
+        "attention_finalize_phase": {
+          "call:system.bar_mte3": [
+            1,
+            0
+          ],
+          "call:system.bar_v": [
+            2,
+            1
+          ],
+          "call:system.set_flag": [
+            18,
+            8
+          ],
+          "call:system.wait_flag": [
+            18,
+            8
+          ]
+        },
+        "down_proj": {
+          "call:system.bar_m": [
+            7,
+            5
+          ],
+          "call:system.set_flag": [
+            104,
+            44
+          ],
+          "call:system.wait_flag": [
+            104,
+            44
+          ]
+        },
+        "final_rmsnorm": {
+          "call:system.bar_mte2": [
+            3,
+            2
+          ],
+          "call:system.bar_mte3": [
+            1,
+            0
+          ],
+          "call:system.bar_v": [
+            11,
+            8
+          ],
+          "call:system.set_flag": [
+            26,
+            16
+          ],
+          "call:system.wait_flag": [
+            26,
+            16
+          ]
+        },
+        "gate_up_proj": {
+          "call:system.bar_m": [
+            10,
+            8
+          ],
+          "call:system.set_flag": [
+            144,
+            64
+          ],
+          "call:system.wait_flag": [
+            144,
+            64
+          ]
+        },
+        "kv_proj": {
+          "call:system.bar_m": [
+            10,
+            8
+          ],
+          "call:system.set_flag": [
+            144,
+            64
+          ],
+          "call:system.wait_flag": [
+            144,
+            64
+          ]
+        },
+        "lm_head": {
+          "call:system.bar_m": [
+            5,
+            4
+          ],
+          "call:system.set_flag": [
+            72,
+            32
+          ],
+          "call:system.wait_flag": [
+            72,
+            32
+          ]
+        },
+        "mlp_out_seed": {
+          "call:system.bar_mte3": [
+            1,
+            0
+          ]
+        },
+        "out_proj_aic": {
+          "call:system.bar_m": [
+            5,
+            4
+          ],
+          "call:system.set_flag": [
+            72,
+            32
+          ],
+          "call:system.wait_flag": [
+            72,
+            32
+          ]
+        },
+        "q_proj": {
+          "call:system.bar_m": [
+            5,
+            4
+          ],
+          "call:system.set_flag": [
+            72,
+            32
+          ],
+          "call:system.wait_flag": [
+            72,
+            32
+          ]
+        },
+        "qk_pv_partial_merge": {
+          "call:system.bar_mte3": [
+            6,
+            5
+          ],
+          "call:system.bar_v": [
+            11,
+            10
+          ],
+          "call:system.set_flag": [
+            84,
+            16
+          ],
+          "call:system.wait_flag": [
+            84,
+            16
+          ]
+        },
+        "save_prefill_last_token_group": {
+          "call:system.bar_mte3": [
+            1,
+            0
+          ]
+        },
+        "save_prefill_last_token_single": {
+          "call:system.bar_mte3": [
+            1,
+            0
+          ]
+        },
+        "silu": {
+          "call:system.bar_mte3": [
+            1,
+            0
+          ],
+          "call:system.bar_v": [
+            7,
+            6
+          ],
+          "call:system.set_flag": [
+            22,
+            8
+          ],
+          "call:system.wait_flag": [
+            22,
+            8
+          ]
+        }
+      },
+      "owned_leaves": [
+        "attention_finalize_phase",
+        "down_proj",
+        "final_rmsnorm",
+        "gate_up_proj",
+        "kv_proj",
+        "lm_head",
+        "mlp_out_cast",
+        "mlp_out_cast_0",
+        "mlp_out_seed",
+        "out_proj_aic",
+        "post_rmsnorm",
+        "q_proj",
+        "qk_pv_partial_merge",
+        "save_prefill_last_token_group",
+        "save_prefill_last_token_single",
+        "silu",
+        "x_gamma",
+        "x_gamma_0"
+      ],
+      "delegated_leaves": [
+        {
+          "function": "out_proj_aiv",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/operation_recipe at tile.add (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:1275:29)"
+        },
+        {
+          "function": "out_proj_aiv_0",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/operation_recipe at tile.add (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:1275:29)"
+        },
+        {
+          "function": "qk_pv_partial_plan_aic",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/type_layout at Var (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:263:13)"
+        },
+        {
+          "function": "qk_pv_partial_plan_aiv",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/type_layout at Var (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:263:13)"
+        },
+        {
+          "function": "qk_pv_single_block_0_aic",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/type_layout at Var (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:558:5)"
+        },
+        {
+          "function": "qk_pv_single_block_0_aiv",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/type_layout at Var (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:558:5)"
+        },
+        {
+          "function": "qk_pv_single_block_aic",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/type_layout at Var (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:558:5)"
+        },
+        {
+          "function": "qk_pv_single_block_aiv",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/type_layout at Var (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:558:5)"
+        },
+        {
+          "function": "qkpv_plan",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/operation_recipe at tensor.write (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:225:17)"
+        },
+        {
+          "function": "rms_recip",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/operation_recipe at tile.add (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:1095:37)"
+        },
+        {
+          "function": "rms_recip_0",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/operation_recipe at tile.add (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:1095:37)"
+        },
+        {
+          "function": "rope_kv_cache",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/operation_recipe at tile.mul (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:781:17)"
+        },
+        {
+          "function": "token_embed_group",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/operation_recipe at tensor.read (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:1651:29)"
+        },
+        {
+          "function": "token_embed_single",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/operation_recipe at tensor.read (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:1554:29)"
+        }
+      ],
+      "artifacts": {
+        "receipt.json": {
+          "before_sha256": "c78a74ef8f4221392b19b261329f73c4ab089d4e9da473bec235589a3bd09300",
+          "after_sha256": "d796542f50df2b80e8167366b9025dc7968ceeffcba3496533d82c51d330e9bd"
+        },
+        "before-sync.msgpack": {
+          "before_sha256": "62751fcfb99424e2ae271ab207199549333ddef0a84fa669f6d0fd49f51795e5",
+          "after_sha256": "62751fcfb99424e2ae271ab207199549333ddef0a84fa669f6d0fd49f51795e5"
+        },
+        "after-sync.msgpack": {
+          "before_sha256": "8a3c1e17927bc48459dbe95147c8988f283de19a2865aaea4b5b762874bf7876",
+          "after_sha256": "f1b79fd61f58aa37c3a916e43ab666b4257141fc2671c9b4f12bfa0a19f21c38"
+        }
+      },
+      "commands": {
+        "before": [
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_qwen_whole_model.py",
+          "--library",
+          "/home/toni/work/pypto3/pypto-lib",
+          "--output",
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/production-repair/before-native",
+          "--layers",
+          "2",
+          "--policy",
+          "conservative_prefix",
+          "--require-domain-owners"
+        ],
+        "after": [
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_qwen_whole_model.py",
+          "--library",
+          "/home/toni/work/pypto3/pypto-lib",
+          "--output",
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/production-repair/after-native",
+          "--layers",
+          "2",
+          "--policy",
+          "conservative_prefix",
+          "--require-domain-owners"
+        ]
+      }
+    },
+    "staged": {
+      "enable_scalar_gm_dma": true,
+      "owner_counts_before_and_after": {
+        "verified_pypto_leaf": 21,
+        "task_control_owner_observed": 47,
+        "delegated": 11
+      },
+      "cpp_leaves": 32,
+      "byte_identical_cpp_leaves": 16,
+      "compile_seconds_inclusive": {
+        "before": 9.972316266968846,
+        "after": 12.175484413746744
+      },
+      "matching_pre_sync_ir_sha256": "0825000f187dd10721a3378981125b4be4a8781d6fed7bd39325144ee1c0507d",
+      "payload_control_inventory_equal": true,
+      "static_sync_changes": {
+        "attention_finalize_phase": {
+          "call:system.bar_mte3": [
+            1,
+            0
+          ],
+          "call:system.bar_v": [
+            2,
+            1
+          ],
+          "call:system.set_flag": [
+            18,
+            8
+          ],
+          "call:system.wait_flag": [
+            18,
+            8
+          ]
+        },
+        "down_proj": {
+          "call:system.bar_m": [
+            7,
+            5
+          ],
+          "call:system.set_flag": [
+            104,
+            44
+          ],
+          "call:system.wait_flag": [
+            104,
+            44
+          ]
+        },
+        "final_rmsnorm": {
+          "call:system.bar_mte2": [
+            3,
+            2
+          ],
+          "call:system.bar_mte3": [
+            1,
+            0
+          ],
+          "call:system.bar_v": [
+            11,
+            8
+          ],
+          "call:system.set_flag": [
+            26,
+            16
+          ],
+          "call:system.wait_flag": [
+            26,
+            16
+          ]
+        },
+        "gate_up_proj": {
+          "call:system.bar_m": [
+            10,
+            8
+          ],
+          "call:system.set_flag": [
+            144,
+            64
+          ],
+          "call:system.wait_flag": [
+            144,
+            64
+          ]
+        },
+        "kv_proj": {
+          "call:system.bar_m": [
+            10,
+            8
+          ],
+          "call:system.set_flag": [
+            144,
+            64
+          ],
+          "call:system.wait_flag": [
+            144,
+            64
+          ]
+        },
+        "lm_head": {
+          "call:system.bar_m": [
+            5,
+            4
+          ],
+          "call:system.set_flag": [
+            72,
+            32
+          ],
+          "call:system.wait_flag": [
+            72,
+            32
+          ]
+        },
+        "mlp_out_seed": {
+          "call:system.bar_mte3": [
+            1,
+            0
+          ]
+        },
+        "out_proj_aic": {
+          "call:system.bar_m": [
+            5,
+            4
+          ],
+          "call:system.set_flag": [
+            72,
+            32
+          ],
+          "call:system.wait_flag": [
+            72,
+            32
+          ]
+        },
+        "q_proj": {
+          "call:system.bar_m": [
+            5,
+            4
+          ],
+          "call:system.set_flag": [
+            72,
+            32
+          ],
+          "call:system.wait_flag": [
+            72,
+            32
+          ]
+        },
+        "qk_pv_partial_merge": {
+          "call:system.bar_mte3": [
+            6,
+            5
+          ],
+          "call:system.bar_v": [
+            11,
+            10
+          ],
+          "call:system.set_flag": [
+            84,
+            16
+          ],
+          "call:system.wait_flag": [
+            84,
+            16
+          ]
+        },
+        "qkpv_plan": {
+          "call:system.bar_mte3": [
+            768,
+            0
+          ],
+          "call:system.set_flag": [
+            8450,
+            4610
+          ],
+          "call:system.wait_flag": [
+            8450,
+            4610
+          ]
+        },
+        "save_prefill_last_token_group": {
+          "call:system.bar_mte3": [
+            1,
+            0
+          ]
+        },
+        "save_prefill_last_token_single": {
+          "call:system.bar_mte3": [
+            1,
+            0
+          ]
+        },
+        "silu": {
+          "call:system.bar_mte3": [
+            1,
+            0
+          ],
+          "call:system.bar_v": [
+            7,
+            6
+          ],
+          "call:system.set_flag": [
+            22,
+            8
+          ],
+          "call:system.wait_flag": [
+            22,
+            8
+          ]
+        },
+        "token_embed_group": {
+          "call:system.bar_mte2": [
+            4,
+            2
+          ],
+          "call:system.bar_mte3": [
+            1,
+            0
+          ],
+          "call:system.set_flag": [
+            24,
+            20
+          ],
+          "call:system.wait_flag": [
+            24,
+            20
+          ]
+        },
+        "token_embed_single": {
+          "call:system.bar_mte2": [
+            2,
+            1
+          ],
+          "call:system.bar_mte3": [
+            1,
+            0
+          ],
+          "call:system.set_flag": [
+            12,
+            10
+          ],
+          "call:system.wait_flag": [
+            12,
+            10
+          ]
+        }
+      },
+      "owned_leaves": [
+        "attention_finalize_phase",
+        "down_proj",
+        "final_rmsnorm",
+        "gate_up_proj",
+        "kv_proj",
+        "lm_head",
+        "mlp_out_cast",
+        "mlp_out_cast_0",
+        "mlp_out_seed",
+        "out_proj_aic",
+        "post_rmsnorm",
+        "q_proj",
+        "qk_pv_partial_merge",
+        "qkpv_plan",
+        "save_prefill_last_token_group",
+        "save_prefill_last_token_single",
+        "silu",
+        "token_embed_group",
+        "token_embed_single",
+        "x_gamma",
+        "x_gamma_0"
+      ],
+      "delegated_leaves": [
+        {
+          "function": "out_proj_aiv",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/operation_recipe at tile.add (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:1275:29)"
+        },
+        {
+          "function": "out_proj_aiv_0",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/operation_recipe at tile.add (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:1275:29)"
+        },
+        {
+          "function": "qk_pv_partial_plan_aic",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/type_layout at Var (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:263:13)"
+        },
+        {
+          "function": "qk_pv_partial_plan_aiv",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/type_layout at Var (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:263:13)"
+        },
+        {
+          "function": "qk_pv_single_block_0_aic",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/type_layout at Var (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:558:5)"
+        },
+        {
+          "function": "qk_pv_single_block_0_aiv",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/type_layout at Var (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:558:5)"
+        },
+        {
+          "function": "qk_pv_single_block_aic",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/type_layout at Var (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:558:5)"
+        },
+        {
+          "function": "qk_pv_single_block_aiv",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/type_layout at Var (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:558:5)"
+        },
+        {
+          "function": "rms_recip",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/operation_recipe at tile.add (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:1095:37)"
+        },
+        {
+          "function": "rms_recip_0",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/operation_recipe at tile.add (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:1095:37)"
+        },
+        {
+          "function": "rope_kv_cache",
+          "reason": "PyPTO synchronization requires physically placed Buffer IR; first obligation: SelectBufferIRFunctions/operation_recipe at tile.mul (/home/toni/work/pypto3/pypto-lib/models/qwen3_14b/prefill_fwd.py:781:17)"
+        }
+      ],
+      "artifacts": {
+        "receipt.json": {
+          "before_sha256": "495b7e9cbcd46cb6e87c7f8038d8d2c3796ca66026142ac68f7c85e6b2794a4a",
+          "after_sha256": "aa1e5cab881ddaeff2a0cfd8f4363bd16bb42a17362d4e292ede1b9965718d4b"
+        },
+        "before-sync.msgpack": {
+          "before_sha256": "0825000f187dd10721a3378981125b4be4a8781d6fed7bd39325144ee1c0507d",
+          "after_sha256": "0825000f187dd10721a3378981125b4be4a8781d6fed7bd39325144ee1c0507d"
+        },
+        "after-sync.msgpack": {
+          "before_sha256": "049c0629def83aac157c8dc465edab2124d5cc3127d0c810ca3ccc4bce97a63b",
+          "after_sha256": "7130c32e12fffac0e6cc1051a5529492b81c1db48af8310d585bbc6f8de83d4e"
+        }
+      },
+      "commands": {
+        "before": [
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_qwen_whole_model.py",
+          "--library",
+          "/home/toni/work/pypto3/pypto-lib",
+          "--output",
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/production-repair/before-staged",
+          "--layers",
+          "2",
+          "--policy",
+          "conservative_prefix",
+          "--require-domain-owners",
+          "--scalar-gm-dma"
+        ],
+        "after": [
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_qwen_whole_model.py",
+          "--library",
+          "/home/toni/work/pypto3/pypto-lib",
+          "--output",
+          "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/production-repair/after-staged",
+          "--layers",
+          "2",
+          "--policy",
+          "conservative_prefix",
+          "--require-domain-owners",
+          "--scalar-gm-dma"
+        ]
+      }
+    }
+  },
+  "actual_command_checks": {
+    "cases": [
+      {
+        "finalize_tok": 1,
+        "domain": "admitted positive caller execution",
+        "invocations": 1,
+        "payloads": 770,
+        "pairs": {
+          "before": 2818,
+          "after": 1538
+        },
+        "reuse_checks_after": 1528,
+        "completion_to_start_reference_pairs": 296065,
+        "added_payload_pairs": 0,
+        "removed_payload_pairs": 0,
+        "output_sha256": "3ce0ca491e412e8041637b6305c34b132ee27b502ab0803ecb4f9ee1a798fab6"
+      },
+      {
+        "finalize_tok": 8,
+        "domain": "admitted positive caller execution",
+        "invocations": 1,
+        "payloads": 770,
+        "pairs": {
+          "before": 2818,
+          "after": 1538
+        },
+        "reuse_checks_after": 1528,
+        "completion_to_start_reference_pairs": 296065,
+        "added_payload_pairs": 0,
+        "removed_payload_pairs": 0,
+        "output_sha256": "3ce0ca491e412e8041637b6305c34b132ee27b502ab0803ecb4f9ee1a798fab6"
+      },
+      {
+        "finalize_tok": 9,
+        "domain": "admitted positive caller execution",
+        "invocations": 2,
+        "payloads": 1540,
+        "pairs": {
+          "before": 5636,
+          "after": 3076
+        },
+        "reuse_checks_after": 3066,
+        "completion_to_start_reference_pairs": 1185030,
+        "added_payload_pairs": 0,
+        "removed_payload_pairs": 0,
+        "output_sha256": "3ce0ca491e412e8041637b6305c34b132ee27b502ab0803ecb4f9ee1a798fab6"
+      },
+      {
+        "finalize_tok": 16,
+        "domain": "admitted positive caller execution",
+        "invocations": 1,
+        "payloads": 770,
+        "pairs": {
+          "before": 2818,
+          "after": 1538
+        },
+        "reuse_checks_after": 1528,
+        "completion_to_start_reference_pairs": 296065,
+        "added_payload_pairs": 0,
+        "removed_payload_pairs": 0,
+        "output_sha256": "3ce0ca491e412e8041637b6305c34b132ee27b502ab0803ecb4f9ee1a798fab6"
+      },
+      {
+        "finalize_tok": 17,
+        "domain": "admitted positive caller execution",
+        "invocations": 1,
+        "payloads": 770,
+        "pairs": {
+          "before": 2818,
+          "after": 1538
+        },
+        "reuse_checks_after": 1528,
+        "completion_to_start_reference_pairs": 296065,
+        "added_payload_pairs": 0,
+        "removed_payload_pairs": 0,
+        "output_sha256": "3ce0ca491e412e8041637b6305c34b132ee27b502ab0803ecb4f9ee1a798fab6"
+      },
+      {
+        "finalize_tok": 127,
+        "domain": "admitted positive caller execution",
+        "invocations": 1,
+        "payloads": 770,
+        "pairs": {
+          "before": 2818,
+          "after": 1538
+        },
+        "reuse_checks_after": 1528,
+        "completion_to_start_reference_pairs": 296065,
+        "added_payload_pairs": 0,
+        "removed_payload_pairs": 0,
+        "output_sha256": "3ce0ca491e412e8041637b6305c34b132ee27b502ab0803ecb4f9ee1a798fab6"
+      },
+      {
+        "finalize_tok": 128,
+        "domain": "admitted positive caller execution",
+        "invocations": 1,
+        "payloads": 770,
+        "pairs": {
+          "before": 2818,
+          "after": 1538
+        },
+        "reuse_checks_after": 1528,
+        "completion_to_start_reference_pairs": 296065,
+        "added_payload_pairs": 0,
+        "removed_payload_pairs": 0,
+        "output_sha256": "3ce0ca491e412e8041637b6305c34b132ee27b502ab0803ecb4f9ee1a798fab6"
+      },
+      {
+        "finalize_tok": 0,
+        "domain": "zero structural stress; outside positive caller",
+        "invocations": 1,
+        "payloads": 770,
+        "pairs": {
+          "before": 2818,
+          "after": 1538
+        },
+        "reuse_checks_after": 1528,
+        "completion_to_start_reference_pairs": 296065,
+        "added_payload_pairs": 0,
+        "removed_payload_pairs": 0,
+        "output_sha256": "3ce0ca491e412e8041637b6305c34b132ee27b502ab0803ecb4f9ee1a798fab6"
+      }
+    ],
+    "directional_ids_after": {
+      "S->MTE3": [
+        0,
+        1
+      ],
+      "MTE3->S": [
+        0,
+        1
+      ],
+      "MTE3->MTE2": [
+        0
+      ],
+      "MTE2->MTE3": [
+        0
+      ],
+      "S->MTE2": [
+        0,
+        1
+      ],
+      "MTE2->S": [
+        0,
+        1
+      ]
+    },
+    "reference": "Reference is actual before-sync native-pipe/SSA/control order plus independently extracted staged-byte conflicts and explicit invocation completion. It models MTE2/S/MTE3 with a private32B UB enclosure; it is not original scalar-DCache order, an exact minimum-cover result, or a native theorem.",
+    "value_limitation": "With SB_BATCH1 active work is already a prefix; outputs are0..127. Cases exercise distinct branch/readiness paths, not a nonidentity permutation.",
+    "not_established": [
+      "uniform symbolic caller theorem",
+      "minimum demands",
+      "minimum IDs",
+      "native/device execution",
+      "general model completion"
+    ],
+    "relation_argument": "Both actual emitted plans equal the same independently extracted reference on identical executed payloads; equality implies no added or removed payload prerequisites on these cases.",
+    "peak_rss_kib": {
+      "before": 825364,
+      "after": 672888
+    },
+    "memory_limit_mib": 1024,
+    "commands": [
+      [
+        "timeout",
+        "120s",
+        "python",
+        "-m",
+        "transforms.qualify_qwen_point_planner",
+        "--capture",
+        "build-py314/production-repair/before-staged",
+        "--library",
+        "/home/toni/work/pypto3/pypto-lib",
+        "--output",
+        "build-py314/production-repair/before-point-audit"
+      ],
+      [
+        "timeout",
+        "120s",
+        "python",
+        "-m",
+        "transforms.qualify_qwen_point_planner",
+        "--capture",
+        "build-py314/production-repair/after-staged",
+        "--library",
+        "/home/toni/work/pypto3/pypto-lib",
+        "--output",
+        "build-py314/production-repair/after-point-audit"
+      ]
+    ]
+  },
+  "construction_probe": {
+    "policy": "conservative_prefix",
+    "alias": "may-alias",
+    "production_source_revision": "89a481d4637c02ea839bddbe99d66ccfb51b0936",
+    "counters": {
+      "statements": 3081,
+      "expression_visits": 15250,
+      "dataflow_visits": 3081,
+      "retained_facts": 3465,
+      "services": 3072,
+      "baseline_services": 6528,
+      "suppressed_services": 3456,
+      "certificate_visits": 3081,
+      "certificate_omissions": 3456,
+      "parent_links": 3080,
+      "enclosure_lookups": 2306,
+      "storage_domains": 1,
+      "conflict_summary_facts": 6,
+      "conflict_queries": 3459,
+      "incoming_diagnostic_facts": 0,
+      "control_snapshot_facts": 2304,
+      "control_merge_facts": 2304,
+      "diagnostic_control_output_nodes": 3840
+    },
+    "storage_domains": 1,
+    "sites": 2306,
+    "seconds": {
+      "analysis_with_python_diagnostic_export": 0.04236747696995735,
+      "analysis_selection_certificate_and_logical_construction_inclusive": 0.08547310018911958,
+      "physical_qualification_allocation_emission_inclusive": 0.264540305826813
+    },
+    "timing_qualification": "One descriptive run of existing shared services, without test-wrapper IR serialization. The separate diagnostic analysis repeats work included in logical construction; do not add these measurements. Physical stage includes selected-native checks and Python result export; allocation is not separately instrumented. No old-binary stage timing comparison."
+  },
+  "static_scaling": [
+    {
+      "static_groups": 8,
+      "domains": 16,
+      "sites": 16,
+      "production": {
+        "statements": 34,
+        "expression_visits": 112,
+        "dataflow_visits": 34,
+        "retained_facts": 57,
+        "services": 8,
+        "baseline_services": 8,
+        "suppressed_services": 0,
+        "certificate_visits": 34,
+        "certificate_omissions": 0,
+        "parent_links": 33,
+        "enclosure_lookups": 24,
+        "storage_domains": 16,
+        "conflict_summary_facts": 25,
+        "conflict_queries": 32,
+        "incoming_diagnostic_facts": 0,
+        "control_snapshot_facts": 0,
+        "control_merge_facts": 0,
+        "diagnostic_control_output_nodes": 0
+      },
+      "diagnostic_snapshot_facts": 191
+    },
+    {
+      "static_groups": 32,
+      "domains": 64,
+      "sites": 64,
+      "production": {
+        "statements": 130,
+        "expression_visits": 448,
+        "dataflow_visits": 130,
+        "retained_facts": 225,
+        "services": 32,
+        "baseline_services": 32,
+        "suppressed_services": 0,
+        "certificate_visits": 130,
+        "certificate_omissions": 0,
+        "parent_links": 129,
+        "enclosure_lookups": 96,
+        "storage_domains": 64,
+        "conflict_summary_facts": 97,
+        "conflict_queries": 128,
+        "incoming_diagnostic_facts": 0,
+        "control_snapshot_facts": 0,
+        "control_merge_facts": 0,
+        "diagnostic_control_output_nodes": 0
+      },
+      "diagnostic_snapshot_facts": 3071
+    },
+    {
+      "static_groups": 128,
+      "domains": 256,
+      "sites": 256,
+      "production": {
+        "statements": 514,
+        "expression_visits": 1792,
+        "dataflow_visits": 514,
+        "retained_facts": 897,
+        "services": 128,
+        "baseline_services": 128,
+        "suppressed_services": 0,
+        "certificate_visits": 514,
+        "certificate_omissions": 0,
+        "parent_links": 513,
+        "enclosure_lookups": 384,
+        "storage_domains": 256,
+        "conflict_summary_facts": 385,
+        "conflict_queries": 512,
+        "incoming_diagnostic_facts": 0,
+        "control_snapshot_facts": 0,
+        "control_merge_facts": 0,
+        "diagnostic_control_output_nodes": 0
+      },
+      "diagnostic_snapshot_facts": 49151
+    }
+  ],
+  "verification": {
+    "fresh_nonoverlapping_python_cases": 692,
+    "python_groups": [
+      {
+        "command": [
+          "timeout",
+          "120s",
+          "python",
+          "-m",
+          "pytest",
+          "-q",
+          "tests/ut/ir/transforms/test_finite_sync_analysis.py",
+          "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+          "tests/ut/ir/transforms/test_parameterized_sync.py",
+          "tests/ut/ir/transforms/test_nested_phase_sync.py",
+          "tests/ut/ir/transforms/test_nested_sync_repetition.py",
+          "--require-ptoas"
+        ],
+        "exit_code": 0,
+        "passed": 245,
+        "log": "stage5-exact-regional.log",
+        "log_sha256": "85a68d9b0b29ed25a0225db99d4461cd548b115a6a6d364ab903697a4895ef51"
+      },
+      {
+        "command": [
+          "timeout",
+          "120s",
+          "python",
+          "-m",
+          "pytest",
+          "-q",
+          "tests/ut/ir/transforms/test_scoped_sync_palette.py",
+          "tests/ut/ir/transforms/test_scoped_token_order.py",
+          "tests/ut/ir/transforms/test_token_sync_lowering.py",
+          "-k",
+          "not test_shenggan_original_tiles_single_invocation_cpp",
+          "--require-ptoas"
+        ],
+        "exit_code": 0,
+        "passed": 114,
+        "log": "stage5-tokens-reuse.log",
+        "log_sha256": "af4d389983d3a4c71c1d5cdcc8d12cb3bf4bc350602823c374cb2ab2db2a59f2"
+      },
+      {
+        "command": [
+          "timeout",
+          "120s",
+          "python",
+          "-m",
+          "pytest",
+          "-q",
+          "tests/ut/ir/transforms/test_scoped_token_order.py::test_shenggan_original_tiles_single_invocation_cpp",
+          "--require-ptoas"
+        ],
+        "exit_code": 0,
+        "passed": 1,
+        "log": "stage5-known-small-gemm.log",
+        "log_sha256": "6acb4509916378a0ba370877a7e397892c2067f613aeb35c2d94d6b805c191a1"
+      },
+      {
+        "command": [
+          "timeout",
+          "120s",
+          "python",
+          "-m",
+          "pytest",
+          "-q",
+          "tests/ut/ir/transforms/test_qwen_prefill_production.py",
+          "tests/ut/ir/transforms/test_whole_module_sync_ownership.py",
+          "--require-ptoas"
+        ],
+        "exit_code": 0,
+        "passed": 29,
+        "log": "stage5-production-ownership.log",
+        "log_sha256": "5435e3457ca579322927a08ade218e025a3a6a9a9a2aa26a832c0ead495d3ade"
+      },
+      {
+        "command": [
+          "timeout",
+          "120s",
+          "python",
+          "-m",
+          "pytest",
+          "-q",
+          "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+          "-k",
+          "not invocation_partition and not invocation_cases and not activation and not small_original_output_covers",
+          "--require-ptoas"
+        ],
+        "exit_code": 0,
+        "passed": 21,
+        "log": "stage5-pipeline-structure.log",
+        "log_sha256": "78110266de22198cdff186746d9c1a592cd561d1eb77a2203b057ec1173e8bc3"
+      },
+      {
+        "command": [
+          "timeout",
+          "120s",
+          "python",
+          "-m",
+          "pytest",
+          "-q",
+          "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+          "-k",
+          "small_original_output_covers",
+          "--require-ptoas"
+        ],
+        "exit_code": 0,
+        "passed": 2,
+        "log": "stage5-pipeline-selectors.log",
+        "log_sha256": "cfa2ffcec7f87f8a09a6a232534d46a9195ae209dc1dfc74f545b4ccc4e9caad"
+      },
+      {
+        "command": [
+          "timeout",
+          "120s",
+          "python",
+          "-m",
+          "pytest",
+          "-q",
+          "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+          "-k",
+          "invocation_partition or invocation_cases or activation",
+          "--require-ptoas"
+        ],
+        "exit_code": 0,
+        "passed": 15,
+        "log": "stage5-pipeline-remaining.log",
+        "log_sha256": "9c47a3f988315bbcea100c1135e78b59fc9c1cb8ac0885e43baa265a963c56ad"
+      },
+      {
+        "command": [
+          "timeout",
+          "120s",
+          "python",
+          "-m",
+          "pytest",
+          "-q",
+          "tests/ut/ir/transforms/test_conservative_sync_dataflow.py",
+          "tests/ut/ir/transforms/test_conservative_sync_storage.py",
+          "tests/ut/ir/transforms/test_conservative_sync_completions.py",
+          "tests/ut/ir/transforms/test_closed_prefix_sync.py",
+          "tests/ut/ir/transforms/test_conservative_sync_children.py",
+          "tests/ut/ir/transforms/test_conservative_sync_child_api.py",
+          "tests/ut/ir/transforms/test_conservative_sync_child_commands.py",
+          "tests/ut/ir/transforms/test_conservative_sync_child_implicit_effects.py",
+          "tests/ut/ir/transforms/test_eventful_sync_children.py",
+          "tests/ut/ir/transforms/test_gm_scalar_staging.py",
+          "tests/ut/ir/transforms/test_gm_scalar_write_staging.py",
+          "--require-ptoas"
+        ],
+        "exit_code": 0,
+        "passed": 265,
+        "log": "stage5-repair-integration.log",
+        "log_sha256": "f46d055fdd37ec1b8b06b57b9c5ded28ba678f5cd9685db4a36fa6cd20da0dd9"
+      }
+    ],
+    "cpp": {
+      "command": [
+        "ctest",
+        "--test-dir",
+        "build-py314",
+        "--parallel",
+        "1",
+        "--output-on-failure",
+        "-R",
+        "pypto_(sync_resource_catalog|sync_isa_macro_resources|numerical_sync_order)_test"
+      ],
+      "exit_code": 0,
+      "passed": 3,
+      "log": "stage5-ctest.log"
+    },
+    "retained_timeout": {
+      "command": [
+        "timeout",
+        "120s",
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/ut/ir/transforms/test_qwen_prefill_production.py",
+        "tests/ut/ir/transforms/test_qwen_prefill_pipeline.py",
+        "tests/ut/ir/transforms/test_whole_module_sync_ownership.py",
+        "--require-ptoas"
+      ],
+      "exit_code": 124,
+      "completed_cases_before_timeout": 33,
+      "log": "stage5-production.log",
+      "resolution": "All67 selected cases pass in29+21+2+15 bounded groups under unchanged120s watchdog. Isolated next selector passed25.39s. This is batch decomposition, not a longer kernel watchdog."
+    },
+    "warnings": "Existing inline helper direction-annotation deprecations in Qwen captures; no device tests",
+    "review": "Implementation commits1-4 accepted separately by independent reviewer; final report uses the same reviewer gate."
+  },
+  "durable_evidence": {
+    "directory": "build-py314/production-repair",
+    "sha256": {
+      "stage5-comparison.json": "bfed8a4f764aa4ad92e80274c79a95726bd283fbada5aa0deb0d2a7e91dbf433",
+      "stage5-qkpv-construction.json": "5fe6215bfc6be08c665f6c78dede96f9a1c102f8c62760cba295a6af9c244583",
+      "stage5-scaling.json": "fa5054d81c6164471e15d7fbcc521e370082aa481b73e424aa8f7e46f89183ed",
+      "stage5-ctest.log": "a7c6e6bbb05417d7fd86aeac529b4cabb000a33b8c8fe0f2ab64ed8335cbff1c",
+      "stage5-production.log": "4f653a0e984483819dba67aef5fb2c0453694565f100d3fb21d55c7f5e856718",
+      "stage5-selector-isolated.log": "c81d352acb76f486c146dcbd801dd129bdd3d2baadd23cd159b8c1be71636667",
+      "after-point-audit/receipt.json": "91778555ec7e3479b3da6109bd2c9ae97483b6b0b631ecc26d12e559f11a7297",
+      "before-point-audit/receipt.json": "9ff8a4fbec40b12342874ab401691366627b2d9e0ddd55d8a51485043b87be36",
+      "native-scalar-observations.json": "63c7b79e9ae841c5ef4e4c5d2f38091da8b6627337f787df7ccbb1e9178c7d42",
+      "stage2-receipt.json": "544e6453f8558589f037d043210c21b5cc37a12584dfc42782b20c8b67c482ed",
+      "stage4-tests-final.log": "de72f05fe63ada9a94f8b565cb1b0d97f2f2ed929c06632bf6568acbdf74e8ce",
+      "stage4-ctest.log": "553b596d0825b05cf5c0758502fae95c2a49a1feab97a17e650490701220068c",
+      "build-stage4-final.log": "6e11bbdcce5cdcf5dd25639c6672b3458976a5b76e1c17f363ea4faddd8bceb2",
+      "stage1-hooks-accepted.log": "b1c12e7d7805d4a6b74a42dd137abc924281d6256d34ac7c9a3e90960e180640",
+      "stage2-hooks-final.log": "2b62d659dd4b75ba968b9871dceecb9d7cde89615ba4d73151fbf6ad8eb47bee",
+      "stage3-hooks-accepted.log": "2b62d659dd4b75ba968b9871dceecb9d7cde89615ba4d73151fbf6ad8eb47bee",
+      "stage4-hooks-final.log": "2b62d659dd4b75ba968b9871dceecb9d7cde89615ba4d73151fbf6ad8eb47bee"
+    }
+  },
+  "limitations": [
+    "Original scalar native cache/readiness/invocation and admission/export qualification remains unavailable; default delegation retained.",
+    "No native/device performance or correctness theorem follows from staged host checks.",
+    "Cut-local inclusion-minimal storage services are not globally minimum demands or a minimum command protocol.",
+    "No claim that all changed whole-model leaves have independently checked full execution relations; generic fixtures and qkpv audits have their stated scope.",
+    "Generic control joins and nested summaries retain class-universe dependence; single-run compile increase is recorded.",
+    "No larger ID pool, new allocator/protocol/backend, tiled-kernel specialization, cross-core or inter-kernel synchronization construction."
+  ]
+}
