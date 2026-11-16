@@ -12,6 +12,7 @@
 #include "src/ir/transforms/utils/conservative_sync_dataflow.h"
 
 #include <algorithm>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -23,6 +24,7 @@
 
 #include "pypto/core/logging.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memref.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/type.h"
@@ -51,6 +53,126 @@ MemorySpace Space(const ExprPtr& operand) {
   return MemorySpace::DDR;
 }
 
+// Each catalog entry is a conservative connected component of overlapping
+// enclosures. Unknown effects are wildcards, not disjoint unknown roots.
+struct RawEffect {
+  MemorySpace space;
+  PipeType pipe;
+  bool write;
+  std::optional<backend::BufferSyncByteWindow> enclosure;
+  ExprPtr original_root;
+};
+
+class StorageClasses {
+ public:
+  void Build(const std::vector<std::vector<RawEffect>>& sites) {
+    std::map<MemorySpace, std::vector<backend::BufferSyncByteWindow>> intervals;
+    for (const auto& effects : sites)
+      for (const auto& effect : effects)
+        if (effect.enclosure) intervals[effect.space].push_back(*effect.enclosure);
+    for (auto& [space, windows] : intervals) {
+      std::sort(windows.begin(), windows.end(), [](const auto& left, const auto& right) {
+        return std::tie(left.begin, left.end) < std::tie(right.begin, right.end);
+      });
+      for (const auto& window : windows) {
+        auto& components = local_[space];
+        if (!components.empty() && window.begin < components.back().first.end) {
+          auto& component = components.back();
+          component.first.end = std::max(component.first.end, window.end);
+          domains[component.second - 1].enclosure = component.first;
+        } else {
+          const auto id = domains.size() + 1;
+          components.emplace_back(window, id);
+          domains.push_back({id, space, window, nullptr});
+        }
+      }
+    }
+    // Original lexical effect order gives deterministic IDs, independent of
+    // pointer ordering and hash iteration. Roots are retained by the catalog.
+    for (const auto& effects : sites)
+      for (const auto& effect : effects)
+        if (effect.original_root && !roots_.count(effect.original_root.get())) {
+          const auto id = domains.size() + 1;
+          roots_.emplace(effect.original_root.get(), id);
+          domains.push_back({id, effect.space, {}, effect.original_root});
+        }
+  }
+  size_t Domain(const RawEffect& effect) const {
+    if (effect.original_root) return roots_.at(effect.original_root.get());
+    if (!effect.enclosure) return 0;
+    const auto& components = local_.at(effect.space);
+    auto found =
+        std::upper_bound(components.begin(), components.end(), effect.enclosure->begin,
+                         [](int64_t begin, const auto& component) { return begin < component.first.begin; });
+    INTERNAL_CHECK(found != components.begin()) << "Internal error: missing conservative storage component";
+    --found;
+    INTERNAL_CHECK(effect.enclosure->end <= found->first.end)
+        << "Internal error: conservative storage component does not enclose an effect";
+    return found->second;
+  }
+  std::vector<ConservativeStorageDomain> domains;
+
+ private:
+  std::map<MemorySpace, std::vector<std::pair<backend::BufferSyncByteWindow, size_t>>> local_;
+  std::unordered_map<const Expr*, size_t> roots_;
+};
+
+// Summarize possible preceding reads and writes by source pipe. A wildcard
+// consumer queries all domains; a known consumer queries its own and wildcard.
+// This avoids comparing every incoming fact with every consumer fact.
+class ConflictSources {
+ public:
+  explicit ConflictSources(ConservativeSyncCost& cost) : cost_(&cost) {}
+  void Add(const ConservativeAccessFact& fact) {
+    const auto& [space, pipe, write, domain] = fact;
+    ++cost_->conflict_summary_facts;
+    auto& exact = indexed_[{space, domain}];
+    (write ? exact.writes : exact.reads).insert(pipe);
+    auto& all = all_[space];
+    (write ? all.writes : all.reads).insert(pipe);
+  }
+  std::set<PipeType> Query(const ConservativeAccessFact& consumer) {
+    ++cost_->conflict_queries;
+    const auto& [space, destination, write, domain] = consumer;
+    (void)destination;
+    std::set<PipeType> result;
+    const auto add = [&](const Summary& summary) {
+      result.insert(summary.writes.begin(), summary.writes.end());
+      if (write) result.insert(summary.reads.begin(), summary.reads.end());
+    };
+    if (!domain) {
+      if (const auto found = all_.find(space); found != all_.end()) {
+        add(found->second);
+      }
+    } else {
+      for (const auto candidate : {size_t{0}, domain}) {
+        if (const auto found = indexed_.find({space, candidate}); found != indexed_.end()) {
+          add(found->second);
+        }
+      }
+    }
+    return result;
+  }
+
+ private:
+  struct Summary {
+    std::set<PipeType> reads, writes;
+  };
+  ConservativeSyncCost* cost_;
+  std::map<std::pair<MemorySpace, size_t>, Summary> indexed_;
+  std::map<MemorySpace, Summary> all_;
+};
+
+struct FlowState {
+  explicit FlowState(ConservativeSyncCost& cost) : sources(cost) {}
+  void Add(const ConservativeAccessSet& added) {
+    for (const auto& fact : added)
+      if (effects.insert(fact).second) sources.Add(fact);
+  }
+  ConservativeAccessSet effects;
+  ConflictSources sources;
+};
+
 struct End {
   std::optional<size_t> yield;
   bool returned = false;
@@ -61,8 +183,14 @@ class Builder {
  public:
   Builder(const FunctionPtr& function, std::string target,
           const std::vector<std::shared_ptr<const NativeSyncChild>>& retained,
-          const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful)
-      : function_(function), target_(std::move(target)), placement_(function) {
+          const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful,
+          bool retain_incoming_diagnostics)
+      : function_(function),
+        target_(std::move(target)),
+        placement_(function),
+        retain_incoming_diagnostics_(retain_incoming_diagnostics) {
+    const auto* context = PassContext::Current();
+    disjoint_gm_ = context && context->GetAutoSyncDisjointGM();
     scopes_.emplace_back();
     for (const auto& parameter : function->params_) {
       const auto& type = parameter->GetType();
@@ -71,6 +199,10 @@ class Builder {
           parameter->span_)
           << "Conservative synchronization: parameter requires an invocation ownership/readiness contract";
       Bind(parameter);
+      if (const auto tensor = As<TensorType>(type)) {
+        const auto memory = tensor->memref_.value_or(nullptr);
+        gm_roots_.emplace(parameter.get(), memory ? ExprPtr(memory->base_) : ExprPtr(parameter));
+      }
     }
     for (const auto& child : retained) {
       CHECK(child) << "Conservative synchronization: missing retained child certificate";
@@ -90,6 +222,8 @@ class Builder {
 
   void Build() {
     Read(function_->body_);
+    RefineStorage();
+    RebuildGenerated(function_->body_);
     for (auto& child : children) {
       const auto found = generated_.find(child.scope.get());
       CHECK(found != generated_.end()) << "Retained child is outside the original semantic input";
@@ -104,15 +238,23 @@ class Builder {
     return result;
   }
 
-  ConservativeAccessSet Flow(const StmtPtr& statement, ConservativeAccessSet incoming) {
+  ConservativeAccessSet Solve() {
+    auto solved = Flow(function_->body_, FlowState(cost));
+    return std::move(solved.effects);
+  }
+
+  FlowState Flow(const StmtPtr& statement, FlowState incoming) {
     ++cost.dataflow_visits;
     if (const auto found = child_index_.find(statement.get()); found != child_index_.end()) {
       auto& entry = children[found->second];
-      entry.incoming = incoming;
+      if (retain_incoming_diagnostics_) {
+        entry.incoming = incoming.effects;
+        cost.incoming_diagnostic_facts += entry.incoming.size();
+      }
       std::set<std::pair<PipeType, PipeType>> services;
-      for (const auto& [space, source, write] : incoming)
-        for (const auto& [consumer_space, destination, consumer_write] : entry.effects)
-          if (space == consumer_space && (write || consumer_write)) services.emplace(source, destination);
+      for (const auto& effect : entry.effects)
+        for (const auto source : incoming.sources.Query(effect))
+          services.emplace(source, std::get<1>(effect));
       if (entry.eventful) {
         // Explicit selected-token entry acknowledgments rearm every child
         // direction across arbitrary skipped/reset visits. Closed matching at
@@ -123,41 +265,47 @@ class Builder {
       }
       entry.services.assign(services.begin(), services.end());
       cost.services += services.size();
-      cost.retained_facts += incoming.size() + entry.effects.size();
+
       // Empty notification state does not complete any payload. All child
       // effects remain possibly pending, including across zero/skipped visits.
-      Union(incoming, entry.effects);
+      incoming.Add(entry.effects);
       return incoming;
     }
     if (const auto seq = As<SeqStmts>(statement)) {
       for (const auto& child : seq->stmts_) incoming = Flow(child, std::move(incoming));
     } else if (const auto branch = As<IfStmt>(statement)) {
+      cost.control_snapshot_facts += incoming.effects.size();
       auto then_exit = Flow(branch->then_body_, incoming);
-      if (branch->else_body_)
-        Union(then_exit, Flow(*branch->else_body_, incoming));
-      else
-        Union(then_exit, incoming);
+      if (branch->else_body_) {
+        auto else_exit = Flow(*branch->else_body_, std::move(incoming));
+        cost.control_merge_facts += else_exit.effects.size();
+        then_exit.Add(else_exit.effects);
+      } else {
+        cost.control_merge_facts += incoming.effects.size();
+        then_exit.Add(incoming.effects);
+      }
       incoming = std::move(then_exit);
     } else if (const auto loop = As<ForStmt>(statement)) {
-      Union(incoming, generated_.at(loop->body_.get()));
+      incoming.Add(generated_.at(loop->body_.get()));
       incoming = Flow(loop->body_, std::move(incoming));
     } else if (const auto loop = As<WhileStmt>(statement)) {
-      Union(incoming, generated_.at(loop->body_.get()));
+      incoming.Add(generated_.at(loop->body_.get()));
       incoming = Flow(loop->body_, std::move(incoming));
     } else if (const auto found = site_index_.find(statement.get()); found != site_index_.end()) {
       auto& site = sites[found->second];
-      site.incoming = incoming;
+      if (retain_incoming_diagnostics_) {
+        site.incoming = incoming.effects;
+        cost.incoming_diagnostic_facts += site.incoming.size();
+      }
       std::set<PipeType> sources;
-      for (const auto& [space, source, write] : incoming) {
-        for (const auto& [consumer_space, destination, consumer_write] : site.effects) {
-          (void)destination;
-          if (space == consumer_space && (write || consumer_write)) sources.insert(source);
-        }
+      for (const auto& effect : site.effects) {
+        const auto conflicting = incoming.sources.Query(effect);
+        sources.insert(conflicting.begin(), conflicting.end());
       }
       site.source_pipes.assign(sources.begin(), sources.end());
       cost.services += sources.size();
-      cost.retained_facts += incoming.size() + site.effects.size();
-      Union(incoming, site.effects);
+
+      incoming.Add(site.effects);
     }
     return incoming;
   }
@@ -165,8 +313,78 @@ class Builder {
   std::vector<ConservativeSyncSite> sites;
   std::vector<ConservativeSyncChildEntry> children;
   ConservativeSyncCost cost;
+  std::vector<ConservativeStorageDomain> domains;
+  bool disjoint_gm_ = false;
 
  private:
+  void RefineStorage() {
+    std::vector<std::vector<RawEffect>> raw(sites.size());
+    for (size_t site = 0; site < sites.size(); ++site) {
+      const auto& operation = sites[site].operation;
+      const auto& call = operation.Operation();
+      const auto pipe = operation.Implementation().Pipe();
+      const auto append = [&](MemorySpace space, BufferAccess mode,
+                              std::optional<backend::BufferSyncByteWindow> enclosure, ExprPtr root) {
+        if (mode == BufferAccess::Read || mode == BufferAccess::ReadWrite)
+          raw[site].push_back({space, pipe, false, enclosure, root});
+        if (mode == BufferAccess::Write || mode == BufferAccess::ReadWrite)
+          raw[site].push_back({space, pipe, true, enclosure, root});
+      };
+      for (size_t index = 0; index < operation.ArgumentEffects().size(); ++index) {
+        const auto mode = operation.ArgumentEffects()[index].data;
+        if (mode == BufferAccess::None) continue;
+        const auto& operand = call->args_[index];
+        const auto space = Space(operand);
+        std::optional<backend::BufferSyncByteWindow> enclosure;
+        ExprPtr root;
+        if (space == MemorySpace::DDR) {
+          if (disjoint_gm_) {
+            if (const auto found = gm_roots_.find(operand.get()); found != gm_roots_.end())
+              root = found->second;
+          }
+        } else {
+          ++cost.enclosure_lookups;
+          enclosure = placement_.Window(operand);
+        }
+        append(space, mode, enclosure, std::move(root));
+      }
+      for (const auto& effect : operation.Implementation().ImplicitEffects()) {
+        std::optional<backend::BufferSyncByteWindow> enclosure;
+        if (effect.space != MemorySpace::DDR && effect.begin >= 0 && effect.end > effect.begin)
+          enclosure = backend::BufferSyncByteWindow{effect.begin, effect.end};
+        append(effect.space, effect.data, enclosure, nullptr);
+      }
+    }
+    StorageClasses classes;
+    classes.Build(raw);
+    for (size_t site = 0; site < sites.size(); ++site) {
+      auto& effects = sites[site].effects;
+      effects.clear();
+      for (const auto& effect : raw[site])
+        effects.emplace(effect.space, effect.pipe, effect.write, classes.Domain(effect));
+    }
+    domains = std::move(classes.domains);
+    cost.storage_domains = domains.size();
+  }
+
+  const ConservativeAccessSet& RebuildGenerated(const StmtPtr& statement) {
+    auto& summary = generated_.at(statement.get());
+    summary.clear();
+    if (const auto site = site_index_.find(statement.get()); site != site_index_.end()) {
+      summary = sites[site->second].effects;
+    } else if (const auto sequence = As<SeqStmts>(statement)) {
+      for (const auto& child : sequence->stmts_) Union(summary, RebuildGenerated(child));
+    } else if (const auto branch = As<IfStmt>(statement)) {
+      Union(summary, RebuildGenerated(branch->then_body_));
+      if (branch->else_body_) Union(summary, RebuildGenerated(*branch->else_body_));
+    } else if (const auto loop = As<ForStmt>(statement)) {
+      Union(summary, RebuildGenerated(loop->body_));
+    } else if (const auto loop = As<WhileStmt>(statement)) {
+      Union(summary, RebuildGenerated(loop->body_));
+    }
+    return summary;
+  }
+
   void Bind(const VarPtr& variable) {
     CHECK_SPAN(ready_.insert(variable.get()).second, variable->span_)
         << "Conservative synchronization: a ready SSA definition is redefined";
@@ -190,7 +408,14 @@ class Builder {
       const auto behavior = descriptor->Result().behavior;
       CHECK_SPAN(static_cast<bool>(result) == (behavior != BufferResultBehavior::None), call->span_)
           << "Conservative synchronization: descriptor result must have an original SSA binding";
-      if (result) Bind(result);
+      if (result) {
+        Bind(result);
+        const auto& ownership = descriptor->Result();
+        if (ownership.behavior == BufferResultBehavior::Alias && ownership.alias_arg) {
+          const auto found = gm_roots_.find(call->args_[*ownership.alias_arg].get());
+          if (found != gm_roots_.end()) gm_roots_.emplace(result.get(), found->second);
+        }
+      }
       return;
     }
     auto operation = backend::QualifyBufferSyncOperation(call, function_->func_type_, target_);
@@ -207,16 +432,16 @@ class Builder {
       const auto space = Space(call->args_[index]);
       const auto pipe = operation.Implementation().Pipe();
       if (effect == BufferAccess::Read || effect == BufferAccess::ReadWrite)
-        effects.emplace(space, pipe, false);
+        effects.emplace(space, pipe, false, 0);
       if (effect == BufferAccess::Write || effect == BufferAccess::ReadWrite)
-        effects.emplace(space, pipe, true);
+        effects.emplace(space, pipe, true, 0);
     }
     for (const auto& effect : operation.Implementation().ImplicitEffects()) {
       const auto pipe = operation.Implementation().Pipe();
       if (effect.data == BufferAccess::Read || effect.data == BufferAccess::ReadWrite)
-        effects.emplace(effect.space, pipe, false);
+        effects.emplace(effect.space, pipe, false, 0);
       if (effect.data == BufferAccess::Write || effect.data == BufferAccess::ReadWrite)
-        effects.emplace(effect.space, pipe, true);
+        effects.emplace(effect.space, pipe, true, 0);
     }
     CHECK_SPAN(!effects.empty(), call->span_)
         << "Conservative synchronization: command-only payload requires a protocol contract";
@@ -251,6 +476,8 @@ class Builder {
       } else {
         Ready(assignment->value_);
         Bind(assignment->var_);
+        if (const auto found = gm_roots_.find(assignment->value_.get()); found != gm_roots_.end())
+          gm_roots_.emplace(assignment->var_.get(), found->second);
       }
       return {};
     }
@@ -340,6 +567,8 @@ class Builder {
   FunctionPtr function_;
   std::string target_;
   NativeSyncPlacement placement_;
+  bool retain_incoming_diagnostics_;
+  std::unordered_map<const Expr*, ExprPtr> gm_roots_;
   std::vector<std::vector<const Var*>> scopes_;
   std::unordered_set<const Var*> ready_;
   size_t control_depth_ = 0;
@@ -364,20 +593,27 @@ std::vector<StmtPtr> ConservativeSyncAnalysis::ControlPath(size_t site) const {
 ConservativeSyncAnalysis AnalyzeConservativeSync(
     const FunctionPtr& function, const std::string& target,
     const std::vector<std::shared_ptr<const NativeSyncChild>>& children,
-    const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful_children) {
+    const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful_children,
+    bool retain_incoming_diagnostics) {
   CHECK(function && function->ir_stage_ == FunctionIRStage::Buffer)
       << "Conservative synchronization requires Buffer IR";
   CHECK(function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV)
       << "Conservative synchronization requires an owned local AIC/AIV domain";
   backend::RequireLocalSyncExecutionContract(target);
   RequireBufferRuntimeValid(function);
-  Builder builder(function, target, children, eventful_children);
+  Builder builder(function, target, children, eventful_children, retain_incoming_diagnostics);
   builder.Build();
-  auto exit = builder.Flow(function->body_, {});
+  auto exit = builder.Solve();
+  builder.cost.retained_facts = exit.size();
+  for (const auto& site : builder.sites)
+    builder.cost.retained_facts += site.effects.size() + site.incoming.size();
+  for (const auto& child : builder.children)
+    builder.cost.retained_facts += child.effects.size() + child.incoming.size();
   auto parents = std::make_shared<StatementParents>();
   parents->BuildMap(function);
   builder.cost.parent_links = builder.cost.statements ? builder.cost.statements - 1 : 0;
   return ConservativeSyncAnalysis(function, builder.PrimitiveSites(), std::move(exit), builder.cost,
-                                  std::move(parents), std::move(builder.children));
+                                  std::move(parents), std::move(builder.children), std::move(builder.domains),
+                                  retain_incoming_diagnostics, builder.disjoint_gm_);
 }
 }  // namespace pypto::ir::sync

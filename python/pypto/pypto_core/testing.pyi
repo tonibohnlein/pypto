@@ -354,9 +354,17 @@ def export_native_sync_child(
     ...
 
 def analyze_conservative_sync(
-    function: Function, target: str = "a2a3", *, children: list[NativeSyncChild] = []
+    function: Function,
+    target: str = "a2a3",
+    *,
+    children: list[NativeSyncChild] = [],
+    retain_incoming_diagnostics: bool = True,
 ) -> dict[str, Any]:
-    """Qualify structured no-KILL effects/readiness; does not insert commands or export exact selectors."""
+    """Qualify structured no-KILL effects/readiness without insertion.
+
+    Incoming history snapshots are an optional diagnostic export. When disabled,
+    incoming fields are unavailable (None), rather than exact empty histories.
+    """
     ...
 
 def insert_conservative_prefixes(

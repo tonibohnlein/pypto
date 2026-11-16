@@ -75,12 +75,15 @@ class NativeSyncPlacement : public IRVisitor {
     RequireBufferSyncScalarLayout(owner);
     VisitStmt(owner->body_);
   }
+  // Sound enclosing allocation bytes, never an exact access footprint.
+  std::optional<backend::BufferSyncByteWindow> Window(const ExprPtr& value) const {
+    const auto found = windows_.find(value.get());
+    return found == windows_.end() ? std::optional<backend::BufferSyncByteWindow>{}
+                                   : std::optional<backend::BufferSyncByteWindow>{found->second};
+  }
   void Require(const backend::BufferSyncOperation& operation) const {
-    backend::RequireBufferSyncWorkspaceSeparation(operation, [this](const ExprPtr& value) {
-      const auto found = windows_.find(value.get());
-      return found == windows_.end() ? std::optional<backend::BufferSyncByteWindow>{}
-                                     : std::optional<backend::BufferSyncByteWindow>{found->second};
-    });
+    backend::RequireBufferSyncWorkspaceSeparation(operation,
+                                                  [this](const ExprPtr& value) { return Window(value); });
   }
 
  protected:

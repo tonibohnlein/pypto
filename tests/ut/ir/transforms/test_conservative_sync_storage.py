@@ -1,0 +1,399 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Storage-domain refinement is independent of structured may-dataflow."""
+
+from itertools import product
+
+import pytest
+from pypto import ir, passes, testing
+
+from .sync_closed_command_oracle import ClosedCommands, check_closed_commands
+from .test_closed_prefix_sync import lower
+from .test_conservative_sync_dataflow import conservative_fixture
+from .test_implicit_sync_effects import independent_broadcasts
+from .test_logical_sync_realization import verify
+from .test_vec_sync_analysis import vec_fixture
+
+pytestmark = pytest.mark.usefixtures("ascend_backend")
+SPAN = ir.Span.unknown()
+
+
+def fixture(addresses=(0, 128, 64), *, unknown=False, same_gm_root=False, shared_gm_allocation=False):
+    def ci(number):
+        return ir.ConstInt(number, ir.DataType.INDEX, SPAN)
+
+    def tup(values):
+        return ir.MakeTuple([ci(v) for v in values], SPAN)
+
+    def call(name, args, result=None):
+        return ir.Call(ir.get_op(name), args, result or ir.VoidType(), SPAN)
+
+    def payload(name, args):
+        return ir.EvalStmt(call(name, args), SPAN)
+
+    shared = (
+        ir.MemRef(ir.Var("shared_gm_base", ir.PtrType(), SPAN), 0, 64, SPAN) if shared_gm_allocation else None
+    )
+    gm = ir.TensorType([2, 8], ir.DataType.FP32, shared)
+    a, b, out = [ir.Var(name, gm, SPAN) for name in ("a", "b", "out")]
+    local = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    x, z, y = [ir.Var(name, local, SPAN) for name in ("x", "z", "y")]
+    definitions = [
+        ir.AssignStmt(v, call("buffer.alloc", [tup([]), ci(address)], local), SPAN)
+        for v, address in zip((x, z, y), addresses, strict=True)
+    ]
+    if unknown:
+        definitions[-1] = ir.AssignStmt(y, call("buffer.alloc", [tup([])], local), SPAN)
+    return ir.Function(
+        "storage_domains",
+        [a, b, (out, ir.ParamDirection.InOut)],
+        [out.type],
+        ir.SeqStmts(
+            [
+                *definitions,
+                payload("buffer.load", [a, tup([0, 0]), tup([2, 8]), x]),
+                payload("buffer.abs", [x, z]),
+                payload("buffer.load", [b, tup([0, 0]), tup([2, 8]), y]),
+                payload("buffer.store", [z, tup([0, 0]), tup([2, 8]), a if same_gm_root else out]),
+                ir.ReturnStmt([out], SPAN),
+            ],
+            SPAN,
+        ),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+
+
+def analyze(function, disjoint=False):
+    with passes.PassContext([], autosync_disjoint_gm=disjoint):
+        return testing.analyze_conservative_sync(function)
+
+
+def domains_for(summary, space):
+    return [domain for domain in summary["storage_domains"] if domain["space"] == space]
+
+
+@pytest.mark.parametrize("address,conflict", [(64, False), (96, True), (128, True), (192, False)])
+def test_half_open_local_enclosures_preserve_only_possible_overlap(address, conflict):
+    original = fixture((0, 128, address))
+    verify(original)
+    summary = analyze(original)
+    # The earlier V write occupies bytes [128,192); a new MTE2 destination
+    # overlaps exactly when its independent 64-byte enclosure intersects it.
+    assert (ir.PipeType.V in summary["sites"][2]["source_pipes"]) == conflict
+    assert all(not domain["exact_selector"] for domain in summary["storage_domains"])
+
+
+def test_transitive_enclosure_overlap_is_coarsened_soundly():
+    summary = analyze(fixture((0, 64, 32)))
+    local = domains_for(summary, "Vec")
+    assert len(local) == 1 and tuple(local[0]["enclosure"]) == (0, 128)
+    assert ir.PipeType.V in summary["sites"][2]["source_pipes"]
+
+
+def test_unknown_local_geometry_remains_a_space_wildcard():
+    summary = analyze(fixture(unknown=True))
+    assert any(
+        effect["space"] == "Vec" and effect["domain"] == 0 for effect in summary["sites"][2]["effects"]
+    )
+    assert ir.PipeType.V in summary["sites"][2]["source_pipes"]
+
+
+@pytest.mark.parametrize("disjoint", [False, True])
+@pytest.mark.parametrize("same_root", [False, True])
+def test_gm_root_independence_requires_the_supplied_contract(disjoint, same_root):
+    summary = analyze(fixture(same_gm_root=same_root), disjoint)
+    # Local source z is separate from both MTE2 destinations. Thus the MTE2
+    # prerequisite at the final store is solely the GM read/write possibility.
+    assert (ir.PipeType.MTE2 in summary["sites"][3]["source_pipes"]) == (not disjoint or same_root)
+    assert bool(domains_for(summary, "DDR")) == disjoint
+
+
+def test_static_storage_classification_does_not_change_original_input():
+    original = fixture()
+    before = ir.serialize(original)
+    first, second = analyze(original), analyze(original)
+    assert ir.serialize(original) == before
+    assert first["storage_domains"] == second["storage_domains"]
+    assert first["cost"]["conflict_queries"] > 0
+
+
+def test_distinct_gm_parameters_with_shared_allocation_do_not_become_disjoint():
+    summary = analyze(fixture(shared_gm_allocation=True), disjoint=True)
+    assert len(domains_for(summary, "DDR")) == 1
+    assert ir.PipeType.MTE2 in summary["sites"][3]["source_pipes"]
+
+
+def test_selected_native_workspace_effects_share_the_ordinary_class_universe():
+    function, _, _ = independent_broadcasts(("sub", "div"))
+    summary = analyze(function)
+    scratch = next(
+        domain
+        for domain in domains_for(summary, "Vec")
+        if tuple(domain["enclosure"]) == (184 * 1024, 192 * 1024)
+    )
+    computations = [
+        site
+        for site in summary["sites"]
+        if site["operation"].op.name
+        in {
+            ir.get_op("buffer.row_expand_sub").name,
+            ir.get_op("buffer.row_expand_div").name,
+        }
+    ]
+    assert len(computations) == 2
+    for site in computations:
+        assert any(effect["domain"] == scratch["id"] for effect in site["effects"])
+    assert ir.PipeType.V in computations[1]["source_pipes"]
+
+
+def many_independent_windows(count):
+    def ci(number):
+        return ir.ConstInt(number, ir.DataType.INDEX, SPAN)
+
+    def tup(values):
+        return ir.MakeTuple([ci(v) for v in values], SPAN)
+
+    def call(name, args, result=None):
+        return ir.Call(ir.get_op(name), args, result or ir.VoidType(), SPAN)
+
+    gm = ir.Var("source", ir.TensorType([2, 8], ir.DataType.FP32), SPAN)
+    local = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    statements = []
+    for index in range(count):
+        source, target = [ir.Var(f"{name}_{index}", local, SPAN) for name in ("x", "z")]
+        for variable, address in ((source, 128 * index), (target, 128 * index + 64)):
+            statements.append(
+                ir.AssignStmt(variable, call("buffer.alloc", [tup([]), ci(address)], local), SPAN)
+            )
+        statements.append(ir.EvalStmt(call("buffer.load", [gm, tup([0, 0]), tup([2, 8]), source]), SPAN))
+        statements.append(ir.EvalStmt(call("buffer.abs", [source, target]), SPAN))
+    statements.append(ir.ReturnStmt([], SPAN))
+    return ir.Function(
+        "independent_windows",
+        [gm],
+        [],
+        ir.SeqStmts(statements, SPAN),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+
+
+@pytest.mark.parametrize("count", [0, 1, 8, 32])
+def test_class_recovery_and_queries_charge_static_effects_without_pairwise_geometry(count):
+    summary = analyze(many_independent_windows(count))
+    assert len(summary["sites"]) == 2 * count
+    assert len(domains_for(summary, "Vec")) == 2 * count
+    assert summary["cost"]["enclosure_lookups"] == 3 * count
+    assert summary["cost"]["conflict_queries"] == 4 * count
+    for index, site in enumerate(summary["sites"]):
+        assert set(site["source_pipes"]) == ({ir.PipeType.MTE2} if index % 2 else set())
+    # No-KILL history is explicitly allowed to depend on J growing with the
+    # class universe. These assertions concern recovery/query work, not a
+    # false global-linear retained-state bound.
+
+
+def clone_with_body(function, body):
+    return ir.Function(
+        function.name,
+        list(zip(function.params, function.param_directions, strict=True)),
+        function.return_types,
+        body,
+        function.span,
+        type=function.func_type,
+        ir_stage=function.ir_stage,
+    )
+
+
+def test_plain_tensor_alias_preserves_its_established_original_root():
+    original = fixture()
+    out = original.params[2]
+    alias = ir.Var("output_alias", out.type, SPAN)
+    assert isinstance(original.body, ir.SeqStmts)
+    statements = list(original.body.stmts)
+    store = statements[-2]
+    assert isinstance(store, ir.EvalStmt) and isinstance(store.expr, ir.Call)
+    rewritten = ir.Call(store.expr.op, [*store.expr.args[:3], alias], store.expr.type, SPAN)
+    body = ir.SeqStmts(
+        [
+            *statements[:-2],
+            ir.AssignStmt(alias, out, SPAN),
+            ir.EvalStmt(rewritten, SPAN),
+            statements[-1],
+        ],
+        SPAN,
+    )
+    summary = analyze(clone_with_body(original, body), disjoint=True)
+    assert ir.PipeType.MTE2 not in summary["sites"][-1]["source_pipes"]
+    assert all(effect["domain"] != 0 for effect in summary["sites"][-1]["effects"])
+
+
+@pytest.mark.parametrize("kind", ["carried", "branch"])
+def test_unqualified_tensor_result_origins_remain_gm_wildcards(kind):
+    original = fixture()
+    out = original.params[2]
+    assert isinstance(original.body, ir.SeqStmts)
+    statements = list(original.body.stmts)
+    store = statements[-2]
+    assert isinstance(store, ir.EvalStmt) and isinstance(store.expr, ir.Call)
+    if kind == "carried":
+        target = ir.IterArg("carried_output", out.type, out, SPAN)
+        final = ir.Var("final_output", out.type, SPAN)
+        rewritten = ir.Call(store.expr.op, [*store.expr.args[:3], target], store.expr.type, SPAN)
+        loop_body = ir.SeqStmts(
+            [
+                ir.EvalStmt(rewritten, SPAN),
+                ir.YieldStmt([target], SPAN),
+            ],
+            SPAN,
+        )
+        zero, one = [ir.ConstInt(i, ir.DataType.INDEX, SPAN) for i in (0, 1)]
+        wrapper = ir.ForStmt(
+            ir.Var("visit", ir.ScalarType(ir.DataType.INDEX), SPAN),
+            zero,
+            one,
+            one,
+            [target],
+            loop_body,
+            [final],
+            SPAN,
+        )
+        ending = [wrapper, statements[-1]]
+    else:
+        target = ir.Var("selected_output", out.type, SPAN)
+        branch = ir.IfStmt(
+            ir.ConstBool(True, SPAN),
+            ir.YieldStmt([out], SPAN),
+            ir.YieldStmt([out], SPAN),
+            [target],
+            SPAN,
+        )
+        rewritten = ir.Call(store.expr.op, [*store.expr.args[:3], target], store.expr.type, SPAN)
+        ending = [branch, ir.EvalStmt(rewritten, SPAN), statements[-1]]
+    candidate = clone_with_body(original, ir.SeqStmts([*statements[:-2], *ending], SPAN))
+    verify(candidate)
+    summary = analyze(candidate, disjoint=True)
+    final_store = summary["sites"][-1]
+    assert any(effect["space"] == "DDR" and effect["domain"] == 0 for effect in final_store["effects"])
+    assert ir.PipeType.MTE2 in final_store["source_pipes"]
+
+
+def test_explicit_scratch_alias_and_implicit_effect_use_one_physical_domain():
+    function, _, _ = independent_broadcasts(("sub", "div"), explicit_alias=True)
+    summary = analyze(function)
+    scratch = next(
+        domain
+        for domain in domains_for(summary, "Vec")
+        if tuple(domain["enclosure"]) == (184 * 1024, 192 * 1024)
+    )
+    effects = [
+        (site["pipe"], effect["write"])
+        for site in summary["sites"]
+        for effect in site["effects"]
+        if effect["domain"] == scratch["id"]
+    ]
+    assert (ir.PipeType.MTE2, True) in effects
+    assert (ir.PipeType.V, True) in effects
+
+
+@pytest.mark.parametrize("disjoint", [False, True])
+def test_refined_plan_preserves_actual_payload_order_coverage_and_physical_reuse(disjoint):
+    original = conservative_fixture()
+    with passes.PassContext([], autosync_disjoint_gm=disjoint):
+        logical = testing.insert_conservative_prefixes(original)
+        physical = lower(logical, eligible=list(range(6)))
+    for visits, count, choice in product((0, 1, 2), (0, 1, 3), (0, 1)):
+        parameters = {3: count, 4: visits, 5: choice}
+        baseline = ClosedCommands(original, parameters, range(6))
+        baseline.run()
+        actual, _ = check_closed_commands(logical, physical, parameters, range(6), compare_commands=False)
+        assert baseline.payloads == actual.payloads
+
+
+def test_registered_local_alias_retains_the_parent_physical_domain():
+    original = fixture()
+    assert isinstance(original.body, ir.SeqStmts)
+    statements = list(original.body.stmts)
+    first_allocation = statements[0]
+    assert isinstance(first_allocation, ir.AssignStmt)
+    source = first_allocation.var
+    alias = ir.Var("physical_alias", source.type, SPAN)
+    offsets = ir.MakeTuple([ir.ConstInt(0, ir.DataType.INDEX, SPAN)] * 2, SPAN)
+    alias_call = ir.Call(ir.get_op("buffer.subview"), [source, offsets], source.type, SPAN)
+    load = statements[-3]
+    assert isinstance(load, ir.EvalStmt) and isinstance(load.expr, ir.Call)
+    replacement = ir.EvalStmt(
+        ir.Call(load.expr.op, [*load.expr.args[:3], alias], load.expr.type, SPAN),
+        SPAN,
+    )
+    body = ir.SeqStmts(
+        [
+            *statements[:-3],
+            ir.AssignStmt(alias, alias_call, SPAN),
+            replacement,
+            *statements[-2:],
+        ],
+        SPAN,
+    )
+    candidate = clone_with_body(original, body)
+    verify(candidate)
+    summary = analyze(candidate)
+    assert ir.PipeType.V in summary["sites"][2]["source_pipes"]
+    first_local = {effect["domain"] for effect in summary["sites"][0]["effects"] if effect["space"] == "Vec"}
+    alias_local = {effect["domain"] for effect in summary["sites"][2]["effects"] if effect["space"] == "Vec"}
+    assert first_local == alias_local and 0 not in alias_local
+
+
+@pytest.mark.parametrize("count", [8, 32, 128])
+def test_flat_production_state_avoids_copied_prefix_histories(count):
+    function = many_independent_windows(count)
+    production = testing.analyze_conservative_sync(function, retain_incoming_diagnostics=False)
+    diagnostic = testing.analyze_conservative_sync(function, retain_incoming_diagnostics=True)
+    assert not production["incoming_diagnostics_available"]
+    assert all(site["incoming"] is None for site in production["sites"])
+    assert diagnostic["incoming_diagnostics_available"]
+    assert production["cost"]["incoming_diagnostic_facts"] == 0
+    assert diagnostic["cost"]["incoming_diagnostic_facts"] > count * count
+    assert production["cost"]["retained_facts"] <= 8 * count
+    assert production["cost"]["conflict_summary_facts"] <= 4 * count
+    assert production["cost"]["control_snapshot_facts"] == 0
+    assert production["cost"]["control_merge_facts"] == 0
+    assert [site["source_pipes"] for site in production["sites"]] == [
+        site["source_pipes"] for site in diagnostic["sites"]
+    ]
+    assert production["exit_effects"] == diagnostic["exit_effects"]
+
+
+@pytest.mark.parametrize("disjoint", [False, True])
+def test_alias_premise_is_retained_even_when_no_domain_needs_it(disjoint):
+    function = many_independent_windows(0)
+    summary = analyze(function, disjoint)
+    assert not summary["storage_domains"]
+    assert summary["disjoint_gm"] == disjoint
+    assert summary["gm_alias_contract"] == ("supplied_disjoint_roots" if disjoint else "may_alias")
+    # Leaving/replacing PassContext cannot change the published premise.
+    with passes.PassContext([], autosync_disjoint_gm=not disjoint):
+        assert summary["disjoint_gm"] == disjoint
+
+
+def test_repeated_native_fixed_claims_remain_reserved_after_storage_refinement():
+    original = vec_fixture(count=3, visits=2, operation="buffer.recip")
+    with passes.PassContext([], autosync_disjoint_gm=True):
+        logical = testing.insert_conservative_prefixes(original)
+        result = testing.lower_sync_schedule(logical, eligible_ids=list(range(6)))
+    assert result["physical_cases"]
+    for case in result["physical_cases"]:
+        assert set(case["native_reserved_ids"]) == {
+            (ir.PipeType.V, ir.PipeType.S, 0),
+            (ir.PipeType.S, ir.PipeType.V, 0),
+        }
+    check_closed_commands(logical, result["function"], {}, range(6), compare_commands=False)

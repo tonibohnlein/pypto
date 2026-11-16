@@ -361,7 +361,7 @@ class ClosedCommands:
                 reads |= writes
             signature = name, *(self.signature(arg) for arg in args)
         else:
-            assert name in (opname("buffer.abs"), opname("buffer.rsqrt")), (
+            assert name in (opname("buffer.abs"), opname("buffer.rsqrt"), opname("buffer.recip")), (
                 f"unsupported fixture payload {name}"
             )
             pipe, reads, writes = ir.PipeType.V, self.bytes(args[0]), self.bytes(args[1])

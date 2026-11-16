@@ -241,7 +241,7 @@ def main() -> None:
         "access_contract": (
             "Distinct input GM arguments assumed disjoint; no runtime values inferred"
             if args.policy == "exact"
-            else "Whole-memory-space enclosures; no GM disjointness used; "
+            else "Qualified storage enclosures; no GM disjointness used; "
             "source access-validity preconditions remain"
         ),
         "device": "not run",

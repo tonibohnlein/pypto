@@ -177,7 +177,7 @@ FunctionPtr InsertConservativePrefixes(const ConservativeSyncAnalysis& analysis)
   CheckLogicalSync(result);
   auto reported = std::make_shared<Function>(*result);
   reported->attrs_.emplace_back(kAttrAutosyncAnalysisPolicy, std::string("conservative_prefix"));
-  reported->attrs_.emplace_back(kAttrAutosyncAccessPrecision, std::string("whole_memory_space_enclosures"));
+  reported->attrs_.emplace_back(kAttrAutosyncAccessPrecision, std::string("qualified_storage_enclosures"));
   reported->attrs_.emplace_back(kAttrAutosyncRealizationOrder, std::string("preserves_selected_token_order"));
   return reported;
 }

@@ -1512,15 +1512,18 @@ void BindTesting(nb::module_& m) {
   testing.def(
       "analyze_conservative_sync",
       [](const ir::FunctionPtr& function, const std::string& target,
-         const std::vector<std::shared_ptr<const ir::sync::NativeSyncChild>>& children) {
-        const auto analysis = ir::sync::AnalyzeConservativeSync(function, target, children);
+         const std::vector<std::shared_ptr<const ir::sync::NativeSyncChild>>& children,
+         bool retain_incoming_diagnostics) {
+        const auto analysis =
+            ir::sync::AnalyzeConservativeSync(function, target, children, {}, retain_incoming_diagnostics);
         auto facts = [](const ir::sync::ConservativeAccessSet& accesses) {
           nb::list result;
-          for (const auto& [space, pipe, write] : accesses) {
+          for (const auto& [space, pipe, write, domain] : accesses) {
             nb::dict fact;
             fact["space"] = ir::MemorySpaceToString(space);
             fact["pipe"] = pipe;
             fact["write"] = write;
+            fact["domain"] = domain;
             result.append(fact);
           }
           return result;
@@ -1537,7 +1540,10 @@ void BindTesting(nb::module_& m) {
           control_output_nodes += control.size();
           record["control"] = control;
           record["effects"] = facts(site.effects);
-          record["incoming"] = facts(site.incoming);
+          if (analysis.HasIncomingDiagnostics())
+            record["incoming"] = facts(site.incoming);
+          else
+            record["incoming"] = nb::none();
           record["source_pipes"] = site.source_pipes;
           sites.append(record);
         }
@@ -1549,6 +1555,13 @@ void BindTesting(nb::module_& m) {
         counters["retained_facts"] = cost.retained_facts;
         counters["services"] = cost.services;
         counters["parent_links"] = cost.parent_links;
+        counters["enclosure_lookups"] = cost.enclosure_lookups;
+        counters["storage_domains"] = cost.storage_domains;
+        counters["conflict_summary_facts"] = cost.conflict_summary_facts;
+        counters["conflict_queries"] = cost.conflict_queries;
+        counters["incoming_diagnostic_facts"] = cost.incoming_diagnostic_facts;
+        counters["control_snapshot_facts"] = cost.control_snapshot_facts;
+        counters["control_merge_facts"] = cost.control_merge_facts;
         counters["diagnostic_control_output_nodes"] = control_output_nodes;
         nb::dict result;
         result["function"] = analysis.Function();
@@ -1557,7 +1570,10 @@ void BindTesting(nb::module_& m) {
         for (const auto& child : analysis.ChildEntries()) {
           nb::dict entry;
           entry["scope"] = child.scope;
-          entry["incoming"] = facts(child.incoming);
+          if (analysis.HasIncomingDiagnostics())
+            entry["incoming"] = facts(child.incoming);
+          else
+            entry["incoming"] = nb::none();
           entry["effects"] = facts(child.effects);
           entry["services"] = child.services;
           child_entries.append(entry);
@@ -1565,14 +1581,31 @@ void BindTesting(nb::module_& m) {
         result["children"] = child_entries;
         result["exit_effects"] = facts(analysis.ExitEffects());
         result["cost"] = counters;
-        result["precision"] = "whole_memory_space_no_kill";
+        nb::list domains;
+        for (const auto& domain : analysis.StorageDomains()) {
+          nb::dict record;
+          record["id"] = domain.id;
+          record["space"] = ir::MemorySpaceToString(domain.space);
+          record["enclosure"] = domain.enclosure
+                                    ? nb::cast(std::make_pair(domain.enclosure->begin, domain.enclosure->end))
+                                    : nb::none();
+          record["original_root"] = domain.original_root ? nb::cast(domain.original_root) : nb::none();
+          record["exact_selector"] = false;
+          domains.append(record);
+        }
+        result["storage_domains"] = domains;
+        result["incoming_diagnostics_available"] = analysis.HasIncomingDiagnostics();
+        result["disjoint_gm"] = analysis.SuppliedDisjointGM();
+        result["gm_alias_contract"] = analysis.SuppliedDisjointGM() ? "supplied_disjoint_roots" : "may_alias";
+        result["precision"] = "storage_domain_no_kill";
         result["exact_storage_selectors"] = false;
         result["executable_protocol"] = false;
         return result;
       },
       nb::arg("function"), nb::arg("target") = "a2a3", nb::kw_only(),
       nb::arg("children") = std::vector<std::shared_ptr<const ir::sync::NativeSyncChild>>{},
-      "Qualify conservative effects/readiness and solve no-KILL structured may-dataflow without insertion");
+      nb::arg("retain_incoming_diagnostics") = true,
+      "Qualify conservative effects/readiness; incoming history is an optional diagnostic export");
   testing.def(
       "insert_conservative_prefixes",
       [](const ir::FunctionPtr& function, const std::string& target,

@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <tuple>
@@ -28,24 +29,32 @@
 
 namespace pypto::ir::sync {
 
-// A whole-memory-space enclosure, not an exact footprint or selector. Different
-// roots/views/slots in one space intentionally share a class. No disjoint-GM
-// premise is used. write=false denotes a possible read, write=true a write.
-using ConservativeAccessFact = std::tuple<MemorySpace, PipeType, bool>;
+// A provider-owned conservative storage class, never an exact selector.
+// Domain zero is a wildcard over its whole memory space. Nonzero IDs name this
+// immutable analysis's catalog only; they are not global storage identities.
+// write=false denotes a possible read, write=true a possible write.
+using ConservativeAccessFact = std::tuple<MemorySpace, PipeType, bool, size_t>;
+
+struct ConservativeStorageDomain {
+  size_t id;
+  MemorySpace space;
+  std::optional<backend::BufferSyncByteWindow> enclosure;
+  ExprPtr original_root;  // GM provenance qualified by the supplied disjoint contract.
+};
 using ConservativeAccessSet = std::set<ConservativeAccessFact>;
 
 struct ConservativeSyncSite {
   StmtPtr cut;  // Original statement, immediately before its payload call.
   backend::BufferSyncOperation operation;
   ConservativeAccessSet effects;
-  ConservativeAccessSet incoming;
+  ConservativeAccessSet incoming;  // Unavailable unless HasIncomingDiagnostics() is true.
   std::vector<PipeType> source_pipes;
 };
 
 struct ConservativeSyncChildEntry {
   ForStmtPtr scope;
   std::shared_ptr<const NativeSyncChild> child;
-  ConservativeAccessSet incoming, effects;
+  ConservativeAccessSet incoming, effects;  // incoming requires HasIncomingDiagnostics().
   // A child has several participating pipes, never one fabricated payload pipe.
   std::vector<std::pair<PipeType, PipeType>> services;
   std::shared_ptr<const EventfulSyncChild> eventful;
@@ -58,6 +67,13 @@ struct ConservativeSyncCost {
   size_t retained_facts = 0;
   size_t services = 0;
   size_t parent_links = 0;
+  size_t enclosure_lookups = 0;
+  size_t storage_domains = 0;
+  size_t conflict_summary_facts = 0;
+  size_t conflict_queries = 0;
+  size_t incoming_diagnostic_facts = 0;
+  size_t control_snapshot_facts = 0;
+  size_t control_merge_facts = 0;
 };
 
 // Published immutable input/evidence for a subsequent explicit conservative
@@ -72,6 +88,9 @@ class ConservativeSyncAnalysis {
   const std::vector<ConservativeSyncChildEntry>& ChildEntries() const { return children_; }
   const ConservativeAccessSet& ExitEffects() const { return exit_; }
   const ConservativeSyncCost& Cost() const { return cost_; }
+  const std::vector<ConservativeStorageDomain>& StorageDomains() const { return domains_; }
+  bool HasIncomingDiagnostics() const { return incoming_diagnostics_; }
+  bool SuppliedDisjointGM() const { return disjoint_gm_; }
   // Diagnostic, output-sensitive O(depth) walk of the shared original-parent
   // index. Production sites retain only cuts, never one copied path per site.
   std::vector<StmtPtr> ControlPath(size_t site) const;
@@ -79,23 +98,31 @@ class ConservativeSyncAnalysis {
  private:
   friend ConservativeSyncAnalysis AnalyzeConservativeSync(
       const FunctionPtr&, const std::string&, const std::vector<std::shared_ptr<const NativeSyncChild>>&,
-      const std::vector<std::shared_ptr<const EventfulSyncChild>>&);
+      const std::vector<std::shared_ptr<const EventfulSyncChild>>&, bool);
   ConservativeSyncAnalysis(FunctionPtr function, std::vector<ConservativeSyncSite> sites,
                            ConservativeAccessSet exit, ConservativeSyncCost cost,
                            std::shared_ptr<const ParentStmtAnalysis> parents,
-                           std::vector<ConservativeSyncChildEntry> children)
+                           std::vector<ConservativeSyncChildEntry> children,
+                           std::vector<ConservativeStorageDomain> domains, bool incoming_diagnostics,
+                           bool disjoint_gm)
       : function_(std::move(function)),
         sites_(std::move(sites)),
         exit_(std::move(exit)),
         cost_(cost),
         parents_(std::move(parents)),
-        children_(std::move(children)) {}
+        children_(std::move(children)),
+        domains_(std::move(domains)),
+        incoming_diagnostics_(incoming_diagnostics),
+        disjoint_gm_(disjoint_gm) {}
   FunctionPtr function_;
   std::vector<ConservativeSyncSite> sites_;
   ConservativeAccessSet exit_;
   ConservativeSyncCost cost_;
   std::shared_ptr<const ParentStmtAnalysis> parents_;
   std::vector<ConservativeSyncChildEntry> children_;
+  std::vector<ConservativeStorageDomain> domains_;
+  bool incoming_diagnostics_;
+  bool disjoint_gm_;
 };
 
 // No-KILL may-dataflow over the original structured IR. GEN is computed bottom
@@ -106,16 +133,25 @@ class ConservativeSyncAnalysis {
 // entry and every visit, including the final false test; effectful conditions
 // require a separate readiness/visibility contract and are refused.
 //
-// Fixed spaces/pipes bound the fact universe C. State work/storage is O(N*C+E);
-// conflict selection additionally scans O(N*C*C) pairs (C is target-fixed).
+// Let J be the resulting class/mode/pipe fact universe and k the pipe count.
+// Class recovery/sweep costs O(A log(A+2)) for A primitive/implicit effects.
+// Flat sequences increment one indexed state: O(A log(J+2)+A*k+E) work and
+// O(A+J) retained state. Actual control boundaries may copy/merge J facts;
+// nested summaries can retain O(N*J). Explicit diagnostic snapshots additionally
+// cost their output size D, which can be quadratic even for a flat sequence.
+// Indexed conflict selection builds no all-access or all-fact pair matrix.
+// This explicit class-universe dependence is not a global O(N log N) claim.
 // Original control uses one O(N) parent index; requested paths cost their output
 // depth only. E counts actual scalar DAG visits (deduplicated per readiness
 // query). No trip count is unfolded. Runtime
 // realization, invocation completion, and resource reuse remain separate gates.
+// Production omits copied incoming snapshots; explicit diagnostic requests pay
+// their output size and publish availability separately from empty histories.
 ConservativeSyncAnalysis AnalyzeConservativeSync(
     const FunctionPtr& function, const std::string& target = "a2a3",
     const std::vector<std::shared_ptr<const NativeSyncChild>>& children = {},
-    const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful_children = {});
+    const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful_children = {},
+    bool retain_incoming_diagnostics = false);
 // Explicit policy construction. Acknowledgment-induced order is represented
 // here in logical tokens before LowerSync; no physical resource is assigned.
 FunctionPtr InsertConservativePrefixes(const ConservativeSyncAnalysis& analysis);
