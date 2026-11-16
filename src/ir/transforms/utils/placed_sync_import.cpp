@@ -2002,6 +2002,7 @@ SyncInvocationEvidence CollectSyncInvocationEvidence(const ProgramPtr& program, 
         ++work->call_graph_edges;
       }
   }
+  if (work == &local_work && work->call_graph_edges == 0) return {};
   std::set<std::string> ready, processed;
   for (const auto& [name, count] : incoming)
     if (!count) ready.insert(name);

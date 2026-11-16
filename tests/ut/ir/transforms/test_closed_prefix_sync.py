@@ -917,3 +917,217 @@ def test_intra_loop_set_wait_ack_reuses_ids_without_exhaustion():
     assert "event_id=0" in text
     assert "event_id=9" not in text
     check_closed_commands(fn, phys_fn, {0: 3}, range(8), compare_commands=False)
+
+
+def test_loop_if_else_cross_arm_payloads_and_open_edges_never_collide():
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+    ci = lambda v: ir.ConstInt(v, idx, span)
+    tup = lambda vals: ir.MakeTuple([ci(v) for v in vals], span)
+    vec_t = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    gm_t = ir.TensorType([2, 8], ir.DataType.FP32)
+
+    src = ir.Var("src", gm_t, span)
+    out = ir.Var("out", gm_t, span)
+    n = ir.Var("n", ir.ScalarType(idx), span)
+    choice = ir.Var("choice", ir.ScalarType(idx), span)
+    k = ir.Var("k", ir.ScalarType(idx), span)
+    x = ir.Var("x", vec_t, span)
+    y = ir.Var("y", vec_t, span)
+    z = ir.Var("z", vec_t, span)
+    w = ir.Var("w", vec_t, span)
+
+    # 1. Pure-payload BufferIR reproducer: MTE2->V in then-arm, V->MTE2 in else-arm inside a loop.
+    # Both arms have closed cycle in loop; forward IDs must stay 2-cmd SetWait with no cross-arm race.
+    cond = ir.Eq(ir.FloorMod(k, ci(2), idx, span), choice, ir.DataType.BOOL, span)
+    payload_loop = ir.ForStmt(
+        k,
+        ci(0),
+        n,
+        ci(1),
+        [],
+        seq(
+            ir.IfStmt(
+                cond,
+                seq(
+                    ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), z], ir.VoidType(), span), span),
+                    ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [z, w], ir.VoidType(), span), span),
+                ),
+                seq(
+                    ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [x, y], ir.VoidType(), span), span),
+                    ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+                ),
+                [],
+                span,
+            ),
+            ir.YieldStmt([], span),
+        ),
+        [],
+        span,
+    )
+    payload_fn = ir.Function(
+        "loop_if_else_payloads",
+        [src, (out, ir.ParamDirection.InOut), n, choice],
+        [out.type],
+        seq(
+            ir.AssignStmt(x, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(0)], vec_t, span), span),
+            ir.AssignStmt(y, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(128)], vec_t, span), span),
+            ir.AssignStmt(z, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(256)], vec_t, span), span),
+            ir.AssignStmt(w, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(384)], vec_t, span), span),
+            ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+            payload_loop,
+            ir.EvalStmt(ir.Call(ir.get_op("buffer.store"), [w, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span), span),
+            ir.ReturnStmt([out], span),
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    prog = ir.Program([payload_fn], "LoopIfElsePayloads", span)
+    with passes.PassContext([], enable_pypto_autosync=True, autosync_policy="conservative_prefix"):
+        opt = passes.optimize_sync()(passes.insert_sync()(prog))
+        p3 = next(iter(passes.lower_sync()(opt).functions.values()))
+        p1 = next(iter(passes.realize_sync()(prog).functions.values()))
+    log_fn = next(iter(opt.functions.values()))
+    for phys in (p3, p1):
+        for n_val, ch_val in product((0, 1, 2, 4), (0, 1)):
+            check_closed_commands(log_fn, phys, {2: n_val, 3: ch_val}, range(8), compare_commands=False)
+
+    # 2. Open-cycle cross-arm tokens: SetWaitAck ack_ids must not collide with opposite-arm forward_ids.
+    t_then = ir.Var("t_then", ir.SyncTokenType(ir.PipeType.MTE2), span)
+    t_else = ir.Var("t_else", ir.SyncTokenType(ir.PipeType.V), span)
+    open_fn = ir.Function(
+        "loop_if_else_open_tokens",
+        [n, choice],
+        [],
+        seq(
+            ir.ForStmt(
+                k,
+                ci(0),
+                n,
+                ci(1),
+                [],
+                seq(
+                    ir.IfStmt(
+                        cond,
+                        seq(
+                            ir.AssignStmt(t_then, sync.record(ir.PipeType.MTE2), span),
+                            ir.EvalStmt(sync.wait(t_then, ir.PipeType.V), span),
+                        ),
+                        seq(
+                            ir.AssignStmt(t_else, sync.record(ir.PipeType.V), span),
+                            ir.EvalStmt(sync.wait(t_else, ir.PipeType.MTE2), span),
+                        ),
+                        [],
+                        span,
+                    ),
+                    ir.YieldStmt([], span),
+                ),
+                [],
+                span,
+            ),
+            ir.ReturnStmt([], span),
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        attrs={"autosync_analysis_policy": "conservative_prefix"},
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    phys_open = lower(open_fn, [0, 1])
+    for n_val, ch_val in product((0, 1, 2, 4), (0, 1)):
+        _, after = check_closed_commands(open_fn, phys_open, {0: n_val, 1: ch_val}, [0, 1], compare_commands=False)
+        assert not after.live
+
+
+@pytest.mark.parametrize("kind", ["for", "while"])
+def test_ten_sequential_unpromoted_loops_reuse_single_event_id(kind):
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+    ci = lambda v: ir.ConstInt(v, idx, span)
+    n = ir.Var("n", ir.ScalarType(idx), span)
+
+    loops: list[ir.Stmt] = []
+    for li in range(10):
+        tok = ir.Var(f"tok_{li}", ir.SyncTokenType(ir.PipeType.MTE2), span)
+        body_stmts: list[ir.Stmt] = [
+            ir.AssignStmt(tok, sync.record(ir.PipeType.MTE2), span),
+            ir.EvalStmt(sync.wait(tok, ir.PipeType.V), span),
+        ]
+        if kind == "while":
+            iv = ir.IterArg(f"i_{li}", ir.ScalarType(idx), ci(0), span)
+            final = ir.Var(f"fin_{li}", ir.ScalarType(idx), span)
+            body_stmts.append(ir.YieldStmt([ir.Add(iv, ci(1), idx, span)], span))
+            loops.append(
+                ir.WhileStmt(
+                    ir.Lt(iv, n, ir.DataType.BOOL, span), [iv], seq(*body_stmts), [final], span
+                )
+            )
+        else:
+            iv = ir.Var(f"i_{li}", ir.ScalarType(idx), span)
+            body_stmts.append(ir.YieldStmt([], span))
+            loops.append(ir.ForStmt(iv, ci(0), n, ci(1), [], seq(*body_stmts), [], span))
+
+    fn = ir.Function(
+        f"ten_seq_{kind}_loops",
+        [n],
+        [],
+        seq(*loops, ir.ReturnStmt([], span)),
+        span,
+        type=ir.FunctionType.AIV,
+        attrs={"autosync_analysis_policy": "conservative_prefix"},
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with passes.PassContext([]):
+        phys = next(iter(passes.lower_sync()(ir.Program([fn], "TenLoops", span)).functions.values()))
+    _, after = check_closed_commands(fn, phys, {0: 2}, range(8), compare_commands=False)
+    assert after.ids[ir.PipeType.MTE2, ir.PipeType.V] == {0}
+
+
+@pytest.mark.parametrize("control", ["straight", "while", "if"])
+def test_closed_prefix_refuses_stale_same_pipe_barrier_with_intervening_payload(control):
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+    ci = lambda v: ir.ConstInt(v, idx, span)
+    tup = lambda vals: ir.MakeTuple([ci(v) for v in vals], span)
+    vec_t = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    gm_t = ir.TensorType([2, 8], ir.DataType.FP32)
+
+    src = ir.Var("src", gm_t, span)
+    cond = ir.Var("cond", ir.ScalarType(ir.DataType.BOOL), span)
+    x = ir.Var("x", vec_t, span)
+    z = ir.Var("z", vec_t, span)
+    tok = ir.Var("tok", ir.SyncTokenType(ir.PipeType.MTE2), span)
+
+    stale_seq = seq(
+        ir.AssignStmt(tok, sync.record(ir.PipeType.MTE2), span),
+        ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), z], ir.VoidType(), span), span),
+        ir.EvalStmt(sync.wait(tok, ir.PipeType.MTE2), span),
+    )
+    if control == "straight":
+        middle = stale_seq
+    elif control == "while":
+        middle = ir.WhileStmt(cond, [], seq(*stale_seq.stmts, ir.YieldStmt([], span)), [], span)
+    else:
+        middle = ir.IfStmt(cond, stale_seq, None, [], span)
+
+    fn = ir.Function(
+        f"stale_same_pipe_{control}",
+        [src, cond],
+        [],
+        seq(
+            ir.AssignStmt(x, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(0)], vec_t, span), span),
+            ir.AssignStmt(z, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(128)], vec_t, span), span),
+            ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+            middle,
+            ir.ReturnStmt([], span),
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        attrs={"autosync_analysis_policy": "conservative_prefix"},
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    before = ir.serialize(fn)
+    with pytest.raises(ValueError, match="LowerSync same-pipe barrier would strengthen the recorded prefix"):
+        with passes.PassContext([]):
+            passes.lower_sync()(ir.Program([fn], "StaleSamePipe", span))
+    assert ir.serialize(fn) == before

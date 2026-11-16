@@ -141,6 +141,20 @@ def test_barrier_only_module_keeps_actual_token_order_and_exit_completion():
     _check_actual_tokens(original, logical, physical)
     assert "pto.barrier" in codegen.PTOCodegen().generate(ir.Program([physical], "Physical", S))
 
+    with passes.PassContext([], enable_pypto_autosync=True, autosync_disjoint_gm=True):
+        delegated_lower = passes.lower_sync(require_whole_module=False)(logical_program).get_function(
+            original.name
+        )
+        delegated_realize = passes.realize_sync(require_whole_module=False)(program).get_function(
+            original.name
+        )
+    assert delegated_lower is not None and delegated_realize is not None
+    assert dict(delegated_lower.attrs)[PYPTO_AUTOSYNC_ATTR] is False
+    assert dict(delegated_realize.attrs)[PYPTO_AUTOSYNC_ATTR] is False
+    assert ir.get_op("system.bar_v").name not in calls(delegated_lower)
+    assert "SyncToken" not in str(delegated_lower)
+    ir.assert_structural_equal(delegated_lower.body, delegated_realize.body)
+
 
 @pytest.mark.parametrize("realize", [False, True])
 def test_explicit_flag_module_completes_last_store_and_preserves_default_plan(realize):

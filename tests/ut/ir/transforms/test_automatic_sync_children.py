@@ -597,6 +597,8 @@ def test_parent_scalar_parameter_and_var_alias_promote_disjoint_gm_ddr_store_chi
         optimized = passes.optimize_sync()(logical)
     with passes.PassContext([], autosync_disjoint_gm=True):
         physical_3pass = passes.lower_sync()(optimized)
+    with passes.PassContext([], autosync_disjoint_gm=False):
+        physical_standalone = passes.lower_sync()(optimized)
     with passes.PassContext(
         [], enable_pypto_autosync=True, autosync_disjoint_gm=True, autosync_policy="conservative_prefix"
     ):
@@ -605,9 +607,12 @@ def test_parent_scalar_parameter_and_var_alias_promote_disjoint_gm_ddr_store_chi
     log_fn = next(f for g, f in optimized.functions.items() if g.name == "worker_ddr_store_child")
     assert dict(log_fn.attrs)["autosync_retained_child_count"] == 1
     p3 = next(f for g, f in physical_3pass.functions.items() if g.name == "worker_ddr_store_child")
+    ps = next(f for g, f in physical_standalone.functions.items() if g.name == "worker_ddr_store_child")
     p1 = next(f for g, f in physical_1pass.functions.items() if g.name == "worker_ddr_store_child")
     assert dict(p3.attrs)["pypto_autosync"] is True
+    assert dict(ps.attrs)["pypto_autosync"] is True
     assert dict(p1.attrs)["pypto_autosync"] is True
+    ir.assert_structural_equal(p3.body, ps.body)
     for phys in (p3, p1):
         check_closed_commands(
             log_fn,
@@ -741,3 +746,92 @@ def test_prescreen_skips_outer_loop_with_while_without_losing_inner_promotion():
     no_inner_analysis = inspect(no_inner_fn)
     assert no_inner_analysis["child_attempts"] == []
     assert no_inner_analysis["cost"]["child_index_nodes"] == 0
+
+
+def test_local_only_and_readonly_children_receive_caller_bounds_without_disjoint_gm():
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+    ci = lambda v: ir.ConstInt(v, idx, span)
+    tup = lambda vals: ir.MakeTuple([ci(v) for v in vals], span)
+    vec_t = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    gm_t = ir.TensorType([2, 8], ir.DataType.FP32)
+
+    src = ir.Var("src", gm_t, span)
+    out = ir.Var("out", gm_t, span)
+    n = ir.Var("n", ir.ScalarType(idx), span)
+    x = ir.Var("x", vec_t, span)
+    y = ir.Var("y", vec_t, span)
+    k = ir.Var("k", ir.ScalarType(idx), span)
+
+    # Child loop uses caller-bounded `n` in [2, 2] (`range(n, 4)`) and reads GM `src` (readonly external effect).
+    child = ir.ForStmt(
+        k,
+        n,
+        ci(4),
+        ci(1),
+        [],
+        ir.SeqStmts(
+            [
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [x, y], ir.VoidType(), span), span),
+                ir.YieldStmt([], span),
+            ],
+            span,
+        ),
+        [],
+        span,
+    )
+    worker = ir.Function(
+        "worker_caller_bounds_no_disjoint",
+        [src, (out, ir.ParamDirection.InOut), n],
+        [out.type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(x, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(0)], vec_t, span), span),
+                ir.AssignStmt(y, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(128)], vec_t, span), span),
+                child,
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.store"), [y, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span), span),
+                ir.ReturnStmt([out], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        level=ir.Level.AIV,
+        role=ir.Role.SubWorker,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    gv_worker = ir.GlobalVar(worker.name)
+    e_src = ir.Var("e_src", gm_t, span)
+    e_out = ir.Var("e_out", gm_t, span)
+    e_res = ir.Var("e_res", out.type, span)
+    caller = ir.Function(
+        "caller_entry",
+        [e_src, (e_out, ir.ParamDirection.InOut)],
+        [e_out.type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(e_res, ir.Call(gv_worker, [e_src, e_out, ci(2)], out.type, span), span),
+                ir.ReturnStmt([e_res], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.Opaque,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    prog = ir.Program([worker, caller], "CallerBoundsNoDisjointGm", span)
+
+    with passes.PassContext(
+        [], enable_pypto_autosync=True, autosync_policy="conservative_prefix", autosync_disjoint_gm=False
+    ):
+        opt = passes.optimize_sync()(passes.insert_sync()(prog))
+        p3 = passes.lower_sync()(opt)
+        p1 = passes.realize_sync()(prog)
+
+    log_fn = next(f for g, f in opt.functions.items() if g.name == "worker_caller_bounds_no_disjoint")
+    assert dict(log_fn.attrs)["autosync_retained_child_count"] == 1
+    for phys_prog in (p3, p1):
+        pf = next(f for g, f in phys_prog.functions.items() if g.name == "worker_caller_bounds_no_disjoint")
+        assert dict(pf.attrs)["pypto_autosync"] is True
+        check_closed_commands(log_fn, pf, {2: 2}, range(6), compare_commands=False, hardware_source=worker)
