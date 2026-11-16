@@ -88,42 +88,37 @@
     "fresh_whole_qwen_capture": false,
     "device": false
   },
-  "next_gate": {
-    "remaining_native_contracts": [
-      "Mixed full/partial operation value/metadata semantics",
-      "Scalar GM input visibility and readiness",
-      "Local boundary effects and resource coexistence for existing communication protocols (new peer synchronization excluded)"
-    ],
-    "remaining_precision_contracts": [
-      "Symbolic caller relations and exact GM boundary exports"
-    ],
-    "rule": "Preserve qualified exact results and explicit conservative requests; no implied admission from benchmark parameters or address enclosures."
-  },
+  "next_gate": "Implement reviewed designs50/51 with reviewer gates; preserve all original M1-M6 and explicit missing mixed-valid/native/caller premises.",
   "latest_checkpoint": {
-    "date": "2026-11-15",
-    "runtime_commit": "32c472089cf8e29ab4cff24964cf79c5d03ecc32",
-    "runtime_report": "41-general-autosync-runtime-axis.json",
-    "retained_child_report": "41-general-autosync-readonly-child.json",
+    "date": "2026-11-16",
+    "source_parent": "30864da6221d781b3e4ba77a494d2a5b5b8fcd02",
+    "reports": [
+      "43-autosync-value-and-scalar-contracts.json",
+      "44-autosync-gm-scalar-staging.json",
+      "45-autosync-effective-invocation-coordinate.json",
+      "46-autosync-acc-row-trim.json",
+      "47-autosync-gm-scalar-write-staging.json",
+      "48-autosync-vector-identity-reshape.json",
+      "49-autosync-statement-rewrite.json"
+    ],
+    "review_status": "47-49 source and final report accepted; 4259 broad tests,128 posthook focused,3CTests,all hooks and final capture/audit pass",
     "whole_model": {
       "cpp_leaves": 32,
-      "prefix_owned": 16,
-      "exact_owned": 3,
-      "prefix_delegated": 16,
-      "task_control_owners_observed": 47,
-      "unverified_owner_domains": 0,
-      "historical_unverified_owner_domains": 47
+      "prefix_owned": 21,
+      "prefix_delegated": 11,
+      "task_control_owners_observed": 47
     },
     "remaining": [
-      "Review repairs R1-R4 must pass before resuming coverage expansion",
-      "Mixed-full/partial ADD and carrier value-domain contracts",
-      "Scalar GM visibility and readiness",
-      "Qualified local boundaries around existing manual protocols; no new cross-core or inter-kernel synchronization",
-      "Additional symbolic caller/GM export contracts",
-      "Remaining shared regional capabilities under original contracts; additional common-completion construction only if needed under a separate M3 subgate",
+      "Four ADD leaves: native equal-valid premise not established; inactive-element semantics remain unresolved",
+      "Rope MUL: unequal active domains and pitched partial-column descriptor export",
+      "Six peer leaves: selected-native local lifecycle/resource capsule remains an implementation gap; preserve existing peer protocol",
+      "Scope-aware generic BufferIR/SSA DAG verification cost",
+      "Additional original M5 symbolic caller/GM exports and shared regional capabilities",
       "Whole-model local ownership and separate native/device qualification"
     ],
+    "scope": "Original M1-M6 retained; repairs extend them; no new cross-core/inter-kernel protocol",
     "all_original_milestones_complete": false,
-    "task_domain_report": "41-general-autosync-task-domains.json"
+    "final_verification": "build-py314/review-repairs-20261116/final-accepted-verification.json"
   },
   "historical_field_scope": "compiler_revision, source_sha256, historical_evidence, draft, review and validation preserve the original architecture-plan audit; they are not a current build or test claim. latest_checkpoint and its linked receipts identify current implementation and dirty-source evidence.",
   "historical_next_gate": "M1 shared qualification and domain ownership; refresh existing pinned capture",
@@ -259,5 +254,31 @@
     "receipt": "42-autosync-review-repairs.json",
     "original_M1_M6_complete": false,
     "next": "Restore byte-preserved packages, coherent build, then original independent review/commit loop; no cross-core/inter-kernel synthesis"
+  },
+  "historical_checkpoint_20261115": {
+    "date": "2026-11-15",
+    "runtime_commit": "32c472089cf8e29ab4cff24964cf79c5d03ecc32",
+    "runtime_report": "41-general-autosync-runtime-axis.json",
+    "retained_child_report": "41-general-autosync-readonly-child.json",
+    "whole_model": {
+      "cpp_leaves": 32,
+      "prefix_owned": 16,
+      "exact_owned": 3,
+      "prefix_delegated": 16,
+      "task_control_owners_observed": 47,
+      "unverified_owner_domains": 0,
+      "historical_unverified_owner_domains": 47
+    },
+    "remaining": [
+      "Review repairs R1-R4 must pass before resuming coverage expansion",
+      "Mixed-full/partial ADD and carrier value-domain contracts",
+      "Scalar GM visibility and readiness",
+      "Qualified local boundaries around existing manual protocols; no new cross-core or inter-kernel synchronization",
+      "Additional symbolic caller/GM export contracts",
+      "Remaining shared regional capabilities under original contracts; additional common-completion construction only if needed under a separate M3 subgate",
+      "Whole-model local ownership and separate native/device qualification"
+    ],
+    "all_original_milestones_complete": false,
+    "task_domain_report": "41-general-autosync-task-domains.json"
   }
 }

@@ -1,9 +1,9 @@
 # General autosync integration: architecture and Qwen acceptance plan
 
-Current priority (2026-11-16): external review identifies four blocking defects.
-Complete repair gates R1–R4 below before resuming the paused coverage packages.
-Earlier accepted gates and test receipts are historical evidence, not a current
-merge-readiness claim.
+Current priority (2026-11-16): complete the resumed bounded implementation and
+review gates after R1–R4. The original milestones and whole-model target remain
+in force; the review repairs extend them. Earlier test receipts are historical
+evidence and do not replace the final coherent regression gate.
 
 Status: the continued operation, ownership and retained-child gates are reviewed.
 The original six milestones and whole-model ownership remain **partially complete**:
@@ -15,8 +15,9 @@ policies: exact owns 3, conservative prefix owns 16 and delegates 16. Another
 fixture expectations, resolved by a reviewed 196-test module rerun. This is
 aggregate evidence, not a fresh single all-green 2,675-test campaign. See the
 continued ledger and [retained-child checkpoint](41-general-autosync-readonly-child.md).
-The current post-repair prefix checkpoint is 20 owned / 12 delegated leaves; see
-the Acc metadata ledger below.
+The latest combined prefix capture has 21 owned / 11 delegated local leaves;
+all 32 generate C++. The final combined regression and publication gate is
+recorded below separately from this capture.
 Baseline: `b5597650a75b598645b1b1d3fe05bd3aab220f09`. This extends the
 [regional architecture](39-regional-sync-architecture.md). Qwen end-to-end remains
 the acceptance target, not a source of kernel-specific admission rules. Autosync
@@ -932,3 +933,41 @@ qualification remain separate. A shared-DAG receipt-counting defect was repaired
 without changing demands, protocol, IDs or budgets; the distinct raw-DAG generic
 BufferIR/SSA verifier cost and invocation-rewriter traversal remain follow-ups.
 The earlier tables and counts above are historical checkpoint evidence.
+
+## Continued implementation and remaining contract gate (2026-11-16)
+
+The original M1–M6 plan above is retained. The following reusable packages extend
+its M2/M3/M6 coverage and the R4 cost repair; they do not replace any outstanding
+milestone with a narrower Qwen-only objective. Source review has accepted the
+[GM point-write adapter](47-autosync-gm-scalar-write-staging.md),
+[strict vector identity](48-autosync-vector-identity-reshape.md) and
+[statement-only rewriting](49-autosync-statement-rewrite.md), conditional on the
+final coherent tests and hooks recorded in those reports.
+
+The combined unchanged two-layer capture produces 32/32 C++ leaves, with 21
+PyPTO owners, 11 delegates and 47 observed existing task-control owners. The new
+owner is `qkpv_plan`. Its staged selected model has a shared 32-byte UB carrier:
+the independent eight-case actual-command check finds complete matching, causal
+reuse and no missing payload prerequisites. That reference is already totally
+ordered; zero excess against it establishes neither overlap nor a minimum
+command protocol. The 2,818 executed flag pairs per invocation remain a material
+cost. See report47 for distinct static, executed and ordering measurements.
+
+| Remaining family | First missing obligation | Conservative outcome |
+| ---------------- | ------------------------ | -------------------- |
+| Four ADD leaves | Full-valid and partial-valid operands do not establish the native equal-valid premise; original full observations cannot be silently narrowed | Existing delegation; a sound footprint enclosure does not repair unknown inactive-element semantics |
+| Rope MUL | Actual multiply at source line781 combines full16 and `group_tok` rows; pitched partial-column descriptors also need export | Identity reshape is admitted, but the next operation still delegates; no inferred full16 caller bound |
+| Six peer-transport leaves | Native workspace, reserved slots, ready/borrow/release lifetimes and rearming are not exported by the selected transport owner | Preserve manual/native/runtime ownership and delegation; no new cross-core or inter-kernel protocol |
+
+The original caller permits short groups; the captured benchmark is not a
+compiler-enforced equality or divisibility contract. Any future caller-specific
+premise must be explicit and established at analysis. The question about defined
+inactive-element values remains open; no unavailable answer is treated as empty.
+Exact dynamic GM boundaries, general symbolic control/coordinates and generic
+raw-DAG BufferIR/SSA costs remain separate original obligations. Final acceptance
+of these bounded packages does not mark M1–M6 or whole-Qwen ownership complete.
+
+The final47–49 gate and independent report review are accepted: 4,259 broad
+tests, 128 post-format tests, three CTests, all configured hooks, strict original
+model capture and eight actual-command cases pass. Reviewed designs50/51 are the
+next implementation gates; their acceptance does not claim implementation.

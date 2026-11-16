@@ -27,12 +27,14 @@
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
+#include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/simplify.h"
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/closed_prefix_sync.h"
 #include "src/ir/transforms/utils/conservative_sync_dataflow.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/scoped_logical_sync.h"
+#include "src/ir/transforms/utils/sync_statement_rewrite.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
 
 namespace pypto::ir::pass {
@@ -127,7 +129,7 @@ FunctionPtr CompleteOwnedInvocation(const FunctionPtr& function, const std::stri
   auto body = As<SeqStmts>(function->body_);
   CHECK(body && !body->stmts_.empty() && As<ReturnStmt>(body->stmts_.back()))
       << "Invocation completion requires a canonical terminal return";
-  class CompleteReturns : public IRMutator {
+  class CompleteReturns : public sync::SyncStatementMutator {
     std::string core_;
     const char* completion_;
 
@@ -145,7 +147,9 @@ FunctionPtr CompleteOwnedInvocation(const FunctionPtr& function, const std::stri
           std::vector<StmtPtr>{std::make_shared<EvalStmt>(completion, op->span_), op}, op->span_);
     }
   } complete(function->func_type_, execution.terminal_completion_op);
-  return sync::SyncOutcome(complete.VisitFunction(function), true, "");
+  auto completed = MutableCopy(function);
+  completed->body_ = complete.VisitStmt(function->body_);
+  return sync::SyncOutcome(completed, true, "");
 }
 // Validate the requested original cuts in one statement occurrence walk before
 // constructing mathematics. Pointer membership alone cannot detect a shared
