@@ -33,7 +33,7 @@ from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core import log_debug as _log_debug
 from pypto.pypto_core import passes as _passes
 
-from .pass_manager import OptimizationStrategy, PassDumpLevel, PassManager
+from .pass_manager import OptimizationStrategy, PassDumpLevel, PassFactory, PassManager
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +211,7 @@ def _run_pass_pipeline(  # noqa: PLR0913
     inherit_outer_report_instruments: bool = True,
     dump_passes: bool | PassDumpLevel = False,
     passes_dump_dir: str | None = None,
+    layout_pass: PassFactory | None = None,
 ) -> _PassPipelineResult:
     """Resolve pass settings and run the configured pass pipeline."""
     effective_backend_type = _select_backend(backend_type=backend_type, platform=platform)
@@ -282,6 +283,7 @@ def _run_pass_pipeline(  # noqa: PLR0913
         pm = PassManager.get_strategy(
             strategy,
             analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
+            layout_pass=layout_pass,
         )
         with passes_stage:
             transformed_program = pm.run_passes(
@@ -341,6 +343,7 @@ def compile(  # noqa: PLR0913
     emit_source_loc: bool | None = None,
     dump_ptoas_passes: bool = False,
     runtime: _passes.RuntimeKind | None = None,
+    layout_pass: PassFactory | None = None,
 ) -> "CompiledProgram | DistributedCompiledProgram":
     """Compile a Program through passes and codegen.
 
@@ -485,6 +488,7 @@ def compile(  # noqa: PLR0913
         emit_source_loc=emit_source_loc,
         dump_ptoas_passes=dump_ptoas_passes,
         runtime=runtime,
+        layout_pass=layout_pass,
     )
     lowered_program = result.lowered_program
     # Entry selection and execution wrappers belong to the public program API.
@@ -598,6 +602,7 @@ def _compile_to_files(  # noqa: PLR0913
     emit_source_loc: bool | None = None,
     dump_ptoas_passes: bool = False,
     runtime: _passes.RuntimeKind | None = None,
+    layout_pass: PassFactory | None = None,
 ) -> _CompilationResult:
     """Run shared contract analysis, passes and codegen without execution wrappers."""
     from ._compile_contract import (  # noqa: PLC0415
@@ -663,6 +668,7 @@ def _compile_to_files(  # noqa: PLR0913
             extra_instruments=(report_instrument,),
             dump_passes=dump_passes,
             passes_dump_dir=os.path.join(output_dir, "passes_dump"),
+            layout_pass=layout_pass,
         )
         transformed_program = pipeline.transformed_program
         mplan = pipeline.memory_planner

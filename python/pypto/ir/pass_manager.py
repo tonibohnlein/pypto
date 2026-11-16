@@ -162,6 +162,7 @@ class PassManager:
         strategy: OptimizationStrategy,
         *,
         analyze_auto_scopes_for_deps: bool,
+        layout_pass: PassFactory | None = None,
     ) -> tuple[PassFactory, ...]:
         """Build the immutable pass-factory recipe for an optimization strategy."""
         if strategy != OptimizationStrategy.Default:
@@ -212,6 +213,7 @@ class PassManager:
             passes.auto_tile_matmul_l0,
             passes.canonicalize_tile_slice,
             passes.infer_tile_memory_space,
+            *((layout_pass, passes.block_nz_tensor_views) if layout_pass is not None else ()),
             passes.insert_mx_scale_addr,
             passes.resolve_backend_op_layouts,
             # Preserve explicit AIV regions and localize boundary valid extents.
@@ -324,6 +326,7 @@ class PassManager:
         strategy: OptimizationStrategy = OptimizationStrategy.Default,
         *,
         analyze_auto_scopes_for_deps: bool = False,
+        layout_pass: PassFactory | None = None,
     ) -> "PassManager":
         """Get a PassManager configured for the specified strategy.
 
@@ -335,6 +338,10 @@ class PassManager:
                 dependency mechanism. User-written manual scopes are skipped:
                 they do not get compiler deps or automatic NoDep/OutputExisting
                 direction rewrites.
+            layout_pass: Optional pass factory inserted right after
+                ``InferTileMemorySpace`` (followed by ``BlockNzTensorViews`` so
+                any GM tensor newly assigned ``pl.NZ`` is blocked before
+                downstream lowering).
 
         Returns:
             A PassManager instance configured with the appropriate passes
@@ -342,6 +349,7 @@ class PassManager:
         return cls(
             strategy,
             analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
+            layout_pass=layout_pass,
         )
 
     def __init__(
@@ -349,6 +357,7 @@ class PassManager:
         strategy: OptimizationStrategy,
         *,
         analyze_auto_scopes_for_deps: bool = False,
+        layout_pass: PassFactory | None = None,
     ):
         """Initialize PassManager with a specific strategy.
 
@@ -356,9 +365,12 @@ class PassManager:
             strategy: The optimization strategy to use
             analyze_auto_scopes_for_deps: If True, enable compiler-derived task
                 dependency analysis for AUTO runtime scopes.
+            layout_pass: Optional pass factory inserted after
+                ``InferTileMemorySpace``.
         """
         self.strategy = strategy
         self.analyze_auto_scopes_for_deps = analyze_auto_scopes_for_deps
+        self.layout_pass = layout_pass
 
         # DSA_RP consumes the allocation identities produced by
         # MaterializeSemanticAliases and performs lifetime reuse itself in
@@ -394,6 +406,7 @@ class PassManager:
         pass_factories = self._get_pass_factories(
             strategy,
             analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
+            layout_pass=layout_pass,
         )
         phase_properties = passes.IRPropertySet()
         phase_properties.insert(passes.IRProperty.AccStorePhaseValid)

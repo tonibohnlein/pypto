@@ -35,6 +35,7 @@ PyPTO programs, start with the [User Manual](../user/index.md).
 | [Distributed Operators](distributed_ops.md) | The N6 distributed op family — typed DSL access to collectives and primitives |
 | [PTOAS Op Status Matrix](ptoas-op-status.md) | Which public and compatibility PTOAS ops the compiler currently emits |
 | [FP4](fp4.md) | Packed E2M1x2/E1M2x2 types, byte-carrier ABI, and existing E2M1 operator support |
+| [Automatic Layout Selection](11-auto-layout.md) | Post-`InferTileMemorySpace` layout selection, enumeration, and cost calibration across GM (`ND`/`NZ`), L1 (`Mat`), and L0 (`Left`/`Right`/`Acc`) |
 
 ## Comment-triggered full CI
 

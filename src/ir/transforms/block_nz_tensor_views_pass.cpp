@@ -481,6 +481,15 @@ class BlockNzMutator : public IRMutator {
 
     auto new_return_type = BlockNzType(visited->GetType(), op->span_);
     const bool type_changed = new_return_type.get() != op->GetType().get();
+    if (type_changed && IsOp(op, "tensor.create") && !new_args.empty()) {
+      // Keep tensor.create's shape argument aligned with its blocked return type
+      // so text serialization / RoundtripInstrument re-deduces the rank-5 shape.
+      if (auto blocked_tensor = AsTensorTypeLike(new_return_type)) {
+        auto shape_span = new_args[0] ? new_args[0]->span_ : op->span_;
+        new_args[0] = std::make_shared<MakeTuple>(blocked_tensor->shape_, shape_span);
+        args_changed = true;
+      }
+    }
     if (!args_changed && !type_changed) return op;
 
     // Direct ctor, not OpRegistry::Create: re-deducing ``tile.load``'s type

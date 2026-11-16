@@ -33,10 +33,11 @@ from pypto.pypto_core.passes import (
     VerificationMode,
 )
 
+# Import operation modules
+from . import auto_layout as auto_layout
+
 # Import call-site direction helpers (input/output/inout/...) for hand-written IR.
 from . import directions as _directions
-
-# Import operation modules
 from . import op  # noqa: F401
 from . import operators as operators
 
@@ -96,6 +97,7 @@ INDEX = DataType.INDEX
 
 
 __all__ = [
+    "auto_layout",
     "op",
     "IRBuilder",
     "IRMutator",
