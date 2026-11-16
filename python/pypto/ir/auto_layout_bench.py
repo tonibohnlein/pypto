@@ -234,9 +234,41 @@ def prepare_variant_tensors(
     return call_inputs, out_buf
 
 
-def _extract_swimlane_aicore_us(work_dir: Path) -> float | None:
-    """Read median AICore task duration (µs) from level-1 swimlane records if present."""
-    dfx_dir = work_dir / "dfx_outputs"
+def _sum_merged_swimlane_us(dfx_dir: Path) -> float | None:
+    """Sum `kernel-duration-us` across AIC task events in `merged_swimlane_*.json`."""
+    merged_files = sorted(dfx_dir.glob("merged_swimlane_*.json"))
+    if not merged_files:
+        return None
+    try:
+        merged_obj: Any = json.loads(merged_files[-1].read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(merged_obj, dict):
+        return None
+    raw_trace: object = cast(dict[str, object], merged_obj).get("traceEvents")
+    if not isinstance(raw_trace, list):
+        return None
+    kern_us: list[float] = []
+    for ev in cast(list[object], raw_trace):
+        if not isinstance(ev, dict):
+            continue
+        ev_dict = cast(dict[str, object], ev)
+        if ev_dict.get("ph") != "X" or ev_dict.get("cat") != "event":
+            continue
+        args_obj = ev_dict.get("args")
+        k_dur = (
+            cast(dict[str, object], args_obj).get("kernel-duration-us")
+            if isinstance(args_obj, dict)
+            else None
+        )
+        dur = k_dur if isinstance(k_dur, (int, float)) and k_dur > 0 else ev_dict.get("dur")
+        if isinstance(dur, (int, float)) and dur > 0:
+            kern_us.append(float(dur))
+    return float(sum(kern_us)) if kern_us else None
+
+
+def _sum_chip_records_us(dfx_dir: Path) -> float | None:
+    """Sum AICore task durations (µs) from `chip_swimlane_records.json`."""
     records_path = dfx_dir / "chip_swimlane_records.json"
     if not records_path.is_file():
         return None
@@ -244,26 +276,50 @@ def _extract_swimlane_aicore_us(work_dir: Path) -> float | None:
         payload_obj: Any = json.loads(records_path.read_text())
     except (OSError, json.JSONDecodeError):
         return None
-    if isinstance(payload_obj, list):
-        events = cast(list[object], payload_obj)
-    elif isinstance(payload_obj, dict):
+
+    events_obj: object
+    if isinstance(payload_obj, dict):
         payload_dict = cast(dict[str, object], payload_obj)
-        raw_events: object = payload_dict.get("traceEvents") or payload_dict.get("events")
-        events = cast(list[object], raw_events) if isinstance(raw_events, list) else []
+        meta_obj = payload_dict.get("metadata")
+        hz = cast(dict[str, object], meta_obj).get("clock_freq_hz") if isinstance(meta_obj, dict) else None
+        tasks_obj = payload_dict.get("aicore_tasks")
+        if isinstance(tasks_obj, list) and isinstance(hz, (int, float)) and float(hz) > 0:
+            task_us: list[float] = []
+            for raw_task in cast(list[object], tasks_obj):
+                if not isinstance(raw_task, list):
+                    continue
+                row = cast(list[object], raw_task)
+                if len(row) < 5:
+                    continue
+                start, end = row[3], row[4]
+                if isinstance(start, (int, float)) and isinstance(end, (int, float)) and end > start:
+                    task_us.append((float(end) - float(start)) * 1e6 / float(hz))
+            if task_us:
+                return float(sum(task_us))
+        events_obj = payload_dict.get("traceEvents") or payload_dict.get("events")
     else:
+        events_obj = payload_obj
+
+    if not isinstance(events_obj, list):
         return None
     durations_us: list[float] = []
-    for ev in events:
-        if not isinstance(ev, dict):
+    for raw_ev in cast(list[object], events_obj):
+        if not isinstance(raw_ev, dict):
             continue
-        ev_dict = cast(dict[str, object], ev)
+        ev_dict = cast(dict[str, object], raw_ev)
         dur = ev_dict.get("dur")
-        ph = ev_dict.get("ph")
-        if ph == "X" and isinstance(dur, (int, float)) and dur > 0:
+        if ev_dict.get("ph") == "X" and isinstance(dur, (int, float)) and dur > 0:
             durations_us.append(float(dur))
-    if not durations_us:
-        return None
-    return statistics.median(durations_us)
+    return float(sum(durations_us)) if durations_us else None
+
+
+def _extract_swimlane_aicore_us(work_dir: Path) -> float | None:
+    """Read total AICore kernel duration (µs) from level-1 swimlane dumps."""
+    dfx_dir = work_dir / "dfx_outputs"
+    merged_us = _sum_merged_swimlane_us(dfx_dir)
+    if merged_us is not None:
+        return merged_us
+    return _sum_chip_records_us(dfx_dir)
 
 
 def default_a2_calibration_suite(
@@ -305,6 +361,7 @@ def _serialize_calibration_report(
             "fixpipe_acc_to_nd_bytes_per_cycle": report.fitted_model.fixpipe_acc_to_nd_bytes_per_cycle,
             "fixpipe_acc_to_nz_bytes_per_cycle": report.fitted_model.fixpipe_acc_to_nz_bytes_per_cycle,
         },
+        "fallback_params": list(report.fallback_params),
         "residuals_us": report.residuals_us,
     }
 
@@ -512,6 +569,8 @@ def _print_calibration_block(title: str, cal: dict[str, Any] | None) -> None:
         f"overhead={cal['fixed_overhead_us']:.2f}us eff_freq={cal['effective_freq_ghz']:.3f}GHz"
     )
     print(f"  fitted_params={cal['fitted_params']}")
+    if cal.get("fallback_params"):
+        print(f"  WARNING unfitted fallback_params={cal['fallback_params']}")
 
 
 def _print_summary(summary: dict[str, Any]) -> None:

@@ -731,6 +731,81 @@ class TestPassPipelineIntegrationAndCalibration:
                 assert v["accuracy_ok"] is True
                 assert v["swimlane_aicore_us"] > 0.0
 
+    def test_extract_swimlane_aicore_us_real_schemas_and_fallback_flag(self, tmp_path: Path):
+        # 1. Real merged_swimlane_*.json with 2 AIC tasks (chain): must sum kernel-duration-us.
+        d1 = tmp_path / "merged_case" / "dfx_outputs"
+        d1.mkdir(parents=True)
+        (d1 / "merged_swimlane_0.json").write_text(
+            json.dumps(
+                {
+                    "traceEvents": [
+                        {"ph": "X", "cat": "event", "args": {"kernel-duration-us": 3.20}},
+                        {"ph": "X", "cat": "event", "args": {"kernel-duration-us": 3.26}},
+                        {"ph": "X", "cat": "other", "args": {"kernel-duration-us": 99.0}},
+                    ]
+                }
+            )
+        )
+        assert auto_layout_bench._extract_swimlane_aicore_us(tmp_path / "merged_case") == pytest.approx(6.46)
+
+        # 2. Real chip_swimlane_records.json (`aicore_tasks` + `clock_freq_hz=50_000_000`).
+        d2 = tmp_path / "records_case" / "dfx_outputs"
+        d2.mkdir(parents=True)
+        (d2 / "chip_swimlane_records.json").write_text(
+            json.dumps(
+                {
+                    "chip_swimlane_level": 1,
+                    "metadata": {"clock_freq_hz": 50_000_000},
+                    "aicore_tasks": [
+                        [0, 1, 1, 1000, 1169, 94, 112],
+                    ],
+                }
+            )
+        )
+        assert auto_layout_bench._extract_swimlane_aicore_us(tmp_path / "records_case") == pytest.approx(
+            169.0 * 1e6 / 50_000_000
+        )
+
+        # 3. Negative-slope measurements surface fallback_params instead of silent defaults.
+        set_backend_type(BackendType.Ascend910)
+        base_model = LayoutCostModel(expected_uses=100, backend_type=BackendType.Ascend910)
+        neg_meas: list[CalibrationMeasurement] = []
+        for s_idx, (m_dim, k_dim, n_dim) in enumerate(
+            [(64, 128, 64), (64, 256, 64), (128, 128, 64), (128, 128, 128)]
+        ):
+            case = auto_layout_bench.build_single_matmul_case(
+                m_dim, k_dim, n_dim, expected_uses=100, seed=s_idx
+            )
+            inst = extract_layout_instance(run_pre_layout_passes(case.program), cost_model=base_model)
+            for v_idx, bd in enumerate(enumerate_assignments(inst, deduplicate=True)):
+                load_b = sum(
+                    float(inst.values[op.output].byte_size)
+                    for op in inst.operations
+                    if op.op_name == "tile.load"
+                )
+                store_b = sum(
+                    float(inst.values[op.inputs[0]].byte_size)
+                    for op in inst.operations
+                    if op.op_name == "tile.store"
+                )
+                # Deliberately invert sign on load/store bytes so all 4 bandwidth slopes <= 0.
+                measured_us = 100.0 - 1e-4 * (load_b + store_b)
+                neg_meas.append(
+                    CalibrationMeasurement(
+                        variant_id=f"neg_{s_idx}_{v_idx}",
+                        measured_us=measured_us,
+                        instance=inst,
+                        breakdown=bd,
+                    )
+                )
+        report = fit_cost_model_from_measurements(neg_meas, base_model)
+        assert set(report.fallback_params) == {
+            "mte2_nd2nz_bytes_per_cycle",
+            "mte2_nz2nz_bytes_per_cycle",
+            "fixpipe_acc_to_nd_bytes_per_cycle",
+            "fixpipe_acc_to_nz_bytes_per_cycle",
+        }
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

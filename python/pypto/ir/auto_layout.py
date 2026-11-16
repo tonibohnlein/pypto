@@ -1803,6 +1803,7 @@ class CalibrationReport:
     spearman_rho: float
     mape_percent: float
     residuals_us: dict[str, float]
+    fallback_params: tuple[str, ...] = ()
 
 
 def _rank_array(vals: Sequence[float]) -> np.ndarray:
@@ -1906,16 +1907,23 @@ def fit_cost_model_from_measurements(
     us_per_cycle = float(coef[5]) if coef[5] > 1e-6 else (1.0 / 1800.0)
     eff_freq_ghz = 1.0 / (us_per_cycle * 1000.0)
 
-    def _slope_to_bpc(slope_us_per_byte: float, fallback: float) -> float:
+    fallback_params: list[str] = []
+
+    def _slope_to_bpc(name: str, slope_us_per_byte: float, fallback: float) -> float:
         if slope_us_per_byte <= 1e-9:
+            fallback_params.append(name)
             return fallback
         return max(1.0, us_per_cycle / slope_us_per_byte)
 
     fitted = LayoutCostModel(
         expected_uses=model.expected_uses,
         backend_type=model.backend_type,
-        mte2_nd2nz_bytes_per_cycle=_slope_to_bpc(float(coef[1]), model.mte2_nd2nz_bytes_per_cycle),
-        mte2_nz2nz_bytes_per_cycle=_slope_to_bpc(float(coef[2]), model.mte2_nz2nz_bytes_per_cycle),
+        mte2_nd2nz_bytes_per_cycle=_slope_to_bpc(
+            "mte2_nd2nz_bytes_per_cycle", float(coef[1]), model.mte2_nd2nz_bytes_per_cycle
+        ),
+        mte2_nz2nz_bytes_per_cycle=_slope_to_bpc(
+            "mte2_nz2nz_bytes_per_cycle", float(coef[2]), model.mte2_nz2nz_bytes_per_cycle
+        ),
         mte2_nd2nz_row_penalty_cycles=0.0,
         mte2_vec_bytes_per_cycle=model.mte2_vec_bytes_per_cycle,
         mte1_l1_to_l0_bytes_per_cycle=model.mte1_l1_to_l0_bytes_per_cycle,
@@ -1924,10 +1932,10 @@ def fit_cost_model_from_measurements(
         cube_issue_overhead_cycles=model.cube_issue_overhead_cycles,
         vec_elements_per_cycle=model.vec_elements_per_cycle,
         fixpipe_acc_to_nd_bytes_per_cycle=_slope_to_bpc(
-            float(coef[3]), model.fixpipe_acc_to_nd_bytes_per_cycle
+            "fixpipe_acc_to_nd_bytes_per_cycle", float(coef[3]), model.fixpipe_acc_to_nd_bytes_per_cycle
         ),
         fixpipe_acc_to_nz_bytes_per_cycle=_slope_to_bpc(
-            float(coef[4]), model.fixpipe_acc_to_nz_bytes_per_cycle
+            "fixpipe_acc_to_nz_bytes_per_cycle", float(coef[4]), model.fixpipe_acc_to_nz_bytes_per_cycle
         ),
         gm_pack_bytes_per_cycle=model.gm_pack_bytes_per_cycle,
         gm_pack_fixed_cycles=model.gm_pack_fixed_cycles,
@@ -1949,6 +1957,7 @@ def fit_cost_model_from_measurements(
         spearman_rho=rho,
         mape_percent=mape,
         residuals_us=residuals,
+        fallback_params=tuple(fallback_params),
     )
 
 
