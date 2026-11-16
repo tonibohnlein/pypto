@@ -28,7 +28,9 @@ bool SupportsLogicalBufferScalar(const ir::CallPtr& call);
 // Narrow source ABI for point staging. This proves packed geometry, not input
 // address validity, external publication, alias disjointness or scalar readiness.
 bool IsBufferScalarGMSource(const ir::TensorTypePtr& tensor);
-bool SupportsBufferScalarTransfer(const std::vector<ir::ExprPtr>& args);
+// Direction is part of the contract: load reads four GM bytes; store writes
+// exactly four GM bytes. Both retain a complete aligned 32-byte local carrier.
+bool SupportsBufferScalarTransfer(const std::vector<ir::ExprPtr>& args, bool load);
 bool SupportsLogicalBufferScalarTransfer(const ir::CallPtr& call);
 // Native aligned DMA may write a dummy tail inside the complete private
 // carrier. Its sound write enclosure is 32 bytes; only one GM element is read.

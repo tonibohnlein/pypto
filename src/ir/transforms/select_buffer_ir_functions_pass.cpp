@@ -95,6 +95,7 @@ class BufferKernelSupport : public IRVisitor {
   bool has_load = false;
   bool has_fill = false;
   bool has_store = false;
+  bool has_scalar_write = false;
 
   static bool ConstantEquals(const ExprPtr& value, int64_t expected) {
     const auto constant = As<ConstInt>(value);
@@ -513,6 +514,10 @@ class BufferKernelSupport : public IRVisitor {
       admission.Require(call->args_.size() == 3, BufferAdmissionProperty::OperationRecipe);
       CheckTransferParameter(call, 2, false);
       CheckTransferTypes(call, false);
+      if (const auto destination = As<TensorType>(call->args_[2]->GetType());
+          destination && destination->shape_.size() == 1)
+        admission.Require(backend::SupportsLogicalBufferScalarTransfer(call),
+                          BufferAdmissionProperty::TransferTypes);
       const auto store_source = As<TileType>(call->args_[0]->GetType());
       const auto store_destination = As<TensorType>(call->args_[2]->GetType());
       const bool store_mode = store_source && store_destination &&
@@ -589,6 +594,9 @@ class BufferKernelSupport : public IRVisitor {
                             (!IsOp(call, "tile.read") || scalar_definition_ == call.get()) &&
                             views_.HasDenseRowPitch(call->args_[0]),
                         BufferAdmissionProperty::OperationRecipe);
+      // A qualified SetValue initializes the point consumed by a staged
+      // scalar store; that leaf need not contain an unrelated load or fill.
+      has_scalar_write |= admission.supported() && IsOp(call, "tile.write");
     } else if (const auto* indexed = backend::FindLogicalBufferIndexedRecipe(call->op_->name_)) {
       admission.Require(backend::SupportsLogicalBufferIndexed(*indexed, call) &&
                             (!indexed->scatter || indexed_.HasExclusiveZeroBase(call)),
@@ -1038,7 +1046,7 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper
     // complete candidate, otherwise the original Functional body is retained.
     if (context && context->GetEnablePyptoAutoSync() &&
         context->GetAutoSyncPolicy() == "conservative_prefix" && function->func_type_ == FunctionType::AIV)
-      function = StageBufferScalarReads(function);
+      function = StageBufferScalarAccesses(function);
   }
   const BufferAccTrimAnalysis acc_trims(function,
                                         !context || context->GetMemoryPlanner() != MemoryPlanner::PtoAS);
@@ -1079,8 +1087,9 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper
                                                   : function.get());
     support.admission.Require(valid.supported(), BufferAdmissionProperty::DynamicValidRecipe);
   }
-  support.admission.Require((support.has_load || support.has_fill) && support.has_store,
-                            BufferAdmissionProperty::KernelShape);
+  support.admission.Require(
+      (support.has_load || support.has_fill || support.has_scalar_write) && support.has_store,
+      BufferAdmissionProperty::KernelShape);
   auto selected = std::make_shared<Function>(support.admission.supported() ? *function : *original);
   selected->attrs_.emplace_back(kAttrBufferIrSelected, support.admission.supported());
   support.admission.AppendTo(*selected);

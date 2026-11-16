@@ -922,6 +922,10 @@ REGISTER_OP("tensor.write")
     // store to the same GM tensor, and rejects a function that mixes them.
     .set_arg_effect(0, ArgEffect::Write)
     .set_write_channel(WriteChannel::Scalar)
+    // The chaining result names the exact destination storage, not merely
+    // its logical lineage. Reuse only an already established input MemRef;
+    // this declaration does not allocate a distributed runtime window.
+    .set_output_reuses_input(0)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTensorWriteType(args, kwargs);

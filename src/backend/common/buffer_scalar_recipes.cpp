@@ -61,17 +61,17 @@ bool IsBufferScalarGMSource(const ir::TensorTypePtr& tensor) {
   return stride && stride->value_ == 1;
 }
 
-bool SupportsBufferScalarTransfer(const std::vector<ir::ExprPtr>& args) {
+bool SupportsBufferScalarTransfer(const std::vector<ir::ExprPtr>& args, bool load) {
   if (args.size() != 4) return false;
   for (const auto& arg : args)
     if (!arg) return false;
-  const auto source = ir::As<ir::TensorType>(args[0]->GetType());
-  const auto destination = ir::As<ir::BufferType>(args[3]->GetType());
+  const auto tensor = ir::As<ir::TensorType>(args[load ? 0 : 3]->GetType());
+  const auto carrier = ir::As<ir::BufferType>(args[load ? 3 : 0]->GetType());
   const auto offsets = ir::As<ir::MakeTuple>(args[1]);
   const auto valid = ir::As<ir::MakeTuple>(args[2]);
-  if (!IsBufferScalarGMSource(source) || !IsAlignedDenseVecBufferGeometry(destination) ||
-      destination->dtype_ != DataType::INT32 || destination->shape_ != std::vector<int64_t>{1, 8} ||
-      destination->valid_shape_ != std::vector<int64_t>{1, 1} || !offsets || offsets->elements_.size() != 1 ||
+  if (!IsBufferScalarGMSource(tensor) || !IsAlignedDenseVecBufferGeometry(carrier) ||
+      carrier->dtype_ != DataType::INT32 || carrier->shape_ != std::vector<int64_t>{1, 8} ||
+      carrier->valid_shape_ != std::vector<int64_t>{1, 1} || !offsets || offsets->elements_.size() != 1 ||
       !valid || valid->elements_.size() != 1)
     return false;
   const auto extent = ir::As<ir::ConstInt>(valid->elements_[0]);
@@ -81,13 +81,24 @@ bool SupportsBufferScalarTransfer(const std::vector<ir::ExprPtr>& args) {
       !(index_type->dtype_ == DataType::INDEX || index_type->dtype_.IsSignedInt()))
     return false;
   const auto index = ir::As<ir::ConstInt>(offsets->elements_[0]);
-  const auto length = ir::As<ir::ConstInt>(source->shape_[0]);
-  // Symbolic indices retain the original defined tensor.read precondition.
+  const auto length = ir::As<ir::ConstInt>(tensor->shape_[0]);
+  // Symbolic indices retain the original defined tensor.read/write precondition.
   // Do not manufacture an in-bounds predicate or silently clamp the address.
   return !index || (index->value_ >= 0 && (!length || index->value_ < length->value_));
 }
 
 bool SupportsLogicalBufferScalarTransfer(const ir::CallPtr& call) {
+  if (ir::IsOp(call, "tile.store")) {
+    if (call->args_.size() != 3 || !call->args_[0] || !call->args_[1] || !call->args_[2]) return false;
+    const auto descriptor = StaticLogicalBufferDescriptor(call->args_[0]->GetType());
+    if (!descriptor) return false;
+    const auto carrier = std::make_shared<ir::Var>("scalar_carrier_geometry", descriptor, call->span_);
+    const auto one = std::make_shared<ir::ConstInt>(1, DataType::INDEX, call->span_);
+    const auto valid = std::make_shared<ir::MakeTuple>(std::vector<ir::ExprPtr>{one}, call->span_);
+    // Vec-to-GM ND TSTORE has one four-byte burst for this valid unit view.
+    // This is the store geometry, not authorization from the TLOAD contract.
+    return SupportsBufferScalarTransfer({carrier, call->args_[1], valid, call->args_[2]}, false);
+  }
   if (!ir::IsOp(call, "tile.load") || call->args_.size() != 4) return false;
   const auto shape = ir::As<ir::MakeTuple>(call->args_[2]);
   const auto capacity =
@@ -97,7 +108,7 @@ bool SupportsLogicalBufferScalarTransfer(const ir::CallPtr& call) {
   // Existing flattened-load semantics keep tensor-side rank-one window
   // coordinates while the physical tile descriptor is two-dimensional.
   const auto carrier = std::make_shared<ir::Var>("scalar_carrier_geometry", descriptor, call->span_);
-  return SupportsBufferScalarTransfer({call->args_[0], call->args_[1], call->args_[3], carrier});
+  return SupportsBufferScalarTransfer({call->args_[0], call->args_[1], call->args_[3], carrier}, true);
 }
 
 bool SupportsLogicalBufferScalar(const ir::CallPtr& call) {

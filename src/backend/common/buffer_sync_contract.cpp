@@ -95,12 +95,13 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
     const bool load = IsOp(call, "buffer.load");
     if (const auto tensor = As<ir::TensorType>(call->args_[load ? 0 : 3]->GetType());
         tensor && tensor->shape_.size() == 1) {
-      CHECK(load && core == FunctionType::AIV && target == "a2a3" &&
-            SupportsBufferScalarTransfer(call->args_))
+      CHECK(core == FunctionType::AIV && target == "a2a3" && SupportsBufferScalarTransfer(call->args_, load))
           << "Rank-one scalar DMA requires the qualified A2/A3 AIV INT32 point-transfer contract";
-      // Native DMA reads one GM element and may write a dummy alignment tail
-      // inside the complete 32-byte carrier. Conservative import covers that
-      // entire Vec domain; no exact physical selector is granted here.
+      // TLOAD reads one GM element and may write a local alignment tail;
+      // TSTORE writes exactly one GM element. Its selected ND unit view gives
+      // nBurst=1,lenBurst=4 in TStoreUb2gmNd2nd, then the A2/A3 b32 intrinsic.
+      // Both retain the normative selected native DMA contract. Conservative
+      // import covers the full carrier; no exact physical selector is granted.
       result.audited_signal_free_variant_ = true;
     }
     const auto local = As<BufferType>(call->args_[load ? 3 : 0]->GetType());
