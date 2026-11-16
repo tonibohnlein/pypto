@@ -26,8 +26,9 @@ using Family = PhysicalSyncFamily;
 PhysicalSyncRealization RealizeDirectSync(const CompactSyncInput& input, std::vector<Family> families,
                                           const DirectSyncOrder& order, const std::string& target,
                                           const std::optional<std::vector<int>>& restricted,
-                                          const SyncSchedulePolicy& policy) {
-  auto result = AllocateDirectSync(input, std::move(families), order, target, restricted);
+                                          const SyncSchedulePolicy& policy,
+                                          const SyncNativeReservations& extra_reservations) {
+  auto result = AllocateDirectSync(input, std::move(families), order, target, restricted, extra_reservations);
   result.function = physical::CompileAssignedSyncSchedule(
       input.owner, {{&input, result.assignment, &result}},
       input.block_bounds.value_or(std::make_pair(static_cast<int64_t>(0), static_cast<int64_t>(0))), policy);

@@ -1317,6 +1317,21 @@ class Importer {
     return x->second.first == y->second.first && x->second.step == y->second.step &&
            x->second.frame == y->second.frame && x->second.scope == y->second.scope;
   }
+  static bool IsInitializationContinuationBranch(const IfStmtPtr& branch) {
+    if (!branch || !branch->else_body_ || !branch->return_vars_.empty()) return false;
+    auto single_call = [](const StmtPtr& stmt) -> CallPtr {
+      StmtPtr leaf = stmt;
+      if (const auto seq = As<SeqStmts>(leaf)) {
+        if (seq->stmts_.size() != 1) return nullptr;
+        leaf = seq->stmts_.front();
+      }
+      const auto eval = As<EvalStmt>(leaf);
+      return eval ? As<Call>(eval->expr_) : nullptr;
+    };
+    const auto first = single_call(branch->then_body_);
+    const auto later = single_call(*branch->else_body_);
+    return first && later && IsOp(first, "buffer.matmul") && IsOp(later, "buffer.matmul_acc");
+  }
   void Body(const StmtPtr& stmt, SyncSegment& segment) {
     bool preceding_matrix = false;
     for (const auto& s : Statements(stmt)) {
@@ -1328,7 +1343,7 @@ class Importer {
         segment.sites.push_back(Site(call, segment));
         preceding_matrix |= segment.sites.back().pipe == PipeType::M;
       } else if (auto branch = As<IfStmt>(s)) {
-        if (branch->return_vars_.empty()) {
+        if (branch->return_vars_.empty() && !IsInitializationContinuationBranch(branch)) {
           if (const auto verdict = EvaluateStaticBranchCondition(branch->condition_, segment)) {
             result.static_branches[branch.get()] = *verdict;
             if (*verdict) {
@@ -1517,7 +1532,7 @@ SyncRegion ImportStructuredBody(Importer& importer, const StmtPtr& statement,
       }
       parents.pop_back();
     } else if (auto branch = As<IfStmt>(child)) {
-      if (branch->return_vars_.empty()) {
+      if (branch->return_vars_.empty() && !Importer::IsInitializationContinuationBranch(branch)) {
         if (const auto verdict = importer.EvaluateStaticBranchCondition(branch->condition_, finite)) {
           importer.result.static_branches[branch.get()] = *verdict;
           const std::optional<StmtPtr> live_arm =

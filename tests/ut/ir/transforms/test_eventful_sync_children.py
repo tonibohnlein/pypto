@@ -200,6 +200,20 @@ def test_missing_child_entry_rearm_or_capacity_is_an_explicit_refusal():
                         ):
                             removed = True
                             position += 4
+                        elif (
+                            isinstance(publication, ir.AssignStmt)
+                            and isinstance(publication.value, ir.Call)
+                            and publication.value.op.name == ir.get_op("sync.record").name
+                            and publication.value.kwargs["pipe"] in (int(ir.PipeType.MTE1), int(ir.PipeType.M))
+                            and isinstance(acquisition, ir.EvalStmt)
+                            and isinstance(acquisition.expr, ir.Call)
+                            and acquisition.expr.op.name == ir.get_op("sync.wait").name
+                            and acquisition.expr.kwargs["dst_pipe"] in (int(ir.PipeType.MTE1), int(ir.PipeType.M))
+                            and acquisition.expr.kwargs["dst_pipe"] != publication.value.kwargs["pipe"]
+                            and acquisition.expr.args[0] is publication.var
+                        ):
+                            removed = True
+                            position += 2
                         else:
                             kept.append(publication)
                             position += 1

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
+#include "src/ir/transforms/utils/physical_sync_allocation.h"
 
 namespace pypto::ir::sync {
 // Syntactic routing only; this does not establish matching, resource, or native
@@ -32,6 +33,7 @@ bool QualifyLocalSyncInvocation(const FunctionPtr& function, const std::string& 
 // No required-order analysis or numerical occurrence inventory is consulted.
 std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     const FunctionPtr& function, const std::string& target,
-    const std::optional<std::vector<int>>& eligible_ids);
+    const std::optional<std::vector<int>>& eligible_ids,
+    const SyncNativeReservations& extra_reservations = {});
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_CLOSED_PREFIX_SYNC_H_

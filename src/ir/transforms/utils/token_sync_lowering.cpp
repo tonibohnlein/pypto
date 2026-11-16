@@ -19,11 +19,14 @@
 
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -132,8 +135,13 @@ struct Handoff {
 class FiniteLowering {
  public:
   FiniteLowering(const FunctionPtr& function, CompactSyncInput input, const std::string& target,
-                 const std::optional<std::vector<int>>& eligible)
-      : function_(function), input_(std::move(input)), target_(target), eligible_(eligible) {
+                 const std::optional<std::vector<int>>& eligible,
+                 SyncNativeReservations extra_reservations = {})
+      : function_(function),
+        input_(std::move(input)),
+        target_(target),
+        eligible_(eligible),
+        extra_reservations_(std::move(extra_reservations)) {
     for (const auto& segment : input_.segments) {
       CHECK(!segment.original_loop && segment.nested_frames.empty() && segment.count == 1)
           << "LowerSync structured token transport is unavailable";
@@ -150,6 +158,8 @@ class FiniteLowering {
     auto reservations = SyncNativeClaims(input_, target_);
     for (const auto& [direction, ids] : reservations)
       for (int id : ids) result_.native_reserved_ids.emplace_back(direction.first, direction.second, id);
+    for (const auto& [direction, ids] : extra_reservations_)
+      reservations[direction].insert(ids.begin(), ids.end());
     std::map<SyncDirection, std::vector<size_t>> directions;
     for (size_t i = 0; i < handoffs_.size(); ++i)
       directions[{records_[handoffs_[i].record].pipe, handoffs_[i].destination}].push_back(i);
@@ -212,6 +222,7 @@ class FiniteLowering {
   CompactSyncInput input_;
   std::string target_;
   const std::optional<std::vector<int>>& eligible_;
+  SyncNativeReservations extra_reservations_;
   std::map<const Call*, PipeType> pipes_;
   std::map<const Var*, Token> variables_;
   std::map<const Expr*, Token> values_;
@@ -385,18 +396,439 @@ void CheckGeneratedLogicalSync(const FunctionPtr& function) {
         << diagnostics.front().message;
   }
 }
+namespace {
+
+// #3375 Pass 2 (`OptimizeSync`):
+// 1. Forward CFG simplification over SyncTokenType values:
+//    - eliminate waits on `sync.completed` / completed aliases,
+//    - simplify `sync.join` with completed/identical operands,
+//    - eliminate dominated duplicate `(token, dst)` waits,
+//    - eliminate intra-bundle FIFO-subsumed waits on the same producer pipe.
+// 2. Backward liveness DCE removing dead `sync.record`/`sync.completed`/`sync.join` bindings.
+class ForwardSyncOptimizer : public IRMutator {
+ public:
+  StmtPtr Run(const StmtPtr& body) {
+    waited_.clear();
+    completed_.clear();
+    local_record_.clear();
+    alias_of_.clear();
+    record_seq_ = 0;
+    scope_depth_ = 0;
+    next_scope_id_ = 1;
+    return VisitStmt(body);
+  }
+
+ protected:
+  StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
+    std::vector<StmtPtr> rewritten;
+    rewritten.reserve(op->stmts_.size());
+    for (const auto& child : op->stmts_) {
+      auto next = VisitStmt(child);
+      if (const auto nested = As<SeqStmts>(next)) {
+        for (const auto& s : nested->stmts_) rewritten.push_back(s);
+      } else {
+        rewritten.push_back(std::move(next));
+      }
+    }
+    std::vector<StmtPtr> pruned;
+    pruned.reserve(rewritten.size());
+    size_t i = 0;
+    while (i < rewritten.size()) {
+      auto wait_info = ParseWait(rewritten[i]);
+      if (!wait_info) {
+        pruned.push_back(std::move(rewritten[i++]));
+        continue;
+      }
+      size_t j = i;
+      struct BundleWait {
+        StmtPtr stmt;
+        const Var* tok;
+        PipeType dst;
+        bool drop = false;
+      };
+      std::vector<BundleWait> bundle;
+      while (j < rewritten.size()) {
+        auto info = ParseWait(rewritten[j]);
+        if (!info) break;
+        bundle.push_back({rewritten[j], info->first.get(), info->second, false});
+        ++j;
+      }
+      for (size_t a = 0; a < bundle.size(); ++a) {
+        const auto rec_a = local_record_.find(bundle[a].tok);
+        if (rec_a == local_record_.end()) continue;
+        for (size_t b = a + 1; b < bundle.size(); ++b) {
+          if (bundle[b].dst != bundle[a].dst) continue;
+          const auto rec_b = local_record_.find(bundle[b].tok);
+          if (rec_b == local_record_.end()) continue;
+          if (rec_a->second.pipe == rec_b->second.pipe &&
+              rec_a->second.scope_id == rec_b->second.scope_id &&
+              rec_a->second.seq < rec_b->second.seq) {
+            bundle[a].drop = true;
+            break;
+          }
+        }
+      }
+      for (auto& item : bundle) {
+        if (!item.drop) pruned.push_back(std::move(item.stmt));
+      }
+      i = j;
+    }
+    return std::make_shared<SeqStmts>(std::move(pruned), op->span_);
+  }
+
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    if (!As<SyncTokenType>(op->var_->GetType())) return op;
+    alias_of_.erase(op->var_.get());
+    for (auto it = waited_.begin(); it != waited_.end();) {
+      if (it->first == op->var_.get())
+        it = waited_.erase(it);
+      else
+        ++it;
+    }
+    auto bind_alias = [&](const VarPtr& target, const VarPtr& rhs) -> StmtPtr {
+      const VarPtr root = Canonical(rhs);
+      alias_of_[target.get()] = root;
+      if (completed_.count(root.get())) completed_.insert(target.get());
+      if (const auto rec = local_record_.find(root.get()); rec != local_record_.end()) {
+        local_record_[target.get()] = rec->second;
+      }
+      return rhs.get() == root.get()
+                 ? StmtPtr(std::make_shared<AssignStmt>(target, root, op->span_, op->leading_comments_))
+                 : StmtPtr(std::make_shared<AssignStmt>(target, root, op->span_, op->leading_comments_));
+    };
+    if (const auto rhs_var = As<Var>(op->value_)) {
+      const VarPtr root = Canonical(rhs_var);
+      alias_of_[op->var_.get()] = root;
+      if (completed_.count(root.get())) completed_.insert(op->var_.get());
+      if (const auto rec = local_record_.find(root.get()); rec != local_record_.end()) {
+        local_record_[op->var_.get()] = rec->second;
+      }
+      return root.get() == rhs_var.get()
+                 ? StmtPtr(op)
+                 : std::make_shared<AssignStmt>(op->var_, root, op->span_, op->leading_comments_);
+    }
+    if (const auto call = As<Call>(op->value_)) {
+      if (IsOp(call, "sync.completed")) {
+        completed_.insert(op->var_.get());
+        return op;
+      }
+      if (IsOp(call, "sync.record")) {
+        local_record_[op->var_.get()] = {Pipe(call, "pipe"), scope_depth_, record_seq_++};
+        return op;
+      }
+      if (IsOp(call, "sync.join") && call->args_.size() == 2) {
+        const auto a = As<Var>(call->args_[0]);
+        const auto b = As<Var>(call->args_[1]);
+        const VarPtr ca = a ? Canonical(a) : VarPtr{};
+        const VarPtr cb = b ? Canonical(b) : VarPtr{};
+        if (ca && cb && ca.get() == cb.get()) {
+          return bind_alias(op->var_, ca);
+        }
+        if (ca && completed_.count(ca.get())) {
+          if (cb) return bind_alias(op->var_, cb);
+          return std::make_shared<AssignStmt>(op->var_, call->args_[1], op->span_, op->leading_comments_);
+        }
+        if (cb && completed_.count(cb.get())) {
+          if (ca) return bind_alias(op->var_, ca);
+          return std::make_shared<AssignStmt>(op->var_, call->args_[0], op->span_, op->leading_comments_);
+        }
+      }
+    }
+    return op;
+  }
+
+  StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
+    const auto info = ParseWait(op);
+    if (!info) return op;
+    const VarPtr root = Canonical(info->first);
+    if (completed_.count(root.get()) || !waited_.emplace(root.get(), info->second).second) {
+      return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, op->span_);
+    }
+    if (root.get() != info->first.get()) {
+      const auto old_call = As<Call>(op->expr_);
+      auto new_call = OpRegistry::GetInstance().Create(old_call->op_->name_, {root}, old_call->kwargs_,
+                                                       old_call->span_);
+      return std::make_shared<EvalStmt>(std::move(new_call), op->span_, op->leading_comments_);
+    }
+    return op;
+  }
+
+  StmtPtr VisitStmt_(const IfStmtPtr& op) override {
+    const auto saved_waited = waited_;
+    const auto saved_completed = completed_;
+    const auto saved_aliases = alias_of_;
+    scope_depth_ = next_scope_id_++;
+    StmtPtr then_body = VisitStmt(op->then_body_);
+    const auto then_waited = waited_;
+    waited_ = saved_waited;
+    completed_ = saved_completed;
+    alias_of_ = saved_aliases;
+    std::optional<StmtPtr> else_body;
+    if (op->else_body_) {
+      scope_depth_ = next_scope_id_++;
+      else_body = VisitStmt(*op->else_body_);
+    }
+    const auto& else_waited = op->else_body_ ? waited_ : saved_waited;
+    waited_.clear();
+    for (const auto& entry : then_waited) {
+      if (else_waited.count(entry)) waited_.insert(entry);
+    }
+    completed_ = saved_completed;
+    alias_of_ = saved_aliases;
+    scope_depth_ = next_scope_id_++;
+    return std::make_shared<IfStmt>(op->condition_, then_body, else_body, op->return_vars_, op->span_,
+                                    op->leading_comments_);
+  }
+
+  StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+    std::set<const Var*> loop_vars;
+    loop_vars.insert(op->loop_var_.get());
+    for (const auto& arg : op->iter_args_) loop_vars.insert(arg.get());
+    const auto saved_waited = waited_;
+    const auto saved_completed = completed_;
+    const auto saved_aliases = alias_of_;
+    for (auto it = waited_.begin(); it != waited_.end();) {
+      if (loop_vars.count(it->first))
+        it = waited_.erase(it);
+      else
+        ++it;
+    }
+    const size_t outer_scope = next_scope_id_++;
+    scope_depth_ = next_scope_id_++;
+    StmtPtr body = VisitStmt(op->body_);
+    waited_ = saved_waited;
+    completed_ = saved_completed;
+    alias_of_ = saved_aliases;
+    scope_depth_ = outer_scope;
+    return std::make_shared<ForStmt>(op->loop_var_, op->start_, op->stop_, op->step_, op->iter_args_, body,
+                                     op->return_vars_, op->span_, op->kind_, op->attrs_, op->leading_comments_,
+                                     op->hardware_loop_policy_);
+  }
+
+  StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
+    std::set<const Var*> loop_vars;
+    for (const auto& arg : op->iter_args_) loop_vars.insert(arg.get());
+    const auto saved_waited = waited_;
+    const auto saved_completed = completed_;
+    const auto saved_aliases = alias_of_;
+    for (auto it = waited_.begin(); it != waited_.end();) {
+      if (loop_vars.count(it->first))
+        it = waited_.erase(it);
+      else
+        ++it;
+    }
+    const size_t outer_scope = next_scope_id_++;
+    scope_depth_ = next_scope_id_++;
+    StmtPtr body = VisitStmt(op->body_);
+    waited_ = saved_waited;
+    completed_ = saved_completed;
+    alias_of_ = saved_aliases;
+    scope_depth_ = outer_scope;
+    return std::make_shared<WhileStmt>(op->condition_, op->iter_args_, body, op->return_vars_, op->span_,
+                                       op->leading_comments_);
+  }
+
+ private:
+  struct RecordInfo {
+    PipeType pipe;
+    size_t scope_id;
+    size_t seq;
+  };
+  VarPtr Canonical(VarPtr v) const {
+    while (v) {
+      const auto it = alias_of_.find(v.get());
+      if (it == alias_of_.end() || it->second.get() == v.get()) break;
+      v = it->second;
+    }
+    return v;
+  }
+  static std::optional<std::pair<VarPtr, PipeType>> ParseWait(const StmtPtr& stmt) {
+    const auto eval = As<EvalStmt>(stmt);
+    const auto call = eval ? As<Call>(eval->expr_) : nullptr;
+    if (!call || !IsOp(call, "sync.wait") || call->args_.empty()) return std::nullopt;
+    const auto tok = As<Var>(call->args_[0]);
+    if (!tok) return std::nullopt;
+    return std::make_pair(tok, Pipe(call, "dst_pipe"));
+  }
+  std::set<std::pair<const Var*, PipeType>> waited_;
+  std::unordered_set<const Var*> completed_;
+  std::unordered_map<const Var*, RecordInfo> local_record_;
+  std::unordered_map<const Var*, VarPtr> alias_of_;
+  size_t record_seq_ = 0;
+  size_t scope_depth_ = 0;
+  size_t next_scope_id_ = 1;
+};
+
+class SyncLivenessCollector : public IRVisitor {
+ public:
+  std::unordered_set<const Var*> Solve(const StmtPtr& body) {
+    VisitStmt(body);
+    std::deque<const Var*> work(live_.begin(), live_.end());
+    while (!work.empty()) {
+      const Var* cur = work.front();
+      work.pop_front();
+      if (const auto found = deps_.find(cur); found != deps_.end()) {
+        for (const Var* next : found->second) {
+          if (live_.insert(next).second) work.push_back(next);
+        }
+      }
+    }
+    return live_;
+  }
+
+ protected:
+  void VisitExpr_(const VarPtr& var) override {
+    if (As<SyncTokenType>(var->GetType())) live_.insert(var.get());
+  }
+
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    if (!As<SyncTokenType>(op->var_->GetType())) {
+      IRVisitor::VisitStmt_(op);
+      return;
+    }
+    auto& dst = deps_[op->var_.get()];
+    if (const auto v = As<Var>(op->value_)) {
+      dst.push_back(v.get());
+      return;
+    }
+    if (const auto call = As<Call>(op->value_)) {
+      if (IsOp(call, "sync.completed") || IsOp(call, "sync.record")) return;
+      if (IsOp(call, "sync.join")) {
+        for (const auto& arg : call->args_) {
+          if (const auto v = As<Var>(arg)) dst.push_back(v.get());
+        }
+        return;
+      }
+    }
+    IRVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const IfStmtPtr& op) override {
+    VisitExpr(op->condition_);
+    std::vector<std::vector<const Var*>> targets(op->return_vars_.size());
+    for (size_t i = 0; i < op->return_vars_.size(); ++i) targets[i].push_back(op->return_vars_[i].get());
+    active_yield_targets_.push_back(std::move(targets));
+    VisitStmt(op->then_body_);
+    if (op->else_body_) VisitStmt(*op->else_body_);
+    active_yield_targets_.pop_back();
+  }
+
+  void VisitStmt_(const ForStmtPtr& op) override {
+    VisitExpr(op->start_);
+    VisitExpr(op->stop_);
+    VisitExpr(op->step_);
+    LinkLoop(op->iter_args_, op->return_vars_, op->body_);
+  }
+
+  void VisitStmt_(const WhileStmtPtr& op) override {
+    VisitExpr(op->condition_);
+    LinkLoop(op->iter_args_, op->return_vars_, op->body_);
+  }
+
+  void VisitStmt_(const YieldStmtPtr& op) override {
+    // Yielded SyncToken variables remain referenced inside YieldStmt unless the
+    // enclosing IfStmt/loop return arity is also pruned; keep them alive.
+    for (const auto& val : op->value_) VisitExpr(val);
+    if (active_yield_targets_.empty() || active_yield_targets_.back().size() != op->value_.size()) {
+      return;
+    }
+    const auto& targets = active_yield_targets_.back();
+    for (size_t i = 0; i < targets.size(); ++i) {
+      if (const auto v = As<Var>(op->value_[i]); v && As<SyncTokenType>(v->GetType())) {
+        for (const Var* target : targets[i]) deps_[target].push_back(v.get());
+      }
+    }
+  }
+
+ private:
+  void LinkLoop(const std::vector<IterArgPtr>& iter_args, const std::vector<VarPtr>& return_vars,
+                const StmtPtr& body) {
+    std::vector<std::vector<const Var*>> targets(iter_args.size());
+    for (size_t i = 0; i < iter_args.size(); ++i) {
+      const auto& arg = iter_args[i];
+      VisitExpr(arg->initValue_);
+      if (As<SyncTokenType>(arg->GetType())) {
+        if (const auto init_v = As<Var>(arg->initValue_)) deps_[arg.get()].push_back(init_v.get());
+        targets[i].push_back(arg.get());
+        if (i < return_vars.size()) {
+          deps_[return_vars[i].get()].push_back(arg.get());
+          if (const auto init_v = As<Var>(arg->initValue_))
+            deps_[return_vars[i].get()].push_back(init_v.get());
+          targets[i].push_back(return_vars[i].get());
+        }
+      }
+    }
+    active_yield_targets_.push_back(std::move(targets));
+    VisitStmt(body);
+    active_yield_targets_.pop_back();
+  }
+
+  std::unordered_set<const Var*> live_;
+  std::unordered_map<const Var*, std::vector<const Var*>> deps_;
+  std::vector<std::vector<std::vector<const Var*>>> active_yield_targets_;
+};
+
+class DeadSyncTokenEraser : public IRMutator {
+ public:
+  explicit DeadSyncTokenEraser(std::unordered_set<const Var*> live) : live_(std::move(live)) {}
+
+ protected:
+  StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
+    std::vector<StmtPtr> out;
+    out.reserve(op->stmts_.size());
+    for (const auto& child : op->stmts_) {
+      auto next = VisitStmt(child);
+      if (const auto nested = As<SeqStmts>(next)) {
+        for (const auto& s : nested->stmts_) out.push_back(s);
+      } else {
+        out.push_back(std::move(next));
+      }
+    }
+    return std::make_shared<SeqStmts>(std::move(out), op->span_);
+  }
+
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    if (As<SyncTokenType>(op->var_->GetType()) && !live_.count(op->var_.get())) {
+      if (const auto call = As<Call>(op->value_)) {
+        const auto kind = GetLogicalSyncKind(call->op_);
+        if (kind == LogicalSyncKind::Completed || kind == LogicalSyncKind::Record ||
+            kind == LogicalSyncKind::Join) {
+          return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, op->span_);
+        }
+      } else if (As<Var>(op->value_)) {
+        return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, op->span_);
+      }
+    }
+    return op;
+  }
+
+ private:
+  std::unordered_set<const Var*> live_;
+};
+
+}  // namespace
+
 FunctionPtr OptimizeLogicalSync(const FunctionPtr& function) {
   CheckLogicalSync(function);
-  // No logical rewrites are enabled yet. Assigned-ID control optimization is
-  // deliberately later, after physical handoffs and resource proofs exist.
-  return function;
+  if (!HasLogicalSync(function)) return function;
+  StmtPtr simplified = ForwardSyncOptimizer().Run(function->body_);
+  std::unordered_set<const Var*> live = SyncLivenessCollector().Solve(simplified);
+  StmtPtr cleaned = DeadSyncTokenEraser(std::move(live)).VisitStmt(simplified);
+  if (cleaned == function->body_) return function;
+  auto result = std::make_shared<Function>(
+      function->name_, function->params_, function->param_directions_, function->return_types_, cleaned,
+      function->span_, function->func_type_, function->level_, function->role_, function->attrs_,
+      function->requires_runtime_binding_, function->ir_stage_);
+  CheckLogicalSync(result);
+  return result;
 }
 LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::string& target,
                                     const std::optional<std::vector<int>>& eligible_ids,
                                     const SyncParameterBounds& parameters,
                                     std::optional<std::pair<int64_t, int64_t>> blocks,
                                     const SyncSchedulePolicy& policy, SyncExternalPolicy external_policy,
-                                    std::optional<int64_t> launch_count) {
+                                    std::optional<int64_t> launch_count,
+                                    const SyncNativeReservations& extra_reservations) {
   CheckLogicalSync(function);
   RequireBufferSyncScalarLayout(function);
   RequireBufferRuntimeValid(function);
@@ -408,10 +840,12 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
     return {function, 0, 0, {std::move(result)}};
   }
   FindLogical(true).VisitFunction(function);
-  if (auto closed = TryLowerClosedPrefixSync(function, target, eligible_ids)) {
-    CheckPhysicalSyncResult(closed->function);
-    FinishSyncScheduleReceipt(closed->function, *closed, policy);
-    return {closed->function, closed->set_sites, closed->wait_sites, {std::move(*closed)}};
+  if (HasOnlyClosedPrefixSyntax(function)) {
+    if (auto closed = TryLowerClosedPrefixSync(function, target, eligible_ids, extra_reservations)) {
+      CheckPhysicalSyncResult(closed->function);
+      FinishSyncScheduleReceipt(closed->function, *closed, policy);
+      return {closed->function, closed->set_sites, closed->wait_sites, {std::move(*closed)}};
+    }
   }
   class Structure : public IRVisitor {
    public:
@@ -424,7 +858,7 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
   structure.VisitFunction(function);
   if (structure.loop) {
     auto result = LowerStructuredLogicalSync(function, target, eligible_ids, parameters, blocks, policy,
-                                             external_policy, launch_count);
+                                             external_policy, launch_count, extra_reservations);
     CheckPhysicalSyncResult(result.function);
     return result;
   }
@@ -432,7 +866,8 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
   // No storage-demand importer or GM partition authorizes this lowering.
   // Actual token uses, including manually supplied ordering, are authoritative.
   auto input = ImportSyncPayloads(stripped, target, parameters, blocks, external_policy);
-  auto result = FiniteLowering(function, std::move(input), target, eligible_ids).Run();
+  auto result =
+      FiniteLowering(function, std::move(input), target, eligible_ids, extra_reservations).Run();
   CheckPhysicalSyncResult(result.function);
   FinishSyncScheduleReceipt(result.function, result, policy);
   return {result.function, result.set_sites, result.wait_sites, {std::move(result)}};

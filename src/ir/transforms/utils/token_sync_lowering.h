@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
+#include "src/ir/transforms/utils/physical_sync_allocation.h"
 
 namespace pypto::ir::sync {
 // Current payload/control/native qualification for token lowering. This does
@@ -63,7 +64,8 @@ LoweredLogicalSync LowerStructuredLogicalSync(
     const std::optional<std::vector<int>>& eligible_ids, const SyncParameterBounds& parameters = {},
     std::optional<std::pair<int64_t, int64_t>> blocks = std::nullopt, const SyncSchedulePolicy& policy = {},
     SyncExternalPolicy external_policy = SyncExternalPolicy::Geometry,
-    std::optional<int64_t> launch_count = std::nullopt);
+    std::optional<int64_t> launch_count = std::nullopt,
+    const SyncNativeReservations& extra_reservations = {});
 // Interpret actual logical token uses without substituting minimum demands.
 // The finite adapter keeps actual command cuts and has no payload families;
 // canonical structured transport certifies and retains direct-cut families.
@@ -73,6 +75,7 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
                                     std::optional<std::pair<int64_t, int64_t>> blocks = std::nullopt,
                                     const SyncSchedulePolicy& policy = {},
                                     SyncExternalPolicy external_policy = SyncExternalPolicy::Geometry,
-                                    std::optional<int64_t> launch_count = std::nullopt);
+                                    std::optional<int64_t> launch_count = std::nullopt,
+                                    const SyncNativeReservations& extra_reservations = {});
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_TOKEN_SYNC_LOWERING_H_
