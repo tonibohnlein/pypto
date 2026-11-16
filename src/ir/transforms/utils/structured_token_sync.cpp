@@ -61,7 +61,7 @@ PipeType Pipe(const CallPtr& call, const char* key) {
 }
 // The erased function is used for shared payload/native import and, only after
 // the parser certifies all actual token cuts, for shared direct-cut emission.
-class Erase : public IRMutator {
+class Erase : public SyncStatementMutator {
  public:
   explicit Erase(bool allow_nested = false) : allow_nested_(allow_nested) {}
   std::map<const ForStmt*, ForStmtPtr> loops;
@@ -502,7 +502,8 @@ class Order {
 }  // namespace
 StrippedLogicalSync StripStructuredLogicalSync(const FunctionPtr& function, bool allow_nested) {
   Erase erase(allow_nested);
-  auto stripped = erase.VisitFunction(function);
+  auto stripped = MutableCopy(function);
+  stripped->body_ = erase.VisitStmt(function->body_);
   return {std::move(stripped), std::move(erase.loops)};
 }
 LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const std::string& target,

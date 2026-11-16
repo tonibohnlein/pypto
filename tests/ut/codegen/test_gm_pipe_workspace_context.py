@@ -232,3 +232,13 @@ def test_unmanaged_direct_spelling_has_no_managed_pointer_or_offsets(gm_backend)
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_unrelated_peer_definition_does_not_acquire_workspace_ownership(gm_backend):
+    """Bundling a peer definition cannot manufacture a shared launch allocation."""
+    root = _function("root", [_workspace()], [_setup(pipe_id=0)])
+    peer = _function("peer", [_workspace()], [_setup(pipe_id=1)])
+    original = _program([root, peer])
+    context = codegen.GMPipeLayoutEvidence(original).bind_root(root)
+    with pytest.raises(ValueError, match="does not cover an emitted original setup"):
+        codegen.PTOCodegen().generate(original, workspace=context)

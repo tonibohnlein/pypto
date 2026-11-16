@@ -331,6 +331,7 @@ nav:
           - Statement-only Synchronization Rewriting: en/dev/ir/49-autosync-statement-rewrite.md
           - Verifier Expression DAG Plan: en/dev/ir/50-autosync-verifier-expression-dag.md
           - Existing Transport Capsule Plan: en/dev/ir/51-autosync-existing-transport-capsules.md
+          - Autosync Construction Repair: en/dev/ir/52-autosync-construction-repair.md
       - Passes:
           - en/dev/passes/index.md
           - en/dev/passes/00-pass_manager.md

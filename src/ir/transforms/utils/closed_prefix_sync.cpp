@@ -559,19 +559,20 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
         std::remove_if(unmarked->attrs_.begin(), unmarked->attrs_.end(),
                        [](const auto& attribute) { return attribute.first == kClosedSyncChildAttr; }),
         unmarked->attrs_.end());
-    class Replace : public IRMutator {
+    class Replace : public SyncStatementMutator {
      public:
       Replace(ForStmtPtr before, ForStmtPtr after) : before_(std::move(before)), after_(std::move(after)) {}
 
      protected:
       StmtPtr VisitStmt_(const ForStmtPtr& loop) override {
-        return loop == before_ ? after_ : IRMutator::VisitStmt_(loop);
+        return loop == before_ ? after_ : SyncStatementMutator::VisitStmt_(loop);
       }
 
      private:
       ForStmtPtr before_, after_;
     } replace(child, unmarked);
-    auto actual = replace.VisitFunction(context.binding_owner);
+    auto actual = MutableCopy(context.binding_owner);
+    actual->body_ = replace.VisitStmt(context.binding_owner->body_);
     std::optional<std::vector<int>> private_ids;
     if (intersection) private_ids = std::vector<int>(intersection->begin(), intersection->end());
     auto lowered = LowerLogicalSync(actual, target, private_ids, {}, std::nullopt, {}, external_policy);
