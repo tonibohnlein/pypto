@@ -1,0 +1,68 @@
+{
+  "status": "architecture accepted for implementation under existing normative TLOAD contract; implementation and semantic validation pending",
+  "date": "2026-11-16",
+  "parent_milestones": [
+    "M2",
+    "M3"
+  ],
+  "baseline_head": "005ebfd35d1b8955dbc1a8a8f7115d46471d57b4",
+  "native_pin": "5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f",
+  "existing_native_source_snapshots": {
+    "build-py314/packed-column-contract/TLoad.hpp": "28a849ffef4fcb7772b18e3f443bddea873cf9723c0849b620c4f2d6415f8ea6",
+    "build-py314/packed-column-contract/tload_common.hpp": "8fe56369f36a11f26c37e153063143c7f8ea8d0f93399613ac20bb239625f781"
+  },
+  "contracts": {
+    "core": "AIV",
+    "target": "A2/A3",
+    "source": "ordinary packed unpadded ND rank-one INT32 GM TensorType",
+    "source_read_bytes": 4,
+    "carrier_capacity_bytes": 32,
+    "carrier_shape": [
+      1,
+      8
+    ],
+    "carrier_valid": [
+      1,
+      1
+    ],
+    "native_carrier_writes": "sound 32-byte enclosure; padding values unobserved",
+    "source_alignment": "element alignment, not assumed 32-byte alignment",
+    "source_definedness": "original in-bounds nonwrapping read precondition; no invented caller bounds",
+    "result": "original ready scalar SSA after qualified MTE2-to-S service and local read",
+    "selectors": "rank-one exact GM export unavailable until separately implemented; never empty"
+  },
+  "native_sources": [
+    "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/docs/isa/TLOAD.md",
+    "https://www.hiascend.com/doc_center/source/zh/canncommercial/900/API/ascendcopapi/atlasascendc_api_07_0265.html"
+  ],
+  "required_gate": [
+    "pinned native byte-length/alignment/UB-tail binding",
+    "original ABI/root/index/control preservation",
+    "normal planner carrier allocation",
+    "actual demand coverage, matching, progress and causal physical reuse",
+    "all planners and Buffer-disabled behavior",
+    "no unqualified peer publication/polling or effectful control rewrite"
+  ],
+  "device_validation": false,
+  "implementation_changes": [],
+  "test_results": [],
+  "native_evidence_locator": {
+    "A2A3_product_and_INT32": "official DataCopyPad lines7\u20138,119\u2013126",
+    "source_destination_alignment": "official DataCopyPad lines141\u2013142",
+    "byte_length_range": "official DataCopyPad lines156\u2013157",
+    "mandatory_UB_dummy_tail": "official DataCopyPad lines188\u2013200"
+  },
+  "public_api_snapshot": {
+    "path": "build-py314/packed-column-contract/gm-scalar-public-api-snapshot.md",
+    "sha256": "aa0ef7e529ad4cf2562f22d35ea0e0493621955c89f01d9c2182297002d05b0c",
+    "source": "https://www.hiascend.com/doc_center/source/zh/canncommercial/900/API/ascendcopapi/atlasascendc_api_07_0265.html",
+    "retrieved": "2026-11-16",
+    "scope": "rendered authoritative API text; exact CCE intrinsic/public API mapping still pending review"
+  },
+  "review": {
+    "architecture": "accepted for implementation",
+    "native_correctness": "existing selected-TLOAD supplied contract",
+    "independently_reproduced_CCE_builtin_to_public_API_implementation": false,
+    "reason": "CANN headers absent locally; authoritative source service rate limited"
+  }
+}
