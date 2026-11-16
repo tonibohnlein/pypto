@@ -231,6 +231,7 @@ struct CompactSyncInput {
   std::optional<std::pair<int64_t, int64_t>> block_bounds;
   std::shared_ptr<const SyncInvocationCoordinate> invocation_coordinate;
   std::optional<SyncRegion> region_tree;
+  std::map<const IfStmt*, bool> static_branches;
   size_t coordinate_nodes = 0, coordinate_flatten_visits = 0, coordinate_coefficient_entries = 0;
   size_t interval_access_visits = 0, qualified_intervals = 0;
 };

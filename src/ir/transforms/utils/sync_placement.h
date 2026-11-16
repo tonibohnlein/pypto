@@ -75,6 +75,11 @@ class SyncPlacement : public IRMutator {
     return Wrap(op, it->second);
   }
   StmtPtr VisitStmt_(const IfStmtPtr& op) override {
+    if (const auto resolved = input_.static_branches.find(op.get()); resolved != input_.static_branches.end()) {
+      if (resolved->second) return VisitStmt(op->then_body_);
+      if (op->else_body_) return VisitStmt(*op->else_body_);
+      return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, op->span_);
+    }
     StmtPtr first = op->then_body_;
     if (auto seq = As<SeqStmts>(first)) {
       INTERNAL_CHECK(seq->stmts_.size() == 1) << "Changed admitted initialization branch";

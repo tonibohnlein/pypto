@@ -46,6 +46,7 @@ FunctionPtr OptimizeLogicalSync(const FunctionPtr& function);
 struct StrippedLogicalSync {
   FunctionPtr function;
   std::map<const ForStmt*, ForStmtPtr> loops;
+  std::map<const IfStmt*, IfStmtPtr> branches;
 };
 StrippedLogicalSync StripStructuredLogicalSync(const FunctionPtr& function, bool allow_nested);
 bool HasLogicalSync(const FunctionPtr& function);

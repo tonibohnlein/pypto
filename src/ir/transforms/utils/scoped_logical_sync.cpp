@@ -98,6 +98,7 @@ class ScopedRealizer : public IRMutator {
   }
   void Append(const CompactSyncResult& analysis, const ExprPtr& guard = nullptr) {
     CHECK(analysis.State().input.region_tree) << "Scoped logical transport requires an original region tree";
+    static_branches_ = analysis.State().input.static_branches;
     for (const auto& segment : analysis.State().input.segments)
       for (const auto& frame : segment.nested_frames)
         if (frame.count) active_loops_.insert(frame.loop.get());
@@ -122,6 +123,11 @@ class ScopedRealizer : public IRMutator {
     return found == cuts_.end() ? op : Wrap(op, *found->second);
   }
   StmtPtr VisitStmt_(const IfStmtPtr& op) override {
+    if (const auto resolved = static_branches_.find(op.get()); resolved != static_branches_.end()) {
+      if (resolved->second) return VisitStmt(op->then_body_);
+      if (op->else_body_) return VisitStmt(*op->else_body_);
+      return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, op->span_);
+    }
     // Qualified initialization/accumulation is one payload macro. Never move
     // a case record into an arm where its SSA fact would become conditional.
     // Only pointers already certified by the access importer identify the
@@ -205,6 +211,7 @@ class ScopedRealizer : public IRMutator {
   SyncTokenNames names_;
   const ForStmt* active_ = nullptr;
   std::set<const ForStmt*> active_loops_;
+  std::map<const IfStmt*, bool> static_branches_;
   std::map<const Call*, std::shared_ptr<LogicalCut>> cuts_;
   std::map<const ForStmt*, std::vector<Transport>> transports_;
 
