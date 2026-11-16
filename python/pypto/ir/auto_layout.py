@@ -1952,6 +1952,10 @@ class CalibrationMeasurement:
     label: str = ""
 
 
+def _empty_float_dict() -> dict[str, float]:
+    return {}
+
+
 @dataclass(frozen=True)
 class CalibrationReport:
     """Summary of fitting `LayoutCostModel` parameters to device measurements."""
@@ -1964,6 +1968,8 @@ class CalibrationReport:
     mape_percent: float
     residuals_us: dict[str, float]
     fallback_params: tuple[str, ...] = ()
+    effective_freq_fallback: bool = False
+    param_t_stats: dict[str, float] = field(default_factory=_empty_float_dict)
 
 
 def _rank_array(vals: Sequence[float]) -> np.ndarray:
@@ -1990,16 +1996,20 @@ def _spearman_rank_correlation(xs: Sequence[float], ys: Sequence[float]) -> floa
 def fit_cost_model_from_measurements(
     measurements: Sequence[CalibrationMeasurement],
     base_model: LayoutCostModel | None = None,
+    *,
+    nominal_freq_ghz: float = 1.8,
+    min_t_stat: float = 2.0,
+    max_physical_bpc: float = 1024.0,
 ) -> CalibrationReport:
     """Fit MTE2/FIXPIPE bandwidth coefficients & dispatch offset to measured latencies.
 
-    Decomposes each measured device execution time $T_{\\text{meas}}$ into:
+    Decomposes each measured single-run device execution time $T_{\\text{meas}}$ into:
     - Fixed dispatch/launch overhead $\\beta_0$ ($\\mu$s),
-    - `ND -> Mat` load bytes / `nd2nz_bw` ($\\text{bytes} \\cdot \\text{invocations}$),
+    - `ND -> Mat` load bytes / `nd2nz_bw` (per-run $\\text{bytes} \\cdot \\text{loop\\_trips}$),
     - `NZ -> Mat` load bytes / `nz2nz_bw`,
     - `Acc -> ND` store bytes / `store_nd_bw`,
     - `Acc -> NZ` store bytes / `store_nz_bw`, and
-    - Remaining modeled cycles (`MTE1` + `Cube` + other ops) scaled cleanly.
+    - Remaining modeled cycles (`MTE1` + `Cube` + other ops).
 
     Returns a calibrated `LayoutCostModel` plus goodness-of-fit diagnostics.
     """
@@ -2008,14 +2018,16 @@ def fit_cost_model_from_measurements(
         return CalibrationReport(
             fitted_model=model,
             fixed_overhead_us=0.0,
-            effective_freq_ghz=1.8,
+            effective_freq_ghz=nominal_freq_ghz,
             r2=1.0,
             spearman_rho=1.0,
             mape_percent=0.0,
             residuals_us={},
         )
 
-    # Extract per-measurement byte volumes by operation category.
+    # Extract per-run byte volumes and compute cycles by operation category.
+    # Solver `op.invocations` scales runtime costs by `expected_uses`; normalize
+    # back to a single kernel invocation to match single-run `measured_us`.
     # Features: [1.0, nd2nz_bytes, nz2nz_bytes, store_nd_bytes, store_nz_bytes, compute_cycles]
     rows_x: list[list[float]] = []
     rows_y: list[float] = []
@@ -2027,12 +2039,13 @@ def fit_cost_model_from_measurements(
         store_nd_b = 0.0
         store_nz_b = 0.0
         other_cycles = 0.0
+        run_scale = float(max(1, m.instance.cost_model.expected_uses))
 
         for op in m.instance.operations:
             cfg = m.breakdown.assignment.op_configs.get(op.op_id)
             if cfg is None:
                 continue
-            inv = float(op.invocations)
+            inv = float(op.invocations) / run_scale
             if op.op_name == _TILE_LOAD_OP and op.inputs:
                 dst_node = m.instance.values[op.output]
                 if dst_node.memory_space == core_ir.MemorySpace.Mat:
@@ -2058,31 +2071,63 @@ def fit_cost_model_from_measurements(
     y_vec = np.asarray(rows_y, dtype=np.float64)
     col_norms = np.sqrt(np.sum(x_mat * x_mat, axis=0))
     safe_scales = np.asarray([s if s > 0.0 else 1.0 for s in col_norms.tolist()], dtype=np.float64)
-    scaled_coef, _, _, _ = np.linalg.lstsq(x_mat / safe_scales, y_vec, rcond=None)
+    x_scaled = np.asarray(x_mat / safe_scales, dtype=np.float64)
+    scaled_coef, _, _, _ = np.linalg.lstsq(x_scaled, y_vec, rcond=None)
     coef = scaled_coef / safe_scales
     y_pred = x_mat @ coef
 
-    # Convert us/cycle & us/byte slopes back to cycle-domain bandwidths at nominal 1.8 GHz
-    # (1.8 cycles/ns = 1800 cycles/us) unless `other_cycles` slope yields an effective frequency.
-    us_per_cycle = float(coef[5]) if coef[5] > 1e-6 else (1.0 / 1800.0)
-    eff_freq_ghz = 1.0 / (us_per_cycle * 1000.0)
+    # OLS parameter standard errors (scaled back from normalized columns for stability).
+    n_cols = len(rows_x[0])
+    dof = max(1, len(rows_y) - n_cols)
+    rss = float(np.sum((y_vec - y_pred) ** 2))
+    sigma2 = rss / float(dof)
+    scales_list = [float(s) for s in safe_scales.tolist()]
+    gram: list[list[float]] = [
+        [sum((row[i] / scales_list[i]) * (row[j] / scales_list[j]) for row in rows_x) for j in range(n_cols)]
+        for i in range(n_cols)
+    ]
+    xtx_scaled_inv: np.ndarray = np.linalg.pinv(np.asarray(gram, dtype=np.float64))
+    se_list = [
+        math.sqrt(max(0.0, float(xtx_scaled_inv[j, j]) * sigma2)) / scales_list[j] for j in range(n_cols)
+    ]
+
+    # Reject non-physical clock estimates (negative or pipeline-overlapped > 3.5 GHz)
+    # so overlap in `other_cycles` cannot deflate fitted bandwidths.
+    raw_freq_ghz = (1.0 / (float(coef[5]) * 1000.0)) if float(coef[5]) > 1e-6 else 0.0
+    if 0.5 <= raw_freq_ghz <= 3.5:
+        us_per_cycle = float(coef[5])
+        eff_freq_ghz = raw_freq_ghz
+        freq_fallback = False
+    else:
+        us_per_cycle = 1.0 / (nominal_freq_ghz * 1000.0)
+        eff_freq_ghz = nominal_freq_ghz
+        freq_fallback = True
 
     fallback_params: list[str] = []
+    param_t_stats: dict[str, float] = {}
 
-    def _slope_to_bpc(name: str, slope_us_per_byte: float, fallback: float) -> float:
-        if slope_us_per_byte <= 1e-9:
+    def _slope_to_bpc(name: str, col_idx: int, fallback: float) -> float:
+        slope = float(coef[col_idx])
+        err = se_list[col_idx]
+        t_val = (slope / err) if err > 1e-18 else (float("inf") if slope > 1e-9 else 0.0)
+        param_t_stats[name] = float(t_val)
+        if slope <= 1e-9 or t_val < min_t_stat:
             fallback_params.append(name)
             return fallback
-        return max(1.0, us_per_cycle / slope_us_per_byte)
+        bpc = us_per_cycle / slope
+        if bpc > max_physical_bpc:
+            fallback_params.append(name)
+            return fallback
+        return max(1.0, bpc)
 
     fitted = LayoutCostModel(
         expected_uses=model.expected_uses,
         backend_type=model.backend_type,
         mte2_nd2nz_bytes_per_cycle=_slope_to_bpc(
-            "mte2_nd2nz_bytes_per_cycle", float(coef[1]), model.mte2_nd2nz_bytes_per_cycle
+            "mte2_nd2nz_bytes_per_cycle", 1, model.mte2_nd2nz_bytes_per_cycle
         ),
         mte2_nz2nz_bytes_per_cycle=_slope_to_bpc(
-            "mte2_nz2nz_bytes_per_cycle", float(coef[2]), model.mte2_nz2nz_bytes_per_cycle
+            "mte2_nz2nz_bytes_per_cycle", 2, model.mte2_nz2nz_bytes_per_cycle
         ),
         mte2_nd2nz_row_penalty_cycles=0.0,
         mte2_vec_bytes_per_cycle=model.mte2_vec_bytes_per_cycle,
@@ -2092,10 +2137,10 @@ def fit_cost_model_from_measurements(
         cube_issue_overhead_cycles=model.cube_issue_overhead_cycles,
         vec_elements_per_cycle=model.vec_elements_per_cycle,
         fixpipe_acc_to_nd_bytes_per_cycle=_slope_to_bpc(
-            "fixpipe_acc_to_nd_bytes_per_cycle", float(coef[3]), model.fixpipe_acc_to_nd_bytes_per_cycle
+            "fixpipe_acc_to_nd_bytes_per_cycle", 3, model.fixpipe_acc_to_nd_bytes_per_cycle
         ),
         fixpipe_acc_to_nz_bytes_per_cycle=_slope_to_bpc(
-            "fixpipe_acc_to_nz_bytes_per_cycle", float(coef[4]), model.fixpipe_acc_to_nz_bytes_per_cycle
+            "fixpipe_acc_to_nz_bytes_per_cycle", 4, model.fixpipe_acc_to_nz_bytes_per_cycle
         ),
         gm_pack_bytes_per_cycle=model.gm_pack_bytes_per_cycle,
         gm_pack_fixed_cycles=model.gm_pack_fixed_cycles,
@@ -2118,6 +2163,8 @@ def fit_cost_model_from_measurements(
         mape_percent=mape,
         residuals_us=residuals,
         fallback_params=tuple(fallback_params),
+        effective_freq_fallback=freq_fallback,
+        param_t_stats=param_t_stats,
     )
 
 

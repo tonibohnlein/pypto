@@ -559,6 +559,9 @@ class TestPassPipelineIntegrationAndCalibration:
         report = fit_cost_model_from_measurements(measurements, base_model)
         assert report.r2 > 0.999
         assert report.spearman_rho == pytest.approx(1.0)
+        assert report.effective_freq_ghz == pytest.approx(1.5, rel=1e-3)
+        assert report.effective_freq_fallback is False
+        assert report.fallback_params == ()
         assert report.fixed_overhead_us == pytest.approx(true_overhead_us, abs=1e-4)
         assert report.fitted_model.mte2_nd2nz_bytes_per_cycle == pytest.approx(true_nd2nz_bpc, rel=1e-3)
         assert report.fitted_model.mte2_nz2nz_bytes_per_cycle == pytest.approx(true_nz2nz_bpc, rel=1e-3)
@@ -765,6 +768,7 @@ class TestPassPipelineIntegrationAndCalibration:
         assert call_events.count("benchmark") == 32
         assert call_events.count("swimlane") == 32
         assert summary["calibration"]["num_measurements"] == 32
+        assert summary["calibration_effective"]["num_measurements"] == 32
         assert summary["calibration_swimlane"]["num_measurements"] == 32
         for c_rec in summary["cases"]:
             for v in c_rec["variants"]:
@@ -842,6 +846,69 @@ class TestPassPipelineIntegrationAndCalibration:
         assert set(report.fallback_params) == {
             "mte2_nd2nz_bytes_per_cycle",
             "mte2_nz2nz_bytes_per_cycle",
+            "fixpipe_acc_to_nd_bytes_per_cycle",
+            "fixpipe_acc_to_nz_bytes_per_cycle",
+        }
+
+    def test_fit_cost_model_normalizes_expected_uses_and_flags_overlapped_freq(self):
+        set_backend_type(BackendType.Ascend910)
+        base_model = LayoutCostModel(expected_uses=100, backend_type=BackendType.Ascend910)
+        nominal_us_per_cyc = 1.0 / (1.8 * 1000.0)
+        true_nd2nz_bpc = 75.0
+        true_nz2nz_bpc = 120.0
+        meas: list[CalibrationMeasurement] = []
+        for s_idx, (m_dim, k_dim, n_dim, kt, nt) in enumerate(
+            [
+                (64, 2048, 64, 256, None),
+                (64, 8192, 64, 256, None),
+                (64, 256, 2048, 256, 64),
+                (128, 1024, 1024, 128, 128),
+            ]
+        ):
+            case = auto_layout_bench.build_single_matmul_case(
+                m_dim, k_dim, n_dim, k_tile=kt, n_tile=nt, expected_uses=100, seed=s_idx
+            )
+            inst = extract_layout_instance(run_pre_layout_passes(case.program), cost_model=base_model)
+            for v_idx, bd in enumerate(enumerate_assignments(inst, deduplicate=True)):
+                run_scale = float(inst.cost_model.expected_uses)
+                nd2nz_b = nz2nz_b = other_cyc = 0.0
+                for op in inst.operations:
+                    cfg = bd.assignment.op_configs[op.op_id]
+                    inv = float(op.invocations) / run_scale
+                    if op.op_name == "tile.load":
+                        dst = inst.values[op.output]
+                        if dst.memory_space == ir.MemorySpace.Mat:
+                            if cfg.input_layouts[0] == ir.TensorLayout.NZ:
+                                nz2nz_b += inv * float(dst.byte_size)
+                            else:
+                                nd2nz_b += inv * float(dst.byte_size)
+                            continue
+                    elif op.op_name == "tile.store":
+                        continue
+                    other_cyc += inv * cfg.op_cost_cycles
+
+                # Simulate pipelined execution: `other_cyc` contributes only 25% non-overlapped
+                # (~7.2 GHz raw slope) and FIXPIPE stores add ~0 delta.
+                measured_us = (
+                    16.0
+                    + nominal_us_per_cyc * (nd2nz_b / true_nd2nz_bpc + nz2nz_b / true_nz2nz_bpc)
+                    + 0.25 * nominal_us_per_cyc * other_cyc
+                )
+                meas.append(
+                    CalibrationMeasurement(
+                        variant_id=f"pipe_{s_idx}_{v_idx}",
+                        measured_us=measured_us,
+                        instance=inst,
+                        breakdown=bd,
+                    )
+                )
+
+        report = fit_cost_model_from_measurements(meas, base_model)
+        assert report.effective_freq_fallback is True
+        assert report.effective_freq_ghz == pytest.approx(1.8)
+        assert report.fitted_model.mte2_nd2nz_bytes_per_cycle == pytest.approx(true_nd2nz_bpc, rel=1e-2)
+        assert report.fitted_model.mte2_nz2nz_bytes_per_cycle == pytest.approx(true_nz2nz_bpc, rel=1e-2)
+        assert set(report.fallback_params) == {
             "fixpipe_acc_to_nd_bytes_per_cycle",
             "fixpipe_acc_to_nz_bytes_per_cycle",
         }

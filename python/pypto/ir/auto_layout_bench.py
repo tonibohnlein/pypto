@@ -420,6 +420,7 @@ def _serialize_calibration_report(
         "num_measurements": len(measurements),
         "fixed_overhead_us": report.fixed_overhead_us,
         "effective_freq_ghz": report.effective_freq_ghz,
+        "effective_freq_fallback": report.effective_freq_fallback,
         "r2": report.r2,
         "spearman_rho": report.spearman_rho,
         "mape_percent": report.mape_percent,
@@ -430,6 +431,7 @@ def _serialize_calibration_report(
             "fixpipe_acc_to_nz_bytes_per_cycle": report.fitted_model.fixpipe_acc_to_nz_bytes_per_cycle,
         },
         "fallback_params": list(report.fallback_params),
+        "param_t_stats": report.param_t_stats,
         "residuals_us": report.residuals_us,
     }
 
@@ -459,6 +461,7 @@ def run_calibration_suite(  # noqa: PLR0913
 
     base_model = cost_model or LayoutCostModel(backend_type=backend_type)
     measurements: list[CalibrationMeasurement] = []
+    effective_measurements: list[CalibrationMeasurement] = []
     swimlane_measurements: list[CalibrationMeasurement] = []
     suite_records: list[dict[str, Any]] = []
     pending_swimlanes: list[
@@ -580,6 +583,16 @@ def run_calibration_suite(  # noqa: PLR0913
                             label=f"{case.case_id}:{variant.gm_input_layouts}->{variant.gm_output_layouts}",
                         )
                     )
+                if ok and eff_median > 0.0:
+                    effective_measurements.append(
+                        CalibrationMeasurement(
+                            variant_id=f"{case.case_id}/{variant.variant_id}",
+                            measured_us=eff_median,
+                            instance=instance,
+                            breakdown=variant.breakdown,
+                            label=f"{case.case_id}:{variant.gm_input_layouts}->{variant.gm_output_layouts}",
+                        )
+                    )
                 if capture_swimlane:
                     pending_swimlanes.append((case, instance, variant, compiled, all_args, out_buf, ok, rec))
 
@@ -589,13 +602,22 @@ def run_calibration_suite(  # noqa: PLR0913
 
     # Pass B: level-1 chip swimlane capture after all benchmark() invocations complete.
     if capture_swimlane and not compile_only:
+        warm_cfg = RunConfig(
+            backend_type=backend_type,
+            execution_mode=execution_mode,
+            device_id=device_id,
+        )
         swimlane_cfg = RunConfig(
             backend_type=backend_type,
             execution_mode=execution_mode,
             device_id=device_id,
             enable_chip_swimlane=1,
         )
+        swimlane_warmup = min(warmup, 2)
         for case, instance, variant, compiled, all_args, out_buf, ok, rec in pending_swimlanes:
+            for _ in range(swimlane_warmup):
+                out_buf.zero_()
+                compiled(*all_args, config=warm_cfg)
             out_buf.zero_()
             compiled(*all_args, config=swimlane_cfg)
             aicore_us = _extract_swimlane_aicore_us(variant.build_dir)
@@ -612,6 +634,7 @@ def run_calibration_suite(  # noqa: PLR0913
                 )
 
     calibration = _serialize_calibration_report(measurements, base_model)
+    calibration_effective = _serialize_calibration_report(effective_measurements, base_model)
     calibration_swimlane = _serialize_calibration_report(swimlane_measurements, base_model)
 
     summary: dict[str, Any] = {
@@ -622,6 +645,7 @@ def run_calibration_suite(  # noqa: PLR0913
         "compile_only": compile_only,
         "cases": suite_records,
         "calibration": calibration,
+        "calibration_effective": calibration_effective,
         "calibration_swimlane": calibration_swimlane,
     }
     return summary
@@ -631,12 +655,15 @@ def _print_calibration_block(title: str, cal: dict[str, Any] | None) -> None:
     if cal is None:
         return
     print(f"\n=== {title} ===")
+    freq_note = " (nominal fallback)" if cal.get("effective_freq_fallback") else ""
     print(
         f"  measurements={cal['num_measurements']} R2={cal['r2']:.4f} "
         f"Spearman={cal['spearman_rho']:.4f} MAPE={cal['mape_percent']:.2f}% "
-        f"overhead={cal['fixed_overhead_us']:.2f}us eff_freq={cal['effective_freq_ghz']:.3f}GHz"
+        f"overhead={cal['fixed_overhead_us']:.2f}us eff_freq={cal['effective_freq_ghz']:.3f}GHz{freq_note}"
     )
     print(f"  fitted_params={cal['fitted_params']}")
+    if cal.get("param_t_stats"):
+        print(f"  param_t_stats={cal['param_t_stats']}")
     if cal.get("fallback_params"):
         print(f"  WARNING unfitted fallback_params={cal['fallback_params']}")
 
@@ -657,6 +684,9 @@ def _print_summary(summary: dict[str, Any]) -> None:
                 f"{dev_str}{sw_str}{acc_str}"
             )
     _print_calibration_block("Calibrated LayoutCostModel (device_us_median)", summary.get("calibration"))
+    _print_calibration_block(
+        "Calibrated LayoutCostModel (effective_us_median)", summary.get("calibration_effective")
+    )
     _print_calibration_block(
         "Calibrated LayoutCostModel (swimlane_aicore_us)", summary.get("calibration_swimlane")
     )
