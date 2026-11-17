@@ -2075,14 +2075,28 @@ class CalibrationReport:
     residuals_us: dict[str, float]
     fallback_params: tuple[str, ...] = ()
     effective_freq_fallback: bool = False
+    raw_freq_ghz: float = 0.0
     param_t_stats: dict[str, float] = field(default_factory=_empty_float_dict)
+    within_case_r2: float = 1.0
+    within_case_mte2_delta_us_per_mb: float = 0.0
+    within_case_fixpipe_delta_us_per_mb: float = 0.0
+    within_case_op_spearman_rho: float = 1.0
+    pooled_op_spearman_rho: float = 1.0
 
 
 def _rank_array(vals: Sequence[float]) -> np.ndarray:
-    order = sorted(range(len(vals)), key=vals.__getitem__)
-    ranks = np.empty(len(vals), dtype=np.float64)
-    for rank, idx in enumerate(order):
-        ranks[idx] = float(rank)
+    n = len(vals)
+    order = sorted(range(n), key=vals.__getitem__)
+    ranks = np.empty(n, dtype=np.float64)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and vals[order[j + 1]] == vals[order[i]]:
+            j += 1
+        avg_rank = 0.5 * float(i + j)
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg_rank
+        i = j + 1
     return ranks
 
 
@@ -2097,6 +2111,119 @@ def _spearman_rank_correlation(xs: Sequence[float], ys: Sequence[float]) -> floa
     if denom == 0.0:
         return 1.0
     return float(np.sum(rx_c * ry_c) / denom)
+
+
+def _fit_within_case_differentials(
+    rows_x: Sequence[Sequence[float]],
+    rows_y: Sequence[float],
+    op_cycles_list: Sequence[float],
+    case_groups: dict[str, list[int]],
+) -> tuple[float, float, float, float, float, float, float, float]:
+    """Fit case-demeaned ND->NZ differential slopes for MTE2 loads and FIXPIPE stores."""
+    d_rows_x: list[list[float]] = [[0.0, 0.0] for _ in rows_y]
+    d_rows_y: list[float] = [0.0 for _ in rows_y]
+    within_case_rhos: list[float] = []
+    for idxs in case_groups.values():
+        if len(idxs) < 2:
+            continue
+        mean_nd = sum(rows_x[i][1] for i in idxs) / float(len(idxs))
+        mean_snd = sum(rows_x[i][3] for i in idxs) / float(len(idxs))
+        mean_y = sum(rows_y[i] for i in idxs) / float(len(idxs))
+        for i in idxs:
+            d_rows_x[i] = [rows_x[i][1] - mean_nd, rows_x[i][3] - mean_snd]
+            d_rows_y[i] = rows_y[i] - mean_y
+        grp_ops = [op_cycles_list[i] for i in idxs]
+        if max(grp_ops) > min(grp_ops):
+            within_case_rhos.append(_spearman_rank_correlation(grp_ops, [rows_y[i] for i in idxs]))
+
+    xd_mat = np.asarray(d_rows_x, dtype=np.float64)
+    yd_vec = np.asarray(d_rows_y, dtype=np.float64)
+    xd_norms = np.sqrt(np.sum(xd_mat * xd_mat, axis=0))
+    xd_scales = [float(s) if float(s) > 0.0 else 1.0 for s in xd_norms.tolist()]
+    active_cols = sum(1 for s in xd_norms.tolist() if float(s) > 0.0)
+    xd_scaled = np.asarray(xd_mat / np.asarray(xd_scales, dtype=np.float64), dtype=np.float64)
+    yd_scaled_coef, _, _, _ = np.linalg.lstsq(xd_scaled, yd_vec, rcond=None)
+    delta_coef = [float(yd_scaled_coef[j]) / xd_scales[j] for j in range(2)]
+    yd_pred = xd_mat @ np.asarray(delta_coef, dtype=np.float64)
+    ss_res = float(np.sum((yd_vec - yd_pred) ** 2))
+    ss_tot = float(np.sum(yd_vec * yd_vec))
+    within_r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 1e-12 else 1.0
+    dof_within = max(1, len(rows_y) - len(case_groups) - active_cols)
+    sigma2_within = ss_res / float(dof_within)
+    gram_within: list[list[float]] = [
+        [
+            sum((d_rows_x[r][i] / xd_scales[i]) * (d_rows_x[r][j] / xd_scales[j]) for r in range(len(rows_y)))
+            for j in range(2)
+        ]
+        for i in range(2)
+    ]
+    xd_inv: np.ndarray = np.linalg.pinv(np.asarray(gram_within, dtype=np.float64))
+    se_within = [math.sqrt(max(0.0, float(xd_inv[j, j]) * sigma2_within)) / xd_scales[j] for j in range(2)]
+    norm_mte2 = float(xd_norms[0])
+    norm_fixpipe = float(xd_norms[1])
+    delta_mte2 = delta_coef[0] if norm_mte2 > 0.0 else 0.0
+    delta_fixpipe = delta_coef[1] if norm_fixpipe > 0.0 else 0.0
+    t_mte2 = (
+        (delta_mte2 / se_within[0]) if se_within[0] > 1e-18 else (float("inf") if delta_mte2 > 1e-9 else 0.0)
+    )
+    t_fixpipe = (
+        (delta_fixpipe / se_within[1])
+        if se_within[1] > 1e-18
+        else (float("inf") if abs(delta_fixpipe) > 1e-9 else 0.0)
+    )
+    within_op_rho = float(np.median(within_case_rhos)) if within_case_rhos else 1.0
+    return (
+        delta_mte2,
+        t_mte2,
+        norm_mte2,
+        delta_fixpipe,
+        t_fixpipe,
+        norm_fixpipe,
+        within_r2,
+        within_op_rho,
+    )
+
+
+def _anchor_pair_from_differential(  # noqa: PLR0913
+    nd_name: str,
+    nz_name: str,
+    fit_nd: float,
+    fit_nz: float,
+    default_nd: float,
+    default_nz: float,
+    delta_slope: float,
+    t_delta: float,
+    norm_delta: float,
+    us_per_cycle: float,
+    min_t_stat: float,
+    max_physical_bpc: float,
+    require_both_cols: bool,
+    fallback_params: list[str],
+    param_t_stats: dict[str, float],
+) -> tuple[float, float]:
+    trigger = (
+        (nd_name in fallback_params or nz_name in fallback_params)
+        if require_both_cols
+        else (nz_name in fallback_params)
+    )
+    if not trigger or norm_delta <= 0.0:
+        return fit_nd, fit_nz
+    if require_both_cols:
+        fit_nz = default_nz
+        if nz_name not in fallback_params:
+            fallback_params.append(nz_name)
+    anchored_nd_slope = (us_per_cycle / fit_nz) + delta_slope
+    param_t_stats[nd_name] = float(t_delta)
+    t_ok = (abs(t_delta) >= min_t_stat) if require_both_cols else (t_delta >= min_t_stat)
+    if t_ok and anchored_nd_slope > 1e-9 and (us_per_cycle / anchored_nd_slope) <= max_physical_bpc:
+        fit_nd = max(1.0, us_per_cycle / anchored_nd_slope)
+        if nd_name in fallback_params:
+            fallback_params.remove(nd_name)
+    else:
+        fit_nd = default_nd
+        if nd_name not in fallback_params:
+            fallback_params.append(nd_name)
+    return fit_nd, fit_nz
 
 
 def fit_cost_model_from_measurements(
@@ -2137,9 +2264,11 @@ def fit_cost_model_from_measurements(
     # Features: [1.0, nd2nz_bytes, nz2nz_bytes, store_nd_bytes, store_nz_bytes, compute_cycles]
     rows_x: list[list[float]] = []
     rows_y: list[float] = []
+    op_cycles_list: list[float] = []
+    case_groups: dict[str, list[int]] = {}
     labels: list[str] = []
 
-    for m in measurements:
+    for idx, m in enumerate(measurements):
         nd2nz_b = 0.0
         nz2nz_b = 0.0
         store_nd_b = 0.0
@@ -2171,6 +2300,9 @@ def fit_cost_model_from_measurements(
 
         rows_x.append([1.0, nd2nz_b, nz2nz_b, store_nd_b, store_nz_b, other_cycles])
         rows_y.append(float(m.measured_us))
+        op_cycles_list.append(float(m.breakdown.operator_cost_cycles) / run_scale)
+        case_key = m.variant_id.split("/", 1)[0] if "/" in m.variant_id else str(id(m.instance))
+        case_groups.setdefault(case_key, []).append(idx)
         labels.append(m.label or m.variant_id)
 
     x_mat = np.asarray(rows_x, dtype=np.float64)
@@ -2197,10 +2329,21 @@ def fit_cost_model_from_measurements(
         math.sqrt(max(0.0, float(xtx_scaled_inv[j, j]) * sigma2)) / scales_list[j] for j in range(n_cols)
     ]
 
-    # Reject non-physical clock estimates (negative or pipeline-overlapped > 3.5 GHz)
-    # so overlap in `other_cycles` cannot deflate fitted bandwidths.
+    (
+        delta_mte2_slope,
+        t_delta_mte2,
+        norm_mte2,
+        delta_fixpipe_slope,
+        t_delta_fixpipe,
+        norm_fixpipe,
+        within_r2,
+        within_op_rho,
+    ) = _fit_within_case_differentials(rows_x, rows_y, op_cycles_list, case_groups)
+
+    # Reject non-physical clock estimates outside ±20% of `nominal_freq_ghz`
+    # so pipeline overlap in `other_cycles` (e.g. 3.2 GHz on A2) cannot bias bandwidths.
     raw_freq_ghz = (1.0 / (float(coef[5]) * 1000.0)) if float(coef[5]) > 1e-6 else 0.0
-    if 0.5 <= raw_freq_ghz <= 3.5:
+    if 0.8 * nominal_freq_ghz <= raw_freq_ghz <= 1.2 * nominal_freq_ghz:
         us_per_cycle = float(coef[5])
         eff_freq_ghz = raw_freq_ghz
         freq_fallback = False
@@ -2226,21 +2369,57 @@ def fit_cost_model_from_measurements(
             return fallback
         return max(1.0, bpc)
 
+    fit_nd2nz = _slope_to_bpc("mte2_nd2nz_bytes_per_cycle", 1, model.mte2_nd2nz_bytes_per_cycle)
+    fit_nz2nz = _slope_to_bpc("mte2_nz2nz_bytes_per_cycle", 2, model.mte2_nz2nz_bytes_per_cycle)
+    fit_acc_to_nd = _slope_to_bpc(
+        "fixpipe_acc_to_nd_bytes_per_cycle", 3, model.fixpipe_acc_to_nd_bytes_per_cycle
+    )
+    fit_acc_to_nz = _slope_to_bpc(
+        "fixpipe_acc_to_nz_bytes_per_cycle", 4, model.fixpipe_acc_to_nz_bytes_per_cycle
+    )
+
+    fit_nd2nz, fit_nz2nz = _anchor_pair_from_differential(
+        "mte2_nd2nz_bytes_per_cycle",
+        "mte2_nz2nz_bytes_per_cycle",
+        fit_nd2nz,
+        fit_nz2nz,
+        model.mte2_nd2nz_bytes_per_cycle,
+        model.mte2_nz2nz_bytes_per_cycle,
+        delta_mte2_slope,
+        t_delta_mte2,
+        norm_mte2,
+        us_per_cycle,
+        min_t_stat,
+        max_physical_bpc,
+        False,
+        fallback_params,
+        param_t_stats,
+    )
+    fit_acc_to_nd, fit_acc_to_nz = _anchor_pair_from_differential(
+        "fixpipe_acc_to_nd_bytes_per_cycle",
+        "fixpipe_acc_to_nz_bytes_per_cycle",
+        fit_acc_to_nd,
+        fit_acc_to_nz,
+        model.fixpipe_acc_to_nd_bytes_per_cycle,
+        model.fixpipe_acc_to_nz_bytes_per_cycle,
+        delta_fixpipe_slope,
+        t_delta_fixpipe,
+        norm_fixpipe,
+        us_per_cycle,
+        min_t_stat,
+        max_physical_bpc,
+        True,
+        fallback_params,
+        param_t_stats,
+    )
+
     fitted = replace(
         model,
-        mte2_nd2nz_bytes_per_cycle=_slope_to_bpc(
-            "mte2_nd2nz_bytes_per_cycle", 1, model.mte2_nd2nz_bytes_per_cycle
-        ),
-        mte2_nz2nz_bytes_per_cycle=_slope_to_bpc(
-            "mte2_nz2nz_bytes_per_cycle", 2, model.mte2_nz2nz_bytes_per_cycle
-        ),
+        mte2_nd2nz_bytes_per_cycle=fit_nd2nz,
+        mte2_nz2nz_bytes_per_cycle=fit_nz2nz,
         mte2_nd2nz_row_penalty_cycles=0.0,
-        fixpipe_acc_to_nd_bytes_per_cycle=_slope_to_bpc(
-            "fixpipe_acc_to_nd_bytes_per_cycle", 3, model.fixpipe_acc_to_nd_bytes_per_cycle
-        ),
-        fixpipe_acc_to_nz_bytes_per_cycle=_slope_to_bpc(
-            "fixpipe_acc_to_nz_bytes_per_cycle", 4, model.fixpipe_acc_to_nz_bytes_per_cycle
-        ),
+        fixpipe_acc_to_nd_bytes_per_cycle=fit_acc_to_nd,
+        fixpipe_acc_to_nz_bytes_per_cycle=fit_acc_to_nz,
     )
 
     ss_res = float(np.sum((y_vec - y_pred) ** 2))
@@ -2248,6 +2427,7 @@ def fit_cost_model_from_measurements(
     r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 1e-12 else 1.0
     mape = float(np.mean(np.abs(y_vec - y_pred) / np.maximum(np.abs(y_vec), 1e-9)) * 100.0)
     rho = _spearman_rank_correlation([float(yp) for yp in y_pred], rows_y)
+    pooled_op_rho = _spearman_rank_correlation(op_cycles_list, rows_y)
     residuals = {lbl: float(yp - yt) for lbl, yt, yp in zip(labels, y_vec, y_pred, strict=True)}
     return CalibrationReport(
         fitted_model=fitted,
@@ -2259,7 +2439,13 @@ def fit_cost_model_from_measurements(
         residuals_us=residuals,
         fallback_params=tuple(fallback_params),
         effective_freq_fallback=freq_fallback,
+        raw_freq_ghz=raw_freq_ghz,
         param_t_stats=param_t_stats,
+        within_case_r2=within_r2,
+        within_case_mte2_delta_us_per_mb=delta_mte2_slope * 1e6,
+        within_case_fixpipe_delta_us_per_mb=delta_fixpipe_slope * 1e6,
+        within_case_op_spearman_rho=within_op_rho,
+        pooled_op_spearman_rho=pooled_op_rho,
     )
 
 

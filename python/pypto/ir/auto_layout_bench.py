@@ -593,9 +593,15 @@ def _serialize_calibration_report(
         "fixed_overhead_us": report.fixed_overhead_us,
         "effective_freq_ghz": report.effective_freq_ghz,
         "effective_freq_fallback": report.effective_freq_fallback,
+        "raw_freq_ghz": report.raw_freq_ghz,
         "r2": report.r2,
+        "within_case_r2": report.within_case_r2,
         "spearman_rho": report.spearman_rho,
+        "within_case_op_spearman_rho": report.within_case_op_spearman_rho,
+        "pooled_op_spearman_rho": report.pooled_op_spearman_rho,
         "mape_percent": report.mape_percent,
+        "within_case_mte2_delta_us_per_mb": report.within_case_mte2_delta_us_per_mb,
+        "within_case_fixpipe_delta_us_per_mb": report.within_case_fixpipe_delta_us_per_mb,
         "fitted_params": {
             "mte2_nd2nz_bytes_per_cycle": report.fitted_model.mte2_nd2nz_bytes_per_cycle,
             "mte2_nz2nz_bytes_per_cycle": report.fitted_model.mte2_nz2nz_bytes_per_cycle,
@@ -813,11 +819,20 @@ def _print_calibration_block(title: str, cal: dict[str, Any] | None) -> None:
     if cal is None:
         return
     print(f"\n=== {title} ===")
-    freq_note = " (nominal fallback)" if cal.get("effective_freq_fallback") else ""
+    raw_f = cal.get("raw_freq_ghz", 0.0)
+    freq_note = f" (nominal fallback; raw={raw_f:.3f}GHz)" if cal.get("effective_freq_fallback") else ""
     print(
         f"  measurements={cal['num_measurements']} R2={cal['r2']:.4f} "
-        f"Spearman={cal['spearman_rho']:.4f} MAPE={cal['mape_percent']:.2f}% "
+        f"within_case_R2={cal.get('within_case_r2', 1.0):.4f} "
+        f"Spearman={cal['spearman_rho']:.4f} "
+        f"within_case_op_Spearman={cal.get('within_case_op_spearman_rho', 1.0):.4f} "
+        f"MAPE={cal['mape_percent']:.2f}% "
         f"overhead={cal['fixed_overhead_us']:.2f}us eff_freq={cal['effective_freq_ghz']:.3f}GHz{freq_note}"
+    )
+    print(
+        f"  within_case_deltas_us_per_mb={{'mte2_nd_minus_nz': "
+        f"{cal.get('within_case_mte2_delta_us_per_mb', 0.0):+.4f}, "
+        f"'fixpipe_nd_minus_nz': {cal.get('within_case_fixpipe_delta_us_per_mb', 0.0):+.4f}}}"
     )
     print(f"  fitted_params={cal['fitted_params']}")
     if cal.get("param_t_stats"):

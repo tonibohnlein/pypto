@@ -973,16 +973,16 @@ class TestPassPipelineIntegrationAndCalibration:
                         continue
                     other_cyc += inv * cfg.op_cost_cycles
 
-                # Simulate pipelined execution: `other_cyc` contributes only 25% non-overlapped
-                # (~7.2 GHz raw slope) and FIXPIPE stores add ~0 delta.
+                # Simulate 2-stage pipelined execution (`~3.2 GHz` raw slope = 0.5625x nominal
+                # period, matching the 910B2 124-variant device fit) and ~0 FIXPIPE delta.
                 measured_us = (
                     16.0
                     + nominal_us_per_cyc * (nd2nz_b / true_nd2nz_bpc + nz2nz_b / true_nz2nz_bpc)
-                    + 0.25 * nominal_us_per_cyc * other_cyc
+                    + 0.5625 * nominal_us_per_cyc * other_cyc
                 )
                 meas.append(
                     CalibrationMeasurement(
-                        variant_id=f"pipe_{s_idx}_{v_idx}",
+                        variant_id=f"case_{s_idx}/v_{v_idx}",
                         measured_us=measured_us,
                         instance=inst,
                         breakdown=bd,
@@ -991,7 +991,12 @@ class TestPassPipelineIntegrationAndCalibration:
 
         report = fit_cost_model_from_measurements(meas, base_model)
         assert report.effective_freq_fallback is True
+        assert report.raw_freq_ghz == pytest.approx(3.2, rel=1e-2)
         assert report.effective_freq_ghz == pytest.approx(1.8)
+        assert report.within_case_r2 == pytest.approx(1.0)
+        assert report.within_case_op_spearman_rho > 0.9
+        expected_delta_us_per_mb = 1e6 * nominal_us_per_cyc * (1.0 / true_nd2nz_bpc - 1.0 / true_nz2nz_bpc)
+        assert report.within_case_mte2_delta_us_per_mb == pytest.approx(expected_delta_us_per_mb, rel=1e-3)
         assert report.fitted_model.mte2_nd2nz_bytes_per_cycle == pytest.approx(true_nd2nz_bpc, rel=1e-2)
         assert report.fitted_model.mte2_nz2nz_bytes_per_cycle == pytest.approx(true_nz2nz_bpc, rel=1e-2)
         assert set(report.fallback_params) == {
