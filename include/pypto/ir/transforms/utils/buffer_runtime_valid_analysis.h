@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "pypto/backend/common/buffer_axis_recipes.h"
+#include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/ir/arith/analyzer.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -192,14 +193,46 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
       }
       return;
     }
+    if (const auto* conversion = backend::FindBufferConversionRecipe(call->op_->name_);
+        conversion && conversion->kind == backend::BufferConversionKind::Cast && call->args_.size() == 2) {
+      bool dynamic = false;
+      for (const auto& arg : call->args_) {
+        if (const auto type = As<BufferType>(arg->GetType()))
+          for (const auto extent : type->valid_shape_) dynamic |= extent < 0;
+      }
+      if (!dynamic) return;
+      const auto source = Extents(call->args_[0]);
+      const auto target = Extents(call->args_[1]);
+      const auto type = As<BufferType>(call->args_[0]->GetType());
+      if (!source || !target || !type) {
+        Refuse(call,
+               "Runtime cast valid metadata is unavailable at this use; restore owned allocation metadata");
+      } else if (!Equal((*source)[0], (*target)[0]) ||
+                 !Equal((*source)[1], Constant(type->shape_[1], call->span_)) ||
+                 !Equal((*target)[1], Constant(type->shape_[1], call->span_))) {
+        Refuse(call, "Runtime cast requires proved matching runtime rows and fixed full columns at this use");
+      } else if (!AtomicInteger((*source)[0]) || !analyzer_->CanProveGreaterEqual((*source)[0], 1)) {
+        Refuse(call, "Runtime cast requires a proved positive-row guard at this use");
+      }
+      return;
+    }
     const auto* recipe = backend::FindBufferAxisRecipe(call->op_->name_);
-    if (!recipe || recipe->axis != 0 || recipe->reduction || call->args_.size() != 3) return;
+    if (!recipe || call->args_.size() != 3 || (recipe->axis == 0 && recipe->reduction)) return;
+    bool dynamic = false;
+    for (const auto& arg : call->args_) {
+      if (const auto type = As<BufferType>(arg->GetType())) {
+        for (const auto extent : type->valid_shape_) dynamic |= extent < 0;
+      }
+    }
+    // Existing static axis recipes retain their established active domains.
+    if (!dynamic) return;
+    if (recipe->axis == 0 && std::string_view(recipe->buffer_op) != "buffer.col_expand_mul") return;
     const auto source = Extents(call->args_[0]);
     const auto carrier = Extents(call->args_[1]);
     const auto target = Extents(call->args_[2]);
-    if (!source || !carrier || !target) {
+    if (!source || !target || (!recipe->reduction && !carrier)) {
       Refuse(call,
-             "Column broadcast runtime valid metadata is unavailable at this use; restore owned "
+             "Row operation runtime valid metadata is unavailable at this use; restore owned "
              "allocation metadata after control-flow boundaries");
       return;
     }
@@ -207,13 +240,17 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     if (!type || type->shape_.size() != 2) return;
     const auto columns = Constant(type->shape_[1], call->span_);
     const auto one = Constant(1, call->span_);
+    const bool carrier_valid =
+        recipe->reduction ||
+        (recipe->axis == 0 ? Equal((*carrier)[0], one) && Equal((*carrier)[1], columns)
+                           : Equal((*carrier)[0], (*source)[0]) && Equal((*carrier)[1], one));
     if (!Equal((*source)[0], (*target)[0]) || !Equal((*source)[1], columns) ||
-        !Equal((*target)[1], columns) || !Equal((*carrier)[0], one) || !Equal((*carrier)[1], columns)) {
+        !Equal((*target)[1], recipe->reduction ? one : columns) || !carrier_valid) {
       Refuse(call,
-             "Column broadcast requires proved matching runtime rows and fixed full columns at "
+             "Row operation requires proved matching runtime rows and fixed full columns at "
              "this use; unrelated dynamic descriptor fields are not equal metadata");
     } else if (!AtomicInteger((*source)[0]) || !analyzer_->CanProveGreaterEqual((*source)[0], 1)) {
-      Refuse(call, "Column broadcast requires a proved positive-row guard at this use");
+      Refuse(call, "Row operation requires a proved positive-row guard at this use");
     }
   }
   uint64_t epoch_ = 0;

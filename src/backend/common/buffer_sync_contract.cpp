@@ -132,6 +132,19 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
           << "Synchronization conversion import requires a qualified AIV cast";
     result.pipe_ = PipeType::V;
   }
+  if (IsOp(call, "buffer.cast")) {
+    const auto source = As<BufferType>(call->args_[0]->GetType());
+    const auto target_type = As<BufferType>(call->args_[1]->GetType());
+    if (source && target_type &&
+        ((source->dtype_ == DataType::BF16 && target_type->dtype_ == DataType::FP32) ||
+         (source->dtype_ == DataType::FP32 && target_type->dtype_ == DataType::BF16))) {
+      // pto-isa 5487a6b0 TCvt.hpp: selected direct BF16/FP32 head/tail loops
+      // consume destination valid rows/columns and explicit source/destination
+      // strides, including runtime-row descriptors. Integer scratch/event
+      // branches are not selected. Retain existing conservative catalog claims.
+      CHECK(target == "a2a3") << "Direct BF16/FP32 conversion requires a qualified native implementation";
+    }
+  }
   if (IsOp(call, "buffer.rsqrt")) {
     CHECK(target == "a2a3") << "Default rsqrt requires a qualified native implementation";
     // pto-isa 5487a6b0 TUnaryOp.hpp: the admitted two-operand default
@@ -139,6 +152,15 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
     // numbered-event operation is present. The explicit-workspace overload
     // is a different recipe and is rejected by shared call validation.
     result.audited_signal_free_variant_ = true;
+  }
+  if (const auto row = FindBufferRowRecipe(call->op_->name_); row && row->reduction) {
+    CHECK(target == "a2a3") << "FP32 row reduction requires a qualified native implementation";
+    // pto-isa 5487a6b0 TRowSum/TRowMax dispatch FP32 to the generic vector
+    // reduction helper, including runtime-row descriptors. Scratch is explicit;
+    // the integer-only EVENT_ID0 scalar reduction branch is not selected.
+    // Inactive output rows are untouched, never an implicit zero-padding fact.
+    // Keep the catalog's existing conservative integer-variant reservation;
+    // selecting a narrower resource declaration is a separate contract change.
   }
   if (IsOp(call, "buffer.col_expand_mul")) {
     CHECK(target == "a2a3") << "Column broadcast requires a qualified native implementation";
@@ -156,12 +178,14 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
                                IsOp(call, "buffer.row_expand_mul")))
         << "Row broadcast implicit effects require a qualified native implementation";
     // Registry validation selects FP32 Mode1 (a contiguous column carrier),
-    // with no explicit temporary operand. The pinned A2/A3 TRowExpandBin helper
-    // fills and reads TMP_UB_OFFSET. Its small-row paths use <=32 256-byte
-    // repeats; large-row paths reuse <=30 repeats, within the same 8KiB range.
-    // This is an enclosure of native scratch, not its exact used-byte footprint.
-    // Internal fill->use barriers do not discharge the next call's overwrite.
-    // pto-isa 5487a6b0: common/constants.hpp and npu/a2a3/TRowExpandBinOp.hpp.
+    // with no explicit temporary operand. Runtime-row CountMode has the same
+    // vbrcb staging: ceil(rows/8) carrier groups are read, bounded by the
+    // aligned physical column allocation. The enclosing access contract must
+    // include those rounded reads, not claim an exact active-row footprint. The pinned A2/A3 TRowExpandBin
+    // helper fills and reads TMP_UB_OFFSET. Its small-row paths use <=32 256-byte repeats; large-row paths
+    // reuse <=30 repeats, within the same 8KiB range. This is an enclosure of native scratch, not its exact
+    // used-byte footprint. Internal fill->use barriers do not discharge the next call's overwrite. pto-isa
+    // 5487a6b0: common/constants.hpp and npu/a2a3/TRowExpandBinOp.hpp.
     result.implicit_effects_.push_back({MemorySpace::Vec, 184 * 1024, 192 * 1024, ir::BufferAccess::ReadWrite,
                                         "a2a3-row-broadcast-mode1-implicit-scratch", false});
     // These three selected wrappers and their shared Mode1 helper contain

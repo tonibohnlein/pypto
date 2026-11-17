@@ -34,6 +34,15 @@ std::optional<uint64_t> PhysicalBufferBytes(const ir::BufferTypePtr& type);
 /// window/provenance and exclude inherited noncontiguous slices.
 bool IsContiguousVectorReshape(const ir::BufferTypePtr& source, const ir::BufferTypePtr& destination);
 
+/// Physical contiguous FP32 vector geometry, independent of valid metadata.
+/// No storage identity, readiness or native metadata ownership is implied.
+std::optional<int64_t> LogicalContiguousVectorLength(const ir::TileTypePtr& type);
+
+/// A pure whole-vector axis map with actual logical valid prefix [r,1] <->
+/// [1,r]. Lowering must preserve the placed bytes and independent metadata
+/// objects; this does not admit dynamic addressless native reshape.
+bool SupportsLogicalContiguousVectorReshape(const ir::CallPtr& call);
+
 /// Static native view forms, with every intermediate descriptor already in IR.
 /// Subview slices full-width UINT8[N,32] rows; reshape preserves physical bytes.
 /// A matrix-space reshape relabels one fractal window within its memory space.

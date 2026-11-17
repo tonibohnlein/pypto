@@ -22,6 +22,7 @@
 #include "pypto/backend/common/buffer_axis_recipes.h"
 #include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
+#include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
@@ -90,14 +91,16 @@ class BufferValidAnalysis : public IRVisitor {
     const bool static_cast_recipe = conversion && conversion->kind == backend::BufferConversionKind::Cast &&
                                     backend::SupportsLogicalBufferConversion(*conversion, call);
     const auto* axis_recipe = backend::FindLogicalBufferAxisRecipe(call->op_->name_);
-    const bool runtime_row_broadcast = axis_recipe && axis_recipe->axis == 0 && !axis_recipe->reduction &&
-                                       std::string_view(axis_recipe->buffer_op) == "buffer.col_expand_mul" &&
-                                       backend::SupportsLogicalBufferAxis(*axis_recipe, call);
-    restricted_ |= (axis_recipe && !runtime_row_broadcast) || (conversion && !static_cast_recipe) ||
+    const bool runtime_axis_op =
+        axis_recipe &&
+        (axis_recipe->axis == 1 || std::string_view(axis_recipe->buffer_op) == "buffer.col_expand_mul") &&
+        backend::SupportsLogicalBufferAxis(*axis_recipe, call);
+    restricted_ |= (axis_recipe && !runtime_axis_op) || (conversion && !static_cast_recipe) ||
                    backend::FindLogicalBufferIndexedRecipe(call->op_->name_) != nullptr;
-    if (IsOp(call, "tile.reshape") || IsOp(call, "tile.reinterpret_view") || IsOp(call, "tile.assemble") ||
-        IsOp(call, "tile.move") || IsOp(call, "tile.extract") || IsOp(call, "tile.transpose_view") ||
-        IsOp(call, "tile.matmul") || IsOp(call, "tile.matmul_acc") || IsOp(call, "tile.transpose")) {
+    if ((IsOp(call, "tile.reshape") && !backend::SupportsLogicalContiguousVectorReshape(call)) ||
+        IsOp(call, "tile.reinterpret_view") || IsOp(call, "tile.assemble") || IsOp(call, "tile.move") ||
+        IsOp(call, "tile.extract") || IsOp(call, "tile.transpose_view") || IsOp(call, "tile.matmul") ||
+        IsOp(call, "tile.matmul_acc") || IsOp(call, "tile.transpose")) {
       restricted_ = true;
     }
     if (restricted_ && !restricted_operation_) {
@@ -169,7 +172,14 @@ class BufferRootCompatibility : public IRVisitor {
       const auto cols = As<ConstInt>(tile->shape_[1]);
       const auto origin = As<ConstInt>(memory->byte_offset_);
       if (rows && cols && origin && origin->value_ == 0) {
-        key = Key{tile->dtype_.ToString(), rows->value_, cols->value_, memory->size_};
+        const auto vector = backend::LogicalContiguousVectorLength(tile);
+        if (vector && memory->size_ % 4 == 0 && memory->size_ / 4 == static_cast<uint64_t>(*vector)) {
+          // Only a complete contiguous FP32 allocation can change valid-axis
+          // interpretation. Equal capacity alone never admits matrix reshapes.
+          key = Key{tile->dtype_.ToString(), 1, *vector, memory->size_};
+        } else {
+          key = Key{tile->dtype_.ToString(), rows->value_, cols->value_, memory->size_};
+        }
       }
     }
     if (!root.initialized) {

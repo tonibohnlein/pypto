@@ -12,7 +12,7 @@
 #include "pypto/backend/common/buffer_axis_recipes.h"
 
 #include <cstddef>
-#include <memory>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -91,6 +91,43 @@ const BufferAxisRecipe* FindBufferAxisRecipe(const std::string& name) {
 
 namespace {
 
+bool HasRuntimeMetadata(const std::vector<ir::BufferTypePtr>& types) {
+  for (const auto& type : types)
+    if (type)
+      for (const auto extent : type->valid_shape_)
+        if (extent < 0) return true;
+  return false;
+}
+
+bool NativeElementsFit(const ir::BufferTypePtr& type) {
+  return type && type->shape_.size() == 2 && type->shape_[0] > 0 && type->shape_[1] > 0 &&
+         static_cast<uint64_t>(type->shape_[0]) <= std::numeric_limits<uint32_t>::max() / type->shape_[1];
+}
+
+const char* RuntimeRowEncodingError(const BufferAxisRecipe& recipe,
+                                    const std::vector<ir::BufferTypePtr>& types) {
+  if (recipe.axis == 0) return nullptr;
+  const auto& source = types[0];
+
+  if (!NativeElementsFit(source) || !NativeElementsFit(types[2]))
+    return "requires runtime row-operation native uint32 element offsets";
+  if (recipe.reduction) {
+    // Generic row reduction passes active rows to UB-copy nburst and
+    // physical row strides to uint16 reduction operands. Count masks use
+    // at most rows*64 elements; the nburst bound also proves no overflow.
+    if (source->shape_[0] > std::numeric_limits<uint16_t>::max() ||
+        source->shape_[1] / 8 > std::numeric_limits<uint16_t>::max() ||
+        types[1]->shape_[1] / 8 > std::numeric_limits<uint16_t>::max() || !NativeElementsFit(types[1]))
+      return "requires runtime reduction native uint16 row-count/stride and uint32 scratch offsets";
+  } else if (source->shape_[0] >= 256 && source->shape_[1] / 8 > std::numeric_limits<uint8_t>::max()) {
+    // Large-row Mode1 selects NormMode; only the small-row path can switch
+    // to CountMode when the encoded repeat stride would overflow.
+    return "requires runtime row expansion's large-row native uint8 repeat strides";
+  }
+
+  return nullptr;
+}
+
 // Return a contract diagnostic without throwing: the same predicate must serve
 // whole-kernel selection before planning and validation of explicit Buffer IR.
 const char* OperandError(const BufferAxisRecipe& recipe, const std::vector<ir::BufferTypePtr>& types) {
@@ -98,7 +135,7 @@ const char* OperandError(const BufferAxisRecipe& recipe, const std::vector<ir::B
     const auto& type = types[i];
     const bool column = recipe.axis == 1 && i == (recipe.reduction ? 2 : 1);
     if (column) {
-      if (!IsColumnVectorBuffer(type)) return "requires a static aligned FP32 column vector";
+      if (!IsColumnVectorBufferGeometry(type)) return "requires an aligned contiguous FP32 column vector";
     } else if (!type || type->shape_.size() != 2 || type->dtype_ != DataType::FP32 ||
                type->memory_space_ != ir::MemorySpace::Vec || type->blayout_ != ir::TileLayout::row_major ||
                type->slayout_ != ir::TileLayout::none_box || type->fractal_ != 512 ||
@@ -106,14 +143,19 @@ const char* OperandError(const BufferAxisRecipe& recipe, const std::vector<ir::B
                type->shape_[1] % 8 != 0) {
       return "requires aligned rank-2 row-major Vec FP32 operands";
     }
-    const bool runtime_col_broadcast =
-        std::string_view(recipe.buffer_op) == "buffer.col_expand_mul" && i != 1 &&
-        type->valid_shape_ == std::vector<int64_t>{-1, -1};
-    if (!runtime_col_broadcast && (type->valid_shape_[0] <= 0 || type->valid_shape_[1] <= 0)) {
+    const bool supports_dynamic =
+        recipe.axis == 1 || std::string_view(recipe.buffer_op) == "buffer.col_expand_mul";
+    const bool metadata_operand =
+        supports_dynamic && !(recipe.reduction && i == 1) && !(recipe.axis == 0 && i == 1);
+    const bool dynamic_matrix = metadata_operand && type->valid_shape_ == std::vector<int64_t>{-1, -1};
+    if (!dynamic_matrix && (type->valid_shape_[0] <= 0 || type->valid_shape_[1] <= 0)) {
       return "requires nonempty static valid extents or qualified broadcast runtime rows";
     }
   }
   const auto& source = types[0];
+  if (HasRuntimeMetadata(types)) {
+    if (const auto* error = RuntimeRowEncodingError(recipe, types)) return error;
+  }
   if (recipe.axis == 0) {
     const auto& row = types[1];
     const bool dynamic_broadcast =
@@ -153,7 +195,9 @@ const char* OperandError(const BufferAxisRecipe& recipe, const std::vector<ir::B
     return nullptr;
   }
   const auto& column = types[recipe.reduction ? 2 : 1];
-  if (column->shape_[0] != source->shape_[0] || column->valid_shape_[0] != source->valid_shape_[0]) {
+  if (column->shape_[0] != source->shape_[0] ||
+      (column->valid_shape_[0] >= 0 && source->valid_shape_[0] >= 0 &&
+       column->valid_shape_[0] != source->valid_shape_[0])) {
     return "requires the column vector to preserve physical and valid rows";
   }
   if (recipe.reduction) {
@@ -162,7 +206,9 @@ const char* OperandError(const BufferAxisRecipe& recipe, const std::vector<ir::B
         workspace->valid_shape_ != workspace->shape_) {
       return "requires full-valid scratch covering the source physical shape";
     }
-  } else if (types[2]->shape_ != source->shape_ || types[2]->valid_shape_ != source->valid_shape_) {
+  } else if (types[2]->shape_ != source->shape_ || (types[2]->valid_shape_ != std::vector<int64_t>{-1, -1} &&
+                                                    source->valid_shape_ != std::vector<int64_t>{-1, -1} &&
+                                                    types[2]->valid_shape_ != source->valid_shape_)) {
     return "requires the broadcast destination to preserve source physical and valid shape";
   }
   return nullptr;
@@ -178,29 +224,6 @@ bool HasSupportedKwargs(const BufferAxisRecipe& recipe, const ir::CallPtr& call)
     if (key != "out_layout" || AnyCast<ir::TileLayout>(value) != ir::TileLayout::col_major) return false;
   }
   return true;
-}
-
-ir::BufferTypePtr BroadcastPhysicalDescriptor(const ir::TypePtr& type) {
-  const auto tile = ir::As<ir::TileType>(type);
-  if (!tile || tile->shape_.size() != 2) return nullptr;
-  const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
-  if (!IsDenseVecBufferTile(tile, view)) return nullptr;
-  const auto rows = ir::As<ir::ConstInt>(tile->shape_[0]);
-  const auto columns = ir::As<ir::ConstInt>(tile->shape_[1]);
-  if (!rows || !columns || rows->value_ <= 0 || columns->value_ <= 0) return nullptr;
-  if (view.start_offset) {
-    const auto offset = ir::As<ir::ConstInt>(view.start_offset);
-    if (!offset || offset->value_ != 0) return nullptr;
-  }
-  if (!view.stride.empty()) {
-    if (view.stride.size() != 2) return nullptr;
-    for (size_t i = 0; i < 2; ++i) {
-      const auto stride = ir::As<ir::ConstInt>(view.stride[i]);
-      if (!stride || stride->value_ != (i ? 1 : columns->value_)) return nullptr;
-    }
-  }
-  return std::make_shared<ir::BufferType>(std::vector<int64_t>{rows->value_, columns->value_}, tile->dtype_,
-                                          ir::MemorySpace::Vec);
 }
 
 bool HasRuntimeBroadcastValid(const ir::TypePtr& type) {
@@ -236,6 +259,32 @@ bool MatchingLogicalBroadcastValid(const ir::TypePtr& source_type, const ir::Typ
   return scalar && (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt());
 }
 
+bool MatchingLogicalRowValid(const BufferAxisRecipe& recipe, const ir::CallPtr& call) {
+  const auto source = ir::As<ir::TileType>(call->args_[0]->GetType());
+  const auto target = ir::As<ir::TileType>(call->GetType());
+  if (!source || !target) return false;
+  const auto a = ir::tile_view_semantics::GetEffectiveTileView(*source);
+  const auto b = ir::tile_view_semantics::GetEffectiveTileView(*target);
+  const auto& av = a.valid_shape.empty() ? source->shape_ : a.valid_shape;
+  const auto& bv = b.valid_shape.empty() ? target->shape_ : b.valid_shape;
+  if (av.size() != 2 || bv.size() != 2 || !ir::structural_equal(av[0], bv[0])) return false;
+  const auto columns = ir::As<ir::ConstInt>(source->shape_[1]);
+  const auto ac = ir::As<ir::ConstInt>(av[1]);
+  const auto bc = ir::As<ir::ConstInt>(bv[1]);
+  if (!columns || !ac || ac->value_ != columns->value_ || !bc ||
+      bc->value_ != (recipe.reduction ? 1 : columns->value_))
+    return false;
+  if (!recipe.reduction) {
+    const auto carrier = ir::As<ir::TileType>(call->args_[1]->GetType());
+    if (!carrier) return false;
+    const auto c = ir::tile_view_semantics::GetEffectiveTileView(*carrier);
+    const auto& cv = c.valid_shape.empty() ? carrier->shape_ : c.valid_shape;
+    const auto cc = cv.size() == 2 ? ir::As<ir::ConstInt>(cv[1]) : nullptr;
+    if (!cc || cc->value_ != 1 || !ir::structural_equal(av[0], cv[0])) return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 bool SupportsLogicalBufferAxis(const BufferAxisRecipe& recipe, const ir::CallPtr& call) {
@@ -246,15 +295,21 @@ bool SupportsLogicalBufferAxis(const BufferAxisRecipe& recipe, const ir::CallPtr
   if (std::string_view(recipe.buffer_op) == "buffer.col_expand_mul" &&
       (HasRuntimeBroadcastValid(call->args_[0]->GetType()) || HasRuntimeBroadcastValid(call->GetType()))) {
     if (!MatchingLogicalBroadcastValid(call->args_[0]->GetType(), call->GetType())) return false;
-    types = {BroadcastPhysicalDescriptor(call->args_[0]->GetType()),
+    types = {PhysicalLogicalVecDescriptor(call->args_[0]->GetType()),
              StaticLogicalBufferDescriptor(call->args_[1]->GetType()),
-             BroadcastPhysicalDescriptor(call->GetType())};
+             PhysicalLogicalVecDescriptor(call->GetType())};
     if (types[0] && types[2] && (types[0]->shape_[0] > 255 || types[0]->shape_[1] / 8 > 255)) return false;
   } else {
     for (const auto& arg : call->args_) types.push_back(StaticLogicalBufferDescriptor(arg->GetType()));
     types.push_back(StaticLogicalBufferDescriptor(call->GetType()));
+    if (OperandError(recipe, types) == nullptr) return true;
+    if (recipe.axis != 1 || !MatchingLogicalRowValid(recipe, call)) return false;
+    types = {PhysicalLogicalVecDescriptor(call->args_[0]->GetType()),
+             recipe.reduction ? StaticLogicalBufferDescriptor(call->args_[1]->GetType())
+                              : PhysicalLogicalVecDescriptor(call->args_[1]->GetType()),
+             PhysicalLogicalVecDescriptor(call->GetType())};
   }
-  return OperandError(recipe, types) == nullptr;
+  return OperandError(recipe, types) == nullptr && RuntimeRowEncodingError(recipe, types) == nullptr;
 }
 
 void ValidateBufferAxisOperands(const BufferAxisRecipe& recipe, const std::vector<ir::ExprPtr>& args) {

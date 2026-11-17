@@ -25,7 +25,10 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memory_space.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/type.h"
 
 namespace pypto::backend {
@@ -63,6 +66,61 @@ bool IsContiguousVectorReshape(const ir::BufferTypePtr& source, const ir::Buffer
   return bytes && IsColumnVectorBuffer(column) && IsAlignedDenseVecBuffer(row) &&
          row->dtype_ == DataType::FP32 && row->shape_[0] == 1 && column->shape_[0] > 0 &&
          row->shape_[1] == column->shape_[0] && bytes == PhysicalBufferBytes(destination);
+}
+
+std::optional<int64_t> LogicalContiguousVectorLength(const ir::TileTypePtr& type) {
+  if (!type || type->shape_.size() != 2 || type->dtype_ != DataType::FP32 ||
+      type->GetMemorySpace() != ir::MemorySpace::Vec)
+    return std::nullopt;
+  const auto rows = ir::As<ir::ConstInt>(type->shape_[0]);
+  const auto columns = ir::As<ir::ConstInt>(type->shape_[1]);
+  if (!rows || !columns) return std::nullopt;
+  const auto view = ir::tile_view_semantics::GetEffectiveTileView(*type);
+  const bool column = IsColumnVectorBufferTile(type, view);
+  const bool row = IsDenseVecBufferTile(type, view) && rows->value_ == 1 && columns->value_ > 0 &&
+                   columns->value_ % 8 == 0;
+  if (!column && !row) return std::nullopt;
+  if (view.start_offset) {
+    const auto offset = ir::As<ir::ConstInt>(view.start_offset);
+    if (!offset || offset->value_ != 0) return std::nullopt;
+  }
+  if (!view.stride.empty()) {
+    if (view.stride.size() != 2) return std::nullopt;
+    for (size_t axis = 0; axis < 2; ++axis) {
+      const auto stride = ir::As<ir::ConstInt>(view.stride[axis]);
+      const auto expected = column ? (axis ? rows->value_ : 1) : (axis ? 1 : columns->value_);
+      if (!stride || stride->value_ != expected) return std::nullopt;
+    }
+  }
+  return column ? rows->value_ : columns->value_;
+}
+
+bool SupportsLogicalContiguousVectorReshape(const ir::CallPtr& call) {
+  if (!call || !ir::IsOp(call, "tile.reshape") || call->args_.size() != 2 || !call->kwargs_.empty())
+    return false;
+  const auto source = ir::As<ir::TileType>(call->args_[0]->GetType());
+  const auto target = ir::As<ir::TileType>(call->GetType());
+  const auto requested = ir::As<ir::MakeTuple>(call->args_[1]);
+  if (!target || !requested || requested->elements_.size() != target->shape_.size()) return false;
+  for (size_t axis = 0; axis < target->shape_.size(); ++axis) {
+    const auto dimension = ir::As<ir::ConstInt>(requested->elements_[axis]);
+    const auto declared = ir::As<ir::ConstInt>(target->shape_[axis]);
+    if (!dimension || !declared || dimension->value_ != declared->value_) return false;
+  }
+  const auto length = LogicalContiguousVectorLength(source);
+  if (!length || LogicalContiguousVectorLength(target) != length) return false;
+  const auto a = ir::tile_view_semantics::GetEffectiveTileView(*source);
+  const auto b = ir::tile_view_semantics::GetEffectiveTileView(*target);
+  if (a.blayout == b.blayout) return false;
+  const auto& av = a.valid_shape.empty() ? source->shape_ : a.valid_shape;
+  const auto& bv = b.valid_shape.empty() ? target->shape_ : b.valid_shape;
+  if (av.size() != 2 || bv.size() != 2) return false;
+  const size_t source_axis = a.blayout == ir::TileLayout::col_major ? 0 : 1;
+  const size_t target_axis = b.blayout == ir::TileLayout::col_major ? 0 : 1;
+  const auto fixed_a = ir::As<ir::ConstInt>(av[1 - source_axis]);
+  const auto fixed_b = ir::As<ir::ConstInt>(bv[1 - target_axis]);
+  return fixed_a && fixed_a->value_ == 1 && fixed_b && fixed_b->value_ == 1 &&
+         ir::structural_equal(av[source_axis], bv[target_axis]);
 }
 
 namespace {

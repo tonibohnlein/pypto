@@ -117,8 +117,10 @@ BufferTypePtr DenseDescriptor(const TileTypePtr& tile, const Span& span) {
         << "LowerTileToBuffer: strided tiles require an explicit Buffer view recipe";
   }
   const auto valid = DescriptorValid(view.valid_shape.empty() ? tile->shape_ : view.valid_shape, shape);
-  CHECK_SPAN(!column || (valid[0] > 0 && valid[1] == 1), span)
-      << "LowerTileToBuffer: column vectors require positive static valid extents";
+  const auto& logical_valid = view.valid_shape.empty() ? tile->shape_ : view.valid_shape;
+  const auto fixed_column = logical_valid.size() == 2 ? As<ConstInt>(logical_valid[1]) : nullptr;
+  CHECK_SPAN(!column || (fixed_column && fixed_column->value_ == 1), span)
+      << "LowerTileToBuffer: contiguous column vectors require a fixed valid column of one";
   return std::make_shared<BufferType>(shape, tile->dtype_, MemorySpace::Vec, valid, view.blayout);
 }
 
@@ -350,9 +352,9 @@ class StorageIndex : public IRVisitor {
           << "LowerTileToBuffer: full-capacity storage members disagree on the allocation origin";
       origin = address;
     }
-    const bool has_column =
-        std::any_of(storage.members.begin(), storage.members.end(),
-                    [](const auto& member) { return backend::IsColumnVectorBuffer(member.descriptor); });
+    const bool has_column = std::any_of(
+        storage.members.begin(), storage.members.end(),
+        [](const auto& member) { return backend::IsColumnVectorBufferGeometry(member.descriptor); });
     const auto gather_workspace =
         std::find_if(storage.members.begin(), storage.members.end(),
                      [&](const auto& member) { return gather_workspaces_.count(member.tile.get()) != 0; });
@@ -623,10 +625,20 @@ class StorageIndex : public IRVisitor {
       const auto& [key, descriptor] = member_keys[i];
       auto [entry, inserted] = handles_by_window.emplace(key, nullptr);
       if (inserted) {
-        CHECK_SPAN(!HasDynamicValid(descriptor), storage.members[i].span)
-            << "LowerTileToBuffer: typed storage windows require static valid extents";
+        CHECK_SPAN(!HasDynamicValid(descriptor) || addressed_, storage.members[i].span)
+            << "LowerTileToBuffer: runtime-valid typed aliases require proved placed addresses; "
+               "addressless metadata reinterprets remain unavailable";
         if (addressed_ || !root) {
-          std::vector<ExprPtr> args{std::make_shared<MakeTuple>(std::vector<ExprPtr>{}, span)};
+          // Placed aliases have independent native metadata objects at the
+          // same certified byte address. Per-use setters restore each logical
+          // axis map; no metadata mutation is inherited through a pointer alias.
+          std::vector<ExprPtr> initial_valid;
+          for (size_t axis = 0; axis < descriptor->valid_shape_.size(); ++axis) {
+            if (descriptor->valid_shape_[axis] < 0)
+              initial_valid.push_back(
+                  std::make_shared<ConstInt>(descriptor->shape_[axis], DataType::INDEX, span));
+          }
+          std::vector<ExprPtr> args{std::make_shared<MakeTuple>(initial_valid, span)};
           if (addressed_) {
             args.push_back(
                 std::make_shared<ConstInt>(static_cast<int64_t>(std::get<0>(key)), DataType::INDEX, span));
@@ -1072,7 +1084,7 @@ class TileToBufferMutator : public IRMutator {
     const bool static_cast_recipe = conversion && conversion->kind == backend::BufferConversionKind::Cast &&
                                     backend::SupportsLogicalBufferConversion(*conversion, call);
     const auto* row_recipe = backend::FindLogicalBufferRowRecipe(call->op_->name_);
-    const bool guarded_row_broadcast = row_recipe && row_recipe->row_vector;
+    const bool guarded_row_broadcast = row_recipe && backend::SupportsLogicalBufferRow(*row_recipe, call);
     const bool data_operation =
         guarded_row_broadcast || store || IsOp(call, "tile.load") || IsOp(call, "tile.move") ||
         backend::FindLogicalBufferElementwiseRecipe(call->op_->name_) || static_cast_recipe;
@@ -1257,7 +1269,9 @@ class TileToBufferMutator : public IRMutator {
       // An old static alias may share a dynamically valid allocation handle.
       // Keep the cast's qualified static descriptor at this use; LowerDefinition
       // restores source and destination metadata before these windows execute.
-      const bool static_cast_recipe = conversion->kind == backend::BufferConversionKind::Cast;
+      const bool static_cast_recipe = conversion->kind == backend::BufferConversionKind::Cast &&
+                                      !NeedsRuntimeBufferValid(call->args_[0]->GetType()) &&
+                                      !NeedsRuntimeBufferValid(result->GetType());
       for (size_t i = 0; i < call->args_.size(); ++i) {
         if (static_cast<int>(i) == conversion->scalar_index) {
           auto scalar = VisitExpr(call->args_[i]);

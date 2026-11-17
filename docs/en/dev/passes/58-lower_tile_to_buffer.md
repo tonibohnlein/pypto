@@ -927,3 +927,27 @@ closed prefix protocol. Its order-coverage guarantee does not become a
 minimum-demand claim. Host tests independently interpret runtime metadata and
 active physical rectangles, check output sentinels, token/flag order, matching
 and causal reuse; device qualification is separate.
+
+### Matched runtime reductions, valid-axis maps and casts
+
+The same metadata evidence also qualifies FP32 row sum/max and column-carrier
+row expansion with runtime rows and fixed positive full columns. Native use
+requires actual matching source/output rows and a matching `[rows,1]` carrier;
+a full carrier is not silently narrowed to a partial matrix. Native encoding
+bounds and declared reduction/row-expansion scratch effects remain explicit.
+
+Whole-capacity contiguous FP32 column `[M,1]` and row `[1,M]` interpretations
+preserve original valid prefixes `[r,1]` and `[1,r]` using separately owned native
+metadata objects at the same proved placed address. Each data use restores its
+own logical state. Dynamic addressless interpretations, dynamic column DMA
+variants and unqualified dynamic-column elementwise operations remain unavailable.
+Use a qualified row-major axis interpretation for the supported arithmetic.
+
+Direct BF16/FP32 runtime-row casts reuse the shared physical geometry and
+use-site metadata service: physical `[M,C]` shapes match, full positive columns
+are divisible by sixteen and satisfy native stride/offset fields, and actual
+valid rows agree under a positive guard. Existing rounding, saturation and
+source/destination disjointness rules are unchanged. A2/A3 source qualification
+is separate from native/device execution. See the
+[runtime-axis qualification](../ir/41-general-autosync-runtime-axis.md) and its
+receipt for bounds, independent checks and remaining mixed-valid-domain refusals.

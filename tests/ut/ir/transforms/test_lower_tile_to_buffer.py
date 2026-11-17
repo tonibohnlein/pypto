@@ -643,10 +643,13 @@ class MixedRollout:
 
     @pl.function(type=pl.FunctionType.InCore)
     def unsupported(
-        self, a: pl.Tensor[[16, 32], pl.FP32], out: pl.Out[pl.Tensor[[16, 1], pl.FP32]]
-    ) -> pl.Tensor[[16, 1], pl.FP32]:
-        x = pl.load(a, [0, 0], [16, 32])
-        tmp = pl.create_tile([16, 32], pl.FP32)
+        self, a: pl.Tensor[[16, 32], pl.FP32], out: pl.Out[pl.Tensor[[16, 1], pl.FP16]]
+    ) -> pl.Tensor[[16, 1], pl.FP16]:
+        x = pl.cast(pl.load(a, [0, 0], [16, 32]), pl.FP16)
+        tmp = pl.create_tile([16, 32], pl.FP16)
+        # FP32 reduction plus packed-column storage is now supported. Keep a
+        # legal Tile/native half reduction to exercise mixed rollout: Buffer
+        # reduction/column recipes deliberately remain FP32-only.
         return pl.store(pl.row_sum(x, tmp_tile=tmp), [0, 0], out)
 
     @pl.function(type=pl.FunctionType.Orchestration)
@@ -655,8 +658,8 @@ class MixedRollout:
         a: pl.Tensor[[16, 32], pl.FP32],
         b: pl.Tensor[[16, 32], pl.FP32],
         scratch: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
-        out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
-    ) -> pl.Tensor[[16, 1], pl.FP32]:
+        out: pl.Out[pl.Tensor[[16, 1], pl.FP16]],
+    ) -> pl.Tensor[[16, 1], pl.FP16]:
         with pl.manual_scope():
             scratch, first = pl.submit(self.supported, a, b, scratch)
             out, second = pl.submit(self.unsupported, scratch, out, deps=[first])

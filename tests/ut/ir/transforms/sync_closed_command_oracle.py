@@ -229,6 +229,41 @@ class ClosedCommands:
         elif name == opname("buffer.copy"):
             pipe, reads, writes = ir.PipeType.MTE1, self.bytes(args[0]), self.bytes(args[1])
             signature = name, self.signature(args[0]), self.signature(args[1])
+        elif name in (opname("buffer.add"), opname("buffer.mul")):
+            pipe = ir.PipeType.V
+            reads, writes = self.bytes(args[0]) | self.bytes(args[1]), self.bytes(args[2])
+            signature = name, *(self.signature(arg) for arg in args)
+        elif name == opname("buffer.adds"):
+            pipe = ir.PipeType.V
+            reads, writes = self.bytes(args[0]), self.bytes(args[2])
+            signature = name, self.signature(args[0]), value(args[1], env), self.signature(args[2])
+        elif name == opname("buffer.cast"):
+            pipe = ir.PipeType.V
+            reads, writes = self.bytes(args[0]), self.bytes(args[1])
+            signature = name, self.signature(args[0]), self.signature(args[1]), tuple(call.kwargs.items())
+        elif name in (opname("buffer.row_sum"), opname("buffer.row_max")):
+            # The focused runtime-axis fixtures reduce <=64 full columns, so
+            # the audited one-repeat native path does not touch its workspace.
+            source_type = args[0].type
+            assert isinstance(source_type, ir.BufferType) and source_type.shape[1] <= 64
+            pipe = ir.PipeType.V
+            reads, writes = self.bytes(args[0]), self.bytes(args[2])
+            signature = name, *(self.signature(arg) for arg in args)
+        elif name == opname("buffer.row_expand_mul"):
+            pipe = ir.PipeType.V
+            source_type, carrier_type = args[0].type, args[1].type
+            assert isinstance(source_type, ir.BufferType) and isinstance(carrier_type, ir.BufferType)
+            valid = getattr(self, "valid", {}).get(args[0], tuple(source_type.valid_shape))
+            rows = valid[0]
+            assert 0 < rows <= 255 and carrier_type.shape[0] % 8 == 0
+            rounded = ((rows + 7) // 8) * 8
+            carrier = self.bytes(args[1], (0, 0, rounded, 1))
+            # Vbrcb writes 32 bytes per rounded carrier row; both native modes
+            # consume the staged values from the same fixed workspace.
+            temporary = frozenset((ir.MemorySpace.Vec, 184 * 1024 + i) for i in range(rounded * 32))
+            reads = self.bytes(args[0]) | carrier | temporary
+            writes = self.bytes(args[2]) | temporary
+            signature = name, *(self.signature(arg) for arg in args)
         elif name == opname("buffer.col_expand_mul"):
             # A row carrier is read repeatedly; the footprint is the explicit
             # matrix plus carrier, with no row-expand implicit scratch.

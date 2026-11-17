@@ -1,0 +1,276 @@
+{
+  "gate": "runtime row reductions, contiguous valid-axis aliases and direct BF16/FP32 casts",
+  "milestone": "M2 shared native operation/metadata qualification; existing conservative composition consumes its effects",
+  "base_revision": "d7458eac7b3af615c08fe56374cfe1ea2e354c6c",
+  "working_tree_source_hashes": {
+    "include/pypto/backend/common/buffer_type_support.h": "382a6b3b9fa0dcaaf8be0b15c8be2322a0ae06bb89f61e79bc04596e9a3b4483",
+    "include/pypto/backend/common/buffer_view_semantics.h": "4eb95ea805283f0074935f17e76168f12aba00475433e01c2a18177e0c2f3a5e",
+    "include/pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h": "6c7058e5ede9cc6794753ad1a1a0503ae7c7eb916da9ca32c91791e7fb2ae820",
+    "include/pypto/ir/transforms/utils/buffer_valid_analysis.h": "27231977d168721753bc968678ea95ddce808f3cdd43b82e1fefd18f9c7cfae1",
+    "src/backend/common/buffer_row_recipes.cpp": "f386cd06aee7c649a750a180f1c4193084b4b7209d2cd7eb3d5e2ab2c3313ccb",
+    "src/backend/common/buffer_conversion_recipes.cpp": "1f080d55157ca934691b447d240df68b2ade63f6b39eee4759e8b7e59dcafb28",
+    "src/backend/common/buffer_view_semantics.cpp": "af3961adc049447b564fabd531fc523b2faf94f115418aaff877cf090f7cd03e",
+    "src/backend/common/buffer_elementwise_recipes.cpp": "794a356cd904fac8d62fbc5aa76d538860ed61a8c58409ec56dbb3d7d8078d85",
+    "src/backend/common/buffer_sync_contract.cpp": "f4647d5dc0b9ce1c475237963a741eb4853c5f4660be2c03bb0e452bb2185313",
+    "src/codegen/pto/pto_buffer_codegen.cpp": "f2d6b85f68551c6beb34cde8c0131b97a0f8a13db97bb78963af781019a348e9",
+    "src/ir/op/buffer_ops/memory.cpp": "64a2a69fbf36c103e609add1e46a19a2a3e7c240b9723ca5ab0bccd6a5ae60aa",
+    "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "48ecac88c8031690bad40ab2178f877d174d3608e10375e7a3a4623e2cc705d5",
+    "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "8a88cbfcf77eabcdc6b53899bf1ccaa26dd7c8bf016bf8cdcd02a32bdb0e8045",
+    "tests/ut/ir/transforms/test_runtime_valid_reduction_axis.py": "1691790c9137c362fe3c1990e4b50518c2ea4e059abd28600bba97da5559c916",
+    "tests/ut/ir/transforms/test_runtime_valid_metadata.py": "5e95b2a2a97752316a8a4f3d7780df96dd758dc048cb6f0c7bc59c39db1172a9",
+    "tests/ut/ir/transforms/test_runtime_valid_cast.py": "93eb13a013ecb3daa097d8b6085083f2f4bd526eacdacb17571c5de51534a835",
+    "tests/ut/ir/transforms/sync_closed_command_oracle.py": "1d6bfc2f9324196cc29cb6ba7cb6e12031104dcdbc360260f06ec40d720fc36f",
+    "tests/ut/ir/transforms/sync_logical_oracle.py": "72e2e34e557bd6221f86954ad0626cd882d47162726784b38328767087f967e0"
+  },
+  "native_revision": "5487a6b0",
+  "native_headers": {
+    "build-py314/packed-column-contract/TRowSum.hpp": "32461a74dcf1697eef87cf7af100a407d5c4ae644b0b3d22d468870c31e8fee0",
+    "build-py314/packed-column-contract/TRowMax.hpp": "2e535e1a5bb5c76239ad7ba33ea5b822a35e7cb19d2fb5936d3a0fb6f6dff632",
+    "build-py314/packed-column-contract/TRowReduceOps.hpp": "ca6645d76b7abb931ab8c1fdf1bd05090c10f29d3c289da12bdcafc5a87d5dce",
+    "build-py314/packed-column-contract/TRowExpandBinOp.hpp": "7a37a1b24db962fe028df5b2ded7da4b32448fd7504cfc6b11298ec61d15f6ef",
+    "build-py314/packed-column-contract/TRowExpandMul.hpp": "6848d414aa542af8d136c2dddf7809e17b2da397dc97660d9332796c79cf456b",
+    "build-py314/milestone-loop-20261115/TCvt-5487a6b0.hpp": "1b5f14f2f253e34908115424626d6dccafadc2cd21a3b4025c1e26364caefe90"
+  },
+  "tcvt_git_blob": "6724cf8a2c602e35d30c5415eb9d5846b701d545",
+  "review": "Independent reviewer accepted general design, mode-specific native field/output/scratch audits, source implementation and mixed-rollout fixture adjustment. All 60 runtime-family focused tests and 196 updated-rollout tests passed; package native/style and full-project typing checks passed.",
+  "commands": [
+    "cmake --build build-py314 --parallel 2",
+    "python -m pytest -q --require-ptoas tests/ut/ir/transforms/test_runtime_valid_broadcast.py tests/ut/ir/transforms/test_runtime_valid_cast.py tests/ut/ir/transforms/test_runtime_valid_reduction_axis.py tests/ut/ir/transforms/test_runtime_valid_metadata.py"
+  ],
+  "results": {
+    "final_focused": "All 60 runtime-family focused tests passed; no runtime-family failures remain.",
+    "hooks": "All configured checks passed serially, including native/style/docs and full-project pyright, with no concurrent intensive work.",
+    "device": "not run",
+    "new_and_preserved_focused": "All 60 runtime-family tests passed (14 prior broadcast + 5 cast + 9 axis + 32 explicit metadata/native-boundary tests).",
+    "cohort_log": "build-py314/milestone-loop-20261115/continued-third.log",
+    "cohort_log_sha256": "cdbec82abb894d310eccd4eb48467397263a32e9d99f419dc1b73e5833e9996b",
+    "cohort_status": "82 passed, 2 unrelated eventful-child fixture construction failures; both corrected and all24 eventful-child tests separately passed. Full52-module cohort and corrected196-test rollout rerun are recorded below.",
+    "hooks_log": "build-py314/milestone-loop-20261115/runtime-package-hooks.log",
+    "hooks_log_sha256": "b1c12e7d7805d4a6b74a42dd137abc924281d6256d34ac7c9a3e90960e180640",
+    "rollout_rerun": "196 passed in 11.61s",
+    "rollout_rerun_log": "build-py314/milestone-loop-20261115/rollout-fixed.log",
+    "rollout_rerun_log_sha256": "976e80ab8d04e42b870a0e183b94f4d5e5073098eca5baf0ddf36d46ac455e95",
+    "broad_gate": {
+      "log": "build-py314/milestone-loop-20261115/broad-gate.log",
+      "sha256": "dc1d5364af5fca92b8bc89c86a7c12df02ce000e9add15aaae958bdaab32d42d",
+      "modules": 52,
+      "result": "2669 passed, 6 stale mixed-rollout fixture failures, 4 warnings, 437.97s",
+      "resolution": "The six failures expected FP32 row reduction plus packed-column transfer to remain unsupported; those operations are now supported. Reviewer accepted replacing that synthetic unsupported leaf with a legal FP16 reduction (still outside the Buffer family), retaining submit/serialization/whole-kernel selection checks. The complete affected module rerun passed 196 tests. The full 2675-test cohort was not rerun after this fixture-only correction. No production logic was changed to resolve these six failures."
+    },
+    "package_gate": {
+      "result": "256 passed in10.03s",
+      "log": "build-py314/milestone-loop-20261115/runtime-package-tests.log",
+      "sha256": "476a6944d5b2ce71d9cbb94b096a32927a33b17446c68338dae260bf0d9fec8c",
+      "oracle_scope": "Runtime-only shared oracle snapshot; integrated reviewed binary explicitly pinned above."
+    }
+  },
+  "input_contract": {
+    "valid_range": "0<=actual extents<=physical capacity is the existing operation-validity precondition, not inferred caller bounds",
+    "new_reduction_axes": "fixed full positive source columns; runtime rows matched to output rows; positive rows at native call",
+    "row_broadcast": "matching actual matrix/output/carrier rows; carrier column one; whole allocation/scratch enclosures include rounded carrier reads",
+    "axis_alias": "complete contiguous FP32 allocation [M,1] <-> [1,M], M%8=0, original valid prefix [r,1] <-> [1,r], independent native metadata objects at same proved placed interval",
+    "dynamic_cast": "BF16/FP32 only; same physical[M,C], fixed full positive C; C%16=0,C<=65535,M*C<=UINT32_MAX, matched actual rows and positive guard; existing rounding/saturation/disjointness",
+    "reduction_encoding": "runtime-only M<=UINT16_MAX, source/scratch C/8<=UINT16_MAX, all source/output/scratch element products<=UINT32_MAX",
+    "row_expand_encoding": "source/output element products<=UINT32_MAX; physical M<256 or C/8<=UINT8_MAX",
+    "native_completion": "Existing backend invocation contract, token matching and causal reuse remain separate obligations"
+  },
+  "footprint_qualification": {
+    "dynamic_exact_selectors": "unavailable",
+    "selected_model": "whole-memory-space conservative effects, preserving modes and physical reuse",
+    "scalar_reduction_output": "one FP32 value per repeat; inactive output rows untouched, no implicit zero padding",
+    "scratch": "existing explicit reduction allocation plus existing fixed row-expand workspace enclosure",
+    "cast": "direct BF16/FP32 source/destination loops; no selected integer scratch/event branches"
+  },
+  "negative_boundaries": [
+    "actual row mismatch",
+    "unguarded zero-capable rows",
+    "partial/unknown columns",
+    "unsupported target",
+    "conversion window overlap",
+    "native uint16/uint32/uint8 encoding failure",
+    "forged reshape shape",
+    "addressless dynamic-column metadata ownership",
+    "dynamic-column GM load/store, singleton and wide GM",
+    "unqualified dynamic-column elementwise add/mul"
+  ],
+  "unchanged": [
+    "allocation algorithms",
+    "eligible six-ID pool",
+    "expert protocols",
+    "compact K/replay representations",
+    "zero-inner-body barriers",
+    "hardware same-pipe exemptions"
+  ],
+  "remaining": [
+    "original Qwen mixed-full/partial elementwise operation contract and full-carrier/partial-matrix relation",
+    "dynamic exact storage selectors",
+    "general dynamic addressless/borrowed metadata aliasing",
+    "broader runtime reduction-column domains",
+    "native/device execution"
+  ],
+  "native_docs": [
+    "https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/SIMD-API/C-API/vector_compute/asc_repeat_reduce_sum.md",
+    "https://asc.gitcode.com/api/SIMD-API/c_api/vector_compute/asc_repeat_reduce_max.html"
+  ],
+  "binary_sha256": "8c1e98e57f502057852c65de02da143a16ac1e83082b3786ea5e17d54680691c",
+  "binary_scope": "Integrated dirty-tree batch including concurrent reviewed GM-readiness and child-provider work; not an isolated clean-commit build. Aggregate final receipt pins the full batch.",
+  "whole_model_capture": {
+    "receipt": "build-py314/milestone-loop-20261115/qwen-final-prefix/receipt.json",
+    "sha256": "f19af2012a4a5175b7856459dd5f07f446f153ef7f5a5fa5f3155dc101dd8864",
+    "configuration": {
+      "layers": 2,
+      "sequence": 128,
+      "batch": 1
+    },
+    "compiler_revision": "d7458eac7b3af615c08fe56374cfe1ea2e354c6c",
+    "library_revision": "b72c66d9df69ba5f11982b212530a255c050988d",
+    "model_source_prefill_sha256": "3e05b6f910055549d6f89c24743dc384acfb0134be059efe4351b72092824dcb",
+    "compiler_dirty_sources_recorded_in_capture": true,
+    "tool_pins": {
+      "path": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher/ptoas",
+      "hash": "8b52c0bfe3259f37dd17331ec0b8ee534461f18e70042edce0e2b6ee2fd7adf8",
+      "version": "ptoas 0.72",
+      "additional_artifacts": {
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so": "86655444ce6e3470dbbbf061438046bc5f87c5f0f89f4145fd2a4340c8fd70e9",
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so": "0aa83ba0abbd3432c2ce9ecb6c854485b5502d51b181fa200ee87fd9254ea321"
+      }
+    },
+    "extension_hashes": {
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "8c1e98e57f502057852c65de02da143a16ac1e83082b3786ea5e17d54680691c"
+    },
+    "environment": {
+      "PYTHONPATH": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106",
+      "PTOAS_ROOT": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher",
+      "OMP_NUM_THREADS": "1",
+      "PYPTO_CODEGEN_MAX_WORKERS": "1"
+    },
+    "command": [
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_qwen_whole_model.py",
+      "--library",
+      "/home/toni/work/pypto3/pypto-lib",
+      "--output",
+      "build-py314/milestone-loop-20261115/qwen-final-prefix",
+      "--layers",
+      "2",
+      "--policy",
+      "conservative_prefix",
+      "--require-function",
+      "down_proj",
+      "--require-function",
+      "gate_up_proj",
+      "--require-function",
+      "kv_proj",
+      "--require-function",
+      "mlp_out_cast",
+      "--require-function",
+      "mlp_out_cast_0",
+      "--require-function",
+      "mlp_out_seed",
+      "--require-function",
+      "out_proj_aic",
+      "--require-function",
+      "q_proj",
+      "--require-function",
+      "save_prefill_last_token_group",
+      "--require-function",
+      "save_prefill_last_token_single",
+      "--require-function",
+      "silu",
+      "--tool-artifact",
+      "build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas",
+      "--tool-artifact",
+      "build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so",
+      "--tool-artifact",
+      "build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so",
+      "--require-function",
+      "final_rmsnorm",
+      "--require-function",
+      "attention_finalize_phase",
+      "--require-function",
+      "qk_pv_partial_merge"
+    ],
+    "compile_success": true,
+    "cpp_leaves": 32,
+    "owned_leaves": 16,
+    "previous_owned_leaves": 14,
+    "new_owned_leaves": [
+      "x_gamma",
+      "x_gamma_0"
+    ],
+    "all_generated_leaves_pypto": false,
+    "compile_seconds_inclusive": 6.487057051155716,
+    "timing_scope": "Single descriptive whole-capture measurement, not demand-generation time or speedup evidence.",
+    "new_leaf_contract": "conservative_prefix; whole-memory-space enclosures, no GM disjointness; actual token order preserved; C++ generated",
+    "original_model_unchanged": true,
+    "whole_model_device_validation": false
+  },
+  "bounded_coverage": {
+    "axis_concrete_executions": 40,
+    "cast_concrete_executions": 32,
+    "previous_broadcast_executions": 24,
+    "runtime_rows": [
+      0,
+      1,
+      7,
+      8
+    ],
+    "axis_visits_replay": [
+      [
+        1,
+        1
+      ],
+      [
+        3,
+        2
+      ]
+    ],
+    "branch_choices": [
+      0,
+      1
+    ],
+    "changing_rows": "min(rows,visit%8), original SSA values restored across two outer replay resets",
+    "axis_and_cast_scaling_counts": [
+      3,
+      1023,
+      1000000
+    ],
+    "retained_result": "conservative site/state counters unchanged under the tested literal trip-count changes",
+    "footprints": "independent original active-byte expansion, rounded carrier reads, selected <=64-column no-scratch reduction path; independent Torch values/inactive sentinels",
+    "logical_and_physical": "full token-induced payload-event order equality, strict physical matching, acyclicity, six-ID eligibility and causal consumption before republication"
+  },
+  "packaging": {
+    "owned_paths": [
+      "include/pypto/backend/common/buffer_type_support.h",
+      "include/pypto/backend/common/buffer_view_semantics.h",
+      "include/pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h",
+      "include/pypto/ir/transforms/utils/buffer_valid_analysis.h",
+      "src/backend/common/buffer_row_recipes.cpp",
+      "src/backend/common/buffer_conversion_recipes.cpp",
+      "src/backend/common/buffer_view_semantics.cpp",
+      "src/backend/common/buffer_elementwise_recipes.cpp",
+      "src/backend/common/buffer_sync_contract.cpp",
+      "src/codegen/pto/pto_buffer_codegen.cpp",
+      "src/ir/op/buffer_ops/memory.cpp",
+      "src/ir/transforms/lower_tile_to_buffer_pass.cpp",
+      "src/ir/transforms/select_buffer_ir_functions_pass.cpp",
+      "tests/ut/ir/transforms/test_runtime_valid_reduction_axis.py",
+      "tests/ut/ir/transforms/test_runtime_valid_metadata.py",
+      "tests/ut/ir/transforms/test_runtime_valid_cast.py",
+      "tests/ut/ir/transforms/test_lower_tile_to_buffer.py",
+      "tests/ut/ir/transforms/sync_closed_command_oracle.py",
+      "tests/ut/ir/transforms/sync_logical_oracle.py",
+      "docs/en/dev/ir/41-general-autosync-runtime-axis.md",
+      "docs/zh/dev/ir/41-general-autosync-runtime-axis.md",
+      "docs/en/dev/ir/41-general-autosync-runtime-axis.json",
+      "docs/en/dev/ir/index.md",
+      "docs/zh/dev/ir/index.md",
+      "docs/en/dev/passes/58-lower_tile_to_buffer.md",
+      "docs/zh/dev/passes/58-lower_tile_to_buffer.md",
+      "mkdocs.yml"
+    ],
+    "shared_closed_oracle_scope": "Include only new ADD/MUL/ADDS, cast, row_sum/max and row_expand_mul payload models; keep concurrent M4 constructor/record-origin/extract changes for its own package.",
+    "packaged_closed_oracle_sha256": "94a5aae45f157e730994e4f358c1fd01d272b57d29b58c9d70f57c2883a743c2",
+    "integrated_tests_use_dirty_shared_oracle": "The working-tree source hash above identifies the full integrated checker; package-only source differs solely by separately reviewed M4 support, as identified by packaged_closed_oracle_sha256."
+  }
+}

@@ -83,28 +83,39 @@ inline bool IsColumnVectorBufferTile(const ir::TileTypePtr& tile, const ir::Tile
          view.fractal == 512 && view.pad == ir::PadValue::null && view.compact == ir::CompactMode::null;
 }
 
+// Physical geometry alone does not certify active extents or native metadata.
+inline bool IsColumnVectorBufferGeometry(const ir::BufferTypePtr& type) {
+  return type && type->shape_.size() == 2 && type->shape_[0] > 0 && type->shape_[0] % 8 == 0 &&
+         type->shape_[1] == 1 && type->dtype_ == DataType::FP32 &&
+         type->memory_space_ == ir::MemorySpace::Vec && type->blayout_ == ir::TileLayout::col_major &&
+         type->slayout_ == ir::TileLayout::none_box && type->fractal_ == 512 &&
+         type->pad_ == ir::PadValue::null && type->compact_ == ir::CompactMode::null;
+}
+
 inline bool IsColumnVectorBuffer(const ir::BufferTypePtr& type) {
-  return type && type->shape_.size() == 2 && type->shape_[0] % 8 == 0 && type->shape_[1] == 1 &&
-         type->dtype_ == DataType::FP32 && type->memory_space_ == ir::MemorySpace::Vec &&
-         type->blayout_ == ir::TileLayout::col_major && type->slayout_ == ir::TileLayout::none_box &&
-         type->fractal_ == 512 && type->pad_ == ir::PadValue::null &&
-         type->compact_ == ir::CompactMode::null && type->valid_shape_[0] > 0 && type->valid_shape_[1] == 1;
+  return IsColumnVectorBufferGeometry(type) && type->valid_shape_[0] > 0 && type->valid_shape_[1] == 1;
 }
 
 /// Dense allocation descriptors shared by heterogeneous native recipes.
-inline bool IsAlignedDenseVecBuffer(const ir::BufferTypePtr& type) {
+inline bool IsAlignedDenseVecBufferGeometry(const ir::BufferTypePtr& type) {
   const auto element_bytes = type ? type->dtype_.GetBit() / 8 : 0;
   // Check alignment without multiplying a potentially large physical extent.
   return element_bytes > 0 && element_bytes <= 32 && 32 % element_bytes == 0 && type &&
          type->shape_.size() == 2 && type->memory_space_ == ir::MemorySpace::Vec &&
          type->blayout_ == ir::TileLayout::row_major && type->slayout_ == ir::TileLayout::none_box &&
          type->fractal_ == 512 && type->pad_ == ir::PadValue::null &&
-         type->compact_ == ir::CompactMode::null && type->valid_shape_[0] > 0 && type->valid_shape_[1] > 0 &&
+         type->compact_ == ir::CompactMode::null && type->shape_[0] > 0 && type->shape_[1] > 0 &&
          type->shape_[1] % (32 / element_bytes) == 0;
 }
 
-/// Static positive-valid logical descriptors shared by heterogeneous recipes.
-inline ir::BufferTypePtr StaticLogicalBufferDescriptor(const ir::TypePtr& type) {
+inline bool IsAlignedDenseVecBuffer(const ir::BufferTypePtr& type) {
+  return IsAlignedDenseVecBufferGeometry(type) && type->valid_shape_[0] > 0 && type->valid_shape_[1] > 0;
+}
+
+/// Physical descriptor projection shared by native operation recipes. The
+/// returned full-shape valid fields describe capacity only, never the actual
+/// active domain; a caller must separately certify original valid metadata.
+inline ir::BufferTypePtr PhysicalLogicalVecDescriptor(const ir::TypePtr& type) {
   const auto tile = ir::As<ir::TileType>(type);
   if (!tile || tile->shape_.size() != 2) return nullptr;
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
@@ -112,18 +123,10 @@ inline ir::BufferTypePtr StaticLogicalBufferDescriptor(const ir::TypePtr& type) 
   const auto offset = ir::As<ir::ConstInt>(view.start_offset);
   if (view.start_offset && (!offset || offset->value_ != 0)) return nullptr;
   std::vector<int64_t> shape;
-  std::vector<int64_t> valid;
-  const auto& extents = view.valid_shape.empty() ? tile->shape_ : view.valid_shape;
-  if (extents.size() != 2) return nullptr;
-  for (size_t i = 0; i < 2; ++i) {
-    const auto dimension = ir::As<ir::ConstInt>(tile->shape_[i]);
-    const auto extent = ir::As<ir::ConstInt>(extents[i]);
-    if (!dimension || dimension->value_ <= 0 || !extent || extent->value_ <= 0 ||
-        extent->value_ > dimension->value_) {
-      return nullptr;
-    }
+  for (const auto& expression : tile->shape_) {
+    const auto dimension = ir::As<ir::ConstInt>(expression);
+    if (!dimension || dimension->value_ <= 0) return nullptr;
     shape.push_back(dimension->value_);
-    valid.push_back(extent->value_);
   }
   if (!view.stride.empty()) {
     const std::vector<int64_t> expected = view.blayout == ir::TileLayout::col_major
@@ -135,7 +138,25 @@ inline ir::BufferTypePtr StaticLogicalBufferDescriptor(const ir::TypePtr& type) 
       if (!stride || stride->value_ != expected[i]) return nullptr;
     }
   }
-  return std::make_shared<ir::BufferType>(shape, tile->dtype_, ir::MemorySpace::Vec, valid, view.blayout);
+  return std::make_shared<ir::BufferType>(shape, tile->dtype_, ir::MemorySpace::Vec, shape, view.blayout);
+}
+
+/// Static positive-valid logical descriptors shared by heterogeneous recipes.
+inline ir::BufferTypePtr StaticLogicalBufferDescriptor(const ir::TypePtr& type) {
+  const auto physical = PhysicalLogicalVecDescriptor(type);
+  const auto tile = ir::As<ir::TileType>(type);
+  if (!physical || !tile) return nullptr;
+  const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
+  const auto& extents = view.valid_shape.empty() ? tile->shape_ : view.valid_shape;
+  if (extents.size() != 2) return nullptr;
+  std::vector<int64_t> valid;
+  for (size_t i = 0; i < 2; ++i) {
+    const auto extent = ir::As<ir::ConstInt>(extents[i]);
+    if (!extent || extent->value_ <= 0 || extent->value_ > physical->shape_[i]) return nullptr;
+    valid.push_back(extent->value_);
+  }
+  return std::make_shared<ir::BufferType>(physical->shape_, tile->dtype_, ir::MemorySpace::Vec, valid,
+                                          view.blayout);
 }
 
 /// Packed singleton-column GM and a full-valid contiguous FP32 Vec column.
