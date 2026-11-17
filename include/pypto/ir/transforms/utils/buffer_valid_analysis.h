@@ -89,8 +89,11 @@ class BufferValidAnalysis : public IRVisitor {
     // even when another alias promoted its allocation handle to dynamic.
     const bool static_cast_recipe = conversion && conversion->kind == backend::BufferConversionKind::Cast &&
                                     backend::SupportsLogicalBufferConversion(*conversion, call);
-    restricted_ |= backend::FindLogicalBufferAxisRecipe(call->op_->name_) != nullptr ||
-                   (conversion && !static_cast_recipe) ||
+    const auto* axis_recipe = backend::FindLogicalBufferAxisRecipe(call->op_->name_);
+    const bool runtime_row_broadcast = axis_recipe && axis_recipe->axis == 0 && !axis_recipe->reduction &&
+                                       std::string_view(axis_recipe->buffer_op) == "buffer.col_expand_mul" &&
+                                       backend::SupportsLogicalBufferAxis(*axis_recipe, call);
+    restricted_ |= (axis_recipe && !runtime_row_broadcast) || (conversion && !static_cast_recipe) ||
                    backend::FindLogicalBufferIndexedRecipe(call->op_->name_) != nullptr;
     if (IsOp(call, "tile.reshape") || IsOp(call, "tile.reinterpret_view") || IsOp(call, "tile.assemble") ||
         IsOp(call, "tile.move") || IsOp(call, "tile.extract") || IsOp(call, "tile.transpose_view") ||

@@ -886,3 +886,44 @@ three planners, with independent host values, modeled access checks and PTOAS
 C++ generation. These checks qualify the declared contiguous storage model;
 they do not establish native device correctness or add unsupported broadcast
 operation recipes.
+
+### Runtime rows in column broadcast
+
+The FP32 `col_expand_mul` recipe additionally accepts runtime active rows while
+retaining a fixed positive full-column extent and a full-valid `[1,N]` carrier.
+Physical shape, stride, alias restrictions and native repeat/stride bounds remain
+part of the same shared recipe. Runtime `0 <= rows <= physical_rows` is the
+existing valid-metadata input precondition; a storage enclosure does not prove
+program memory validity. Runtime or zero reduction columns are not admitted.
+
+Lowering restores each operand's current logical valid metadata, sets the output
+state and guards the native call with `rows > 0`. A zero-row broadcast updates
+metadata without issuing that native operation; unrelated active payloads, such
+as the carrier load, retain their original control. Numerical facts concern atomic
+integer SSA values and constants under their original comparisons; unchecked
+arithmetic substitutions do not establish bounds or positivity. Rows are
+compared as actual SSA expressions, not as equal `-1` descriptor fields. The shared
+`BufferRuntimeValidAnalysis` checks matching source/output rows, full matrix
+columns, the carrier's `[1,N]` state and positive-row control at the use site.
+It runs in Buffer verification, which codegen also consumes, so an explicit
+Buffer call does not bypass those obligations. Unknown metadata after joins or
+backedges is unavailable until re-established. The initial proof owns ordinary
+`buffer.alloc` metadata; aliases, slots and borrowed metadata require separate
+ownership evidence. No private branch-history state is introduced.
+
+The state scan uses indexed handle facts and constant-time epoch invalidation
+at control boundaries, rather than rescanning all handles. It never unfolds
+iteration counts; expression equality and guard proof work is charged separately
+to the existing arithmetic analyzer. The selected native `5487a6b0`
+`TColExpandBinaryCountMode` sets a column-count mask, loops active rows and
+restores the vector mask. Like the existing NormalMode, it uses explicit inputs
+and output without hidden scratch or numbered events. This newly qualified
+variant remains A2/A3-only. A5 and other native implementations require their
+own qualification.
+
+Exact dynamic-storage selectors remain unavailable. The explicit conservative
+policy can use its sound full-allocation/memory-space effects and existing
+closed prefix protocol. Its order-coverage guarantee does not become a
+minimum-demand claim. Host tests independently interpret runtime metadata and
+active physical rectangles, check output sentinels, token/flag order, matching
+and causal reuse; device qualification is separate.

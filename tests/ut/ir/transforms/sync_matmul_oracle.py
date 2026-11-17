@@ -297,6 +297,7 @@ def interpret(
             reads = access(args[0])
             writes, pipe = access(args[1]) | access(args[2]), ir.PipeType.V
         elif name in {
+            ir.get_op("buffer.full").name,
             ir.get_op("buffer.add").name,
             ir.get_op("buffer.mul").name,
             ir.get_op("buffer.sub").name,

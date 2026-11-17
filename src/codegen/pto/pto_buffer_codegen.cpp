@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <any>
 #include <cstddef>
 #include <cstdint>
@@ -415,6 +416,17 @@ class BufferEmissionPreflight : public ir::IRVisitor {
         backend::FindBufferIndexedRecipe(call->op_->name_)) {
       CHECK_SPAN(conversion_supported_, call->span_)
           << "Direct Buffer cast/compare/select and indexed operations currently supports A2/A3 only";
+    }
+    if (const auto* row = backend::FindBufferRowRecipe(call->op_->name_); row && row->row_vector) {
+      bool runtime_valid = false;
+      for (const auto& arg : call->args_) {
+        if (const auto type = As<ir::BufferType>(arg->GetType())) {
+          runtime_valid |=
+              std::find(type->valid_shape_.begin(), type->valid_shape_.end(), -1) != type->valid_shape_.end();
+        }
+      }
+      CHECK_SPAN(!runtime_valid || conversion_supported_, call->span_)
+          << "Runtime-valid Buffer column broadcast currently supports A2/A3 only";
     }
     const auto* recipe = backend::FindBufferElementwiseRecipe(call->op_->name_);
     CHECK_SPAN(recipe || backend::FindBufferAxisRecipe(call->op_->name_) ||

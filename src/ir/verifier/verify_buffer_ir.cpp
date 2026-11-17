@@ -39,6 +39,7 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/buffer_ir_selection.h"
+#include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/transforms/utils/type_metadata.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/verifier.h"
@@ -676,6 +677,14 @@ class BufferIRPropertyVerifierImpl : public PropertyVerifier {
       }
       BufferIRVisitor visitor(diagnostics, function->name_);
       visitor.VisitFunction(function);
+      if (!visitor.HasMalformedStructure()) {
+        BufferRuntimeValidAnalysis valid(function);
+        if (const auto& issue = valid.issue()) {
+          diagnostics.emplace_back(DiagnosticSeverity::Error, "BufferIR", 1,
+                                   issue->message + " in function '" + function->name_ + "'",
+                                   issue->call->span_);
+        }
+      }
       // Other verifiers assume intact structural nodes. The diagnostics above
       // already reject missing callees or assignment fields; do not send those
       // malformed functions into verifiers with stronger input assumptions.
