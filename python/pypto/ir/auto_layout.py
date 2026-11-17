@@ -280,7 +280,9 @@ class LayoutOperationNode:
             `tile.transpose_view`, `tile.matmul`, `tile.store`).
         inputs: Input value names (referencing `LayoutProblemInstance.values`).
         output: Output value name (referencing `LayoutProblemInstance.values`).
-        invocations: Number of invocations $R_o$ per kernel run.
+        invocations: Total executions $R_o$ over the optimization horizon:
+            `expected_uses` times nested loop/call multiplicity. Calibration
+            divides by `expected_uses` to compare with one-launch measurements.
         configs: Candidate `OperatorConfig`s for this operation.
     """
 
@@ -538,6 +540,9 @@ class LayoutCostModel:
         Follows `MadCycles` in `l0_tile_chooser.cpp`: full FP32 MMAD requires
         `mad_fp32_passes` (`2` on `a2a3`, `8` on `a5`) per K-fractal due to
         mantissa decomposition, while `<= 2B` dtypes (`FP16`/`BF16`) use `1` pass.
+        A K-fractal contains 32 bytes, so FP32 also has twice as many K-fractals
+        as FP16 for the same K. `cube_macs_per_cycle` scales the nominal 4096
+        FP16-equivalent throughput; M/N/K tails pay for whole hardware fractals.
         """
         del out_node
         m_dim = int(lhs_node.shape[-2])
@@ -549,9 +554,10 @@ class LayoutCostModel:
             if self.mad_fp32_passes is not None
             else (8 if self.target_arch() == "a5" else 2)
         )
-        cpr = float(fp32_passes) if bpe == 4 else 1.0
-        macs = float(m_dim * n_dim * k_dim)
-        return self.cube_issue_overhead_cycles + cpr * (macs / self.cube_macs_per_cycle)
+        cpr = max(1, fp32_passes) if bpe == 4 else max(1, bpe // 2)
+        k_fractal = max(1, 32 // bpe)
+        fractals = ((m_dim + 15) // 16) * ((n_dim + 15) // 16) * ((k_dim + k_fractal - 1) // k_fractal)
+        return self.cube_issue_overhead_cycles + cpr * fractals * (4096.0 / self.cube_macs_per_cycle)
 
     def estimate_store_cost(
         self,
@@ -674,10 +680,13 @@ class LayoutProblemInstance:
 
 
 _TENSOR_CREATE_OP = core_ir.get_op("tensor.create").name
+_TENSOR_RESHAPE_OP = core_ir.get_op("tensor.reshape").name
+_TENSOR_VIEW_OP = core_ir.get_op("tensor.view").name
 _TILE_CREATE_OP = core_ir.get_op("tile.create").name
 _TILE_LOAD_OP = core_ir.get_op("tile.load").name
 _TILE_STORE_OP = core_ir.get_op("tile.store").name
 _TILE_MOVE_OP = core_ir.get_op("tile.move").name
+_TILE_EXTRACT_OP = core_ir.get_op("tile.extract").name
 _TILE_TRANSPOSE_VIEW_OP = core_ir.get_op("tile.transpose_view").name
 _TILE_MATMUL_OPS = frozenset(
     {
@@ -703,6 +712,21 @@ def _static_shape(shape_exprs: Sequence[core_ir.Expr]) -> tuple[int, ...] | None
             return None
         dims.append(int(expr.value))
     return tuple(dims)
+
+
+def _tensor_shape_with_dynamic_fallback(
+    shape_exprs: Sequence[core_ir.Expr], default_dyn: int = 128
+) -> tuple[tuple[int, ...], bool]:
+    """Return `(dims, is_fully_static)` substituting `default_dyn` for symbolic dimensions."""
+    dims: list[int] = []
+    is_static = True
+    for expr in shape_exprs:
+        if isinstance(expr, core_ir.ConstInt):
+            dims.append(int(expr.value))
+        else:
+            dims.append(default_dyn)
+            is_static = False
+    return tuple(dims), is_static
 
 
 def _effective_tile_layout(tile_type: core_ir.TileType) -> TileLayoutDesc:
@@ -731,8 +755,6 @@ def _admissible_tile_layouts(tile_type: core_ir.TileType) -> tuple[TileLayoutDes
         return (current, other)
     if space == core_ir.MemorySpace.Acc:
         return (FRACTAL_ACC_NZ,)
-    if space == core_ir.MemorySpace.Vec:
-        return (ROW_MAJOR_FLAT, COL_MAJOR_FLAT)
     return (_effective_tile_layout(tile_type),)
 
 
@@ -808,11 +830,20 @@ class _OrchCallMultiplierVisitor:
         self._alias_by_uid: dict[int, str] = {}
         self.call_counts: dict[str, int] = {}
         self.call_arg_names: dict[str, list[str | None]] = {}
+        self.call_sites: dict[str, list[tuple[list[str | None], int]]] = {}
+        self.call_order: dict[str, int] = {}
 
     def walk(self, func: core_ir.Function) -> None:
-        for param in func.params:
-            self._alias_by_uid[param.unique_id] = _clean_ssa_name(param.name_hint)
-        self._walk_stmt(func.body)
+        caller_args = self.call_arg_names.get(func.name, [])
+        for idx, param in enumerate(func.params):
+            override = caller_args[idx] if idx < len(caller_args) else None
+            self._alias_by_uid[param.unique_id] = override or _clean_ssa_name(param.name_hint)
+        prev_mult = self._mult
+        self._mult = self.call_counts.get(func.name, 1)
+        try:
+            self._walk_stmt(func.body)
+        finally:
+            self._mult = prev_mult
 
     def _resolve_arg_name(self, expr: core_ir.Expr) -> str | None:
         if not isinstance(expr, core_ir.Var):
@@ -823,9 +854,17 @@ class _OrchCallMultiplierVisitor:
         if isinstance(expr, core_ir.Call):
             if isinstance(expr.op, core_ir.GlobalVar):
                 name = expr.op.name
+                self.call_order.setdefault(name, len(self.call_order))
                 self.call_counts[name] = self.call_counts.get(name, 0) + self._mult
                 resolved = [self._resolve_arg_name(arg) for arg in expr.args]
                 self.call_arg_names.setdefault(name, resolved)
+                sites = self.call_sites.setdefault(name, [])
+                for idx, (prev_args, prev_mult) in enumerate(sites):
+                    if prev_args == resolved:
+                        sites[idx] = (prev_args, prev_mult + self._mult)
+                        break
+                else:
+                    sites.append((resolved, self._mult))
                 if assign_var is not None:
                     callee = self._func_by_name.get(name)
                     if callee is not None:
@@ -838,17 +877,35 @@ class _OrchCallMultiplierVisitor:
                                 break
             elif assign_var is not None and expr.op.name == _TENSOR_CREATE_OP:
                 self._alias_by_uid[assign_var.unique_id] = _clean_ssa_name(assign_var.name_hint)
+            elif (
+                assign_var is not None and expr.op.name in (_TENSOR_RESHAPE_OP, _TENSOR_VIEW_OP) and expr.args
+            ):
+                src_alias = self._resolve_arg_name(expr.args[0])
+                self._alias_by_uid[assign_var.unique_id] = src_alias or _clean_ssa_name(assign_var.name_hint)
             for arg in expr.args:
                 self._record_calls(arg)
+        elif assign_var is not None and isinstance(expr, core_ir.Var):
+            alias = self._resolve_arg_name(expr)
+            if alias is not None:
+                self._alias_by_uid[assign_var.unique_id] = alias
 
     def _walk_stmt(self, stmt: core_ir.Stmt) -> None:
         if isinstance(stmt, core_ir.ForStmt):
+            for iter_arg in stmt.iter_args:
+                init_val = getattr(iter_arg, "initValue", None)
+                if isinstance(init_val, core_ir.Expr):
+                    alias = self._resolve_arg_name(init_val)
+                    if alias is not None:
+                        self._alias_by_uid[iter_arg.unique_id] = alias
             prev = self._mult
             self._mult = prev * _for_trip_count(stmt)
             try:
                 self._walk_stmt(stmt.body)
             finally:
                 self._mult = prev
+            for rv, iter_arg in zip(stmt.return_vars, stmt.iter_args, strict=False):
+                if iter_arg.unique_id in self._alias_by_uid:
+                    self._alias_by_uid[rv.unique_id] = self._alias_by_uid[iter_arg.unique_id]
             return
         if isinstance(stmt, core_ir.AssignStmt):
             self._record_calls(stmt.value, assign_var=stmt.var)
@@ -871,6 +928,7 @@ class _PostInferInstanceExtractor:
         *,
         external_out_names: set[str] | None = None,
         shared_values: dict[str, LayoutValueNode] | None = None,
+        consumed_values: set[str] | None = None,
         op_offset: int = 0,
         tile_prefix: str = "",
         call_multiplier: int = 1,
@@ -881,6 +939,7 @@ class _PostInferInstanceExtractor:
         self._external_out_names = external_out_names
         self._tile_prefix = tile_prefix
         self.values: dict[str, LayoutValueNode] = dict(shared_values) if shared_values else {}
+        self.consumed_values: set[str] = set(consumed_values) if consumed_values else set()
         self.operations: list[LayoutOperationNode] = []
         self._uid_to_name: dict[int, str] = {}
         self._op_counter = op_offset
@@ -896,8 +955,8 @@ class _PostInferInstanceExtractor:
         for idx, (param, direction) in enumerate(zip(func.params, func.param_directions, strict=True)):
             if not isinstance(param.type, core_ir.TensorType):
                 continue
-            shape = _static_shape(param.type.shape)
-            if shape is None:
+            shape, _is_static = _tensor_shape_with_dynamic_fallback(param.type.shape)
+            if not shape:
                 continue
             override = self._param_overrides[idx] if idx < len(self._param_overrides) else None
             name = override or _clean_ssa_name(param.name_hint)
@@ -928,14 +987,33 @@ class _PostInferInstanceExtractor:
             )
         self._walk_stmt(func.body)
 
-    def _register_tile_var(self, var: core_ir.Var, producer_op_id: str | None) -> LayoutValueNode | None:
+    def _register_tile_var(
+        self,
+        var: core_ir.Var,
+        producer_op_id: str | None,
+        *,
+        op_inputs: Sequence[str] = (),
+    ) -> LayoutValueNode | None:
         if not isinstance(var.type, core_ir.TileType):
             return None
         shape = _static_shape(var.type.shape)
         if shape is None:
             return None
+        for inp in op_inputs:
+            self.consumed_values.add(inp)
         base_name = _clean_ssa_name(var.name_hint)
         name = f"{self._tile_prefix}{base_name}" if self._tile_prefix else base_name
+        if name in self.values and (
+            self.values[name].producer_op_id is not None
+            or producer_op_id is None
+            or name in self.consumed_values
+        ):
+            raw_name = f"{self._tile_prefix}{var.name_hint}" if self._tile_prefix else var.name_hint
+            name = (
+                raw_name
+                if (raw_name not in self.values and raw_name not in self.consumed_values)
+                else f"{raw_name}_{self._op_counter}"
+            )
         self._uid_to_name[var.unique_id] = name
         space = var.type.memory_space or core_ir.MemorySpace.Vec
         cur_layout = _effective_tile_layout(var.type)
@@ -961,7 +1039,7 @@ class _PostInferInstanceExtractor:
         src_name = self._uid_to_name[src_arg.unique_id]
         op_id = f"op_{self._op_counter}_{op.var.name_hint}_load"
         self._op_counter += 1
-        dst_node = self._register_tile_var(op.var, op_id)
+        dst_node = self._register_tile_var(op.var, op_id, op_inputs=(src_name,))
         src_node = self.values.get(src_name)
         if src_node is None or dst_node is None:
             return
@@ -1003,7 +1081,7 @@ class _PostInferInstanceExtractor:
         src_name = self._uid_to_name[src_arg.unique_id]
         op_id = f"op_{self._op_counter}_{op.var.name_hint}_tview"
         self._op_counter += 1
-        dst_node = self._register_tile_var(op.var, op_id)
+        dst_node = self._register_tile_var(op.var, op_id, op_inputs=(src_name,))
         src_node = self.values.get(src_name)
         if src_node is None or dst_node is None:
             return
@@ -1045,7 +1123,7 @@ class _PostInferInstanceExtractor:
         src_name = self._uid_to_name[src_arg.unique_id]
         op_id = f"op_{self._op_counter}_{op.var.name_hint}_move"
         self._op_counter += 1
-        dst_node = self._register_tile_var(op.var, op_id)
+        dst_node = self._register_tile_var(op.var, op_id, op_inputs=(src_name,))
         src_node = self.values.get(src_name)
         if src_node is None or dst_node is None:
             return
@@ -1096,7 +1174,7 @@ class _PostInferInstanceExtractor:
         rhs_name = self._uid_to_name[rhs_arg.unique_id]
         op_id = f"op_{self._op_counter}_{op.var.name_hint}_matmul"
         self._op_counter += 1
-        dst_node = self._register_tile_var(op.var, op_id)
+        dst_node = self._register_tile_var(op.var, op_id, op_inputs=(lhs_name, rhs_name))
         lhs_node = self.values.get(lhs_name)
         rhs_node = self.values.get(rhs_name)
         if lhs_node is None or rhs_node is None or dst_node is None:
@@ -1141,8 +1219,10 @@ class _PostInferInstanceExtractor:
         dst_node = self.values.get(dst_name)
         if src_node is None or dst_node is None:
             return
+        self.consumed_values.add(tile_name)
         op_id = f"op_{self._op_counter}_{dst_name}_store"
         self._op_counter += 1
+        is_additional_store = dst_node.producer_op_id is not None or dst_name in self.consumed_values
         configs: list[OperatorConfig] = []
         for s_lay in src_node.admissible_layouts:
             for d_lay in dst_node.admissible_layouts:
@@ -1156,15 +1236,42 @@ class _PostInferInstanceExtractor:
                     OperatorConfig(
                         op_id=op_id,
                         op_name=rhs.op.name,
-                        input_layouts=(s_lay,),
-                        output_layout=d_lay,
+                        input_layouts=(s_lay, d_lay) if is_additional_store else (s_lay,),
+                        output_layout=s_lay if is_additional_store else d_lay,
                         op_cost_cycles=cost,
                         notes=f"FIXPIPE {src_node.memory_space.name}->GM({dst_label})",
                     )
                 )
         supported_out_layouts = tuple(
-            d_lay for d_lay in dst_node.admissible_layouts if any(c.output_layout == d_lay for c in configs)
+            d_lay
+            for d_lay in dst_node.admissible_layouts
+            if any((c.input_layouts[1] if is_additional_store else c.output_layout) == d_lay for c in configs)
         )
+        if is_additional_store:
+            self.consumed_values.add(dst_name)
+            sink_name = f"{tile_name}_stored_{self._op_counter}"
+            self.values[sink_name] = LayoutValueNode(
+                name=sink_name,
+                shape=src_node.shape,
+                dtype=src_node.dtype,
+                memory_space=src_node.memory_space,
+                current_layout=src_node.current_layout,
+                admissible_layouts=src_node.admissible_layouts,
+                producer_op_id=op_id,
+            )
+            if supported_out_layouts and not self._model.allow_external_output_relayout:
+                self.values[dst_name] = replace(dst_node, admissible_layouts=supported_out_layouts)
+            self.operations.append(
+                LayoutOperationNode(
+                    op_id=op_id,
+                    op_name=rhs.op.name,
+                    inputs=(tile_name, dst_name),
+                    output=sink_name,
+                    invocations=self._model.expected_uses * self._loop_multiplier,
+                    configs=tuple(configs),
+                )
+            )
+            return
         # Mark `dst_node` as produced by this store and restrict its admissible layouts
         # to those actually supported by the store when external output relayout is off.
         self.values[dst_name] = LayoutValueNode(
@@ -1209,7 +1316,7 @@ class _PostInferInstanceExtractor:
 
         op_id = f"op_{self._op_counter}_{op.var.name_hint}_{rhs.op.name.replace('.', '_')}"
         self._op_counter += 1
-        dst_node = self._register_tile_var(op.var, op_id)
+        dst_node = self._register_tile_var(op.var, op_id, op_inputs=tuple(name for _, name, _ in tile_inputs))
         if dst_node is None:
             return
 
@@ -1284,7 +1391,11 @@ class _PostInferInstanceExtractor:
                 self._extract_load(op, rhs)
             elif op_name == _TILE_TRANSPOSE_VIEW_OP:
                 self._extract_transpose_view(op, rhs)
-            elif op_name == _TILE_MOVE_OP:
+            elif op_name == _TILE_MOVE_OP or (
+                op_name == _TILE_EXTRACT_OP
+                and isinstance(op.var.type, core_ir.TileType)
+                and op.var.type.memory_space in (core_ir.MemorySpace.Left, core_ir.MemorySpace.Right)
+            ):
                 self._extract_move(op, rhs)
             elif op_name in _TILE_MATMUL_OPS:
                 self._extract_matmul(op, rhs)
@@ -1354,36 +1465,68 @@ def extract_layout_instance(
     model = cost_model or LayoutCostModel()
     reusable = reusable_tensors or set()
     values: dict[str, LayoutValueNode] = {}
+    consumed_values: set[str] = set()
     operations: list[LayoutOperationNode] = []
 
     incore_funcs = [f for f in program.functions.values() if core_ir.is_incore_type(f.func_type)]
-    orch_funcs = [f for f in program.functions.values() if not core_ir.is_incore_type(f.func_type)]
+    non_incore_funcs = [f for f in program.functions.values() if not core_ir.is_incore_type(f.func_type)]
     ext_out_names: set[str] | None = None
     call_counts: dict[str, int] = {}
     call_arg_names: dict[str, list[str | None]] = {}
-    if orch_funcs:
+    call_sites: dict[str, list[tuple[list[str | None], int]]] = {}
+    if non_incore_funcs:
         ext_out_names = {
             _clean_ssa_name(p.name_hint)
-            for fn in orch_funcs
+            for fn in non_incore_funcs
             for p, d in zip(fn.params, fn.param_directions, strict=True)
             if d in (core_ir.ParamDirection.Out, core_ir.ParamDirection.InOut)
         }
         func_by_name = {f.name: f for f in program.functions.values()}
         call_counter = _OrchCallMultiplierVisitor(func_by_name)
-        for fn in orch_funcs:
+        top_orch = [f for f in non_incore_funcs if str(f.func_type).endswith("Orchestration")]
+        sub_orch = [f for f in non_incore_funcs if not str(f.func_type).endswith("Orchestration")]
+        for fn in top_orch:
+            call_counter.walk(fn)
+        sub_orch.sort(key=lambda fn: call_counter.call_order.get(fn.name, 10**9))
+        for fn in sub_orch:
             call_counter.walk(fn)
         call_counts = call_counter.call_counts
         call_arg_names = call_counter.call_arg_names
+        call_sites = call_counter.call_sites
+        incore_funcs.sort(key=lambda fn: call_counter.call_order.get(fn.name, 10**9))
 
     multi_incore = len(incore_funcs) > 1
     op_offset = 0
     for func in incore_funcs:
+        sites = call_sites.get(func.name)
+        if sites and len(sites) > 1:
+            for site_idx, (site_args, site_mult) in enumerate(sites):
+                prefix = f"{func.name}_{site_idx}."
+                extractor = _PostInferInstanceExtractor(
+                    model,
+                    reusable,
+                    external_out_names=ext_out_names,
+                    shared_values=values,
+                    consumed_values=consumed_values,
+                    op_offset=op_offset,
+                    tile_prefix=prefix,
+                    call_multiplier=site_mult,
+                    param_name_overrides=site_args,
+                )
+                extractor.extract(func)
+                values = extractor.values
+                consumed_values = extractor.consumed_values
+                operations.extend(extractor.operations)
+                op_offset = extractor.op_counter
+            continue
+
         prefix = f"{func.name}." if multi_incore else ""
         extractor = _PostInferInstanceExtractor(
             model,
             reusable,
             external_out_names=ext_out_names,
             shared_values=values,
+            consumed_values=consumed_values,
             op_offset=op_offset,
             tile_prefix=prefix,
             call_multiplier=call_counts.get(func.name, 1),
@@ -1391,10 +1534,79 @@ def extract_layout_instance(
         )
         extractor.extract(func)
         values = extractor.values
+        consumed_values = extractor.consumed_values
         operations.extend(extractor.operations)
         op_offset = extractor.op_counter
 
-    return LayoutProblemInstance(values=values, operations=operations, cost_model=model)
+    filtered_operations: list[LayoutOperationNode] = []
+    for op in operations:
+        valid_cfgs = tuple(
+            cfg
+            for cfg in op.configs
+            if cfg.output_layout in values[op.output].admissible_layouts
+            and all(
+                lay in values[inp].admissible_layouts
+                for inp, lay in zip(op.inputs, cfg.input_layouts, strict=True)
+            )
+        )
+        filtered_operations.append(replace(op, configs=valid_cfgs if valid_cfgs else op.configs))
+
+    return LayoutProblemInstance(values=values, operations=filtered_operations, cost_model=model)
+
+
+def _operator_cost_multiplier(instance: LayoutProblemInstance, op: LayoutOperationNode) -> float:
+    """Return the execution weight, including the model's MTE2 L2 reread discount."""
+    load_scale = 1.0
+    if op.op_name == _TILE_LOAD_OP and op.inputs:
+        src_val = instance.values[op.inputs[0]]
+        dst_val = instance.values[op.output]
+        if dst_val.memory_space == core_ir.MemorySpace.Mat:
+            model = instance.cost_model
+            per_run_inv = float(op.invocations) / float(max(1, model.expected_uses))
+            load_scale = model.effective_mte2_load_multiplier(src_val, dst_val, per_run_inv)
+    return float(op.invocations) * load_scale
+
+
+def _conversion_multiplier(
+    instance: LayoutProblemInstance,
+    value: LayoutValueNode,
+    operations_by_id: Mapping[str, LayoutOperationNode],
+    conversion_invocations: Sequence[int],
+) -> float:
+    """Count dynamic values, while sharing conversions only within one value."""
+    if value.memory_space == core_ir.MemorySpace.DDR and value.is_reusable_weight:
+        return 1.0
+    if value.memory_space != core_ir.MemorySpace.DDR and value.producer_op_id is not None:
+        producer_invocations = operations_by_id[value.producer_op_id].invocations
+        if any(
+            count < producer_invocations or count % producer_invocations != 0
+            for count in conversion_invocations
+        ):
+            raise ValueError(
+                f"On-chip conversion for {value.name!r} has differing producer/consumer execution counts; "
+                f"producer={producer_invocations}, consumers={sorted(set(conversion_invocations))}. "
+                "Execution-domain-aware conversion costing is required"
+            )
+        return float(producer_invocations)
+    return float(instance.cost_model.expected_uses)
+
+
+def _resolved_value_layouts(
+    instance: LayoutProblemInstance,
+    assignment: LayoutAssignment,
+    produced_layout: Mapping[str, LayoutChoice],
+) -> dict[str, LayoutChoice]:
+    """Keep caller packing choices, but never overwrite a scored producer layout."""
+    resolved = dict(assignment.value_layouts)
+    for name, layout in produced_layout.items():
+        if instance.values[name].producer_op_id is not None:
+            supplied = assignment.value_layouts.get(name, layout)
+            if supplied != layout:
+                raise ValueError(f"Value layout for {name!r} contradicts its producer configuration")
+            resolved[name] = layout
+        else:
+            resolved.setdefault(name, layout)
+    return resolved
 
 
 def evaluate_assignment(
@@ -1420,10 +1632,14 @@ def evaluate_assignment(
         name: node.current_layout for name, node in instance.values.items() if node.producer_op_id is None
     }
     consumer_layouts: dict[str, set[LayoutChoice]] = {name: set() for name in instance.values}
+    consumer_invocations: dict[str, dict[LayoutChoice, set[int]]] = {name: {} for name in instance.values}
     resolved_configs: dict[str, OperatorConfig] = {}
+    operations_by_id = {op.op_id: op for op in instance.operations}
 
     for op in instance.operations:
         chosen_cfg = assignment.op_configs.get(op.op_id)
+        if chosen_cfg is not None and chosen_cfg not in op.configs:
+            raise ValueError(f"Configuration for {op.op_id!r} is not in its legal catalog")
         if chosen_cfg is None:
             out_target = assignment.value_layouts.get(op.output, instance.values[op.output].current_layout)
             in_targets = tuple(
@@ -1440,24 +1656,14 @@ def evaluate_assignment(
             chosen_cfg = min(matching, key=lambda c: c.op_cost_cycles)
 
         resolved_configs[op.op_id] = chosen_cfg
-        load_scale = 1.0
-        if op.op_name == _TILE_LOAD_OP and op.inputs:
-            src_val = instance.values.get(op.inputs[0])
-            dst_val = instance.values.get(op.output)
-            if (
-                src_val is not None
-                and dst_val is not None
-                and dst_val.memory_space == core_ir.MemorySpace.Mat
-            ):
-                per_run_inv = float(op.invocations) / float(max(1, model.expected_uses))
-                load_scale = model.effective_mte2_load_multiplier(src_val, dst_val, per_run_inv)
-        cost = float(op.invocations) * load_scale * chosen_cfg.op_cost_cycles
+        cost = _operator_cost_multiplier(instance, op) * chosen_cfg.op_cost_cycles
         per_op_costs[op.op_id] = cost
         op_cost_total += cost
         produced_layout[op.output] = chosen_cfg.output_layout
 
         for inp_name, req_layout in zip(op.inputs, chosen_cfg.input_layouts, strict=True):
             consumer_layouts.setdefault(inp_name, set()).add(req_layout)
+            consumer_invocations[inp_name].setdefault(req_layout, set()).add(op.invocations)
 
     # External output tensors must be delivered in their caller-expected layout
     # unless `allow_external_output_relayout` is enabled.
@@ -1465,6 +1671,9 @@ def evaluate_assignment(
         for val_name, val_node in instance.values.items():
             if val_node.is_external_output:
                 consumer_layouts.setdefault(val_name, set()).add(val_node.current_layout)
+                consumer_invocations[val_name].setdefault(val_node.current_layout, set()).add(
+                    model.expected_uses
+                )
 
     per_value_conv: dict[str, float] = {}
     conv_cost_total = 0.0
@@ -1473,11 +1682,14 @@ def evaluate_assignment(
             continue
         val_node = instance.values[val_name]
         src_lay = produced_layout.get(val_name, val_node.current_layout)
-        # Reusable GM weights pay conversion once; streaming values pay per invocation.
-        multiplier = (
-            1.0
-            if (val_node.memory_space == core_ir.MemorySpace.DDR and val_node.is_reusable_weight)
-            else float(model.expected_uses)
+        conversion_invocations = {
+            count
+            for target in req_set
+            if target != src_lay
+            for count in consumer_invocations[val_name][target]
+        }
+        multiplier = _conversion_multiplier(
+            instance, val_node, operations_by_id, tuple(conversion_invocations)
         )
         val_conv = 0.0
         for dst_lay in req_set:
@@ -1486,8 +1698,7 @@ def evaluate_assignment(
         per_value_conv[val_name] = val_conv
         conv_cost_total += val_conv
 
-    resolved_value_layouts = dict(produced_layout)
-    resolved_value_layouts.update(assignment.value_layouts)
+    resolved_value_layouts = _resolved_value_layouts(instance, assignment, produced_layout)
     full_assignment = LayoutAssignment(value_layouts=resolved_value_layouts, op_configs=resolved_configs)
     return CostBreakdown(
         assignment=full_assignment,
@@ -2085,6 +2296,7 @@ class CalibrationReport:
 
 
 def _rank_array(vals: Sequence[float]) -> np.ndarray:
+    """Return zero-based average ranks, giving equal values equal ranks."""
     n = len(vals)
     order = sorted(range(n), key=vals.__getitem__)
     ranks = np.empty(n, dtype=np.float64)
@@ -2101,16 +2313,131 @@ def _rank_array(vals: Sequence[float]) -> np.ndarray:
 
 
 def _spearman_rank_correlation(xs: Sequence[float], ys: Sequence[float]) -> float:
+    """Return rank correlation, or zero when there is no rank variation."""
     if len(xs) < 2:
-        return 1.0
+        return 0.0
     rx = _rank_array(xs)
     ry = _rank_array(ys)
     rx_c = rx - rx.mean()
     ry_c = ry - ry.mean()
     denom = float(np.sqrt(np.sum(rx_c * rx_c) * np.sum(ry_c * ry_c)))
     if denom == 0.0:
-        return 1.0
+        return 0.0
     return float(np.sum(rx_c * ry_c) / denom)
+
+
+def _calibration_op_cost(
+    model: LayoutCostModel,
+    instance: LayoutProblemInstance,
+    op: LayoutOperationNode,
+    config: OperatorConfig,
+) -> float:
+    """Reprice one operation under the supplied calibration model."""
+    output = instance.values[op.output]
+    if op.op_name == _TILE_TRANSPOSE_VIEW_OP:
+        return 0.0
+    if op.op_name == _TILE_LOAD_OP:
+        return model.estimate_load_cost(
+            instance.values[op.inputs[0]], output, config.input_layouts[0], config.output_layout
+        )
+    if op.op_name == _TILE_MOVE_OP:
+        return model.estimate_move_cost(
+            instance.values[op.inputs[0]], output, config.input_layouts[0], config.output_layout
+        )
+    if op.op_name == _TILE_STORE_OP and op.inputs:
+        in_names = list(op.inputs)
+        in_lays = list(config.input_layouts)
+        store_out_lay = in_lays[1] if len(in_lays) > 1 else config.output_layout
+        store_dst_node = instance.values[in_names[1]] if len(in_names) > 1 else output
+        return model.estimate_store_cost(instance.values[in_names[0]], store_dst_node, store_out_lay)
+    if op.op_name in _TILE_MATMUL_OPS:
+        return model.estimate_matmul_cost(
+            instance.values[op.inputs[0]], instance.values[op.inputs[1]], output
+        )
+    if op.op_name.startswith("tile."):
+        return float(output.num_elements) / model.vec_elements_per_cycle
+    return config.op_cost_cycles
+
+
+def _calibration_load_scale(
+    model: LayoutCostModel,
+    instance: LayoutProblemInstance,
+    op: LayoutOperationNode,
+    per_run_inv: float,
+) -> float:
+    """Return the evaluator's per-run MTE2 re-read discount for a load."""
+    if op.op_name == _TILE_LOAD_OP and op.inputs:
+        src = instance.values[op.inputs[0]]
+        dst = instance.values[op.output]
+        if dst.memory_space == core_ir.MemorySpace.Mat:
+            return model.effective_mte2_load_multiplier(src, dst, per_run_inv)
+    return 1.0
+
+
+def _calibration_prediction_cycles(model: LayoutCostModel, measurement: CalibrationMeasurement) -> float:
+    """Return single-launch operator cycles; boundary packing is outside timing."""
+    expected_uses = float(measurement.instance.cost_model.expected_uses)
+    total = 0.0
+    for op in measurement.instance.operations:
+        config = measurement.breakdown.assignment.op_configs.get(op.op_id)
+        if config is None:
+            continue
+        inv = float(op.invocations) / expected_uses
+        scale = _calibration_load_scale(model, measurement.instance, op, inv)
+        total += inv * scale * _calibration_op_cost(model, measurement.instance, op, config)
+    return total
+
+
+def _calibration_features(
+    model: LayoutCostModel,
+    measurement: CalibrationMeasurement,
+    expected_uses: float,
+    contiguous_nd_ratio: float,
+) -> list[float]:
+    """Build four transfer-byte features and one retained-cycle feature."""
+    instance = measurement.instance
+    nd2nz_b = nz2nz_b = store_nd_b = store_nz_b = other_cycles = 0.0
+    for op in instance.operations:
+        cfg = measurement.breakdown.assignment.op_configs.get(op.op_id)
+        if cfg is None:
+            continue
+        inv = float(op.invocations) / expected_uses
+        if op.op_name == _TILE_LOAD_OP and op.inputs:
+            src_node = instance.values[op.inputs[0]]
+            dst_node = instance.values[op.output]
+            if dst_node.memory_space == core_ir.MemorySpace.Mat:
+                scale = _calibration_load_scale(model, instance, op, inv)
+                tile_bytes = float(dst_node.byte_size)
+                if cfg.input_layouts[0] == core_ir.TensorLayout.NZ:
+                    nz2nz_b += inv * scale * tile_bytes
+                    transfer_cycles = tile_bytes / model.mte2_nz2nz_bytes_per_cycle
+                else:
+                    cols = dst_node.shape[-1] if dst_node.shape else 1
+                    parent_cols = src_node.shape[-1] if src_node.shape else cols
+                    parent_row_bytes = parent_cols * _dtype_byte_width(dst_node.dtype)
+                    wide_strided = cols < parent_cols and parent_row_bytes > model.l2_cache_line_bytes
+                    ratio = 1.0 if wide_strided else max(1.0, contiguous_nd_ratio)
+                    nd2nz_b += inv * scale * tile_bytes / ratio
+                    transfer_cycles = tile_bytes / (model.mte2_nd2nz_bytes_per_cycle * ratio)
+                other_cycles += (
+                    inv * scale * (_calibration_op_cost(model, instance, op, cfg) - transfer_cycles)
+                )
+                continue
+        elif op.op_name == _TILE_STORE_OP and op.inputs:
+            src_node = instance.values[op.inputs[0]]
+            store_out_lay = cfg.input_layouts[1] if len(cfg.input_layouts) > 1 else cfg.output_layout
+            if store_out_lay == core_ir.TensorLayout.NZ:
+                store_nz_b += inv * float(src_node.byte_size)
+                store_bw = model.fixpipe_acc_to_nz_bytes_per_cycle
+            else:
+                store_nd_b += inv * float(src_node.byte_size)
+                store_bw = model.fixpipe_acc_to_nd_bytes_per_cycle
+            other_cycles += inv * (
+                _calibration_op_cost(model, instance, op, cfg) - float(src_node.byte_size) / store_bw
+            )
+            continue
+        other_cycles += inv * _calibration_op_cost(model, instance, op, cfg)
+    return [1.0, nd2nz_b, nz2nz_b, store_nd_b, store_nz_b, other_cycles]
 
 
 def _fit_within_case_differentials(
@@ -2234,18 +2561,7 @@ def fit_cost_model_from_measurements(
     min_t_stat: float = 2.0,
     max_physical_bpc: float = 1024.0,
 ) -> CalibrationReport:
-    """Fit MTE2/FIXPIPE bandwidth coefficients & dispatch offset to measured latencies.
-
-    Decomposes each measured single-run device execution time $T_{\\text{meas}}$ into:
-    - Fixed dispatch/launch overhead $\\beta_0$ ($\\mu$s),
-    - `ND -> Mat` load bytes / `nd2nz_bw` (per-run $\\text{bytes} \\cdot \\text{loop\\_trips}$),
-    - `NZ -> Mat` load bytes / `nz2nz_bw`,
-    - `Acc -> ND` store bytes / `store_nd_bw`,
-    - `Acc -> NZ` store bytes / `store_nz_bw`, and
-    - Remaining modeled cycles (`MTE1` + `Cube` + other ops).
-
-    Returns a calibrated `LayoutCostModel` plus goodness-of-fit diagnostics.
-    """
+    """Fit MTE2/FIXPIPE bandwidth coefficients & dispatch offset to measured latencies."""
     model = base_model or LayoutCostModel()
     if not measurements:
         return CalibrationReport(
@@ -2258,73 +2574,60 @@ def fit_cost_model_from_measurements(
             residuals_us={},
         )
 
-    # Extract per-run byte volumes and compute cycles by operation category.
-    # Solver `op.invocations` scales runtime costs by `expected_uses`; normalize
-    # back to a single kernel invocation to match single-run `measured_us`.
-    # Features: [1.0, nd2nz_bytes, nz2nz_bytes, store_nd_bytes, store_nz_bytes, compute_cycles]
     rows_x: list[list[float]] = []
     rows_y: list[float] = []
     op_cycles_list: list[float] = []
     case_groups: dict[str, list[int]] = {}
-    labels: list[str] = []
+    variant_ids: list[str] = []
+    if (
+        not math.isfinite(model.mte2_nd2nz_bytes_per_cycle)
+        or model.mte2_nd2nz_bytes_per_cycle <= 0.0
+        or not math.isfinite(model.mte2_nd2nz_contiguous_bytes_per_cycle)
+        or model.mte2_nd2nz_contiguous_bytes_per_cycle <= 0.0
+    ):
+        raise ValueError("ND load calibration requires positive finite base bandwidths")
+    contiguous_nd_ratio = model.mte2_nd2nz_contiguous_bytes_per_cycle / model.mte2_nd2nz_bytes_per_cycle
 
     for idx, m in enumerate(measurements):
-        nd2nz_b = 0.0
-        nz2nz_b = 0.0
-        store_nd_b = 0.0
-        store_nz_b = 0.0
-        other_cycles = 0.0
-        run_scale = float(max(1, m.instance.cost_model.expected_uses))
-
-        for op in m.instance.operations:
-            cfg = m.breakdown.assignment.op_configs.get(op.op_id)
-            if cfg is None:
-                continue
-            inv = float(op.invocations) / run_scale
-            if op.op_name == _TILE_LOAD_OP and op.inputs:
-                dst_node = m.instance.values[op.output]
-                if dst_node.memory_space == core_ir.MemorySpace.Mat:
-                    if cfg.input_layouts[0] == core_ir.TensorLayout.NZ:
-                        nz2nz_b += inv * float(dst_node.byte_size)
-                    else:
-                        nd2nz_b += inv * float(dst_node.byte_size)
-                    continue
-            elif op.op_name == _TILE_STORE_OP and op.inputs:
-                src_node = m.instance.values[op.inputs[0]]
-                if cfg.output_layout == core_ir.TensorLayout.NZ:
-                    store_nz_b += inv * float(src_node.byte_size)
-                else:
-                    store_nd_b += inv * float(src_node.byte_size)
-                continue
-            other_cycles += inv * cfg.op_cost_cycles
-
-        rows_x.append([1.0, nd2nz_b, nz2nz_b, store_nd_b, store_nz_b, other_cycles])
+        expected_uses = float(m.instance.cost_model.expected_uses)
+        if not math.isfinite(expected_uses) or expected_uses <= 0.0:
+            raise ValueError(
+                f"Measurement {m.variant_id!r} requires positive finite expected_uses, "
+                f"got {m.instance.cost_model.expected_uses}"
+            )
+        if not math.isfinite(m.measured_us) or m.measured_us <= 0.0:
+            raise ValueError(
+                f"Measurement {m.variant_id!r} requires positive finite measured_us, got {m.measured_us}"
+            )
+        rows_x.append(_calibration_features(model, m, expected_uses, contiguous_nd_ratio))
         rows_y.append(float(m.measured_us))
-        op_cycles_list.append(float(m.breakdown.operator_cost_cycles) / run_scale)
+        op_cycles_list.append(float(m.breakdown.operator_cost_cycles) / expected_uses)
         case_key = m.variant_id.split("/", 1)[0] if "/" in m.variant_id else str(id(m.instance))
         case_groups.setdefault(case_key, []).append(idx)
-        labels.append(m.label or m.variant_id)
+        variant_ids.append(m.variant_id)
 
     x_mat = np.asarray(rows_x, dtype=np.float64)
     y_vec = np.asarray(rows_y, dtype=np.float64)
     col_norms = np.sqrt(np.sum(x_mat * x_mat, axis=0))
     safe_scales = np.asarray([s if s > 0.0 else 1.0 for s in col_norms.tolist()], dtype=np.float64)
     x_scaled = np.asarray(x_mat / safe_scales, dtype=np.float64)
-    scaled_coef, _, _, _ = np.linalg.lstsq(x_scaled, y_vec, rcond=None)
+    scaled_coef, _, design_rank, _ = np.linalg.lstsq(x_scaled, y_vec, rcond=None)
     coef = scaled_coef / safe_scales
-    y_pred = x_mat @ coef
+    raw_y_pred = x_mat @ coef
 
-    # OLS parameter standard errors (scaled back from normalized columns for stability).
     n_cols = len(rows_x[0])
-    dof = max(1, len(rows_y) - n_cols)
-    rss = float(np.sum((y_vec - y_pred) ** 2))
-    sigma2 = rss / float(dof)
+    dof = len(rows_y) - int(design_rank)
+    rss = float(np.sum((y_vec - raw_y_pred) ** 2))
+    sigma2 = rss / float(max(1, dof))
     scales_list = [float(s) for s in safe_scales.tolist()]
     gram: list[list[float]] = [
         [sum((row[i] / scales_list[i]) * (row[j] / scales_list[j]) for row in rows_x) for j in range(n_cols)]
         for i in range(n_cols)
     ]
-    xtx_scaled_inv: np.ndarray = np.linalg.pinv(np.asarray(gram, dtype=np.float64))
+    gram_arr = np.asarray(gram, dtype=np.float64)
+    xtx_scaled_inv: np.ndarray = np.linalg.pinv(gram_arr)
+    proj_row: np.ndarray = xtx_scaled_inv @ gram_arr
+    estimable = [dof > 0 and abs(1.0 - float(proj_row[j, j])) <= 1e-7 for j in range(n_cols)]
     se_list = [
         math.sqrt(max(0.0, float(xtx_scaled_inv[j, j]) * sigma2)) / scales_list[j] for j in range(n_cols)
     ]
@@ -2340,10 +2643,8 @@ def fit_cost_model_from_measurements(
         within_op_rho,
     ) = _fit_within_case_differentials(rows_x, rows_y, op_cycles_list, case_groups)
 
-    # Reject non-physical clock estimates outside ±20% of `nominal_freq_ghz`
-    # so pipeline overlap in `other_cycles` (e.g. 3.2 GHz on A2) cannot bias bandwidths.
     raw_freq_ghz = (1.0 / (float(coef[5]) * 1000.0)) if float(coef[5]) > 1e-6 else 0.0
-    if 0.8 * nominal_freq_ghz <= raw_freq_ghz <= 1.2 * nominal_freq_ghz:
+    if estimable[5] and 0.8 * nominal_freq_ghz <= raw_freq_ghz <= 1.2 * nominal_freq_ghz:
         us_per_cycle = float(coef[5])
         eff_freq_ghz = raw_freq_ghz
         freq_fallback = False
@@ -2358,9 +2659,13 @@ def fit_cost_model_from_measurements(
     def _slope_to_bpc(name: str, col_idx: int, fallback: float) -> float:
         slope = float(coef[col_idx])
         err = se_list[col_idx]
-        t_val = (slope / err) if err > 1e-18 else (float("inf") if slope > 1e-9 else 0.0)
+        t_val = (
+            ((slope / err) if err > 1e-18 else (float("inf") if slope > 1e-9 else 0.0))
+            if estimable[col_idx]
+            else 0.0
+        )
         param_t_stats[name] = float(t_val)
-        if slope <= 1e-9 or t_val < min_t_stat:
+        if not estimable[col_idx] or slope <= 1e-9 or t_val < min_t_stat:
             fallback_params.append(name)
             return fallback
         bpc = us_per_cycle / slope
@@ -2378,57 +2683,65 @@ def fit_cost_model_from_measurements(
         "fixpipe_acc_to_nz_bytes_per_cycle", 4, model.fixpipe_acc_to_nz_bytes_per_cycle
     )
 
-    fit_nd2nz, fit_nz2nz = _anchor_pair_from_differential(
-        "mte2_nd2nz_bytes_per_cycle",
-        "mte2_nz2nz_bytes_per_cycle",
-        fit_nd2nz,
-        fit_nz2nz,
-        model.mte2_nd2nz_bytes_per_cycle,
-        model.mte2_nz2nz_bytes_per_cycle,
-        delta_mte2_slope,
-        t_delta_mte2,
-        norm_mte2,
-        us_per_cycle,
-        min_t_stat,
-        max_physical_bpc,
-        False,
-        fallback_params,
-        param_t_stats,
-    )
-    fit_acc_to_nd, fit_acc_to_nz = _anchor_pair_from_differential(
-        "fixpipe_acc_to_nd_bytes_per_cycle",
-        "fixpipe_acc_to_nz_bytes_per_cycle",
-        fit_acc_to_nd,
-        fit_acc_to_nz,
-        model.fixpipe_acc_to_nd_bytes_per_cycle,
-        model.fixpipe_acc_to_nz_bytes_per_cycle,
-        delta_fixpipe_slope,
-        t_delta_fixpipe,
-        norm_fixpipe,
-        us_per_cycle,
-        min_t_stat,
-        max_physical_bpc,
-        True,
-        fallback_params,
-        param_t_stats,
-    )
+    if estimable[5] and len(case_groups) > 1:
+        fit_nd2nz, fit_nz2nz = _anchor_pair_from_differential(
+            "mte2_nd2nz_bytes_per_cycle",
+            "mte2_nz2nz_bytes_per_cycle",
+            fit_nd2nz,
+            fit_nz2nz,
+            model.mte2_nd2nz_bytes_per_cycle,
+            model.mte2_nz2nz_bytes_per_cycle,
+            delta_mte2_slope,
+            t_delta_mte2,
+            norm_mte2,
+            us_per_cycle,
+            min_t_stat,
+            max_physical_bpc,
+            False,
+            fallback_params,
+            param_t_stats,
+        )
+        fit_acc_to_nd, fit_acc_to_nz = _anchor_pair_from_differential(
+            "fixpipe_acc_to_nd_bytes_per_cycle",
+            "fixpipe_acc_to_nz_bytes_per_cycle",
+            fit_acc_to_nd,
+            fit_acc_to_nz,
+            model.fixpipe_acc_to_nd_bytes_per_cycle,
+            model.fixpipe_acc_to_nz_bytes_per_cycle,
+            delta_fixpipe_slope,
+            t_delta_fixpipe,
+            norm_fixpipe,
+            us_per_cycle,
+            min_t_stat,
+            max_physical_bpc,
+            True,
+            fallback_params,
+            param_t_stats,
+        )
 
     fitted = replace(
         model,
         mte2_nd2nz_bytes_per_cycle=fit_nd2nz,
+        mte2_nd2nz_contiguous_bytes_per_cycle=contiguous_nd_ratio * fit_nd2nz,
         mte2_nz2nz_bytes_per_cycle=fit_nz2nz,
-        mte2_nd2nz_row_penalty_cycles=0.0,
         fixpipe_acc_to_nd_bytes_per_cycle=fit_acc_to_nd,
         fixpipe_acc_to_nz_bytes_per_cycle=fit_acc_to_nz,
     )
 
+    y_pred = np.asarray(
+        [
+            float(coef[0]) + us_per_cycle * _calibration_prediction_cycles(fitted, measurement)
+            for measurement in measurements
+        ],
+        dtype=np.float64,
+    )
     ss_res = float(np.sum((y_vec - y_pred) ** 2))
     ss_tot = float(np.sum((y_vec - y_vec.mean()) ** 2))
-    r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 1e-12 else 1.0
-    mape = float(np.mean(np.abs(y_vec - y_pred) / np.maximum(np.abs(y_vec), 1e-9)) * 100.0)
+    r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 1e-12 else float(ss_res <= 1e-12)
+    mape = 100.0 * float(np.mean(np.abs(y_vec - y_pred) / np.maximum(np.abs(y_vec), 1e-9)))
     rho = _spearman_rank_correlation([float(yp) for yp in y_pred], rows_y)
     pooled_op_rho = _spearman_rank_correlation(op_cycles_list, rows_y)
-    residuals = {lbl: float(yp - yt) for lbl, yt, yp in zip(labels, y_vec, y_pred, strict=True)}
+    residuals = {vid: float(yp - yt) for vid, yt, yp in zip(variant_ids, y_vec, y_pred, strict=True)}
     return CalibrationReport(
         fitted_model=fitted,
         fixed_overhead_us=float(coef[0]),

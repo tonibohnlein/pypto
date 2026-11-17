@@ -95,17 +95,35 @@ $$
 
 ---
 
-## 4. API & Usage (`pypto.ir.auto_layout`)
+## 4. Solvers & Treewidth Diagnostics (`pypto.ir.auto_layout_solver`)
+
+`pypto.ir.auto_layout_solver` implements the paper's layout selection algorithms on top of `LayoutProblemInstance`:
+
+1. **`solve_greedy(instance, *, initial=None, config=None) -> LayoutSolverResult`** (Section 4.1):
+   - Initializes operations in topological dataflow order (greedily minimizing local operator + already-live input conversion costs) and then performs deterministic coordinate-descent sweeps over all movable operations (`|Q_o| > 1`) using exact incremental gain accounting (`_State.gain` / `_State.apply`).
+2. **`compute_treewidth(instance) -> TreewidthStats`**:
+   - Computes min-fill tree decompositions and reports:
+     - `dataflow_treewidth`: treewidth of the producer-consumer DAG (ignoring co-consumer cliques on shared GM inputs),
+     - `primal_treewidth`: treewidth of the full primal factor graph (where operations sharing a value form a clique),
+     - `active_primal_treewidth`: treewidth of the primal subgraph induced by movable operations (`|Q_o| > 1`),
+     - `max_bag_domain_product` and `total_dp_states`: exact state-space size $\sum_k \prod_{u \in B_k} |Q_u|$ for dynamic programming.
+3. **`solve_treewidth_dp(instance, *, config=None) -> LayoutSolverResult`** (Section 4.2):
+   - Exact bottom-up dynamic programming + top-down backpointer reconstruction over a rooted min-fill tree decomposition of the active primal graph.
+   - Assigns each operator unary factor $\theta_u(q_u)$ and each shared-value conversion hyperedge $\psi_t(q_{N(t)})$ to the unique highest bag containing its scope, guaranteeing the global minimum of the paper's objective (including across shared-conversion barriers where single-operation greedy flips are locally unprofitable).
 
 ```python
 from pypto.backend import BackendType, set_backend_type
 from pypto.ir.auto_layout import (
     LayoutCostModel,
     apply_layout_assignment,
-    enumerate_assignments,
     extract_layout_instance,
     run_post_layout_passes,
     run_pre_layout_passes,
+)
+from pypto.ir.auto_layout_solver import (
+    compute_treewidth,
+    solve_greedy,
+    solve_treewidth_dp,
 )
 from pypto.pypto_core import passes
 
@@ -121,18 +139,19 @@ with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
         reusable_tensors={"w"},
     )
 
-    # 3. Evaluate & rank candidate assignments under the cost model
-    ranked = enumerate_assignments(instance)
-    best = ranked[0]
+    # 3. Inspect treewidth & solve (greedy heuristic or exact treewidth DP)
+    tw_stats = compute_treewidth(instance)
+    greedy_res = solve_greedy(instance)
+    exact_res = solve_treewidth_dp(instance)
 
     # 4. Write the chosen assignment back into the IR and finish lowering
-    rewritten = apply_layout_assignment(pre_prog, best.assignment)
+    rewritten = apply_layout_assignment(pre_prog, exact_res.writeback_assignment())
     lowered = run_post_layout_passes(rewritten)
 ```
 
 ### Pass-Manager Insertion & Calibration Harness (`auto_layout_bench`)
 
-`ir.compile(..., layout_pass=...)` and `PassManager.get_strategy(..., layout_pass=...)` inject a custom pass (for example `lambda: make_auto_layout_pass(best.assignment)`) immediately after `InferTileMemorySpace` and before `BlockNzTensorViews` / `ResolveBackendOpLayouts`.
+`ir.compile(..., layout_pass=...)` and `PassManager.get_strategy(..., layout_pass=...)` inject a custom pass (for example `lambda: make_auto_layout_pass(exact_res.writeback_assignment())`) immediately after `InferTileMemorySpace` and before `BlockNzTensorViews` / `ResolveBackendOpLayouts`.
 
 To enumerate all legal design-space variants, compile them end-to-end (exporting `manifest.json` + `.pto` + runtime artifacts), benchmark them on Ascend A2 (`a2a3`), and fit `LayoutCostModel`:
 
@@ -152,5 +171,5 @@ Programmatic entry points live in `compile_layout_variants(...)` and `fit_cost_m
 
 - **Step 0 (Completed)**: Build environment and C++ `pypto_core` setup.
 - **Step 1 (Completed)**: Post-`InferTileMemorySpace` instance extraction (`extract_layout_instance`), assignment writeback (`apply_layout_assignment`) covering GM (`DDR`), L1 (`Mat`), and L0 (`Left`, `Right`, `Acc`), backend-legal enumeration, and decoupled `LayoutCostModel` evaluation (`evaluate_assignment`, `enumerate_assignments`) on L0-fitting matmul kernels.
-- **Step 2 (Ready for Hardware Run)**: End-to-end variant emission (`compile_layout_variants`), `PassManager`/`ir.compile` `layout_pass` integration, Ascend A2 benchmark harness (`pypto.ir.auto_layout_bench`), and linear regression calibration (`fit_cost_model_from_measurements`). Execute on an `a2a3` device to calibrate coefficients.
-- **Step 3 (Future)**: Multi-operator DAG solver (DP / MaxSAT) across fused vector + cube regions once the cost model is calibrated.
+- **Step 2 (Completed)**: End-to-end variant emission (`compile_layout_variants`), `PassManager`/`ir.compile` `layout_pass` integration, Ascend 910B2 (`a2a3`) 13-case / 124-variant hardware calibration campaign, and within-case demeaned differential regression (`fit_cost_model_from_measurements`) achieving `+0.9222` within-case Spearman rank correlation.
+- **Step 3 (Completed)**: Greedy coordinate-descent solver (`solve_greedy`), treewidth diagnostics (`compute_treewidth`), and exact treewidth dynamic programming solver (`solve_treewidth_dp`) validated across calibration and production `pypto-lib` kernels.

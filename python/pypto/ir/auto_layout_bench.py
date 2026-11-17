@@ -189,10 +189,19 @@ def build_single_matmul_case(  # noqa: PLR0913
     expected_uses: int = 100,
     seed: int = 0,
 ) -> CalibrationCaseSpec:
-    """Build an L0-fitting `C[M, N] = X[M, K] @ W[N, K].T` FP16->FP32 `@pl.jit` workload."""
+    """Build an L0-fitting `C[M, N] = X[M, K] @ W[N, K].T` FP16->FP32 `@pl.jit` workload.
+
+    The A-stationary templates support one or two complete K tiles only.
+    """
     m_step = m_tile if m_tile is not None else m_dim
     k_step = k_tile if k_tile is not None else k_dim
     n_step = n_tile if n_tile is not None else n_dim
+    if stationary == "a" and k_dim not in (k_step, 2 * k_step):
+        raise ValueError(
+            "stationary='a' supports only one or two K tiles: require k_dim == k_tile "
+            f"or k_dim == 2 * k_tile, got k_dim={k_dim}, k_tile={k_step}. "
+            "Use stationary='output' for other reduction tilings."
+        )
     is_single_tile = m_step == m_dim and k_step == k_dim and n_step == n_dim
 
     @pl.jit
@@ -604,6 +613,9 @@ def _serialize_calibration_report(
         "within_case_fixpipe_delta_us_per_mb": report.within_case_fixpipe_delta_us_per_mb,
         "fitted_params": {
             "mte2_nd2nz_bytes_per_cycle": report.fitted_model.mte2_nd2nz_bytes_per_cycle,
+            "mte2_nd2nz_contiguous_bytes_per_cycle": (
+                report.fitted_model.mte2_nd2nz_contiguous_bytes_per_cycle
+            ),
             "mte2_nz2nz_bytes_per_cycle": report.fitted_model.mte2_nz2nz_bytes_per_cycle,
             "fixpipe_acc_to_nd_bytes_per_cycle": report.fitted_model.fixpipe_acc_to_nd_bytes_per_cycle,
             "fixpipe_acc_to_nz_bytes_per_cycle": report.fitted_model.fixpipe_acc_to_nz_bytes_per_cycle,

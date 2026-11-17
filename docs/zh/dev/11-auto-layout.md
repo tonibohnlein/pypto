@@ -95,17 +95,35 @@ $$
 
 ---
 
-## 4. API 与使用示例 (`pypto.ir.auto_layout`)
+## 4. 求解器与树宽诊断 (`pypto.ir.auto_layout_solver`)
+
+`pypto.ir.auto_layout_solver` 基于 `LayoutProblemInstance` 实现了论文中的布局选择求解算法：
+
+1. **`solve_greedy(instance, *, initial=None, config=None) -> LayoutSolverResult`**（论文第 4.1 节）：
+   - 按拓扑数据流序执行贪心初始化（局部最小化算子自身代价与已就绪输入的转换代价），随后在所有可调算子 (`|Q_o| > 1`) 上执行确定性坐标下降扫描，并使用精确的增量收益计算 (`_State.gain` / `_State.apply`)。
+2. **`compute_treewidth(instance) -> TreewidthStats`**：
+   - 计算最小填充 (min-fill) 树分解并报告：
+     - `dataflow_treewidth`：生产者-消费者数据流 DAG 的树宽（不含共享 GM 输入上的共消费者团），
+     - `primal_treewidth`：完整原因子图 (primal factor graph) 的树宽（共享同一变量的算子构成团），
+     - `active_primal_treewidth`：由可调算子 (`|Q_o| > 1`) 诱导的原图子图树宽，
+     - `max_bag_domain_product` 与 `total_dp_states`：动态规划的精确状态空间规模 $\sum_k \prod_{u \in B_k} |Q_u|$。
+3. **`solve_treewidth_dp(instance, *, config=None) -> LayoutSolverResult`**（论文第 4.2 节）：
+   - 在可调原图的最小填充有根树分解上执行自底向上动态规划与自顶向下回溯重构。
+   - 将每个算子的一元代价项 $\theta_u(q_u)$ 与每个共享张量的多端转换超边项 $\psi_t(q_{N(t)})$ 唯一分配给完整覆盖其作用域的最高树袋 (bag)，从而严格保证求得论文目标函数的全局最优解（包括跨越多消费者共享转换壁垒的协同翻转）。
 
 ```python
 from pypto.backend import BackendType, set_backend_type
 from pypto.ir.auto_layout import (
     LayoutCostModel,
     apply_layout_assignment,
-    enumerate_assignments,
     extract_layout_instance,
     run_post_layout_passes,
     run_pre_layout_passes,
+)
+from pypto.ir.auto_layout_solver import (
+    compute_treewidth,
+    solve_greedy,
+    solve_treewidth_dp,
 )
 from pypto.pypto_core import passes
 
@@ -121,18 +139,19 @@ with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
         reusable_tensors={"w"},
     )
 
-    # 3. 使用代价模型评估并排序所有候选布局分配
-    ranked = enumerate_assignments(instance)
-    best = ranked[0]
+    # 3. 诊断树宽并运行求解器（贪心坐标下降或精确树宽动态规划）
+    tw_stats = compute_treewidth(instance)
+    greedy_res = solve_greedy(instance)
+    exact_res = solve_treewidth_dp(instance)
 
     # 4. 将选定的布局分配写回 IR 并完成后续降级
-    rewritten = apply_layout_assignment(pre_prog, best.assignment)
+    rewritten = apply_layout_assignment(pre_prog, exact_res.writeback_assignment())
     lowered = run_post_layout_passes(rewritten)
 ```
 
 ### Pass 管线接入与标定基准套件 (`auto_layout_bench`)
 
-`ir.compile(..., layout_pass=...)` 和 `PassManager.get_strategy(..., layout_pass=...)` 支持在 `InferTileMemorySpace` 之后、`BlockNzTensorViews` / `ResolveBackendOpLayouts` 之前注入自定义 Pass（例如 `lambda: make_auto_layout_pass(best.assignment)`）。
+`ir.compile(..., layout_pass=...)` 和 `PassManager.get_strategy(..., layout_pass=...)` 支持在 `InferTileMemorySpace` 之后、`BlockNzTensorViews` / `ResolveBackendOpLayouts` 之前注入自定义 Pass（例如 `lambda: make_auto_layout_pass(exact_res.writeback_assignment())`）。
 
 可使用以下命令枚举全部数据流一致的后端合法变体、完成端到端编译（生成 `manifest.json`、`.pto` 与运行时产物），并在昇腾 A2 (`a2a3`) 上实测与线性拟合 `LayoutCostModel`：
 
@@ -152,5 +171,5 @@ python -m pypto.ir.auto_layout_bench --platform a2a3 --device 0 --rounds 100 --s
 
 - **Step 0（已完成）**：构建环境与 C++ `pypto_core` 编译配置。
 - **Step 1（已完成）**：在 `InferTileMemorySpace` 之后提取求解器实例 (`extract_layout_instance`)、支持 GM (`DDR`) / L1 (`Mat`) / L0 (`Left`、`Right`、`Acc`) 布局写回 (`apply_layout_assignment`)、后端合法空间枚举，并在绕过 `AutoTileMatmulL0` 的 L0 适配矩阵乘上提供解耦的 `LayoutCostModel` 评估 (`evaluate_assignment`、`enumerate_assignments`)。
-- **Step 2（待真机执行）**：已完成端到端变体编译导出 (`compile_layout_variants`)、`PassManager`/`ir.compile` 的 `layout_pass` 接入、昇腾 A2 基准测试与泳道采集套件 (`pypto.ir.auto_layout_bench`) 及线性回归拟合 (`fit_cost_model_from_measurements`)；下一步在 `a2a3` 真机执行以标定带宽与转换开销系数。
-- **Step 3（后续）**：在代价模型标定完成后，引入面向多算子融合子图（Vector + Cube）的全局求解器（DP / MaxSAT）。
+- **Step 2（已完成）**：已完成端到端变体编译导出 (`compile_layout_variants`)、`PassManager`/`ir.compile` 的 `layout_pass` 接入、昇腾 910B2 (`a2a3`) 13 用例 / 124 变体真机实测与泳道标定，以及用例内去均值差分回归 (`fit_cost_model_from_measurements`，用例内 Spearman 秩相关系数达 `+0.9222`)。
+- **Step 3（已完成）**：实现贪心坐标下降求解器 (`solve_greedy`)、树宽诊断 (`compute_treewidth`) 以及精确树宽动态规划求解器 (`solve_treewidth_dp`)，并在标定套件与 `pypto-lib` 生产核函数上完成验证。

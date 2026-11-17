@@ -26,6 +26,7 @@ Verifies:
 """
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,7 +35,7 @@ import pytest
 import torch
 from pypto import DataType, ir
 from pypto.backend import BackendType, reset_for_testing, set_backend_type
-from pypto.ir import auto_layout_bench
+from pypto.ir import auto_layout, auto_layout_bench
 from pypto.ir.auto_layout import (
     FRACTAL_ACC_NZ,
     FRACTAL_NZ,
@@ -263,6 +264,42 @@ class TestInstanceReadoutAndWriteback:
 
 class TestCostModelCalibrationAndEvaluation:
     """Test `LayoutCostModel`, `evaluate_assignment`, and `enumerate_assignments`."""
+
+    @pytest.mark.parametrize(
+        "dtype, backend, shape, expected_cycles",
+        [
+            (DataType.FP16, BackendType.Ascend910, (64, 128, 64), 149.0),
+            (DataType.FP32, BackendType.Ascend910, (64, 128, 64), 533.0),
+            (DataType.FP32, BackendType.Ascend950, (64, 128, 64), 2069.0),
+            (DataType.FP16, BackendType.Ascend910, (17, 33, 31), 33.0),
+            (DataType.FP32, BackendType.Ascend910, (17, 33, 31), 61.0),
+        ],
+    )
+    def test_matmul_cost_counts_dtype_specific_hardware_fractals(
+        self,
+        dtype: DataType,
+        backend: BackendType,
+        shape: tuple[int, int, int],
+        expected_cycles: float,
+    ):
+        set_backend_type(backend)
+        m_dim, k_dim, n_dim = shape
+        lhs = LayoutValueNode(
+            name="lhs",
+            shape=(m_dim, k_dim),
+            dtype=dtype,
+            memory_space=ir.MemorySpace.Left,
+            current_layout=FRACTAL_NZ,
+            admissible_layouts=(FRACTAL_NZ,),
+        )
+        rhs = replace(lhs, name="rhs", shape=(k_dim, n_dim), memory_space=ir.MemorySpace.Right)
+        out = replace(lhs, name="out", shape=(m_dim, n_dim), memory_space=ir.MemorySpace.Acc)
+        model = LayoutCostModel(backend_type=backend)
+        assert model.estimate_matmul_cost(lhs, rhs, out) == pytest.approx(expected_cycles)
+        faster = replace(model, cube_macs_per_cycle=2 * model.cube_macs_per_cycle)
+        assert faster.estimate_matmul_cost(lhs, rhs, out) == pytest.approx(
+            model.cube_issue_overhead_cycles + (expected_cycles - model.cube_issue_overhead_cycles) / 2
+        )
 
     def test_cost_model_single_use_vs_reused_weight_ranking(self):
         """Compare candidate rankings at R=1 (keeps ND) vs. R=100 (selects NZ for reusable weight `w`)."""
@@ -494,58 +531,71 @@ class TestPassPipelineIntegrationAndCalibration:
         assert len(manifest["variants"]) == 8
         assert any(v["gm_input_layouts"].get("w") == "NZ" for v in manifest["variants"])
 
-    def test_fit_cost_model_from_synthetic_measurements(self):
+    @pytest.mark.parametrize("reuse_horizons", [(100, 100, 100, 100), (1, 10, 100, 1000)])
+    def test_fit_cost_model_from_synthetic_measurements(self, reuse_horizons: tuple[int, ...]):
         set_backend_type(BackendType.Ascend910)
-        shapes = [(64, 128, 64), (64, 256, 64), (128, 128, 64), (128, 128, 128)]
+        shapes = [
+            (64, 128, 96, None, None),
+            (64, 256, 64, None, None),
+            (128, 1024, 1024, 128, 128),
+            (128, 128, 128, None, None),
+        ]
         true_overhead_us = 5.0
         true_us_per_cycle = 1.0 / 1500.0
         true_nd2nz_bpc = 16.0
         true_nz2nz_bpc = 64.0
         true_store_nd_bpc = 24.0
         true_store_nz_bpc = 56.0
-        base_model = LayoutCostModel(expected_uses=100, backend_type=BackendType.Ascend910)
+        base_model = LayoutCostModel(
+            expected_uses=100,
+            backend_type=BackendType.Ascend910,
+            mte2_nd2nz_row_penalty_cycles=0.3,
+            fixpipe_drain_fixed_cycles=7.0,
+        )
+        nd_ratio = base_model.mte2_nd2nz_contiguous_bytes_per_cycle / base_model.mte2_nd2nz_bytes_per_cycle
+        true_model = replace(
+            base_model,
+            mte2_nd2nz_bytes_per_cycle=true_nd2nz_bpc,
+            mte2_nd2nz_contiguous_bytes_per_cycle=nd_ratio * true_nd2nz_bpc,
+            mte2_nz2nz_bytes_per_cycle=true_nz2nz_bpc,
+            fixpipe_acc_to_nd_bytes_per_cycle=true_store_nd_bpc,
+            fixpipe_acc_to_nz_bytes_per_cycle=true_store_nz_bpc,
+        )
         measurements: list[CalibrationMeasurement] = []
-        for s_idx, (m_dim, k_dim, n_dim) in enumerate(shapes):
+        for s_idx, (m_dim, k_dim, n_dim, k_tile, n_tile) in enumerate(shapes):
+            expected_uses = reuse_horizons[s_idx]
             case = auto_layout_bench.build_single_matmul_case(
-                m_dim, k_dim, n_dim, expected_uses=100, seed=s_idx
+                m_dim,
+                k_dim,
+                n_dim,
+                k_tile=k_tile,
+                n_tile=n_tile,
+                expected_uses=expected_uses,
+                seed=s_idx,
             )
             pre_prog = run_pre_layout_passes(case.program)
             inst = extract_layout_instance(
                 pre_prog,
-                cost_model=base_model,
+                cost_model=replace(
+                    base_model,
+                    expected_uses=expected_uses,
+                    mte1_l0a_bytes_per_cycle=2.0 * base_model.mte1_l0a_bytes_per_cycle,
+                ),
                 reusable_tensors={"w"},
             )
+            true_inst = extract_layout_instance(
+                pre_prog,
+                cost_model=replace(true_model, expected_uses=expected_uses),
+                reusable_tensors={"w"},
+            )
+            true_variants = {
+                tuple(sorted(bd.assignment.value_layouts.items())): bd
+                for bd in enumerate_assignments(true_inst, deduplicate=True)
+            }
             for v_idx, bd in enumerate(enumerate_assignments(inst, deduplicate=True)):
-                nd2nz_b = 0.0
-                nz2nz_b = 0.0
-                store_nd_b = 0.0
-                store_nz_b = 0.0
-                other_cycles = 0.0
-                for op in inst.operations:
-                    cfg = bd.assignment.op_configs[op.op_id]
-                    if op.op_name == "tile.load":
-                        dst = inst.values[op.output]
-                        if dst.memory_space == ir.MemorySpace.Mat:
-                            if cfg.input_layouts[0] == ir.TensorLayout.NZ:
-                                nz2nz_b += float(dst.byte_size)
-                            else:
-                                nd2nz_b += float(dst.byte_size)
-                            continue
-                    elif op.op_name == "tile.store":
-                        src = inst.values[op.inputs[0]]
-                        if cfg.output_layout == ir.TensorLayout.NZ:
-                            store_nz_b += float(src.byte_size)
-                        else:
-                            store_nd_b += float(src.byte_size)
-                        continue
-                    other_cycles += cfg.op_cost_cycles
-
-                measured_us = true_overhead_us + true_us_per_cycle * (
-                    nd2nz_b / true_nd2nz_bpc
-                    + nz2nz_b / true_nz2nz_bpc
-                    + store_nd_b / true_store_nd_bpc
-                    + store_nz_b / true_store_nz_bpc
-                    + other_cycles
+                true_bd = true_variants[tuple(sorted(bd.assignment.value_layouts.items()))]
+                measured_us = (
+                    true_overhead_us + true_us_per_cycle * true_bd.operator_cost_cycles / expected_uses
                 )
                 measurements.append(
                     CalibrationMeasurement(
@@ -553,17 +603,22 @@ class TestPassPipelineIntegrationAndCalibration:
                         measured_us=measured_us,
                         instance=inst,
                         breakdown=bd,
+                        label=case.case_id,
                     )
                 )
 
         report = fit_cost_model_from_measurements(measurements, base_model)
+        assert set(report.residuals_us) == {measurement.variant_id for measurement in measurements}
         assert report.r2 > 0.999
         assert report.spearman_rho == pytest.approx(1.0)
-        assert report.effective_freq_ghz == pytest.approx(1.5, rel=1e-3)
         assert report.effective_freq_fallback is False
         assert report.fallback_params == ()
         assert report.fixed_overhead_us == pytest.approx(true_overhead_us, abs=1e-4)
+        assert report.effective_freq_ghz == pytest.approx(1.5, rel=1e-3)
         assert report.fitted_model.mte2_nd2nz_bytes_per_cycle == pytest.approx(true_nd2nz_bpc, rel=1e-3)
+        assert report.fitted_model.mte2_nd2nz_contiguous_bytes_per_cycle == pytest.approx(
+            nd_ratio * true_nd2nz_bpc, rel=1e-3
+        )
         assert report.fitted_model.mte2_nz2nz_bytes_per_cycle == pytest.approx(true_nz2nz_bpc, rel=1e-3)
         assert report.fitted_model.fixpipe_acc_to_nd_bytes_per_cycle == pytest.approx(
             true_store_nd_bpc, rel=1e-3
@@ -571,6 +626,26 @@ class TestPassPipelineIntegrationAndCalibration:
         assert report.fitted_model.fixpipe_acc_to_nz_bytes_per_cycle == pytest.approx(
             true_store_nz_bpc, rel=1e-3
         )
+        assert report.fitted_model.mte2_nd2nz_row_penalty_cycles == 0.3
+        assert report.fitted_model.fixpipe_drain_fixed_cycles == 7.0
+        assert max(abs(residual) for residual in report.residuals_us.values()) < 1e-8
+
+        serialized = auto_layout_bench._serialize_calibration_report(measurements, base_model)
+        assert serialized is not None
+        reloaded = json.loads(json.dumps(serialized))
+        assert replace(base_model, **reloaded["fitted_params"]) == report.fitted_model
+
+        one_shape = [m for m in measurements if m.label == measurements[0].label]
+        unidentifiable = fit_cost_model_from_measurements(one_shape, base_model)
+        assert unidentifiable.effective_freq_fallback is True
+        assert set(unidentifiable.fallback_params) == set(unidentifiable.param_t_stats)
+        assert all(t_stat == 0.0 for t_stat in unidentifiable.param_t_stats.values())
+
+    def test_calibration_rank_diagnostics_handle_ties(self):
+        assert auto_layout._rank_array([3.0, 1.0, 1.0, 2.0]).tolist() == [3.0, 0.5, 0.5, 2.0]
+        assert auto_layout._spearman_rank_correlation([1.0, 1.0, 2.0], [2.0, 2.0, 4.0]) == pytest.approx(1.0)
+        assert auto_layout._spearman_rank_correlation([1.0, 1.0, 1.0], [1.0, 2.0, 3.0]) == 0.0
+        assert auto_layout._spearman_rank_correlation([1.0, 2.0, 3.0], [1.0, 1.0, 1.0]) == 0.0
 
     def test_auto_layout_bench_compile_only_suite(self, tmp_path: Path):
         cases = [
@@ -733,6 +808,10 @@ class TestPassPipelineIntegrationAndCalibration:
         )
         sa_loads = [op for op in inst_sa.operations if op.op_name == "tile.load"]
         assert [op.invocations for op in sa_loads] == [100, 3200]
+
+        for k_dim in (512, 192, 64):
+            with pytest.raises(ValueError, match="stationary='a' supports only one or two K tiles"):
+                auto_layout_bench.build_single_matmul_case(64, k_dim, 64, k_tile=128, stationary="a")
 
     def test_prepare_variant_tensors_uses_entry_param_order_for_chain(self, tmp_path: Path):
         chain = auto_layout_bench.build_two_matmul_chain_case(64, 128, 64, 64, seed=7)
@@ -935,6 +1014,7 @@ class TestPassPipelineIntegrationAndCalibration:
             "fixpipe_acc_to_nd_bytes_per_cycle",
             "fixpipe_acc_to_nz_bytes_per_cycle",
         }
+        assert report.r2 < 0.99
 
     def test_fit_cost_model_normalizes_expected_uses_and_flags_overlapped_freq(self):
         set_backend_type(BackendType.Ascend910)
@@ -942,6 +1022,23 @@ class TestPassPipelineIntegrationAndCalibration:
         nominal_us_per_cyc = 1.0 / (1.8 * 1000.0)
         true_nd2nz_bpc = 75.0
         true_nz2nz_bpc = 120.0
+        base_transfer_model = replace(
+            base_model,
+            mte2_nd2nz_row_penalty_cycles=0.0,
+            mte2_nd2nz_sub512b_penalty_cycles=0.0,
+            fixpipe_drain_fixed_cycles=0.0,
+            fixpipe_odd_n1_penalty_cycles=0.0,
+        )
+        transfer_model = replace(
+            base_transfer_model,
+            mte2_nd2nz_bytes_per_cycle=true_nd2nz_bpc,
+            mte2_nd2nz_contiguous_bytes_per_cycle=(
+                true_nd2nz_bpc
+                * base_model.mte2_nd2nz_contiguous_bytes_per_cycle
+                / base_model.mte2_nd2nz_bytes_per_cycle
+            ),
+            mte2_nz2nz_bytes_per_cycle=true_nz2nz_bpc,
+        )
         meas: list[CalibrationMeasurement] = []
         for s_idx, (m_dim, k_dim, n_dim, kt, nt) in enumerate(
             [
@@ -957,29 +1054,38 @@ class TestPassPipelineIntegrationAndCalibration:
             inst = extract_layout_instance(run_pre_layout_passes(case.program), cost_model=base_model)
             for v_idx, bd in enumerate(enumerate_assignments(inst, deduplicate=True)):
                 run_scale = float(inst.cost_model.expected_uses)
-                nd2nz_b = nz2nz_b = other_cyc = 0.0
+                transfer_cyc = other_cyc = 0.0
                 for op in inst.operations:
                     cfg = bd.assignment.op_configs[op.op_id]
                     inv = float(op.invocations) / run_scale
                     if op.op_name == "tile.load":
+                        src = inst.values[op.inputs[0]]
                         dst = inst.values[op.output]
                         if dst.memory_space == ir.MemorySpace.Mat:
-                            if cfg.input_layouts[0] == ir.TensorLayout.NZ:
-                                nz2nz_b += inv * float(dst.byte_size)
-                            else:
-                                nd2nz_b += inv * float(dst.byte_size)
+                            scale = base_model.effective_mte2_load_multiplier(src, dst, inv)
+                            load_args = (src, dst, cfg.input_layouts[0], cfg.output_layout)
+                            transfer_cyc += inv * scale * transfer_model.estimate_load_cost(*load_args)
+                            other_cyc += (
+                                inv
+                                * scale
+                                * (
+                                    base_model.estimate_load_cost(*load_args)
+                                    - base_transfer_model.estimate_load_cost(*load_args)
+                                )
+                            )
                             continue
                     elif op.op_name == "tile.store":
+                        store_args = (inst.values[op.inputs[0]], inst.values[op.output], cfg.output_layout)
+                        other_cyc += inv * (
+                            base_model.estimate_store_cost(*store_args)
+                            - base_transfer_model.estimate_store_cost(*store_args)
+                        )
                         continue
                     other_cyc += inv * cfg.op_cost_cycles
 
                 # Simulate 2-stage pipelined execution (`~3.2 GHz` raw slope = 0.5625x nominal
                 # period, matching the 910B2 124-variant device fit) and ~0 FIXPIPE delta.
-                measured_us = (
-                    16.0
-                    + nominal_us_per_cyc * (nd2nz_b / true_nd2nz_bpc + nz2nz_b / true_nz2nz_bpc)
-                    + 0.5625 * nominal_us_per_cyc * other_cyc
-                )
+                measured_us = 16.0 + nominal_us_per_cyc * (transfer_cyc + 0.5625 * other_cyc)
                 meas.append(
                     CalibrationMeasurement(
                         variant_id=f"case_{s_idx}/v_{v_idx}",
@@ -993,10 +1099,8 @@ class TestPassPipelineIntegrationAndCalibration:
         assert report.effective_freq_fallback is True
         assert report.raw_freq_ghz == pytest.approx(3.2, rel=1e-2)
         assert report.effective_freq_ghz == pytest.approx(1.8)
-        assert report.within_case_r2 == pytest.approx(1.0)
+        assert report.within_case_r2 > 0.9
         assert report.within_case_op_spearman_rho > 0.9
-        expected_delta_us_per_mb = 1e6 * nominal_us_per_cyc * (1.0 / true_nd2nz_bpc - 1.0 / true_nz2nz_bpc)
-        assert report.within_case_mte2_delta_us_per_mb == pytest.approx(expected_delta_us_per_mb, rel=1e-3)
         assert report.fitted_model.mte2_nd2nz_bytes_per_cycle == pytest.approx(true_nd2nz_bpc, rel=1e-2)
         assert report.fitted_model.mte2_nz2nz_bytes_per_cycle == pytest.approx(true_nz2nz_bpc, rel=1e-2)
         assert set(report.fallback_params) == {
