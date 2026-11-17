@@ -580,3 +580,41 @@ selected order, while LowerSync preserves the supplied actual-token order. Parti
 coverage identifies specific unprovided contracts; it is not evidence that the
 algorithms or hardware are inherently incapable. All six original milestones and
 whole-model ownership remain incomplete at this checkpoint.
+
+## Continued M2 gate: column broadcast (2026-11-15)
+
+The existing row/broadcast recipe now represents broadcast orientation explicitly.
+`col_expand_mul` repeats a row-major `[1,N]` carrier across an `[M,N]` matrix;
+row expansion continues to use a column-major `[M,1]` carrier. Selection,
+lowering, verification, native emission and synchronization effects consume that
+same recipe. The admitted variant is full-valid aligned FP32 Vec, `M <= 255`,
+`N <= 2040`, and `N % 8 == 0`. These bounds prevent narrowing the selected
+native implementation's uint8 repeat and block-stride operands. Matrix/output
+exact aliasing remains permitted; output/carrier overlap remains forbidden by
+the existing storage verifier. No hidden scratch or events are claimed for this
+variant. Partial-valid operands and other layouts remain unavailable.
+
+The native audit uses pto-isa `5487a6b0` A2/A3 headers:
+`TColExpandBinOp.hpp` SHA256
+`00bf43def423bd0701b28ea78784b64ce988f2a7f2e00275f7e9f281c00855ab`, and
+`TColExpandMul.hpp` SHA256
+`76a3eb7be75560f5ef909ecfad9c61d9a8ac839b6cf80d8a309f74a7f5d386b8`.
+Generic frontend cases exercise several shapes and repeated visits through
+independent access/cover/query/selector checks, physical matching/reuse and
+PTOAS C++ generation. The unchanged RMSNorm example now has an owned exact plan;
+LayerNorm's separate missing recipe remains explicit. The refreshed two-layer
+Qwen prefix capture generates 32/32 C++ leaves and owns 12/32, adding
+`final_rmsnorm` while preserving all eleven prior required owners. The focused
+gate passes 80 tests and the broader regression passes 198 tests. The historical
+11/32 table above remains the pre-recipe baseline. See
+`41-general-autosync-column-broadcast.json` for commands and hashes. This is host-model
+qualification, not device validation or whole-Qwen acceptance.
+
+The next type/layout gate requires a transfer construction, rather than a
+relaxed descriptor check. Singleton-column GM `[M,1]` currently has neither an
+admitted column-major transfer nor an exact partial-valid padded-row transfer.
+Runtime-valid column vectors need coordinated descriptor/recipe/footprint
+evidence. Rank-one index loads additionally require scalar-memory visibility
+and readiness evidence. The existing refusals are retained until those
+obligations are established. Eventful child composition and paired AIC/AIV
+transport remain subsequent gates; this operation recipe does not qualify them.
