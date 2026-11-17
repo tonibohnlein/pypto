@@ -85,7 +85,7 @@ std::string BufferTypeString(const ir::BufferTypePtr& type, const ir::Span& span
            "FP32/INT32 "
            "accumulators in "
         << ir::MemorySpaceToString(space);
-  } else if (!backend::IsColumnVectorBuffer(type)) {
+  } else if (!backend::IsColumnVectorBufferGeometry(type)) {
     CHECK_SPAN(space == ir::MemorySpace::Vec &&
                    (backend::IsDenseBufferTransferDtype(type->dtype_) || type->dtype_ == DataType::UINT8 ||
                     type->dtype_ == DataType::INT16 || type->dtype_ == DataType::UINT32) &&
@@ -417,7 +417,7 @@ class BufferEmissionPreflight : public ir::IRVisitor {
       CHECK_SPAN(conversion_supported_, call->span_)
           << "Direct Buffer cast/compare/select and indexed operations currently supports A2/A3 only";
     }
-    if (const auto* row = backend::FindBufferRowRecipe(call->op_->name_); row && row->row_vector) {
+    if (const auto* row = backend::FindBufferRowRecipe(call->op_->name_); row) {
       bool runtime_valid = false;
       for (const auto& arg : call->args_) {
         if (const auto type = As<ir::BufferType>(arg->GetType())) {
@@ -426,7 +426,7 @@ class BufferEmissionPreflight : public ir::IRVisitor {
         }
       }
       CHECK_SPAN(!runtime_valid || conversion_supported_, call->span_)
-          << "Runtime-valid Buffer column broadcast currently supports A2/A3 only";
+          << "Runtime-valid Buffer row operations currently support A2/A3 only";
     }
     const auto* recipe = backend::FindBufferElementwiseRecipe(call->op_->name_);
     CHECK_SPAN(recipe || backend::FindBufferAxisRecipe(call->op_->name_) ||
@@ -471,7 +471,8 @@ class BufferEmissionPreflight : public ir::IRVisitor {
       const auto tensor_type = As<ir::TensorType>(call->args_[load ? 0 : 3]->GetType());
       const auto tensor_columns = tensor_type ? As<ir::ConstInt>(tensor_type->shape_.back()) : nullptr;
       CHECK_SPAN(
-          (!backend::IsColumnVectorBuffer(buffer) && (!tensor_columns || tensor_columns->value_ != 1)) ||
+          (!backend::IsColumnVectorBufferGeometry(buffer) &&
+           (!tensor_columns || tensor_columns->value_ != 1)) ||
               (conversion_supported_ && backend::SupportsPackedColumnBufferTransfer(tensor_type, buffer)),
           call->span_)
           << "Direct Buffer IR column transfers require the qualified A2/A3 packed singleton-column "

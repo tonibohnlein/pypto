@@ -24,6 +24,7 @@ IR 定义是整个编译器的真源：pass 可以重写，IR 节点定义不可
 | [有限同步需求分析](12-sync-demand-analysis.md) | 数值存储生成边、最小需求、可达性与边界契约 |
 | [逻辑需求实现](14-logical-demand-realization.md) | 保留需求到完成 token 的构造与独立命令验证 |
 | [物理需求实现](15-physical-demand-realization.md) | 限定范围内的标志分配、直接放置及独立复用检查 |
+| [运行时有效轴](41-general-autosync-runtime-axis.md) | 共享物理几何、实际有效元数据、放置轴别名、归约和直接转换 |
 | [逻辑同步](11-logical-sync.md) | SSA 完成凭证、流水顺序、运行时地址谓词与 VF 完成边界 |
 
 ## 另请参阅
@@ -31,11 +32,6 @@ IR 定义是整个编译器的真源：pass 可以重写，IR 节点定义不可
 - [Passes](../passes/index.md) —— 运行在该 IR 之上的各种变换。
 - [Python IR 语法规范](../language/00-python_syntax.md) —— parser 接受的表层语法。
 - [IR 验证器](../passes/99-verifier.md) —— 在 pass 之间检查 IR 合法性的属性验证器。
-
-
-
-
-
 
 - [自动同步架构契约](33-sync-architecture-contracts.md) —— 共享逻辑阶段、已限定描述符、分配方案和标量绑定所有权。
 

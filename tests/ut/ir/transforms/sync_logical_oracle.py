@@ -38,6 +38,8 @@ _BINARY_VALUES: dict[type, Callable[[Any, Any], Any]] = {
     ir.Mul: operator.mul,
     ir.FloorDiv: operator.floordiv,
     ir.FloorMod: operator.mod,
+    ir.Min: min,
+    ir.Max: max,
     ir.Eq: operator.eq,
     ir.Ne: operator.ne,
     ir.Gt: operator.gt,
@@ -48,7 +50,7 @@ _BINARY_VALUES: dict[type, Callable[[Any, Any], Any]] = {
 
 
 def value(expr, env):
-    if isinstance(expr, (ir.ConstInt, ir.ConstBool)):
+    if isinstance(expr, (ir.ConstInt, ir.ConstBool, ir.ConstFloat)):
         return expr.value
     if isinstance(expr, ir.Cast):
         assert isinstance(expr.type, ir.ScalarType)

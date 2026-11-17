@@ -326,6 +326,13 @@ void ValidateBufferElementwiseOperands(const BufferElementwiseRecipe& recipe,
     CHECK(buffer) << recipe.buffer_op << " argument " << i << " must have BufferType";
     CHECK(buffer->memory_space_ == ir::MemorySpace::Vec)
         << recipe.buffer_op << " argument " << i << " must be in Vec memory";
+    if (IsColumnVectorBufferGeometry(buffer)) {
+      bool runtime = false;
+      for (const auto extent : buffer->valid_shape_) runtime |= extent < 0;
+      CHECK(!runtime)
+          << recipe.buffer_op
+          << " runtime column elementwise operands require a qualified row-major axis interpretation";
+    }
     CHECK(ir::structural_equal(descriptor, buffer))
         << recipe.buffer_op
         << " requires identical physical descriptors, including valid shape, layout and padding";

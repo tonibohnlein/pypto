@@ -14,6 +14,7 @@
 #include <any>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -25,6 +26,7 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/type.h"
 
 namespace pypto::backend {
@@ -68,6 +70,38 @@ bool Geometry(const ir::BufferTypePtr& a, const ir::BufferTypePtr& b) {
   return a->shape_ == b->shape_ && a->valid_shape_ == b->valid_shape_;
 }
 
+bool RuntimeBfloatGeometry(const ir::BufferTypePtr& source, const ir::BufferTypePtr& target) {
+  if (!IsAlignedDenseVecBufferGeometry(source) || !IsAlignedDenseVecBufferGeometry(target) ||
+      source->shape_ != target->shape_)
+    return false;
+  const bool pair = (source->dtype_ == DataType::BF16 && target->dtype_ == DataType::FP32) ||
+                    (source->dtype_ == DataType::FP32 && target->dtype_ == DataType::BF16);
+  const auto columns = source->shape_[1];
+  // The selected TCvt tail narrows physical row strides to uint16 before
+  // block division; row-index products in the head use uint32 arithmetic.
+  return pair && columns % 16 == 0 && columns <= std::numeric_limits<uint16_t>::max() &&
+         static_cast<uint64_t>(source->shape_[0]) <= std::numeric_limits<uint32_t>::max() / columns;
+}
+
+bool Dynamic(const ir::BufferTypePtr& type) {
+  if (!type) return false;
+  for (const auto extent : type->valid_shape_)
+    if (extent < 0) return true;
+  return false;
+}
+
+bool MatchingRuntimeCastValid(const ir::TypePtr& a_type, const ir::TypePtr& b_type) {
+  const auto a = ir::As<ir::TileType>(a_type);
+  const auto b = ir::As<ir::TileType>(b_type);
+  if (!a || !b) return false;
+  const auto av = ir::tile_view_semantics::GetEffectiveTileView(*a);
+  const auto bv = ir::tile_view_semantics::GetEffectiveTileView(*b);
+  const auto& x = av.valid_shape.empty() ? a->shape_ : av.valid_shape;
+  const auto& y = bv.valid_shape.empty() ? b->shape_ : bv.valid_shape;
+  return x.size() == 2 && y.size() == 2 && ir::structural_equal(x[0], y[0]) &&
+         ir::structural_equal(x[1], a->shape_[1]) && ir::structural_equal(y[1], b->shape_[1]);
+}
+
 // A predicate byte encodes eight logical columns, least-significant bit first.
 // Physical predicate rows are padded to 32 bytes, independently of valid bytes.
 bool Predicate(const ir::BufferTypePtr& mask, const ir::BufferTypePtr& values) {
@@ -80,8 +114,19 @@ bool Predicate(const ir::BufferTypePtr& mask, const ir::BufferTypePtr& values) {
 
 const char* OperandError(const BufferConversionRecipe& recipe, const std::vector<ir::BufferTypePtr>& types,
                          const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  const bool has_runtime_shape =
+      recipe.kind == K::Cast && types.size() == 2 && (Dynamic(types[0]) || Dynamic(types[1]));
+  if (has_runtime_shape && IsAlignedDenseVecBufferGeometry(types[0]) &&
+      IsAlignedDenseVecBufferGeometry(types[1]) && types[0]->shape_ == types[1]->shape_) {
+    const bool bfloat = (types[0]->dtype_ == DataType::BF16 && types[1]->dtype_ == DataType::FP32) ||
+                        (types[0]->dtype_ == DataType::FP32 && types[1]->dtype_ == DataType::BF16);
+    if (bfloat && !RuntimeBfloatGeometry(types[0], types[1]))
+      return "requires runtime BF16/FP32 native uint16 row strides and uint32 element offsets";
+  }
+  const bool runtime_cast = has_runtime_shape && RuntimeBfloatGeometry(types[0], types[1]);
   for (size_t i = 0; i < types.size(); ++i) {
-    if (static_cast<int>(i) != recipe.scalar_index && !IsAlignedDenseVecBuffer(types[i])) {
+    if (static_cast<int>(i) != recipe.scalar_index &&
+        !(runtime_cast ? IsAlignedDenseVecBufferGeometry(types[i]) : IsAlignedDenseVecBuffer(types[i]))) {
       return "requires aligned dense rank-2 Vec buffers with positive static valid extents";
     }
   }
@@ -98,7 +143,7 @@ const char* OperandError(const BufferConversionRecipe& recipe, const std::vector
     for (const auto& [key, value] : kwargs)
       if (key == "mode" && AnyCast<int>(value, "Buffer cast mode") == 2 && !bfloat)
         return "has unsupported conversion attributes for this dtype pair";
-    return (pair || bfloat) && Geometry(src, dst)
+    return (pair || bfloat) && (Geometry(src, dst) || runtime_cast)
                ? nullptr
                : "requires FP16/FP32 or BF16/FP32 conversion with matching physical and valid shapes";
   }
@@ -178,7 +223,12 @@ bool SupportsLogicalBufferConversion(const BufferConversionRecipe& recipe, const
     }
   }
   types.push_back(StaticLogicalBufferDescriptor(call->GetType()));
-  return OperandError(recipe, types, call->kwargs_) == nullptr;
+  if (OperandError(recipe, types, call->kwargs_) == nullptr) return true;
+  if (recipe.kind != K::Cast || !MatchingRuntimeCastValid(call->args_[0]->GetType(), call->GetType()))
+    return false;
+  types = {PhysicalLogicalVecDescriptor(call->args_[0]->GetType()),
+           PhysicalLogicalVecDescriptor(call->GetType())};
+  return RuntimeBfloatGeometry(types[0], types[1]) && OperandError(recipe, types, call->kwargs_) == nullptr;
 }
 
 void ValidateBufferConversionOperands(const BufferConversionRecipe& recipe,

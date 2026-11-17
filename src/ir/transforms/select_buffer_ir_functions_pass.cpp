@@ -111,6 +111,14 @@ class BufferKernelSupport : public IRVisitor {
     if (auto tile = As<TileType>(type)) {
       const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
       const bool column = backend::IsColumnVectorBufferTile(tile, view);
+      if (column && NeedsRuntimeBufferValid(tile)) {
+        const auto context = PassContext::Current();
+        // Runtime column/row aliases use separately owned metadata objects at
+        // proved placed addresses. Native addressless reinterpretation has no
+        // corresponding metadata export; retain Functional IR before planning.
+        admission.Require(!context || context->GetMemoryPlanner() != MemoryPlanner::PtoAS,
+                          BufferAdmissionProperty::TypeLayout);
+      }
       if (!column && !StaticShape(tile->shape_)) {
         admission.Require(false, BufferAdmissionProperty::TileShape);
         return;
@@ -156,8 +164,10 @@ class BufferKernelSupport : public IRVisitor {
                                 : space == MemorySpace::Vec && scalar &&
                                       (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt()),
                             BufferAdmissionProperty::TypeLayout);
-          if (space != MemorySpace::Vec || column)
+          if (space != MemorySpace::Vec)
             admission.Require(valid && valid->value_ > 0, BufferAdmissionProperty::TypeLayout);
+          if (column && i == 1)
+            admission.Require(valid && valid->value_ == 1, BufferAdmissionProperty::TypeLayout);
         }
       }
       if (const auto memory = tile->memref_.value_or(nullptr)) {
@@ -520,8 +530,9 @@ class BufferKernelSupport : public IRVisitor {
       const bool vector_relabel =
           source && destination && IsOp(call, "tile.reshape") && !views_.IsWindow(call->args_[0]) &&
           views_.HasDenseRowPitch(call->args_[0]) &&
-          backend::IsContiguousVectorReshape(backend::StaticLogicalBufferDescriptor(source),
-                                             backend::StaticLogicalBufferDescriptor(destination));
+          (backend::IsContiguousVectorReshape(backend::StaticLogicalBufferDescriptor(source),
+                                              backend::StaticLogicalBufferDescriptor(destination)) ||
+           backend::SupportsLogicalContiguousVectorReshape(call));
       admission.Require(source && destination && source->GetMemorySpace() == MemorySpace::Vec &&
                             destination->GetMemorySpace() == MemorySpace::Vec &&
                             (vector_relabel || (source_bytes && source_bytes == TileBytes(destination) &&
