@@ -32,6 +32,7 @@ from pypto.ir.auto_layout import (
     enumerate_assignments,
     evaluate_assignment,
     extract_layout_instance,
+    make_solver_auto_layout_pass,
     run_post_layout_passes,
     run_pre_layout_passes,
 )
@@ -40,6 +41,7 @@ from pypto.ir.auto_layout_solver import (
     _Problem,
     _State,
     compute_treewidth,
+    solve_auto_layout,
     solve_greedy,
     solve_treewidth_dp,
 )
@@ -603,6 +605,50 @@ def test_extracted_matmul_solver_matches_calibration_enumerator_and_lowers():
                 emitted = codegen.PTOCodegen().generate(single, emit_tile_addr=True)
                 texts.append(emitted if isinstance(emitted, str) else "".join(emitted.values()))
         assert any("pto.tmatmul" in text for text in texts)
+
+
+def test_solve_auto_layout_dispatches_by_max_treewidth_and_shared_qkv_case():
+    set_backend_type(BackendType.Ascend910)
+    instance, initial = _barrier()
+    # Default max_treewidth=8 uses exact treewidth DP (`optimal`).
+    auto_dp = solve_auto_layout(instance, initial=initial)
+    assert auto_dp.stats.termination_reason == "optimal"
+    assert auto_dp.total_cost_cycles == pytest.approx(4.0)
+
+    # Setting max_treewidth=0 forces fallback to greedy coordinate descent (`local_optimum`).
+    auto_greedy = solve_auto_layout(instance, initial=initial, config=LayoutSolverConfig(max_treewidth=0))
+    assert auto_greedy.stats.termination_reason == "local_optimum"
+    assert auto_greedy.total_cost_cycles == pytest.approx(6.0)
+    with pytest.raises(ValueError, match="max_treewidth"):
+        solve_treewidth_dp(instance, config=LayoutSolverConfig(max_treewidth=0))
+
+    # Verify the 3-projection shared-x QKV case separates DP/auto_layout from greedy.
+    qkv_case = auto_layout_bench.build_shared_input_qkv_case(64, 1024, 64, expected_uses=100)
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
+        pre_qkv = run_pre_layout_passes(qkv_case.program)
+        qkv_inst = extract_layout_instance(
+            pre_qkv,
+            cost_model=LayoutCostModel(expected_uses=100, backend_type=BackendType.Ascend910),
+            reusable_tensors=qkv_case.reusable_tensors,
+        )
+        greedy_qkv = solve_greedy(qkv_inst)
+        dp_qkv = solve_treewidth_dp(qkv_inst)
+        auto_qkv = solve_auto_layout(qkv_inst)
+        assert greedy_qkv.assignment.tensor_layouts["x"] == ND
+        assert dp_qkv.assignment.tensor_layouts["x"] == NZ
+        assert auto_qkv.assignment.tensor_layouts["x"] == NZ
+        assert dp_qkv.total_cost_cycles < greedy_qkv.total_cost_cycles
+        assert auto_qkv.total_cost_cycles == pytest.approx(dp_qkv.total_cost_cycles)
+
+        # Verify `make_solver_auto_layout_pass` rewrites `x`, `wq`, `wk`, `wv` to NZ.
+        solver_pass = make_solver_auto_layout_pass(
+            LayoutCostModel(expected_uses=100, backend_type=BackendType.Ascend910),
+            reusable_tensors=qkv_case.reusable_tensors,
+            solver="auto",
+        )
+        rewritten_qkv = solver_pass(pre_qkv)
+        lowered_qkv = run_post_layout_passes(rewritten_qkv)
+        assert len(lowered_qkv.functions) >= 1
 
 
 if __name__ == "__main__":

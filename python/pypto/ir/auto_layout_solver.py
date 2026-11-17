@@ -58,18 +58,21 @@ class LayoutSolverConfig:
     Attributes:
         max_evaluations: Candidate evaluations across initialization and search.
         max_greedy_sweeps: Bound on full coordinate-descent sweeps.
+        max_treewidth: Maximum active primal treewidth for exact treewidth DP (default 8).
         max_bag_states: Maximum states allowed in a single treewidth-DP bag.
         tolerance: Absolute minimum improvement in cycles; ties retain the incumbent.
     """
 
     max_evaluations: int = 100_000
     max_greedy_sweeps: int = 100
+    max_treewidth: int = 8
     max_bag_states: int = 100_000
     tolerance: float = 1e-9
 
     def __post_init__(self) -> None:
         for name in ("max_evaluations", "max_greedy_sweeps", "max_bag_states"):
             _require_integer(getattr(self, name), name, 1)
+        _require_integer(self.max_treewidth, "max_treewidth", 0)
         if not math.isfinite(self.tolerance) or self.tolerance < 0:
             raise ValueError(f"tolerance must be finite and nonnegative, got {self.tolerance!r}")
 
@@ -768,19 +771,24 @@ def _eval_tensor_factor_at_bag(
     return math.fsum(costs[dst] for dst in requested)
 
 
-def solve_treewidth_dp(
-    instance: LayoutProblemInstance,
-    *,
-    config: LayoutSolverConfig | None = None,
+def _run_treewidth_dp_on_decomposition(
+    problem: _Problem,
+    cfg: LayoutSolverConfig,
+    progress: _Progress,
+    tw_stats: TreewidthStats,
+    elim_order: Sequence[int],
+    bags: Sequence[tuple[int, ...]],
+    parents: Sequence[int | None],
 ) -> LayoutSolverResult:
-    """Solve `instance` to proven global optimality via treewidth dynamic programming."""
-    problem = _Problem(instance)
-    cfg = config or LayoutSolverConfig()
-    progress = _Progress(cfg)
-    tw_stats, elim_order, bags, parents = _compute_active_decomposition(problem)
     if not problem.ops:
         progress.termination_reason = "optimal"
         return _result(_State(problem, []), progress, tw_stats)
+
+    if tw_stats.active_primal_treewidth > cfg.max_treewidth:
+        raise ValueError(
+            f"Treewidth DP active primal treewidth {tw_stats.active_primal_treewidth} exceeds "
+            f"max_treewidth={cfg.max_treewidth}"
+        )
 
     if tw_stats.max_bag_domain_product > cfg.max_bag_states:
         raise ValueError(
@@ -851,6 +859,45 @@ def solve_treewidth_dp(
     return _result(state, progress, tw_stats)
 
 
+def solve_treewidth_dp(
+    instance: LayoutProblemInstance,
+    *,
+    config: LayoutSolverConfig | None = None,
+) -> LayoutSolverResult:
+    """Solve `instance` to proven global optimality via treewidth dynamic programming."""
+    problem = _Problem(instance)
+    cfg = config or LayoutSolverConfig()
+    progress = _Progress(cfg)
+    tw_stats, elim_order, bags, parents = _compute_active_decomposition(problem)
+    return _run_treewidth_dp_on_decomposition(problem, cfg, progress, tw_stats, elim_order, bags, parents)
+
+
+def solve_auto_layout(
+    instance: LayoutProblemInstance,
+    *,
+    initial: LayoutAssignment | None = None,
+    config: LayoutSolverConfig | None = None,
+) -> LayoutSolverResult:
+    """Solve `instance` via exact treewidth DP when `active_treewidth <= max_treewidth`, else greedy."""
+    problem = _Problem(instance)
+    cfg = config or LayoutSolverConfig()
+    progress = _Progress(cfg)
+    tw_stats, elim_order, bags, parents = _compute_active_decomposition(problem)
+    if (
+        tw_stats.active_primal_treewidth <= cfg.max_treewidth
+        and tw_stats.max_bag_domain_product <= cfg.max_bag_states
+    ):
+        return _run_treewidth_dp_on_decomposition(problem, cfg, progress, tw_stats, elim_order, bags, parents)
+    choices = (
+        problem.initial_choices(initial) if initial is not None else _topological_seed(problem, progress)
+    )
+    state = _State(problem, choices)
+    progress.initial_cost_cycles = state.cost
+    if progress.termination_reason != "evaluation_budget":
+        _greedy_refine(state, progress)
+    return _result(state, progress, tw_stats)
+
+
 __all__ = [
     "LayoutConversion",
     "LayoutSolverConfig",
@@ -858,6 +905,7 @@ __all__ = [
     "LayoutSolverStats",
     "TreewidthStats",
     "compute_treewidth",
+    "solve_auto_layout",
     "solve_greedy",
     "solve_treewidth_dp",
 ]

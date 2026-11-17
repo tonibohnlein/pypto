@@ -2086,6 +2086,45 @@ def make_auto_layout_pass(
     return passes.create_program_pass(lambda prog: apply_layout_assignment(prog, assignment), name=name)
 
 
+def make_solver_auto_layout_pass(
+    cost_model: LayoutCostModel | None = None,
+    *,
+    reusable_tensors: set[str] | None = None,
+    solver: str = "auto",
+    max_treewidth: int = 8,
+    name: str = "AutoLayout",
+) -> passes.Pass:
+    """Create a solver-driven `passes.Pass` that extracts, solves, and writes back layouts."""
+    if solver not in ("auto", "greedy", "treewidth_dp"):
+        raise ValueError(f"Unknown solver={solver!r}; expected 'auto', 'greedy', or 'treewidth_dp'")
+
+    def _run_pass(prog: core_ir.Program) -> core_ir.Program:
+        from pypto.ir.auto_layout_solver import (  # noqa: PLC0415
+            LayoutSolverConfig,
+            solve_auto_layout,
+            solve_greedy,
+            solve_treewidth_dp,
+        )
+
+        inst = extract_layout_instance(
+            prog,
+            cost_model=cost_model,
+            reusable_tensors=reusable_tensors,
+        )
+        cfg = LayoutSolverConfig(max_treewidth=max_treewidth)
+        if solver == "greedy":
+            res = solve_greedy(inst, config=cfg)
+        elif solver == "treewidth_dp":
+            res = solve_treewidth_dp(inst, config=cfg)
+        else:
+            res = solve_auto_layout(inst, config=cfg)
+        if res.writeback_issues:
+            return prog
+        return apply_layout_assignment(prog, res.writeback_assignment())
+
+    return passes.create_program_pass(_run_pass, name=name)
+
+
 def _format_layout_choice(choice: LayoutChoice) -> str:
     if isinstance(choice, core_ir.TensorLayout):
         return choice.name
@@ -2789,6 +2828,7 @@ __all__ = [
     "fit_cost_model_from_measurements",
     "is_nz_compatible_shape",
     "make_auto_layout_pass",
+    "make_solver_auto_layout_pass",
     "pack_nz",
     "run_post_layout_passes",
     "run_pre_layout_passes",

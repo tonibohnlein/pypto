@@ -31,6 +31,7 @@ import argparse
 import json
 import math
 import statistics
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -50,6 +51,12 @@ from pypto.ir.auto_layout import (
     fit_cost_model_from_measurements,
     pack_nz,
     unpack_nz,
+)
+from pypto.ir.auto_layout_solver import (
+    compute_treewidth,
+    solve_auto_layout,
+    solve_greedy,
+    solve_treewidth_dp,
 )
 from pypto.ir.compiled_program import CompiledProgram
 from pypto.pypto_core import ir as core_ir
@@ -352,6 +359,100 @@ def build_two_matmul_chain_case(  # noqa: PLR0913
     )
 
 
+@pl.jit.inline
+def _qkv_shared_x_sum(  # noqa: PLR0913
+    x: pl.Tensor,
+    wq: pl.Tensor,
+    wk: pl.Tensor,
+    wv: pl.Tensor,
+    out: pl.Tensor,
+    m_dim: pl.constexpr,
+    k_dim: pl.constexpr,
+    n_dim: pl.constexpr,
+    k_tile: pl.constexpr,
+) -> pl.Tensor:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qkv_shared_x"):
+        acc_q = pl.create_tensor([m_dim, n_dim], dtype=pl.FP32)
+        for kb in pl.range(0, k_dim // k_tile, 1):
+            k0 = kb * k_tile
+            xq = pl.slice(x, [m_dim, k_tile], [0, k0])
+            wqt = pl.slice(wq, [n_dim, k_tile], [0, k0])
+            acc_q = pl.matmul_acc(acc_q, xq, wqt, b_trans=True, init_cond=kb == 0)
+
+        acc_k = pl.create_tensor([m_dim, n_dim], dtype=pl.FP32)
+        for kb in pl.range(0, k_dim // k_tile, 1):
+            k0 = kb * k_tile
+            xk = pl.slice(x, [m_dim, k_tile], [0, k0])
+            wkt = pl.slice(wk, [n_dim, k_tile], [0, k0])
+            acc_k = pl.matmul_acc(acc_k, xk, wkt, b_trans=True, init_cond=kb == 0)
+
+        acc_v = pl.create_tensor([m_dim, n_dim], dtype=pl.FP32)
+        for kb in pl.range(0, k_dim // k_tile, 1):
+            k0 = kb * k_tile
+            xv = pl.slice(x, [m_dim, k_tile], [0, k0])
+            wvt = pl.slice(wv, [n_dim, k_tile], [0, k0])
+            acc_v = pl.matmul_acc(acc_v, xv, wvt, b_trans=True, init_cond=kb == 0)
+
+        qk = pl.add(acc_q, acc_k)
+        qkv = pl.add(qk, acc_v)
+        out = pl.assemble(out, qkv, [0, 0])
+    return out
+
+
+def build_shared_input_qkv_case(  # noqa: PLR0913
+    m_dim: int = 64,
+    k_dim: int = 1024,
+    n_dim: int = 64,
+    *,
+    k_tile: int = 128,
+    expected_uses: int = 100,
+    seed: int = 9,
+) -> CalibrationCaseSpec:
+    """Build a 3-projection shared-input workload `Out = X@Wq.T + X@Wk.T + X@Wv.T`.
+
+    `x` is a non-reusable activation consumed by three separate K-reduction
+    matmuls, creating the shared-conversion barrier where single-consumer greedy
+    flips leave `x` in `ND` while treewidth DP jointly flips all three loads to `NZ`.
+    """
+
+    @pl.jit
+    def qkv_shared_x_entry(
+        x: pl.Tensor,
+        wq: pl.Tensor,
+        wk: pl.Tensor,
+        wv: pl.Tensor,
+        out: pl.Out[pl.Tensor],
+    ) -> pl.Tensor:
+        out = _qkv_shared_x_sum(x, wq, wk, wv, out, m_dim, k_dim, n_dim, k_tile)
+        return out
+
+    gen = torch.Generator().manual_seed(seed)
+    scale = 0.05 if k_dim >= 1024 else 0.25
+    x_host = torch.randn((m_dim, k_dim), generator=gen, dtype=torch.float16) * scale
+    wq_host = torch.randn((n_dim, k_dim), generator=gen, dtype=torch.float16) * scale
+    wk_host = torch.randn((n_dim, k_dim), generator=gen, dtype=torch.float16) * scale
+    wv_host = torch.randn((n_dim, k_dim), generator=gen, dtype=torch.float16) * scale
+    out_stub = torch.zeros((m_dim, n_dim), dtype=torch.float32)
+
+    program = qkv_shared_x_entry.specialize(x_host, wq_host, wk_host, wv_host, out_stub)
+    expected = (
+        (x_host.float() @ wq_host.float().T)
+        + (x_host.float() @ wk_host.float().T)
+        + (x_host.float() @ wv_host.float().T)
+    )
+
+    return CalibrationCaseSpec(
+        case_id=f"qkv_shared_x_{m_dim}x{k_dim}x{n_dim}",
+        program=program,
+        inputs=(x_host, wq_host, wk_host, wv_host),
+        expected_output=expected,
+        output_shape=(m_dim, n_dim),
+        output_dtype=torch.float32,
+        reusable_tensors={"wq", "wk", "wv"},
+        expected_uses=expected_uses,
+    )
+
+
 def _entry_function(program: core_ir.Program) -> core_ir.Function:
     """Return the `Orchestration` entry function of *program* (falling back to the last function)."""
     orch_funcs = [
@@ -480,6 +581,7 @@ def default_a2_calibration_suite(
     *,
     include_chain: bool = True,
     include_variations: bool = True,
+    include_shared_qkv: bool = False,
     expected_uses: int = 100,
 ) -> list[CalibrationCaseSpec]:
     """Return a high-volume L0-fitting Ascend A2 (`Ascend910`) calibration workload suite.
@@ -587,7 +689,123 @@ def default_a2_calibration_suite(
                 seed=6,
             )
         )
+    if include_shared_qkv:
+        cases.append(
+            build_shared_input_qkv_case(
+                64,
+                1024,
+                64,
+                k_tile=128,
+                expected_uses=expected_uses,
+                seed=9,
+            )
+        )
     return cases
+
+
+def _match_variant_record(
+    variant_records: Sequence[dict[str, Any]],
+    gm_layouts: dict[str, str],
+) -> dict[str, Any] | None:
+    for rec in variant_records:
+        if rec.get("gm_layouts") == gm_layouts:
+            return rec
+    return None
+
+
+def _evaluate_solvers_for_case(
+    instance: LayoutProblemInstance,
+    variant_records: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Run treewidth and layout solvers on `instance` and match their selected variants."""
+    t0 = time.perf_counter()
+    tw = compute_treewidth(instance)
+    tw_us = (time.perf_counter() - t0) * 1e6
+
+    t0 = time.perf_counter()
+    greedy_res = solve_greedy(instance)
+    greedy_us = (time.perf_counter() - t0) * 1e6
+
+    t0 = time.perf_counter()
+    dp_res = solve_treewidth_dp(instance)
+    dp_us = (time.perf_counter() - t0) * 1e6
+
+    t0 = time.perf_counter()
+    auto_res = solve_auto_layout(instance)
+    auto_us = (time.perf_counter() - t0) * 1e6
+
+    nd_layouts = {
+        name: "ND" for name, node in instance.values.items() if node.memory_space == core_ir.MemorySpace.DDR
+    }
+    base_rec = _match_variant_record(variant_records, nd_layouts)
+    base_dev_us = base_rec.get("device_us_median") if base_rec else None
+    base_swim_us = base_rec.get("swimlane_aicore_us") if base_rec else None
+
+    def _pack_solver_entry(res: Any, solve_us: float) -> dict[str, Any]:
+        gm_lay = {k: v.name for k, v in res.assignment.tensor_layouts.items()}
+        matched = _match_variant_record(variant_records, gm_lay)
+        dev_us = matched.get("device_us_median") if matched else None
+        eff_us = matched.get("effective_us_median") if matched else None
+        swim_us = matched.get("swimlane_aicore_us") if matched else None
+        delta_dev = (
+            float(dev_us - base_dev_us)
+            if isinstance(dev_us, (int, float)) and isinstance(base_dev_us, (int, float))
+            else None
+        )
+        delta_swim = (
+            float(swim_us - base_swim_us)
+            if isinstance(swim_us, (int, float)) and isinstance(base_swim_us, (int, float))
+            else None
+        )
+        return {
+            "gm_layouts": gm_lay,
+            "variant_id": matched.get("variant_id") if matched else None,
+            "predicted_total_cycles": res.total_cost_cycles,
+            "predicted_op_cycles": res.breakdown.operator_cost_cycles,
+            "predicted_conv_cycles": res.breakdown.conversion_cost_cycles,
+            "evaluated_moves": res.stats.evaluated_moves,
+            "termination_reason": res.stats.termination_reason,
+            "solve_time_us": solve_us,
+            "device_us_median": dev_us,
+            "effective_us_median": eff_us,
+            "swimlane_aicore_us": swim_us,
+            "device_delta_vs_nd_us": delta_dev,
+            "swimlane_delta_vs_nd_us": delta_swim,
+        }
+
+    greedy_entry = _pack_solver_entry(greedy_res, greedy_us)
+    dp_entry = _pack_solver_entry(dp_res, dp_us)
+    auto_entry = _pack_solver_entry(auto_res, auto_us)
+    g_dev = greedy_entry.get("device_us_median")
+    dp_dev = dp_entry.get("device_us_median")
+    if isinstance(g_dev, (int, float)) and isinstance(dp_dev, (int, float)):
+        dp_entry["device_delta_vs_greedy_us"] = float(dp_dev - g_dev)
+
+    return {
+        "treewidth": {
+            "num_values": tw.num_values,
+            "num_operations": tw.num_operations,
+            "num_movable_operations": tw.num_movable_operations,
+            "dataflow_treewidth": tw.dataflow_treewidth,
+            "primal_treewidth": tw.primal_treewidth,
+            "active_primal_treewidth": tw.active_primal_treewidth,
+            "max_bag_domain_product": tw.max_bag_domain_product,
+            "total_dp_states": tw.total_dp_states,
+            "compute_time_us": tw_us,
+        },
+        "baseline_nd": {
+            "gm_layouts": nd_layouts,
+            "variant_id": base_rec.get("variant_id") if base_rec else None,
+            "predicted_total_cycles": base_rec.get("predicted_total_cycles") if base_rec else None,
+            "predicted_op_cycles": base_rec.get("predicted_op_cycles") if base_rec else None,
+            "device_us_median": base_dev_us,
+            "effective_us_median": base_rec.get("effective_us_median") if base_rec else None,
+            "swimlane_aicore_us": base_swim_us,
+        },
+        "greedy": greedy_entry,
+        "treewidth_dp": dp_entry,
+        "auto_layout": auto_entry,
+    }
 
 
 def _serialize_calibration_report(
@@ -774,7 +992,13 @@ def run_calibration_suite(  # noqa: PLR0913
 
             variant_records.append(rec)
 
-        suite_records.append({"case_id": case.case_id, "variants": variant_records})
+        suite_records.append(
+            {
+                "case_id": case.case_id,
+                "variants": variant_records,
+                "_instance": instance,
+            }
+        )
 
     # Pass B: level-1 chip swimlane capture after all benchmark() invocations complete.
     if capture_swimlane and not compile_only:
@@ -808,6 +1032,10 @@ def run_calibration_suite(  # noqa: PLR0913
                         label=f"{case.case_id}:{variant.gm_input_layouts}->{variant.gm_output_layouts}",
                     )
                 )
+
+    for case_rec in suite_records:
+        inst = cast(LayoutProblemInstance, case_rec.pop("_instance"))
+        case_rec["solver_evaluation"] = _evaluate_solvers_for_case(inst, case_rec["variants"])
 
     calibration = _serialize_calibration_report(measurements, base_model)
     calibration_effective = _serialize_calibration_report(effective_measurements, base_model)
@@ -868,6 +1096,20 @@ def _print_summary(summary: dict[str, Any]) -> None:
                 f"pred_op={v['predicted_op_cycles']:.1f}cyc pred_total={v['predicted_total_cycles']:.1f}cyc "
                 f"{dev_str}{sw_str}{acc_str}"
             )
+        se = case.get("solver_evaluation")
+        if isinstance(se, dict):
+            se_dict = cast(dict[str, dict[str, Any]], se)
+            tw = se_dict.get("treewidth", {})
+            g = se_dict.get("greedy", {})
+            dp = se_dict.get("treewidth_dp", {})
+            al = se_dict.get("auto_layout", {})
+            print(
+                f"  [solvers] tw=(df={tw.get('dataflow_treewidth')}, pr={tw.get('primal_treewidth')}, "
+                f"act={tw.get('active_primal_treewidth')}, states={tw.get('total_dp_states')}) "
+                f"greedy={g.get('variant_id')}({g.get('gm_layouts')}, dev={g.get('device_us_median')}) "
+                f"dp={dp.get('variant_id')}({dp.get('gm_layouts')}, dev={dp.get('device_us_median')}) "
+                f"auto={al.get('variant_id')}({al.get('termination_reason')})"
+            )
     _print_calibration_block("Calibrated LayoutCostModel (device_us_median)", summary.get("calibration"))
     _print_calibration_block(
         "Calibrated LayoutCostModel (effective_us_median)", summary.get("calibration_effective")
@@ -909,10 +1151,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Skip the two-matmul chained workload",
     )
+    parser.add_argument(
+        "--include-shared-qkv",
+        action="store_true",
+        help="Include the 3-projection shared-input QKV case (tests DP vs greedy barrier)",
+    )
     args = parser.parse_args(argv)
 
     cases = default_a2_calibration_suite(
         include_chain=not args.no_chain,
+        include_shared_qkv=args.include_shared_qkv,
         expected_uses=args.expected_uses,
     )
     summary = run_calibration_suite(
