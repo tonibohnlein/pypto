@@ -872,3 +872,17 @@ both pass. The broader 147-test gate covers real Call/Submit/Graph/wrapper
 emission, unused wrappers, publication failures and module ownership. Two stale
 Graph test stubs were updated to the already committed compiler keyword API;
 no native or dependency check was weakened.
+
+## Repair acceptance checkpoint (2026-11-16)
+
+R1 (`07cb2cacf`), R2 (`04604d1cb`), R3 (`1bafd4c00`) and the R4 checkpoint
+are accepted through independent review. The isolated repair gate passed 2,910
+test executions with zero failures; the three resource/native/order C++ tests
+and applicable hooks also pass. See [repair report](42-autosync-review-repairs.md)
+and its machine-readable receipt for proof scope, commands, pins and costs.
+
+The preserved active-domain, scalar, effective-coordinate and local-boundary
+packages remain uncommitted and unqualified. Restore them after this accepted
+repair commit, rebuild coherently, then resume their original individual review
+gates. M1–M6 and whole-Qwen local ownership remain incomplete. R4 adds no general
+CFG capability, new allocator, default dispatch or cross-core construction.

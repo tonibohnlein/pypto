@@ -16,7 +16,9 @@ import pytest
 from pypto import ir, testing
 
 from .sync_matmul_oracle import hardware_reference, interpret
+from .sync_physical_oracle import PhysicalExecution, checked_payload_calls
 from .test_nested_phase_sync import nested_matrix_fixture
+from .test_nested_sync_repetition import BOUNDS, nested_fixture
 from .test_scoped_token_families import Uses, occurrence_indices
 from .test_token_sync_lowering import _project
 
@@ -38,15 +40,17 @@ def test_palette_ranks_preserve_actual_handoffs(count, visits):
     check_palette(logical, require_reuse=count >= 2 and visits > 0)
 
 
-def check_palette(logical, *, require_reuse=False):
-    inventory = testing.inspect_scoped_token_families(logical)
-    _, calls = interpret(inventory["function"])
+def check_palette(logical, *, require_reuse=False, parameter_bounds=None, parameters=None):
+    parameter_bounds = parameter_bounds or {}
+    parameters = parameters or {}
+    inventory = testing.inspect_scoped_token_families(logical, parameter_bounds=parameter_bounds)
+    _, calls = interpret(inventory["function"], parameters)
     vertices = hardware_reference(inventory["function"], calls)[0]
     executed = Uses(calls, vertices)
-    executed.execute(logical.body, {})
+    executed.execute(logical.body, {logical.params[i]: value for i, value in parameters.items()})
     _, closure = _project(executed.vertices, executed.edges, vertices)
     occurrences = occurrence_indices(inventory, calls)
-    order = testing.analyze_scoped_token_order(logical)
+    order = testing.analyze_scoped_token_order(logical, parameter_bounds=parameter_bounds)
     cut_order = {use: j for _, _, _, after in inventory["protocol_cuts"] for j, use in enumerate(after)}
     by_direction = {}
     all_uses = Counter()
@@ -177,3 +181,143 @@ def test_palette_reuses_schedule_and_rejects_foreign_protocol():
     refusal = schedule.certify(foreign, 6)
     assert refusal["status"] == "unsupported-grammar"
     assert "different immutable token protocol" in refusal["reason"]
+
+
+@pytest.mark.parametrize("depth", [2, 4, 8, 12, 16])
+def test_successor_palette_avoids_cartesian_nested_boundary_cells(depth):
+    original = nested_fixture([2] * depth)
+    logical = testing.analyze_placed_sync(original, True, parameter_bounds=BOUNDS).realize()["function"]
+    order = testing.analyze_scoped_token_order(logical, parameter_bounds=BOUNDS)
+    result = order.palette(ir.PipeType.MTE3, ir.PipeType.MTE2, 1)
+    assert result["status"] == "certified", result
+    assert result["publications"] == 2**depth - 1
+    assert len(result["pieces"]) == depth
+    assert result["grammar_nodes"] == result["phase_visits"] == result["routing_entries"] == 0
+    # The public one-shot receipt reports certification transition queries.
+    # Construction prequalification uses the same queries separately.
+    assert result["transition_queries"] == depth
+    # Public LowerSync consumes these same original tokens and their IDs. The
+    # output must not have one literal SET for every dynamic publication.
+    physical = testing.lower_sync_schedule(logical, parameter_bounds=BOUNDS, eligible_ids=list(range(6)))
+    assert physical["set_sites"] <= 2 * depth + 8
+    assert physical["wait_sites"] <= 2 * depth + 8
+
+
+@pytest.mark.parametrize("counts", [[2, 3], [3, 2, 2], [1, 2, 1, 2]])
+def test_successor_palette_ranks_labels_matching_and_reuse_independently(counts):
+    original = nested_fixture(counts)
+    logical = testing.analyze_placed_sync(original, True, parameter_bounds=BOUNDS).realize()["function"]
+    parameters = {1: 0, 3: 64}
+    # Expands actual token uses, every emitted affine rank and all raw labels;
+    # compares ranks with concrete original occurrences independently of cells.
+    check_palette(logical, parameter_bounds=BOUNDS, parameters=parameters, require_reuse=True)
+    physical = testing.lower_sync_schedule(logical, parameter_bounds=BOUNDS, eligible_ids=list(range(6)))
+    emitted = physical["function"]
+    calls, emitted_calls = checked_payload_calls(original, emitted, parameters)
+    reference = hardware_reference(original, calls)
+    tokens = Uses(calls, reference[0])
+    tokens.execute(logical.body, {logical.params[i]: value for i, value in parameters.items()})
+    flags = PhysicalExecution(emitted_calls, reference[0], range(6))
+    flags.execute(emitted.body, {emitted.params[i]: value for i, value in parameters.items()})
+    before, token_order = _project(tokens.vertices, tokens.edges, reference[0])
+    after, flag_order = _project(flags.vertices, flags.edges, reference[0])
+    assert token_order == flag_order
+    assert reference[2] <= flag_order
+    assert not tokens.pending or not any(tokens.pending.values())
+    assert not flags.live and not any(flags.pending.values())
+    assert len(flags.records) == len(flags.waits)
+    assert all(pair in after for pair in flags.reuses)
+    assert all(ids <= set(range(6)) for ids in flags.ids.values())
+    assert not any(a == b for a, b in before | after)
+
+
+def test_successor_palette_retains_original_frames_as_counts_grow():
+    sizes = []
+    for count in [2, 17, 1000000]:
+        logical = testing.analyze_placed_sync(
+            nested_fixture([count, 3, 2]), True, parameter_bounds=BOUNDS
+        ).realize()["function"]
+        order = testing.analyze_scoped_token_order(logical, parameter_bounds=BOUNDS)
+        result = order.palette(ir.PipeType.MTE3, ir.PipeType.MTE2, 1)
+        assert result["status"] == "certified", result
+        assert result["publications"] == count * 6 - 1
+        sizes.append((len(result["pieces"]), result["grammar_nodes"], result["phase_visits"]))
+    assert sizes == [(3, 0, 0)] * 3
+
+
+@pytest.mark.parametrize("kind", ["duplicate", "hole", "missing_reuse_path"])
+def test_successor_normalization_retains_general_grammar_for_unproved_shapes(kind):
+    logical = testing.analyze_placed_sync(nested_fixture([2, 3]), True, parameter_bounds=BOUNDS).realize()[
+        "function"
+    ]
+
+    class AlterUses(ir.IRMutator):
+        frame = None
+        changed = 0
+
+        def visit_for_stmt(self, op):
+            saved = self.frame
+            self.frame = op
+            result = super().visit_for_stmt(op)
+            self.frame = saved
+            return result
+
+        def visit_eval_stmt(self, op):
+            call = op.expr
+            if not isinstance(call, ir.Call) or call.op.name != ir.get_op("sync.wait").name:
+                return op
+            token = call.args[0].type
+            assert isinstance(token, ir.SyncTokenType)
+            destination = ir.PipeType(call.kwargs["dst_pipe"])
+            if kind == "missing_reuse_path":
+                if token.pipe == ir.PipeType.MTE2 and destination == ir.PipeType.MTE3:
+                    self.changed += 1
+                    return ir.SeqStmts([], op.span)
+                return op
+            if token.pipe != ir.PipeType.MTE3 or destination != ir.PipeType.MTE2:
+                return op
+            if kind == "duplicate":
+                self.changed += 1
+                return ir.SeqStmts([op, op], op.span)
+            if self.frame is None:
+                return op
+            self.changed += 1
+            frame = self.frame
+            assert isinstance(frame.start, ir.ConstInt) and isinstance(frame.step, ir.ConstInt)
+            # Express the same alternating original-occurrence domain through
+            # the supported direct-IV residue syntax. With step=3 this selects
+            # IVs 2 and 8 while excluding IV 5, preserving an actual hole.
+            modulus = 2 * frame.step.value
+            residue = ir.FloorMod(
+                ir.Sub(frame.loop_var, frame.start, ir.DataType.INDEX, op.span),
+                ir.ConstInt(modulus, ir.DataType.INDEX, op.span),
+                ir.DataType.INDEX,
+                op.span,
+            )
+            guard = ir.Eq(
+                residue,
+                ir.ConstInt(0, ir.DataType.INDEX, op.span),
+                ir.DataType.BOOL,
+                op.span,
+            )
+            return ir.IfStmt(guard, op, None, [], op.span)
+
+    altered = AlterUses()
+    actual = altered.visit_function(logical)
+    assert altered.changed
+    order = testing.analyze_scoped_token_order(actual, parameter_bounds=BOUNDS)
+    result = order.palette(ir.PipeType.MTE3, ir.PipeType.MTE2, 1)
+    assert result["grammar_nodes"] > 0, "inapplicable compact normalization must retain the original grammar"
+    if kind == "hole":
+        assert 0 < result["publications"] < 5, "the residue must remove a proper subset of five successors"
+    if kind == "missing_reuse_path":
+        # This deliberately under-synchronized token program need not cover
+        # buffer hazards. Lowering must not invent its missing readiness edge
+        # to justify a resource assignment; actual-token order is its owner.
+        assert result["status"] == "unproved-reuse"
+    else:
+        check_palette(actual, parameter_bounds=BOUNDS, parameters={1: 0, 3: 64})
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

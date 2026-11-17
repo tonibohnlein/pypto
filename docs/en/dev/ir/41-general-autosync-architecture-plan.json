@@ -245,5 +245,19 @@
       "scope": "EN/ZH architecture plan and companion JSON only",
       "validation": "Source inspection and documentation checks; no fresh compiler defect reproduction, build, runtime or device validation"
     }
+  },
+  "repair_acceptance_checkpoint_20261116": {
+    "R1": "07cb2cacf",
+    "R2": "04604d1cb",
+    "R3": "1bafd4c00",
+    "R4": "this accepted repair checkpoint",
+    "independent_review": "accepted; fresh gate and hooks passed",
+    "test_executions": 2910,
+    "failed": 0,
+    "ctest_passed": 3,
+    "report": "42-autosync-review-repairs.md",
+    "receipt": "42-autosync-review-repairs.json",
+    "original_M1_M6_complete": false,
+    "next": "Restore byte-preserved packages, coherent build, then original independent review/commit loop; no cross-core/inter-kernel synthesis"
   }
 }

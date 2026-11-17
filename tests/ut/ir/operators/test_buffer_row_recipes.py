@@ -79,12 +79,80 @@ def test_row_recipes_do_not_admit_unverified_dtypes(suffix, dtype):
 
 
 @pytest.mark.parametrize("suffix", _RECIPES)
-@pytest.mark.parametrize("valid", [[-1, -1], [0, 64], [16, 0]])
-def test_row_recipes_reject_dynamic_and_empty_reduction_domains(suffix, valid):
+@pytest.mark.parametrize("valid", [[0, 64], [16, 0]])
+def test_row_recipes_reject_empty_static_reduction_domains(suffix, valid):
     arguments = _args(suffix)
     arguments[0] = _buffer("src", valid_shape=valid)
     with pytest.raises(ValueError, match="nonempty static valid"):
         _call(suffix, arguments)
+
+
+@pytest.mark.parametrize("suffix", _RECIPES)
+def test_runtime_row_descriptor_construction_does_not_prove_metadata(suffix):
+    arguments = _args(suffix)
+    arguments[0] = _buffer("src", valid_shape=[-1, -1])
+    call = _call(suffix, arguments)
+    assert isinstance(call.type, ir.VoidType)
+    statement = ir.EvalStmt(call, _SPAN)
+    ir.assert_structural_equal(statement, ir.deserialize(ir.serialize(statement)), enable_auto_mapping=True)
+
+
+def _verify_runtime_rows(suffix, kind):
+    # All native metadata comes from actual dominating allocations. Matching
+    # -1 descriptor fields alone say nothing about the rows at this use.
+    first, second = [ir.Var(name, ir.ScalarType(DataType.INDEX), _SPAN) for name in ("rows", "other_rows")]
+    arguments = _args(suffix)
+    reduction = suffix in _REDUCTIONS
+    dynamic = (0, 2) if reduction or suffix == "col_expand_mul" else (0, 1, 2)
+    for i in dynamic:
+        original = arguments[i].type
+        assert isinstance(original, ir.BufferType)
+        arguments[i] = _buffer(
+            f"runtime_{i}",
+            shape=list(original.shape),
+            blayout=original.blayout,
+            valid_shape=[-1, -1],
+        )
+    allocations = []
+    for i, argument in enumerate(arguments):
+        descriptor = argument.type
+        assert isinstance(descriptor, ir.BufferType)
+        rows = second if kind == "mismatch" and i == 2 else first
+        extents = [rows, ir.ConstInt(descriptor.shape[1], DataType.INDEX, _SPAN)] if i in dynamic else []
+        allocation = _ir._create_internal_op_call(
+            "buffer.alloc",
+            [ir.MakeTuple(extents, _SPAN), ir.ConstInt(i * 8192, DataType.INDEX, _SPAN)],
+            {},
+            descriptor,
+            _SPAN,
+        )
+        allocations.append(ir.AssignStmt(argument, allocation, _SPAN))
+    native: ir.Stmt = ir.EvalStmt(_call(suffix, arguments), _SPAN)
+    if kind != "unguarded":
+        guard = ir.Gt(first, ir.ConstInt(0, DataType.INDEX, _SPAN), DataType.BOOL, _SPAN)
+        native = ir.IfStmt(guard, native, None, [], _SPAN)
+    function = ir.Function(
+        "runtime_rows",
+        [first, second],
+        [],
+        ir.SeqStmts([*allocations, native, ir.ReturnStmt([], _SPAN)], _SPAN),
+        _SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    properties = passes.IRPropertySet()
+    properties.insert(passes.IRProperty.BufferIR)
+    return passes.PropertyVerifierRegistry.verify(properties, ir.Program([function], "RuntimeRows", _SPAN))
+
+
+@pytest.mark.parametrize("suffix", _RECIPES)
+@pytest.mark.parametrize(
+    "kind,reason", [("mismatch", "matching runtime rows"), ("unguarded", "positive-row guard")]
+)
+def test_runtime_row_calls_retain_function_level_metadata_obligations(suffix, kind, reason):
+    assert _verify_runtime_rows(suffix, "matched") == []
+    diagnostics = _verify_runtime_rows(suffix, kind)
+    assert diagnostics and any(reason in diagnostic.message for diagnostic in diagnostics)
 
 
 @pytest.mark.parametrize("suffix", _REDUCTIONS)
@@ -176,7 +244,6 @@ def test_broadcast_can_reuse_matrix_but_not_its_repeated_column(suffix):
     assert diagnostics and any("disjoint" in diagnostic.message for diagnostic in diagnostics)
 
 
-<<<<<<< HEAD
 _COLUMN_REDUCTIONS = ("col_sum", "col_max", "col_min", "col_prod")
 _COLUMN_BROADCASTS = tuple(f"col_expand_{op}" for op in ("add", "sub", "mul", "div", "max", "min"))
 _COLUMN_RECIPES = (*_COLUMN_REDUCTIONS, *_COLUMN_BROADCASTS)

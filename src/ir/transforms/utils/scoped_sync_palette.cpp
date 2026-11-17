@@ -77,6 +77,10 @@ struct ScopedPublicationSchedule::State {
   std::shared_ptr<const ScopedSyncProtocol> protocol;
   PipeType source, target;
   NodePtr root;
+  int64_t publications = 0;
+  // Nonempty only for a proved canonical successor partition. The numerical
+  // rank pieces keep raw labels; these are reuse questions, never token edges.
+  std::vector<ScopedEventTransition> successor_transitions;
   std::vector<ScopedPublicationRankPiece> pieces;
 };
 ScopedPublicationSchedule::ScopedPublicationSchedule(std::shared_ptr<const State> state)
@@ -86,7 +90,7 @@ const std::shared_ptr<const ScopedSyncProtocol>& ScopedPublicationSchedule::Prot
 }
 PipeType ScopedPublicationSchedule::SourcePipe() const { return state_->source; }
 PipeType ScopedPublicationSchedule::TargetPipe() const { return state_->target; }
-int64_t ScopedPublicationSchedule::Publications() const { return state_->root->count; }
+int64_t ScopedPublicationSchedule::Publications() const { return state_->publications; }
 const std::vector<ScopedPublicationRankPiece>& ScopedPublicationSchedule::Pieces() const {
   return state_->pieces;
 }
@@ -376,13 +380,116 @@ struct ScopedPaletteBuilder {
       }
     }
   }
+  // The carry classes of a mixed-radix successor partition every visit except
+  // the final one. Construct their affine ranks directly instead of splitting
+  // every nested frame at all other classes' boundaries. The latter produces
+  // one cell per publication for a deep nest even when raw uses are O(depth).
+  // Structural validation and rank construction cost O(F*D), linear in the
+  // raw domain inventory; existing event-order proof queries are charged
+  // separately. Preserve the raw record label, original frames and matching map.
+  bool CanonicalSuccessors() {
+    if (selected.empty()) return false;
+    const auto& first = uses[selected.front()];
+    if (first.source_region != first.target_region) return false;
+    const auto region = first.source_region;
+    const auto& segment = input.segments[region];
+    const auto& frames = segment.nested_frames;
+    if (frames.empty()) return false;
+    std::vector<int64_t> strides(frames.size());
+    int64_t total = 1;
+    size_t expected = 0;
+    for (size_t i = frames.size(); i-- > 0;) {
+      if (frames[i].count <= 0) return false;
+      strides[i] = total;
+      total = Checked(static_cast<__int128>(total) * frames[i].count);
+      expected += frames[i].count > 1;
+    }
+    if (total != segment.count || selected.size() != expected) return false;
+    std::vector<bool> carries(frames.size());
+    std::vector<ScopedPublicationRankPiece> pieces;
+    std::vector<ScopedEventTransition> transitions;
+    int64_t publications = 0;
+    for (auto id : selected) {
+      const auto& f = uses[id];
+      if (f.source_region != region || f.target_region != region || f.source_site != first.source_site ||
+          f.target_site != first.target_site || !f.source_domain || !f.target_domain ||
+          f.source_domain->frame != f.target_domain->frame)
+        return false;
+      const auto& source = *f.source_domain;
+      const auto& target = *f.target_domain;
+      const auto& frame = source.frame;
+      if (!frame || frame->owner != input.owner || frame->region != region ||
+          frame->blocks != input.block_bounds || frame->loops.size() != frames.size() ||
+          source.ranges.size() != frames.size() || target.ranges.size() != frames.size() ||
+          (!source.steps.empty() && source.steps.size() != frames.size()) ||
+          (!target.steps.empty() && target.steps.size() != frames.size()) || f.axes.size() > frames.size())
+        return false;
+      size_t carry = 0;
+      while (carry < frames.size() && source.ranges[carry].first == target.ranges[carry].first) ++carry;
+      if (carry == frames.size() || frames[carry].count <= 1 || carries[carry]) return false;
+      ScopedPublicationRankPiece piece;
+      piece.raw_use = id;
+      ScopedEventTransition transition{
+          {region, f.target_first, f.target_site}, {region, f.target_first, f.source_site}, {}};
+      int64_t volume = 1, target_base = 0;
+      for (size_t i = 0; i < frames.size(); ++i) {
+        const auto n = frames[i].count;
+        const std::pair<int64_t, int64_t> sr =
+            i < carry ? std::make_pair(int64_t{0}, n)
+                      : (i == carry ? std::make_pair(int64_t{0}, n - 1) : std::make_pair(n - 1, n));
+        const std::pair<int64_t, int64_t> tr =
+            i < carry ? std::make_pair(int64_t{0}, n)
+                      : (i == carry ? std::make_pair(int64_t{1}, n) : std::make_pair(int64_t{0}, int64_t{1}));
+        if (frame->loops[i].loop != frames[i].loop || frame->loops[i].count != n || source.ranges[i] != sr ||
+            target.ranges[i] != tr || (!source.steps.empty() && source.steps[i] != 1) ||
+            (!target.steps.empty() && target.steps[i] != 1))
+          return false;
+        const auto width = sr.second - sr.first;
+        if (i < f.axes.size()) {
+          const auto& a = f.axes[i];
+          if (a.frame != frames[i].loop || a.count != width || a.source_stride != strides[i] ||
+              a.target_stride != strides[i] || a.source_step != 1 || a.target_step != 1)
+            return false;
+          transition.axes.push_back({a.frame, a.count, a.target_stride, a.target_stride, 1, 1});
+        } else if (width != 1) {
+          return false;
+        }
+        volume = Checked(static_cast<__int128>(volume) * width);
+        piece.rank_base = Checked(static_cast<__int128>(piece.rank_base) + sr.first * strides[i]);
+        target_base = Checked(static_cast<__int128>(target_base) + tr.first * strides[i]);
+        piece.source.push_back({sr.first, 1, width});
+        piece.target.push_back({tr.first, 1, width});
+        piece.rank_coefficients.push_back(strides[i]);
+      }
+      if (volume != f.count || piece.rank_base != f.source_first || target_base != f.target_first ||
+          target_base != Checked(static_cast<__int128>(piece.rank_base) + 1))
+        return false;
+      carries[carry] = true;
+      publications = Checked(static_cast<__int128>(publications) + volume);
+      pieces.push_back(std::move(piece));
+      transitions.push_back(std::move(transition));
+    }
+    if (publications != total - 1) return false;
+    // Prove every consecutive release before accepting this representation.
+    // A failed proof keeps the existing general grammar, including its wider
+    // palette attempts. No selected token relation becomes proof evidence.
+    for (const auto& transition : transitions) {
+      ++result.work.transition_queries;
+      result.work.proof_axis_entries += transition.axes.size();
+      if (!order.ProveTransition(transition)) return false;
+    }
+    state->publications = publications;
+    state->pieces = std::move(pieces);
+    state->successor_transitions = std::move(transitions);
+    result.work.rank_pieces += state->pieces.size();
+    return true;
+  }
   ScopedPaletteResult Build() {
     try {
       cuts.resize(input.segments.size());
       for (const auto& cut : order.Protocol()->Cuts())
         cuts[cut.region].insert(cuts[cut.region].end(), cut.after.begin(), cut.after.end());
 
-      if (input.region_tree) Index(*input.region_tree);
       Require(state->source != state->target, "Palette requires a directional cross-pipe protocol");
       Require(input.region_tree.has_value(), "Publication ranking requires original structured schedule");
       for (size_t i = 0; i < uses.size(); ++i) {
@@ -393,7 +500,15 @@ struct ScopedPaletteBuilder {
           selected.push_back(i);
         }
       }
+      if (CanonicalSuccessors()) {
+        result.schedule =
+            std::shared_ptr<const ScopedPublicationSchedule>(new ScopedPublicationSchedule(state));
+        result.status = ScopedPaletteStatus::Constructed;
+        return result;
+      }
+      Index(*input.region_tree);
       state->root = Region(*input.region_tree, selected, {});
+      state->publications = state->root->count;
       Pieces(state->root, 0, {});
       std::vector<int64_t> volumes(uses.size());
       for (const auto& piece : state->pieces) {
@@ -418,7 +533,26 @@ struct ScopedPaletteBuilder {
       Require(schedule && schedule->Protocol().get() == order.Protocol().get(),
               "Publication schedule belongs to a different immutable token protocol");
       result.schedule = std::move(schedule);
-      if (!Verify(result.schedule->state_->root)) {
+      const auto& saved = *result.schedule->state_;
+      bool verified = true;
+      if (!saved.successor_transitions.empty()) {
+        // These queries establish WAIT(x) -> SET(x+1) at the existing direct
+        // cuts. SET(x+1) -> its matching WAIT(x+1) then permits transitive reuse
+        // at any positive budget, without closing guarded metadata relations.
+        // The last query reaches the existing final payload, even though that
+        // payload has no publication; this is a stronger sufficient obligation.
+        for (const auto& transition : saved.successor_transitions) {
+          ++result.work.transition_queries;
+          result.work.proof_axis_entries += transition.axes.size();
+          if (!order.ProveTransition(transition)) {
+            verified = false;
+            break;
+          }
+        }
+      } else {
+        verified = Verify(saved.root);
+      }
+      if (!verified) {
         result.status = ScopedPaletteStatus::UnprovedReuse;
         result.reason = "Actual-token order does not prove a complete same-lane transition";
       } else {
