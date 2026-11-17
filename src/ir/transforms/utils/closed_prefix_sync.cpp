@@ -124,6 +124,8 @@ struct OneWayTransaction {
   std::vector<const Stmt*> loop_stack;
   uint32_t loop_scope_id = 0;
   bool needs_return_ack = false;
+  RelayMask loop_pre_reach = 0;
+  RelayMask loop_post_reach = 0;
   int forward_id = -1;
   int return_id = -1;
   uint64_t record_seq = 0;
@@ -616,6 +618,8 @@ class Assignment {
         continue;
       }
       bool closed_all = true;
+      RelayMask pre_reach_all = (RelayMask{1} << kRelayPipeCount) - 1;
+      RelayMask post_reach_all = (RelayMask{1} << kRelayPipeCount) - 1;
       const Stmt* cur_rec = ow.record_cut.get();
       const Stmt* cur_wt = ow.wait_cut.get();
       RelayMatrix rec_prefix = IdentityRelay();
@@ -637,8 +641,17 @@ class Assignment {
         };
         if (!advance(cur_rec, rec_prefix, true) || !advance(cur_wt, wt_suffix, false)) {
           closed_all = false;
+          pre_reach_all = 0;
+          post_reach_all = 0;
           break;
         }
+        RelayMask pre_mask = 0;
+        const RelayMask src_bit = RelayPipeBit(ow.source);
+        for (size_t p = 0; p < kRelayPipeCount; ++p) {
+          if ((rec_prefix[p] & src_bit) != 0) pre_mask |= (RelayMask{1} << p);
+        }
+        pre_reach_all &= pre_mask;
+        post_reach_all &= wt_suffix[static_cast<size_t>(ow.destination)];
         const RelayMatrix back = ComposeRelay(wt_suffix, rec_prefix);
         if ((back[static_cast<size_t>(ow.destination)] & RelayPipeBit(ow.source)) == 0) {
           closed_all = false;
@@ -646,6 +659,8 @@ class Assignment {
         }
       }
       ow.needs_return_ack = !closed_all;
+      ow.loop_pre_reach = closed_all ? pre_reach_all : 0;
+      ow.loop_post_reach = closed_all ? post_reach_all : 0;
     }
 
     // Allocate directional IDs for all 1-way transactions (both 2-cmd and 4-cmd fallback),
@@ -656,6 +671,8 @@ class Assignment {
       bool in_flight;
       RelayMask reach_from_dst;
       bool acyclic;
+      RelayMask loop_pre_reach = 0;
+      RelayMask loop_post_reach = 0;
       uint32_t loop_scope_id = 0;
       uint64_t wait_seq = 0;
     };
@@ -695,21 +712,29 @@ class Assignment {
               if (touched) {
                 entry.reach_from_dst = 0;
                 entry.acyclic = false;
+                entry.loop_pre_reach = 0;
+                entry.loop_post_reach = 0;
               } else {
                 entry.reach_from_dst &= matched_se->reach_from_dst;
                 entry.acyclic = entry.acyclic && matched_se->acyclic;
+                entry.loop_pre_reach &= matched_se->loop_pre_reach;
+                entry.loop_post_reach &= matched_se->loop_post_reach;
               }
               entry.in_flight = entry.in_flight || matched_se->in_flight;
               entry.wait_seq = std::max(entry.wait_seq, matched_se->wait_seq);
             } else {
               entry.reach_from_dst = 0;
               entry.acyclic = false;
+              entry.loop_pre_reach = 0;
+              entry.loop_post_reach = 0;
             }
           } else {
             if (!matched_se) {
               entry.in_flight = false;
               entry.reach_from_dst |= RelayPipeBit(dir.second);
               entry.acyclic = true;
+              entry.loop_pre_reach = 0;
+              entry.loop_post_reach = 0;
               entry.loop_scope_id = 0;
             } else {
               if (entry.wait_seq != matched_se->wait_seq) {
@@ -720,6 +745,8 @@ class Assignment {
               }
               entry.in_flight = entry.in_flight || matched_se->in_flight;
               entry.acyclic = matched_se->acyclic;
+              entry.loop_pre_reach = matched_se->loop_pre_reach;
+              entry.loop_post_reach = matched_se->loop_post_reach;
               entry.loop_scope_id = 0;
               entry.wait_seq = std::max(entry.wait_seq, matched_se->wait_seq);
             }
@@ -781,7 +808,9 @@ class Assignment {
         for (auto& [dir, vec] : active_by_dir) {
           const auto tit = then_active.find(dir);
           if (tit == then_active.end()) {
-            for (auto& entry : vec) entry.reach_from_dst = 0;
+            // Every entry in `vec` was freshly allocated in `else_body_` (none
+            // existed in `saved[dir]` or `then_active[dir]`). On the `then` path
+            // these IDs were never issued, so they retain their `else_body_` reachability.
             continue;
           }
           for (auto& entry : vec) {
@@ -796,17 +825,19 @@ class Assignment {
               entry.in_flight = entry.in_flight || matched_te->in_flight;
               entry.reach_from_dst &= matched_te->reach_from_dst;
               entry.acyclic = entry.acyclic && matched_te->acyclic;
+              const bool same_scope = entry.loop_scope_id == matched_te->loop_scope_id;
+              entry.loop_pre_reach = same_scope ? (entry.loop_pre_reach & matched_te->loop_pre_reach) : 0;
+              entry.loop_post_reach = same_scope ? (entry.loop_post_reach & matched_te->loop_post_reach) : 0;
               entry.wait_seq = std::max(entry.wait_seq, matched_te->wait_seq);
               if (matched_te->loop_scope_id != 0) entry.loop_scope_id = matched_te->loop_scope_id;
-            } else {
-              entry.reach_from_dst = 0;
             }
+            // If `!matched_te`, `entry` was freshly allocated in `else_body_` and
+            // never touched on the `then` path; retain its `else_body_` reachability.
           }
           for (const auto& te : tit->second) {
             if (std::none_of(vec.begin(), vec.end(), [&](const ActiveId& e) { return e.id == te.id; })) {
-              ActiveId merged = te;
-              merged.reach_from_dst = 0;
-              vec.push_back(merged);
+              // Freshly allocated in `then_body_` and untouched in `else_body_`.
+              vec.push_back(te);
             }
           }
         }
@@ -814,9 +845,8 @@ class Assignment {
           if (active_by_dir.count(dir)) continue;
           auto& dst_vec = active_by_dir[dir];
           for (const auto& te : then_vec) {
-            ActiveId merged = te;
-            merged.reach_from_dst = 0;
-            dst_vec.push_back(merged);
+            // Freshly allocated in `then_body_` and untouched in `else_body_`.
+            dst_vec.push_back(te);
           }
         }
         return;
@@ -829,7 +859,7 @@ class Assignment {
             for (auto& [dir, vec] : active_by_dir) {
               const auto sit = saved.find(dir);
               if (sit == saved.end()) {
-                for (auto& entry : vec) entry.reach_from_dst = 0;
+                // Freshly allocated inside a <=1-trip loop; untouched on 0-trip path.
                 continue;
               }
               for (auto& entry : vec) {
@@ -844,10 +874,11 @@ class Assignment {
                   entry.in_flight = entry.in_flight || matched_se->in_flight;
                   entry.reach_from_dst &= matched_se->reach_from_dst;
                   entry.acyclic = entry.acyclic && matched_se->acyclic;
+                  entry.loop_pre_reach &= matched_se->loop_pre_reach;
+                  entry.loop_post_reach &= matched_se->loop_post_reach;
                   entry.wait_seq = std::max(entry.wait_seq, matched_se->wait_seq);
-                } else {
-                  entry.reach_from_dst = 0;
                 }
+                // If `!matched_se`, freshly allocated inside a <=1-trip loop; untouched on 0-trip path.
               }
             }
             return;
@@ -883,19 +914,29 @@ class Assignment {
         auto& active = active_by_dir[dir];
         const bool may_reuse = ow.loop_stack.empty() || ow.needs_return_ack;
         int chosen = -1;
-        if (may_reuse) {
-          for (auto& entry : active) {
-            if (!entry.in_flight && entry.acyclic &&
-                (entry.loop_scope_id == ow.loop_scope_id || entry.loop_scope_id == 0) &&
-                (entry.reach_from_dst & RelayPipeBit(ow.source)) != 0 && !is_branch_blocked(dir, entry.id)) {
-              chosen = entry.id;
-              entry.in_flight = true;
-              entry.reach_from_dst = 0;
-              entry.loop_scope_id = ow.loop_scope_id;
-              entry.acyclic = may_reuse;
-              break;
-            }
+        for (auto& entry : active) {
+          if (entry.in_flight || is_branch_blocked(dir, entry.id)) continue;
+          if ((entry.reach_from_dst & RelayPipeBit(ow.source)) == 0) continue;
+          if (entry.loop_scope_id != ow.loop_scope_id && entry.loop_scope_id != 0) continue;
+          const bool acyclic_reuse = may_reuse && entry.acyclic;
+          const bool loop_closed_reuse =
+              ow.loop_scope_id != 0 && entry.loop_scope_id == ow.loop_scope_id &&
+              (entry.loop_post_reach & ow.loop_pre_reach) != 0 &&
+              (ow.loop_post_reach & entry.loop_pre_reach) != 0;
+          if (!acyclic_reuse && !loop_closed_reuse) continue;
+          chosen = entry.id;
+          entry.in_flight = true;
+          entry.reach_from_dst = 0;
+          entry.loop_scope_id = ow.loop_scope_id;
+          entry.acyclic = may_reuse;
+          if (acyclic_reuse) {
+            entry.loop_pre_reach = ow.loop_pre_reach;
+            entry.loop_post_reach = ow.loop_post_reach;
+          } else {
+            entry.loop_pre_reach &= ow.loop_pre_reach;
+            entry.loop_post_reach &= ow.loop_post_reach;
           }
+          break;
         }
         if (chosen < 0) {
           for (int candidate : pool_for(dir)) {
@@ -903,7 +944,8 @@ class Assignment {
                 std::none_of(active.begin(), active.end(),
                              [&](const ActiveId& e) { return e.id == candidate; })) {
               chosen = candidate;
-              active.push_back({chosen, true, 0, may_reuse, ow.loop_scope_id, 0});
+              active.push_back({chosen, true, 0, may_reuse, ow.loop_pre_reach, ow.loop_post_reach,
+                                ow.loop_scope_id, 0});
               if (reservations_[dir].insert(chosen).second) ++roles_count_;
               break;
             }
@@ -948,6 +990,8 @@ class Assignment {
               entry.reach_from_dst = RelayPipeBit(rev.second);
               entry.loop_scope_id = ow.loop_scope_id;
               entry.acyclic = true;
+              entry.loop_pre_reach = 0;
+              entry.loop_post_reach = 0;
               entry.wait_seq = seq_now;
               break;
             }
@@ -958,7 +1002,8 @@ class Assignment {
                   std::none_of(rev_active.begin(), rev_active.end(),
                                [&](const ActiveId& e) { return e.id == candidate; })) {
                 ack_chosen = candidate;
-                rev_active.push_back({ack_chosen, false, RelayPipeBit(rev.second), true, ow.loop_scope_id, seq_now});
+                rev_active.push_back({ack_chosen, false, RelayPipeBit(rev.second), true, 0, 0,
+                                      ow.loop_scope_id, seq_now});
                 if (reservations_[rev].insert(ack_chosen).second) ++roles_count_;
                 break;
               }
@@ -967,6 +1012,16 @@ class Assignment {
           CHECK(ack_chosen >= 0)
               << "Closed prefix role reservation unavailable; this is not a fixed-plan capacity lower bound";
           ow.return_id = ack_chosen;
+          // `SetWaitAck` appends `set_flag(rev) ; wait_flag(rev)` at `ow.wait_cut`,
+          // ordering `rev.first -> rev.second` after every prior idle completion.
+          for (auto& [dir, vec] : active_by_dir) {
+            for (auto& entry : vec) {
+              if (dir == rev && entry.id == ack_chosen) continue;
+              if (!entry.in_flight && (entry.reach_from_dst & RelayPipeBit(rev.first)) != 0) {
+                entry.reach_from_dst |= RelayPipeBit(rev.second);
+              }
+            }
+          }
         }
         return;
       }

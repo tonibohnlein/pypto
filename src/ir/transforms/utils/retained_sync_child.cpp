@@ -364,6 +364,7 @@ class SyncRegionBindings::State : public ParentStmtAnalysis {
   size_t clock = 0;
   std::unordered_map<const Stmt*, size_t> occurrences, begin, end;
   std::unordered_map<const Var*, std::vector<AssignStmtPtr>> definitions;
+  std::unordered_map<const Var*, std::vector<std::pair<StmtPtr, VarPtr>>> return_var_definitions;
   // Ephemeral request-local qualification cache. Published mathematics and
   // capabilities do not depend on later mutations of this index.
   std::map<std::pair<const AssignStmt*, SyncExternalPolicy>, bool> qualified;
@@ -388,19 +389,33 @@ class SyncRegionBindings::State : public ParentStmtAnalysis {
   void VisitStmt(const StmtPtr& statement) override {
     ++occurrences[statement.get()];
     begin.emplace(statement.get(), clock++);
-    if (const auto definition = As<AssignStmt>(statement))
+    if (const auto definition = As<AssignStmt>(statement)) {
       definitions[definition->var_.get()].push_back(definition);
+    } else {
+      auto record_return_vars = [&](const std::vector<VarPtr>& return_vars) {
+        for (const auto& rv : return_vars) {
+          return_var_definitions[rv.get()].emplace_back(statement, rv);
+        }
+      };
+      if (const auto branch = As<IfStmt>(statement)) {
+        record_return_vars(branch->return_vars_);
+      } else if (const auto loop = As<ForStmt>(statement)) {
+        record_return_vars(loop->return_vars_);
+      } else if (const auto loop = As<WhileStmt>(statement)) {
+        record_return_vars(loop->return_vars_);
+      }
+    }
     ParentStmtAnalysis::VisitStmt(statement);
     end[statement.get()] = clock;
   }
   void VisitExpr(const ExprPtr&) override {}
-  bool Dominates(const AssignStmtPtr& definition, const StmtPtr& use) const {
+  bool Dominates(const StmtPtr& definition, const StmtPtr& use) const {
     const auto parent = GetParent(definition);
     // A binding in a sequence dominates precisely the later sibling subtrees
     // in that sequence. Its interval ends at the original branch/loop scope;
     // a definition from another arm or a prior iteration cannot leak out.
     return parent && As<SeqStmts>(parent) && occurrences.at(definition.get()) == 1 &&
-           occurrences.at(parent.get()) == 1 && begin.at(definition.get()) < begin.at(use.get()) &&
+           occurrences.at(parent.get()) == 1 && end.at(definition.get()) <= begin.at(use.get()) &&
            begin.at(use.get()) < end.at(parent.get());
   }
   bool Qualify(const AssignStmtPtr& assignment, SyncExternalPolicy policy) {
@@ -508,6 +523,18 @@ SyncRegionContext SyncRegionBindings::Bind(const ForStmtPtr& scope, SyncExternal
       continue;
     }
     const auto found = state_->definitions.find(variable);
+    if (found == state_->definitions.end() && policy == SyncExternalPolicy::ReadOnlyProjection) {
+      const auto rv_found = state_->return_var_definitions.find(variable);
+      if (rv_found != state_->return_var_definitions.end() && rv_found->second.size() == 1) {
+        const auto& [def_stmt, rv_var] = rv_found->second.front();
+        if (As<ScalarType>(rv_var->GetType())) {
+          CHECK(state_->Dominates(def_stmt, use))
+              << "Regional synchronization descriptor binding does not dominate its original use";
+          captures.emplace(variable, std::make_pair(rv_var, ParamDirection::In));
+          continue;
+        }
+      }
+    }
     CHECK(found != state_->definitions.end() && found->second.size() == 1)
         << "Regional synchronization child has an unavailable enclosing coordinate, caller value or "
            "descriptor binding: "

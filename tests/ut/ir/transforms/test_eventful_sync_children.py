@@ -14,6 +14,7 @@ from pypto import ir, passes, testing
 
 from .sync_closed_command_oracle import check_closed_commands
 from .sync_matmul_oracle import sequence_stmts, validate
+from .sync_shenggan_cases import capture_shenggan
 from .test_autosync_switch import clone
 from .test_closed_prefix_sync import Services
 from .test_conservative_sync_children import resident_child_fixture
@@ -986,3 +987,416 @@ def test_eventful_child_preserves_unrelated_self_pipe_debt():
         hardware_source=fn,
     )
     assert "pl.system.barrier(pipe=pl.PipeType.V" in str(phys_fn)
+
+
+def test_readonly_child_binds_if_return_var_scalars():
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+
+    def ci(val):
+        return ir.ConstInt(val, idx, span)
+
+    def tup(vals):
+        return ir.MakeTuple([ci(v) for v in vals], span)
+
+    mat_t = ir.BufferType(
+        [128, 256],
+        ir.DataType.FP16,
+        ir.MemorySpace.Mat,
+        slayout=ir.TileLayout.row_major,
+        blayout=ir.TileLayout.col_major,
+        fractal=512,
+    )
+    mat_multi_t = ir.MultiBufferType(mat_t, 2)
+    vec_t = ir.BufferType([16, 64], ir.DataType.FP32, ir.MemorySpace.Vec)
+    gm_t = ir.TensorType([512, 64], ir.DataType.FP32)
+
+    a = ir.Var("a", gm_t, span)
+    out = ir.Var("out", gm_t, span)
+    cond = ir.Var("cond", ir.ScalarType(ir.DataType.BOOL), span)
+    row_phi = ir.Var("row_phi", ir.ScalarType(idx), span)
+    m0 = ir.Var("m0", ir.ScalarType(idx), span)
+    k = ir.Var("k", ir.ScalarType(idx), span)
+    x_buf = ir.Var("x_buf", vec_t, span)
+    y = ir.Var("y", vec_t, span)
+    a_pool = ir.Var("a_pool", mat_multi_t, span)
+    a_slot = ir.Var("a_slot", mat_t, span)
+
+    branch = ir.IfStmt(
+        cond,
+        ir.SeqStmts([ir.YieldStmt([ci(0)], span)], span),
+        ir.SeqStmts([ir.YieldStmt([ci(1)], span)], span),
+        [row_phi],
+        span,
+    )
+    child = ir.ForStmt(
+        k,
+        ci(0),
+        ci(4),
+        ci(1),
+        [],
+        ir.SeqStmts(
+            [
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.get_op("buffer.load"),
+                        [a, ir.MakeTuple([m0, ci(0)], span), tup([16, 64]), x_buf],
+                        ir.VoidType(),
+                        span,
+                    ),
+                    span,
+                ),
+                ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [x_buf, y], ir.VoidType(), span), span),
+                ir.YieldStmt([], span),
+            ],
+            span,
+        ),
+        [],
+        span,
+    )
+    fn = ir.Function(
+        "if_return_var_readonly_child",
+        [a, (out, ir.ParamDirection.InOut), cond],
+        [out.type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(
+                    x_buf, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(0)], vec_t, span), span
+                ),
+                ir.AssignStmt(
+                    y, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(8192)], vec_t, span), span
+                ),
+                branch,
+                ir.AssignStmt(m0, ir.Mul(row_phi, ci(16), idx, span), span),
+                child,
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.get_op("buffer.store"),
+                        [y, tup([0, 0]), tup([16, 64]), out],
+                        ir.VoidType(),
+                        span,
+                    ),
+                    span,
+                ),
+                ir.ReturnStmt([out], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+
+    with passes.PassContext([], enable_buffer_ir=True, memory_planner=passes.MemoryPlanner.PYPTO):
+        ev = passes.prepare_eventful_sync_children(fn, [child])[0]
+    program = ir.Program([fn], "IfReturnVarReadonlyChild", span)
+    with passes.PassContext([], enable_pypto_autosync=True, autosync_policy="conservative_prefix"):
+        p_realize = passes.realize_sync()(program)
+        logical = passes.insert_sync(eventful_children=[ev])(program)
+        optimized = passes.optimize_sync()(logical)
+    with passes.PassContext([]):
+        p_lower = passes.lower_sync()(optimized)
+
+    for p_fn in (next(iter(p_realize.functions.values())), next(iter(p_lower.functions.values()))):
+        assert p_fn.attrs.get("pypto_autosync") is True
+        assert p_fn.attrs.get("autosync_retained_child_count") == 1
+        check_closed_commands(
+            next(iter(optimized.functions.values())),
+            p_fn,
+            {2: True},
+            range(8),
+            tensor_bases={0: 0, 1: 1 << 20},
+            compare_commands=False,
+            hardware_source=fn,
+        )
+
+    # Negative check: using an IfStmt-defined scalar for local on-chip slot indexing must be refused.
+    gm_aic_t = ir.TensorType([512, 512], ir.DataType.FP16)
+    gm_aic_out_t = ir.TensorType([512, 512], ir.DataType.FP32)
+    a_aic = ir.Var("a_aic", gm_aic_t, span)
+    out_aic = ir.Var("out_aic", gm_aic_out_t, span)
+    bad_child = ir.ForStmt(
+        k,
+        ci(0),
+        ci(2),
+        ci(1),
+        [],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(
+                    a_slot, ir.Call(ir.get_op("buffer.slot"), [a_pool, row_phi], mat_t, span), span
+                ),
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.get_op("buffer.load"),
+                        [a_aic, tup([0, 0]), tup([128, 256]), a_slot],
+                        ir.VoidType(),
+                        span,
+                    ),
+                    span,
+                ),
+                ir.YieldStmt([], span),
+            ],
+            span,
+        ),
+        [],
+        span,
+    )
+    bad_fn = ir.Function(
+        "if_return_var_local_slot_refused",
+        [a_aic, (out_aic, ir.ParamDirection.InOut), cond],
+        [out_aic.type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(
+                    a_pool,
+                    ir.Call(ir.get_op("buffer.alloc_multi"), [tup([]), ci(0)], mat_multi_t, span),
+                    span,
+                ),
+                branch,
+                bad_child,
+                ir.ReturnStmt([out_aic], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIC,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with passes.PassContext([], enable_buffer_ir=True, memory_planner=passes.MemoryPlanner.PYPTO):
+        with pytest.raises(ValueError, match="Invocation coordinate has no established caller range"):
+            passes.prepare_eventful_sync_children(bad_fn, [bad_child])
+
+
+def test_shenggan_swizzle_promotes_kb_in_realize_and_three_pass(tmp_path):
+    program = capture_shenggan(tmp_path / "capture", m=256, n=512, k=512, workers=4, swizzle=True)
+    for disjoint_gm in (False, True):
+        with passes.PassContext(
+            [],
+            enable_buffer_ir=True,
+            memory_planner=passes.MemoryPlanner.PYPTO,
+            enable_pypto_autosync=True,
+            autosync_policy="conservative_prefix",
+            autosync_disjoint_gm=disjoint_gm,
+        ):
+            realized = passes.realize_sync()(program)
+            lowered = passes.lower_sync()(passes.optimize_sync()(passes.insert_sync()(program)))
+        for prog in (realized, lowered):
+            fn = next(f for f in prog.functions.values() if "hpgemm_hpgemm" in f.name)
+            assert fn.attrs.get("pypto_autosync") is True
+            assert fn.attrs.get("autosync_retained_child_count") == 1
+            refusals = str(fn.attrs.get("autosync_child_refusals", ""))
+            assert "kb__idx_v0" not in refusals
+            assert "n_col" not in refusals
+
+
+def test_qwen3_jit_pipeline_unrolled_acc_children_promote():
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+
+    def ci(val):
+        return ir.ConstInt(val, idx, span)
+
+    def tup(vals):
+        return ir.MakeTuple([ci(v) for v in vals], span)
+
+    mat_a_t = ir.BufferType(
+        [16, 128],
+        ir.DataType.BF16,
+        ir.MemorySpace.Mat,
+        slayout=ir.TileLayout.row_major,
+        blayout=ir.TileLayout.col_major,
+        fractal=512,
+    )
+    mat_b_t = ir.BufferType(
+        [128, 256],
+        ir.DataType.BF16,
+        ir.MemorySpace.Mat,
+        slayout=ir.TileLayout.row_major,
+        blayout=ir.TileLayout.col_major,
+        fractal=512,
+    )
+    left_t = ir.BufferType(
+        [16, 32],
+        ir.DataType.BF16,
+        ir.MemorySpace.Left,
+        slayout=ir.TileLayout.row_major,
+        blayout=ir.TileLayout.row_major,
+        fractal=512,
+    )
+    right_t = ir.BufferType(
+        [32, 256],
+        ir.DataType.BF16,
+        ir.MemorySpace.Right,
+        slayout=ir.TileLayout.col_major,
+        blayout=ir.TileLayout.row_major,
+        fractal=512,
+    )
+    acc_t = ir.BufferType(
+        [16, 256],
+        ir.DataType.FP32,
+        ir.MemorySpace.Acc,
+        slayout=ir.TileLayout.row_major,
+        blayout=ir.TileLayout.col_major,
+        fractal=1024,
+    )
+    gm_a_t = ir.TensorType([16, 1024], ir.DataType.BF16)
+    gm_b_t = ir.TensorType([1024, 256], ir.DataType.BF16)
+    gm_c_t = ir.TensorType([16, 256], ir.DataType.FP32)
+
+    a = ir.Var("a", gm_a_t, span)
+    b = ir.Var("b", gm_b_t, span)
+    c = ir.Var("c", gm_c_t, span)
+    acc = ir.Var("acc", acc_t, span)
+    m4 = ir.Var("m4", mat_a_t, span)
+    m5 = ir.Var("m5", mat_b_t, span)
+    m6 = ir.Var("m6", mat_a_t, span)
+    m7 = ir.Var("m7", mat_b_t, span)
+    l9 = ir.Var("l9", left_t, span)
+    r10 = ir.Var("r10", right_t, span)
+    l21 = ir.Var("l21", left_t, span)
+    r22 = ir.Var("r22", right_t, span)
+
+    kb = ir.Var("kb", ir.ScalarType(idx), span)
+    k0 = ir.Var("k0", ir.ScalarType(idx), span)
+    k1 = ir.Var("k1", ir.ScalarType(idx), span)
+    ko = ir.Var("ko", ir.ScalarType(idx), span)
+    ko1 = ir.Var("ko1", ir.ScalarType(idx), span)
+    ko2 = ir.Var("ko2", ir.ScalarType(idx), span)
+
+    def acc_loop(loop_var, ma, mb, la, rb, init_first):
+        mm_stmt = ir.EvalStmt(ir.Call(ir.get_op("buffer.matmul"), [la, rb, acc], ir.VoidType(), span), span)
+        mm_acc_stmt = ir.EvalStmt(
+            ir.Call(ir.get_op("buffer.matmul_acc"), [la, rb, acc], ir.VoidType(), span), span
+        )
+        mm_call = (
+            ir.IfStmt(
+                ir.Eq(loop_var, ci(0), ir.DataType.BOOL, span),
+                ir.SeqStmts([mm_stmt], span),
+                ir.SeqStmts([mm_acc_stmt], span),
+                [],
+                span,
+            )
+            if init_first
+            else ir.EvalStmt(
+                ir.Call(ir.get_op("buffer.matmul_acc"), [la, rb, acc], ir.VoidType(), span), span
+            )
+        )
+        return ir.ForStmt(
+            loop_var,
+            ci(0),
+            ci(128),
+            ci(64),
+            [],
+            ir.SeqStmts(
+                [
+                    ir.EvalStmt(
+                        ir.Call(ir.get_op("buffer.extract"), [ma, ci(0), loop_var, la], ir.VoidType(), span),
+                        span,
+                    ),
+                    ir.EvalStmt(
+                        ir.Call(ir.get_op("buffer.extract"), [mb, loop_var, ci(0), rb], ir.VoidType(), span),
+                        span,
+                    ),
+                    mm_call,
+                    ir.YieldStmt([], span),
+                ],
+                span,
+            ),
+            [],
+            span,
+        )
+
+    def load_mat(src, row_off, col_off, shape, dst):
+        return ir.EvalStmt(
+            ir.Call(
+                ir.get_op("buffer.load"),
+                [src, ir.MakeTuple([row_off, col_off], span), tup(shape), dst],
+                ir.VoidType(),
+                span,
+            ),
+            span,
+        )
+
+    kb_loop = ir.ForStmt(
+        kb,
+        ci(0),
+        ci(6),
+        ci(2),
+        [],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(k0, ir.Mul(kb, ci(128), idx, span), span),
+                ir.AssignStmt(k1, ir.Add(k0, ci(128), idx, span), span),
+                load_mat(a, ci(0), k0, [16, 128], m4),
+                load_mat(b, k0, ci(0), [128, 256], m5),
+                load_mat(a, ci(0), k1, [16, 128], m6),
+                load_mat(b, k1, ci(0), [128, 256], m7),
+                ir.IfStmt(
+                    ir.Eq(k0, ci(0), ir.DataType.BOOL, span),
+                    ir.SeqStmts([acc_loop(ko, m4, m5, l9, r10, True), ir.YieldStmt([], span)], span),
+                    ir.SeqStmts([acc_loop(ko1, m4, m5, l9, r10, False), ir.YieldStmt([], span)], span),
+                    [],
+                    span,
+                ),
+                acc_loop(ko2, m6, m7, l21, r22, False),
+                ir.YieldStmt([], span),
+            ],
+            span,
+        ),
+        [],
+        span,
+    )
+
+    def alloc_buf(offset, buf_t):
+        return ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(offset)], buf_t, span)
+
+    fn = ir.Function(
+        "qwen3_jit_unrolled_pipeline_proj",
+        [a, b, (c, ir.ParamDirection.InOut)],
+        [c.type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(acc, alloc_buf(0, acc_t), span),
+                ir.AssignStmt(m4, alloc_buf(0, mat_a_t), span),
+                ir.AssignStmt(m5, alloc_buf(4096, mat_b_t), span),
+                ir.AssignStmt(m6, alloc_buf(69632, mat_a_t), span),
+                ir.AssignStmt(m7, alloc_buf(73728, mat_b_t), span),
+                ir.AssignStmt(l9, alloc_buf(0, left_t), span),
+                ir.AssignStmt(r10, alloc_buf(0, right_t), span),
+                ir.AssignStmt(l21, alloc_buf(1024, left_t), span),
+                ir.AssignStmt(r22, alloc_buf(16384, right_t), span),
+                kb_loop,
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.get_op("buffer.store"), [acc, tup([0, 0]), tup([16, 256]), c], ir.VoidType(), span
+                    ),
+                    span,
+                ),
+                ir.ReturnStmt([c], span),
+            ],
+            span,
+        ),
+        span,
+        type=ir.FunctionType.AIC,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    program = ir.Program([fn], "Qwen3JitUnrolledPipeline", span)
+    with passes.PassContext(
+        [],
+        enable_buffer_ir=True,
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+    ):
+        realized = passes.realize_sync()(program)
+        lowered = passes.lower_sync()(passes.optimize_sync()(passes.insert_sync()(program)))
+    for prog in (realized, lowered):
+        out_fn = next(iter(prog.functions.values()))
+        assert out_fn.attrs.get("pypto_autosync") is True
+        # Outer multi-stage unrolled kb loop stays unpromoted due to IfStmt over distinct nested ForStmts,
+        # while all 3 inner acc loops promote cleanly as EventfulSyncChildren.
+        assert out_fn.attrs.get("autosync_retained_child_count") == 3
+        assert "Only first-visit initialization/continuation selection is qualified" in str(
+            out_fn.attrs.get("autosync_child_refusals", "")
+        )
