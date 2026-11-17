@@ -448,25 +448,4 @@ SyncInvocationAnalysis AnalyzeSyncInvocation(const FunctionPtr& function, bool d
   }
   return result;
 }
-std::shared_ptr<const CompactSyncResult> SyncInvocationAnalysis::SelectCase(
-    int64_t block, const std::map<size_t, int64_t>& parameters) const {
-  if (block < block_bounds.first || block > block_bounds.second) return nullptr;
-  for (const auto& [parameter, bound] : parameter_bounds) {
-    auto value = parameters.find(parameter);
-    if (value == parameters.end() || value->second < bound.first || value->second > bound.second)
-      return nullptr;
-  }
-  if (coordinate) {
-    const auto mapped = coordinate->Map(block, parameters);
-    if (!mapped) return nullptr;
-    block = *mapped;
-  }
-  auto found = std::upper_bound(cases.begin(), cases.end(), block, [](int64_t value, const auto& candidate) {
-    return value < candidate.block_first;
-  });
-  if (found == cases.begin()) return nullptr;
-  --found;
-  if (block > found->block_last) return nullptr;
-  return found->mathematics;
-}
 }  // namespace pypto::ir::sync

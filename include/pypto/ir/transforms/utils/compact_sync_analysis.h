@@ -93,13 +93,6 @@ struct SyncCoordinateNode {
 struct SyncCoordinateProgram {
   std::vector<SyncCoordinateNode> nodes;
 };
-// Evaluate a requested exact coordinate using supplied ORIGINAL IV values.
-// Missing bindings or values outside the proved machine/domain ranges return
-// unavailable, not a zero coordinate. Traverses the reachable DAG once.
-std::optional<int64_t> EvaluateSyncCoordinate(const SyncCoordinateProgram& program, size_t root,
-                                              const std::map<const ForStmt*, int64_t>& original_values,
-                                              const std::map<size_t, int64_t>& parameters,
-                                              std::optional<int64_t> block);
 struct SyncRowMajorTileMap {
   ForStmtPtr frame;
   size_t tile_coordinate = 0;
@@ -357,25 +350,11 @@ class CompactSyncView {
   const CompactSyncState& State() const { return *state_; }
   CompactSyncDiagnostics& Diagnostics() const { return *diagnostics_; }
   bool HasHierarchy() const { return static_cast<bool>(State().hierarchy); }
-  std::vector<Crossing> ExpandRetainedDemands(size_t max_payloads) const;
   // Finite crossing records only; shared repeated scopes need a separate endpoint map.
   // Unavailable is distinct from an available empty crossing inventory.
   std::optional<std::vector<Crossing>> ExportCrossingDemands() const;
   bool ReferenceBefore(const Occurrence& a, const Occurrence& b) const;
-  // Exact point answer within one retained leaf scope; coordinates are local
-  // to that scope, not the repeated use of its source definition.
-  PointBoundary LeafBoundary(size_t region, size_t storage, int64_t row, int64_t column) const;
   bool Precedes(const Occurrence& a, bool sc, const Occurrence& b, bool tc) const;
-  // Out-of-domain -> nullopt. Covered but untouched point -> empty boundary.
-  std::optional<PointBoundary> Boundary(size_t storage, int64_t row, int64_t column) const;
-  std::optional<PointBoundary> BoundaryAt(size_t storage, int64_t row, int64_t column,
-                                          const std::map<size_t, int64_t>& parameters,
-                                          std::optional<int64_t> block_index = std::nullopt) const;
-  // Explicit original physical slot. Legacy Boundary cannot omit this coordinate
-  // for a multi-slot domain. Nullopt means outside/unavailable, never absence.
-  std::optional<PointBoundary> BoundarySlot(size_t storage, int64_t slot, int64_t row, int64_t column,
-                                            const std::map<size_t, int64_t>& parameters = {},
-                                            std::optional<int64_t> block_index = std::nullopt) const;
 
  protected:
   // A view cannot be sliced or assigned through a published result's base:
@@ -389,10 +368,6 @@ class CompactSyncView {
       : state_(std::move(state)), diagnostics_(std::move(diagnostics)) {}
   std::shared_ptr<const CompactSyncState> state_;
   std::shared_ptr<CompactSyncDiagnostics> diagnostics_;
-
- private:
-  std::optional<PointBoundary> RelativeBoundary(size_t storage, int64_t row, int64_t column,
-                                                std::optional<size_t> leaf = std::nullopt) const;
 };
 // A published result and its cache share one immutable premise inventory.
 // Copies share both; changing caller input requires a newly analyzed owner.
@@ -438,8 +413,6 @@ struct SyncInvocationAnalysis {
   std::vector<SyncInvocationCase> cases;
   size_t coordinate_nodes = 0, coordinate_pieces = 0;
   std::shared_ptr<const SyncInvocationCoordinate> coordinate;
-  std::shared_ptr<const CompactSyncResult> SelectCase(int64_t block_index,
-                                                      const std::map<size_t, int64_t>& parameters) const;
 };
 SyncInvocationAnalysis AnalyzeSyncInvocation(const FunctionPtr& function, bool disjoint_gm,
                                              const std::string& target, const SyncParameterBounds& parameters,
@@ -563,7 +536,6 @@ struct PhysicalSyncRealization {
   std::vector<std::shared_ptr<const ScopedPaletteResult>> palette_attempts;
   FunctionPtr function;
   std::shared_ptr<const AssignedSyncPlan> assignment;
-  const std::vector<PhysicalSyncFamily>& Families() const;
   size_t set_sites = 0, wait_sites = 0, barrier_sites = 0, guard_sites = 0;
   // Per-case command sites after local prefix sharing, before invocation-case
   // coalescing. The invocation diagnostic separately counts final emitted IR.

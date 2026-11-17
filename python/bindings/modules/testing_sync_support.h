@@ -12,11 +12,21 @@
 #ifndef PYTHON_BINDINGS_MODULES_TESTING_SYNC_SUPPORT_H_
 #define PYTHON_BINDINGS_MODULES_TESTING_SYNC_SUPPORT_H_
 
+#include <map>
+#include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "src/ir/transforms/utils/physical_sync_schedule.h"
+
+namespace pypto::ir::sync {
+std::optional<int64_t> EvaluateSyncCoordinate(const SyncCoordinateProgram& program, size_t root,
+                                              const std::map<const ForStmt*, int64_t>& original_values,
+                                              const std::map<size_t, int64_t>& parameters,
+                                              std::optional<int64_t> block);
+}  // namespace pypto::ir::sync
 
 // Testing-owned adapters. Retained mathematics first produces actual tokens,
 // then uses production LowerSync. Synthetic pure command forests exercise the
@@ -57,5 +67,18 @@ std::pair<std::vector<physical::Intervals>, PhysicalSyncRealization> InspectGrou
 PhysicalSyncRealization EmitBoundaries(const FunctionPtr&,
                                        const std::vector<std::tuple<CallPtr, StmtPtr, StmtPtr>>&, bool,
                                        bool = false);
+std::optional<ir::sync::PointBoundary> BoundaryAt(const ir::sync::CompactSyncView& view, size_t storage,
+                                                  int64_t row, int64_t column,
+                                                  const std::map<size_t, int64_t>& parameters,
+                                                  std::optional<int64_t> block_index = std::nullopt);
+std::optional<ir::sync::PointBoundary> BoundarySlot(const ir::sync::CompactSyncView& view, size_t storage,
+                                                    int64_t slot, int64_t row, int64_t column,
+                                                    const std::map<size_t, int64_t>& parameters = {},
+                                                    std::optional<int64_t> block_index = std::nullopt);
+std::vector<ir::sync::Crossing> ExpandRetainedDemands(const ir::sync::CompactSyncView& view,
+                                                      size_t max_payloads);
+std::shared_ptr<const CompactSyncResult> SelectInvocationCase(const SyncInvocationAnalysis& analysis,
+                                                              int64_t block_index,
+                                                              const std::map<size_t, int64_t>& parameters);
 }  // namespace pypto::python::sync_testing
 #endif  // PYTHON_BINDINGS_MODULES_TESTING_SYNC_SUPPORT_H_

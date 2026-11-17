@@ -981,7 +981,7 @@ def insert_sync(
     """
 
 def optimize_sync() -> Pass:
-    """Verify logical synchronization and return it unchanged."""
+    """Verify and simplify logical synchronization (forward wait simplification and dead token elimination)."""
 
 def lower_sync(*, require_whole_module: bool = False) -> Pass:
     """Lower supported logical token programs to certified physical commands.

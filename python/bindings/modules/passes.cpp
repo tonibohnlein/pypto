@@ -772,7 +772,8 @@ void BindPass(nb::module_& m) {
       nb::arg("eventful_children") = std::vector<std::shared_ptr<const ir::sync::EventfulSyncChild>>{},
       "Insert logical synchronization; accepted immutable children require conservative_prefix policy.");
   passes.def("optimize_sync", &pass::OptimizeSync,
-             "Verify logical synchronization; initially an identity optimization stage.");
+             "Verify and simplify logical synchronization (forward wait simplification and dead token "
+             "elimination).");
   passes.def("lower_sync", &pass::LowerSync, nb::kw_only(), nb::arg("require_whole_module") = false,
              "Lower supported logical tokens using certified directional event resources.");
   passes.def("realize_sync", &pass::RealizeSync, nb::kw_only(), nb::arg("require_whole_module") = false,

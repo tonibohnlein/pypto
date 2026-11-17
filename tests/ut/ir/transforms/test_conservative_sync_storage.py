@@ -374,7 +374,7 @@ def test_flat_production_state_avoids_copied_prefix_histories(count):
     assert [site["source_pipes"] for site in production["sites"]] == [
         site["source_pipes"] for site in diagnostic["sites"]
     ]
-    assert production["exit_effects"] == diagnostic["exit_effects"]
+    assert production["exit_effects"] is None
 
 
 @pytest.mark.parametrize("disjoint", [False, True])

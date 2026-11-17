@@ -54,7 +54,6 @@ class Operations : public IRVisitor {
         if (site.continuation) modeled_.insert(site.continuation.get());
       }
   }
-  std::vector<backend::BufferSyncOperation> payloads;
   bool available = true;
 
   void VisitStmt(const StmtPtr& statement) override {
@@ -146,10 +145,6 @@ class Operations : public IRVisitor {
           return;
         }
       }
-      // Retain the selected implementation's implicit inventory as well as
-      // operand effects. The parent recovers the same whole-space summary;
-      // notification closure does not discard pending native scratch effects.
-      payloads.push_back(std::move(operation));
     }
     IRVisitor::VisitExpr_(call);
   }
@@ -277,8 +272,7 @@ NativeSyncChildExport ExportNativeSyncChild(const CompactSyncResult& mathematics
   Operations operations(mathematics, target, result);
   operations.VisitStmt(scope);
   if (!operations.available) return result;
-  result.child = std::shared_ptr<const NativeSyncChild>(
-      new NativeSyncChild(mathematics, scope, target, std::move(operations.payloads)));
+  result.child = std::shared_ptr<const NativeSyncChild>(new NativeSyncChild(mathematics, scope, target));
   result.status = NativeSyncChildStatus::Ready;
   result.reason = "Retained internal order is native-only, with no notification resources";
   return result;
@@ -593,8 +587,6 @@ EventfulSyncChildAttempt TryPrepareEventfulSyncChild(
     operations.VisitStmt(scope);
     CHECK(operations.available) << "Eventful child native/effect qualification unavailable: "
                                 << qualification.reason;
-    std::set<PipeType> participating;
-    for (const auto& operation : operations.payloads) participating.insert(operation.Implementation().Pipe());
     enter_phase(EventfulSyncChildStage::ExecutableExport);
     const auto realized = RealizeCompactSync(mathematics);
     attempt.logical_record_sites = realized.record_sites;
@@ -675,7 +667,6 @@ EventfulSyncChildAttempt TryPrepareEventfulSyncChild(
     }
     attempt.child = std::shared_ptr<const EventfulSyncChild>(
         new EventfulSyncChild(std::move(context), mathematics, logical_recipe, target,
-                              std::vector<PipeType>(participating.begin(), participating.end()),
                               std::vector<SyncDirection>(rearm_dirs.begin(), rearm_dirs.end())));
     enter_phase(EventfulSyncChildStage::Ready);
   } catch (const pypto::ValueError& error) {
