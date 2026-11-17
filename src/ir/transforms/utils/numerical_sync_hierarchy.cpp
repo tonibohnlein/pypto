@@ -581,17 +581,25 @@ CompactSyncBuilder AnalyzePhasedSource(CompactSyncInput input, const std::string
         const auto& segment = result.State().input.segments[r];
         const auto& access = segment.sites[s].accesses[a];
         CHECK(access.write && access.exact_footprint && !access.after_first && access.external &&
-              (access.external->row_major_tiles || segment.count <= 1))
+              (access.external->row_major_tiles || access.external->swizzled_tiles || segment.count <= 1))
             << "External output has no exact injective tile ownership certificate";
         if (segment.count <= 1) {
           hierarchy->phase_owned_outputs.insert(storage);
           ++result.Diagnostics().omitted_bridge_domains;
           continue;
         }
-        const auto& tiles = *access.external->row_major_tiles;
+        const auto owner_frame = access.external->row_major_tiles
+                                     ? access.external->row_major_tiles->frame
+                                     : access.external->swizzled_tiles->frame;
+        const auto owner_row_scale = access.external->row_major_tiles
+                                         ? access.external->row_major_tiles->row_scale
+                                         : access.external->swizzled_tiles->row_scale;
+        const auto owner_column_scale = access.external->row_major_tiles
+                                            ? access.external->row_major_tiles->column_scale
+                                            : access.external->swizzled_tiles->column_scale;
         bool found = false;
         for (const auto& frame : segment.nested_frames) {
-          if (frame.loop == tiles.frame) {
+          if (frame.loop == owner_frame) {
             CHECK(!found) << "Duplicate output tile coordinate frame";
             found = true;
           } else {
@@ -599,7 +607,7 @@ CompactSyncBuilder AnalyzePhasedSource(CompactSyncInput input, const std::string
                 << "External tile ownership does not cover repeated enclosing or inner visits";
           }
         }
-        CHECK(found && access.rows == tiles.row_scale && access.columns == tiles.column_scale)
+        CHECK(found && access.rows == owner_row_scale && access.columns == owner_column_scale)
             << "External output ownership has incompatible frame or tile extents";
         hierarchy->phase_owned_outputs.insert(storage);
         ++result.Diagnostics().omitted_bridge_domains;
@@ -806,12 +814,17 @@ class ScopedExporter {
 
 CompactSyncBuilder AnalyzeNumericalSync(CompactSyncInput input, const std::string& order) {
   const bool structured = input.region_tree.has_value();
-  if (structured)
+  if (structured) {
+    if (input.segments.empty() &&
+        std::any_of(input.storage.begin(), input.storage.end(),
+                    [](const auto& s) { return s.slot_count > 1; }))
+      return AnalyzePhasedSource(std::move(input), order);
     for (const auto& segment : input.segments)
       for (const auto& site : segment.sites)
         for (const auto& access : site.accesses)
           if (access.slot_coordinate_frame && access.slot_coordinate_frame != segment.original_loop)
             return AnalyzePhasedSource(std::move(input), order);
+  }
   for (const auto& segment : input.segments)
     for (const auto& site : segment.sites)
       for (const auto& access : site.accesses)

@@ -46,6 +46,11 @@ def test_split_k_uses_standalone_token_program():
     logical = _apply(passes.optimize_sync, logical)
     physical = _apply(passes.lower_sync, logical)
     _check_actual_tokens(original, logical, physical)
+    text = str(physical)
+    assert text.count("system.set_flag") == 13
+    assert text.count("system.wait_flag") == 13
+    assert sum(1 for line in text.splitlines() if line.lstrip().startswith("if ")) == 7
+    assert "if c__tile_t1_l0_ko_sync_boundary_1 < 64:\n            pl.system.wait_flag(src_pipe=pl.PipeType.FIX" not in text
 
 
 def test_structured_serialization_without_sidecar(tmp_path):
