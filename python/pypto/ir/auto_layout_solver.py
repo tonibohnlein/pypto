@@ -518,6 +518,43 @@ def _min_fill_decomposition(
     return elim_order, bags, parents, max(0, tw)
 
 
+def _compute_active_decomposition(
+    problem: _Problem,
+) -> tuple[TreewidthStats, list[int], list[tuple[int, ...]], list[int | None]]:
+    """Decompose only the movable operations (`|K_u| > 1`) for fast treewidth DP."""
+    movable = sorted(i for i, op in enumerate(problem.ops) if len(op.configs) > 1)
+    movable_set = set(movable)
+    active_edges: list[tuple[int, int]] = []
+    for participants in problem.participants.values():
+        pts = [u for u in sorted(participants) if u in movable_set]
+        for i, u in enumerate(pts):
+            for v in pts[i + 1 :]:
+                active_edges.append((u, v))
+    elim_order, bags, parents, active_tw = _min_fill_decomposition(movable, active_edges)
+    if len(problem.ops) <= 64:
+        tw_stats, _, _, _ = _compute_problem_treewidth(problem)
+        return tw_stats, elim_order, bags, parents
+    bag_products = [math.prod(len(problem.ops[u].configs) for u in b) for b in bags]
+    max_prod = max(bag_products, default=1)
+    total_states = sum(bag_products) if bag_products else (1 if problem.ops else 0)
+    max_active_bag_size = max((len(b) for b in bags), default=0)
+    tw_stats = TreewidthStats(
+        num_values=len(problem.instance.values),
+        num_operations=len(problem.ops),
+        num_movable_operations=len(movable_set),
+        dataflow_treewidth=active_tw,
+        primal_treewidth=active_tw,
+        active_primal_treewidth=active_tw,
+        max_bag_size=max_active_bag_size,
+        max_active_bag_size=max_active_bag_size,
+        max_bag_domain_product=max_prod,
+        total_dp_states=total_states,
+        elimination_order=tuple(problem.ops[u].op_id for u in elim_order),
+        bags=tuple(tuple(problem.ops[u].op_id for u in b) for b in bags),
+    )
+    return tw_stats, elim_order, bags, parents
+
+
 def _compute_problem_treewidth(
     problem: _Problem,
 ) -> tuple[TreewidthStats, list[int], list[tuple[int, ...]], list[int | None]]:
@@ -543,13 +580,13 @@ def _compute_problem_treewidth(
 
     _, _, _, df_tw = _min_fill_decomposition(all_ops, dataflow_edges)
     elim_order, bags, parents, primal_tw = _min_fill_decomposition(all_ops, primal_edges)
-    _, _, _, active_tw = _min_fill_decomposition(sorted(movable_set), active_edges)
+    _, active_bags, _, active_tw = _min_fill_decomposition(sorted(movable_set), active_edges)
 
     max_bag_size = max((len(b) for b in bags), default=0)
-    max_active_bag_size = max((sum(1 for u in b if u in movable_set) for b in bags), default=0)
-    bag_products = [math.prod(len(problem.ops[u].configs) for u in b) for b in bags]
-    max_prod = max(bag_products, default=1 if not bags else 0)
-    total_states = sum(bag_products)
+    max_active_bag_size = max((len(b) for b in active_bags), default=0)
+    bag_products = [math.prod(len(problem.ops[u].configs) for u in b) for b in active_bags]
+    max_prod = max(bag_products, default=1 if problem.ops else 0)
+    total_states = sum(bag_products) if bag_products else (1 if problem.ops else 0)
 
     stats = TreewidthStats(
         num_values=len(problem.instance.values),
@@ -666,14 +703,18 @@ def _conversion_report(state: _State) -> tuple[tuple[LayoutConversion, ...], tup
     return tuple(conversions), tuple(issues)
 
 
-def _result(state: _State, progress: _Progress, tw_stats: TreewidthStats | None = None) -> LayoutSolverResult:
+def _result(
+    state: _State,
+    progress: _Progress,
+    tw_stats: TreewidthStats | None = None,
+    *,
+    active_tw: int = 0,
+) -> LayoutSolverResult:
     breakdown = evaluate_assignment(state.problem.instance, state.assignment())
     if not math.isclose(state.cost, breakdown.total_cost_cycles, rel_tol=1e-10, abs_tol=1e-7):
         raise RuntimeError(
             f"Layout gain cache disagrees with evaluator: {state.cost} vs {breakdown.total_cost_cycles}"
         )
-    if tw_stats is None:
-        tw_stats, _, _, _ = _compute_problem_treewidth(state.problem)
     conversions, issues = _conversion_report(state)
     stats = LayoutSolverStats(
         evaluated_moves=progress.evaluated_moves,
@@ -681,8 +722,8 @@ def _result(state: _State, progress: _Progress, tw_stats: TreewidthStats | None 
         greedy_sweeps=progress.greedy_sweeps,
         initial_cost_cycles=progress.initial_cost_cycles,
         termination_reason=progress.termination_reason,
-        treewidth=tw_stats.primal_treewidth,
-        active_treewidth=tw_stats.active_primal_treewidth,
+        treewidth=tw_stats.primal_treewidth if tw_stats is not None else active_tw,
+        active_treewidth=tw_stats.active_primal_treewidth if tw_stats is not None else active_tw,
     )
     return LayoutSolverResult(breakdown, stats, conversions, issues, treewidth_stats=tw_stats)
 
@@ -714,14 +755,14 @@ def _eval_tensor_factor_at_bag(
 ) -> float:
     node = problem.instance.values[name]
     prod = problem.producers.get(name)
-    source = (
-        problem.ops[prod].configs[combo[bag_pos[prod]]].output_layout
-        if prod is not None
-        else node.current_layout
-    )
+    if prod is None:
+        source = node.current_layout
+    else:
+        prod_q = combo[bag_pos[prod]] if prod in bag_pos else 0
+        source = problem.ops[prod].configs[prod_q].output_layout
     requested: set[LayoutChoice] = set(problem.boundary[name].keys())
     for u in problem.participants[name]:
-        q_u = combo[bag_pos[u]]
+        q_u = combo[bag_pos[u]] if u in bag_pos else 0
         requested.update(problem.uses[u][q_u].get(name, ()))
     costs = problem.conversion_costs[name][source]
     return math.fsum(costs[dst] for dst in requested)
@@ -736,7 +777,7 @@ def solve_treewidth_dp(
     problem = _Problem(instance)
     cfg = config or LayoutSolverConfig()
     progress = _Progress(cfg)
-    tw_stats, elim_order, bags, parents = _compute_problem_treewidth(problem)
+    tw_stats, elim_order, bags, parents = _compute_active_decomposition(problem)
     if not problem.ops:
         progress.termination_reason = "optimal"
         return _result(_State(problem, []), progress, tw_stats)
@@ -744,15 +785,17 @@ def solve_treewidth_dp(
     if tw_stats.max_bag_domain_product > cfg.max_bag_states:
         raise ValueError(
             f"Treewidth DP max bag states {tw_stats.max_bag_domain_product} exceeds "
-            f"max_bag_states={cfg.max_bag_states} (primal_treewidth={tw_stats.primal_treewidth})"
+            f"max_bag_states={cfg.max_bag_states} "
+            f"(active_primal_treewidth={tw_stats.active_primal_treewidth})"
         )
 
     step_of = {u: step for step, u in enumerate(elim_order)}
     factors_at_bag: list[list[str]] = [[] for _ in bags]
     for name, pts in problem.participants.items():
-        if not pts:
+        act_pts = [u for u in pts if u in step_of]
+        if not act_pts:
             continue
-        first_step = min(step_of[u] for u in pts)
+        first_step = min(step_of[u] for u in act_pts)
         factors_at_bag[first_step].append(name)
 
     children_of: list[list[int]] = [[] for _ in bags]
