@@ -1,7 +1,9 @@
 # Addressed accumulator row trims: operation-contract subgate
 
-Status: design accepted in principle; implementation, independent source review
-and fresh tests are still required. This is a reusable M2 metadata/export repair
+Status: implementation and independent source review accepted; the coherent
+139-test gate, subsequent 151-test alias-policy gate and unchanged-model capture
+pass. Final source hooks, coherent post-format rebuild, a fresh 151-test rerun
+(106.14 s) and the three C++ resource/order tests also pass. This is a reusable M2 metadata/export repair
 within the [architecture plan](41-general-autosync-architecture-plan.md). It
 follows the separate [GM scalar staging gate](44-autosync-gm-scalar-staging.md).
 No accumulator, tile-size, allocation or synchronization-policy change is proposed.
@@ -52,7 +54,7 @@ Functional body on unsupported selection.
 ## Existing native evidence
 
 At PTO-ISA pin `5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f`,
-`include/pto/npu/a2a3/tstore_common.hpp::TStoreAccNz2nd` takes runtime
+`include/pto/common/arch/memory/tstore_common.hpp::TStoreAccNz2nd` takes runtime
 `validRow/validCol` and checks that they match the GM partition dimensions.
 With compact mode disabled, its source stride remains `TileData::Rows`,
 independent of the trimmed runtime row count. The native row/column field limits
@@ -126,3 +128,123 @@ Representation and construction work must follow static aliases/uses and their
 shared metadata DAG, without unfolding runtime rows or visits. Success is a
 qualified metadata bridge; it is not a new minimum-demand theorem or a device
 speedup claim.
+
+## Implemented checkpoint (2026-11-16)
+
+`BufferAccTrimAnalysis` now owns one immutable, function-scoped capability used by
+selection, `BufferValidAnalysis` and `MatrixDescriptor`. It recognizes the
+qualified static full writer plus row-only setter, checks the identical complete
+storage window again after placement, and excludes unsupported observers and
+runtime carries before committing to Buffer lowering. The initial observer gate
+is deliberately stronger than component-local exclusion: an unknown Acc metadata
+observer anywhere in the function refuses this family.
+
+The selected backend must be configured and its active handler must be A2/A3;
+AIC alone is insufficient. Addressless selection remains Functional. Numerical
+facts come from original ready scalar SSA, tensor-shape ABI nonnegativity,
+constants, min/max and atomic guard comparisons. No arbitrary arithmetic or
+benchmark bound is inferred. Counted-loop coordinates are ready only in their
+original body, without an inferred sign, count or interval. Native capacity
+checks require physical `M <= 8192` and fixed full `N <= 4095`, independently of
+allocation capacity.
+
+`FinalizeTypedRoot` continues to own physical storage and typed native handles.
+The writer/carry stays static; the store alias receives two dynamic fields.
+Existing `RestoreDataOperands` restores `(rows,N)` for each use, including A/B/A
+alternation on a shared runtime handle and later uses of the old full source.
+The actual Buffer metadata checker independently verifies address ownership,
+positive bounded rows, full columns and exact equality with the GM partition.
+Conservative analysis, actual-token lowering, ownership and code generation use
+that same check. Invalid or unavailable evidence is a refusal, never an empty
+access answer. This changes neither allocation nor the logical protocol.
+
+### Bounded evidence and cost repair
+
+A coherent build and the final combined run pass **139 tests in 55.46 s**:
+Acc bridge, proof contexts, static row descriptors, runtime row operations,
+runtime casts and GM scalar staging. The 17 proof-context cases include A5 and
+unconfigured-target refusal. Generic matrix shapes are `(16,32)`, `(32,64)` and
+`(64,128)`; rows include zero, one, `M-1` and `M`, with repeated visits/resets,
+full static carries at zero/one/three updates and alternating runtime aliases.
+Independent interpreters compare payload identities, declared transfer rectangles
+in the original physical packing, guard behavior, matching, acyclicity and causal
+consumption before republication. Actual noncontiguous IDs `{2,5}` are checked.
+Real PTOAS 0.72 C++ is produced for addressed planners, including the default-off
+PyPTO route that leaves downstream PTOAS synchronization enabled.
+
+The subsequent combined two-policy gate passes **151 tests in 105.16 s** under
+the same 120 s watchdog. Both policies use identical, explicitly disjoint concrete
+GM bases. The may-not-alias caller contract excludes overlapping distinct GM roots. These tests do not claim
+numerical matmul/device validation or exact burst-level native footprints.
+Conservative whole-Acc/DDR summaries preserve the required enclosures.
+
+A new deep shared-guard test exposed an existing receipt-cost traversal:
+`ScheduleTreeSize` unfolded an expression DAG and hit the unchanged **30 s**
+watchdog. It now memoizes expression-subtree **expanded occurrence weights**,
+retains statement/command occurrences, and counts actual inspection work
+separately. Small inputs agree with the independent expanded census; depth-28
+DAGs complete while retaining their large expanded size. Overflow is explicit
+`cost_unproved`: optional complete-candidate selection retains the original
+guarded assigned-cut emission, never treats saturated counts as a fit, and does
+not throw an internal baseline-size error. Bound addends are widened before
+arithmetic. Demands, IDs, protocol and growth budgets are unchanged.
+
+Shared guard proofs likewise extract distinct atomic conjuncts without passing
+compound DAGs to the recursive arithmetic simplifier. Range caches are scoped to
+lexical proof contexts; repeated contexts can repeat queries, so there is no
+claim of globally linear work over arbitrary contexts. Runtime rows and visits
+are not unfolded.
+
+### Pins, commands and preserved failures
+
+The companion JSON pins the design baseline, dirty compiler/test sources,
+compiled extension, native source snapshots, PTOAS artifacts, environment and
+capture command. Capture-stage hashes identify the measured pre-final-hooks
+snapshot. The JSON separately records the final formatted source and rebuilt
+extension pins, rather than relabelling the measured capture snapshot. Use the Linux environment loader with the pinned
+Python/PTOAS launcher; the checkout's stale `env.sh` is not the toolchain source.
+The exact combined test command is:
+
+```bash
+timeout 120s python -m pytest -q \
+  tests/ut/ir/transforms/test_acc_row_trim_bridge.py \
+  tests/ut/ir/transforms/test_acc_row_trim_proof_context.py \
+  tests/ut/ir/transforms/test_static_row_descriptor_bridge.py \
+  tests/ut/ir/transforms/test_runtime_valid_broadcast.py \
+  tests/ut/ir/transforms/test_runtime_valid_cast.py \
+  tests/ut/ir/transforms/test_gm_scalar_staging.py
+```
+
+The initial 29-pass/three-failure run concerned fixtures: an unsupported consumer
+changed core classification, constant-zero loops were eliminated before Buffer
+selection, and a guard mutator expected a comparison rather than its actual SSA
+Boolean. A subsequent 136-pass/one-failure run used fresh deserialization IDs with
+an old empty-execution parameter map. These were corrected without changing the
+native qualification. Their logs remain, along with the original shared-DAG
+watchdog. A separate **10 s** raw-DAG BufferIR verification watchdog remains an
+unresolved generic verifier cost issue: SSA/use-after-def checks cannot be fixed
+by blindly memoizing uses across scopes. The flag-bearing invocation-completion
+rewriter's generic expression traversal is also a separate follow-up, not the
+cause of the no-flag receipt timeout and not claimed fixed here.
+
+The first capture command incorrectly invoked Python with timeout options. That
+runner error reached no compiler and is retained separately. The corrected run
+kept the **120 s** watchdog and generated all **32 C++ leaves**, with **20 PyPTO
+owners, 12 delegated leaves and 47 observed task-control owners**, in **6.7544 s
+inclusive**. `lm_head` is the added owned leaf; the previous GM-staging checkpoint
+was 19/13. Expected-ownership failures are empty. This is one descriptive host
+measurement, not a speedup or whole-model/device correctness result.
+
+The original M1–M6 plan remains partially complete. The remaining twelve local
+leaves comprise four mixed-valid ADD leaves, `qkpv_plan`'s `tensor.write`,
+`rope_kv_cache`'s reshape family, and six existing mixed-peer domains. No peer or
+inter-kernel synchronization is generated or replaced. Exact dynamic GM exports,
+other arithmetic/readiness forms, broader caller configurations, and native
+execution remain distinct obligations.
+
+| Established result | Remaining premise or limitation | Appropriate claim |
+| ------------------ | ------------------------------- | ----------------- |
+| Static Acc writers and ready row-only store aliases share original bytes with restored metadata | Qualified A2/A3 native store, original access validity and full-column/packing premises | Reusable descriptor/export bridge |
+| Independent bounded command checks and existing allocation accept the family | Conservative root ordering; no new minimum-demand, minimum-ID or burst-footprint theorem | Host-model synchronization feasibility |
+| Expanded cost weights preserve small census values without DAG unfolding | Raw-DAG generic BufferIR/SSA verification remains unqualified; context-dependent proof costs remain explicit | Bounded diagnostic/candidate-count construction |
+| Original Qwen capture gains `lm_head`, reaching 20/32 owned leaves | Twelve leaves and the original M1–M6 programme remain incomplete; no device validation | Incremental production coverage, not complete-model autosynchronization |

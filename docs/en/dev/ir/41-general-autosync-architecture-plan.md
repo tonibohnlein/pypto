@@ -8,13 +8,15 @@ merge-readiness claim.
 Status: the continued operation, ownership and retained-child gates are reviewed.
 The original six milestones and whole-model ownership remain **partially complete**:
 missing native and value-domain premises are not inferred from a passing capture.
-The latest unchanged two-layer Qwen capture produces 32/32 C++ leaves under both
+The historical pre-repair two-layer Qwen capture produced 32/32 C++ leaves under both
 policies: exact owns 3, conservative prefix owns 16 and delegates 16. Another
 47 existing task-control owners are now observed separately (see the M1 gate). The runtime package passes
 256 tests; the broader 52-module campaign recorded 2,669 passes and six stale
 fixture expectations, resolved by a reviewed 196-test module rerun. This is
 aggregate evidence, not a fresh single all-green 2,675-test campaign. See the
 continued ledger and [retained-child checkpoint](41-general-autosync-readonly-child.md).
+The current post-repair prefix checkpoint is 20 owned / 12 delegated leaves; see
+the Acc metadata ledger below.
 Baseline: `b5597650a75b598645b1b1d3fe05bd3aab220f09`. This extends the
 [regional architecture](39-regional-sync-architecture.md). Qwen end-to-end remains
 the acceptance target, not a source of kernel-specific admission rules. Autosync
@@ -910,3 +912,23 @@ for the frozen M5 source/build hashes, original-coordinate proof, multitrip
 covers/queries/selectors/reuse checks and retained earlier failures. This slice
 adds no backend, allocator, launch transformation, larger resource pool or
 whole-nest expansion. M5 and the original M1–M6 programme are not complete.
+
+## Acc metadata and cost checkpoint (2026-11-16)
+
+The resumed GM staging implementation is accepted as `a3831d6f7`. The subsequent
+[Acc row-trim checkpoint](46-autosync-acc-row-trim.md) implements the reviewed M2
+metadata bridge while keeping the original full writer/carry and native pending
+effects. Its coherent 139-test gate and original two-layer capture pass: 32 C++
+leaves, 20 PyPTO owners, 12 delegates and 47 observed task-control owners;
+`lm_head` is newly owned. The capture uses the same original model/configuration,
+not a replacement fixture or caller bound. The subsequent two-policy gate passes 151 tests in 105.16 s; final hooks and
+source-pin refresh are recorded separately in that checkpoint.
+
+This is an incremental M2/M3/M6 result, not completion of M1–M6. The remaining
+local leaves need the already identified mixed-valid operation, scalar write,
+reshape and mixed-peer contracts. Existing hand-written cross-core/inter-kernel
+protocols remain their owners. Exact dynamic GM exports and native/device
+qualification remain separate. A shared-DAG receipt-counting defect was repaired
+without changing demands, protocol, IDs or budgets; the distinct raw-DAG generic
+BufferIR/SSA verifier cost and invocation-rewriter traversal remain follow-ups.
+The earlier tables and counts above are historical checkpoint evidence.

@@ -19,6 +19,7 @@
 #include <numeric>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1559,27 +1560,61 @@ class CommandSeams {
   }
 };
 
+// Preserve expanded-tree growth bounds without visiting exponentially many
+// paths through shared expression DAGs. Statement occurrences remain distinct;
+// only context-independent expression subtree weights are memoized. Saturation
+// is accompanied by an explicit unproved-size flag and cannot certify a fit.
 class ScheduleTreeSize : public IRVisitor {
  public:
   size_t nodes = 0, payloads = 0, commands = 0, expressions = 0, statements = 0;
+  size_t inspected_expressions = 0;
+  bool overflow = false;
   void VisitExpr(const ExprPtr& expression) override {
-    ++nodes;
-    ++expressions;
-    IRVisitor::VisitExpr(expression);
+    auto found = weights_.find(expression.get());
+    if (found == weights_.end()) {
+      ++inspected_expressions;
+      const Weight previous{nodes, expressions, overflow};
+      nodes = expressions = 1;
+      overflow = false;
+      IRVisitor::VisitExpr(expression);
+      const Weight weight{nodes, expressions, overflow};
+      found = weights_.emplace(expression.get(), weight).first;
+      nodes = previous.nodes;
+      expressions = previous.expressions;
+      overflow = previous.overflow;
+    }
+    Add(nodes, found->second.nodes);
+    Add(expressions, found->second.expressions);
+    overflow |= found->second.overflow;
   }
   void VisitStmt(const StmtPtr& statement) override {
-    ++nodes;
-    ++statements;
+    Add(nodes, 1);
+    Add(statements, 1);
     IRVisitor::VisitStmt(statement);
   }
   void VisitStmt_(const EvalStmtPtr& statement) override {
     const auto call = As<Call>(statement->expr_);
     if (call && !IsOp(call, "system.set_flag") && !IsOp(call, "system.wait_flag") &&
         !IsOp(call, "system.bar_m") && !IsOp(call, "system.bar_v"))
-      ++payloads;
+      Add(payloads, 1);
     else if (call)
-      ++commands;
+      Add(commands, 1);
     IRVisitor::VisitStmt_(statement);
+  }
+
+ private:
+  struct Weight {
+    size_t nodes, expressions;
+    bool overflow;
+  };
+  std::unordered_map<const Expr*, Weight> weights_;
+  void Add(size_t& total, size_t value) {
+    if (value > std::numeric_limits<size_t>::max() - total) {
+      total = std::numeric_limits<size_t>::max();
+      overflow = true;
+    } else {
+      total += value;
+    }
   }
 };
 
@@ -1820,6 +1855,7 @@ CandidateSchedule PrepareCandidate(const RegularLoopSchedule& loop, unsigned mod
 // sequence wrappers and first-use SSA bindings retained by the frozen scalar plan.
 bool BoundCandidate(CandidateSchedule& candidate, const ScheduleTreeSize& body,
                     const AssignedRegionSchedule& assigned, std::pair<int64_t, int64_t> blocks) {
+  if (body.overflow) return false;
   __int128 nodes = 0, payloads = 0, commands = 0;
   auto add = [&](const ControlForest& forest) {
     const CaseCodeSize size(forest);
@@ -1834,7 +1870,7 @@ bool BoundCandidate(CandidateSchedule& candidate, const ScheduleTreeSize& body,
       add(phase.entry);
       add(phase.exit);
       for (const auto& inventory : phase.visits) {
-        nodes += body.nodes + 8;  // Fresh offset binding and residue sequence.
+        nodes += __int128(body.nodes) + 8;  // Fresh offset binding and residue sequence.
         payloads += body.payloads;
         std::set<const PhysicalCuts*> seen;
         for (const auto& [anchor, cut] : inventory) {
@@ -1849,8 +1885,9 @@ bool BoundCandidate(CandidateSchedule& candidate, const ScheduleTreeSize& body,
     ScheduleTreeSize size;
     size.VisitExpr(InvocationGroupGuard(assigned.block, blocks, candidate.plan.groups[i].intervals,
                                         assigned.owner->span_));
-    nodes += size.nodes + 4;
-    candidate.work.schedule_inspected_expressions += size.expressions;
+    if (size.overflow) return false;
+    nodes += __int128(size.nodes) + 4;
+    candidate.work.schedule_inspected_expressions += size.inspected_expressions;
   }
   if (nodes > std::numeric_limits<size_t>::max() || payloads > std::numeric_limits<size_t>::max() ||
       commands > std::numeric_limits<size_t>::max())
@@ -1982,14 +2019,47 @@ PreparedLoops PlanLoopSchedules(const AssignedRegionSchedule& assigned, const Cu
     original.VisitStmt(loop.loop);
     body.VisitStmt(loop.loop->body_);
     work.schedule_inspected_descriptors += original.statements + body.statements;
-    work.schedule_inspected_expressions += original.expressions + body.expressions;
+    work.schedule_inspected_expressions += original.inspected_expressions + body.inspected_expressions;
+    const auto unproved_size = [&]() {
+      SyncScheduleCandidateReceipt guarded{
+          label, "guarded", "fallback",
+          "expanded schedule size is unproved; preserve original guarded emission"};
+      guarded.selected = true;
+      guarded.payload_sites = original.payloads;
+      guarded.control_node_bound = std::numeric_limits<size_t>::max();
+      work.schedule_choices.push_back(std::move(guarded));
+      for (unsigned mode = 1; mode < kScheduleModes.size(); ++mode) {
+        if (policy.mode != "auto" && policy.mode != kScheduleModes[mode]) continue;
+        work.schedule_choices.push_back(
+            {label, kScheduleModes[mode], "cost_unproved",
+             "expanded size cannot certify the complete-candidate growth budget"});
+      }
+    };
+    if (original.overflow || body.overflow) {
+      unproved_size();
+      continue;
+    }
     ScheduleCostModel model(loop, assigned, blocks, work);
     std::vector<CandidateSchedule> candidates;
     candidates.reserve(kScheduleModes.size());
     candidates.push_back(PrepareCandidate(loop, 0, assigned, domains, blocks, policy));
     auto& baseline = candidates.front();
     baseline.receipt = {label, kScheduleModes[0], "eligible", ""};
-    INTERNAL_CHECK(BoundCandidate(baseline, body, assigned, blocks)) << "Guarded schedule size overflow";
+    if (!BoundCandidate(baseline, body, assigned, blocks)) {
+      // The generic guarded emitter is already qualified by the immutable
+      // assigned plan. No optional source duplication is selected without a
+      // representable complete-candidate bound.
+      work.schedule_inspected_descriptors +=
+          baseline.work.schedule_inspected_descriptors + baseline.work.control_descriptors +
+          baseline.work.schedule_descriptor_visits + baseline.work.schedule_body_visits +
+          baseline.work.case_sequence_visits + baseline.work.case_sequence_comparisons +
+          baseline.work.cut_case_comparisons + baseline.work.invocation_schedule_visits +
+          baseline.work.invocation_schedule_comparisons;
+      work.schedule_inspected_expressions +=
+          baseline.work.schedule_inspected_expressions + baseline.work.control_expression_visits;
+      unproved_size();
+      continue;
+    }
     MeasureCandidate(baseline, assigned, blocks, model);
     baseline.receipt.model_comparable = Comparable(baseline, baseline);
     size_t chosen = 0;
@@ -2193,6 +2263,8 @@ void FinishSyncScheduleReceipt(const FunctionPtr& function, PhysicalSyncRealizat
   }
   ScheduleTreeSize measured;
   measured.VisitFunction(function);
+  work.schedule_inspected_descriptors += measured.statements;
+  work.schedule_inspected_expressions += measured.inspected_expressions;
   work.schedule_emitted_payload_sites = measured.payloads;
   work.schedule_emitted_control_nodes = measured.nodes;
   for (auto& receipt : work.schedule_choices) {
@@ -2200,6 +2272,22 @@ void FinishSyncScheduleReceipt(const FunctionPtr& function, PhysicalSyncRealizat
     receipt.payload_sites = measured.payloads;
     receipt.control_node_bound = measured.nodes;
     receipt.command_sites = measured.commands;
+    if (measured.overflow) {
+      receipt.status = "cost_unproved";
+      receipt.reason = "expanded emitted size exceeds the count representation; guarded plan retained";
+      receipt.model_comparable = receipt.model_exact = false;
+    }
+  }
+  if (measured.overflow &&
+      std::none_of(work.schedule_choices.begin(), work.schedule_choices.end(),
+                   [](const auto& receipt) { return receipt.loop == "<function>" && receipt.selected; })) {
+    SyncScheduleCandidateReceipt unknown{"<function>", "guarded", "cost_unproved",
+                                         "expanded emitted size exceeds the count representation"};
+    unknown.selected = true;
+    unknown.payload_sites = measured.payloads;
+    unknown.control_node_bound = measured.nodes;
+    unknown.command_sites = measured.commands;
+    work.schedule_choices.push_back(std::move(unknown));
   }
 }
 std::pair<std::vector<std::vector<std::pair<int64_t, int64_t>>>, PhysicalSyncRealization>

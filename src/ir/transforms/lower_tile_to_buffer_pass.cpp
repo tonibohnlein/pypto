@@ -59,6 +59,7 @@
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/buffer_acc_trim_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_indexed_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_ir_selection.h"
 #include "pypto/ir/transforms/utils/buffer_tuple_results.h"
@@ -85,7 +86,7 @@ std::vector<int64_t> StaticExtents(const std::vector<ExprPtr>& extents, const Sp
   return result;
 }
 
-// Valid extents of a Vec descriptor. A runtime extent makes both dimensions
+// Valid extents of a qualified mutable native descriptor. A runtime extent makes both dimensions
 // dynamic: the native metadata update always writes both. The lane-1 [0, 0]
 // sentinel means "no data on this lane", not a static empty window, so it is a
 // runtime value too.
@@ -147,9 +148,10 @@ bool HasDynamicValid(const BufferTypePtr& type) {
   return std::any_of(type->valid_shape_.begin(), type->valid_shape_.end(), [](int64_t v) { return v < 0; });
 }
 
-// A cube-space tile keeps its resolved fractal layout. Its physical extents
-// are already whole boxes, so the descriptor is exact without a byte view.
-BufferTypePtr MatrixDescriptor(const TileTypePtr& tile, MemorySpace space, const Span& span) {
+// A cube-space tile keeps its resolved physical fractal layout and full boxes.
+// Only a qualified store alias may vary its independently owned valid metadata.
+BufferTypePtr MatrixDescriptor(const TileTypePtr& tile, MemorySpace space, const Span& span,
+                               const BufferAccTrimAnalysis* acc_trims) {
   const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
   CHECK_SPAN(tile->shape_.size() == 2 && backend::IsMatrixBufferDtype(space, tile->dtype_) &&
                  view.pad == PadValue::null && view.stride.empty(),
@@ -161,14 +163,17 @@ BufferTypePtr MatrixDescriptor(const TileTypePtr& tile, MemorySpace space, const
   CHECK_SPAN(!view.start_offset || (view_offset && view_offset->value_ == 0), span)
       << "LowerTileToBuffer: nonzero tile view offsets require an explicit Buffer view recipe";
   const auto shape = StaticExtents(tile->shape_, span);
-  const auto valid = StaticExtents(view.valid_shape.empty() ? tile->shape_ : view.valid_shape, span);
+  const auto& original_valid = view.valid_shape.empty() ? tile->shape_ : view.valid_shape;
+  const auto valid = acc_trims && acc_trims->Qualifies(tile) ? DescriptorValid(original_valid, shape)
+                                                             : StaticExtents(original_valid, span);
   return std::make_shared<BufferType>(shape, tile->dtype_, space, valid, view.blayout, view.slayout,
                                       view.fractal, view.pad, view.compact);
 }
 
-BufferTypePtr StorageDescriptor(const TileTypePtr& tile, const Span& span) {
+BufferTypePtr StorageDescriptor(const TileTypePtr& tile, const Span& span,
+                                const BufferAccTrimAnalysis* acc_trims = nullptr) {
   const auto space = tile->GetMemorySpace();
-  if (space && backend::IsMatrixBufferSpace(*space)) return MatrixDescriptor(tile, *space, span);
+  if (space && backend::IsMatrixBufferSpace(*space)) return MatrixDescriptor(tile, *space, span, acc_trims);
   return DenseDescriptor(tile, span);
 }
 
@@ -189,7 +194,8 @@ struct BufferStorage {
 
 class StorageIndex : public IRVisitor {
  public:
-  explicit StorageIndex(bool addressed) : addressed_(addressed) {}
+  explicit StorageIndex(bool addressed, const BufferAccTrimAnalysis& acc_trims)
+      : addressed_(addressed), acc_trims_(acc_trims) {}
 
   void VisitExpr(const ExprPtr& expr) override {
     if (!expr) return;
@@ -205,7 +211,7 @@ class StorageIndex : public IRVisitor {
       CHECK_SPAN(memory->slot_index_ || (offset && offset->value_ >= 0), expr->span_)
           << "LowerTileToBuffer: expected a static nonnegative storage window address";
       roots[memory->base_.get()].members.push_back(
-          {tile, memory, StorageDescriptor(tile, expr->span_), expr->span_});
+          {tile, memory, StorageDescriptor(tile, expr->span_, &acc_trims_), expr->span_});
     }
     IRVisitor::VisitExpr(expr);
   }
@@ -675,6 +681,7 @@ class StorageIndex : public IRVisitor {
   }
 
   bool addressed_;
+  const BufferAccTrimAnalysis& acc_trims_;
   // Tiles that windows are cut from. PTOAS cannot legalize a subview of a
   // byte-root relabel, so in addressed storage they get their own allocation.
   std::unordered_set<const TileType*> window_sources_;
@@ -1754,7 +1761,8 @@ ProgramPtr TransformProgram(const ProgramPtr& program) {
           << "LowerTileToBuffer: device Tile parameters require the Buffer helper ABI recipe";
     }
     const bool addressed = GetFunctionMemoryPlanner(function) != MemoryPlanner::PtoAS;
-    StorageIndex storage(addressed);
+    const BufferAccTrimAnalysis acc_trims(function, addressed);
+    StorageIndex storage(addressed, acc_trims);
     storage.VisitStmt(function->body_);
     storage.Finalize();
     std::optional<LocalAccumulatorIndex> local_accumulators;

@@ -1,8 +1,8 @@
 {
-  "status": "design accepted in principle; implementation/review/fresh validation pending",
+  "status": "Accepted source/report review; serial post-format build, fresh151-test gate, original20/12 capture, threeCTests and repository hooks passed.",
   "milestone": "M2 addressed Acc row-trim metadata/export adapter",
   "date": "2026-11-16",
-  "baseline_head": "04965c91cf7ddb3ea606ad2225ecff316ec85010",
+  "baseline_head": "34b7b551871975e9b93dabbd89a98a39554b7ef2",
   "native_pin": "5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f",
   "dependencies": [
     "44 GM scalar staging gate accepted/committed before shared-file implementation"
@@ -26,7 +26,10 @@
       "unknown metadata observations anywhere in affected physical alias component",
       "new atomic/quantization/activation/phase store variants"
     ],
-    "store": "existing default two-operand TSTORE only; GM partition exactly(rows,N)"
+    "store": "existing default two-operand TSTORE only; GM partition exactly(rows,N)",
+    "target": "Configured selected native handler a2a3; unavailable/A5 refuses",
+    "native_physical_rows_max": 8192,
+    "native_full_columns_max": 4095
   },
   "existing_owners": [
     "StorageIndex::FinalizeTypedRoot",
@@ -39,10 +42,289 @@
     "build-py314/packed-column-contract/TStore.hpp": "5ac8b76106cdfa77e182d062453b7b4b2c447917113393415e032becedd697aa",
     "build-py314/packed-column-contract/tstore_common.hpp": "d1ea6f21d2bfb88b6d0f20d28036180a814c773be41a2b0ae758599d68c7005f"
   },
-  "implementation_changes": [],
-  "test_results": [],
+  "implementation_changes": [
+    "Shared immutable BufferAccTrimAnalysis capability with selected A2/A3 target, original SSA/range, complete-window and observer qualification",
+    "SelectBuffer, BufferValidAnalysis and MatrixDescriptor consume the same capability",
+    "Existing typed-root owner preserves static writer/carry and independently owned dynamic store metadata; restore each runtime alias at every use",
+    "Actual Buffer runtime metadata proof shared by conservative analysis, actual-token lowering, ownership and codegen",
+    "DAG-safe atomic guard extraction, lexical range caches and original counted-coordinate readiness without inferred numerical bounds",
+    "Weighted ScheduleTreeSize preserves expanded occurrence counts with explicit overflow, actual visit work and guarded fallback under unproved complete-candidate budgets"
+  ],
+  "test_results": [
+    {
+      "log": "build-py314/review-repairs-20261116/acc-row-trim-final-gate.log",
+      "passed": 139,
+      "failed": 0,
+      "seconds": 55.46,
+      "scope": "Acc bridge and 17 proof contexts, static row descriptor, runtime broadcast/cast, GM staging"
+    },
+    {
+      "log": "build-py314/review-repairs-20261116/acc-row-trim-weighted-proof-tests.log",
+      "passed": 15,
+      "failed": 0,
+      "seconds": 0.27,
+      "scope": "Earlier weighted proof-context gate before the two target-refusal cases"
+    },
+    {
+      "log": "build-py314/review-repairs-20261116/acc-row-trim-alias-gate.log",
+      "passed": 151,
+      "failed": 0,
+      "seconds": 105.16,
+      "watchdog_seconds": 120,
+      "scope": "Same six-module gate plus primary fixture under both alias policies on identical disjoint concrete layouts"
+    }
+  ],
   "device_validation": false,
   "review": {
-    "native_contract_expert": "conditional accept; document per-use shared-runtime-handle restoration, component-wide observer refusal and default-TSTORE scope before implementation"
+    "design": "independently accepted before dependent implementation",
+    "source_and_tests": "Accepted conditional final hooks and frozen-source pin refresh",
+    "native_contract": "Existing selected A2/A3 default TSTORE contract; no new device or burst-footprint theorem"
+  },
+  "previous_gm_checkpoint": "a3831d6f7",
+  "design_commit": "34b7b551871975e9b93dabbd89a98a39554b7ef2",
+  "parent_milestones": [
+    "M2",
+    "M3",
+    "M6"
+  ],
+  "original_milestone_plan_retained": true,
+  "all_original_milestones_complete": false,
+  "capture_stage_pins": {
+    "stage": "capture before final formatting/hooks; retain as measured snapshot",
+    "compiler_revision": "34b7b551871975e9b93dabbd89a98a39554b7ef2",
+    "compiler_dirty_sources": {
+      "include/pypto/backend/common/buffer_type_support.h": "3df82bef530afb3c2f40694e4a60ae87fd0b7136da70798546c316771e89904a",
+      "include/pypto/ir/transforms/utils/buffer_acc_trim_analysis.h": "4d6004b4ba56710acbaad19fab71e7a51e692321f15f1cf649270d28f2d728f9",
+      "include/pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h": "65674c1689cbf12a6e36dd2751e78d317bf88fe1e048c3ae714e1414edbd1922",
+      "include/pypto/ir/transforms/utils/buffer_valid_analysis.h": "28eb6fc78a1691207598ead2698ef37020e2ca522f5ff0a8ba012d9f1011c86e",
+      "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "a328313fff47ac44a0c12f02e3b257f8aaea0ddb26e549e24106fab6728c2022",
+      "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "d9d3157d3992ceccf56d202d8359bf6c9660df350631efa159bd7abf1feb6ad1",
+      "src/ir/transforms/utils/buffer_acc_trim_analysis.cpp": "48e07eecf6c6f69ed9b36f710319454818cd34b6e743a2b405f61ebc60f0987f",
+      "src/ir/transforms/utils/conservative_sync_dataflow.cpp": "9f8b45f8d7ce4177cbc2df0548a202a33e71ae5ba71f3ed97159c5cfed3bfa9c",
+      "src/ir/transforms/utils/physical_sync_schedule.cpp": "7e756d2f0d55b916c28b739417cf2bbc7f63b651e0438535053550786e644945",
+      "src/ir/transforms/utils/token_sync_lowering.cpp": "c093da20ac16b96a476afb1baf1d9e6b82a82c7c6bea8ca2324560c04d6bfddf",
+      "tests/ut/ir/transforms/test_acc_row_trim_bridge.py": "1dbc393195adac7f9f8157ee15e4763dc973abb14fff41e528155398a4b5079f",
+      "tests/ut/ir/transforms/test_acc_row_trim_proof_context.py": "96fbd3acdcd1708b55f0f096333c27b2ccaa2058a49d25d760860f9d57997048"
+    },
+    "cmake_sha256": "bf6da65cc719b0f8a80fe85ff06a52f0b92b2be851d63f24cbabc6a7ff5e9484",
+    "extension_hashes": {
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "734a650643f7998401d43640f7912fdab38a3e0a83e21f05862513d9e12f3ca2"
+    },
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "ptoas": {
+      "path": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher/ptoas",
+      "hash": "8b52c0bfe3259f37dd17331ec0b8ee534461f18e70042edce0e2b6ee2fd7adf8",
+      "version": "ptoas 0.72",
+      "additional_artifacts": {
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so": "86655444ce6e3470dbbbf061438046bc5f87c5f0f89f4145fd2a4340c8fd70e9",
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so": "0aa83ba0abbd3432c2ce9ecb6c854485b5502d51b181fa200ee87fd9254ea321"
+      }
+    },
+    "environment": {
+      "PYTHONPATH": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/codegen:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106",
+      "PTOAS_ROOT": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher",
+      "OMP_NUM_THREADS": "1",
+      "PYPTO_CODEGEN_MAX_WORKERS": "1"
+    }
+  },
+  "commands": {
+    "build": "cmake --build build-py314 --parallel 1",
+    "build_log": "build-py314/review-repairs-20261116/acc-row-trim-target-build.log",
+    "test": "timeout 120s python -m pytest -q tests/ut/ir/transforms/test_acc_row_trim_bridge.py tests/ut/ir/transforms/test_acc_row_trim_proof_context.py tests/ut/ir/transforms/test_static_row_descriptor_bridge.py tests/ut/ir/transforms/test_runtime_valid_broadcast.py tests/ut/ir/transforms/test_runtime_valid_cast.py tests/ut/ir/transforms/test_gm_scalar_staging.py",
+    "test_log": "build-py314/review-repairs-20261116/acc-row-trim-final-gate.log",
+    "capture": [
+      "/usr/bin/python",
+      "-m",
+      "transforms.qualify_qwen_whole_model",
+      "--library",
+      "/home/toni/work/pypto3/pypto-lib",
+      "--output",
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/review-repairs-20261116/qwen-acc-row-trim-qualified",
+      "--layers",
+      "2",
+      "--policy",
+      "conservative_prefix",
+      "--require-function",
+      "down_proj",
+      "--require-function",
+      "gate_up_proj",
+      "--require-function",
+      "kv_proj",
+      "--require-function",
+      "mlp_out_cast",
+      "--require-function",
+      "mlp_out_cast_0",
+      "--require-function",
+      "mlp_out_seed",
+      "--require-function",
+      "out_proj_aic",
+      "--require-function",
+      "q_proj",
+      "--require-function",
+      "save_prefill_last_token_group",
+      "--require-function",
+      "save_prefill_last_token_single",
+      "--require-function",
+      "silu",
+      "--tool-artifact",
+      "build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas",
+      "--tool-artifact",
+      "build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so",
+      "--tool-artifact",
+      "build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so",
+      "--require-function",
+      "final_rmsnorm",
+      "--require-function",
+      "attention_finalize_phase",
+      "--require-function",
+      "qk_pv_partial_merge",
+      "--require-function",
+      "x_gamma",
+      "--require-function",
+      "x_gamma_0",
+      "--require-domain-owners"
+    ],
+    "capture_timeout_seconds": 120,
+    "alias_test": "timeout 120s python -m pytest -q tests/ut/ir/transforms/test_acc_row_trim_bridge.py tests/ut/ir/transforms/test_acc_row_trim_proof_context.py tests/ut/ir/transforms/test_static_row_descriptor_bridge.py tests/ut/ir/transforms/test_runtime_valid_broadcast.py tests/ut/ir/transforms/test_runtime_valid_cast.py tests/ut/ir/transforms/test_gm_scalar_staging.py",
+    "alias_test_log": "build-py314/review-repairs-20261116/acc-row-trim-alias-gate.log"
+  },
+  "historical_attempts": [
+    {
+      "log": "build-py314/review-repairs-20261116/acc-row-trim-tests.log",
+      "passed": 29,
+      "failed": 3,
+      "seconds": 53.33,
+      "attribution": "Fixture core classification, eliminated constant-zero loop and actual SSA guard shape"
+    },
+    {
+      "log": "build-py314/review-repairs-20261116/acc-row-trim-combined-tests.log",
+      "passed": 136,
+      "failed": 1,
+      "seconds": 55.09,
+      "attribution": "Fresh deserialization identity versus old empty-execution parameter map"
+    },
+    {
+      "log": "build-py314/review-repairs-20261116/acc-row-trim-proof-context-tests.log",
+      "exit_code": 124,
+      "watchdog_seconds": 30,
+      "attribution": "Existing ScheduleTreeSize expanded expression DAG traversal; repaired without longer watchdog"
+    },
+    {
+      "log": "build-py314/review-repairs-20261116/acc-guard-buffer-verify-isolation.log",
+      "exit_code": 124,
+      "watchdog_seconds": 10,
+      "attribution": "Separate raw-DAG BufferIR/generic verifier cost; not repaired"
+    },
+    {
+      "log": "build-py314/review-repairs-20261116/acc-capture.log",
+      "attribution": "Runner invoked Python with timeout options; compiler not entered"
+    }
+  ],
+  "whole_model_capture": {
+    "receipt": "build-py314/review-repairs-20261116/qwen-acc-row-trim-qualified/receipt.json",
+    "receipt_sha256": "d3ca1552cf486be2bcccec3229cca95f185cc2373ce6dfd1fed2e7200bc5f0dd",
+    "log": "build-py314/review-repairs-20261116/acc-capture-corrected.log",
+    "library_revision": "b72c66d9df69ba5f11982b212530a255c050988d",
+    "model_sources": {
+      "config.py": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+      "constants.py": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+      "contract.py": "f16c43df64c42769dc365a820e5fbc0ff6e9c4d3ceada21660003869ccbeaf15",
+      "decode_fwd.py": "c2f7288ce1e45cbe9fe99d60484aed7a4cb6b4d7255701c4692692a7586dd6f3",
+      "decode_layer_a8w8.py": "4074dea2e5225818108bc088d06dc1717cb2706dd004255a96c05843ba7a5fb8",
+      "decode_ssn_draft.py": "55016c298d42f77500e87bccdf020dbc3e78210cbe1a4c526b97f59466d77705",
+      "decode_tq_draft.py": "9daf2b9b1851d646552cb75504f33aad4766569ff740462a16cdf06d99f352ec",
+      "greedy_sample.py": "8f3fc3e4c533abf01140b299cac35a11185c5151e92df5ba84327afdfa3fceb8",
+      "paged_attention_cce.py": "aafa0bc6dde1758f5518081f3814449e0ca93d137451b67065a06f4b8a375b2d",
+      "paged_attention_pypto.py": "4087a49cd0b6c6396d4fef859576a02f8c6b096e9b94f5b55560e1f4b238e843",
+      "prefill_fwd.py": "3e05b6f910055549d6f89c24743dc384acfb0134be059efe4351b72092824dcb",
+      "prefill_fwd_a8w8.py": "3f359f5b5147c025efa21152117f75291c07826d9675f0a5bc9b76c3a13c67ac",
+      "prefill_tq_draft.py": "0eb51c30bfce55eabbb3318d39542813aef8687858957e41dcfafd5b93c5d8da",
+      "rms_lm_head.py": "0cafe8226d85659afd9d1c19e3c9ae46269a109a7c3c501d846a366e3826e3ce",
+      "rope_qkv_regen.py": "17d868b0527f6555e48426d4fe74526c8d72b5126d442efd2727cf9078c94076",
+      "test_paged_attention_cce.py": "7098e2cea21d017ef6f13f0261b19d37a3af62103045543862cf51b99d793f6c",
+      "test_paged_attention_pypto.py": "9bf0d2ea18b5d995a846858df23c301e32ff79849a08a1bb4250101ff468f32d",
+      "topk_select.py": "60ddb96ee27846c0dfb23f95a59cf53701eed94cca88bf7b5eb3802a5aaef267",
+      "turboquant_kv.py": "d49c3cb4764e524b96be5bffd57cbf6138061e65c5b762ac4781741d2181bf7d",
+      "weights.py": "d23e15850574369379e8140eb7a97be000274250dd6369544cc2108132125bf5"
+    },
+    "configuration": {
+      "layers": 2,
+      "sequence": 128,
+      "batch": 1
+    },
+    "compile_seconds_inclusive": 6.754397766664624,
+    "compile_success": true,
+    "all_generated_leaves_pypto": false,
+    "domain_owner_counts": {
+      "verified_pypto_leaf": 20,
+      "task_control_owner_observed": 47,
+      "delegated": 12
+    },
+    "expected_ownership_failures": [],
+    "new_owned_leaf": "lm_head",
+    "previous_owned_delegated": [
+      19,
+      13
+    ],
+    "owned_delegated": [
+      20,
+      12
+    ]
+  },
+  "precision": {
+    "access_checks": "Declared logical transfer rectangles in preserved physical NZ packing; conservative whole-Acc/DDR enclosures retained",
+    "exact_dynamic_gm_exports": "unavailable; no false empty selector",
+    "native_burst_footprints_newly_proved": false,
+    "numerical_matmul_tested": false,
+    "source_protocol_or_allocation_algorithms_changed": false,
+    "alias_gate": "Both policies independently checked in the 151-test gate on identical disjoint concrete bases; may-not-alias requires disjoint distinct roots; no overlapping-layout validation claimed here"
+  },
+  "cost_contract": {
+    "proof": "Statement/type/data-observer DAG scans plus distinct expression/guard work per lexical proof context; repeated contexts can repeat queries",
+    "rows_or_visits_unfolded": false,
+    "schedule_metric": "Expanded occurrence weights preserved via memoized expression subtree weights; actual visited-node work separately counted",
+    "overflow": "Explicit cost_unproved; original guarded emission remains, saturated counts never certify a complete-candidate fit"
+  },
+  "remaining_limitations": [
+    "Original M1-M6 programme and complete whole-Qwen local ownership remain incomplete",
+    "Twelve Qwen leaves remain delegated: four mixed-valid ADD, tensor.write planning, reshape family, six mixed-peer leaves",
+    "General arithmetic, readiness, runtime Acc producers/carries, other stores, addressless/A5 targets and unknown metadata observers remain unsupported",
+    "Raw-DAG BufferIR/SSA/use-after-def verifier traversal remains a demonstrated separate cost issue",
+    "Flag-bearing CompleteOwnedInvocation generic expression traversal remains a separate latent follow-up, not the measured no-flag receipt timeout",
+    "Exact dynamic GM exports, exact native burst footprints, numerical/device validation remain distinct",
+    "Cross-core and inter-kernel synchronization construction excluded; existing manual owners preserved"
+  ],
+  "final_formatted_snapshot": {
+    "head": "d216d78a15fc810a3821903029d82db1e25e0270",
+    "source_sha256": {
+      "CMakeLists.txt": "bf6da65cc719b0f8a80fe85ff06a52f0b92b2be851d63f24cbabc6a7ff5e9484",
+      "include/pypto/backend/common/buffer_type_support.h": "a575d8f024675fc93e39f496c45af27be7771fea56cba926339fb42871395412",
+      "include/pypto/ir/transforms/utils/buffer_acc_trim_analysis.h": "1c66b123a5c0483b62c9638dcf89d76c316476b6680c8a40f6bc10bf4fcc7858",
+      "include/pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h": "c3498abccaf33c6765ba17a9f589044edbe4d659d7b6a4a92817842c2670612a",
+      "include/pypto/ir/transforms/utils/buffer_valid_analysis.h": "57094098bee828e9e5d66a20d061eabeeb534515888eee30c1a52363b1449c77",
+      "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "6d22e3f419a62d02fdf28299701822ebb370161f9a6005741fa571177c61ced1",
+      "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "674f9fc7c9b29fc38a35f28b01c735d5bdf095524693ac984c8fee92d3b4f43d",
+      "src/ir/transforms/utils/buffer_acc_trim_analysis.cpp": "67298e255ada98685575865523359b3d040d4dd539578069351781c0da72c1e1",
+      "src/ir/transforms/utils/conservative_sync_dataflow.cpp": "131ca0314b0507f50054a13cf75da8aa5a4861cacd20ae49112ea140d74c5b86",
+      "src/ir/transforms/utils/physical_sync_schedule.cpp": "e251871df53d0d09593f764a6a8260cc5677cea912e5ea8ec049a230486acda6",
+      "src/ir/transforms/utils/token_sync_lowering.cpp": "4a502d25ac403c45e42bf47b06a99d357d1acea9e6e50cf346b51b3edef89bab",
+      "tests/ut/ir/transforms/test_acc_row_trim_bridge.py": "f6162161dd7d5a8d4429cb1ae637d918e570e50c836f392b93d48b5083410814",
+      "tests/ut/ir/transforms/test_acc_row_trim_proof_context.py": "c0855cb97fab7724911247d8c6a1d1894fe497fa64f40e2f4e6f877fbbc1a3d0"
+    },
+    "extension": "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so",
+    "extension_sha256": "aa1363367ea6cca2c153962630ba2b27c7299f3ce875ae5355501c1ee621393e",
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "hook_log_sha256": "b1c12e7d7805d4a6b74a42dd137abc924281d6256d34ac7c9a3e90960e180640",
+    "validation": {
+      "command": "timeout120s python -m pytest -q <same six modules listed in test_results>",
+      "passed": 151,
+      "failed": 0,
+      "seconds": 106.14,
+      "log": "build-py314/review-repairs-20261116/acc-post-format-gate.log",
+      "log_sha256": "49bef51edb85239a6955858789be2ec9b8ee359d79ad2044b88ad8a5c71c290d",
+      "ctest_log": "build-py314/review-repairs-20261116/acc-final-ctest.log",
+      "hook_log": "build-py314/review-repairs-20261116/acc-and-write-design-hooks-final.log"
+    }
   }
 }

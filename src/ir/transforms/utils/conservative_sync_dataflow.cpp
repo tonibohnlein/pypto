@@ -24,6 +24,7 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/type.h"
 #include "src/ir/transforms/utils/native_sync_placement.h"
 #include "src/ir/transforms/utils/sync_scalar_readiness.h"
@@ -369,6 +370,7 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
   CHECK(function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV)
       << "Conservative synchronization requires an owned local AIC/AIV domain";
   backend::RequireLocalSyncExecutionContract(target);
+  RequireBufferRuntimeValid(function);
   Builder builder(function, target, children, eventful_children);
   builder.Build();
   auto exit = builder.Flow(function->body_, {});

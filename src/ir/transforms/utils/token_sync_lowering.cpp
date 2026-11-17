@@ -34,6 +34,7 @@
 #include "pypto/ir/sync.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/closed_prefix_sync.h"
 #include "src/ir/transforms/utils/native_sync_placement.h"
@@ -398,6 +399,7 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
                                     std::optional<int64_t> launch_count) {
   CheckLogicalSync(function);
   RequireBufferSyncScalarLayout(function);
+  RequireBufferRuntimeValid(function);
   if (!HasLogicalSync(function)) {
     PhysicalSyncRealization result;
     result.function = function;
