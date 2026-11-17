@@ -38,9 +38,12 @@ bool IsContiguousVectorReshape(const ir::BufferTypePtr& source, const ir::Buffer
 /// No storage identity, readiness or native metadata ownership is implied.
 std::optional<int64_t> LogicalContiguousVectorLength(const ir::TileTypePtr& type);
 
-/// A pure whole-vector axis map with actual logical valid prefix [r,1] <->
-/// [1,r]. Lowering must preserve the placed bytes and independent metadata
-/// objects; this does not admit dynamic addressless native reshape.
+/// A pure whole-vector axis map [r,1] <-> [1,r], or a same-orientation
+/// identity retaining physical shape/layout and both actual valid dimensions.
+/// This remains the existing FP32 contiguous-vector geometry (physical L is a
+/// positive multiple of eight). Callers must prove original storage provenance
+/// and preserve the prefix axis for an identity. No dynamic addressless native
+/// reinterpretation or arbitrary two-dimensional reshape is implied.
 bool SupportsLogicalContiguousVectorReshape(const ir::CallPtr& call);
 
 /// Static native view forms, with every intermediate descriptor already in IR.

@@ -111,7 +111,22 @@ bool SupportsLogicalContiguousVectorReshape(const ir::CallPtr& call) {
   if (!length || LogicalContiguousVectorLength(target) != length) return false;
   const auto a = ir::tile_view_semantics::GetEffectiveTileView(*source);
   const auto b = ir::tile_view_semantics::GetEffectiveTileView(*target);
-  if (a.blayout == b.blayout) return false;
+  if (a.blayout == b.blayout) {
+    // An identity is still the existing qualified contiguous vector, not an
+    // arbitrary same-byte rectangle. Preserve every physical axis and its
+    // actual logical valid extent; stride/zero-offset proofs come from length.
+    if (a.slayout != b.slayout || a.fractal != b.fractal || a.pad != b.pad || a.compact != b.compact)
+      return false;
+    for (size_t axis = 0; axis < source->shape_.size(); ++axis)
+      if (!ir::structural_equal(source->shape_[axis], target->shape_[axis])) return false;
+    const auto& av = a.valid_shape.empty() ? source->shape_ : a.valid_shape;
+    const auto& bv = b.valid_shape.empty() ? target->shape_ : b.valid_shape;
+    if (av.size() != 2 || bv.size() != 2) return false;
+    const size_t active_axis = a.blayout == ir::TileLayout::col_major ? 0 : 1;
+    const auto fixed = ir::As<ir::ConstInt>(av[1 - active_axis]);
+    return fixed && fixed->value_ == 1 && ir::structural_equal(av[0], bv[0]) &&
+           ir::structural_equal(av[1], bv[1]);
+  }
   const auto& av = a.valid_shape.empty() ? source->shape_ : a.valid_shape;
   const auto& bv = b.valid_shape.empty() ? target->shape_ : b.valid_shape;
   if (av.size() != 2 || bv.size() != 2) return false;
