@@ -306,10 +306,13 @@ def interpret(
             ir.get_op("buffer.adds").name,
             ir.get_op("buffer.recip").name,
             ir.get_op("buffer.rsqrt").name,
+            ir.get_op("buffer.sqrt").name,
+            ir.get_op("buffer.muls").name,
             ir.get_op("buffer.exp").name,
             ir.get_op("buffer.row_expand_sub").name,
             ir.get_op("buffer.row_expand_div").name,
             ir.get_op("buffer.row_expand_mul").name,
+            ir.get_op("buffer.col_expand_mul").name,
         }:
             reads, writes, pipe = _vector_effects(name, args, access)
         else:

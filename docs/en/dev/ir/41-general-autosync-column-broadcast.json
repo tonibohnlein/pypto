@@ -1,0 +1,110 @@
+{
+  "baseline_revision": "da5073e888469615cbf78b0d1fd785b4c8011d28",
+  "status": "accepted; build, semantic tests, strict whole-model capture and configured checks passed",
+  "milestone": "Shared operation qualification, column broadcast; broader milestones remain incomplete",
+  "source_hashes": {
+    "docs/en/dev/ir/41-general-autosync-architecture-plan.md": "489cb6bb9b6e1571869e83203fc5877200b12fd76dda6303253f9f21bda33d13",
+    "docs/zh/dev/ir/41-general-autosync-architecture-plan.md": "a3ccd319c0f771b9c7dfe4852043e83882292a00fc3b3a62678bc29226bdc0b4",
+    "include/pypto/backend/common/buffer_row_recipes.h": "6b89bf419ec8367bd2c9e58dbaf6a002cda0f90f68bcdf8b903a9ba03e364422",
+    "src/backend/common/buffer_row_recipes.cpp": "ffb7b57c8c3d1e60ef607edbf8947fea6cd581fcea3437279fd321772df9234b",
+    "src/backend/common/buffer_sync_contract.cpp": "dea1f9f8d1843603cef5f8fd4be291a0daf2f8a766a09f44bdc2ae6f0ab2d94e",
+    "src/ir/op/buffer_ops/row.cpp": "f2863f8fe28006578b9b358fdb55a9581edbe25f2cdb074254ad9cb5f468a8aa",
+    "tests/ut/ir/operators/test_buffer_row_recipes.py": "efd1ef51b94689bab0837e53888e27cb67521acefe49b68c411d4e7977452b4c",
+    "tests/ut/ir/transforms/sync_matmul_oracle.py": "4af949c46ec0a5cd0a8dabcb6a48ed6adc410d4aed4ba4f1ad632e4f3601551d",
+    "tests/ut/ir/transforms/test_row_sync_analysis.py": "e783df56c3df9a85690a6ff1a6f64cdadb594913e5bfd43ee91af55afa17990f"
+  },
+  "extension_sha256": "0e81169a55eede5de4b6010d8e0e52b090a45a9cea9d0d692f0c0a58903e461d",
+  "native": {
+    "revision": "5487a6b0",
+    "headers": {
+      "TColExpandBinOp.hpp": "00bf43def423bd0701b28ea78784b64ce988f2a7f2e00275f7e9f281c00855ab",
+      "TColExpandMul.hpp": "76a3eb7be75560f5ef909ecfad9c61d9a8ac839b6cf80d8a309f74a7f5d386b8"
+    },
+    "contract": "A2/A3 fullvalid aligned FP32[M,N] and rowmajor[1,N] carrier; M<=255,N<=2040,N%8=0; no hidden scratch/events; matrix/output exactalias or disjoint; output/carrier disjoint"
+  },
+  "validation": {
+    "focused": "80passed; tests-qualified.log after explicit BufferType refinement",
+    "regression": "198passed6 inherited warnings75.42s; regression.log",
+    "commands": [
+      "cmake --build build-py314 --parallel 1",
+      "python -m pytest -q --require-ptoas tests/ut/ir/operators/test_buffer_row_recipes.py tests/ut/ir/transforms/test_row_sync_analysis.py",
+      "python -m pytest -q --require-ptoas tests/ut/ir/operators/test_buffer_row_recipes.py tests/ut/ir/transforms/test_row_sync_analysis.py tests/ut/ir/transforms/test_compact_sync_analysis.py tests/ut/ir/transforms/test_nested_phase_sync.py tests/ut/ir/transforms/test_qwen_prefill_production.py tests/ut/ir/transforms/test_rsqrt_buffer_sync.py tests/ut/ir/transforms/test_sync_operation_contract.py tests/ut/ir/transforms/test_conservative_sync_child_commands.py"
+    ],
+    "scope": "Independent original Buffer byte accesses, retained covers/closure, all event queries, sampled selectors, command matching/reuse/order, optional PTOAS C++ (required in these runs). No device execution."
+  },
+  "whole_qwen": {
+    "receipt_path": "build-py314/col-expand-contract/qwen-prefix-final/receipt.json",
+    "sha256": "a3c9ed1b81663a8c884399643b16da0969b4eae6896e2c6d756c4dad6b64de0f",
+    "command": [
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_qwen_whole_model.py",
+      "--library",
+      "/home/toni/work/pypto3/pypto-lib",
+      "--output",
+      "build-py314/col-expand-contract/qwen-prefix-final",
+      "--layers",
+      "2",
+      "--policy",
+      "conservative_prefix",
+      "--require-function",
+      "down_proj",
+      "--require-function",
+      "gate_up_proj",
+      "--require-function",
+      "kv_proj",
+      "--require-function",
+      "mlp_out_cast",
+      "--require-function",
+      "mlp_out_cast_0",
+      "--require-function",
+      "mlp_out_seed",
+      "--require-function",
+      "out_proj_aic",
+      "--require-function",
+      "q_proj",
+      "--require-function",
+      "save_prefill_last_token_group",
+      "--require-function",
+      "save_prefill_last_token_single",
+      "--require-function",
+      "silu",
+      "--tool-artifact",
+      "build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas",
+      "--tool-artifact",
+      "build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so",
+      "--tool-artifact",
+      "build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so",
+      "--require-function",
+      "final_rmsnorm"
+    ],
+    "compile_success": true,
+    "required_name_failures": [],
+    "owned": 12,
+    "total_cpp_leaves": 32,
+    "new_owner": "final_rmsnorm",
+    "policy": "conservative_prefix",
+    "guarantee": "Coverage; not minimum demands for conservative plans."
+  },
+  "artifacts": {
+    "build-py314/col-expand-contract/build.log": "9080e69b151cd9d696ffa5739e8aaa9dec81f64587d066314eae81808caab44e",
+    "build-py314/col-expand-contract/build-final.log": "ac5253031d66b7027b623f17b61a01f408d4f33010c20754d012c7898c8ae88a",
+    "build-py314/col-expand-contract/tests.log": "7c3b11222444f08e99f29cfdd8e4e945227bc826ea168e74ebe7e97f29d20dd6",
+    "build-py314/col-expand-contract/tests-final.log": "e73b0c13e487f239f7e5e45b6033537f709a336fcc9874c5b540f702d0bb37f3",
+    "build-py314/col-expand-contract/tests-accepted.log": "86814c7708b22808ed81cb7a27186b228c826d13fc6850a46c847c235d597121",
+    "build-py314/col-expand-contract/tests-final-source.log": "daf64ddf3dbd90593e72e3abd0f1acf5015faf2e5588ba6aadd050d969140122",
+    "build-py314/col-expand-contract/regression.log": "487c6b31dcb6378f50b4166ce9b1c3b03a4d19c3b9b36ab25d616e09ca81632d",
+    "build-py314/col-expand-contract/pyright-resolved.json": "d8691bf0d3a9d09c385f87f64e136aecfe3134974e85ae0a996fe6bcb5f3593d",
+    "build-py314/col-expand-contract/precommit.yaml": "4b6d55a20758bb32cf2f0d8f04b0888704de839e076fea3850fc32a831b3b8fb",
+    "build-py314/col-expand-contract/hooks-qualified.log": "2b62d659dd4b75ba968b9871dceecb9d7cde89615ba4d73151fbf6ad8eb47bee",
+    "build-py314/col-expand-contract/tests-qualified.log": "6fadbf3932775a80b1a7dedcbcab64be9efeada0e802bd3264870e550fdb6726"
+  },
+  "review": "Independent reviewer accepted final nine-file diff, pending successful final checks; optional PTOAS portability fixed. No kernel-name production dispatch introduced.",
+  "remaining": {
+    "singleton_GM": "Needs packed-column transfer or qualified padded partialvalid mapping, not descriptor-only admission.",
+    "runtime_column": "Joint descriptor/native recipe/validity/footprint contract needed.",
+    "rank1_index_load": "Scalar execution/visibility/readiness and address contract needed.",
+    "child_composition": "Eventful matching, joint palettes, pending effects and crossvisit rearming still unqualified.",
+    "paired_transport": "Existing tpush/tpop publication/acquisition/release contract required.",
+    "whole_model": "Not wholly PyPTO-owned; defaults unchanged."
+  },
+  "check_environment": "Pinned Python3.11 hook dependencies; project pyright options retained with paths resolved relative to build config and existing dependency/stub paths. Initial environment failures retained in hooks.log/hooks-final.log/hooks-resolved.log; hooks-qualified.log passed."
+}

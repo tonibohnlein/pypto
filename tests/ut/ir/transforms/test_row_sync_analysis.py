@@ -200,6 +200,48 @@ def test_original_softmax_selects_pypto_and_preserves_payloads():
     assert len(interpret(original)[1]) == 7
 
 
+@pytest.mark.parametrize("rows,columns", [(8, 8), (16, 64), (32, 128)])
+@pytest.mark.parametrize("visits", [1, 3])
+def test_column_broadcast_uses_shared_buffer_contract_and_exact_order(rows, columns, visits, tmp_path):
+    # This family repeats a row carrier across matrix rows. It is deliberately
+    # distinct from row_expand's column-major carrier and implicit scratch.
+    program = pl.parse_program(f"""
+@pl.program
+class ColumnBroadcast:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[{rows}, {columns}], pl.FP32],
+               scale: pl.Tensor[[1, {columns}], pl.FP32],
+               out: pl.InOut[pl.Tensor[[{rows}, {columns}], pl.FP32]]
+    ) -> pl.Tensor[[{rows}, {columns}], pl.FP32]:
+        for visit in pl.range({visits}):
+            x = pl.load(a, [0, 0], [{rows}, {columns}])
+            carrier = pl.load(scale, [0, 0], [1, {columns}])
+            result = pl.col_expand_mul(x, carrier)
+            out = pl.store(result, [0, 0], out)
+        return out
+""")
+    functions = []
+    for enabled in [False, True]:
+        with passes.PassContext([], enable_pypto_autosync=enabled, autosync_disjoint_gm=True):
+            lowered = PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(program)
+        function = lowered.get_function("kernel")
+        assert function is not None
+        functions.append(function)
+    original, emitted = functions
+    assert original.ir_stage == ir.FunctionIRStage.Buffer
+    assert dict(emitted.attrs)[PYPTO_AUTOSYNC_ATTR]
+    retained = testing.analyze_placed_sync(original, True)
+    validate(original, retained)
+    run_physical(original, emitted, range(6))
+    text = codegen.PTOCodegen().generate(ir.Program([emitted], "ColumnBroadcast", emitted.span))
+    assert "pto.tcolexpandmul" in text
+    if find_ptoas_binary() is not None:
+        source, target = tmp_path / "column.pto", tmp_path / "column.cpp"
+        source.write_text(text)
+        _run_ptoas(str(source), str(target), ["--pto-level=level3", "--pto-arch=a2"])
+        assert "TCOLEXPANDMUL" in target.read_text()
+
+
 @pytest.mark.parametrize("original_example", [False, True])
 def test_row_cpp_generation_and_ptoas_delegation(original_example, tmp_path):
     if find_ptoas_binary() is None:
@@ -236,7 +278,7 @@ def test_row_cpp_generation_and_ptoas_delegation(original_example, tmp_path):
 
 
 @pytest.mark.parametrize("name,inputs", [("rms_norm", 3), ("layer_norm", 4)])
-def test_normalization_frontend_boundary_remains_explicit(name, inputs):
+def test_normalization_frontend_uses_qualified_recipe_or_explicit_refusal(name, inputs):
     kernel = load_example("03_normalization.py", name)
     args = [torch.empty(32, 64), *[torch.empty(1, 64) for _ in range(inputs - 2)], torch.empty(32, 64)]
     with passes.PassContext(
@@ -248,8 +290,16 @@ def test_normalization_frontend_boundary_remains_explicit(name, inputs):
     ):
         program = kernel.lower(*args, config=RunConfig(arch=BackendType.Ascend910))
     function = next(f for f in program.functions.values() if f.func_type == ir.FunctionType.AIV)
-    assert not dict(function.attrs)[PYPTO_AUTOSYNC_ATTR]
-    assert "physically placed Buffer IR" in dict(function.attrs)[AUTOSYNC_FALLBACK_REASON_ATTR]
+    if name == "rms_norm":
+        assert dict(function.attrs)[PYPTO_AUTOSYNC_ATTR]
+        with passes.PassContext([], enable_buffer_ir=True, memory_planner=passes.MemoryPlanner.PYPTO):
+            original_program = kernel.lower(*args, config=RunConfig(arch=BackendType.Ascend910))
+        original = next(f for f in original_program.functions.values() if f.func_type == ir.FunctionType.AIV)
+        validate(original, testing.analyze_placed_sync(original, True))
+        run_physical(original, function, range(6))
+    else:
+        assert not dict(function.attrs)[PYPTO_AUTOSYNC_ATTR]
+        assert "physically placed Buffer IR" in dict(function.attrs)[AUTOSYNC_FALLBACK_REASON_ATTR]
 
 
 @pytest.mark.parametrize("op", ["row_sum", "row_max"])

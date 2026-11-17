@@ -140,7 +140,15 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
     // is a different recipe and is rejected by shared call validation.
     result.audited_signal_free_variant_ = true;
   }
-  if (const auto row = FindBufferRowRecipe(call->op_->name_); row && !row->reduction) {
+  if (IsOp(call, "buffer.col_expand_mul")) {
+    CHECK(target == "a2a3") << "Column broadcast requires a qualified native implementation";
+    // Full-valid FP32 row-major TColExpandMul uses TColExpandBinaryNormMode:
+    // VMUL reads its explicit matrix/carrier and writes its explicit output.
+    // No temporary storage or numbered events are used by that variant.
+    // pto-isa 5487a6b0: a2a3/TColExpandMul.hpp and TColExpandBinOp.hpp.
+    result.audited_signal_free_variant_ = true;
+  }
+  if (const auto axis = FindBufferAxisRecipe(call->op_->name_); axis && !axis->reduction && axis->axis == 1) {
     CHECK(target == "a2a3" && (IsOp(call, "buffer.row_expand_sub") || IsOp(call, "buffer.row_expand_div") ||
                                IsOp(call, "buffer.row_expand_mul")))
         << "Row broadcast implicit effects require a qualified native implementation";

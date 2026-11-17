@@ -101,7 +101,8 @@ def test_row_recipe_requires_matching_row_geometry(suffix):
     arguments = _args(suffix)
     column_index = 2 if suffix in _REDUCTIONS else 1
     arguments[column_index] = _buffer("column", column=True, valid_shape=[15, 1])
-    with pytest.raises(ValueError, match="preserve physical and valid rows"):
+    error = "row-major" if suffix == "col_expand_mul" else "preserve physical and valid rows"
+    with pytest.raises(ValueError, match=error):
         _call(suffix, arguments)
 
 
@@ -175,6 +176,7 @@ def test_broadcast_can_reuse_matrix_but_not_its_repeated_column(suffix):
     assert diagnostics and any("disjoint" in diagnostic.message for diagnostic in diagnostics)
 
 
+<<<<<<< HEAD
 _COLUMN_REDUCTIONS = ("col_sum", "col_max", "col_min", "col_prod")
 _COLUMN_BROADCASTS = tuple(f"col_expand_{op}" for op in ("add", "sub", "mul", "div", "max", "min"))
 _COLUMN_RECIPES = (*_COLUMN_REDUCTIONS, *_COLUMN_BROADCASTS)
