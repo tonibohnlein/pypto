@@ -316,6 +316,7 @@ nav:
           - Regional Sync Architecture: en/dev/ir/39-regional-sync-architecture.md
           - Compact Sync Construction and Completion: en/dev/ir/40-sync-construction-and-completion.md
           - General Autosync Integration: en/dev/ir/41-general-autosync-architecture-plan.md
+          - Runtime Valid Broadcast: en/dev/ir/41-general-autosync-runtime-valid.md
       - Passes:
           - en/dev/passes/index.md
           - en/dev/passes/00-pass_manager.md

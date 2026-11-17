@@ -21,7 +21,7 @@ from collections.abc import Sequence
 
 from pypto import ir
 
-from .sync_logical_oracle import value
+from .sync_logical_oracle import Token, value
 from .sync_matmul_oracle import address_set, protected_accumulator_pairs
 from .test_finite_sync_analysis import closure
 
@@ -229,6 +229,12 @@ class ClosedCommands:
         elif name == opname("buffer.copy"):
             pipe, reads, writes = ir.PipeType.MTE1, self.bytes(args[0]), self.bytes(args[1])
             signature = name, self.signature(args[0]), self.signature(args[1])
+        elif name == opname("buffer.col_expand_mul"):
+            # A row carrier is read repeatedly; the footprint is the explicit
+            # matrix plus carrier, with no row-expand implicit scratch.
+            pipe = ir.PipeType.V
+            reads, writes = self.bytes(args[0]) | self.bytes(args[1]), self.bytes(args[2])
+            signature = name, *(self.signature(arg) for arg in args)
         elif name in (opname("buffer.matmul"), opname("buffer.matmul_acc")):
             pipe = ir.PipeType.M
             reads, writes = self.bytes(args[0]) | self.bytes(args[1]), self.bytes(args[2])
@@ -276,9 +282,13 @@ class ClosedCommands:
         call = statement.expr
         assert isinstance(call, ir.Call)
         if call.op.name == opname("sync.wait"):
-            source, publication = env[call.args[0]]
-            self.used_tokens.add(publication)
-            self.acquire(source, ir.PipeType(call.kwargs["dst_pipe"]), publication)
+            fact = env[call.args[0]]
+            source, publication = (fact.pipe, fact.node) if isinstance(fact, Token) else fact
+            # A completed fact has no publication and imposes no ordering.
+            # Carried direct-token recipes may use it on the first/empty visit.
+            if publication is not None:
+                self.used_tokens.add(publication)
+                self.acquire(source, ir.PipeType(call.kwargs["dst_pipe"]), publication)
         elif call.op.name in _BARRIERS or call.op.name in (
             opname("system.set_flag"),
             opname("system.wait_flag"),
@@ -350,8 +360,9 @@ class ClosedCommands:
     def run(self):
         self.execute(self.function.body, dict(self.env))
         assert not self.live, "outstanding flags at invocation exit"
-        if self.logical_records:
-            assert set(self.publications) == self.used_tokens, "unconsumed logical token"
+        # Immutable SSA completion facts may be unused or have several uses.
+        # They are not consuming hardware notifications. Physical closure is
+        # checked independently by the strict live-flag inventory above.
         order = closure(self.vertices, self.edges)
         self.order = order
         assert all(a != b for a, b in order), "cyclic command graph"

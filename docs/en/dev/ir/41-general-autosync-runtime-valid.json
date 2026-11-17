@@ -1,0 +1,121 @@
+{
+  "gate": "runtime rows / fixed full columns FP32 col_expand_mul",
+  "base_revision": "e5544af5dbfd368ba4853d464714a435eceb3eb3",
+  "working_tree_source_hashes": {
+    "include/pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h": "753c1820a3b64e017045f27a8a1e7efe7653a224ba257decf9a9673f0c8a9530",
+    "include/pypto/ir/transforms/utils/buffer_valid_analysis.h": "fc7b645aebff311d7fe9cef6c76df66658eea573b4646783e36728bb5a0f2b67",
+    "src/backend/common/buffer_row_recipes.cpp": "cabfc0d8daa02c77cb26b4c6e0d71dd1bda2fc0fec4b122a3dd1f88d60326df2",
+    "src/backend/common/buffer_sync_contract.cpp": "e895e82805a3309a9b432814259f8b3208d90d0117dc6a5536aae87ca265f1a4",
+    "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "fcab0c335f0280723db6b0357d678457d4d221aaf92ee25d55189192ab9958f8",
+    "src/ir/verifier/verify_buffer_ir.cpp": "f0aba16cf0d32cda4b2d8ec584953f66c24c1f889e5674afdcd904f5e11de85e",
+    "src/codegen/pto/pto_buffer_codegen.cpp": "222251ed2195747bbb84064c51d24adcee93104161819227a79cbdf4b81f5c18",
+    "python/pypto/debug/torch_codegen.py": "e9a78c9128f85cb01bcb735cc63b348e05e40c9267dd649e6a6fe7bd35994270",
+    "tests/ut/ir/transforms/test_runtime_valid_broadcast.py": "dba433a1904e37d3482081bf356b288ad857d750bbb150ea4e8f69c9fe6828ba",
+    "tests/ut/ir/transforms/sync_closed_command_oracle.py": "e0858f64580c91dea13a72f9e7178d2c2833242a4b877ce285afac4905266071"
+  },
+  "build": "Parent-owned integrated Linux Release build in build-py314; binary also contains concurrent reviewed child/ownership work. This is not an isolated clean-commit rebuild; the final aggregate receipt pins the complete batch.",
+  "review": "Independent reviewer accepted design and final source including atomic SSA CanProve(Eq), unsupported-guard handling, A2/A3 target gate and immutable-unused-fact oracle correction; parent final integrated tests apply.",
+  "native_revision": "5487a6b0",
+  "native_headers": {
+    "build-py314/col-expand-contract/TColExpandBinOp.hpp": "00bf43def423bd0701b28ea78784b64ce988f2a7f2e00275f7e9f281c00855ab",
+    "build-py314/col-expand-contract/TColExpandMul.hpp": "76a3eb7be75560f5ef909ecfad9c61d9a8ac839b6cf80d8a309f74a7f5d386b8"
+  },
+  "commands": [
+    "cmake --build build-py314 --parallel 2",
+    "python -m pytest -q --require-ptoas tests/ut/ir/transforms/test_runtime_valid_broadcast.py"
+  ],
+  "results": {
+    "final_focused": "14 passed in 0.94s",
+    "device": "not run",
+    "final_focused_log": "build-py314/milestone-loop-20261115/runtime-final.log",
+    "final_focused_log_sha256": "7b399b70addff27043f10655cb2e6b11ccca711dec3e0fffe63f756eb7bfa845",
+    "hooks": "All configured hooks passed, including full-project pyright",
+    "hooks_log": "build-py314/milestone-loop-20261115/hooks-accepted.log",
+    "hooks_log_sha256": "b1c12e7d7805d4a6b74a42dd137abc924281d6256d34ac7c9a3e90960e180640",
+    "integrated_focused": "183 passed (runtime + retained child + whole-module ownership gate)",
+    "integrated_focused_log": "build-py314/milestone-loop-20261115/accepted-gate.log",
+    "integrated_focused_log_sha256": "ab8bdf1f633e599d00ea67b3406722ee2a7b7bbfb1c964291e039c114e3286fc"
+  },
+  "guarantees": {
+    "actual_metadata_relations": "use-site evidence; descriptor -1 never equality",
+    "accesses": "sound whole-memory-space conservative effects; bounded active-byte checks",
+    "dynamic_storage_selectors": "unavailable",
+    "valid_range": "existing operation input precondition, not compiler-proved caller upper bound"
+  },
+  "remaining": [
+    "dynamic reduction and contiguous valid-axis reinterpretation",
+    "mixed full/partial elementwise operation contract in original Qwen post-RMSNorm",
+    "slot/borrowed metadata ownership",
+    "native device validation"
+  ],
+  "unchanged": [
+    "allocation algorithms",
+    "six-ID pool",
+    "protocol selection",
+    "expert kernels",
+    "zero-inner-body barriers",
+    "native same-pipe exemptions"
+  ],
+  "milestone": "M2 shared operation/metadata qualification feeding M3",
+  "binary_sha256": "3c57d9cca1afc89bbf996adcc88616a02f0bc056c631372ad376712d43979406",
+  "environment": {
+    "python_executable": "/usr/bin/python3",
+    "python_version": "Python 3.14.7",
+    "extension": "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so",
+    "build_workers": 2,
+    "tests_workers": 1,
+    "host_only": true
+  },
+  "test_coverage": {
+    "rows": [
+      0,
+      1,
+      7,
+      8
+    ],
+    "visits_replay": [
+      [
+        1,
+        1
+      ],
+      [
+        3,
+        1
+      ],
+      [
+        3,
+        2
+      ]
+    ],
+    "choices": [
+      0,
+      1
+    ],
+    "bounded_executions": 24,
+    "modeled_effects": "independent actual active bytes, separately checked against conservative selected memory-space effects",
+    "token_lowering": "exact full payload event-order equality; unused immutable record sites may disappear; physical matching and causal reuse checked separately",
+    "trip_count_scaling": [
+      3,
+      1000000,
+      2000000
+    ],
+    "scaling_result": "equal retained prefix counters and static payload-site counts",
+    "unsupported_guards": "neither branch arm receives facts from unchecked arithmetic"
+  },
+  "owned_paths": [
+    "include/pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h",
+    "include/pypto/ir/transforms/utils/buffer_valid_analysis.h",
+    "src/backend/common/buffer_row_recipes.cpp",
+    "src/backend/common/buffer_sync_contract.cpp",
+    "src/ir/transforms/lower_tile_to_buffer_pass.cpp",
+    "src/ir/verifier/verify_buffer_ir.cpp",
+    "src/codegen/pto/pto_buffer_codegen.cpp",
+    "python/pypto/debug/torch_codegen.py",
+    "tests/ut/ir/transforms/test_runtime_valid_broadcast.py",
+    "tests/ut/ir/transforms/sync_closed_command_oracle.py",
+    "docs/en/dev/passes/58-lower_tile_to_buffer.md",
+    "docs/zh/dev/passes/58-lower_tile_to_buffer.md",
+    "docs/en/dev/ir/41-general-autosync-runtime-valid.md",
+    "docs/zh/dev/ir/41-general-autosync-runtime-valid.md"
+  ]
+}

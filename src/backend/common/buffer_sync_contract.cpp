@@ -142,9 +142,12 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
   }
   if (IsOp(call, "buffer.col_expand_mul")) {
     CHECK(target == "a2a3") << "Column broadcast requires a qualified native implementation";
-    // Full-valid FP32 row-major TColExpandMul uses TColExpandBinaryNormMode:
-    // VMUL reads its explicit matrix/carrier and writes its explicit output.
-    // No temporary storage or numbered events are used by that variant.
+    // FP32 row-major TColExpandMul selects NormMode for fixed full columns
+    // and CountMode for dynamic valid metadata. Both issue VMUL over explicit
+    // inputs/output without temporary storage or numbered events. CountMode
+    // sets the column count mask, loops active rows and restores mask state.
+    // Runtime metadata relations and a positive-row guard are checked at the
+    // function boundary by BufferRuntimeValidAnalysis; -1 fields prove none.
     // pto-isa 5487a6b0: a2a3/TColExpandMul.hpp and TColExpandBinOp.hpp.
     result.audited_signal_free_variant_ = true;
   }
