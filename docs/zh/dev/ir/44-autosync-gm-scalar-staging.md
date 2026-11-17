@@ -1,9 +1,10 @@
-# GM 标量暂存：操作契约子门禁提案
+# GM 标量暂存：操作契约检查点
 
-状态：架构已获准实施，尚待实现与语义验收。Native 指令正确性仍是已有
+状态：有界实现已通过源码审查和首次一致的 53 项主机测试。格式化后一致构建、
+修正后的操作门及固定整模型捕获也通过；最终 hooks 与接受后的提交发布待完成。Native 指令正确性仍是已有
 selected-TLOAD 契约前提，不是新增的硬件证明。这扩展[架构计划](41-general-autosync-architecture-plan.md)
 的 M2/M3，并复用已确认的[本地标量桥接](43-autosync-value-and-scalar-contracts.md)。
-不宣称完整 Qwen 所有权改善或设备验证。
+整模型主机捕获的局部所有权从 17 增至 19；不宣称完整 Qwen 所有权或设备验证。
 
 ## 构造与语义
 
@@ -22,7 +23,7 @@ selected-TLOAD 契约前提，不是新增的硬件证明。这扩展[架构计�
 原 GM 读取仍为单个元素。MTE2 到 S 的服务保护 DMA 完成，随后本地阻塞读取
 使原 SSA 就绪。多次访问的载体覆盖必须满足已有物理重用证明。
 
-起初仅接收规范化的直接赋值。丢弃或嵌套读取、缺少原语句切点的有副作用 while
+实现仅接收规范化的直接赋值。丢弃或嵌套读取、缺少原语句切点的有副作用 while
 条件、写入、其他数据类型/内核/目标或不可用的布局保持拒绝。不移动条件内的读取，
 不遗漏 while 最后一次 false 求值。跨核发布或轮询状态仍需要原协议可见性契约；
 DMA 不会凭空建立远程发布保证。
@@ -31,7 +32,7 @@ DMA 不会凭空建立远程发布保证。
 
 PTO-ISA 固定版本为 `5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f`。
 [TLOAD 文档](https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/docs/isa/TLOAD.md)
-支持 A2/A3 Vec INT32 同布局路径。该版本 `tload_common.hpp` 的
+支持 A2/A3 Vec INT32 同布局路径。该版本 `include/pto/common/arch/memory/tload_common.hpp` 的
 `TLoadGm2ubNd2nd` 对源形状 `[1,1,1,1,1]` 和有效 `[1,1]` 计算一个四字节 burst；
 `TLoad.hpp` 的 `TLoadInstrGm2ubNative` 选择 `copy_gm_to_ubuf_align_b32`。
 
@@ -61,8 +62,10 @@ PTO codegen 保留一维 ABI，复用已有 tensor/partition-view、TLOAD 与 Ge
 保守效果覆盖 DDR 源与完整 Vec 载体，保留别名策略、原根与 scalar readiness。
 精确一维提取或 GM selector 缺失时必须显式不可用，不能变成空答案。
 保守覆盖不等同于精确最小物理 demands。不新增后端、Buffer 模型、分配算法、
-ID 池、admission 限制或 watchdog。关闭 autosync 时，必须验证现有下游所有者能
-同步新 transfer，否则只在明确支持的请求内构造。
+ID 池、admission 限制或 watchdog。只有启用 PyPTO autosync 与 Buffer IR，并显式选择 A2/A3 AIV 的
+`conservative_prefix` 时才构造候选。关闭任一开关时保留原 Functional 读取。
+选择 PTOAS planner 时，已暂存的 Buffer 程序仍委托物理所有权；实际下游 C++ 路径已测试。
+普通整函数准入拒绝时不发布部分候选。
 
 ## 验收门禁
 
@@ -77,3 +80,56 @@ ID 池、admission 限制或 watchdog。关闭 autosync 时，必须验证现有
 构造和保留状态应随静态读取点增长，而非 runtime 索引或循环次数。
 分别计量输入恢复、暂存、逻辑协议、物理实现与生成。单点暂存新增 DMA 及握手，
 因此不承诺设备提速。完整英文设计给出文件级责任和全部边界。
+
+## 已实现主机门与限制
+
+首次一致门在原 120 秒看门狗内 **53 项通过，耗时 0.86 秒**：
+
+```bash
+timeout 120s python -m pytest -q --require-ptoas \
+  tests/ut/ir/transforms/test_gm_scalar_staging.py
+```
+
+[回执](../../../en/dev/ir/44-autosync-gm-scalar-staging.json) 保留设计／原生依据并记录
+实现文件、日志与发布状态。门覆盖三个已有 planner、长度 1 和 9、索引 0／1／7／8、
+两种别名策略及符号一维长度。小执行保持同一函数，变化零／单／多次循环、跳过分支及
+计数器重置。实际正／负标量值控制原分支及本地写入。独立字节／命令解释器区分四字节
+GM 源与完整 32 字节 UB 写包络，检查结果值、覆盖、匹配、无环与因果物理复用。
+may-alias 执行包含允许重叠的 GM 根，不从不同指针名推断分离。
+
+三个 planner 均产生包含 TLOAD 与 GetValue 的真实 PTOAS C++。关闭 autosync 或
+Buffer 时保留原 `tensor.read`；丢弃读取和 INT64 保留整函数委托。runtime 次数不会复制
+载体或命令：夹具保留一个标量读点、含普通输入在内两个加载点，以及原两个循环。
+源秩、存储根、实际索引和标量 SSA 不变。
+
+传输仍是异步 DMA，加合格阻塞本地标量消费者，不是虚构单 pipe 标量操作。静态读取点
+需要私有载体，可能新增握手或保守顺序。不因此建立最小需求、最小 ID 或设备加速。
+此门不独立证明对等发布、原生缓存行为、任意有副作用 while 条件、INT64 中转或精确 GM
+边界导出。原 M1–M6 与完整 Qwen 所有权仍未完成。
+
+### 更广门禁与未修改整模型捕获
+
+格式化后一致构建通过。去重的广泛回归记录 **3,132 通过、两个失败、四个警告，
+430.90 秒**。两个失败只是过期 `rank-2` 诊断期望：一维 FP32 load/store 仍被新的
+INT32 单点精确诊断拒绝。仅修正期望诊断及说明。新的完整操作模块与 GM 暂存门
+**202 项通过，1.21 秒**。这些是分别的回执，不声称单次 3,134 项全绿。
+文档冻结后再执行最终 hooks。
+
+原两层、sequence 128、batch 1 的 Qwen 捕获生成全部 32 个叶 C++，包含时间 6.692 秒。
+报告 47 个观察到的任务控制所有者、**19 个 PyPTO 叶、13 个委托叶**。共享配方新增
+`token_embed_single` 和 `token_embed_group`；此前 17／15 保留为基线。该时间是一次
+描述性主机测量，不是设备或单独分析时间。
+
+首个剩余义务包括四个混合有效域 ADD 叶（`out_proj_aiv`、`out_proj_aiv_0`、
+`rms_recip`、`rms_recip_0`）、`qkpv_plan` 的 `tensor.write`、`rope_kv_cache` 的
+`tile.reshape`、`lm_head` 的 Acc 描述符，以及六个既有 GM pipe-buffer 类型尚未准入的
+混合对等叶：`qk_pv_partial_plan_aic`、`qk_pv_partial_plan_aiv`、
+`qk_pv_single_block_0_aic`、`qk_pv_single_block_0_aiv`、`qk_pv_single_block_aic`、
+`qk_pv_single_block_aiv`。首个诊断不等于算法失败或不可行证明。已有对等协议仍保留
+原所有者，不构造新的跨核同步。精确导出与原生资格仍独立。
+
+| 已建立结果 | 剩余前提或限制 | 合适表述 |
+| ---------- | -------------- | -------- |
+| 直接 INT32 GM 读取经普通 DMA 与本地 S 载荷降低 | 选定 TLOAD、原访问合法性及发布前提 | 可复用共享降低配方，不是新硬件定理 |
+| ABI、SSA、控制和保守载体包络通过有界检查 | 未支持读取仍委托，精确 GM 选择器不可用 | 显式策略下保守局部同步 |
+| 三个 planner 生成 C++，PyPTO 实际命令检查使用已有池 | 无设备或统一最优性结论 | 合格家族的主机可行性 |

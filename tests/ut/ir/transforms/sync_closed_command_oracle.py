@@ -87,7 +87,9 @@ class ClosedCommands:
         for i, parameter in enumerate(function.params):
             if isinstance(parameter.type, ir.TensorType):
                 shape = tuple(value(x, self.env) for x in parameter.type.shape)
-                assert len(shape) == 2
+                assert len(shape) in (1, 2)
+                if len(shape) == 1:
+                    shape = (1, shape[0])
                 self.storage[parameter] = (
                     "gm",
                     (tensor_bases or {}).get(i, i * 4096),
@@ -238,7 +240,20 @@ class ClosedCommands:
         rect = None
         if name in (opname("buffer.load"), opname("buffer.store")):
             rect = tuple(value(x, env) for group in args[1:3] for x in group.elements)
-            if name == opname("buffer.load"):
+            if name == opname("buffer.load") and len(args[0].type.shape) == 1:
+                # Original rank-one indexing supplies the concrete GM point.
+                # The selected nonaligned MTE2 load can write its UB dummy tail
+                # within the private 32-byte carrier; no adjacent GM bytes are
+                # read to obtain that alignment. These are different domains.
+                assert len(rect) == 2 and rect[1] == 1
+                assert list(args[3].type.shape) == [1, 8] and args[3].type.dtype == ir.DataType.INT32
+                rect = (0, rect[0], 1, 1)
+                pipe, reads, writes = (
+                    ir.PipeType.MTE2,
+                    self.bytes(args[0], rect),
+                    self.bytes(args[3], (0, 0, 1, 8)),
+                )
+            elif name == opname("buffer.load"):
                 pipe, reads, writes = ir.PipeType.MTE2, self.bytes(args[0], rect), self.bytes(args[3])
             else:
                 pipe = (
@@ -361,6 +376,11 @@ class ClosedCommands:
                 if name == opname("buffer.load"):
                     destination = self.bytes(args[3], (0, 0, rect[2], rect[3]))
                     source = reads
+                    if len(args[0].type.shape) == 1:
+                        # Deliberately poison inactive/dummy lanes: readiness
+                        # and values must rely only on the original GM point.
+                        for cell in writes - destination:
+                            self.scalar_memory[cell] = -987654321
                 else:
                     source = self.bytes(args[0], (0, 0, rect[2], rect[3]))
                     destination = writes

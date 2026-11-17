@@ -1525,8 +1525,10 @@ class TileToBufferMutator : public IRMutator {
           << "Internal error: malformed tile.load";
       CHECK_SPAN(GetIntKwarg(call->kwargs_, "cache", 0) == 0, call->span_)
           << "LowerTileToBuffer: non-default cache requires a Buffer transfer recipe";
+      const bool scalar_point = backend::SupportsLogicalBufferScalarTransfer(call);
       return Operation("buffer.load",
-                       {VisitExpr(call->args_[0]), VisitExpr(call->args_[1]), Valid(result), Handle(result)},
+                       {VisitExpr(call->args_[0]), VisitExpr(call->args_[1]),
+                        scalar_point ? VisitExpr(call->args_[3]) : Valid(result), Handle(result)},
                        call->span_);
     }
     if (IsOp(call, "tile.store")) {

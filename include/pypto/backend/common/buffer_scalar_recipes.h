@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 #include "pypto/ir/expr.h"
 #include "pypto/ir/type.h"
@@ -24,6 +25,14 @@ namespace pypto::backend {
 // readiness or allocation ownership is inferred from this descriptor proof.
 std::optional<uint32_t> BufferScalarPointOffset(const ir::BufferTypePtr& buffer, const ir::ExprPtr& indices);
 bool SupportsLogicalBufferScalar(const ir::CallPtr& call);
+// Narrow source ABI for point staging. This proves packed geometry, not input
+// address validity, external publication, alias disjointness or scalar readiness.
+bool IsBufferScalarGMSource(const ir::TensorTypePtr& tensor);
+bool SupportsBufferScalarTransfer(const std::vector<ir::ExprPtr>& args);
+bool SupportsLogicalBufferScalarTransfer(const ir::CallPtr& call);
+// Native aligned DMA may write a dummy tail inside the complete private
+// carrier. Its sound write enclosure is 32 bytes; only one GM element is read.
+constexpr uint64_t kBufferScalarCarrierBytes = 32;
 // tile.write mutates argument zero and returns that same storage. Final
 // placement must preserve the complete window, including rotating-slot state.
 bool LogicalScalarWriteSharesStorage(const ir::CallPtr& call, const ir::TypePtr& result_type);

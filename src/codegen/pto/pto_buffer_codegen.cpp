@@ -27,6 +27,7 @@
 #include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
+#include "pypto/backend/common/buffer_scalar_recipes.h"
 #include "pypto/backend/common/buffer_sync_contract.h"
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
@@ -115,6 +116,7 @@ std::string BufferTypeString(const ir::BufferTypePtr& type, const ir::Span& span
 }
 
 void CheckBufferTensorParameter(const ir::TensorTypePtr& tensor, const ir::Span& span) {
+  if (backend::IsBufferScalarGMSource(tensor)) return;
   CHECK_SPAN(tensor->shape_.size() == 2 && (backend::IsDenseBufferTransferDtype(tensor->dtype_) ||
                                             backend::IsCubeOperandDtype(tensor->dtype_)),
              span)
@@ -471,9 +473,14 @@ class BufferEmissionPreflight : public ir::IRVisitor {
       const auto buffer = As<ir::BufferType>(call->args_[load ? 3 : 0]->GetType());
       const auto tensor_type = As<ir::TensorType>(call->args_[load ? 0 : 3]->GetType());
       const auto tensor_columns = tensor_type ? As<ir::ConstInt>(tensor_type->shape_.back()) : nullptr;
+      const bool scalar_point = load && backend::SupportsBufferScalarTransfer(call->args_);
+      CHECK_SPAN(!scalar_point || (conversion_supported_ && function_->func_type_ == ir::FunctionType::AIV),
+                 call->span_)
+          << "Rank-one scalar point transfers require A2/A3 AIV execution";
       CHECK_SPAN(
-          (!backend::IsColumnVectorBufferGeometry(buffer) &&
-           (!tensor_columns || tensor_columns->value_ != 1)) ||
+          scalar_point ||
+              (!backend::IsColumnVectorBufferGeometry(buffer) &&
+               (!tensor_columns || tensor_columns->value_ != 1)) ||
               (conversion_supported_ && backend::SupportsPackedColumnBufferTransfer(tensor_type, buffer)),
           call->span_)
           << "Direct Buffer IR column transfers require the qualified A2/A3 packed singleton-column "

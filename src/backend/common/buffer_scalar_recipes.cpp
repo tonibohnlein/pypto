@@ -13,12 +13,15 @@
 
 #include <cstddef>
 #include <limits>
+#include <memory>
+#include <vector>
 
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memref.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 
 namespace pypto::backend {
@@ -39,6 +42,62 @@ std::optional<uint32_t> BufferScalarPointOffset(const ir::BufferTypePtr& buffer,
   const __int128 flat = __int128(point[0]) * buffer->shape_[1] + point[1];
   if (flat > std::numeric_limits<uint32_t>::max()) return std::nullopt;
   return static_cast<uint32_t>(flat);
+}
+
+bool IsBufferScalarGMSource(const ir::TensorTypePtr& tensor) {
+  if (!tensor || tensor->dtype_ != DataType::INT32 || tensor->shape_.size() != 1) return false;
+  const auto length = ir::As<ir::ConstInt>(tensor->shape_[0]);
+  const auto symbol = ir::As<ir::Var>(tensor->shape_[0]);
+  const auto scalar = symbol ? ir::As<ir::ScalarType>(symbol->GetType()) : nullptr;
+  if (!(length ? length->value_ > 0 : scalar && scalar->dtype_ == DataType::INDEX)) return false;
+  if (!tensor->tensor_view_) return true;
+  const auto& view = *tensor->tensor_view_;
+  if (view.layout != ir::TensorLayout::ND || view.pad != ir::PadValue::null ||
+      (!view.valid_shape.empty() &&
+       !ir::tile_view_semantics::ShapeExprListsEquivalent(view.valid_shape, tensor->shape_)))
+    return false;
+  if (view.stride.empty()) return true;
+  const auto stride = view.stride.size() == 1 ? ir::As<ir::ConstInt>(view.stride[0]) : nullptr;
+  return stride && stride->value_ == 1;
+}
+
+bool SupportsBufferScalarTransfer(const std::vector<ir::ExprPtr>& args) {
+  if (args.size() != 4) return false;
+  for (const auto& arg : args)
+    if (!arg) return false;
+  const auto source = ir::As<ir::TensorType>(args[0]->GetType());
+  const auto destination = ir::As<ir::BufferType>(args[3]->GetType());
+  const auto offsets = ir::As<ir::MakeTuple>(args[1]);
+  const auto valid = ir::As<ir::MakeTuple>(args[2]);
+  if (!IsBufferScalarGMSource(source) || !IsAlignedDenseVecBufferGeometry(destination) ||
+      destination->dtype_ != DataType::INT32 || destination->shape_ != std::vector<int64_t>{1, 8} ||
+      destination->valid_shape_ != std::vector<int64_t>{1, 1} || !offsets || offsets->elements_.size() != 1 ||
+      !valid || valid->elements_.size() != 1)
+    return false;
+  const auto extent = ir::As<ir::ConstInt>(valid->elements_[0]);
+  if (!offsets->elements_[0] || !valid->elements_[0]) return false;
+  const auto index_type = ir::As<ir::ScalarType>(offsets->elements_[0]->GetType());
+  if (!extent || extent->value_ != 1 || !index_type ||
+      !(index_type->dtype_ == DataType::INDEX || index_type->dtype_.IsSignedInt()))
+    return false;
+  const auto index = ir::As<ir::ConstInt>(offsets->elements_[0]);
+  const auto length = ir::As<ir::ConstInt>(source->shape_[0]);
+  // Symbolic indices retain the original defined tensor.read precondition.
+  // Do not manufacture an in-bounds predicate or silently clamp the address.
+  return !index || (index->value_ >= 0 && (!length || index->value_ < length->value_));
+}
+
+bool SupportsLogicalBufferScalarTransfer(const ir::CallPtr& call) {
+  if (!ir::IsOp(call, "tile.load") || call->args_.size() != 4) return false;
+  const auto shape = ir::As<ir::MakeTuple>(call->args_[2]);
+  const auto capacity =
+      shape && shape->elements_.size() == 1 ? ir::As<ir::ConstInt>(shape->elements_[0]) : nullptr;
+  const auto descriptor = StaticLogicalBufferDescriptor(call->GetType());
+  if (!capacity || capacity->value_ != 8 || !descriptor) return false;
+  // Existing flattened-load semantics keep tensor-side rank-one window
+  // coordinates while the physical tile descriptor is two-dimensional.
+  const auto carrier = std::make_shared<ir::Var>("scalar_carrier_geometry", descriptor, call->span_);
+  return SupportsBufferScalarTransfer({call->args_[0], call->args_[1], call->args_[3], carrier});
 }
 
 bool SupportsLogicalBufferScalar(const ir::CallPtr& call) {

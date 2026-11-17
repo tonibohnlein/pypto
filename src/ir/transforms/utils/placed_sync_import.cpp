@@ -1857,6 +1857,12 @@ static CompactSyncInput ImportQualifiedSync(
     std::shared_ptr<const SyncInvocationCoordinate> coordinate = nullptr) {
   CHECK(function && (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV))
       << "Synchronization prototype requires one AIC or AIV leaf";
+  if (recover_accesses) {
+    for (const auto& parameter : function->params_)
+      if (const auto tensor = As<TensorType>(parameter->GetType()); tensor && tensor->shape_.size() == 1)
+        CHECK(false) << "Exact rank-one GM access and selector exports are unavailable; use an explicit "
+                        "conservative request";
+  }
   if (function->func_type_ == FunctionType::AIV) {
     // Reuse the production view/recipe alias verifier. Synchronization cannot
     // repair an illegal partial in-place instruction or a malformed descriptor.

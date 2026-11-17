@@ -1,11 +1,14 @@
-# GM scalar staging: proposed operation-contract subgate
+# GM scalar staging: operation-contract checkpoint
 
-Status: architecture accepted for implementation; implementation and semantic
-validation are pending. Native instruction correctness remains the existing
-selected-TLOAD premise, not a newly proved hardware result. This extends M2/M3 of the
+Status: the bounded implementation passes its first coherent 53-test host gate
+and its source review. The post-format build, corrected operator gate and pinned
+whole-model capture also pass. Final hooks and accepted commit publication are
+pending. Native instruction correctness remains
+the existing selected-TLOAD premise, not a newly proved hardware result. This extends M2/M3 of the
 [architecture plan](41-general-autosync-architecture-plan.md). It follows the
 qualified [local scalar bridge](43-autosync-value-and-scalar-contracts.md).
-No whole-Qwen ownership improvement or device result is claimed.
+The whole-model host capture improves local ownership from 17 to 19 leaves;
+complete Qwen ownership and device results are not claimed.
 
 ## Supported construction and preserved semantics
 
@@ -40,7 +43,7 @@ SSA for values, addresses or control. Carrier overwrite on a later visit also
 requires the existing causal reuse proof. Neither scalar native order nor closed
 notification matching establishes an unrelated payload's completion.
 
-Initially accept only normalized direct assignments. A discarded or nested GM
+The implementation accepts only normalized direct assignments. A discarded or nested GM
 read, an effectful while predicate without an original statement cut, a write,
 a different dtype/core/target or unavailable source layout refuses. Do not hoist
 a read out of a branch or omit the final false while evaluation. Reads of
@@ -55,7 +58,7 @@ The selected native pin is PTO-ISA
 - [TLOAD contract](https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/docs/isa/TLOAD.md)
   admits the A2/A3 matching-layout INT32 Vec path with positive source and valid
   extents. This is distinct from the block-aligned Mat paths.
-- `include/pto/npu/a2a3/tload_common.hpp`, `TLoadGm2ubNd2nd`, computes one burst
+- `include/pto/common/arch/memory/tload_common.hpp`, `TLoadGm2ubNd2nd`, computes one burst
   of four bytes for source shape `[1,1,1,1,1]` and valid `[1,1]`.
 - `include/pto/npu/a2a3/TLoad.hpp`, `TLoadInstrGm2ubNative`, selects
   `copy_gm_to_ubuf_align_b32` for four-byte element types.
@@ -69,7 +72,7 @@ The selected native pin is PTO-ISA
 
 The source and public nonaligned-copy model permit a UB alignment tail. Reserve
 and summarize its complete 32-byte enclosing domain, regardless of padding
-values. The proposal does not assert that `PadValue::Null` proves only four
+values. The implementation does not assert that `PadValue::Null` proves only four
 native UB bytes are touched. Exact physical-footprint qualification and any
 future exact-selector extension are separate from the sound enclosure.
 
@@ -83,7 +86,7 @@ limited. Keep that qualification explicit rather than presenting the new bridge
 as a hardware proof. The existing local event contract must order DMA completion
 before GetValue. No device validation is available.
 
-## Existing owners and proposed changes
+## Implemented owners and interfaces
 
 | Owner | Bounded change |
 | ----- | -------------- |
@@ -97,16 +100,19 @@ before GetValue. No device validation is available.
 
 These are shared operation/lowering changes, not a kernel-name recognizer. There
 is no new backend, public buffer representation, flag allocator, pool, admission
-limit or watchdog. The producer must not assume a newly introduced transfer is
-synchronized when autosync is disabled: qualify its existing downstream owner
-and test that path, or limit construction to the explicitly supported request.
+limit or watchdog. `StageBufferScalarReads` runs only when PyPTO autosync and Buffer IR are enabled
+under the explicit `conservative_prefix` policy in A2/A3 AIV. With autosync off
+or Buffer IR disabled, the original Functional read remains. When the PTOAS
+planner is selected, staged Buffer input still delegates physical ownership; the
+real downstream PTOAS C++ path is tested. No partial candidate is published
+when ordinary whole-function admission refuses.
 
 Exact providers may report unavailable rank-one extraction or GM selectors.
 Those are not empty answers and must not discard useful local mathematics.
 A conservative request may use sound whole-memory-space effects; that establishes
 coverage rather than minimum physical demands.
 
-## Acceptance subgate
+## Original acceptance obligations
 
 1. Independent access/value checks for element indices 0, 1, 7, 8 and the final
    valid element, including sources of length one. Poison adjacent GM elements
@@ -127,3 +133,75 @@ Construction and retained state must depend on static read sites, not runtime
 indices or trip counts. Count recovery, staging, logical protocol construction,
 physical realization and source generation separately. This design does not
 promise a device speedup: point staging adds a DMA and its required handshake.
+
+## Implemented host gates and limitations
+
+The first coherent gate passes **53 tests in 0.86 s** under the unchanged
+120-second watchdog. The exact command is:
+
+```bash
+timeout 120s python -m pytest -q --require-ptoas \
+  tests/ut/ir/transforms/test_gm_scalar_staging.py
+```
+
+The [receipt](44-autosync-gm-scalar-staging.json) retains the design/native evidence
+and records implementation files, logs and publication status. The gate covers
+all three existing planners, source lengths one and nine, source indices
+0/1/7/8, both alias policies, and a symbolic rank-one extent. Small executions
+vary empty/one/multiple loops, skipped branches and counter resets while keeping
+one retained function. Loaded positive/negative values drive original scalar
+control and a local write. The independent byte/command interpreter distinguishes
+the four-byte GM source from the entire 32-byte UB write enclosure, checks output
+values and verifies coverage, matching, acyclicity and causal physical reuse.
+May-alias executions include permitted overlapping GM roots; no disjointness is
+inferred from pointer names.
+
+Real PTOAS-generated C++ contains TLOAD and GetValue for all three planners.
+Autosync-disabled and Buffer-disabled paths preserve original `tensor.read`;
+discarded reads and INT64 preserve whole-function delegation. Runtime trip
+values do not clone carriers or commands: the fixture retains one scalar-read
+site, two load sites including its ordinary input, and the original two loops.
+The source's rank, allocation root, actual index and scalar SSA remain unchanged.
+
+The selected transfer remains an asynchronous DMA with a qualified blocking
+local scalar consumer, not a fictional one-pipe scalar operation. Static sites
+require private carriers and can add handshakes or conservative ordering. No
+minimum-demand, minimum-ID or device-speedup result follows. This gate does not
+independently prove peer publication, native cache behavior, arbitrary effectful
+while predicates, INT64 staging or exact GM boundary exports. Those premises
+remain explicit. The original M1–M6 goals and complete Qwen ownership remain incomplete.
+
+### Broader gate and unchanged whole-model capture
+
+The post-format coherent build succeeds. A broader deduplicated regression run
+records **3,132 passed, two failed, four warnings in 430.90 s**. Both failures
+were stale `rank-2` diagnostic expectations: rank-one FP32 load/store inputs
+still refuse under the new, more precise INT32 point-transfer diagnostic. Only
+the expected diagnostic and its explanation were corrected. A fresh operator
+module plus GM staging run passes **202 tests in 1.21 s**. These are separate
+receipts; there is no claimed single green 3,134-test run. Final hooks run after
+all documentation is frozen.
+
+The original two-layer, sequence-128, batch-1 Qwen capture generates all 32 leaf
+C++ files in 6.692 s inclusive. It reports 47 observed task-control owners,
+**19 PyPTO leaves and 13 delegated leaves**, adding `token_embed_single` and
+`token_embed_group` through this shared recipe. The previous 17/15 result remains
+the baseline. This is one descriptive host measurement, not device or
+analysis-only timing.
+
+The remaining first obligations are four mixed-valid ADD leaves
+(`out_proj_aiv`, `out_proj_aiv_0`, `rms_recip`, `rms_recip_0`), `qkpv_plan`'s
+`tensor.write`, `rope_kv_cache`'s `tile.reshape`, `lm_head`'s Acc descriptor,
+and six mixed-peer leaves whose existing GM pipe-buffer type is not admitted.
+The latter are `qk_pv_partial_plan_aic`, `qk_pv_partial_plan_aiv`,
+`qk_pv_single_block_0_aic`, `qk_pv_single_block_0_aiv`,
+`qk_pv_single_block_aic` and `qk_pv_single_block_aiv`. These first diagnostics
+are not all algorithm failures or proof of infeasibility. Existing peer
+protocols remain their own owners; this package constructs no cross-core
+synchronization. Exact exports and native qualification remain separate.
+
+| Established result | Remaining premise or limitation | Appropriate claim |
+| ------------------ | ------------------------------- | ----------------- |
+| Direct INT32 GM read lowers through ordinary DMA plus local S payloads | Selected native TLOAD contract and original access-validity/publication premises | Reusable shared lowering recipe, not a new hardware theorem |
+| Original ABI, SSA and control plus sound carrier enclosure pass bounded checks | Unsupported reads retain delegation; exact GM selectors unavailable | Conservative local synchronization under explicit policy |
+| All three planners generate C++; actual PyPTO command checks use the existing pool | No device execution or uniform optimality result | Host feasibility for the qualified family |
