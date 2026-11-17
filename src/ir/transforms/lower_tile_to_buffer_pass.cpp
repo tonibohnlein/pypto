@@ -1304,10 +1304,24 @@ class TileToBufferMutator : public IRMutator {
     if (const auto* axis_recipe = backend::FindLogicalBufferAxisRecipe(call->op_->name_)) {
       CHECK_SPAN(result && backend::SupportsLogicalBufferAxis(*axis_recipe, call), call->span_)
           << "LowerTileToBuffer: axis recipes require supported static FP32 operands";
-      std::vector<ExprPtr> arguments;
-      for (const auto& arg : call->args_) arguments.push_back(Handle(arg));
-      arguments.push_back(Handle(result));
-      return Operation(axis_recipe->buffer_op, arguments, call->span_);
+      std::vector<StmtPtr> out;
+      std::vector<ExprPtr> args;
+      std::vector<ExprPtr> values(call->args_.begin(), call->args_.end());
+      values.push_back(result);
+      for (const auto& value : values) {
+        const auto tile = As<TileType>(value->GetType());
+        // A runtime alias can promote a row-major allocation's descriptor even
+        // though this use still has proved static valid extents. Preserve those
+        // extents in an independent descriptor, exactly as for static casts.
+        // Column carriers already have independent typed-root descriptors;
+        // subviews cannot reinterpret their column-major physical layout.
+        const bool static_matrix =
+            !NeedsRuntimeBufferValid(tile) &&
+            backend::IsDenseVecBufferTile(tile, tile_view_semantics::GetEffectiveTileView(*tile));
+        args.push_back(static_matrix ? WindowHandle(value, out) : Handle(value));
+      }
+      out.push_back(Operation(axis_recipe->buffer_op, args, call->span_));
+      return std::make_shared<SeqStmts>(std::move(out), call->span_);
     }
     for (const auto& [logical, physical] : {std::pair{"tile.get_block_idx", "buffer.get_block_idx"},
                                             std::pair{"tile.get_block_num", "buffer.get_block_num"},

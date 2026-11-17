@@ -45,3 +45,19 @@ Public regression routes cover exact/conservative analysis, insertion, lowering
 of actual closed tokens and enabled transactional realization, with read/write
 operands, view aliases, workspace edges, unavailable placement and slots. Implicit
 workspace effects remain in inter-operation hazard analysis as well.
+
+## R3: static row descriptors after dynamic alias promotion
+
+Static dense row-major row-recipe operands and outputs now use the existing
+static descriptor-window bridge. The ordinary per-use metadata restoration runs
+first. Each use keeps its original valid extent and physical pitch even if a
+different alias promoted the shared allocation descriptor to runtime metadata.
+Column-major carriers retain their existing independent typed-root descriptors;
+dynamic operands retain their guarded full-column contract.
+
+Sixteen focused tests cover PYPTO, DSA_RP and PTOAS placement, partial/full
+columns, sum/subtraction and max/multiplication, alias reuse after the row call,
+zero/short metadata values, Buffer-disabled controls and unproved-metadata
+refusal. The actual row-call descriptors and independent Torch values are
+checked. The final combined descriptor/workspace/metadata run passed 134 tests.
+No payload arithmetic, guards, physical layout or synchronization policy changes.
