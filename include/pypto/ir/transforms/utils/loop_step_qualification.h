@@ -41,6 +41,9 @@ class PositiveLoopStepProof {
       const auto constant = arith::TryEvaluateIntConstant(expression);
       return constant && *constant > 0;
     }
+    if (const auto max_expr = As<Max>(expression)) {
+      return IsPositive(max_expr->left_) || IsPositive(max_expr->right_);
+    }
     if (const auto variable = AsVarLike(expression)) {
       const auto found = positive_.find(variable.get());
       return found != positive_.end() && found->second;

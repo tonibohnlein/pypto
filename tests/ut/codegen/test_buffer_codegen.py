@@ -1034,5 +1034,56 @@ def test_unsupported_dynamic_gm_geometry_remains_unavailable(kind):
         _emit(program)
 
 
+def test_single_row_non_packed_tensor_view_emits_pto():
+    view = ir.TensorType(
+        [_int(1), _int(64)], DataType.FP32, None, ir.TensorView([_int(128), _int(1)], ir.TensorLayout.ND)
+    )
+    source = ir.Var("source", view, SPAN)
+    out = ir.Var("out", ir.TensorType([_int(1), _int(64)], DataType.FP32), SPAN)
+    buf, allocate = _alloc("tile", _type((1, 64)), address=_int(0))
+    program = _program(
+        [
+            allocate,
+            _eval("buffer.load", source, _window(0, 0), _window(1, 64), buf),
+            _eval("buffer.store", buf, _window(0, 0), _window(1, 64), out),
+        ],
+        [source, (out, ir.ParamDirection.Out)],
+        ir.FunctionIRStage.Buffer,
+    )
+    mlir_text = _emit(program)
+    assert "pto.make_tensor_view" in mlir_text
+    assert "pto.tload" in mlir_text
+
+
+def test_buffer_load_bypass_and_buffer_insert_emit_pto():
+    source = ir.Var("source", ir.TensorType([_int(16), _int(32)], DataType.FP32), SPAN)
+    vec_buf, vec_alloc = _alloc("vec_tile", _type((16, 32)), address=_int(0))
+    acc_type = ir.BufferType(
+        [16, 16], DataType.FP32, ir.MemorySpace.Acc, [16, 16],
+        ir.TileLayout.col_major, ir.TileLayout.row_major, 1024,
+    )
+    mat_type = ir.BufferType(
+        [32, 32], DataType.BF16, ir.MemorySpace.Mat, [32, 32],
+        ir.TileLayout.col_major, ir.TileLayout.row_major, 512,
+    )
+    acc_buf, acc_alloc = _alloc("acc_tile", acc_type, address=_int(0))
+    mat_buf, mat_alloc = _alloc("mat_tile", mat_type, address=_int(0))
+    load_bypass = ir.EvalStmt(
+        _call("buffer.load", [source, _window(0, 0), _window(16, 32), vec_buf], kwargs={"cache": 1}),
+        SPAN,
+    )
+    insert_stmt = _eval("buffer.insert", acc_buf, _int(16), _int(0), mat_buf)
+    program = _program(
+        [vec_alloc, acc_alloc, mat_alloc, load_bypass, insert_stmt],
+        [source],
+        ir.FunctionIRStage.Buffer,
+    )
+    mlir_text = _emit(program)
+    assert "%__pypto_l2_cache_offset: i64" in mlir_text
+    assert "cache_policy = #pto.load_cache_policy<l2_bypass>" in mlir_text
+    assert "offset = %__pypto_l2_cache_offset : i64" in mlir_text
+    assert "pto.tinsert ins(" in mlir_text
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -36,6 +36,7 @@ class BufferViewAnalysis : public IRVisitor {
  public:
   struct View {
     bool window = false;
+    bool contiguous_column_relabel = false;
     std::optional<int64_t> row_bytes;
     CallPtr slice;
     VarPtr root;
@@ -55,6 +56,10 @@ class BufferViewAnalysis : public IRVisitor {
   }
 
   bool IsWindow(const ExprPtr& value) const { return Get(value).window; }
+
+  bool IsContiguousColumnRelabel(const ExprPtr& value) const {
+    return Get(value).contiguous_column_relabel;
+  }
 
   bool HasDenseRowPitch(const ExprPtr& value) const {
     const auto tile = As<TileType>(value->GetType());
@@ -95,6 +100,14 @@ class BufferViewAnalysis : public IRVisitor {
         view.window = IsWindow(call->args_[0]);
         if (view.window) view.root = nullptr;
         if (!HasDenseRowPitch(call->args_[0])) view.row_bytes = std::nullopt;
+        const auto dst = As<TileType>(assign->var_->GetType());
+        const auto src = As<TileType>(call->args_[0]->GetType());
+        const auto src_rows = src && src->shape_.size() == 2 ? As<ConstInt>(src->shape_[0]) : nullptr;
+        if (IsOp(call, "tile.reshape") && HasDenseRowPitch(call->args_[0]) && src_rows &&
+            src_rows->value_ == 1 && dst && dst->shape_.size() == 2 &&
+            tile_view_semantics::GetEffectiveTileView(*dst).blayout == TileLayout::col_major) {
+          view.contiguous_column_relabel = true;
+        }
       } else if (IsOp(call, "tile.set_validshape")) {
         view = Get(call->args_[0]);
       }

@@ -313,6 +313,7 @@ REGISTER_OP("buffer.load")
     .add_argument("offsets", "Tuple of GM element offsets")
     .add_argument("valid_extents", "Tuple of transfer extents matching current buffer valid metadata")
     .add_argument("dst", "Destination buffer")
+    .set_attr<int>("cache")
     .set_output_arity(0)
     .set_buffer_arg_effect(0, BufferAccess::Read, BufferAccess::Read)
     .set_buffer_non_memory_arg(1)
@@ -320,7 +321,10 @@ REGISTER_OP("buffer.load")
     .set_buffer_arg_effect(3, BufferAccess::Write, BufferAccess::Read)
     .set_buffer_result_behavior(BufferResultBehavior::None)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
-                      const std::vector<std::pair<std::string, std::any>>&) {
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      const int cache = GetIntKwarg(kwargs, "cache", static_cast<int>(CachePolicy::kDefault));
+      CHECK(cache == static_cast<int>(CachePolicy::kDefault) || cache == static_cast<int>(CachePolicy::kBypass))
+          << "buffer.load cache must be CachePolicy.NORMAL or CachePolicy.BYPASS";
       return DeduceBufferTransfer(args, true);
     });
 

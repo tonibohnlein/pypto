@@ -713,6 +713,15 @@ def _buffer_extract(source, row, column, destination):
     data = _buffer_active(source)[int(row):int(row) + rows, int(column):int(column) + cols]
     _buffer_write(destination, data)
 
+def _buffer_insert(source, row, column, destination):
+    data = _buffer_active(source)
+    r0, c0 = int(row), int(column)
+    rows, cols = data.shape
+    if isinstance(destination, _MatrixBuffer):
+        destination.storage[destination.indices[r0:r0 + rows, c0:c0 + cols]] = data.to(destination.dtype)
+    else:
+        destination[r0:r0 + rows, c0:c0 + cols].copy_(data.to(destination.dtype))
+
 def _hf32_round(value, mode):
     # HF32 keeps FP32's exponent and ten fraction bits. Drop thirteen fraction
     # bits, with a half-ULP bias adjusted by the retained LSB for ties-to-even.
@@ -1449,6 +1458,7 @@ def _register_ops() -> None:  # noqa: PLR0915
     m["buffer.set_validshape"] = lambda a, _kw: f"_buffer_set_valid({a[0]}, {a[1]})"
     m["buffer.copy"] = lambda a, _kw: f"_buffer_copy({', '.join(a)})"
     m["buffer.extract"] = lambda a, _kw: f"_buffer_extract({', '.join(a)})"
+    m["buffer.insert"] = lambda a, _kw: f"_buffer_insert({', '.join(a)})"
     m["buffer.matmul"] = lambda a, kw: f"_buffer_matmul({', '.join(a)}, False, {kw.get('tf32_mode')!r})"
     m["buffer.matmul_acc"] = lambda a, kw: f"_buffer_matmul({', '.join(a)}, True, {kw.get('tf32_mode')!r})"
     # Evaluate all inputs before copy_ so exact source/destination aliases remain safe.
@@ -1893,11 +1903,17 @@ class TorchCodegen(_ir.IRVisitor):
         elif isinstance(op, _ir.Abs):
             self._expr_result = f"abs({operand})"
         elif isinstance(op, _ir.Cast):
-            self._expr_result = (
-                f"torch.as_tensor({operand}).to({_torch_dtype(op.dtype)})"
-                if hasattr(op, "dtype")
-                else f"int({operand})"
-            )
+            cast_dtype = getattr(op, "dtype", None)
+            if cast_dtype is None and isinstance(getattr(op, "type", None), _ir.ScalarType):
+                cast_dtype = op.type.dtype
+            if cast_dtype in (DataType.FP16, DataType.BF16, DataType.FP32):
+                self._expr_result = (
+                    f"float(torch.as_tensor({operand}).to({_torch_dtype(cast_dtype)}).item())"
+                )
+            elif hasattr(op, "dtype"):
+                self._expr_result = f"torch.as_tensor({operand}).to({_torch_dtype(op.dtype)})"
+            else:
+                self._expr_result = f"int({operand})"
         else:
             self._expr_result = operand
 

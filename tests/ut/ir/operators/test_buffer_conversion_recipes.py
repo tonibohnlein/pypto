@@ -113,6 +113,18 @@ def test_bfloat_extension_does_not_admit_other_round_casts(dtype):
         _call("cast", [_buffer("source"), _buffer("dst", dtype=dtype)], {"mode": 2})
 
 
+def test_int32_to_fp32_cast_preserves_none_mode_and_rejects_other_modes():
+    args = [_buffer("source", dtype=DataType.INT32), _buffer("dst", dtype=DataType.FP32)]
+    call = _call("cast", args, {"mode": 0, "saturation_mode": 0})
+    assert call.kwargs["mode"] == 0
+    assert ir.get_op_buffer_arg_effect(call.op.name, 0).data == ir.BufferAccess.Read
+    assert ir.get_op_buffer_arg_effect(call.op.name, 1).data == ir.BufferAccess.Write
+    ir.assert_structural_equal(call, ir.deserialize(ir.serialize(call)), enable_auto_mapping=True)
+    for bad_mode in (1, 2):
+        with pytest.raises(ValueError, match="unsupported conversion attributes"):
+            _call("cast", args, {"mode": bad_mode, "saturation_mode": 0})
+
+
 @pytest.mark.parametrize("bad", ["shape", "valid", "saturation", "mode"])
 def test_bfloat_cast_preserves_restrictions(bad):
     args = [_buffer("source"), _buffer("dst", dtype=DataType.BF16)]
