@@ -353,6 +353,15 @@ class Parse {
       return;
     }
     if (auto branch = As<IfStmt>(stmt)) {
+      if (!branch->return_vars_.empty() &&
+          std::none_of(branch->return_vars_.begin(), branch->return_vars_.end(),
+                       [](const VarPtr& v) { return static_cast<bool>(As<SyncTokenType>(v->GetType())); }) &&
+          !HasSiteOrWait(branch->then_body_) &&
+          (!branch->else_body_ || !HasSiteOrWait(*branch->else_body_))) {
+        CHECK(cursor.pending.empty()) << "Scalar coordinate selection cannot interrupt pending token waits";
+        cursor.last.reset();
+        return;
+      }
       if (!input_.static_branches.empty() && branch->return_vars_.empty()) {
         const bool then_live = HasSiteOrWait(branch->then_body_);
         const bool else_live = branch->else_body_ && HasSiteOrWait(*branch->else_body_);

@@ -138,11 +138,16 @@ class CoordinateGraph {
     ExprPtr value;
     std::shared_ptr<const CoordinateContext> context;
   };
+  struct DeferredSelect {
+    ExprPtr condition, then_value, else_value;
+    std::shared_ptr<const CoordinateContext> context;
+  };
   using FrameKey = std::tuple<const ForStmt*, int64_t, int64_t, int64_t, const Expr*>;
   using ContextKey = std::tuple<const ForStmt*, int64_t, int64_t, int64_t, std::vector<FrameKey>>;
   std::map<std::pair<const Expr*, const CoordinateContext*>, size_t> memo_;
   std::map<ContextKey, std::shared_ptr<const CoordinateContext>> contexts_;
   std::unordered_map<const Expr*, Deferred> deferred_;
+  std::unordered_map<const Expr*, DeferredSelect> deferred_selects_;
 
   std::shared_ptr<const CoordinateContext> ContextFor(const SyncSegment& segment) {
     std::vector<FrameKey> frames;
@@ -165,8 +170,10 @@ class CoordinateGraph {
 
  public:
   bool Defined(const ExprPtr& e) const {
-    return definitions_.count(e.get()) || remainders_.count(e.get()) || deferred_.count(e.get());
+    return definitions_.count(e.get()) || remainders_.count(e.get()) || deferred_.count(e.get()) ||
+           deferred_selects_.count(e.get());
   }
+  const Node& NodeAt(size_t id) const { return nodes_.at(id); }
   ExprPtr SlotExpression(const ExprPtr& value) const {
     if (const auto found = deferred_.find(value.get()); found != deferred_.end()) {
       if (As<FloorMod>(found->second.value)) return found->second.value;
@@ -181,7 +188,9 @@ class CoordinateGraph {
   size_t BuildInContext(const ExprPtr& e, const CoordinateContext& segment,
                         const ParameterIndices& parameters, CompactSyncInput& input) {
     const auto maximum = SyncCoordinateMaximum(e);
-    CHECK(maximum) << "Synchronization coordinates require integer arithmetic";
+    const auto st = As<ScalarType>(e->GetType());
+    const bool is_bool = !maximum && st && st->dtype_ == DataType::BOOL;
+    CHECK(maximum || is_bool) << "Synchronization coordinates require integer arithmetic";
     if (input.invocation_coordinate &&
         (e == input.invocation_coordinate->Expression() || e == input.invocation_coordinate->Definition())) {
       const auto key = std::make_pair(e.get(), &segment);
@@ -207,6 +216,17 @@ class CoordinateGraph {
       definitions_.emplace(e.get(), root);
       return root;
     }
+    if (const auto found = deferred_selects_.find(e.get()); found != deferred_selects_.end()) {
+      if (const auto materialized = definitions_.find(e.get()); materialized != definitions_.end())
+        return materialized->second;
+      const auto& original = found->second;
+      const auto cond_id = BuildInContext(original.condition, *original.context, parameters, input);
+      const auto then_id = BuildInContext(original.then_value, *original.context, parameters, input);
+      const auto else_id = BuildInContext(original.else_value, *original.context, parameters, input);
+      const auto root = MakeSelect(cond_id, then_id, else_id, input);
+      definitions_.emplace(e.get(), root);
+      return root;
+    }
     // A named remainder need not itself be affine: buffer.slot consumes the
     // affine numerator and modulus as a rotating family. Ordinary coordinate
     // consumers still go through the original range/wrap proof below.
@@ -221,13 +241,16 @@ class CoordinateGraph {
     }
     if (auto cast = As<Cast>(e)) {
       const auto child = BuildInContext(cast->operand_, segment, parameters, input);
-      CHECK(nodes_[child].upper <= *maximum) << "Synchronization coordinate cast may change its value";
+      if (maximum) CHECK(nodes_[child].upper <= *maximum) << "Synchronization coordinate cast may change its value";
       memo_.emplace(key, child);
       return child;
     }
     Node n{Kind::Constant};
     if (auto c = As<ConstInt>(e)) {
       n.lower = n.upper = n.factor = Constant(c);
+      n.constant = true;
+    } else if (auto b = As<ConstBool>(e)) {
+      n.lower = n.upper = n.factor = b->value_ ? 1 : 0;
       n.constant = true;
     } else if (auto call = As<Call>(e); call && IsOp(call, "buffer.get_block_idx")) {
       CHECK(!input.invocation_coordinate) << "Access uses an unrelated original block coordinate";
@@ -296,16 +319,144 @@ class CoordinateGraph {
         n.lower = x.lower - n.factor;
         n.upper = x.upper - n.factor;
       }
+    } else if (is_bool) {
+      if (const auto neg = As<Not>(e)) {
+        n.left = BuildInContext(neg->operand_, segment, parameters, input);
+        const auto x = nodes_[n.left];
+        if (x.constant) {
+          n.kind = Kind::Constant;
+          n.lower = n.upper = n.factor = x.upper == 0 ? 1 : 0;
+          n.constant = true;
+        } else {
+          n.kind = Kind::Not;
+          n.lower = 0;
+          n.upper = 1;
+        }
+      } else if (const auto logic_and = As<And>(e)) {
+        CHECK(SameCoordinateType(e, logic_and->left_) && SameCoordinateType(e, logic_and->right_))
+            << "Coordinate logical operand requires BOOL type";
+        n.left = BuildInContext(logic_and->left_, segment, parameters, input);
+        n.right = BuildInContext(logic_and->right_, segment, parameters, input);
+        const auto x = nodes_[n.left], y = nodes_[n.right];
+        if ((x.constant && x.upper == 0) || (y.constant && y.upper == 0)) {
+          n.kind = Kind::Constant;
+          n.lower = n.upper = n.factor = 0;
+          n.constant = true;
+        } else if (x.constant && y.constant) {
+          n.kind = Kind::Constant;
+          n.lower = n.upper = n.factor = 1;
+          n.constant = true;
+        } else {
+          n.kind = Kind::And;
+          n.lower = 0;
+          n.upper = 1;
+        }
+      } else if (const auto logic_or = As<Or>(e)) {
+        CHECK(SameCoordinateType(e, logic_or->left_) && SameCoordinateType(e, logic_or->right_))
+            << "Coordinate logical operand requires BOOL type";
+        n.left = BuildInContext(logic_or->left_, segment, parameters, input);
+        n.right = BuildInContext(logic_or->right_, segment, parameters, input);
+        const auto x = nodes_[n.left], y = nodes_[n.right];
+        if ((x.constant && x.upper != 0) || (y.constant && y.upper != 0)) {
+          n.kind = Kind::Constant;
+          n.lower = n.upper = n.factor = 1;
+          n.constant = true;
+        } else if (x.constant && y.constant) {
+          n.kind = Kind::Constant;
+          n.lower = n.upper = n.factor = 0;
+          n.constant = true;
+        } else {
+          n.kind = Kind::Or;
+          n.lower = 0;
+          n.upper = 1;
+        }
+      } else {
+        Kind cmp_kind = Kind::Constant;
+        ExprPtr left, right;
+        if (auto eq = As<Eq>(e)) {
+          cmp_kind = Kind::Equal;
+          left = eq->left_;
+          right = eq->right_;
+        } else if (auto ne = As<Ne>(e)) {
+          cmp_kind = Kind::NotEqual;
+          left = ne->left_;
+          right = ne->right_;
+        } else if (auto lt = As<Lt>(e)) {
+          cmp_kind = Kind::LessThan;
+          left = lt->left_;
+          right = lt->right_;
+        } else if (auto le = As<Le>(e)) {
+          cmp_kind = Kind::LessEqual;
+          left = le->left_;
+          right = le->right_;
+        } else if (auto gt = As<Gt>(e)) {
+          cmp_kind = Kind::GreaterThan;
+          left = gt->left_;
+          right = gt->right_;
+        } else if (auto ge = As<Ge>(e)) {
+          cmp_kind = Kind::GreaterEqual;
+          left = ge->left_;
+          right = ge->right_;
+        } else {
+          CHECK(false) << "Unavailable affine synchronization access";
+        }
+        CHECK(SameCoordinateType(left, right))
+            << "Coordinate comparison requires matching operand types";
+        n.left = BuildInContext(left, segment, parameters, input);
+        n.right = BuildInContext(right, segment, parameters, input);
+        const auto x = nodes_[n.left], y = nodes_[n.right];
+        std::optional<bool> folded;
+        switch (cmp_kind) {
+          case Kind::Equal:
+            if (x.constant && y.constant) folded = (x.upper == y.upper);
+            else if (x.upper < y.lower || y.upper < x.lower) folded = false;
+            break;
+          case Kind::NotEqual:
+            if (x.constant && y.constant) folded = (x.upper != y.upper);
+            else if (x.upper < y.lower || y.upper < x.lower) folded = true;
+            break;
+          case Kind::LessThan:
+            if (x.upper < y.lower) folded = true;
+            else if (x.lower >= y.upper) folded = false;
+            break;
+          case Kind::LessEqual:
+            if (x.upper <= y.lower) folded = true;
+            else if (x.lower > y.upper) folded = false;
+            break;
+          case Kind::GreaterThan:
+            if (x.lower > y.upper) folded = true;
+            else if (x.upper <= y.lower) folded = false;
+            break;
+          case Kind::GreaterEqual:
+            if (x.lower >= y.upper) folded = true;
+            else if (x.upper < y.lower) folded = false;
+            break;
+          default:
+            break;
+        }
+        if (folded) {
+          n.kind = Kind::Constant;
+          n.lower = n.upper = n.factor = *folded ? 1 : 0;
+          n.constant = true;
+        } else {
+          n.kind = cmp_kind;
+          n.lower = 0;
+          n.upper = 1;
+        }
+      }
     } else {
       ExprPtr left, right;
       const bool multiply = static_cast<bool>(As<Mul>(e));
+      const bool subtract = static_cast<bool>(As<Sub>(e));
       if (auto add = As<Add>(e)) {
         left = add->left_;
         right = add->right_;
+      } else if (auto sub = As<Sub>(e)) {
+        left = sub->left_;
+        right = sub->right_;
       } else if (auto mul = As<Mul>(e)) {
         left = mul->left_;
         right = mul->right_;
-
       } else {
         CHECK(false) << "Unavailable affine synchronization access";
       }
@@ -326,6 +477,17 @@ class CoordinateGraph {
         n.upper = Checked(__int128(x.upper) * n.factor);
         n.lower = Checked(__int128(x.lower) * n.factor);
         n.constant = x.constant || !n.factor;
+      } else if (subtract) {
+        if (x.constant && y.constant) {
+          n.kind = Kind::Constant;
+          n.lower = n.upper = n.factor = Checked(__int128(x.upper) - y.upper);
+          n.constant = true;
+        } else {
+          n.kind = Kind::Sub;
+          n.lower = Checked(__int128(x.lower) - y.upper);
+          n.upper = Checked(__int128(x.upper) - y.lower);
+          n.constant = false;
+        }
       } else {
         n.kind = Kind::Add;
         n.upper = Checked(__int128(x.upper) + y.upper);
@@ -343,7 +505,7 @@ class CoordinateGraph {
       // Empty static bodies retain the prior representative admission bounds;
       // their zero visit count, not a contradictory negative range, records absence.
     }
-    CHECK(n.lower >= 0 && n.upper <= *maximum)
+    CHECK(n.lower >= 0 && n.upper <= (maximum ? *maximum : 1))
         << "Synchronization coordinate arithmetic may overflow its source type";
     const auto id = nodes_.size();
     nodes_.push_back(n);
@@ -352,11 +514,48 @@ class CoordinateGraph {
     const bool affine = n.constant || n.kind == Kind::Parameter || n.kind == Kind::Block ||
                         (n.kind == Kind::Loop && (!n.dynamic_start || affine_[n.left])) ||
                         ((n.kind == Kind::Scale || n.kind == Kind::ModularShift) && affine_[n.left]) ||
-                        (n.kind == Kind::Add && affine_[n.left] && affine_[n.right]);
+                        ((n.kind == Kind::Add || n.kind == Kind::Sub) && affine_[n.left] && affine_[n.right]);
     affine_.push_back(affine);
     memo_.emplace(key, id);
     ++input.coordinate_nodes;
     return id;
+  }
+  size_t MakeSelect(size_t cond_id, size_t then_id, size_t else_id, CompactSyncInput& input) {
+    const auto cond = nodes_[cond_id];
+    if (cond.constant) return cond.upper != 0 ? then_id : else_id;
+    if (then_id == else_id) return then_id;
+    const auto x = nodes_[then_id], y = nodes_[else_id];
+    Node n{Kind::Select};
+    n.condition = cond_id;
+    n.left = then_id;
+    n.right = else_id;
+    n.lower = std::min(x.lower, y.lower);
+    n.upper = std::max(x.upper, y.upper);
+    if (x.constant && y.constant && x.upper == y.upper) {
+      n.kind = Kind::Constant;
+      n.factor = x.upper;
+      n.constant = true;
+    }
+    const auto id = nodes_.size();
+    nodes_.push_back(n);
+    affine_.push_back(n.constant);
+    ++input.coordinate_nodes;
+    return id;
+  }
+  void DefineSelect(const ExprPtr& var, const ExprPtr& cond, const ExprPtr& then_value,
+                    const ExprPtr& else_value, const SyncSegment& segment,
+                    const ParameterIndices& parameters, CompactSyncInput& input, bool lazy = false) {
+    CHECK(SameCoordinateType(var, then_value) && SameCoordinateType(var, else_value))
+        << "Coordinate selection requires matching operand types";
+    if (lazy || (input.invocation_coordinate && input.invocation_coordinate->SupportsDefinition(var))) {
+      deferred_selects_.emplace(var.get(),
+                                DeferredSelect{cond, then_value, else_value, ContextFor(segment)});
+      return;
+    }
+    const auto cond_id = Build(cond, segment, parameters, input);
+    const auto then_id = Build(then_value, segment, parameters, input);
+    const auto else_id = Build(else_value, segment, parameters, input);
+    definitions_.emplace(var.get(), MakeSelect(cond_id, then_id, else_id, input));
   }
   void Define(const ExprPtr& var, const ExprPtr& value, const SyncSegment& segment,
               const ParameterIndices& parameters, CompactSyncInput& input, bool lazy = false) {
@@ -399,13 +598,156 @@ class CoordinateGraph {
       if (node.kind == Kind::Loop) {
         CHECK(active.count(node.frame.get())) << "External coordinate belongs to another occurrence frame";
         if (node.dynamic_start) pending.push_back(node.left);
-      } else if (node.kind == Kind::Scale || node.kind == Kind::ModularShift) {
+      } else if (node.kind == Kind::Scale || node.kind == Kind::ModularShift || node.kind == Kind::Not) {
         pending.push_back(node.left);
-      } else if (node.kind == Kind::Add || node.kind == Kind::FloorDivide || node.kind == Kind::Remainder) {
+      } else if (node.kind == Kind::Add || node.kind == Kind::Sub || node.kind == Kind::FloorDivide ||
+                 node.kind == Kind::Remainder || node.kind == Kind::Equal || node.kind == Kind::NotEqual ||
+                 node.kind == Kind::LessThan || node.kind == Kind::LessEqual ||
+                 node.kind == Kind::GreaterThan || node.kind == Kind::GreaterEqual ||
+                 node.kind == Kind::And || node.kind == Kind::Or) {
+        pending.push_back(node.left);
+        pending.push_back(node.right);
+      } else if (node.kind == Kind::Select) {
+        pending.push_back(node.condition);
         pending.push_back(node.left);
         pending.push_back(node.right);
       }
     }
+  }
+  bool SameNodeExpr(size_t a, size_t b) const {
+    if (a == b) return true;
+    const auto& x = nodes_.at(a);
+    const auto& y = nodes_.at(b);
+    if (x.kind != y.kind || x.constant != y.constant || x.dynamic_start != y.dynamic_start ||
+        x.factor != y.factor || x.start != y.start || x.step != y.step || x.parameter != y.parameter ||
+        x.frame != y.frame)
+      return false;
+    if (x.constant) return x.upper == y.upper;
+    if (x.kind == Kind::Loop) return !x.dynamic_start || SameNodeExpr(x.left, y.left);
+    if (x.kind == Kind::Parameter || x.kind == Kind::Block) return true;
+    if (x.kind == Kind::Scale || x.kind == Kind::ModularShift || x.kind == Kind::Not)
+      return SameNodeExpr(x.left, y.left);
+    if (x.kind == Kind::Select)
+      return SameNodeExpr(x.condition, y.condition) && SameNodeExpr(x.left, y.left) &&
+             SameNodeExpr(x.right, y.right);
+    return SameNodeExpr(x.left, y.left) && SameNodeExpr(x.right, y.right);
+  }
+  struct LinearMatch {
+    int64_t coeff = 0, offset = 0;
+  };
+  std::optional<LinearMatch> MatchLinearIn(size_t id, size_t target) const {
+    if (SameNodeExpr(id, target)) return LinearMatch{1, 0};
+    const auto& n = nodes_.at(id);
+    if (n.constant) return LinearMatch{0, n.upper};
+    if (n.kind == Kind::Scale) {
+      const auto sub = MatchLinearIn(n.left, target);
+      if (!sub) return std::nullopt;
+      return LinearMatch{sub->coeff * n.factor, sub->offset * n.factor};
+    }
+    if (n.kind == Kind::ModularShift) {
+      const auto sub = MatchLinearIn(n.left, target);
+      if (!sub) return std::nullopt;
+      return LinearMatch{sub->coeff, sub->offset - n.factor};
+    }
+    if (n.kind == Kind::Add || n.kind == Kind::Sub) {
+      const auto l = MatchLinearIn(n.left, target);
+      const auto r = MatchLinearIn(n.right, target);
+      if (!l || !r) return std::nullopt;
+      const int64_t sign = n.kind == Kind::Add ? 1 : -1;
+      return LinearMatch{l->coeff + sign * r->coeff, l->offset + sign * r->offset};
+    }
+    return std::nullopt;
+  }
+  std::optional<SyncSwizzledTileMap> MatchSwizzled(size_t primary_id, size_t secondary_id,
+                                                   int64_t primary_tiles, int64_t secondary_tiles,
+                                                   int64_t row_tiles, int64_t col_tiles,
+                                                   int64_t rows, int64_t columns,
+                                                   bool col_major_groups) const {
+    const auto& sec = nodes_.at(secondary_id);
+    if (sec.kind != Kind::Add) return std::nullopt;
+    for (int swap = 0; swap < 2; ++swap) {
+      const size_t scale_id = swap ? sec.right : sec.left;
+      const size_t rem_id = swap ? sec.left : sec.right;
+      const auto& scaled = nodes_.at(scale_id);
+      const auto& rem = nodes_.at(rem_id);
+      if (scaled.kind != Kind::Scale || scaled.factor <= 0) continue;
+      const int64_t group_tiles = scaled.factor;
+      if (rem.kind != Kind::Remainder && rem.kind != Kind::ModularShift) continue;
+      if (nodes_.at(rem.right).upper != group_tiles || !nodes_.at(rem.right).constant) continue;
+      if (rem.kind == Kind::ModularShift &&
+          (nodes_[rem.left].lower / group_tiles != nodes_[rem.left].upper / group_tiles ||
+           rem.factor != (nodes_[rem.left].lower / group_tiles) * group_tiles))
+        continue;
+      const size_t block_id = scaled.left;
+      const size_t in_group_id = rem.left;
+      const auto& block_node = nodes_.at(block_id);
+      const auto& in_group_node = nodes_.at(in_group_id);
+      if (block_node.kind != Kind::FloorDivide ||
+          (in_group_node.kind != Kind::Remainder && in_group_node.kind != Kind::ModularShift))
+        continue;
+      if (!SameNodeExpr(block_node.left, in_group_node.left)) continue;
+      if (!nodes_.at(block_node.right).constant || !nodes_.at(in_group_node.right).constant) continue;
+      const int64_t group_size = nodes_[block_node.right].upper;
+      if (group_size <= 0 || nodes_[in_group_node.right].upper != group_size) continue;
+      if (in_group_node.kind == Kind::ModularShift &&
+          (nodes_[in_group_node.left].lower / group_size != nodes_[in_group_node.left].upper / group_size ||
+           in_group_node.factor != (nodes_[in_group_node.left].lower / group_size) * group_size))
+        continue;
+      const size_t tile_id = block_node.left;
+      const auto& tile = nodes_.at(tile_id);
+      if (tile.kind != Kind::Loop || group_size != __int128(primary_tiles) * group_tiles) continue;
+      const int64_t full_groups = secondary_tiles / group_tiles;
+      const int64_t tail_cols = secondary_tiles % group_tiles;
+      const __int128 max_tiles = tail_cols == 0
+                                     ? __int128(primary_tiles) * secondary_tiles
+                                     : __int128(full_groups) * group_size + __int128(primary_tiles) * tail_cols;
+      if (tile.upper >= max_tiles) continue;
+      if (tail_cols != 0) continue;  // Exact group_size requires full tail divisor unless generalized.
+      bool snake = false;
+      const auto& pri = nodes_.at(primary_id);
+      auto is_base_primary = [&](size_t id) {
+        const auto& div = nodes_.at(id);
+        return div.kind == Kind::FloorDivide && nodes_.at(div.right).constant &&
+               nodes_[div.right].upper == group_tiles && SameNodeExpr(div.left, in_group_id);
+      };
+      if (is_base_primary(primary_id)) {
+        snake = false;
+      } else if (pri.kind == Kind::Select && is_base_primary(pri.right)) {
+        const auto linear = MatchLinearIn(pri.left, pri.right);
+        if (!linear || linear->coeff != -1 || linear->offset != primary_tiles - 1) continue;
+        const auto& cond = nodes_.at(pri.condition);
+        size_t parity_node = 0;
+        if (cond.kind == Kind::Equal) {
+          if (nodes_[cond.left].constant && nodes_[cond.left].upper == 1)
+            parity_node = cond.right;
+          else if (nodes_[cond.right].constant && nodes_[cond.right].upper == 1)
+            parity_node = cond.left;
+          else
+            continue;
+        } else {
+          continue;
+        }
+        const auto& pnode = nodes_.at(parity_node);
+        if (pnode.kind != Kind::Remainder || !nodes_[pnode.right].constant ||
+            nodes_[pnode.right].upper != 2 || !SameNodeExpr(pnode.left, block_id))
+          continue;
+        snake = true;
+      } else {
+        continue;
+      }
+      return SyncSwizzledTileMap{tile.frame,
+                                 tile_id,
+                                 tile.dynamic_start ? std::optional<size_t>(tile.left) : std::nullopt,
+                                 row_tiles,
+                                 col_tiles,
+                                 rows,
+                                 columns,
+                                 group_tiles,
+                                 group_size,
+                                 col_major_groups,
+                                 snake};
+    }
+    return std::nullopt;
   }
   std::shared_ptr<const SyncExternalFootprint> External(size_t row, size_t column, const SyncStorage& storage,
                                                         int64_t rows, int64_t columns) const {
@@ -424,34 +766,40 @@ class CoordinateGraph {
     const auto r = unscale(row, rows), c = unscale(column, columns);
     if (!r || !c || storage.row_extent_parameter || storage.rows % rows || storage.columns % columns)
       return out;
+    const auto row_tiles = storage.rows / rows, col_tiles = storage.columns / columns;
     const auto& quotient = nodes_[*r];
     const auto& remainder = nodes_[*c];
-    if (quotient.kind != Kind::FloorDivide ||
-        (remainder.kind != Kind::Remainder && remainder.kind != Kind::ModularShift) ||
-        quotient.left != remainder.left || nodes_[quotient.right].upper != nodes_[remainder.right].upper)
+    if (quotient.kind == Kind::FloorDivide &&
+        (remainder.kind == Kind::Remainder || remainder.kind == Kind::ModularShift) &&
+        quotient.left == remainder.left && nodes_[quotient.right].upper == nodes_[remainder.right].upper) {
+      const auto& tile = nodes_[quotient.left];
+      const auto divisor = nodes_[quotient.right].upper;
+      const bool band_ok = remainder.kind != Kind::ModularShift ||
+                           (tile.lower / divisor == tile.upper / divisor &&
+                            remainder.factor == (tile.lower / divisor) * divisor);
+      if (band_ok && tile.kind == Kind::Loop && divisor == col_tiles &&
+          tile.upper < __int128(row_tiles) * divisor) {
+        // Paired quotient/remainder is an injective tile map: t = rowTile*C+colTile.
+        out->row_major_tiles =
+            SyncRowMajorTileMap{tile.frame,
+                                quotient.left,
+                                tile.dynamic_start ? std::optional<size_t>(tile.left) : std::nullopt,
+                                row_tiles,
+                                divisor,
+                                rows,
+                                columns};
+        return out;
+      }
+    }
+    if (auto swizzled = MatchSwizzled(*r, *c, row_tiles, col_tiles, row_tiles, col_tiles, rows, columns,
+                                      /*col_major_groups=*/true)) {
+      out->swizzled_tiles = std::move(*swizzled);
       return out;
-    const auto& tile = nodes_[quotient.left];
-    const auto divisor = nodes_[quotient.right].upper;
-    // The affine fast path may normalize t%C to t-q*C when the complete
-    // admitted domain stays in one quotient band. Its original positive divisor
-    // remains in right; verify the whole-band proof, not one sampled coordinate.
-    if (remainder.kind == Kind::ModularShift && (tile.lower / divisor != tile.upper / divisor ||
-                                                 remainder.factor != (tile.lower / divisor) * divisor))
-      return out;
-    if (tile.kind != Kind::Loop || divisor != storage.columns / columns ||
-        tile.upper >= __int128(storage.rows / rows) * divisor)
-      return out;
-    // Paired quotient/remainder is an injective tile map: t = rowTile*C+colTile.
-    // This proves the map, NOT that another access/invocation cannot reuse it.
-    // The regional consumer must check the complete effect and visit inventory.
-    out->row_major_tiles =
-        SyncRowMajorTileMap{tile.frame,
-                            quotient.left,
-                            tile.dynamic_start ? std::optional<size_t>(tile.left) : std::nullopt,
-                            storage.rows / rows,
-                            divisor,
-                            rows,
-                            columns};
+    }
+    if (auto swizzled = MatchSwizzled(*c, *r, col_tiles, row_tiles, row_tiles, col_tiles, rows, columns,
+                                      /*col_major_groups=*/false)) {
+      out->swizzled_tiles = std::move(*swizzled);
+    }
     return out;
   }
   AffineCoordinate Flatten(size_t root, CompactSyncInput& input) const {
@@ -497,7 +845,9 @@ class CoordinateGraph {
       } else if (n.kind == Kind::Add) {
         add(n.left, weight);
         add(n.right, weight);
-
+      } else if (n.kind == Kind::Sub) {
+        add(n.left, weight);
+        add(n.right, -weight);
       } else {
         CHECK(false) << "Nonlinear coordinate requires an exact external footprint export";
       }
@@ -549,9 +899,19 @@ class Importer {
   std::set<size_t> translated_storage;
   std::vector<std::pair<VarPtr, ExprPtr>> scalar_defs;
 
-  std::optional<bool> EvaluateStaticBranchCondition(const ExprPtr& condition, const SyncSegment& segment) const {
-    if (!condition) return std::nullopt;
-    arith::Analyzer analyzer;
+  static bool SameControlExpr(const ExprPtr& a, const ExprPtr& b) {
+    try {
+      return structural_equal(a, b, false);
+    } catch (const StructuralComparisonUnsupported&) {
+      return false;
+    }
+  }
+  static ExprPtr ConstFromBound(const ExprPtr& like, int64_t value) {
+    const auto st = As<ScalarType>(like->GetType());
+    if (st && st->dtype_ == DataType::BOOL) return std::make_shared<ConstBool>(value != 0, like->span_);
+    return std::make_shared<ConstInt>(value, st ? st->dtype_ : DataType::INDEX, like->span_);
+  }
+  void PopulateAnalyzerFrames(arith::Analyzer& analyzer, const SyncSegment& segment) {
     if (result.owner) {
       for (const auto& [param_idx, bound] : result.parameter_bounds) {
         if (param_idx < result.owner->params_.size()) {
@@ -560,16 +920,40 @@ class Importer {
       }
     }
     auto bind_frame = [&](const SyncLoopFrame& frame) {
-      if (!frame.loop || frame.start_expression) return;
-      if (frame.count <= 0) return;
-      const __int128 last = __int128(frame.start) + __int128(frame.count - 1) * frame.step;
-      if (last >= std::numeric_limits<int64_t>::max()) return;
-      analyzer.const_int_bound.Update(frame.loop->loop_var_, {frame.start, static_cast<int64_t>(last)});
+      if (!frame.loop || frame.count <= 0) return;
+      int64_t lo = frame.start;
+      __int128 hi = __int128(frame.start) + __int128(frame.count - 1) * frame.step;
+      if (frame.start_expression) {
+        if (readonly_external) {
+          if (const auto call = As<Call>(frame.start_expression);
+              call && IsOp(call, "buffer.get_block_idx") && result.block_bounds) {
+            lo = result.block_bounds->first;
+            hi = __int128(result.block_bounds->second) + __int128(frame.count - 1) * frame.step;
+          } else {
+            return;
+          }
+        } else {
+          SyncSegment empty_ctx;
+          const auto start_id = coordinates.Build(frame.start_expression, empty_ctx, parameters, result);
+          const auto& sn = coordinates.NodeAt(start_id);
+          lo = sn.lower;
+          hi = __int128(sn.upper) + __int128(frame.count - 1) * frame.step;
+        }
+      }
+      if (const auto stop = As<ConstInt>(frame.loop->stop_); stop && stop->value_ > lo)
+        hi = std::min<__int128>(hi, stop->value_ - 1);
+      if (hi >= std::numeric_limits<int64_t>::max()) return;
+      analyzer.const_int_bound.Update(frame.loop->loop_var_, {lo, static_cast<int64_t>(hi)});
     };
     for (const auto& frame : segment.nested_frames) bind_frame(frame);
     if (segment.original_loop) {
       bind_frame({segment.original_loop, segment.count, segment.start, segment.step});
     }
+  }
+  std::optional<bool> EvaluateStaticBranchCondition(const ExprPtr& condition, const SyncSegment& segment) {
+    if (!condition) return std::nullopt;
+    arith::Analyzer analyzer;
+    PopulateAnalyzerFrames(analyzer, segment);
     for (const auto& [var, value] : scalar_defs) {
       if (const auto st = As<ScalarType>(var->GetType());
           st && (st->dtype_ == DataType::INDEX || st->dtype_.IsInt() || st->dtype_ == DataType::BOOL)) {
@@ -707,9 +1091,11 @@ class Importer {
     });
   }
   void DefineCoordinate(const AssignStmtPtr& assign, const SyncSegment& segment) {
-    CHECK(As<ScalarType>(assign->var_->GetType()))
+    const auto scalar_type = As<ScalarType>(assign->var_->GetType());
+    CHECK(scalar_type)
         << "Nested or data-dependent storage/view definitions are outside this compact provider";
-    CHECK(readonly_external || SyncCoordinateMaximum(assign->var_)) << "Unavailable scalar coordinate type";
+    CHECK(readonly_external || SyncCoordinateMaximum(assign->var_) || scalar_type->dtype_ == DataType::BOOL)
+        << "Unavailable scalar coordinate type";
     CHECK(!parameters.count(assign->var_.get()) && !coordinates.Defined(assign->var_) &&
           (!segment.original_loop || assign->var_ != segment.original_loop->loop_var_))
         << "Invocation and loop coordinates must retain their original single-assignment identities";
@@ -726,6 +1112,210 @@ class Importer {
     }
     scalar_defs.emplace_back(assign->var_, assign->value_);
     coordinates.Define(assign->var_, assign->value_, segment, parameters, result, readonly_external);
+  }
+  static bool ValidatePureScalarArm(const StmtPtr& stmt, size_t expected_yields) {
+    auto stmts = Statements(stmt);
+    if (stmts.empty()) return false;
+    const auto yield = As<YieldStmt>(stmts.back());
+    if (!yield || yield->value_.size() != expected_yields) return false;
+    for (size_t i = 0; i + 1 < stmts.size(); ++i) {
+      if (const auto assign = As<AssignStmt>(stmts[i])) {
+        if (!As<ScalarType>(assign->var_->GetType())) return false;
+        if (const auto call = As<Call>(assign->value_); call && !IsOp(call, "buffer.get_block_idx"))
+          return false;
+      } else if (const auto nested = As<IfStmt>(stmts[i])) {
+        if (nested->return_vars_.empty() || !nested->else_body_) return false;
+        for (const auto& rv : nested->return_vars_)
+          if (!As<ScalarType>(rv->GetType())) return false;
+        if (!ValidatePureScalarArm(nested->then_body_, nested->return_vars_.size()) ||
+            !ValidatePureScalarArm(*nested->else_body_, nested->return_vars_.size()))
+          return false;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+  static ExprPtr SubstituteScalarMap(const ExprPtr& expr, const std::map<const Var*, ExprPtr>& map) {
+    if (map.empty()) return expr;
+    class Substituter : public IRMutator {
+      const std::map<const Var*, ExprPtr>& map_;
+      ExprPtr VisitExpr_(const VarPtr& var) override {
+        if (const auto found = map_.find(var.get()); found != map_.end()) return found->second;
+        return var;
+      }
+
+     public:
+      explicit Substituter(const std::map<const Var*, ExprPtr>& map) : map_(map) {}
+    };
+    return Substituter(map).VisitExpr(expr);
+  }
+  static std::set<const Var*> CollectVars(const ExprPtr& expr) {
+    std::set<const Var*> vars;
+    class Collector : public IRVisitor {
+      std::set<const Var*>& vars_;
+      void VisitExpr_(const VarPtr& var) override { vars_.insert(var.get()); }
+
+     public:
+      explicit Collector(std::set<const Var*>& vars) : vars_(vars) {}
+    };
+    Collector(vars).VisitExpr(expr);
+    return vars;
+  }
+  std::vector<ExprPtr> ResolvePureScalarArm(const StmtPtr& arm, const SyncSegment& segment,
+                                            const arith::AnalyzerPtr& analyzer,
+                                            const std::map<const Var*, ExprPtr>& bool_defs,
+                                            const std::map<const Var*, ExprPtr>& unconstrained_defs) {
+    std::map<const Var*, ExprPtr> local_defs;
+    auto eval_expr = [&](ExprPtr expr) -> ExprPtr {
+      expr = SubstituteScalarMap(expr, local_defs);
+      ExprPtr bound_probe = expr;
+      for (size_t step = 0; step < unconstrained_defs.size(); ++step) {
+        const auto next = SubstituteScalarMap(bound_probe, unconstrained_defs);
+        if (next == bound_probe) break;
+        bound_probe = next;
+      }
+      const auto b = analyzer->const_int_bound(bound_probe);
+      if (b.is_const() && b.min_value != arith::ConstIntBound::kNegInf &&
+          b.max_value != arith::ConstIntBound::kPosInf) {
+        return ConstFromBound(expr, b.min_value);
+      }
+      return analyzer->Simplify(expr);
+    };
+    auto stmts = Statements(arm);
+    for (size_t i = 0; i + 1 < stmts.size(); ++i) {
+      if (const auto assign = As<AssignStmt>(stmts[i])) {
+        const auto resolved = eval_expr(assign->value_);
+        local_defs[assign->var_.get()] = resolved;
+        if (const auto st = As<ScalarType>(assign->var_->GetType());
+            st && (st->dtype_ == DataType::INDEX || st->dtype_.IsInt() || st->dtype_ == DataType::BOOL)) {
+          const auto b = analyzer->const_int_bound(resolved);
+          if (b.min_value <= b.max_value) analyzer->const_int_bound.Update(assign->var_, b);
+        }
+      } else if (const auto nested = As<IfStmt>(stmts[i])) {
+        const auto cond = SubstituteScalarMap(nested->condition_, local_defs);
+        const auto expanded_cond = SubstituteScalarMap(cond, bool_defs);
+        std::vector<ExprPtr> then_res, else_res;
+        {
+          auto ctx = analyzer->GetConstraintContext(expanded_cond);
+          then_res = ResolvePureScalarArm(nested->then_body_, segment, analyzer, bool_defs, unconstrained_defs);
+        }
+        {
+          auto ctx = analyzer->GetConstraintContext(MakeNot(expanded_cond));
+          else_res = ResolvePureScalarArm(*nested->else_body_, segment, analyzer, bool_defs, unconstrained_defs);
+        }
+        for (size_t k = 0; k < nested->return_vars_.size(); ++k) {
+          const auto& rv = nested->return_vars_[k];
+          if (SameControlExpr(then_res[k], else_res[k])) {
+            local_defs[rv.get()] = then_res[k];
+            const auto b = analyzer->const_int_bound(then_res[k]);
+            if (b.min_value <= b.max_value) analyzer->const_int_bound.Update(rv, b);
+          } else {
+            return {};
+          }
+        }
+      }
+    }
+    const auto yield = As<YieldStmt>(stmts.back());
+    std::vector<ExprPtr> out;
+    out.reserve(yield->value_.size());
+    for (const auto& value : yield->value_) out.push_back(eval_expr(value));
+    return out;
+  }
+  bool TryPureScalarBranch(const IfStmtPtr& branch, const SyncSegment& segment) {
+    if (branch->return_vars_.empty() || !branch->else_body_) return false;
+    for (const auto& rv : branch->return_vars_) {
+      if (!As<ScalarType>(rv->GetType())) return false;
+      if (parameters.count(rv.get()) || coordinates.Defined(rv) ||
+          (segment.original_loop && rv == segment.original_loop->loop_var_))
+        return false;
+    }
+    if (!ValidatePureScalarArm(branch->then_body_, branch->return_vars_.size()) ||
+        !ValidatePureScalarArm(*branch->else_body_, branch->return_vars_.size()))
+      return false;
+
+    auto analyzer = std::make_shared<arith::Analyzer>();
+    PopulateAnalyzerFrames(*analyzer, segment);
+    std::map<const Var*, ExprPtr> bool_defs, int_defs;
+    for (const auto& [var, value] : scalar_defs) {
+      const auto st = As<ScalarType>(var->GetType());
+      if (!st || (!st->dtype_.IsInt() && st->dtype_ != DataType::INDEX && st->dtype_ != DataType::BOOL))
+        continue;
+      const auto expanded = SubstituteScalarMap(value, bool_defs);
+      if (st->dtype_ == DataType::BOOL) {
+        bool_defs[var.get()] = expanded;
+      } else {
+        int_defs[var.get()] = value;
+        const auto b = analyzer->const_int_bound(value);
+        if (b.min_value <= b.max_value) analyzer->const_int_bound.Update(var, b);
+      }
+    }
+
+    auto define_expr_result = [&](const VarPtr& rv, const ExprPtr& value) {
+      const auto scalar_type = As<ScalarType>(rv->GetType());
+      CHECK(readonly_external || SyncCoordinateMaximum(rv) || scalar_type->dtype_ == DataType::BOOL)
+          << "Unavailable scalar coordinate type";
+      if (readonly_external) {
+        ReadyScalar(value, segment);
+        ready_scalars.insert(rv.get());
+      }
+      scalar_defs.emplace_back(rv, value);
+      coordinates.Define(rv, value, segment, parameters, result, readonly_external);
+    };
+    auto define_select_result = [&](const VarPtr& rv, const ExprPtr& cond, const ExprPtr& then_val,
+                                    const ExprPtr& else_val) {
+      const auto scalar_type = As<ScalarType>(rv->GetType());
+      CHECK(readonly_external || SyncCoordinateMaximum(rv) || scalar_type->dtype_ == DataType::BOOL)
+          << "Unavailable scalar coordinate type";
+      if (readonly_external) {
+        ReadyScalar(cond, segment);
+        ReadyScalar(then_val, segment);
+        ReadyScalar(else_val, segment);
+        ready_scalars.insert(rv.get());
+      }
+      coordinates.DefineSelect(rv, cond, then_val, else_val, segment, parameters, result,
+                               readonly_external);
+    };
+
+    const auto verdict = EvaluateStaticBranchCondition(branch->condition_, segment);
+    const auto cond_expanded = SubstituteScalarMap(branch->condition_, bool_defs);
+    const auto cond_vars = CollectVars(cond_expanded);
+    std::map<const Var*, ExprPtr> unconstrained_defs;
+    for (const auto& [k, v] : int_defs)
+      if (!cond_vars.count(k)) unconstrained_defs[k] = v;
+    if (verdict) {
+      std::vector<ExprPtr> selected;
+      {
+        auto ctx = analyzer->GetConstraintContext(*verdict ? cond_expanded : MakeNot(cond_expanded));
+        selected = ResolvePureScalarArm(*verdict ? branch->then_body_ : *branch->else_body_, segment,
+                                        analyzer, bool_defs, unconstrained_defs);
+      }
+      if (selected.size() != branch->return_vars_.size()) return false;
+      for (size_t k = 0; k < branch->return_vars_.size(); ++k)
+        define_expr_result(branch->return_vars_[k], selected[k]);
+      return true;
+    }
+
+    std::vector<ExprPtr> then_res, else_res;
+    {
+      auto ctx = analyzer->GetConstraintContext(cond_expanded);
+      then_res = ResolvePureScalarArm(branch->then_body_, segment, analyzer, bool_defs, unconstrained_defs);
+    }
+    {
+      auto ctx = analyzer->GetConstraintContext(MakeNot(cond_expanded));
+      else_res = ResolvePureScalarArm(*branch->else_body_, segment, analyzer, bool_defs, unconstrained_defs);
+    }
+    if (then_res.size() != branch->return_vars_.size() || else_res.size() != branch->return_vars_.size())
+      return false;
+    for (size_t k = 0; k < branch->return_vars_.size(); ++k) {
+      const auto& rv = branch->return_vars_[k];
+      if (SameControlExpr(then_res[k], else_res[k])) {
+        define_expr_result(rv, then_res[k]);
+      } else {
+        define_select_result(rv, branch->condition_, then_res[k], else_res[k]);
+      }
+    }
+    return true;
   }
   void SelectSlot(const AssignStmtPtr& assign, const SyncSegment& segment) {
     auto call = As<Call>(assign->value_);
@@ -1360,6 +1950,7 @@ class Importer {
         segment.sites.push_back(Site(call, segment));
         preceding_matrix |= segment.sites.back().pipe == PipeType::M;
       } else if (auto branch = As<IfStmt>(s)) {
+        if (!branch->return_vars_.empty() && TryPureScalarBranch(branch, segment)) continue;
         if (branch->return_vars_.empty() && !IsInitializationContinuationBranch(branch)) {
           if (const auto verdict = EvaluateStaticBranchCondition(branch->condition_, segment)) {
             result.static_branches[branch.get()] = *verdict;

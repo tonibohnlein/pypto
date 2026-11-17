@@ -131,6 +131,9 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncView& result) {
           case Kind::Add:
             kind = "add";
             break;
+          case Kind::Sub:
+            kind = "sub";
+            break;
           case Kind::Scale:
             kind = "scale";
             break;
@@ -143,6 +146,36 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncView& result) {
           case Kind::Remainder:
             kind = "remainder";
             break;
+          case Kind::Equal:
+            kind = "equal";
+            break;
+          case Kind::NotEqual:
+            kind = "not_equal";
+            break;
+          case Kind::LessThan:
+            kind = "less_than";
+            break;
+          case Kind::LessEqual:
+            kind = "less_equal";
+            break;
+          case Kind::GreaterThan:
+            kind = "greater_than";
+            break;
+          case Kind::GreaterEqual:
+            kind = "greater_equal";
+            break;
+          case Kind::And:
+            kind = "and";
+            break;
+          case Kind::Or:
+            kind = "or";
+            break;
+          case Kind::Not:
+            kind = "not";
+            break;
+          case Kind::Select:
+            kind = "select";
+            break;
         }
         INTERNAL_CHECK(kind) << "Unknown retained coordinate node";
         nb::dict value;
@@ -154,6 +187,7 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncView& result) {
         value["step"] = node.step;
         value["left"] = node.left;
         value["right"] = node.right;
+        value["condition"] = node.condition;
         value["parameter"] = node.parameter;
         value["frame"] = node.frame;
         value["constant"] = node.constant;
@@ -178,6 +212,23 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncView& result) {
       row_major["row_scale"] = proof.row_scale;
       row_major["column_scale"] = proof.column_scale;
       value["row_major_tiles"] = row_major;
+    }
+    value["swizzled_tiles"] = nb::none();
+    if (footprint.swizzled_tiles) {
+      const auto& proof = *footprint.swizzled_tiles;
+      nb::dict swizzled;
+      swizzled["frame"] = proof.frame;
+      swizzled["tile_coordinate"] = proof.tile_coordinate;
+      swizzled["frame_start_root"] = proof.frame_start_root;
+      swizzled["row_tiles"] = proof.row_tiles;
+      swizzled["column_tiles"] = proof.column_tiles;
+      swizzled["row_scale"] = proof.row_scale;
+      swizzled["column_scale"] = proof.column_scale;
+      swizzled["group_tiles"] = proof.group_tiles;
+      swizzled["group_size"] = proof.group_size;
+      swizzled["col_major_groups"] = proof.col_major_groups;
+      swizzled["snake"] = proof.snake;
+      value["swizzled_tiles"] = swizzled;
     }
     return value;
   };

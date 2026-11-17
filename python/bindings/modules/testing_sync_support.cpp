@@ -429,7 +429,7 @@ std::optional<PointBoundary> QueryExternalNumericalBoundary(const CompactSyncVie
   const auto& access = segment.sites[s].accesses[a];
   const auto& external = *access.external;
   if (!segment.count) return PointBoundary{};
-  if (!external.row_major_tiles) {
+  if (!external.row_major_tiles && !external.swizzled_tiles) {
     INTERNAL_CHECK(segment.count == 1) << "Output ownership missing nontrivial inverse";
     std::map<const ForStmt*, int64_t> binding;
     std::set<const ForStmt*> needed_frames;
@@ -451,29 +451,62 @@ std::optional<PointBoundary> QueryExternalNumericalBoundary(const CompactSyncVie
       out.first_writer = out.last_writer = Occurrence{r, 0, s};
     return out;
   }
-  const auto& tiles = *external.row_major_tiles;
-  const auto tile_row = row / tiles.row_scale, tile_column = column / tiles.column_scale;
-  if (tile_row >= tiles.row_tiles || tile_column >= tiles.column_tiles) return PointBoundary{};
-  const auto inverse = __int128(tile_row) * tiles.column_tiles + tile_column;
-  if (inverse > std::numeric_limits<int64_t>::max()) return std::nullopt;
-  const auto tile = static_cast<int64_t>(inverse);
-  const auto& coordinate = external.program->nodes.at(tiles.tile_coordinate);
+  ForStmtPtr tile_frame;
+  size_t tile_coord_id = 0;
+  std::optional<size_t> frame_start_root;
+  int64_t tile = 0;
+  if (external.row_major_tiles) {
+    const auto& tiles = *external.row_major_tiles;
+    const auto tile_row = row / tiles.row_scale, tile_column = column / tiles.column_scale;
+    if (tile_row >= tiles.row_tiles || tile_column >= tiles.column_tiles) return PointBoundary{};
+    const auto inverse = __int128(tile_row) * tiles.column_tiles + tile_column;
+    if (inverse > std::numeric_limits<int64_t>::max()) return std::nullopt;
+    tile = static_cast<int64_t>(inverse);
+    tile_frame = tiles.frame;
+    tile_coord_id = tiles.tile_coordinate;
+    frame_start_root = tiles.frame_start_root;
+  } else {
+    const auto& tiles = *external.swizzled_tiles;
+    const auto tile_row = row / tiles.row_scale, tile_column = column / tiles.column_scale;
+    if (tile_row >= tiles.row_tiles || tile_column >= tiles.column_tiles) return PointBoundary{};
+    __int128 inverse = 0;
+    if (tiles.col_major_groups) {
+      const auto block = tile_column / tiles.group_tiles;
+      const auto local_c = tile_column % tiles.group_tiles;
+      const auto n_col_b = std::min(tiles.group_tiles, tiles.column_tiles - block * tiles.group_tiles);
+      const auto base_r = (tiles.snake && (block % 2 == 1)) ? (tiles.row_tiles - 1 - tile_row) : tile_row;
+      inverse = __int128(block) * tiles.group_size + __int128(base_r) * n_col_b + local_c;
+    } else {
+      const auto block = tile_row / tiles.group_tiles;
+      const auto local_r = tile_row % tiles.group_tiles;
+      const auto n_row_b = std::min(tiles.group_tiles, tiles.row_tiles - block * tiles.group_tiles);
+      const auto base_c =
+          (tiles.snake && (block % 2 == 1)) ? (tiles.column_tiles - 1 - tile_column) : tile_column;
+      inverse = __int128(block) * tiles.group_size + __int128(base_c) * n_row_b + local_r;
+    }
+    if (inverse > std::numeric_limits<int64_t>::max()) return std::nullopt;
+    tile = static_cast<int64_t>(inverse);
+    tile_frame = tiles.frame;
+    tile_coord_id = tiles.tile_coordinate;
+    frame_start_root = tiles.frame_start_root;
+  }
+  const auto& coordinate = external.program->nodes.at(tile_coord_id);
   std::optional<int64_t> start = coordinate.start;
-  if (tiles.frame_start_root)
-    start = EvaluateSyncCoordinate(*external.program, *tiles.frame_start_root, {}, parameters, block_index);
+  if (frame_start_root)
+    start = EvaluateSyncCoordinate(*external.program, *frame_start_root, {}, parameters, block_index);
   if (!start) return std::nullopt;
   if (tile < *start || (tile - *start) % coordinate.step) return PointBoundary{};
   const auto visit = (tile - *start) / coordinate.step;
   int64_t ordinal = 0;
   for (const auto& frame : segment.nested_frames) {
     if (!frame.count) return PointBoundary{};
-    const auto digit = frame.loop == tiles.frame ? visit : 0;
+    const auto digit = frame.loop == tile_frame ? visit : 0;
     if (digit >= frame.count) return PointBoundary{};
     const auto next = __int128(ordinal) * frame.count + digit;
     if (next > std::numeric_limits<int64_t>::max()) return std::nullopt;
     ordinal = static_cast<int64_t>(next);
   }
-  const std::map<const ForStmt*, int64_t> binding{{tiles.frame.get(), tile}};
+  const std::map<const ForStmt*, int64_t> binding{{tile_frame.get(), tile}};
   const auto first_row =
       EvaluateSyncCoordinate(*external.program, external.row, binding, parameters, block_index);
   const auto first_column =
@@ -713,10 +746,17 @@ std::optional<int64_t> EvaluateSyncCoordinate(const SyncCoordinateProgram& progr
       pending.push_back(child);
       return true;
     };
-    if (n.kind == Kind::Scale || n.kind == Kind::ModularShift || (n.kind == Kind::Loop && n.dynamic_start)) {
+    if (n.kind == Kind::Scale || n.kind == Kind::ModularShift || n.kind == Kind::Not ||
+        (n.kind == Kind::Loop && n.dynamic_start)) {
       if (!dependency(n.left)) return std::nullopt;
-    } else if (n.kind == Kind::Add || n.kind == Kind::FloorDivide || n.kind == Kind::Remainder) {
+    } else if (n.kind == Kind::Add || n.kind == Kind::Sub || n.kind == Kind::FloorDivide ||
+               n.kind == Kind::Remainder || n.kind == Kind::Equal || n.kind == Kind::NotEqual ||
+               n.kind == Kind::LessThan || n.kind == Kind::LessEqual ||
+               n.kind == Kind::GreaterThan || n.kind == Kind::GreaterEqual ||
+               n.kind == Kind::And || n.kind == Kind::Or) {
       if (!dependency(n.left) || !dependency(n.right)) return std::nullopt;
+    } else if (n.kind == Kind::Select) {
+      if (!dependency(n.condition) || !dependency(n.left) || !dependency(n.right)) return std::nullopt;
     }
   }
   std::map<size_t, int64_t> values;
@@ -754,11 +794,44 @@ std::optional<int64_t> EvaluateSyncCoordinate(const SyncCoordinateProgram& progr
       case Kind::Add:
         value = __int128(values.at(n.left)) + values.at(n.right);
         break;
+      case Kind::Sub:
+        value = __int128(values.at(n.left)) - values.at(n.right);
+        break;
       case Kind::FloorDivide:
       case Kind::Remainder:
         if (values.at(n.right) <= 0) return std::nullopt;
         value = n.kind == Kind::FloorDivide ? values.at(n.left) / values.at(n.right)
                                             : values.at(n.left) % values.at(n.right);
+        break;
+      case Kind::Equal:
+        value = values.at(n.left) == values.at(n.right) ? 1 : 0;
+        break;
+      case Kind::NotEqual:
+        value = values.at(n.left) != values.at(n.right) ? 1 : 0;
+        break;
+      case Kind::LessThan:
+        value = values.at(n.left) < values.at(n.right) ? 1 : 0;
+        break;
+      case Kind::LessEqual:
+        value = values.at(n.left) <= values.at(n.right) ? 1 : 0;
+        break;
+      case Kind::GreaterThan:
+        value = values.at(n.left) > values.at(n.right) ? 1 : 0;
+        break;
+      case Kind::GreaterEqual:
+        value = values.at(n.left) >= values.at(n.right) ? 1 : 0;
+        break;
+      case Kind::And:
+        value = (values.at(n.left) != 0 && values.at(n.right) != 0) ? 1 : 0;
+        break;
+      case Kind::Or:
+        value = (values.at(n.left) != 0 || values.at(n.right) != 0) ? 1 : 0;
+        break;
+      case Kind::Not:
+        value = values.at(n.left) == 0 ? 1 : 0;
+        break;
+      case Kind::Select:
+        value = values.at(n.condition) != 0 ? values.at(n.left) : values.at(n.right);
         break;
     }
     if (value < n.lower || value > n.upper || value > std::numeric_limits<int64_t>::max())

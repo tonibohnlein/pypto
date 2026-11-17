@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "pypto/core/logging.h"
+#include "pypto/ir/arith/analyzer.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/base/mutator.h"
@@ -397,6 +398,221 @@ class CommandGuards {
   };
   std::vector<Node> roots_;
   size_t shared_ = 0, visits_ = 0, expressions_ = 0;
+  static bool SameNode(const Node& a, const Node& b) {
+    if (static_cast<bool>(a.condition) != static_cast<bool>(b.condition) ||
+        static_cast<bool>(a.leaf) != static_cast<bool>(b.leaf) ||
+        a.children.size() != b.children.size() || a.alternative.size() != b.alternative.size())
+      return false;
+    if (a.condition && !SameControl(a.condition, b.condition)) return false;
+    if (a.leaf && !SameControl(a.leaf, b.leaf)) return false;
+    for (size_t i = 0; i < a.children.size(); ++i)
+      if (!SameNode(a.children[i], b.children[i])) return false;
+    for (size_t i = 0; i < a.alternative.size(); ++i)
+      if (!SameNode(a.alternative[i], b.alternative[i])) return false;
+    return true;
+  }
+  static bool SameNodeList(const std::vector<Node>& a, const std::vector<Node>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+      if (!SameNode(a[i], b[i])) return false;
+    return true;
+  }
+  static size_t CountNodeGuards(const std::vector<Node>& nodes) {
+    size_t count = 0;
+    for (const auto& node : nodes) {
+      if (node.condition) ++count;
+      count += CountNodeGuards(node.children);
+      count += CountNodeGuards(node.alternative);
+    }
+    return count;
+  }
+  static bool CollectOps(const std::vector<Node>& nodes, std::string& kind,
+                         std::vector<CallPtr>& calls) {
+    for (const auto& node : nodes) {
+      if (node.leaf) {
+        if (!node.leaf->command) return false;
+        const auto call = As<Call>(node.leaf->command);
+        if (!call) return false;
+        const std::string& name = call->op_->name_;
+        if (name != "system.set_flag" && name != "system.wait_flag") return false;
+        if (kind.empty())
+          kind = name;
+        else if (kind != name)
+          return false;
+        calls.push_back(call);
+      } else {
+        if (!CollectOps(node.children, kind, calls) || !CollectOps(node.alternative, kind, calls))
+          return false;
+      }
+    }
+    return true;
+  }
+  // Safe reordering only across same-kind commands (e.g. distinct set_flags at one cut).
+  static bool SameKindDisjointCommands(const std::vector<Node>& a, const Node& b) {
+    std::string kind_a, kind_b;
+    std::vector<CallPtr> calls_a, calls_b;
+    if (!CollectOps(a, kind_a, calls_a) || !CollectOps({b}, kind_b, calls_b)) return false;
+    if (kind_a.empty() || kind_a != kind_b) return false;
+    for (const auto& ca : calls_a)
+      for (const auto& cb : calls_b)
+        if (ca == cb || SameControl(ca, cb)) return false;
+    return true;
+  }
+  struct OrderedCmp {
+    bool is_le;
+    ExprPtr lhs, rhs;
+  };
+  static std::optional<OrderedCmp> CanonicalComparison(const ExprPtr& expr) {
+    if (const auto lt = As<Lt>(expr)) return OrderedCmp{false, lt->left_, lt->right_};
+    if (const auto gt = As<Gt>(expr)) return OrderedCmp{false, gt->right_, gt->left_};
+    if (const auto le = As<Le>(expr)) return OrderedCmp{true, le->left_, le->right_};
+    if (const auto ge = As<Ge>(expr)) return OrderedCmp{true, ge->right_, ge->left_};
+    return std::nullopt;
+  }
+  bool AreComplementary(const ExprPtr& a, const ExprPtr& b) {
+    if (!PureCommandExpression(a, &expressions_) || !PureCommandExpression(b, &expressions_)) return false;
+    if (const auto na = As<Not>(a); na && SameControl(na->operand_, b)) return true;
+    if (const auto nb = As<Not>(b); nb && SameControl(a, nb->operand_)) return true;
+    {
+      const auto ea = As<Eq>(a);
+      const auto nb = As<Ne>(b);
+      if (ea && nb && ((SameControl(ea->left_, nb->left_) && SameControl(ea->right_, nb->right_)) ||
+                       (SameControl(ea->left_, nb->right_) && SameControl(ea->right_, nb->left_))))
+        return true;
+    }
+    {
+      const auto eb = As<Eq>(b);
+      const auto na = As<Ne>(a);
+      if (eb && na && ((SameControl(eb->left_, na->left_) && SameControl(eb->right_, na->right_)) ||
+                       (SameControl(eb->left_, na->right_) && SameControl(eb->right_, na->left_))))
+        return true;
+    }
+    const auto ca = CanonicalComparison(a);
+    const auto cb = CanonicalComparison(b);
+    if (ca && cb && ca->is_le != cb->is_le && SameControl(ca->lhs, cb->rhs) &&
+        SameControl(ca->rhs, cb->lhs))
+      return true;
+    try {
+      arith::Analyzer analyzer;
+      const auto either = std::make_shared<Or>(a, b, DataType::BOOL, a->span_);
+      const auto both = std::make_shared<And>(a, b, DataType::BOOL, a->span_);
+      const auto exclusive = std::make_shared<Not>(both, DataType::BOOL, a->span_);
+      return analyzer.CanProve(either) && analyzer.CanProve(exclusive);
+    } catch (const StructuralComparisonUnsupported&) {
+      return false;
+    }
+  }
+  void NormalizeNodes(std::vector<Node>& nodes) {
+    for (auto& node : nodes) {
+      NormalizeNodes(node.children);
+      NormalizeNodes(node.alternative);
+    }
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (size_t i = 0; i < nodes.size();) {
+        if (nodes[i].condition && nodes[i].children.empty() && nodes[i].alternative.empty()) {
+          nodes.erase(nodes.begin() + static_cast<std::ptrdiff_t>(i));
+          changed = true;
+          continue;
+        }
+        if (nodes[i].condition && !nodes[i].alternative.empty() &&
+            SameNodeList(nodes[i].children, nodes[i].alternative)) {
+          auto lifted = std::move(nodes[i].children);
+          nodes.erase(nodes.begin() + static_cast<std::ptrdiff_t>(i));
+          nodes.insert(nodes.begin() + static_cast<std::ptrdiff_t>(i),
+                       std::make_move_iterator(lifted.begin()), std::make_move_iterator(lifted.end()));
+          changed = true;
+          continue;
+        }
+        ++i;
+      }
+      for (size_t i = 0; i + 1 < nodes.size();) {
+        if (nodes[i].condition && nodes[i + 1].condition &&
+            SameControl(nodes[i].condition, nodes[i + 1].condition)) {
+          nodes[i].children.insert(nodes[i].children.end(),
+                                   std::make_move_iterator(nodes[i + 1].children.begin()),
+                                   std::make_move_iterator(nodes[i + 1].children.end()));
+          nodes[i].alternative.insert(nodes[i].alternative.end(),
+                                      std::make_move_iterator(nodes[i + 1].alternative.begin()),
+                                      std::make_move_iterator(nodes[i + 1].alternative.end()));
+          nodes.erase(nodes.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+          NormalizeNodes(nodes[i].children);
+          NormalizeNodes(nodes[i].alternative);
+          changed = true;
+          continue;
+        }
+        ++i;
+      }
+      if (changed) continue;
+      for (size_t i = 0; i < nodes.size() && !changed; ++i) {
+        if (!nodes[i].condition || !nodes[i].alternative.empty()) continue;
+        for (size_t j = i + 1; j < nodes.size(); ++j) {
+          if (nodes[j].condition && nodes[j].alternative.empty() &&
+              AreComplementary(nodes[i].condition, nodes[j].condition)) {
+            if (j == i + 1) {
+              size_t prefix = 0;
+              const auto min_len = std::min(nodes[i].children.size(), nodes[j].children.size());
+              while (prefix < min_len && SameNode(nodes[i].children[prefix], nodes[j].children[prefix]))
+                ++prefix;
+              size_t suffix = 0;
+              while (prefix + suffix < min_len &&
+                     SameNode(nodes[i].children[nodes[i].children.size() - 1 - suffix],
+                              nodes[j].children[nodes[j].children.size() - 1 - suffix]))
+                ++suffix;
+              if (prefix > 0 || suffix > 0) {
+                std::vector<Node> replacement;
+                for (size_t k = 0; k < prefix; ++k) replacement.push_back(nodes[i].children[k]);
+                std::vector<Node> rem_i(nodes[i].children.begin() + static_cast<std::ptrdiff_t>(prefix),
+                                        nodes[i].children.end() - static_cast<std::ptrdiff_t>(suffix));
+                std::vector<Node> rem_j(nodes[j].children.begin() + static_cast<std::ptrdiff_t>(prefix),
+                                        nodes[j].children.end() - static_cast<std::ptrdiff_t>(suffix));
+                std::vector<Node> suf(nodes[i].children.end() - static_cast<std::ptrdiff_t>(suffix),
+                                      nodes[i].children.end());
+                // When only one branch has residual same-kind disjoint commands
+                // (e.g. an exit-only set_flag alongside an unconditional set_flag),
+                // keep the residual tail at the boundary so boundary motion can hoist it.
+                const auto& residual = !rem_i.empty() ? rem_i : rem_j;
+                const bool suf_before_residual =
+                    suffix > 0 && (!rem_i.empty() != !rem_j.empty()) && suf.size() == 1 &&
+                    SameKindDisjointCommands(residual, suf.front());
+                if (suf_before_residual)
+                  replacement.insert(replacement.end(), std::make_move_iterator(suf.begin()),
+                                     std::make_move_iterator(suf.end()));
+                if (!rem_i.empty()) replacement.push_back({nodes[i].condition, nullptr, std::move(rem_i), {}});
+                if (!rem_j.empty()) replacement.push_back({nodes[j].condition, nullptr, std::move(rem_j), {}});
+                if (!suf_before_residual)
+                  replacement.insert(replacement.end(), std::make_move_iterator(suf.begin()),
+                                     std::make_move_iterator(suf.end()));
+                nodes.erase(nodes.begin() + static_cast<std::ptrdiff_t>(i),
+                            nodes.begin() + static_cast<std::ptrdiff_t>(j) + 1);
+                nodes.insert(nodes.begin() + static_cast<std::ptrdiff_t>(i),
+                             std::make_move_iterator(replacement.begin()),
+                             std::make_move_iterator(replacement.end()));
+                changed = true;
+                break;
+              }
+            } else if (SameNodeList(nodes[i].children, nodes[j].children)) {
+              bool commutes = true;
+              for (size_t m = i + 1; m < j && commutes; ++m)
+                commutes = SameKindDisjointCommands(nodes[i].children, nodes[m]);
+              if (commutes) {
+                auto lifted = std::move(nodes[j].children);
+                nodes.erase(nodes.begin() + static_cast<std::ptrdiff_t>(j));
+                nodes.insert(nodes.begin() + static_cast<std::ptrdiff_t>(j),
+                             std::make_move_iterator(lifted.begin()),
+                             std::make_move_iterator(lifted.end()));
+                nodes.erase(nodes.begin() + static_cast<std::ptrdiff_t>(i));
+                changed = true;
+                break;
+              }
+            }
+          }
+          if (!SameKindDisjointCommands(nodes[i].children, nodes[j])) break;
+        }
+      }
+    }
+  }
   void Append(std::vector<Node>& nodes, const ControlPtr& statement) {
     ++visits_;
     if (!statement->condition && !statement->command) {
@@ -435,6 +651,10 @@ class CommandGuards {
  public:
   ControlForest Build(const ControlForest& commands, PhysicalSyncRealization& result, bool endpoint = true) {
     for (const auto& command : commands) Append(roots_, command);
+    const auto guards_before = CountNodeGuards(roots_);
+    NormalizeNodes(roots_);
+    const auto guards_after = CountNodeGuards(roots_);
+    shared_ += guards_before - guards_after;
     if (endpoint) {
       INTERNAL_CHECK(result.guard_sites >= shared_) << "Internal error: command guard accounting";
       result.guard_sites -= shared_;

@@ -1184,10 +1184,48 @@ def test_shenggan_swizzle_promotes_kb_in_realize_and_three_pass(tmp_path):
         for prog in (realized, lowered):
             fn = next(f for f in prog.functions.values() if "hpgemm_hpgemm" in f.name)
             assert fn.attrs.get("pypto_autosync") is True
-            assert fn.attrs.get("autosync_retained_child_count") == 1
             refusals = str(fn.attrs.get("autosync_child_refusals", ""))
             assert "kb__idx_v0" not in refusals
             assert "n_col" not in refusals
+            if disjoint_gm:
+                assert fn.attrs.get("autosync_retained_child_count") is None
+                assert "autosync_analysis_policy" not in fn.attrs
+            else:
+                assert fn.attrs.get("autosync_retained_child_count") == 1
+
+
+def test_shenggan_4k_swizzle_exact_and_double_buffer_child_ids(tmp_path):
+    program = capture_shenggan(tmp_path / "capture4k", m=2048, n=4096, k=4096, workers=24, swizzle=True)
+    for policy in ("exact", "conservative_prefix"):
+        with passes.PassContext(
+            [],
+            enable_buffer_ir=True,
+            memory_planner=passes.MemoryPlanner.PYPTO,
+            enable_pypto_autosync=True,
+            autosync_policy=policy,
+            autosync_disjoint_gm=True,
+        ):
+            realized = passes.realize_sync()(program)
+        fn = next(f for f in realized.functions.values() if "hpgemm_hpgemm" in f.name)
+        assert fn.attrs.get("pypto_autosync") is True
+        assert fn.attrs.get("autosync_retained_child_count") is None
+        assert "autosync_fallback_reason" not in fn.attrs
+
+    with passes.PassContext(
+        [],
+        enable_buffer_ir=True,
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+        autosync_disjoint_gm=False,
+    ):
+        realized_m1 = passes.realize_sync()(program)
+    fn_m1 = next(f for f in realized_m1.functions.values() if "hpgemm_hpgemm" in f.name)
+    text_m1 = str(fn_m1)
+    assert fn_m1.attrs.get("autosync_retained_child_count") == 1
+    assert "kb__idx_v0 % 15" not in text_m1
+    assert "MTE2, dst_pipe=pl.PipeType.MTE1, event_id=5" not in text_m1
+    assert "MTE2, dst_pipe=pl.PipeType.MTE1, event_id=6" not in text_m1
 
 
 def test_qwen3_jit_pipeline_unrolled_acc_children_promote():

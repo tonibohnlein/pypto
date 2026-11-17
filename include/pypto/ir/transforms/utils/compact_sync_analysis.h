@@ -83,10 +83,31 @@ struct SyncStorage {
 // left; all other node operands precede their users. This retained geometry is
 // distinct from a proof that a storage root has no cross-visit conflicts.
 struct SyncCoordinateNode {
-  enum class Kind { Constant, Parameter, Block, Loop, Add, Scale, ModularShift, FloorDivide, Remainder };
+  enum class Kind {
+    Constant,
+    Parameter,
+    Block,
+    Loop,
+    Add,
+    Sub,
+    Scale,
+    ModularShift,
+    FloorDivide,
+    Remainder,
+    Equal,
+    NotEqual,
+    LessThan,
+    LessEqual,
+    GreaterThan,
+    GreaterEqual,
+    And,
+    Or,
+    Not,
+    Select,
+  };
   Kind kind;
   int64_t upper = 0, factor = 0, start = 0, step = 0, lower = 0;
-  size_t left = 0, right = 0, parameter = 0;
+  size_t left = 0, right = 0, parameter = 0, condition = 0;
   ForStmtPtr frame;
   bool constant = false, dynamic_start = false;
 };
@@ -100,10 +121,21 @@ struct SyncRowMajorTileMap {
   int64_t row_tiles = 0, column_tiles = 0;
   int64_t row_scale = 0, column_scale = 0;
 };
+struct SyncSwizzledTileMap {
+  ForStmtPtr frame;
+  size_t tile_coordinate = 0;
+  std::optional<size_t> frame_start_root;
+  int64_t row_tiles = 0, column_tiles = 0;
+  int64_t row_scale = 0, column_scale = 0;
+  int64_t group_tiles = 0, group_size = 0;
+  bool col_major_groups = true;
+  bool snake = false;
+};
 struct SyncExternalFootprint {
   std::shared_ptr<const SyncCoordinateProgram> program;
   size_t row = 0, column = 0;
   std::optional<SyncRowMajorTileMap> row_major_tiles;
+  std::optional<SyncSwizzledTileMap> swizzled_tiles;
 };
 struct SyncAccess {
   size_t storage;

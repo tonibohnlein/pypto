@@ -420,6 +420,12 @@ class Parser {
         Waits(branch, {}, cursor);
         return;
       }
+      if (std::none_of(branch->return_vars_.begin(), branch->return_vars_.end(),
+                       [](const VarPtr& v) { return static_cast<bool>(As<SyncTokenType>(v->GetType())); })) {
+        CHECK(cursor.pending.empty()) << "Scalar coordinate selection cannot sit inside a pending token wait";
+        cursor.last.reset();
+        return;
+      }
       CHECK(cursor.pending.empty() && !scope_.empty() && branch->return_vars_.size() == 1 &&
             branch->else_body_)
           << "Unsupported scoped token capture";
@@ -864,6 +870,7 @@ class FamilyNormalizer {
     // index after a successful pass; no quadratic whole-inventory search is
     // hidden inside a callback, and all candidate comparisons are counted.
     bool changed;
+    bool allow_singleton_pairs = false;
     do {
       changed = false;
       ++work_.union_passes;
@@ -899,19 +906,31 @@ class FamilyNormalizer {
           groups[std::move(key)].push_back(index);
         }
       }
-      for (const auto& [key, members] : groups) {
+      for (const auto& [key, raw_members] : groups) {
+        if (raw_members.size() < 2) continue;
         const auto axis = static_cast<size_t>(key[4]);
+        auto members = raw_members;
+        std::sort(members.begin(), members.end(), [&](size_t a, size_t b) {
+          const auto pa = EndpointProgression(*families[a].source_domain, axis);
+          const auto pb = EndpointProgression(*families[b].source_domain, axis);
+          return std::tie(pa.first, pa.second, a) < std::tie(pb.first, pb.second, b);
+        });
         for (size_t x = 0; x < members.size(); ++x) {
           const auto i = members[x];
           if (removed[i]) continue;
           for (size_t y = x + 1; y < members.size(); ++y) {
             const auto j = members[y];
             if (removed[j]) continue;
+            // Extend multi-record progressions before forming arbitrary new
+            // two-singleton strides so prefix/tail pieces snap onto steady-state
+            // stride families first.
+            const auto pi = EndpointProgression(*families[i].source_domain, axis);
+            const auto pj = EndpointProgression(*families[j].source_domain, axis);
+            if (!allow_singleton_pairs && pi.Count() == 1 && pj.Count() == 1) continue;
             // A previous axis group can change an indexed coordinate. Only
             // merge one group per pass so no stale key can justify a union.
             ++work_.union_candidates;
-            const auto joined = Union(EndpointProgression(*families[i].source_domain, axis),
-                                      EndpointProgression(*families[j].source_domain, axis));
+            const auto joined = Union(pi, pj);
             if (!joined) continue;
             auto& f = families[i];
             auto sr = f.source_domain->ranges, tr = f.target_domain->ranges;
@@ -947,6 +966,10 @@ class FamilyNormalizer {
             ++retained;
           }
         families.resize(retained);
+        allow_singleton_pairs = false;
+      } else if (!allow_singleton_pairs) {
+        allow_singleton_pairs = true;
+        changed = true;
       }
     } while (changed);
   }

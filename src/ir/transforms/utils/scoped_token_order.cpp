@@ -330,7 +330,8 @@ class ScopedTokenOrder::State {
  private:
   // Prove the complete query rectangle with a single actual token edge between
   // two native chains. Queries never become evidence in the retained graph.
-  bool NativeTokenWitness(const PhysicalSyncFamily& query, size_t split_budget = 2) const {
+  bool NativeTokenWitness(const PhysicalSyncFamily& query, size_t split_budget = 2,
+                          size_t prefix_budget = 4) const {
     if (query.count == 1) {
       return Query({query.source_region, query.source_first, query.source_site}, true,
                    {query.target_region, query.target_first, query.target_site}, false);
@@ -350,6 +351,7 @@ class ScopedTokenOrder::State {
       after_steps.push_back(Product(paths_[nr].frames[j].second, AxisStep(query, j, true)));
     }
     std::optional<std::pair<size_t, int64_t>> split_candidate;
+    std::optional<std::pair<size_t, int64_t>> prefix_split;
     for (const auto index : directional_families_[previous_pipe][next_pipe]) {
       ++candidate_visits;
       const auto& edge = families[index];
@@ -368,11 +370,18 @@ class ScopedTokenOrder::State {
       }
       Ordinal before = source - previous_position, after = next_position - target;
       bool compatible = true;
+      std::optional<std::pair<size_t, int64_t>> edge_prefix;
       for (size_t j = 0; j < counts.size() && compatible; ++j) {
         if (counts[j] == 1) continue;
         size_t e = 0;
         while (e < edge.axes.size() && edge.axes[e].frame != query.axes[j].frame) ++e;
         if (e == edge.axes.size()) {
+          // A trailing singleton axis is omitted from `edge.axes`; its record at
+          // `lo` still proves `s_j = 0` when all other axes match across the prefix.
+          if (prefix_budget > 0 && !edge_prefix) {
+            edge_prefix = {j, 1};
+            continue;
+          }
           compatible = false;
           break;
         }
@@ -386,21 +395,41 @@ class ScopedTokenOrder::State {
           break;
         }
         const auto ratio = step / edge_step;
-        if (Ordinal(digits[e]) + Product(ratio, counts[j] - 1) >= edge.axes[e].count) {
-          compatible = false;
-          break;
+        const auto covered = 1 + (edge.axes[e].count - 1 - digits[e]) / ratio;
+        int64_t span = counts[j] - 1;
+        if (covered < counts[j]) {
+          if (prefix_budget == 0 || edge_prefix) {
+            compatible = false;
+            break;
+          }
+          edge_prefix = {j, covered};
+          span = covered - 1;
         }
-        const auto source_step =
-            Product(paths_[edge.source_region].frames[e].second, AxisStep(edge, e, false));
-        const auto target_step =
-            Product(paths_[edge.target_region].frames[e].second, AxisStep(edge, e, true));
-        const auto before_delta = Product(source_step, ratio) - before_steps[j];
-        const auto after_delta = after_steps[j] - Product(target_step, ratio);
-        if (before_delta < 0) before -= Product(-before_delta, counts[j] - 1);
-        if (after_delta < 0) after -= Product(-after_delta, counts[j] - 1);
-        if (before < 0 || after < 0) compatible = false;
+        if (span > 0) {
+          const auto source_step =
+              Product(paths_[edge.source_region].frames[e].second, AxisStep(edge, e, false));
+          const auto target_step =
+              Product(paths_[edge.target_region].frames[e].second, AxisStep(edge, e, true));
+          const auto before_delta = Product(source_step, ratio) - before_steps[j];
+          const auto after_delta = after_steps[j] - Product(target_step, ratio);
+          if (before_delta < 0) before -= Product(-before_delta, span);
+          if (after_delta < 0) after -= Product(-after_delta, span);
+          if (before < 0 || after < 0) compatible = false;
+        }
       }
-      if (compatible) return true;
+      if (compatible) {
+        if (!edge_prefix) return true;
+        if (!prefix_split || edge_prefix->second > prefix_split->second) prefix_split = edge_prefix;
+      }
+    }
+    if (prefix_split && prefix_budget > 0) {
+      const auto [j, covered] = *prefix_split;
+      PhysicalSyncFamily sub = query;
+      sub.source_first += covered * query.axes[j].source_stride;
+      sub.target_first += covered * query.axes[j].target_stride;
+      sub.axes[j].count = counts[j] - covered;
+      sub.count = (query.count / counts[j]) * sub.axes[j].count;
+      if (NativeTokenWitness(sub, split_budget, prefix_budget - 1)) return true;
     }
     if (split_candidate && split_budget > 0) {
       const auto [j, k] = *split_candidate;
@@ -415,7 +444,7 @@ class ScopedTokenOrder::State {
         sub.axes[j].source_step *= k;
         sub.axes[j].target_step *= k;
         sub.count = (query.count / counts[j]) * sub_count;
-        if (!NativeTokenWitness(sub, split_budget - 1)) return false;
+        if (!NativeTokenWitness(sub, split_budget - 1, prefix_budget)) return false;
       }
       return true;
     }
