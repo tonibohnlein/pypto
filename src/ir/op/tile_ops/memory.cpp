@@ -1284,6 +1284,9 @@ REGISTER_OP("tile.write")
     .set_arg_effect(0, ArgEffect::ReadWrite)
     .set_input_memory(0, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
+    // This is a mutation of the destination, not a fresh tile value. Keep the
+    // returned chaining alias explicit for InitMemRef and every storage planner.
+    .set_output_reuses_input(0)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileWriteType(args, kwargs, "tile.write");

@@ -28,10 +28,12 @@
 
 #include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_config.h"
+#include "pypto/backend/common/backend_handler.h"
 #include "pypto/backend/common/buffer_axis_recipes.h"
 #include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
+#include "pypto/backend/common/buffer_scalar_recipes.h"
 #include "pypto/backend/common/buffer_transpose_recipe.h"
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
@@ -746,9 +748,10 @@ class LocalAccumulatorIndex : public IRVisitor {
 class TileToBufferMutator : public IRMutator {
  public:
   TileToBufferMutator(const StorageIndex& storage, bool guarded_valid,
-                      const LocalAccumulatorIndex* local_accumulators, const StmtPtr& body)
+                      const LocalAccumulatorIndex* local_accumulators, const StmtPtr& body, FunctionType core)
       : storage_(storage),
         guarded_valid_(guarded_valid),
+        core_(core),
         local_accumulators_(local_accumulators),
         indexed_(body),
         tuples_(body) {
@@ -1052,7 +1055,31 @@ class TileToBufferMutator : public IRMutator {
     return std::make_shared<MakeTuple>(std::move(extents), tile->span_);
   }
 
+  // Metadata state belongs to the shared allocation; every data use restores
+  // its original logical alias before building an independent static window.
+  std::vector<StmtPtr> RestoreDataOperands(const CallPtr& call) {
+    std::vector<StmtPtr> states;
+    for (const auto& arg : call->args_) {
+      const auto tile = As<TileType>(arg->GetType());
+      if (!tile || storage_.windows.count(tile.get())) continue;
+      const auto handle = Handle(arg);
+      if (HasDynamicValid(As<BufferType>(handle->GetType()))) {
+        states.push_back(Operation("buffer.set_validshape", {handle, Valid(arg)}, call->span_));
+      }
+    }
+    return states;
+  }
+
   StmtPtr LowerDefinition(const CallPtr& call, const VarPtr& result) {
+    if (IsOp(call, "tile.read") || IsOp(call, "tile.write")) {
+      auto states = RestoreDataOperands(call);
+      use_windows_.clear();
+      use_definitions_.clear();
+      auto body = LowerCall(call, result);
+      states.insert(states.end(), use_definitions_.begin(), use_definitions_.end());
+      states.push_back(std::move(body));
+      return SeqStmts::Flatten(states, call->span_);
+    }
     if (!guarded_valid_) return WithValidState(call, result, LowerCall(call, result));
     const auto result_type = result ? As<TileType>(result->GetType()) : nullptr;
     if (result && IsOp(call, "tile.slice")) {
@@ -1095,15 +1122,7 @@ class TileToBufferMutator : public IRMutator {
     // Restore metadata at every data use, including statically valid old aliases
     // sharing a dynamic allocation. There is deliberately no cross-region cache:
     // a branch or loop may have left that allocation in a different state.
-    std::vector<StmtPtr> states;
-    for (const auto& arg : call->args_) {
-      const auto tile = As<TileType>(arg->GetType());
-      if (!tile || storage_.windows.count(tile.get())) continue;
-      const auto handle = Handle(arg);
-      if (HasDynamicValid(As<BufferType>(handle->GetType()))) {
-        states.push_back(Operation("buffer.set_validshape", {handle, Valid(arg)}, call->span_));
-      }
-    }
+    auto states = RestoreDataOperands(call);
     ExprPtr value = store ? call->args_[0] : ExprPtr(result);
     const auto valid = Valid(value);
     ExprPtr condition;
@@ -1206,6 +1225,35 @@ class TileToBufferMutator : public IRMutator {
     // it). Every other attribute still needs an explicit conversion contract.
     CHECK_SPAN(StripAttr(call->attrs_, kPipelineMembershipAttr).empty(), call->span_)
         << "LowerTileToBuffer: device-call attributes require an explicit conversion contract";
+    if (IsOp(call, "tile.read") || IsOp(call, "tile.write")) {
+      const auto* context = PassContext::Current();
+      const bool scalar_target =
+          backend::BackendConfig::IsConfigured() &&
+          (context ? context->GetBackendHandler() : backend::GetBackend()->GetHandler())
+                  ->GetPtoTargetArch() == "a2a3";
+      CHECK_SPAN(core_ == FunctionType::AIV && scalar_target && backend::SupportsLogicalBufferScalar(call),
+                 call->span_)
+          << "LowerTileToBuffer: scalar access needs a qualified A2/A3 AIV static Vec point";
+      const bool read = IsOp(call, "tile.read");
+      CHECK_SPAN(!read || result, call->span_)
+          << "LowerTileToBuffer: scalar reads require an original SSA result";
+      CHECK_SPAN(read || !result || backend::LogicalScalarWriteSharesStorage(call, result->GetType()),
+                 call->span_)
+          << "LowerTileToBuffer: scalar write result must name its destination's exact storage window";
+      std::vector<StmtPtr> out;
+      auto source = WindowHandle(call->args_[0], out);
+      auto indices = VisitExpr(call->args_[1]);
+      if (read) {
+        auto value =
+            OpRegistry::GetInstance().CreateInternal("buffer.read", {source, indices}, {}, call->span_);
+        // Keep the actual scalar definition. Later control consumes this value,
+        // not a metadata query or a synthetic invocation parameter.
+        out.push_back(std::make_shared<AssignStmt>(result, value, call->span_));
+      } else {
+        out.push_back(Operation("buffer.write", {source, indices, VisitExpr(call->args_[2])}, call->span_));
+      }
+      return SeqStmts::Flatten(out, call->span_);
+    }
     if (const auto* indexed = backend::FindLogicalBufferIndexedRecipe(call->op_->name_)) {
       CHECK_SPAN(result && backend::SupportsLogicalBufferIndexed(*indexed, call), call->span_)
           << "LowerTileToBuffer: unsupported indexed operands";
@@ -1657,6 +1705,7 @@ class TileToBufferMutator : public IRMutator {
   const StorageIndex& storage_;
   CanonicalSlotCollector canonical_slots_;
   bool guarded_valid_;
+  FunctionType core_;
   std::unordered_map<const TileType*, CallPtr> window_recipes_;
   std::unordered_map<const TileType*, std::pair<CallPtr, VarPtr>> deferred_windows_;
   std::map<std::pair<const Var*, uint64_t>, std::vector<std::pair<ExprPtr, VarPtr>>> slot_handles_;
@@ -1709,7 +1758,8 @@ ProgramPtr TransformProgram(const ProgramPtr& program) {
       local_accumulators->VisitStmt(function->body_);
     }
     TileToBufferMutator mutator(storage, function->GetAttr<bool>(kAttrBufferIrSelected, false),
-                                local_accumulators ? &*local_accumulators : nullptr, function->body_);
+                                local_accumulators ? &*local_accumulators : nullptr, function->body_,
+                                function->func_type_);
     auto lowered = std::make_shared<Function>(*function);
     lowered->body_ = mutator.VisitStmt(function->body_);
     lowered->ir_stage_ = FunctionIRStage::Buffer;

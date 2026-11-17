@@ -54,6 +54,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/dsa/allocation_plan.h"
 #include "pypto/ir/transforms/dsa/reuse_penalty_recognizer.h"
+#include "pypto/ir/transforms/utils/buffer_active_domain_analysis.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/finite_sync_analysis.h"
@@ -889,6 +890,28 @@ void BindTesting(nb::module_& m) {
   // Create a protected submodule for testing utilities
   // This will be accessible as pypto.testing in Python
   nb::module_ testing = m.def_submodule("testing", "Internal testing utilities (do not use in production)");
+  testing.def(
+      "normalize_buffer_active_domains",
+      [](const ir::FunctionPtr& function) {
+        ir::BufferActiveDomainWork work;
+        const auto result = ir::NormalizeBufferActiveDomains(function, &work);
+        nb::dict counts;
+        counts["definition_statements"] = work.definition_statements;
+        counts["domain_statements"] = work.domain_statements;
+        counts["metadata_statements"] = work.metadata_statements;
+        counts["metadata_expression_states"] = work.metadata_expression_states;
+        counts["metadata_types"] = work.metadata_types;
+        counts["scalar_stability_nodes"] = work.scalar_stability_nodes;
+        counts["rewritten_statements"] = work.rewritten_statements;
+        counts["rewrite_expression_dispatches"] = work.rewrite_expression_dispatches;
+        nb::dict output;
+        output["candidate"] = result.Candidate();
+        output["changed"] = result.Candidate() != result.Original();
+        output["work"] = counts;
+        return output;
+      },
+      nb::arg("function"),
+      "Inspect the existing prefix normalization candidate and work; this is not whole Buffer admission");
   nb::class_<ir::sync::SyncSchedulePolicy>(testing, "SyncSchedulePolicy")
       .def(
           "__init__",

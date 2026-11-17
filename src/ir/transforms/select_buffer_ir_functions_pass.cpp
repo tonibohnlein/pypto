@@ -31,6 +31,7 @@
 #include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
+#include "pypto/backend/common/buffer_scalar_recipes.h"
 #include "pypto/backend/common/buffer_transpose_recipe.h"
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
@@ -49,6 +50,7 @@
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/buffer_active_domain_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_indexed_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_tuple_results.h"
 #include "pypto/ir/transforms/utils/buffer_valid_analysis.h"
@@ -71,7 +73,8 @@ namespace {
 class BufferKernelSupport : public IRVisitor {
  public:
   explicit BufferKernelSupport(const FunctionPtr& function)
-      : body_(function->body_),
+      : core_(function->func_type_),
+        body_(function->body_),
         return_types_(function->return_types_),
         views_(function->body_),
         indexed_(function->body_),
@@ -335,8 +338,15 @@ class BufferKernelSupport : public IRVisitor {
         allocation_capacities_.emplace(assign->var_.get(), static_cast<uint64_t>(capacity->value_));
       }
     }
+    const auto* previous_definition = scalar_definition_;
+    scalar_definition_ = As<Call>(assign->value_).get();
     IRVisitor::VisitStmt_(assign);
+    scalar_definition_ = previous_definition;
     if (!admission.supported()) return;
+    if (const auto call = As<Call>(assign->value_); IsOp(call, "tile.write")) {
+      admission.Require(backend::LogicalScalarWriteSharesStorage(call, assign->var_->GetType()),
+                        BufferAdmissionProperty::OperationRecipe);
+    }
     if (As<ScalarType>(assign->var_->GetType())) {
       scalar_multiples_.emplace(assign->var_.get(), KnownAlignmentMultiple(assign->value_));
       step_proof_.Define(assign->var_, assign->value_);
@@ -362,8 +372,10 @@ class BufferKernelSupport : public IRVisitor {
   }
 
   void VisitStmt_(const EvalStmtPtr& eval) override {
-    if (auto call = As<Call>(eval->expr_); call && IsOp(call, "tile.set_validshape")) {
-      // Conversion needs an explicit SSA result carrying the new logical valid shape.
+    if (auto call = As<Call>(eval->expr_); IsOp(call, "tile.set_validshape") || IsOp(call, "tile.read")) {
+      // Conversion needs the original SSA result carrying the new metadata
+      // or the scalar value. A discarded read remains an effectful payload;
+      // neither synthesize a dummy result nor erase it during selection.
       admission.Require(false, BufferAdmissionProperty::OperationRecipe);
       return;
     }
@@ -557,6 +569,17 @@ class BufferKernelSupport : public IRVisitor {
     } else if (IsOp(call, "tile.get_block_idx") || IsOp(call, "tile.get_block_num") ||
                IsOp(call, "tile.get_subblock_idx")) {
       admission.Require(call->args_.empty() && call->kwargs_.empty(),
+                        BufferAdmissionProperty::OperationRecipe);
+    } else if (IsOp(call, "tile.read") || IsOp(call, "tile.write")) {
+      const auto* context = PassContext::Current();
+      const bool scalar_target =
+          backend::BackendConfig::IsConfigured() &&
+          (context ? context->GetBackendHandler() : backend::GetBackend()->GetHandler())
+                  ->GetPtoTargetArch() == "a2a3";
+      admission.Require(core_ == FunctionType::AIV && scalar_target &&
+                            backend::SupportsLogicalBufferScalar(call) &&
+                            (!IsOp(call, "tile.read") || scalar_definition_ == call.get()) &&
+                            views_.HasDenseRowPitch(call->args_[0]),
                         BufferAdmissionProperty::OperationRecipe);
     } else if (const auto* indexed = backend::FindLogicalBufferIndexedRecipe(call->op_->name_)) {
       admission.Require(backend::SupportsLogicalBufferIndexed(*indexed, call) &&
@@ -890,6 +913,7 @@ class BufferKernelSupport : public IRVisitor {
     return memory_reuse::SamePhysicalWindow(planned(left, a), planned(right, b));
   }
 
+  FunctionType core_;
   StmtPtr body_;
   std::optional<std::map<VarPtr, TypePtr>> accumulator_plan_;
 
@@ -982,16 +1006,26 @@ class BufferKernelSupport : public IRVisitor {
   std::unordered_set<const Type*> checked_types_;
   std::unordered_map<const Expr*, TypePtr> assigned_slot_types_;
   PositiveLoopStepProof step_proof_;
+  const Call* scalar_definition_ = nullptr;
 };
 
-FunctionPtr SelectBufferFunction(const FunctionPtr& function, bool device_helper) {
-  if (!IsInCoreType(function->func_type_) || function->ir_stage_ == FunctionIRStage::Buffer ||
-      function->HasAttr(kAttrBufferIrSelected)) {
-    return function;
+FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper) {
+  if (!IsInCoreType(original->func_type_) || original->ir_stage_ == FunctionIRStage::Buffer ||
+      original->HasAttr(kAttrBufferIrSelected)) {
+    return original;
+  }
+  const auto* context = PassContext::Current();
+  auto function = original;
+  if (!device_helper && (!context || context->GetEnableBufferIR()) &&
+      backend::BackendConfig::IsConfigured() &&
+      backend::BackendConfig::GetBackend()->GetHandler()->GetPtoTargetArch() == "a2a3") {
+    // Value-definedness and observable-use evidence qualify an explicit Tile
+    // candidate; they do not weaken whole-function recipe/storage admission.
+    // In particular, no normalized metadata escapes on the Functional route.
+    function = NormalizeBufferActiveDomains(original).Candidate();
   }
   BufferKernelSupport support(function);
   auto function_context = support.admission.At(function.get());
-  const auto* context = PassContext::Current();
   support.admission.Require(!device_helper, BufferAdmissionProperty::DeviceHelper);
   support.admission.Require(!context || context->GetEnableBufferIR(), BufferAdmissionProperty::Disabled);
   support.admission.Require(backend::BackendConfig::IsConfigured(), BufferAdmissionProperty::Backend);
@@ -1029,7 +1063,7 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& function, bool device_helper
   }
   support.admission.Require((support.has_load || support.has_fill) && support.has_store,
                             BufferAdmissionProperty::KernelShape);
-  auto selected = std::make_shared<Function>(*function);
+  auto selected = std::make_shared<Function>(support.admission.supported() ? *function : *original);
   selected->attrs_.emplace_back(kAttrBufferIrSelected, support.admission.supported());
   support.admission.AppendTo(*selected);
   return selected;

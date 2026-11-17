@@ -36,6 +36,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/closed_prefix_sync.h"
+#include "src/ir/transforms/utils/native_sync_placement.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
 
@@ -385,6 +386,7 @@ void CheckGeneratedLogicalSync(const FunctionPtr& function) {
 }
 FunctionPtr OptimizeLogicalSync(const FunctionPtr& function) {
   CheckLogicalSync(function);
+  RequireBufferSyncScalarLayout(function);
   // No logical rewrites are enabled yet. Assigned-ID control optimization is
   // deliberately later, after physical handoffs and resource proofs exist.
   return function;
@@ -395,6 +397,7 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
                                     std::optional<std::pair<int64_t, int64_t>> blocks,
                                     const SyncSchedulePolicy& policy, SyncExternalPolicy external_policy) {
   CheckLogicalSync(function);
+  RequireBufferSyncScalarLayout(function);
   if (!HasLogicalSync(function)) {
     PhysicalSyncRealization result;
     result.function = function;

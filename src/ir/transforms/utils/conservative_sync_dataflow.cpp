@@ -194,7 +194,10 @@ class Builder {
     }
     auto operation = backend::QualifyBufferSyncOperation(call, function_->func_type_, target_);
     placement_.Require(operation);
-    CHECK_SPAN(!result && operation.Result().behavior == BufferResultBehavior::None, call->span_)
+    const bool ready_result = operation.Implementation().ProducesReadyScalar();
+    CHECK_SPAN((!result && operation.Result().behavior == BufferResultBehavior::None) ||
+                   (result && ready_result && operation.Result().behavior == BufferResultBehavior::Value),
+               call->span_)
         << "Conservative synchronization: payload-produced scalar/handle readiness is unavailable";
     ConservativeAccessSet effects;
     for (size_t index = 0; index < operation.ArgumentEffects().size(); ++index) {
@@ -222,6 +225,10 @@ class Builder {
     generated_[cut.get()] = effects;
     sites.push_back({cut, std::move(operation), std::move(effects), {}, {}});
     inside_child_.push_back(native_child_depth_ != 0);
+    // The ordinary service protects the scalar instruction's storage read.
+    // Only its selected blocking native return then makes the original SSA
+    // available to following addresses/control; it is never a pure query.
+    if (ready_result) Bind(result);
   }
 
   End Read(const StmtPtr& statement) {

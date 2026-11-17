@@ -198,6 +198,17 @@ class BufferIRVisitor : public IRVisitor {
         registry.ValidateBufferCall(op);
         valid_calls_.insert(op.get());
         if (const auto* recipe = backend::FindBufferElementwiseRecipe(name)) CheckRecipeWindows(op, *recipe);
+        if (IsOp(op, "buffer.read") || IsOp(op, "buffer.write")) {
+          // GetValue/SetValue flatten with the descriptor's column count. A
+          // narrow subview retains its parent's physical pitch, which the
+          // descriptor geometry alone cannot establish.
+          const auto type = As<BufferType>(op->args_[0]->GetType());
+          const auto window = windows_.find(AsVarLike(op->args_[0]).get());
+          const auto pitch = static_cast<uint64_t>(type->shape_[1]) * (type->dtype_.GetBit() / 8);
+          if (window == windows_.end() || window->second.row_pitch != pitch) {
+            Error("Scalar Buffer operations require dense physical row pitch", op->span_);
+          }
+        }
         if (const auto* indexed = backend::FindBufferIndexedRecipe(name)) {
           // Flattened indexing requires dense physical rows. A subview may
           // inherit a wider parent pitch despite its own dense descriptor.

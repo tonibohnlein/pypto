@@ -322,6 +322,7 @@ nav:
           - Read-only External Sync Children: en/dev/ir/41-general-autosync-readonly-child.md
           - Explicit Module Sync Ownership: en/dev/ir/41-general-autosync-module-ownership.md
           - Autosync Review Repairs: en/dev/ir/42-autosync-review-repairs.md
+          - Autosync Value and Scalar Contracts: en/dev/ir/43-autosync-value-and-scalar-contracts.md
       - Passes:
           - en/dev/passes/index.md
           - en/dev/passes/00-pass_manager.md

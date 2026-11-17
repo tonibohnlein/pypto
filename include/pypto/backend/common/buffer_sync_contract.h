@@ -48,6 +48,9 @@ class BufferSyncImplementation {
  public:
   ir::PipeType Pipe() const { return pipe_; }
   bool AccumulatorSizeEligible() const { return accumulator_size_eligible_; }
+  // Only a selected blocking scalar instruction may publish its SSA result
+  // after the protected payload cut. NoAccess or Value alone proves readiness.
+  bool ProducesReadyScalar() const { return produces_ready_scalar_; }
   std::vector<sync::IsaResourceClaim> Claims() const;
   const std::vector<BufferSyncImplicitEffect>& ImplicitEffects() const { return implicit_effects_; }
 
@@ -61,6 +64,7 @@ class BufferSyncImplementation {
   ir::FunctionType core_;
   std::string target_;
   bool accumulator_size_eligible_ = false;
+  bool produces_ready_scalar_ = false;
   bool mat_to_operand_extract_ = false;
   bool audited_signal_free_variant_ = false;
   std::vector<BufferSyncImplicitEffect> implicit_effects_;

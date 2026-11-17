@@ -37,6 +37,8 @@ const char* BufferNativeOperation(const ir::CallPtr& call) {
   using ir::IsOp;
   if (IsOp(call, "buffer.load")) return "pto.tload";
   if (IsOp(call, "buffer.store")) return "pto.tstore";
+  if (IsOp(call, "buffer.read")) return "pto.tgetval";
+  if (IsOp(call, "buffer.write")) return "pto.tsetval";
   if (IsOp(call, "buffer.copy")) return "pto.tmov";
   if (IsOp(call, "buffer.extract")) return "pto.textract";
   if (IsOp(call, "buffer.transpose")) return GetPtoNativeOpSpec("tile.transpose").native_op;
@@ -79,7 +81,16 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
   std::transform(macro.begin(), macro.end(), macro.begin(),
                  [](unsigned char c) { return c == '.' ? '_' : std::toupper(c); });
   BufferSyncImplementation result{PipeType::ALL, "pto::" + macro, core, target};
-  if (IsOp(call, "buffer.load") || IsOp(call, "buffer.store")) {
+  if (IsOp(call, "buffer.read") || IsOp(call, "buffer.write")) {
+    CHECK(core == FunctionType::AIV && target == "a2a3")
+        << "Blocking local scalar access is qualified only for A2/A3 AIV Vec storage";
+    // TGETVAL/TSETVAL select Tile::GetValue/SetValue: synchronous typed UB
+    // dereferences, without GM DCache accesses, asynchronous scratch or flags.
+    // Operand/coordinate validation belongs to the registered Buffer recipe.
+    result.pipe_ = PipeType::S;
+    result.produces_ready_scalar_ = IsOp(call, "buffer.read");
+    result.audited_signal_free_variant_ = true;
+  } else if (IsOp(call, "buffer.load") || IsOp(call, "buffer.store")) {
     const bool load = IsOp(call, "buffer.load");
     const auto local = As<BufferType>(call->args_[load ? 3 : 0]->GetType());
     CHECK(local && (local->memory_space_ == MemorySpace::Vec ||
@@ -196,7 +207,8 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
   }
   const bool vector = core == FunctionType::AIV;
   CHECK(vector ? (result.pipe_ == PipeType::MTE2 || result.pipe_ == PipeType::MTE3 ||
-                  result.pipe_ == PipeType::V)
+                  result.pipe_ == PipeType::V ||
+                  (result.pipe_ == PipeType::S && (IsOp(call, "buffer.read") || IsOp(call, "buffer.write"))))
                : (result.pipe_ == PipeType::MTE2 || result.pipe_ == PipeType::MTE1 ||
                   result.pipe_ == PipeType::M || result.pipe_ == PipeType::FIX))
       << "Payload pipe is unavailable on the owning synchronization core";
