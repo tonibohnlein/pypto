@@ -177,8 +177,11 @@ def test_gm_transfer_contract_exposes_window_and_memory_effects(name):
     assert testing.get_execution_memory_access_evidence(name) == "unknown"
     with pytest.raises(ValueError, match="internal-only"):
         ir.create_op_call(name, args, ir.Span.unknown())
-    with pytest.raises(ValueError, match="Unknown kwarg 'cache'"):
-        internal_call(name, args, cache=1)
+    if name == "buffer.store":
+        with pytest.raises(ValueError, match="Unknown kwarg 'cache'"):
+            internal_call(name, args, cache=1)
+    else:
+        assert isinstance(internal_call(name, args, cache=1).type, ir.VoidType)
     restored = ir.deserialize(ir.serialize(call))
     ir.assert_structural_equal(call, restored, enable_auto_mapping=True)
 
@@ -597,6 +600,61 @@ def test_matrix_reshape_relabels_one_window_in_its_space():
     ]:
         with pytest.raises(ValueError, match=message):
             _ir._create_internal_op_call("buffer.reshape", [source], {}, result, ir.Span.unknown())
+
+
+def test_buffer_insert_acc_to_mat_effects_serialization_and_contracts():
+    span = ir.Span.unknown()
+    acc = matrix_var("acc", ir.MemorySpace.Acc, [16, 32], DataType.FP32)
+    mat = matrix_var("mat", ir.MemorySpace.Mat, [32, 64], DataType.BF16)
+    row = ir.ConstInt(16, DataType.INDEX, span)
+    col = ir.ConstInt(32, DataType.INDEX, span)
+    call = internal_call("buffer.insert", [acc, row, col, mat])
+    assert isinstance(call.type, ir.VoidType)
+    assert [ir.get_op_buffer_arg_effect("buffer.insert", i).data for i in (0, 3)] == [
+        ir.BufferAccess.Read,
+        ir.BufferAccess.Write,
+    ]
+    assert [ir.get_op_buffer_arg_effect("buffer.insert", i).non_memory for i in range(4)] == [
+        False,
+        True,
+        True,
+        False,
+    ]
+    ir.assert_structural_equal(call, ir.deserialize(ir.serialize(call)), enable_auto_mapping=True)
+
+    # Misaligned offset, wrong spaces/dtypes, and partial valid shapes must fail.
+    for bad_args, message in [
+        ([acc, ir.ConstInt(8, DataType.INDEX, span), col, mat], "multiple of 16"),
+        ([acc, row, ir.ConstInt(48, DataType.INDEX, span), mat], "exceeds the source extent"),
+        (
+            [
+                matrix_var("acc_p", ir.MemorySpace.Acc, [16, 32], DataType.FP32, valid_shape=[8, 32]),
+                row,
+                col,
+                mat,
+            ],
+            "full-valid",
+        ),
+        (
+            [matrix_var("left", ir.MemorySpace.Left, [16, 32], DataType.FP16), row, col, mat],
+            "rank-2 Acc buffer",
+        ),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            internal_call("buffer.insert", bad_args)
+
+
+def test_buffer_load_cache_policy_serialization_and_validation():
+    span = ir.Span.unknown()
+    gm = ir.Var("gm", ir.TensorType([16, 32], DataType.FP32), span)
+    off = valid_extents(0, 0)
+    ext = valid_extents(16, 32)
+    dst = buffer_var("dst", shape=[16, 32])
+    bypass = internal_call("buffer.load", [gm, off, ext, dst], cache=1)
+    assert bypass.kwargs["cache"] == 1
+    ir.assert_structural_equal(bypass, ir.deserialize(ir.serialize(bypass)), enable_auto_mapping=True)
+    with pytest.raises(ValueError, match="cache"):
+        internal_call("buffer.load", [gm, off, ext, dst], cache=99)
 
 
 if __name__ == "__main__":

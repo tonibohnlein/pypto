@@ -744,5 +744,82 @@ class MatrixSwap:
     assert kernel is not None and kernel.attrs["buffer_ir_selected"] is False
 
 
+@pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP])
+@pytest.mark.parametrize("split_k", [False, True])
+def test_acc_to_mat_assemble_lowers_inserts_executes_and_owns_autosync(planner, split_k):
+    # Chained-matmul pattern: Acc (FP32) assembled into on-chip Mat (BF16) then consumed by matmul.
+    if split_k:
+        source = """
+@pl.program
+class ChainedSplitK:
+    @pl.function(type=pl.FunctionType.AIC)
+    def kernel(self, a: pl.Tensor[[16, 64], pl.BF16], b: pl.Tensor[[64, 32], pl.BF16],
+               c: pl.Tensor[[32, 16], pl.BF16], out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]
+               ) -> pl.Tensor[[16, 16], pl.FP32]:
+        acc_mat = pl.tile.create([16, 32], pl.BF16, target_memory=pl.MemorySpace.Mat)
+        for n0 in pl.range(0, 32, 16):
+            tile_acc = pl.tile.create([16, 16], pl.FP32, target_memory=pl.MemorySpace.Acc)
+            for k0 in pl.range(0, 64, 32):
+                la = pl.load(a, [0, k0], [16, 32], target_memory=pl.MemorySpace.Mat)
+                rb = pl.load(b, [k0, n0], [32, 16], target_memory=pl.MemorySpace.Mat)
+                tile_acc = pl.matmul_acc(tile_acc, la, rb, init_cond=(k0 == 0))
+            acc_mat = pl.tile.assemble(acc_mat, tile_acc, [0, n0])
+        c_mat = pl.load(c, [0, 0], [32, 16], target_memory=pl.MemorySpace.Mat)
+        out_acc = pl.matmul(acc_mat, c_mat)
+        return pl.store(out_acc, [0, 0], out)
+"""
+    else:
+        source = """
+@pl.program
+class ChainedFullK:
+    @pl.function(type=pl.FunctionType.AIC)
+    def kernel(self, a: pl.Tensor[[16, 64], pl.BF16], b: pl.Tensor[[64, 32], pl.BF16],
+               c: pl.Tensor[[32, 16], pl.BF16], out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]
+               ) -> pl.Tensor[[16, 16], pl.FP32]:
+        la = pl.load(a, [0, 0], [16, 64], target_memory=pl.MemorySpace.Mat)
+        rb = pl.load(b, [0, 0], [64, 32], target_memory=pl.MemorySpace.Mat)
+        ab_acc = pl.matmul(la, rb)
+        acc_mat = pl.tile.create([16, 32], pl.BF16, target_memory=pl.MemorySpace.Mat)
+        acc_mat = pl.tile.assemble(acc_mat, ab_acc, [0, 0])
+        c_mat = pl.load(c, [0, 0], [32, 16], target_memory=pl.MemorySpace.Mat)
+        out_acc = pl.matmul(acc_mat, c_mat)
+        return pl.store(out_acc, [0, 0], out)
+"""
+    program = pl.parse_program(source)
+    lowered = _lower(program, planner)
+    kernel = lowered.get_function("kernel")
+    assert kernel is not None and kernel.ir_stage == ir.FunctionIRStage.Buffer
+    assert "buffer.insert" in str(lowered)
+    mlir_text = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True)
+    assert "pto.tinsert ins(" in mlir_text
+
+    namespace = {}
+    exec(torch_codegen(lowered), namespace)  # noqa: S102
+    a = _matrix_data(16, 64, torch.bfloat16)
+    b = _matrix_data(64, 32, torch.bfloat16, 5)
+    c = _matrix_data(32, 16, torch.bfloat16, 3)
+    output = torch.full((16, 16), -777.0)
+    namespace["kernel"](a, b, c, output)
+    expected = ((a.float() @ b.float()).bfloat16().float()) @ c.float()
+    torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+    with passes.PassContext(
+        [],
+        memory_planner=planner,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+    ):
+        synced = PassManager(OptimizationStrategy.Default).run_passes(program)
+    synced_fn = synced.get_function("kernel")
+    assert synced_fn is not None
+    assert synced_fn.attrs.get("buffer_ir_selected") is True
+    assert synced_fn.attrs.get("pypto_autosync") is True
+    buf_props = passes.IRPropertySet()
+    buf_props.insert(passes.IRProperty.BufferIR)
+    assert passes.PropertyVerifierRegistry.verify(buf_props, synced) == []
+    assert "pto.tinsert ins(" in codegen.PTOCodegen().generate(synced, emit_tile_addr=True)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -42,6 +42,7 @@ const char* BufferNativeOperation(const ir::CallPtr& call) {
   if (IsOp(call, "buffer.write")) return "pto.tsetval";
   if (IsOp(call, "buffer.copy")) return "pto.tmov";
   if (IsOp(call, "buffer.extract")) return "pto.textract";
+  if (IsOp(call, "buffer.insert")) return "pto.tinsert";
   if (IsOp(call, "buffer.transpose")) return GetPtoNativeOpSpec("tile.transpose").native_op;
   if (IsOp(call, "buffer.matmul")) return "pto.tmatmul";
   if (IsOp(call, "buffer.matmul_acc")) return "pto.tmatmul.acc";
@@ -128,12 +129,25 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
     const bool extract = IsOp(call, "buffer.extract");
     const auto source = As<BufferType>(call->args_[0]->GetType());
     const auto destination = As<BufferType>(call->args_[extract ? 3 : 1]->GetType());
-    CHECK(
-        source && destination && source->memory_space_ == MemorySpace::Mat &&
-        (destination->memory_space_ == MemorySpace::Left || destination->memory_space_ == MemorySpace::Right))
-        << "Only Mat to operand-buffer movement is qualified";
-    result.pipe_ = PipeType::MTE1;
-    result.mat_to_operand_extract_ = extract;
+    if (extract && source && destination && source->memory_space_ == MemorySpace::Vec &&
+        destination->memory_space_ == MemorySpace::Vec) {
+      result.pipe_ = PipeType::V;
+    } else {
+      CHECK(source && destination && source->memory_space_ == MemorySpace::Mat &&
+            (destination->memory_space_ == MemorySpace::Left ||
+             destination->memory_space_ == MemorySpace::Right))
+          << "Only Mat to operand-buffer movement or Vec extract is qualified";
+      result.pipe_ = PipeType::MTE1;
+      result.mat_to_operand_extract_ = extract;
+    }
+  } else if (IsOp(call, "buffer.insert")) {
+    const auto source = As<BufferType>(call->args_[0]->GetType());
+    const auto destination = As<BufferType>(call->args_[3]->GetType());
+    CHECK(source && destination && source->memory_space_ == MemorySpace::Acc &&
+          destination->memory_space_ == MemorySpace::Mat)
+        << "Only Acc to Mat FIXPIPE insertion is qualified";
+    result.pipe_ = PipeType::FIX;
+    result.acc_to_mat_insert_ = true;
   } else if (IsOp(call, "buffer.matmul") || IsOp(call, "buffer.matmul_acc")) {
     result.pipe_ = PipeType::M;
     const auto lhs = As<BufferType>(call->args_[0]->GetType());
@@ -315,9 +329,10 @@ std::vector<sync::IsaResourceClaim> BufferSyncImplementation::Claims() const {
     using sync::IsaSyncMode;
     using sync::ResourceKind;
     if (std::find(claim.modes.begin(), claim.modes.end(), IsaSyncMode::Manual) == claim.modes.end()) continue;
-    // This exclusion is authorized by the selected Mat->operand variant, never
-    // by the macro's name alone. The Vec TEXTRACT helper remains unqualified.
-    if (mat_to_operand_extract_ && claim.pool.core == CoreScope::AIV) continue;
+    // This exclusion is authorized by the selected Mat->operand extract or
+    // Acc->Mat FIXPIPE insert variant, never by the macro's name alone. The Vec
+    // TEXTRACT / TINSERT helpers remain reserved when executed on AIV Vec.
+    if ((mat_to_operand_extract_ || acc_to_mat_insert_) && claim.pool.core == CoreScope::AIV) continue;
     CHECK(claim.pool.kind == ResourceKind::PipelineEvent &&
           claim.pool.core == (core_ == ir::FunctionType::AIV ? CoreScope::AIV : CoreScope::AIC) &&
           claim.source == IsaIdSource::Fixed && claim.lifetime == IsaResourceLifetime::Invocation)

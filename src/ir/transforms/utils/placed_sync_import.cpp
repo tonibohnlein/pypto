@@ -1730,36 +1730,50 @@ class Importer {
       auto sid = Storage(call->args_[0]), tid = Storage(call->args_[target]);
       const auto& s = result.storage[sid];
       const auto& t = result.storage[tid];
-      CHECK(s.space == MemorySpace::Mat && (t.space == MemorySpace::Left || t.space == MemorySpace::Right))
-          << "Only Mat to operand-buffer movement is qualified";
-      auto row = extract ? Coordinate(call->args_[1], segment) : AffineCoordinate{};
-      auto column = extract ? Coordinate(call->args_[2], segment) : AffineCoordinate{};
-      CHECK(row.parameters.empty() && column.parameters.empty() && !row.block && !column.block)
-          << "Parameterized local extraction needs a separate membership and alignment certificate";
-      if (!extract) CHECK(s.rows == t.rows && s.columns == t.columns) << "Partial copy is not qualified";
-      if (s.layout->slayout_ != TileLayout::none_box) {
-        const auto box = s.layout->fractal_ / (16 * s.layout->dtype_.GetByte());
-        const auto aligned_frames = [](const auto& frames, int64_t alignment) {
-          return std::all_of(frames.begin(), frames.end(),
-                             [&](const auto& entry) { return entry.second % alignment == 0; });
-        };
-        CHECK(row.first % 16 == 0 && row.second % 16 == 0 && t.rows % 16 == 0 && column.first % box == 0 &&
-              column.second % box == 0 && t.columns % box == 0 && aligned_frames(row.frames, 16) &&
-              aligned_frames(column.frames, box))
-            << "Unaligned boxed extraction requires a separate footprint contract";
+      if (extract && s.space == MemorySpace::Vec && t.space == MemorySpace::Vec) {
+        // Vec->Vec extraction may span non-contiguous physical rows; model the
+        // full Vec domain conservatively across both Exact and prefix analysis.
+        whole(0, false);
+        whole(target, true);
+      } else {
+        CHECK(s.space == MemorySpace::Mat && (t.space == MemorySpace::Left || t.space == MemorySpace::Right))
+            << "Only Mat to operand-buffer movement or Vec extract is qualified";
+        auto row = extract ? Coordinate(call->args_[1], segment) : AffineCoordinate{};
+        auto column = extract ? Coordinate(call->args_[2], segment) : AffineCoordinate{};
+        CHECK(row.parameters.empty() && column.parameters.empty() && !row.block && !column.block)
+            << "Parameterized local extraction needs a separate membership and alignment certificate";
+        if (!extract) CHECK(s.rows == t.rows && s.columns == t.columns) << "Partial copy is not qualified";
+        if (s.layout->slayout_ != TileLayout::none_box) {
+          const auto box = s.layout->fractal_ / (16 * s.layout->dtype_.GetByte());
+          const auto aligned_frames = [](const auto& frames, int64_t alignment) {
+            return std::all_of(frames.begin(), frames.end(),
+                               [&](const auto& entry) { return entry.second % alignment == 0; });
+          };
+          CHECK(row.first % 16 == 0 && row.second % 16 == 0 && t.rows % 16 == 0 && column.first % box == 0 &&
+                column.second % box == 0 && t.columns % box == 0 && aligned_frames(row.frames, 16) &&
+                aligned_frames(column.frames, box))
+              << "Unaligned boxed extraction requires a separate footprint contract";
+        }
+        auto source_access = Access(sid, false, row, column, t.rows, t.columns, segment);
+        // The retained rectangle and physical layout are exact even when a
+        // moving or boxed slice has no stationary contiguous interval export.
+        // Consumers qualify their own representation: the periodic extractor
+        // still refuses unsupported moving shared geometry; numerical phase
+        // snapshots may specialize original coordinates before partitioning it.
+        ApplySlot(source_access, call->args_[0], segment);
+        if (recover_accesses) {
+          site.accesses.push_back(std::move(source_access));
+        }
+        modes[0].first = true;
+        whole(target, true);
       }
-      auto source_access = Access(sid, false, row, column, t.rows, t.columns, segment);
-      // The retained rectangle and physical layout are exact even when a
-      // moving or boxed slice has no stationary contiguous interval export.
-      // Consumers qualify their own representation: the periodic extractor
-      // still refuses unsupported moving shared geometry; numerical phase
-      // snapshots may specialize original coordinates before partitioning it.
-      ApplySlot(source_access, call->args_[0], segment);
-      if (recover_accesses) {
-        site.accesses.push_back(std::move(source_access));
-      }
-      modes[0].first = true;
-      whole(target, true);
+    } else if (IsOp(call, "buffer.insert")) {
+      const auto& s = result.storage[Storage(call->args_[0])];
+      const auto& t = result.storage[Storage(call->args_[3])];
+      CHECK(s.space == MemorySpace::Acc && t.space == MemorySpace::Mat)
+          << "Only Acc to Mat FIXPIPE insertion is qualified";
+      whole(0, false);
+      whole(3, true);
     } else if (IsOp(call, "buffer.matmul") || IsOp(call, "buffer.matmul_acc")) {
       whole(0, false);
       whole(1, false);

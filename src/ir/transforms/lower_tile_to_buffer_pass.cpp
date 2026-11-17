@@ -134,14 +134,15 @@ BufferTypePtr DenseDescriptor(const TileTypePtr& tile, const Span& span) {
 // dynamic on its own, as the subview's explicit valid clause types it.
 BufferTypePtr WindowDescriptor(const TileTypePtr& tile, const Span& span) {
   const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
-  CheckDenseVecTile(tile, view, span);
+  const bool column = backend::IsColumnVectorBufferTile(tile, view);
+  if (!column) CheckDenseVecTile(tile, view, span);
   const auto shape = StaticExtents(tile->shape_, span);
   std::vector<int64_t> valid;
   for (const auto& extent : view.valid_shape.empty() ? tile->shape_ : view.valid_shape) {
     auto constant = As<ConstInt>(extent);
     valid.push_back(constant && constant->value_ != 0 ? constant->value_ : -1);
   }
-  return std::make_shared<BufferType>(shape, tile->dtype_, MemorySpace::Vec, valid);
+  return std::make_shared<BufferType>(shape, tile->dtype_, MemorySpace::Vec, valid, view.blayout);
 }
 
 bool HasDynamicValid(const BufferTypePtr& type) {
@@ -1465,6 +1466,16 @@ class TileToBufferMutator : public IRMutator {
           << "LowerTileToBuffer: fix-pipe pre_quant/pre_relu assembles require a Buffer transfer recipe";
       const auto source_tile = As<TileType>(call->args_[1]->GetType());
       const auto result_space = As<TileType>(result->GetType())->GetMemorySpace();
+      if (source_tile->GetMemorySpace() == MemorySpace::Acc && result_space == MemorySpace::Mat) {
+        const auto destination = Handle(result);
+        INTERNAL_CHECK_SPAN(Handle(call->args_[0]) == destination, call->span_)
+            << "LowerTileToBuffer: Acc -> Mat tile.assemble must write in place into its target Mat buffer";
+        const auto offsets = Offsets(call->args_[2]);
+        return Operation(
+            "buffer.insert",
+            {Handle(call->args_[1]), offsets->elements_[0], offsets->elements_[1], destination},
+            call->span_);
+      }
       CHECK_SPAN(source_tile->GetMemorySpace() == MemorySpace::Vec && result_space == MemorySpace::Vec,
                  call->span_)
           << "LowerTileToBuffer: tile.assemble into "
@@ -1530,19 +1541,25 @@ class TileToBufferMutator : public IRMutator {
     if (IsOp(call, "tile.load")) {
       INTERNAL_CHECK_SPAN(result && call->args_.size() >= 3, call->span_)
           << "Internal error: malformed tile.load";
-      CHECK_SPAN(GetIntKwarg(call->kwargs_, "cache", 0) == 0, call->span_)
-          << "LowerTileToBuffer: non-default cache requires a Buffer transfer recipe";
+      const int cache = GetIntKwarg(call->kwargs_, "cache", static_cast<int>(CachePolicy::kDefault));
+      CHECK_SPAN(cache == static_cast<int>(CachePolicy::kDefault) ||
+                     cache == static_cast<int>(CachePolicy::kBypass),
+                 call->span_)
+          << "LowerTileToBuffer: tile.load cache requires DEFAULT or BYPASS policy";
       const bool scalar_point = backend::SupportsLogicalBufferScalarTransfer(call);
       return Operation("buffer.load",
                        {VisitExpr(call->args_[0]), VisitExpr(call->args_[1]),
                         scalar_point ? VisitExpr(call->args_[3]) : Valid(result), Handle(result)},
-                       call->span_);
+                       call->span_,
+                       cache == static_cast<int>(CachePolicy::kDefault)
+                           ? std::vector<std::pair<std::string, std::any>>{}
+                           : std::vector<std::pair<std::string, std::any>>{{"cache", cache}});
     }
     if (IsOp(call, "tile.store")) {
       CHECK_SPAN(GetIntKwarg(call->kwargs_, "cache", 0) == 0, call->span_)
           << "LowerTileToBuffer: non-default cache requires a Buffer transfer recipe";
-      INTERNAL_CHECK_SPAN(call->args_.size() == 3, call->span_)
-          << "Internal error: dense rank-2 tile.store requires three operands";
+      INTERNAL_CHECK_SPAN(call->args_.size() == 3 || call->args_.size() == 4, call->span_)
+          << "Internal error: dense rank-2 tile.store requires three or four operands";
       const auto store_source = As<TileType>(call->args_[0]->GetType());
       const auto store_destination = As<TensorType>(call->args_[2]->GetType());
       const int atomic = GetIntKwarg(call->kwargs_, "atomic", 0);

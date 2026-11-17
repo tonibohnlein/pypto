@@ -1754,5 +1754,191 @@ def test_slot_selector_cache_does_not_escape_sibling_regions(tmp_path):
     )
 
 
+def _run_autosync(program, planner=passes.MemoryPlanner.PYPTO, policy="conservative_prefix"):
+    with passes.PassContext(
+        [],
+        memory_planner=planner,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=True,
+        autosync_policy=policy,
+    ):
+        synced = PassManager(OptimizationStrategy.Default).run_passes(program)
+    fn = _kernel(synced)
+    assert fn.attrs.get("buffer_ir_selected") is True
+    assert fn.attrs.get("pypto_autosync") is True
+    buf_props = passes.IRPropertySet()
+    buf_props.insert(passes.IRProperty.BufferIR)
+    assert passes.PropertyVerifierRegistry.verify(buf_props, synced) == []
+    return synced
+
+
+@pytest.mark.parametrize("dtype_name,torch_dtype,fill_val", [
+    ("BF16", torch.bfloat16, 1.5),
+    ("FP16", torch.float16, 1.5),
+    ("INT32", torch.int32, 7),
+])
+def test_non_fp32_tile_full_selects_executes_and_owns_autosync(dtype_name, torch_dtype, fill_val):
+    program = pl.parse_program(f"""
+@pl.program
+class NonFp32Fill:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(
+        self, out: pl.Out[pl.Tensor[[16, 32], pl.{dtype_name}]]
+    ) -> pl.Tensor[[16, 32], pl.{dtype_name}]:
+        filled = pl.tile.full([16, 32], pl.{dtype_name}, {fill_val})
+        return pl.store(filled, [0, 0], out)
+""")
+    lowered = _lower(program, passes.MemoryPlanner.PYPTO, enabled=True)
+    assert _kernel(lowered).ir_stage == ir.FunctionIRStage.Buffer
+    assert "buffer.full" in str(lowered)
+    assert "pto.texpands" in codegen.PTOCodegen().generate(lowered, emit_tile_addr=True)
+    ns = {}
+    exec(torch_codegen(lowered), ns)  # noqa: S102
+    out = torch.zeros((16, 32), dtype=torch_dtype)
+    ns["kernel"](out)
+    torch.testing.assert_close(out, torch.full((16, 32), fill_val, dtype=torch_dtype))
+    _run_autosync(program)
+
+
+def test_four_arg_store_matching_source_shape_admits_and_sub_shape_refuses():
+    good = pl.parse_program("""
+@pl.program
+class StoreShapes:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, a: pl.Tensor[[16, 32], pl.BF16], out: pl.Out[pl.Tensor[[32, 64], pl.BF16]]
+               ) -> pl.Tensor[[32, 64], pl.BF16]:
+        x = pl.load(a, [0, 0], [16, 32])
+        return pl.store(x, [0, 0], out, [16, 32])
+""")
+    lowered = _lower(good, passes.MemoryPlanner.PYPTO, enabled=True)
+    assert _kernel(lowered).ir_stage == ir.FunctionIRStage.Buffer
+    _run_autosync(good)
+
+    narrow = pl.parse_program("""
+@pl.program
+class NarrowStoreShapes:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, a: pl.Tensor[[16, 32], pl.BF16], out: pl.Out[pl.Tensor[[32, 64], pl.BF16]]
+               ) -> pl.Tensor[[32, 64], pl.BF16]:
+        x = pl.load(a, [0, 0], [16, 32])
+        return pl.store(x, [0, 0], out, [8, 32])
+""")
+    rejected = _lower(narrow, passes.MemoryPlanner.PYPTO, enabled=True)
+    assert _kernel(rejected).attrs["buffer_ir_selected"] is False
+
+
+def test_load_cache_bypass_single_row_stride_and_max_loop_step_own_autosync():
+    program = pl.parse_program("""
+@pl.program
+class BypassAndMaxStep:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, n: pl.Scalar[pl.INDEX],
+               a: pl.Tensor[[1, 64], pl.FP32, pl.TensorView(stride=[128, 1], layout=pl.TensorLayout.ND)],
+               out: pl.Out[pl.Tensor[[1, 64], pl.FP32]]
+               ) -> pl.Tensor[[1, 64], pl.FP32]:
+        acc = pl.tile.full([1, 64], pl.FP32, 0.0)
+        final_acc = acc
+        for i, (cur,) in pl.range(0, 1, pl.max(n, 1), init_values=(acc,)):
+            loaded = pl.load(a, [0, 0], [1, 64], cache=pl.CachePolicy.BYPASS)
+            nxt = pl.add(cur, loaded)
+            final_acc = pl.yield_(nxt)
+        return pl.store(final_acc, [0, 0], out)
+""")
+    lowered = _lower(program, passes.MemoryPlanner.PYPTO, enabled=True)
+    assert _kernel(lowered).ir_stage == ir.FunctionIRStage.Buffer
+    mlir_text = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True)
+    assert "%__pypto_l2_cache_offset: i64" in mlir_text
+    assert "cache_policy = #pto.load_cache_policy<l2_bypass>" in mlir_text
+    _run_autosync(program)
+
+
+def test_vec_to_vec_tile_extract_selects_executes_and_validates_bounds():
+    program = pl.parse_program("""
+@pl.program
+class VecExtract:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, a: pl.Tensor[[32, 64], pl.FP32], out: pl.Out[pl.Tensor[[16, 32], pl.FP32]]
+               ) -> pl.Tensor[[16, 32], pl.FP32]:
+        src = pl.load(a, [0, 0], [32, 64])
+        sub = pl.tile.extract(src, 8, 16, [16, 32], target_memory=pl.MemorySpace.Vec)
+        return pl.store(sub, [0, 0], out)
+""")
+    lowered = _lower(program, passes.MemoryPlanner.PYPTO, enabled=True)
+    assert _kernel(lowered).ir_stage == ir.FunctionIRStage.Buffer
+    assert "buffer.extract" in str(lowered)
+    assert "pto.textract ins(" in codegen.PTOCodegen().generate(lowered, emit_tile_addr=True)
+    ns = {}
+    exec(torch_codegen(lowered), ns)  # noqa: S102
+    a = torch.arange(32 * 64, dtype=torch.float32).reshape(32, 64)
+    out = torch.empty((16, 32), dtype=torch.float32)
+    ns["kernel"](a, out)
+    torch.testing.assert_close(out, a[8:24, 16:48])
+    _run_autosync(program)
+
+    # Misaligned column offset (4 elements = 16 bytes < 32 bytes) must refuse Buffer IR.
+    bad_prog = pl.parse_program("""
+@pl.program
+class BadVecExtract:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, a: pl.Tensor[[32, 64], pl.FP32], out: pl.Out[pl.Tensor[[16, 32], pl.FP32]]
+               ) -> pl.Tensor[[16, 32], pl.FP32]:
+        src = pl.load(a, [0, 0], [32, 64])
+        sub = pl.tile.extract(src, 0, 4, [16, 32], target_memory=pl.MemorySpace.Vec)
+        return pl.store(sub, [0, 0], out)
+""")
+    rejected = _lower(bad_prog, passes.MemoryPlanner.PYPTO, enabled=True)
+    assert _kernel(rejected).attrs["buffer_ir_selected"] is False
+
+
+def test_int32_to_fp32_dequant_cast_and_single_row_slice_reshape_own_autosync():
+    dequant = pl.parse_program("""
+@pl.program
+class Int32Dequant:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, x: pl.Tensor[[8, 64], pl.INT32], out: pl.Out[pl.Tensor[[8, 64], pl.FP32]]
+               ) -> pl.Tensor[[8, 64], pl.FP32]:
+        loaded = pl.load(x, [0, 0], [8, 64])
+        fp = pl.tile.cast(loaded, target_type=pl.FP32, mode=0)
+        return pl.store(fp, [0, 0], out)
+""")
+    lowered_dq = _lower(dequant, passes.MemoryPlanner.PYPTO, enabled=True)
+    assert _kernel(lowered_dq).ir_stage == ir.FunctionIRStage.Buffer
+    assert "pto.tcvt" in codegen.PTOCodegen().generate(lowered_dq, emit_tile_addr=True)
+    ns = {}
+    exec(torch_codegen(lowered_dq), ns)  # noqa: S102
+    x = torch.arange(-256, 256, dtype=torch.int32).reshape(8, 64)
+    out = torch.empty((8, 64), dtype=torch.float32)
+    ns["kernel"](x, out)
+    torch.testing.assert_close(out, x.float())
+    _run_autosync(dequant)
+
+    slice_reshape = pl.parse_program("""
+@pl.program
+class SingleRowSliceReshape:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, w: pl.Tensor[[8, 8], pl.FP32], x: pl.Tensor[[8, 64], pl.FP32],
+               out: pl.Out[pl.Tensor[[8, 64], pl.FP32]]) -> pl.Tensor[[8, 64], pl.FP32]:
+        weights = pl.load(w, [0, 0], [8, 8])
+        row0 = pl.tile.slice(weights, [1, 8], [1, 0])
+        col = pl.tile.reshape(row0, [8, 1])
+        xs = pl.load(x, [0, 0], [8, 64])
+        scaled = pl.tile.row_expand_mul(xs, col)
+        return pl.store(scaled, [0, 0], out)
+""")
+    lowered_sr = _lower(slice_reshape, passes.MemoryPlanner.PYPTO, enabled=True)
+    assert _kernel(lowered_sr).ir_stage == ir.FunctionIRStage.Buffer
+    assert "buffer.subview" in str(lowered_sr) and "buffer.reshape" in str(lowered_sr)
+    mlir_sr = codegen.PTOCodegen().generate(lowered_sr, emit_tile_addr=True)
+    assert "pto.subview" in mlir_sr and "pto.treshape" in mlir_sr
+    ns_sr = {}
+    exec(torch_codegen(lowered_sr), ns_sr)  # noqa: S102
+    w = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    xd = torch.ones((8, 64), dtype=torch.float32) * 2.0
+    out_sr = torch.empty((8, 64), dtype=torch.float32)
+    ns_sr["kernel"](w, xd, out_sr)
+    torch.testing.assert_close(out_sr, xd * w[1:2, :].reshape(8, 1))
+    _run_autosync(slice_reshape)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

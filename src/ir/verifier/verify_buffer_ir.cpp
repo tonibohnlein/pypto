@@ -268,7 +268,7 @@ class BufferIRVisitor : public IRVisitor {
                                         view_handles_.count(AsVarLike(op->args_[1]).get()))) {
           CheckWindowPair(op, op->args_[0], op->args_[1], true);
         }
-        if (IsOp(op, "buffer.extract")) CheckWindowPair(op, op->args_[0], op->args_[3], false);
+        if (IsOp(op, "buffer.extract") || IsOp(op, "buffer.insert")) CheckWindowPair(op, op->args_[0], op->args_[3], false);
         if (IsOp(op, "buffer.set_validshape") && view_handles_.count(AsVarLike(op->args_[0]).get())) {
           Error("buffer.set_validshape cannot mutate static view metadata", op->span_);
         }

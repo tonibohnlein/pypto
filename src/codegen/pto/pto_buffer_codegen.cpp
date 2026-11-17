@@ -132,9 +132,13 @@ void CheckBufferTensorParameter(const ir::TensorTypePtr& tensor, const ir::Span&
     if (!view.stride.empty()) {
       CHECK_SPAN(view.stride.size() == 2, span)
           << "Direct Buffer IR GM parameters require rank-2 packed strides";
+      auto rows = As<ir::ConstInt>(tensor->shape_[0]);
       auto row_stride = As<ir::ConstInt>(view.stride[0]);
       auto col_stride = As<ir::ConstInt>(view.stride[1]);
-      CHECK_SPAN(row_stride && col_stride && row_stride->value_ == cols->value_ && col_stride->value_ == 1,
+      const bool single_row = rows && rows->value_ == 1;
+      CHECK_SPAN(row_stride && col_stride && col_stride->value_ == 1 &&
+                     (row_stride->value_ == cols->value_ ||
+                      (single_row && row_stride->value_ >= cols->value_)),
                  span)
           << "Direct Buffer IR GM parameters currently require packed row-major strides";
     }
@@ -227,6 +231,7 @@ class BufferEmissionPreflight : public ir::IRVisitor {
  public:
   bool uses_spmd_blocks = false;
   bool uses_spmd_subblock = false;
+  bool uses_l2_bypass_load = false;
   explicit BufferEmissionPreflight(ir::FunctionPtr function, bool conversion_supported,
                                    const backend::Backend* backend)
       : function_(std::move(function)), conversion_supported_(conversion_supported), backend_(backend) {
@@ -442,7 +447,7 @@ class BufferEmissionPreflight : public ir::IRVisitor {
                    ir::IsOp(call, "buffer.get_block_idx") || ir::IsOp(call, "buffer.get_block_num") ||
                    ir::IsOp(call, "buffer.get_subblock_idx") || ir::IsOp(call, "buffer.matmul") ||
                    ir::IsOp(call, "buffer.matmul_acc") || ir::IsOp(call, "buffer.extract") ||
-                   ir::IsOp(call, "buffer.transpose"),
+                   ir::IsOp(call, "buffer.insert") || ir::IsOp(call, "buffer.transpose"),
                call->span_)
         << "Operation '" << call->op_->name_ << "' is not supported by direct Buffer IR codegen";
     if (ir::IsOp(call, "buffer.alloc_multi") && call->args_.size() == 2) {
@@ -494,6 +499,12 @@ class BufferEmissionPreflight : public ir::IRVisitor {
           load ? parameter->second != ir::ParamDirection::Out : parameter->second != ir::ParamDirection::In,
           call->span_)
           << "Direct Buffer IR GM transfer conflicts with the tensor parameter direction";
+      if (load) {
+        const auto policy = static_cast<ir::CachePolicy>(call->GetKwarg<int>("cache", 0));
+        CHECK_SPAN(policy == ir::CachePolicy::kDefault || policy == ir::CachePolicy::kBypass, call->span_)
+            << "Direct Buffer load supports only DEFAULT and BYPASS cache policies";
+        uses_l2_bypass_load |= (policy == ir::CachePolicy::kBypass);
+      }
     }
     if (ir::IsOp(call, "buffer.set_validshape")) {
       const auto type = As<ir::BufferType>(call->args_[0]->GetType());
@@ -617,6 +628,13 @@ void PTOCodegen::GenerateBufferFunction(const ir::FunctionPtr& func) {
     stream_ << binding << ": i32";
     has_parameters = true;
   };
+  if (preflight.uses_l2_bypass_load && GetBackendHandler()->GetPtoTargetArch() == "a2a3") {
+    fs_.l2_cache_offset_arg = "%__pypto_l2_cache_offset";
+    fs_.used_ssa_names.insert("__pypto_l2_cache_offset");
+    if (has_parameters) stream_ << ", ";
+    stream_ << fs_.l2_cache_offset_arg << ": i64";
+    has_parameters = true;
+  }
   if (preflight.uses_spmd_blocks) {
     append_identity(fs_.spmd_block_idx_arg, "__pypto_spmd_block_idx");
     append_identity(fs_.spmd_block_num_arg, "__pypto_spmd_block_num");
@@ -876,7 +894,16 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
     const std::string tensor_operand = partition + " : " + partition_type;
     const std::string operation = backend::BufferNativeOperation(call);
     std::string attributes;
-    if (!load && call->GetKwarg<int>("atomic", 0) != 0) {
+    if (load && static_cast<ir::CachePolicy>(call->GetKwarg<int>("cache", 0)) == ir::CachePolicy::kBypass) {
+      if (GetBackendHandler()->GetPtoTargetArch() == "a5") {
+        attributes = " {l2_hint = #pto.load_l2_hint<not_alloc_keep>}";
+      } else {
+        attributes = " {cache_policy = #pto.load_cache_policy<l2_bypass>}";
+        if (!GetL2CacheOffsetArgSSA().empty()) {
+          attributes += " offset = " + GetL2CacheOffsetArgSSA() + " : i64";
+        }
+      }
+    } else if (!load && call->GetKwarg<int>("atomic", 0) != 0) {
       const auto source = As<ir::BufferType>(buffer->GetType());
       CHECK_SPAN(GetBackendHandler()->GetPtoTargetArch() == "a2a3" && source &&
                      backend::SupportsBufferStoreMode(call->GetKwarg<int>("atomic", 0), source->memory_space_,
@@ -885,7 +912,7 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
           << "Atomic store requires the qualified A2/A3 FP32 Acc writeback";
       attributes = " {atomicType = #pto<atomic_type atomic_add>}";
     }
-    Emit(load ? operation + " ins(" + tensor_operand + ") outs(" + buffer_operand + ")"
+    Emit(load ? operation + " ins(" + tensor_operand + ") outs(" + buffer_operand + ")" + attributes
               : operation + " ins(" + buffer_operand + ") outs(" + tensor_operand + ")" + attributes);
     backend::pto_ops_detail::EndNonEmptyRegion(guarded, *this);
   } else if (const auto* indexed = backend::FindBufferIndexedRecipe(call->op_->name_)) {
@@ -925,7 +952,7 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
     Emit((std::string(backend::BufferNativeOperation(call)) + " ") +
          BufferInsOutsClause(inputs, call->args_[2]) +
          FormatMatmulTf32Attr(call, GetBackendHandler()->GetPtoTargetArch()));
-  } else if (ir::IsOp(call, "buffer.extract")) {
+  } else if (ir::IsOp(call, "buffer.extract") || ir::IsOp(call, "buffer.insert")) {
     const std::string row = EmitBufferIntegerOperand(call->args_[1], DataType::INDEX);
     const std::string col = EmitBufferIntegerOperand(call->args_[2], DataType::INDEX);
     Emit(std::string(backend::BufferNativeOperation(call)) + " ins(" + GetExprAsCode(call->args_[0]) + ", " +

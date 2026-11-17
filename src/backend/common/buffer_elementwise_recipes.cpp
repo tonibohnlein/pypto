@@ -207,7 +207,7 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        GetPtoNativeOpSpec("tile.full").native_op,
        {{1, Kind::ElementScalar}},
        BufferPrecisionKind::None,
-       BufferElementwiseTypePolicy::DenseFP32,
+       BufferElementwiseTypePolicy::DenseFillVec,
        BufferDestinationAliasPolicy::ExactOrDisjoint,
        true},
   };
@@ -244,6 +244,7 @@ std::vector<std::string> GetBufferElementwiseRecipeNames() {
 namespace {
 bool SupportsElementwiseDtype(const BufferElementwiseRecipe& recipe, DataType dtype) {
   if (recipe.types == BufferElementwiseTypePolicy::DenseFP32) return dtype == DataType::FP32;
+  if (recipe.types == BufferElementwiseTypePolicy::DenseFillVec) return IsDenseBufferTransferDtype(dtype);
   return dtype == DataType::FP16 || dtype == DataType::FP32 || dtype == DataType::INT32;
 }
 }  // namespace
@@ -343,9 +344,13 @@ void ValidateBufferElementwiseOperands(const BufferElementwiseRecipe& recipe,
     CHECK(SupportsElementwiseDtype(recipe, descriptor->dtype_))
         << recipe.buffer_op << " currently requires FP16/FP32/INT32 arithmetic operands";
   }
-  if (recipe.types == BufferElementwiseTypePolicy::DenseFP32) {
+  if (recipe.types == BufferElementwiseTypePolicy::DenseFP32 ||
+      recipe.types == BufferElementwiseTypePolicy::DenseFillVec) {
     CHECK(SupportsElementwiseDtype(recipe, descriptor->dtype_))
-        << recipe.buffer_op << " currently requires FP32 operands";
+        << recipe.buffer_op
+        << (recipe.types == BufferElementwiseTypePolicy::DenseFP32
+                ? " currently requires FP32 operands"
+                : " currently requires FP16/BF16/FP32/INT32 operands");
     CHECK((descriptor->shape_.size() == 1 || descriptor->shape_.size() == 2) &&
           descriptor->blayout_ == ir::TileLayout::row_major &&
           descriptor->slayout_ == ir::TileLayout::none_box && descriptor->fractal_ == 512 &&

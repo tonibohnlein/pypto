@@ -144,6 +144,32 @@ TypePtr DeduceBufferExtract(const std::vector<ExprPtr>& args) {
   return GetVoidType();
 }
 
+// FIXPIPE Acc(FP32) -> Mat(BF16/FP16) insertion at a fractal-aligned offset.
+TypePtr DeduceBufferInsert(const std::vector<ExprPtr>& args) {
+  CHECK(args.size() == 4) << "buffer.insert requires source, row offset, column offset and destination, got "
+                          << args.size() << " operands";
+  CHECK(args[0] && args[3]) << "buffer.insert buffer operands must not be null";
+  auto source = MatrixOperand(args, 0, MemorySpace::Acc, "buffer.insert");
+  auto destination = MatrixOperand(args, 3, MemorySpace::Mat, "buffer.insert");
+  CHECK(source->dtype_ == DataType::FP32 &&
+        (destination->dtype_ == DataType::BF16 || destination->dtype_ == DataType::FP16))
+      << "buffer.insert supports FP32 Acc to BF16/FP16 Mat, got " << source->dtype_.ToString() << " -> "
+      << destination->dtype_.ToString();
+  CHECK(source->valid_shape_ == source->shape_ && destination->valid_shape_ == destination->shape_)
+      << "buffer.insert requires full-valid source Acc and destination Mat buffers";
+  CheckExtractOffset(args[1], destination->shape_[0], source->shape_[0], "row");
+  CheckExtractOffset(args[2], destination->shape_[1], source->shape_[1], "column");
+  if (auto constant = As<ConstInt>(args[1])) {
+    CHECK_SPAN(constant->value_ % 16 == 0, args[1]->span_)
+        << "buffer.insert row offset must be a multiple of 16, got " << constant->value_;
+  }
+  if (auto constant = As<ConstInt>(args[2])) {
+    CHECK_SPAN(constant->value_ % 16 == 0, args[2]->span_)
+        << "buffer.insert column offset must be a multiple of 16, got " << constant->value_;
+  }
+  return GetVoidType();
+}
+
 }  // namespace
 
 // Matrix products write the product rectangle of their Acc destination. The
@@ -205,6 +231,26 @@ REGISTER_OP("buffer.extract")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>&) {
       return DeduceBufferExtract(args);
+    });
+
+REGISTER_OP("buffer.insert")
+    .set_description("Write a static-shape Acc buffer into a Mat buffer at fractal-aligned offsets")
+    .set_op_category("BufferOp")
+    .set_ir_stage(OpIRStage::Buffer)
+    .set_internal_only()
+    .add_argument("src", "Acc source buffer")
+    .add_argument("row", "Row offset of the window in destination elements")
+    .add_argument("col", "Column offset of the window in destination elements")
+    .add_argument("dst", "Mat destination buffer containing the inserted window")
+    .set_output_arity(0)
+    .set_buffer_arg_effect(0, BufferAccess::Read, BufferAccess::Read)
+    .set_buffer_non_memory_arg(1)
+    .set_buffer_non_memory_arg(2)
+    .set_buffer_arg_effect(3, BufferAccess::Write, BufferAccess::Read)
+    .set_buffer_result_behavior(BufferResultBehavior::None)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>&) {
+      return DeduceBufferInsert(args);
     });
 
 }  // namespace ir

@@ -25,7 +25,7 @@ namespace backend {
 
 /// Native precision attributes are selected by the recipe, never by lowering text.
 enum class BufferPrecisionKind { None, Div, Log, Recip, Rsqrt };
-enum class BufferElementwiseTypePolicy { MatchingVec, DenseFP32 };
+enum class BufferElementwiseTypePolicy { MatchingVec, DenseFP32, DenseFillVec };
 enum class BufferDestinationAliasPolicy { ExactOrDisjoint, Disjoint };
 enum class BufferElementwiseOperandKind { Buffer, ElementScalar };
 
