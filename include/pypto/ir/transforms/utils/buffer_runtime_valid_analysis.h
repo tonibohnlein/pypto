@@ -12,6 +12,7 @@
 #ifndef PYPTO_IR_TRANSFORMS_UTILS_BUFFER_RUNTIME_VALID_ANALYSIS_H_
 #define PYPTO_IR_TRANSFORMS_UTILS_BUFFER_RUNTIME_VALID_ANALYSIS_H_
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -20,14 +21,19 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "pypto/backend/common/buffer_axis_recipes.h"
 #include "pypto/backend/common/buffer_conversion_recipes.h"
+#include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/ir/arith/analyzer.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/buffer_acc_trim_analysis.h"
 
 namespace pypto::ir {
 
@@ -49,7 +55,11 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
   };
   explicit BufferRuntimeValidAnalysis(const FunctionPtr& function)
       : analyzer_(std::make_shared<arith::Analyzer>()) {
-    if (function && function->body_) VisitStmt(function->body_);
+    if (function) {
+      core_ = function->func_type_;
+      BindBufferAccTrimParameters(function, *analyzer_, ready_);
+      if (function->body_) VisitStmt(function->body_);
+    }
   }
   const std::optional<Issue>& issue() const { return issue_; }
 
@@ -61,6 +71,7 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     const auto type = As<BufferType>(statement->var_->GetType());
     if (call && type && IsOp(call, "buffer.alloc")) {
       owners_.insert(statement->var_.get());
+      if (call->args_.size() == 2) addressed_.insert(statement->var_.get());
       const auto values = call->args_.empty() ? nullptr : As<MakeTuple>(call->args_[0]);
       if (values) {
         State state{epoch_, {}};
@@ -75,11 +86,22 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
         states_[statement->var_.get()] = std::move(state);
       }
     } else if (const auto scalar = As<ScalarType>(statement->var_->GetType());
-               scalar && scalar->dtype_ == DataType::BOOL && !call && SafeGuard(statement->value_)) {
+               scalar && scalar->dtype_ == DataType::BOOL && !call) {
       // Boolean aliases preserve comparisons of actual SSA values. Do not bind
       // numerical arithmetic: cancellation could require an unproved machine-
       // overflow premise. Scalar-memory readiness remains a separate contract.
-      analyzer_->Bind(statement->var_, statement->value_);
+      guard_aliases_.emplace(statement->var_.get(), statement->value_);
+      if (ready_.insert(statement->var_.get()).second) scalar_definitions_.push_back(statement->var_);
+    }
+    if (const auto scalar = As<ScalarType>(statement->var_->GetType());
+        scalar && (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt())) {
+      const auto range = BoundBufferAccTrimScalar(
+          statement->value_, *analyzer_, [this](const VarPtr& var) { return ready_.count(var.get()) != 0; },
+          &bound_cache_);
+      if (range) {
+        if (ready_.insert(statement->var_.get()).second) scalar_definitions_.push_back(statement->var_);
+        analyzer_->const_int_bound.Update(statement->var_, *range);
+      }
     }
     if (call) CheckCall(call);
   }
@@ -87,34 +109,43 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     if (const auto call = As<Call>(statement->expr_)) CheckCall(call);
   }
   void VisitStmt_(const ForStmtPtr& loop) override {
+    const auto checkpoint = scalar_definitions_.size();
+    // The original counted-loop coordinate is available in its body. This
+    // grants no count, sign or numerical bound and does not survive the exit.
+    if (ready_.insert(loop->loop_var_.get()).second) scalar_definitions_.push_back(loop->loop_var_);
     ++epoch_;
+    bound_cache_.clear();
     VisitStmt(loop->body_);
+    RestoreScalars(checkpoint);
     ++epoch_;
   }
   void VisitStmt_(const WhileStmtPtr& loop) override {
+    const auto checkpoint = scalar_definitions_.size();
+    bound_cache_.clear();
     ++epoch_;
     {
-      const auto condition = QualifiedGuard(loop->condition_);
-      auto constraint = analyzer_->GetConstraintContext(
-          condition ? condition : std::make_shared<ConstBool>(true, loop->span_));
+      BufferAccTrimGuardScope constraint(loop->condition_, true, analyzer_, guard_aliases_);
       VisitStmt(loop->body_);
+      RestoreScalars(checkpoint);
     }
     ++epoch_;
   }
   void VisitStmt_(const IfStmtPtr& branch) override {
-    const auto condition = QualifiedGuard(branch->condition_);
+    const auto checkpoint = scalar_definitions_.size();
+    bound_cache_.clear();
     {
-      auto constraint = analyzer_->GetConstraintContext(
-          condition ? condition : std::make_shared<ConstBool>(true, branch->span_));
+      BufferAccTrimGuardScope constraint(branch->condition_, true, analyzer_, guard_aliases_);
       VisitStmt(branch->then_body_);
+      RestoreScalars(checkpoint);
     }
     // Neither arm's mutations prove the other's initial metadata. The initial
     // slice conservatively requires fresh setters in that arm when necessary.
     ++epoch_;
     if (branch->else_body_) {
-      auto constraint = analyzer_->GetConstraintContext(
-          condition ? MakeNot(condition, branch->span_) : std::make_shared<ConstBool>(true, branch->span_));
+      bound_cache_.clear();
+      BufferAccTrimGuardScope constraint(branch->condition_, false, analyzer_, guard_aliases_);
       VisitStmt(*branch->else_body_);
+      RestoreScalars(checkpoint);
     }
     ++epoch_;
   }
@@ -131,28 +162,6 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     const auto type = expression ? As<ScalarType>(expression->GetType()) : nullptr;
     return type && (type->dtype_.IsSignedInt() || type->dtype_ == DataType::INDEX) &&
            (AsVarLike(expression) || As<ConstInt>(expression));
-  }
-  static bool SafeGuard(const ExprPtr& expression) {
-    if (As<ConstBool>(expression)) return true;
-    if (const auto var = AsVarLike(expression)) {
-      const auto type = As<ScalarType>(var->GetType());
-      return type && type->dtype_ == DataType::BOOL;
-    }
-    if (const auto negation = As<Not>(expression)) return SafeGuard(negation->operand_);
-    const auto binary = As<BinaryExpr>(expression);
-    if (!binary) return false;
-    if (As<And>(expression) || As<Or>(expression)) {
-      return SafeGuard(binary->left_) && SafeGuard(binary->right_);
-    }
-    return (As<Eq>(expression) || As<Ne>(expression) || As<Lt>(expression) || As<Le>(expression) ||
-            As<Gt>(expression) || As<Ge>(expression)) &&
-           AtomicInteger(binary->left_) && AtomicInteger(binary->right_);
-  }
-  ExprPtr QualifiedGuard(const ExprPtr& condition) {
-    // Check before simplifying: an unsupported arithmetic condition must not
-    // become a usable fact through algebra requiring absent overflow evidence.
-    if (!SafeGuard(condition)) return nullptr;
-    return analyzer_->Simplify(condition);
   }
   bool Equal(const ExprPtr& a, const ExprPtr& b) {
     // The predicate query includes the analyzer's guarded comparison facts;
@@ -181,6 +190,53 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     if (!issue_) issue_ = Issue{call, message};
   }
   void CheckCall(const CallPtr& call) {
+    // A dynamic Acc is a store-only metadata alias. No producer/carry/window
+    // or unknown consumer inherits permission from its -1 descriptor fields.
+    for (size_t i = 0; i < call->args_.size(); ++i) {
+      const auto type = As<BufferType>(call->args_[i]->GetType());
+      if (!type || type->memory_space_ != MemorySpace::Acc ||
+          std::none_of(type->valid_shape_.begin(), type->valid_shape_.end(),
+                       [](int64_t extent) { return extent < 0; }))
+        continue;
+      if (i != 0 || (!IsOp(call, "buffer.store") && !IsOp(call, "buffer.set_validshape")) ||
+          !backend::IsBufferAccRowTrimDescriptor(type)) {
+        Refuse(call, "Runtime Acc aliases require the qualified row-only default store metadata contract");
+        return;
+      }
+    }
+    if (IsOp(call, "buffer.store") && call->args_.size() == 4) {
+      const auto type = As<BufferType>(call->args_[0]->GetType());
+      if (type && type->memory_space_ == MemorySpace::Acc &&
+          std::any_of(type->valid_shape_.begin(), type->valid_shape_.end(),
+                      [](int64_t extent) { return extent < 0; })) {
+        if (!IsBufferAccTrimTargetQualified()) {
+          Refuse(call, "Runtime Acc row stores require a qualified selected A2/A3 native target");
+          return;
+        }
+        const auto owner = AsVarLike(call->args_[0]);
+        const auto extents = Extents(call->args_[0]);
+        const auto transfer = As<MakeTuple>(call->args_[2]);
+        if (core_ != FunctionType::AIC || !owner || !addressed_.count(owner.get()) ||
+            !backend::IsBufferAccRowTrimDescriptor(type) || !extents || !transfer ||
+            transfer->elements_.size() != 2 || GetIntKwarg(call->kwargs_, "atomic", 0) != 0) {
+          Refuse(call, "Runtime Acc row stores require owned addressed AIC metadata and default TSTORE");
+        } else if (!Equal((*extents)[1], Constant(type->shape_[1], call->span_)) ||
+                   !Equal(transfer->elements_[0], (*extents)[0]) ||
+                   !Equal(transfer->elements_[1], (*extents)[1])) {
+          Refuse(call,
+                 "Runtime Acc store requires restored rows and fixed full columns matching the GM partition");
+        } else {
+          const auto range = BoundBufferAccTrimScalar(
+              (*extents)[0], *analyzer_, [this](const VarPtr& var) { return ready_.count(var.get()) != 0; },
+              &bound_cache_);
+          if (!range || range->min_value < 1 || range->max_value > type->shape_[0])
+            Refuse(call,
+                   "Runtime Acc store requires proved positive rows within physical capacity at this use");
+        }
+        return;
+      }
+    }
+
     if (IsOp(call, "buffer.set_validshape") && call->args_.size() == 2) {
       const auto handle = AsVarLike(call->args_[0]);
       const auto values = As<MakeTuple>(call->args_[1]);
@@ -253,12 +309,33 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
       Refuse(call, "Row operation requires a proved positive-row guard at this use");
     }
   }
+  void RestoreScalars(size_t checkpoint) {
+    bound_cache_.clear();
+    while (scalar_definitions_.size() > checkpoint) {
+      analyzer_->Unbind(scalar_definitions_.back());
+      ready_.erase(scalar_definitions_.back().get());
+      guard_aliases_.erase(scalar_definitions_.back().get());
+      scalar_definitions_.pop_back();
+    }
+  }
+  FunctionType core_ = FunctionType::Opaque;
+  std::unordered_set<const Var*> ready_, addressed_;
+  BufferAccTrimBoundCache bound_cache_;
+  std::unordered_map<const Var*, ExprPtr> guard_aliases_;
+  std::vector<VarPtr> scalar_definitions_;
   uint64_t epoch_ = 0;
   arith::AnalyzerPtr analyzer_;
   std::unordered_set<const Var*> owners_;
   std::unordered_map<const Var*, State> states_;
   std::optional<Issue> issue_;
 };
+
+// A selected descriptor's native runtime obligations apply equally to access
+// analysis, actual-token lowering, ownership and code generation.
+inline void RequireBufferRuntimeValid(const FunctionPtr& function) {
+  const BufferRuntimeValidAnalysis metadata(function);
+  if (const auto& issue = metadata.issue()) CHECK_SPAN(false, issue->call->span_) << issue->message;
+}
 
 }  // namespace pypto::ir
 

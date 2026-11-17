@@ -30,6 +30,7 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/utils/buffer_acc_trim_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_view_analysis.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/type.h"
@@ -55,7 +56,10 @@ inline bool NeedsRuntimeBufferValid(const TypePtr& type) {
 // and yield contracts are checked separately by the whole-kernel selector.
 class BufferValidAnalysis : public IRVisitor {
  public:
-  explicit BufferValidAnalysis(const StmtPtr& body) : views_(body) { VisitStmt(body); }
+  explicit BufferValidAnalysis(const StmtPtr& body, const BufferAccTrimAnalysis* acc_trims = nullptr)
+      : views_(body), acc_trims_(acc_trims) {
+    VisitStmt(body);
+  }
   bool supported() const { return valid_ && !(dynamic_ && restricted_); }
   // Diagnostic evidence from this existing scan, not an additional analysis.
   // If dynamic metadata occurs after a restricted consumer, name that consumer.
@@ -63,7 +67,8 @@ class BufferValidAnalysis : public IRVisitor {
 
   void VisitExpr(const ExprPtr& expr) override {
     if (!expr) return;
-    dynamic_ |= NeedsRuntimeBufferValid(expr->GetType());
+    dynamic_ |=
+        NeedsRuntimeBufferValid(expr->GetType()) && !(acc_trims_ && acc_trims_->Qualifies(expr->GetType()));
     RecordObligation(expr);
     IRVisitor::VisitExpr(expr);
   }
@@ -128,6 +133,7 @@ class BufferValidAnalysis : public IRVisitor {
   }
   ExprPtr first_obligation_, restricted_operation_;
   BufferViewAnalysis views_;
+  const BufferAccTrimAnalysis* acc_trims_;
   bool valid_ = true;
   bool dynamic_ = false;
   bool restricted_ = false;

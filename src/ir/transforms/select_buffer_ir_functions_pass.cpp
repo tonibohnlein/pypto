@@ -50,6 +50,7 @@
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/buffer_acc_trim_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_active_domain_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_indexed_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_scalar_staging.h"
@@ -73,8 +74,9 @@ namespace {
 // is interpreted as an unsupported capability: malformed selected IR must fail.
 class BufferKernelSupport : public IRVisitor {
  public:
-  explicit BufferKernelSupport(const FunctionPtr& function)
-      : core_(function->func_type_),
+  explicit BufferKernelSupport(const FunctionPtr& function, const BufferAccTrimAnalysis& acc_trims)
+      : acc_trims_(acc_trims),
+        core_(function->func_type_),
         body_(function->body_),
         return_types_(function->return_types_),
         views_(function->body_),
@@ -165,10 +167,10 @@ class BufferKernelSupport : public IRVisitor {
           const auto scalar = As<ScalarType>(view.valid_shape[i]->GetType());
           admission.Require(valid
                                 ? valid->value_ >= 0 && valid->value_ <= As<ConstInt>(tile->shape_[i])->value_
-                                : space == MemorySpace::Vec && scalar &&
+                                : (space == MemorySpace::Vec || acc_trims_.Qualifies(tile)) && scalar &&
                                       (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt()),
                             BufferAdmissionProperty::TypeLayout);
-          if (space != MemorySpace::Vec)
+          if (space != MemorySpace::Vec && !acc_trims_.Qualifies(tile))
             admission.Require(valid && valid->value_ > 0, BufferAdmissionProperty::TypeLayout);
           if (column && i == 1)
             admission.Require(valid && valid->value_ == 1, BufferAdmissionProperty::TypeLayout);
@@ -526,7 +528,8 @@ class BufferKernelSupport : public IRVisitor {
                         BufferAdmissionProperty::TransferOptions);
     } else if (IsOp(call, "tile.set_validshape")) {
       admission.Require(call->args_.size() == 3 && call->kwargs_.empty() &&
-                            As<TileType>(call->GetType())->GetMemorySpace() == MemorySpace::Vec,
+                            (As<TileType>(call->GetType())->GetMemorySpace() == MemorySpace::Vec ||
+                             acc_trims_.Qualifies(call)),
                         BufferAdmissionProperty::OperationRecipe);
       if (admission.supported()) {
         const auto source = views_.Get(call->args_[0]);
@@ -919,6 +922,7 @@ class BufferKernelSupport : public IRVisitor {
     return memory_reuse::SamePhysicalWindow(planned(left, a), planned(right, b));
   }
 
+  const BufferAccTrimAnalysis& acc_trims_;
   FunctionType core_;
   StmtPtr body_;
   std::optional<std::map<VarPtr, TypePtr>> accumulator_plan_;
@@ -1036,7 +1040,9 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper
         context->GetAutoSyncPolicy() == "conservative_prefix" && function->func_type_ == FunctionType::AIV)
       function = StageBufferScalarReads(function);
   }
-  BufferKernelSupport support(function);
+  const BufferAccTrimAnalysis acc_trims(function,
+                                        !context || context->GetMemoryPlanner() != MemoryPlanner::PtoAS);
+  BufferKernelSupport support(function, acc_trims);
   auto function_context = support.admission.At(function.get());
   support.admission.Require(!device_helper, BufferAdmissionProperty::DeviceHelper);
   support.admission.Require(!context || context->GetEnableBufferIR(), BufferAdmissionProperty::Disabled);
@@ -1067,7 +1073,7 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper
     support.admission.Require(slots.unsupported_bases.empty(), BufferAdmissionProperty::CanonicalSlots);
   }
   if (support.admission.supported()) {
-    const BufferValidAnalysis valid(function->body_);
+    const BufferValidAnalysis valid(function->body_, &acc_trims);
     auto valid_context = support.admission.At(valid.first_obligation()
                                                   ? static_cast<const IRNode*>(valid.first_obligation().get())
                                                   : function.get());

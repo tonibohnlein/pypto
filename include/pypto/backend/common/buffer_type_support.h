@@ -61,6 +61,24 @@ inline bool IsBufferTensorShape(const std::vector<ir::ExprPtr>& shape) {
   return scalar && scalar->dtype_ == DataType::INDEX;
 }
 
+// A2/A3 default Acc NZ->ND TSTORE valid-size encoding, independent of the
+// allocator's byte-capacity bound. Full columns are fixed by this family.
+inline bool SupportsBufferAccRowTrimCapacity(int64_t rows, int64_t columns) {
+  return rows > 0 && rows <= 8192 && columns > 0 && columns <= 4095;
+}
+
+/// Runtime Acc row-store metadata keeps the static NZ physical pitch. This
+/// descriptor predicate proves no runtime equality/range/availability; those
+/// are checked at the actual store by BufferRuntimeValidAnalysis.
+inline bool IsBufferAccRowTrimDescriptor(const ir::BufferTypePtr& buffer) {
+  return buffer && buffer->memory_space_ == ir::MemorySpace::Acc &&
+         (buffer->dtype_ == DataType::FP32 || buffer->dtype_ == DataType::INT32) &&
+         buffer->shape_.size() == 2 &&
+         SupportsBufferAccRowTrimCapacity(buffer->shape_[0], buffer->shape_[1]) &&
+         buffer->valid_shape_ == std::vector<int64_t>{-1, -1} && buffer->pad_ == ir::PadValue::null &&
+         buffer->compact_ == ir::CompactMode::null && buffer->fractal_ == 1024;
+}
+
 /// Logical descriptor shape shared by default selection and final lowering.
 inline bool IsDenseVecBufferTile(const ir::TileTypePtr& tile, const ir::TileView& view) {
   return tile->shape_.size() == 2 &&
