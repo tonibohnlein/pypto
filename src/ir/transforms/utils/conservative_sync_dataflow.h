@@ -102,6 +102,7 @@ struct ConservativeSyncChildEntry {
   std::shared_ptr<const EventfulSyncChild> eventful;
   std::vector<std::pair<PipeType, PipeType>> required_services;
   CompletionSummary completion = CompletionSummary::Identity();
+  bool first_visit = false;
 };
 
 struct ConservativeSyncCost {

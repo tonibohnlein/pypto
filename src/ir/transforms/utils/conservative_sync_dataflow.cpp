@@ -783,6 +783,14 @@ class Builder {
       return merge;
     }
     if (const auto loop = As<ForStmt>(statement)) {
+      if (IsSpmdAtMostOneTripFor(loop, ssa_defs_)) {
+        const size_t body_exit = BuildSubCfg(loop->body_, entry, cfg);
+        const size_t merge = cfg.size();
+        cfg.push_back({CfgVertex::Kind::BranchMerge, 0, {}, {}});
+        AddCfgEdge(cfg, entry, merge);
+        AddCfgEdge(cfg, body_exit, merge);
+        return merge;
+      }
       const size_t header = cfg.size();
       cfg.push_back({CfgVertex::Kind::Nop, 0, {}, {}});
       AddCfgEdge(cfg, entry, header);
@@ -896,6 +904,29 @@ class Builder {
   void ExtractSourcePipeServices(const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo,
                                  const std::vector<LiveStorageState>& live_in,
                                  const std::vector<LiveStorageState>& live_out) {
+    std::vector<bool> has_reaching_child(cfg.size(), false);
+    {
+      std::queue<size_t> q;
+      for (size_t w = 0; w < cfg.size(); ++w) {
+        if (cfg[w].kind != CfgVertex::Kind::Child) continue;
+        for (const size_t nxt : cfg[w].succs) {
+          if (!has_reaching_child[nxt]) {
+            has_reaching_child[nxt] = true;
+            q.push(nxt);
+          }
+        }
+      }
+      while (!q.empty()) {
+        const size_t x = q.front();
+        q.pop();
+        for (const size_t nxt : cfg[x].succs) {
+          if (!has_reaching_child[nxt]) {
+            has_reaching_child[nxt] = true;
+            q.push(nxt);
+          }
+        }
+      }
+    }
     ConservativeAccessSet tracked_facts;
     for (const size_t u : rpo) {
       const auto& v = cfg[u];
@@ -921,12 +952,9 @@ class Builder {
             services.emplace(source, std::get<1>(effect));
           }
         }
-        if (entry.eventful) {
-          for (const auto source : entry.eventful->Pipes()) {
-            for (const auto destination : entry.eventful->Pipes()) {
-              if (source != destination) services.emplace(source, destination);
-            }
-          }
+        entry.first_visit = !has_reaching_child[u];
+        if (has_reaching_child[u] && entry.eventful) {
+          for (const auto& dir : entry.eventful->RearmDirections()) services.insert(dir);
         }
         entry.services.assign(services.begin(), services.end());
         entry.required_services = entry.services;
@@ -1323,6 +1351,7 @@ class Builder {
       return end;
     }
     if (const auto assignment = As<AssignStmt>(statement)) {
+      ssa_defs_[assignment->var_.get()] = assignment->value_;
       if (const auto call = As<Call>(assignment->value_)) {
         Payload(statement, call, assignment->var_);
       } else {
@@ -1419,6 +1448,7 @@ class Builder {
   bool retain_incoming_diagnostics_;
   bool enable_refresh_kill_;
   std::unordered_map<const Expr*, ExprPtr> gm_roots_;
+  std::unordered_map<const Var*, ExprPtr> ssa_defs_;
   std::vector<std::vector<const Var*>> scopes_;
   std::unordered_set<const Var*> ready_;
   size_t control_depth_ = 0;

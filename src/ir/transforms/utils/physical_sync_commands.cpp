@@ -590,7 +590,9 @@ class CaseSequenceTree {
       if (!right.empty()) alternative = Body(std::move(right));
       result.push_back(ControlBranch(condition, Body(std::move(left)), alternative, span_, work_));
     } else if (!right.empty()) {
-      auto condition = std::make_shared<Gt>(block_, bound, DataType::BOOL, span_);
+      const auto next_bound =
+          std::make_shared<ConstInt>(slices_[middle - 1].last + 1, DataType::INDEX, span_);
+      auto condition = std::make_shared<Ge>(block_, next_bound, DataType::BOOL, span_);
       result.push_back(ControlBranch(condition, Body(std::move(right)), std::nullopt, span_, work_));
     }
     result.insert(result.end(), suffix.rbegin(), suffix.rend());

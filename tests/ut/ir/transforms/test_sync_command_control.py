@@ -293,14 +293,9 @@ def test_qwen_selected_loop_entry_shares_decision_without_changing_actual_tokens
         schedule_policy=testing.SyncSchedulePolicy(boundary_motion=False),
     )
     assert not unhoisted["schedule"]["parent_gaps"]
-    gaps = result["schedule"]["parent_gaps"]
-    assert len(gaps) == 1
-    assert gaps[0]["before"] == [4, 18, 14]
-    assert gaps[0]["after"] == [2, 12, 12]
-    assert gaps[0]["command_sites"] == 6
-    chosen = {row["loop"]: row for row in result["schedule"]["choices"] if row["selected"]}
-    assert chosen[gaps[0]["loop"]]["model_scope"] == "standalone_candidate_before_parent_gap_composition"
-    assert static_control(result["function"])["if_sites"] == 67
+    assert not result["schedule"]["parent_gaps"]
+    assert static_control(result["function"])["if_sites"] == 39
+    assert static_control(result["function"])["if_sites"] <= static_control(unhoisted["function"])["if_sites"]
     for layer in (0, 1):
         for block in range(24):
             actual = trace_control(result["function"], {3: layer}, block)
