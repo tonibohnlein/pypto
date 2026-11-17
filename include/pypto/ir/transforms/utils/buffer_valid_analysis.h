@@ -102,10 +102,22 @@ class BufferValidAnalysis : public IRVisitor {
         backend::SupportsLogicalBufferAxis(*axis_recipe, call);
     restricted_ |= (axis_recipe && !runtime_axis_op) || (conversion && !static_cast_recipe) ||
                    backend::FindLogicalBufferIndexedRecipe(call->op_->name_) != nullptr;
-    if ((IsOp(call, "tile.reshape") && !backend::SupportsLogicalContiguousVectorReshape(call)) ||
-        IsOp(call, "tile.reinterpret_view") || IsOp(call, "tile.assemble") || IsOp(call, "tile.move") ||
-        IsOp(call, "tile.extract") || IsOp(call, "tile.transpose_view") || IsOp(call, "tile.matmul") ||
-        IsOp(call, "tile.matmul_acc") || IsOp(call, "tile.transpose")) {
+    bool vector_reshape = backend::SupportsLogicalContiguousVectorReshape(call);
+    if (vector_reshape) {
+      const auto source = As<TileType>(call->args_[0]->GetType());
+      const auto target = As<TileType>(call->GetType());
+      const bool identity = tile_view_semantics::GetEffectiveTileView(*source).blayout ==
+                            tile_view_semantics::GetEffectiveTileView(*target).blayout;
+      // A type-equivalent identity does not prove an inherited window's pitch
+      // or mutable metadata ownership. Preserve previous static-view support,
+      // but do not make such a view unrestricted in a runtime-valid function.
+      if (identity && (views_.IsWindow(call->args_[0]) || !views_.HasDenseRowPitch(call->args_[0])))
+        vector_reshape = false;
+    }
+    if ((IsOp(call, "tile.reshape") && !vector_reshape) || IsOp(call, "tile.reinterpret_view") ||
+        IsOp(call, "tile.assemble") || IsOp(call, "tile.move") || IsOp(call, "tile.extract") ||
+        IsOp(call, "tile.transpose_view") || IsOp(call, "tile.matmul") || IsOp(call, "tile.matmul_acc") ||
+        IsOp(call, "tile.transpose")) {
       restricted_ = true;
     }
     if (restricted_ && !restricted_operation_) {

@@ -1,0 +1,245 @@
+{
+  "status": "Accepted implementation and final report checkpoint; coherent regression, hooks, capture and bounded command audit passed",
+  "date": "2026-11-16",
+  "parent_milestones": [
+    "M2",
+    "M3",
+    "M6"
+  ],
+  "depends_on": "Accepted checkpoint 46 implementation and commit before dependent source changes",
+  "shared_owner": "SupportsLogicalContiguousVectorReshape and existing view/typed-root services",
+  "native_pin": "5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f",
+  "contract": {
+    "geometry": "Existing qualified FP32 Vec contiguous row[1,L] or column[L,1], physical L positive multiple of eight",
+    "identity": "Same physical shape, dtype, space, orientation, effective layout/fractal/pad/compact, dense pitch, zero descriptor offset and both actual valid dimensions",
+    "provenance": "Original complete placed byte window; no inherited window or unavailable pitch in the new runtime route",
+    "active_domain": "Same-orientation identity preserves the original prefix axis in both forward and operand-domain transfer; actual exchange uses existing axis map",
+    "metadata": "Existing typed-root and per-use restore; no copy or new native instruction",
+    "planner": "Existing metadata ownership and addressless restrictions remain; no new reinterpret export",
+    "physical_L1": "Unavailable under the existing length/alignment predicate; active prefix length1 in physical L>=8 remains distinct"
+  },
+  "refusals": [
+    "Arbitrary two-dimensional identity reshape",
+    "Changed physical shape, dtype, layout, offset, stride or valid metadata",
+    "Unknown or inherited dynamic-window provenance",
+    "Unsupported consumers, metadata observations or planner ownership"
+  ],
+  "validation_plan": [
+    "Generic row/column same-orientation identity, static/runtime zero/one/partial/full prefixes",
+    "Old alias after intervening setter, skipped branches, repeated visits and resets",
+    "Independent declared access/metadata and physical byte/value correspondence",
+    "Actual token/flag payload order, matching, acyclicity and causal reuse",
+    "Both alias contracts on admitted layouts, real planner outcomes and PTOAS C++",
+    "Existing true axis-map, active-domain, scalar, Acc and completion regressions",
+    "Same original Qwen capture; report next first obligation rather than force acceptance"
+  ],
+  "implementation_results": [
+    {
+      "receipt": "build-py314/review-repairs-20261116/qwen-write-identity-qualified/receipt.json",
+      "owned_local_leaves": 20,
+      "delegated_local_leaves": 12,
+      "cpp_local_leaves": 32,
+      "task_control_domains": 47,
+      "new_whole_leaf_ownership": false,
+      "rope_next_obligation": "tile.mul prefill_fwd.py:781: active rows full16 vs group_tok unproved equal, plus partial-column source window from physical[16,128] to logical[16,64]; not k_sq scalar multiplication"
+    },
+    {
+      "receipt": "build-py314/review-repairs-20261116/qwen-pure-write-qualified/receipt.json",
+      "owned_local_leaves": 21,
+      "delegated_local_leaves": 11,
+      "attribution": "Combined checkpoint47 point-write fixes; not additional whole-leaf ownership attributed to48 identity admission"
+    }
+  ],
+  "test_results": [
+    {
+      "log": "build-py314/review-repairs-20261116/vector-identity-first-gate.log",
+      "passed": 22,
+      "failed": 0,
+      "seconds": 9.11,
+      "stage": "Before strengthening no-reshape assertion to cover Assign and Eval Calls"
+    },
+    {
+      "log": "build-py314/review-repairs-20261116/write-identity-qualified-gate.log",
+      "passed": 122,
+      "failed": 0,
+      "seconds": 11.26,
+      "stage": "Strengthened all-statement no-reshape assertion; joint47 write,48 identity and existing GM read regressions"
+    }
+  ],
+  "device_validation": false,
+  "allocation_or_protocol_changes": false,
+  "all_original_milestones_complete": false,
+  "separate_followups": [
+    "Raw-DAG generic BufferIR/SSA verifier cost",
+    "Flag-bearing invocation-completion expression rewriting cost",
+    "Exact GM exports and other missing native/access contracts",
+    "Cross-core and inter-kernel construction remain excluded"
+  ],
+  "implementation_parent": "30864da6221d781b3e4ba77a494d2a5b5b8fcd02",
+  "implementation_changes": [
+    "Strict same-orientation identity extension in existing contiguous-vector predicate; fixed inactive axis1 and existing geometry retained",
+    "Explicit identity-prefix-axis preservation in forward and operand-demand normalizer transfer",
+    "Identity-specific inherited-window/dense-pitch restriction in BufferValid; existing SelectBuffer provenance gate unchanged",
+    "Existing typed-root/relabel lowering; no payload copy, native operation, backend, allocator or protocol change"
+  ],
+  "validation_scope": {
+    "physical_lengths": [
+      8,
+      16
+    ],
+    "runtime_prefixes": [
+      "zero",
+      "one",
+      "partial",
+      "full"
+    ],
+    "static_prefixes": [
+      1,
+      15,
+      16
+    ],
+    "visits": [
+      3,
+      257,
+      65537
+    ],
+    "alias_policies": "Both on identical disjoint concrete layouts, under each contract",
+    "planners_with_cpp": [
+      "PYPTO",
+      "DSA_RP"
+    ],
+    "independent_checks": [
+      "Torch versus independent original arithmetic and output sentinels",
+      "Declared physical byte/access coverage through existing independent interpreter",
+      "Actual token/flag payload-order equality, matching, acyclicity and causal reuse"
+    ],
+    "minimum_covers_claimed": false,
+    "native_or_device_numerical_validation": false,
+    "representation": "Static Buffer statements/payload sites checked independent of visit count; no trip unfolding"
+  },
+  "source_pin_stage": "Own source/test subset before final formatting; compiled module may also contain coordinated checkpoint47 work; final joint snapshot to follow",
+  "source_hashes": {
+    "include/pypto/backend/common/buffer_view_semantics.h": "3ecdaec0e619fa4e9b46cb9ae60266f75bc8f2d000a19f47da27835aea649fb4",
+    "src/backend/common/buffer_view_semantics.cpp": "9ea49d79e71139ee7f53d1ec5f200384cdc8e4b4c8216f2bc0b112ece5908b67",
+    "include/pypto/ir/transforms/utils/buffer_valid_analysis.h": "271d5766e37143e8969fd4aafb16fb560aa53e59ef980a6449d67c46a4243b89",
+    "src/ir/transforms/utils/buffer_active_domain_analysis.cpp": "70f5090625b7bc0a39958ca5478f456cf4bd586e82e3c58dc7c0048e28586c5b",
+    "tests/ut/ir/transforms/test_vector_identity_reshape.py": "f1aae77999fdf3e466d81c0f0df9a4764beaf8e8cac252d9a3e7cc280577ae5e"
+  },
+  "postformat_gates": "pending",
+  "final_verification": {
+    "source_parent": "30864da6221d781b3e4ba77a494d2a5b5b8fcd02",
+    "source_hashes": {
+      "include/pypto/backend/common/buffer_scalar_recipes.h": "aafc7691be07f008a3ea7fbcf04f0f3923fd5765499cfda9ae813f17c9940a16",
+      "include/pypto/backend/common/buffer_view_semantics.h": "3ecdaec0e619fa4e9b46cb9ae60266f75bc8f2d000a19f47da27835aea649fb4",
+      "include/pypto/ir/transforms/utils/buffer_scalar_staging.h": "1e9b7ba58d3e101f4683e145620dd847083bed2ba6e72717c1fc804119770383",
+      "include/pypto/ir/transforms/utils/buffer_valid_analysis.h": "a2d54fa48a1f25ae68e30c4b75d0970e2e2b7318d767b44ad8aafb4bb354a460",
+      "src/backend/common/buffer_scalar_recipes.cpp": "0ea3c7042b894b3a639b95ac4c7bcbe5fb072cd4696e2a8d6a8919394d3588ad",
+      "src/backend/common/buffer_sync_contract.cpp": "20a5eecae4c148ed275e8f59ce04afe4f9c26065bedbe5f20d485019177e3498",
+      "src/backend/common/buffer_view_semantics.cpp": "9ea49d79e71139ee7f53d1ec5f200384cdc8e4b4c8216f2bc0b112ece5908b67",
+      "src/backend/common/pto_ops_memory.cpp": "ab6c40cf29d74650437b6f1a5d16b81a36a1646a8d3a827cb048be26caa48dbb",
+      "src/codegen/pto/pto_buffer_codegen.cpp": "c6d5fd74ae3006a2b8ee34126916606f777a3d2b5ded900cc864395c51be4101",
+      "src/ir/op/buffer_ops/memory.cpp": "df6fe81d6cef29247bc5c9b738d662b65bfd610e8a542fdc9494d926ab42d338",
+      "src/ir/op/tensor_ops/memory.cpp": "cc8ef9ce73e192466e34507614f7b7cbca0ba1c4f0ac9fd416f456e8f6b6ce76",
+      "src/ir/transforms/init_memref.cpp": "55f46feaa19902959d45ce90587f8e2ac012a25eb22996aa6ab7b1c93f162959",
+      "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "b37d8fc8562062b000b22ef92a89838a33c99378c2199165192ed3bd0e7dfba0",
+      "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "bdfd83fa7fe21aa3bdbe3492bf463cac913b699ae614f3886a4d01dd8917b101",
+      "src/ir/transforms/token_sync.cpp": "ac43b69d93ddbd9611eda0a6ed8023ed3321032a22d21d56c49a232cd3a6e187",
+      "src/ir/transforms/utils/buffer_active_domain_analysis.cpp": "70f5090625b7bc0a39958ca5478f456cf4bd586e82e3c58dc7c0048e28586c5b",
+      "src/ir/transforms/utils/buffer_scalar_staging.cpp": "37e0bb7da5e37014129819bb780b71bd335f0881e7fde287e110bf0429c210cd",
+      "src/ir/transforms/utils/closed_prefix_sync.cpp": "08a1d332e1185f811af2d8386b2628a07aef4e63c03b7770a7d2362df9ab7473",
+      "src/ir/transforms/utils/result_alias_utils.cpp": "cd0f50ff2ffd1fb002d55e096bbf9b2423efd27b9a6bdd28c45df68387c6adf1",
+      "src/ir/transforms/utils/sync_statement_rewrite.h": "1ff2acfd4600b0465e139ebca180b8e3f9ae9e82bbac0059024e16ee900bac3a",
+      "tests/ut/ir/transforms/qualify_qwen_point_planner.py": "082edd6e9131bb7c446159200e1131b2d68faf53988607a3b7d5f53239127be9",
+      "tests/ut/ir/transforms/sync_closed_command_oracle.py": "ba008ffd980f536c4dcd34dd3e6150d294edb54bc1cac06c783517df3229c065",
+      "tests/ut/ir/transforms/test_gm_scalar_write_staging.py": "44207d56d113d69f8bde9be01e710645e055caf3583aff490a1d8a9f8673ea6d",
+      "tests/ut/ir/transforms/test_invocation_completion_rewrite.py": "57ba337d8ef65af4a40b6f622207fc3f3e76bfd24771f652639aa0246b02b846",
+      "tests/ut/ir/transforms/test_vector_identity_reshape.py": "16a033b3c2fbedeb3cb775b4511b85da7ba9b93bc9d1eb1c1dfaa85797e2cb59"
+    },
+    "source_manifest_sha256": "4e1c1ac5865a78903195cc92918796826a5f0e0104c7e4ed7244397d8790fe99",
+    "tracked_production_diff_sha256": "88887fec3a47c12ff7f1d23d5a96b3033b67f5e95582ad566c22aed63f399634",
+    "python": {
+      "executable": "/usr/bin/python",
+      "version": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]"
+    },
+    "extension_hashes": {
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "7257062b9c677e072547dad1804bc40daa49d53e5a387caabb47bd47606e876d"
+    },
+    "ptoas": {
+      "path": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher/ptoas",
+      "hash": "8b52c0bfe3259f37dd17331ec0b8ee534461f18e70042edce0e2b6ee2fd7adf8",
+      "version": "ptoas 0.72",
+      "additional_artifacts": {
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so": "86655444ce6e3470dbbbf061438046bc5f87c5f0f89f4145fd2a4340c8fd70e9",
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so": "0aa83ba0abbd3432c2ce9ecb6c854485b5502d51b181fa200ee87fd9254ea321"
+      }
+    },
+    "fresh_broad_gate": {
+      "passed": 4259,
+      "failed": 0,
+      "warnings": 7,
+      "seconds": 560.27,
+      "command": "build-py314/review-repairs-20261116/final-combined-command.json"
+    },
+    "posthook_focused": {
+      "passed": 128,
+      "failed": 0,
+      "seconds": 11.32,
+      "watchdog_seconds": 120
+    },
+    "posthook_ctest": {
+      "passed": 3,
+      "failed": 0
+    },
+    "hooks": {
+      "exit_code": 0,
+      "config": "build-py314/col-expand-contract/precommit.yaml",
+      "serial": true
+    },
+    "whole_model": {
+      "receipt": "build-py314/review-repairs-20261116/qwen-final-write-identity/receipt.json",
+      "sha256": "e84f0767e006899b886b9cbb2ffd6ee8a91d39c9176bab03105da5d2a0bfe598",
+      "owner_counts": {
+        "verified_pypto_leaf": 21,
+        "task_control_owner_observed": 47,
+        "delegated": 11
+      },
+      "cpp_leaves": 32,
+      "expected_ownership_failures": [],
+      "compile_seconds_inclusive": 10.988445410970598
+    },
+    "point_planner": {
+      "receipt": "build-py314/review-repairs-20261116/qwen-point-plan-final-audit/receipt.json",
+      "sha256": "a37b9ee1993c532c29c4a2caf473e46678d38a8b3e24ef0daf6bf63ef3785ff2",
+      "cases": 8,
+      "missing_pairs": 0,
+      "excess_pairs": 0,
+      "reference": "total staged-byte order; no original scalar overlap/minimum-command claim"
+    },
+    "logs": {
+      "build-py314/review-repairs-20261116/final-combined-gate.log": "b2d21d845fd5768e6acef0009d92a2d18414f928725d42fcba6e0889bc4b4266",
+      "build-py314/review-repairs-20261116/final-combined-gate.xml": "b9979e139da3f6d05c7b619a450886924e3d934107485c3a809c66e0fed5c4a8",
+      "build-py314/review-repairs-20261116/final-full-hooks-green.log": "b1c12e7d7805d4a6b74a42dd137abc924281d6256d34ac7c9a3e90960e180640",
+      "build-py314/review-repairs-20261116/posthook-build.log": "8c35b1682f73592d30612d7b0fabdb384fcfff35cb5a076cb48b85b1368aa794",
+      "build-py314/review-repairs-20261116/posthook-focused.log": "cc0fe0bcd104ce41eab1a4e6b572bcd0e0cde74d0e3a46f1101f3113ca550a38",
+      "build-py314/review-repairs-20261116/posthook-ctest.log": "01f3e8e91372a876eca2fd9694416be2cb361239abfdcfd783157063cdd48c21",
+      "build-py314/review-repairs-20261116/posthook-capture-corrected.log": "25da34ad26361f54148d06ce10c1e0928e2b79b54b1202d4d0a8f378a7ad7694",
+      "build-py314/review-repairs-20261116/posthook-point-audit.log": "ef9e4ff6958e5f795a8108a03d4e63229951912eefd7ea1bbf38a6fd39b405d1"
+    },
+    "historical_wrapper_failure": {
+      "log": "build-py314/review-repairs-20261116/posthook-capture.log",
+      "cause": "runner used direct-file invocation for a module with relative imports; corrected to -m without changing compiler/input/watchdog"
+    },
+    "device_validation": false,
+    "all_original_milestones_complete": false
+  },
+  "final_source_hashes": {
+    "include/pypto/backend/common/buffer_view_semantics.h": "3ecdaec0e619fa4e9b46cb9ae60266f75bc8f2d000a19f47da27835aea649fb4",
+    "src/backend/common/buffer_view_semantics.cpp": "9ea49d79e71139ee7f53d1ec5f200384cdc8e4b4c8216f2bc0b112ece5908b67",
+    "include/pypto/ir/transforms/utils/buffer_valid_analysis.h": "a2d54fa48a1f25ae68e30c4b75d0970e2e2b7318d767b44ad8aafb4bb354a460",
+    "src/ir/transforms/utils/buffer_active_domain_analysis.cpp": "70f5090625b7bc0a39958ca5478f456cf4bd586e82e3c58dc7c0048e28586c5b",
+    "tests/ut/ir/transforms/test_vector_identity_reshape.py": "16a033b3c2fbedeb3cb775b4511b85da7ba9b93bc9d1eb1c1dfaa85797e2cb59"
+  },
+  "pending_gates": [],
+  "independent_final_review": "Accepted source, claim scope, current source pins, capture/audit receipts and log hashes"
+}

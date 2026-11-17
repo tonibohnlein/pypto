@@ -103,11 +103,11 @@ bool IsCast(const CallPtr& call) {
   const auto recipe = backend::FindLogicalBufferConversionRecipe(call->op_->name_);
   return recipe && recipe->kind == backend::BufferConversionKind::Cast;
 }
-bool IsAxisMap(const CallPtr& call) {
+bool IsVectorReshape(const CallPtr& call) {
   return IsOp(call, "tile.reshape") && backend::SupportsLogicalContiguousVectorReshape(call);
 }
 bool KnownData(const CallPtr& call) {
-  return IsElementwise(call) || IsCast(call) || IsAxisMap(call) || IsOp(call, "tile.full") ||
+  return IsElementwise(call) || IsCast(call) || IsVectorReshape(call) || IsOp(call, "tile.full") ||
          IsOp(call, "tile.create") || IsOp(call, "tile.load") || IsOp(call, "tile.store") ||
          IsOp(call, "tile.set_validshape") ||
          backend::FindLogicalBufferRowRecipe(call->op_->name_) != nullptr;
@@ -119,6 +119,17 @@ Domain AxisMap(Domain domain, const TypePtr& target) {
   if (!tile) return {};
   domain.axis = As<ConstInt>(tile->shape_[0])->value_ == 1 ? 1 : 0;
   return domain;
+}
+
+// Supported identities preserve the original logical axis in both directions.
+// Only an actual orientation exchange maps the prefix to the target's axis.
+Domain ReshapeDomain(Domain domain, const CallPtr& call, const TypePtr& target) {
+  const auto source = As<TileType>(call->args_[0]->GetType());
+  const auto destination = As<TileType>(call->GetType());
+  if (tile_view_semantics::GetEffectiveTileView(*source).blayout ==
+      tile_view_semantics::GetEffectiveTileView(*destination).blayout)
+    return domain;
+  return AxisMap(domain, target);
 }
 
 struct Node {
@@ -184,7 +195,7 @@ class DomainIndex : public IRVisitor {
       node.dependencies = call->args_;
       node.defined = Forward(call);
       if (!KnownData(call)) ObserveUnknown(call);
-      if (IsAxisMap(call) || IsOp(call, "tile.set_validshape")) Alias(statement->var_, call->args_[0]);
+      if (IsVectorReshape(call) || IsOp(call, "tile.set_validshape")) Alias(statement->var_, call->args_[0]);
     }
     nodes.emplace(statement->var_.get(), std::move(node));
   }
@@ -348,7 +359,7 @@ class DomainIndex : public IRVisitor {
   Domain Forward(const CallPtr& call) const {
     if (IsOp(call, "tile.full") || IsOp(call, "tile.load")) return Declared(call->GetType());
     if (IsOp(call, "tile.set_validshape")) return Meet(Get(call->args_[0]), Declared(call->GetType()));
-    if (IsAxisMap(call)) return AxisMap(Get(call->args_[0]), call->GetType());
+    if (IsVectorReshape(call)) return ReshapeDomain(Get(call->args_[0]), call, call->GetType());
     if (IsElementwise(call) || IsCast(call)) {
       Domain result{DomainKind::Full, nullptr, 0};
       for (const auto& arg : call->args_)
@@ -520,7 +531,7 @@ class MetadataUseIndex : public IRVisitor {
 // construct matching native operand metadata during the subsequent rewrite.
 Domain OperandDomain(const CallPtr& call, size_t argument, Domain output) {
   if (IsElementwise(call) || IsCast(call)) return output;
-  if (IsAxisMap(call)) return AxisMap(output, call->args_[0]->GetType());
+  if (IsVectorReshape(call)) return ReshapeDomain(output, call, call->args_[0]->GetType());
   if (const auto row = backend::FindLogicalBufferRowRecipe(call->op_->name_)) {
     if (row->reduction && argument == 1) return {DomainKind::Unused, nullptr, 0};
     if (row->row_vector && argument == 1) return {DomainKind::Full, nullptr, 0};
