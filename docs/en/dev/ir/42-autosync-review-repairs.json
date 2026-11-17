@@ -1,0 +1,1277 @@
+{
+  "scope": "R1-R4 review repairs; original M1-M6 remains incomplete",
+  "source_revision_at_gate": "1bafd4c00fd24e1e8462fb1ed90362514c099d91",
+  "accepted_commits": {
+    "plan": "275e8533a",
+    "R1": "07cb2cacf",
+    "R2": "04604d1cb",
+    "R3": "1bafd4c00"
+  },
+  "R4": {
+    "independent_review": "source, regression and validity argument accepted; required checks recorded alongside gate",
+    "fresh_gate": {
+      "passed_executions": 2910,
+      "failed": 0,
+      "warnings": 4,
+      "seconds": 397.39,
+      "scope": "isolated repair package; broad manifest plus closed-prefix, static-row and operator modules",
+      "duplicate_explicit_modules": [
+        "test_closed_prefix_sync.py",
+        "test_buffer_ops.py"
+      ],
+      "device_validation": false,
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "--require-ptoas",
+        "tests/ut/ir/transforms/test_buffer_admission_obligations.py",
+        "tests/ut/ir/transforms/test_sync_operation_contract.py",
+        "tests/ut/ir/transforms/test_static_cast_valid_context.py",
+        "tests/ut/ir/transforms/test_contiguous_vector_views.py",
+        "tests/ut/ir/transforms/test_implicit_sync_effects.py",
+        "tests/ut/ir/transforms/test_sync_caller_correlations.py",
+        "tests/ut/ir/transforms/test_sync_range_proofs.py",
+        "tests/ut/ir/transforms/test_select_buffer_ir_functions.py",
+        "tests/ut/ir/transforms/test_buffer_loop_step_qualification.py",
+        "tests/ut/ir/transforms/test_lower_tile_to_buffer_slots.py",
+        "tests/ut/ir/transforms/test_slot_sync_import.py",
+        "tests/ut/ir/transforms/test_vec_sync_analysis.py",
+        "tests/ut/ir/transforms/test_autosync_switch.py",
+        "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+        "tests/ut/ir/transforms/test_rotating_sync_analysis.py",
+        "tests/ut/ir/transforms/test_nested_phase_sync.py",
+        "tests/ut/ir/transforms/test_token_sync_lowering.py",
+        "tests/ut/ir/transforms/test_sync_construction_scaling.py",
+        "tests/ut/ir/transforms/test_scoped_token_families.py",
+        "tests/ut/ir/transforms/test_scoped_token_order.py",
+        "tests/ut/ir/transforms/test_scoped_sync_palette.py",
+        "tests/ut/ir/transforms/test_scoped_palette_realization.py",
+        "tests/ut/ir/transforms/test_scoped_resource_transitions.py",
+        "tests/ut/ir/transforms/test_scoped_physical_sync.py",
+        "tests/ut/ir/transforms/test_physical_sync_realization.py",
+        "tests/ut/ir/transforms/test_logical_sync_realization.py",
+        "tests/ut/ir/transforms/test_conservative_sync_dataflow.py",
+        "tests/ut/ir/transforms/test_closed_prefix_sync.py",
+        "tests/ut/ir/transforms/test_conservative_sync_children.py",
+        "tests/ut/ir/transforms/test_conservative_sync_child_api.py",
+        "tests/ut/ir/transforms/test_conservative_sync_child_commands.py",
+        "tests/ut/ir/transforms/test_conservative_sync_child_implicit_effects.py",
+        "tests/ut/ir/transforms/test_autosync_policy.py",
+        "tests/ut/ir/transforms/test_autosync_inventory.py",
+        "tests/ut/jit/test_cache.py",
+        "tests/ut/ir/transforms/test_slot_index_normalization.py",
+        "tests/ut/ir/transforms/test_rsqrt_buffer_sync.py",
+        "tests/ut/ir/transforms/test_atomic_buffer_sync.py",
+        "tests/ut/ir/transforms/test_lower_tile_to_buffer.py",
+        "tests/ut/ir/operators/test_buffer_ops.py",
+        "tests/ut/ir/operators/test_op_registry.py",
+        "tests/ut/ir/transforms/test_runtime_valid_broadcast.py",
+        "tests/ut/ir/transforms/test_runtime_valid_cast.py",
+        "tests/ut/ir/transforms/test_runtime_valid_reduction_axis.py",
+        "tests/ut/ir/transforms/test_runtime_valid_metadata.py",
+        "tests/ut/ir/transforms/test_eventful_sync_children.py",
+        "tests/ut/ir/transforms/test_whole_module_sync_ownership.py",
+        "tests/ut/runtime/test_pto_rebuild.py",
+        "tests/ut/ir/transforms/test_row_sync_analysis.py",
+        "tests/ut/ir/transforms/test_external_sync_geometry.py",
+        "tests/ut/ir/transforms/test_column_sync_transfer.py",
+        "tests/ut/codegen/test_buffer_view_codegen.py",
+        "tests/ut/ir/transforms/test_closed_prefix_sync.py",
+        "tests/ut/ir/transforms/test_static_row_descriptor_bridge.py",
+        "tests/ut/ir/operators/test_buffer_row_recipes.py",
+        "tests/ut/ir/operators/test_buffer_conversion_recipes.py",
+        "tests/ut/ir/operators/test_buffer_ops.py"
+      ],
+      "watchdog_command_prefix": [
+        "timeout",
+        "600s"
+      ],
+      "workers": 1,
+      "require_ptoas": true
+    },
+    "cost_contract": "O(FD) structural qualification and rank construction, plus existing transition-query costs; canonical complete successor partition only",
+    "allocator_changed": false,
+    "protocol_changed": false,
+    "watchdog_seconds_per_stage": 12,
+    "timing_scope": "single descriptive host measurements",
+    "before": {
+      "watchdog_seconds_per_stage": 12,
+      "workers": 1,
+      "device_validation": false,
+      "execution_oracle": false,
+      "timing_scope": "single descriptive runs; diagnostic requests are separate, non-additive audit work",
+      "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+      "head": "1bafd4c00fd24e1e8462fb1ed90362514c099d91",
+      "script_sha256": "2e278f2a0e3a8eecbb8315d7a5cc940aa924d27d080676639c14e9c2a98aa458",
+      "rows": [
+        {
+          "depth": 2,
+          "trips_per_frame": 2,
+          "kind": "production",
+          "events": [
+            {
+              "stage": "analysis",
+              "status": "start"
+            },
+            {
+              "stage": "analysis",
+              "status": "done",
+              "seconds": 0.0006589540280401707,
+              "source_coordinate_entries": 7,
+              "source_region_nodes": 5
+            },
+            {
+              "stage": "logical",
+              "status": "start"
+            },
+            {
+              "stage": "logical",
+              "status": "done",
+              "seconds": 0.0002305307425558567,
+              "record_sites": 5,
+              "wait_sites": 7
+            },
+            {
+              "stage": "physical",
+              "status": "start"
+            },
+            {
+              "stage": "physical",
+              "status": "done",
+              "seconds": 0.0013600550591945648,
+              "cases": [
+                {
+                  "set_sites": 7,
+                  "wait_sites": 7,
+                  "barrier_sites": 0,
+                  "guard_sites": 10,
+                  "constructed_guard_sites": 10,
+                  "shared_guard_sites": 0,
+                  "shared_composed_guard_sites": 0,
+                  "control_statement_visits": 86,
+                  "simplified_guard_sites": 0,
+                  "shared_control_values": 0,
+                  "cut_domain_interval_visits": 8,
+                  "cut_case_comparisons": 10,
+                  "coalesced_cut_cases": 0,
+                  "case_sequence_visits": 8,
+                  "case_sequence_comparisons": 0,
+                  "factored_case_cuts": 0,
+                  "shared_disjoint_case_cuts": 0,
+                  "endpoint_domain_entries": 14,
+                  "normalized_endpoint_bounds": 10,
+                  "endpoint_predicates_constructed": 10,
+                  "control_descriptors": 80,
+                  "invocation_scheduled_loops": 0,
+                  "invocation_schedule_groups": 0,
+                  "invocation_schedule_visits": 0,
+                  "invocation_schedule_comparisons": 0,
+                  "invocation_schedule_model_saving": 0,
+                  "schedule_name_scans": 1,
+                  "schedule_name_visits": 49,
+                  "regular_schedule_candidates": 1,
+                  "regular_schedule_loops": 0,
+                  "regular_schedule_boundaries": 0,
+                  "regular_schedule_body_copies": 1,
+                  "regular_schedule_payload_copies": 2,
+                  "regular_schedule_model_saving": 0,
+                  "assigned_schedule_endpoints": 14,
+                  "schedule_candidates": 0,
+                  "scheduled_loops": 0,
+                  "schedule_boundary_commands": 0,
+                  "schedule_size_refusals": 0,
+                  "schedule_body_visits": 21,
+                  "schedule_descriptor_visits": 0,
+                  "schedule_original_nodes": 0,
+                  "schedule_candidate_nodes": 0,
+                  "materialized_control_statements": 34,
+                  "control_expression_visits": 72,
+                  "reuse_queries": 7,
+                  "reserved_lanes": 7,
+                  "finite_minimum": false,
+                  "guarantee": "equal selected order under qualified direct-command model",
+                  "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit",
+                  "palette_attempts": []
+                }
+              ]
+            }
+          ],
+          "command": [
+            "/usr/bin/python",
+            "-u",
+            "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_nested_sync_cost.py",
+            "--worker",
+            "2",
+            "2"
+          ],
+          "status": "passed",
+          "exit_code": 0
+        },
+        {
+          "depth": 4,
+          "trips_per_frame": 2,
+          "kind": "production",
+          "events": [
+            {
+              "stage": "analysis",
+              "status": "start"
+            },
+            {
+              "stage": "analysis",
+              "status": "done",
+              "seconds": 0.0006849872879683971,
+              "source_coordinate_entries": 9,
+              "source_region_nodes": 7
+            },
+            {
+              "stage": "logical",
+              "status": "start"
+            },
+            {
+              "stage": "logical",
+              "status": "done",
+              "seconds": 0.0003392440266907215,
+              "record_sites": 5,
+              "wait_sites": 9
+            },
+            {
+              "stage": "physical",
+              "status": "start"
+            },
+            {
+              "stage": "physical",
+              "status": "done",
+              "seconds": 0.0021454929374158382,
+              "cases": [
+                {
+                  "set_sites": 9,
+                  "wait_sites": 9,
+                  "barrier_sites": 0,
+                  "guard_sites": 28,
+                  "constructed_guard_sites": 28,
+                  "shared_guard_sites": 0,
+                  "shared_composed_guard_sites": 0,
+                  "control_statement_visits": 112,
+                  "simplified_guard_sites": 0,
+                  "shared_control_values": 0,
+                  "cut_domain_interval_visits": 10,
+                  "cut_case_comparisons": 10,
+                  "coalesced_cut_cases": 0,
+                  "case_sequence_visits": 12,
+                  "case_sequence_comparisons": 0,
+                  "factored_case_cuts": 0,
+                  "shared_disjoint_case_cuts": 0,
+                  "endpoint_domain_entries": 44,
+                  "normalized_endpoint_bounds": 28,
+                  "endpoint_predicates_constructed": 28,
+                  "control_descriptors": 174,
+                  "invocation_scheduled_loops": 0,
+                  "invocation_schedule_groups": 0,
+                  "invocation_schedule_visits": 0,
+                  "invocation_schedule_comparisons": 0,
+                  "invocation_schedule_model_saving": 0,
+                  "schedule_name_scans": 1,
+                  "schedule_name_visits": 55,
+                  "regular_schedule_candidates": 1,
+                  "regular_schedule_loops": 0,
+                  "regular_schedule_boundaries": 0,
+                  "regular_schedule_body_copies": 1,
+                  "regular_schedule_payload_copies": 2,
+                  "regular_schedule_model_saving": 0,
+                  "assigned_schedule_endpoints": 18,
+                  "schedule_candidates": 0,
+                  "scheduled_loops": 0,
+                  "schedule_boundary_commands": 0,
+                  "schedule_size_refusals": 0,
+                  "schedule_body_visits": 33,
+                  "schedule_descriptor_visits": 0,
+                  "schedule_original_nodes": 0,
+                  "schedule_candidate_nodes": 0,
+                  "materialized_control_statements": 66,
+                  "control_expression_visits": 240,
+                  "reuse_queries": 9,
+                  "reserved_lanes": 9,
+                  "finite_minimum": false,
+                  "guarantee": "equal selected order under qualified direct-command model",
+                  "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit",
+                  "palette_attempts": []
+                }
+              ]
+            }
+          ],
+          "command": [
+            "/usr/bin/python",
+            "-u",
+            "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_nested_sync_cost.py",
+            "--worker",
+            "4",
+            "2"
+          ],
+          "status": "passed",
+          "exit_code": 0
+        },
+        {
+          "depth": 8,
+          "trips_per_frame": 2,
+          "kind": "production",
+          "events": [
+            {
+              "stage": "analysis",
+              "status": "start"
+            },
+            {
+              "stage": "analysis",
+              "status": "done",
+              "seconds": 0.0007996060885488987,
+              "source_coordinate_entries": 13,
+              "source_region_nodes": 11
+            },
+            {
+              "stage": "logical",
+              "status": "start"
+            },
+            {
+              "stage": "logical",
+              "status": "done",
+              "seconds": 0.0005798288621008396,
+              "record_sites": 5,
+              "wait_sites": 13
+            },
+            {
+              "stage": "physical",
+              "status": "start"
+            },
+            {
+              "stage": "physical",
+              "status": "done",
+              "seconds": 0.10430055717006326,
+              "cases": [
+                {
+                  "set_sites": 260,
+                  "wait_sites": 260,
+                  "barrier_sites": 0,
+                  "guard_sites": 2007,
+                  "constructed_guard_sites": 4096,
+                  "shared_guard_sites": 2089,
+                  "shared_composed_guard_sites": 0,
+                  "control_statement_visits": 2389,
+                  "simplified_guard_sites": 0,
+                  "shared_control_values": 4,
+                  "cut_domain_interval_visits": 14,
+                  "cut_case_comparisons": 10,
+                  "coalesced_cut_cases": 0,
+                  "case_sequence_visits": 33,
+                  "case_sequence_comparisons": 0,
+                  "factored_case_cuts": 0,
+                  "shared_disjoint_case_cuts": 0,
+                  "endpoint_domain_entries": 4104,
+                  "normalized_endpoint_bounds": 4096,
+                  "endpoint_predicates_constructed": 4096,
+                  "control_descriptors": 11390,
+                  "invocation_scheduled_loops": 0,
+                  "invocation_schedule_groups": 0,
+                  "invocation_schedule_visits": 0,
+                  "invocation_schedule_comparisons": 0,
+                  "invocation_schedule_model_saving": 0,
+                  "schedule_name_scans": 1,
+                  "schedule_name_visits": 67,
+                  "regular_schedule_candidates": 1,
+                  "regular_schedule_loops": 0,
+                  "regular_schedule_boundaries": 0,
+                  "regular_schedule_body_copies": 1,
+                  "regular_schedule_payload_copies": 2,
+                  "regular_schedule_model_saving": 0,
+                  "assigned_schedule_endpoints": 520,
+                  "schedule_candidates": 0,
+                  "scheduled_loops": 0,
+                  "schedule_boundary_commands": 0,
+                  "schedule_size_refusals": 0,
+                  "schedule_body_visits": 57,
+                  "schedule_descriptor_visits": 0,
+                  "schedule_original_nodes": 0,
+                  "schedule_candidate_nodes": 0,
+                  "materialized_control_statements": 4030,
+                  "control_expression_visits": 20966,
+                  "reuse_queries": 13,
+                  "reserved_lanes": 6,
+                  "finite_minimum": false,
+                  "guarantee": "equal selected order under qualified direct-command model",
+                  "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit",
+                  "palette_attempts": [
+                    {
+                      "status": "certified",
+                      "reason": "",
+                      "attempted_budgets": 1,
+                      "publications": 255,
+                      "grammar_nodes": 2040,
+                      "phase_visits": 510,
+                      "domain_visits": 10431,
+                      "transition_queries": 254,
+                      "routing_entries": 10,
+                      "boundary_node_visits": 4516,
+                      "proof_axis_entries": 0,
+                      "rank_pieces": 255
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "command": [
+            "/usr/bin/python",
+            "-u",
+            "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_nested_sync_cost.py",
+            "--worker",
+            "8",
+            "2"
+          ],
+          "status": "passed",
+          "exit_code": 0
+        },
+        {
+          "depth": 12,
+          "trips_per_frame": 2,
+          "kind": "production",
+          "events": [
+            {
+              "stage": "analysis",
+              "status": "start"
+            },
+            {
+              "stage": "analysis",
+              "status": "done",
+              "seconds": 0.0008827638812363148,
+              "source_coordinate_entries": 17,
+              "source_region_nodes": 15
+            },
+            {
+              "stage": "logical",
+              "status": "start"
+            },
+            {
+              "stage": "logical",
+              "status": "done",
+              "seconds": 0.0009831222705543041,
+              "record_sites": 5,
+              "wait_sites": 17
+            },
+            {
+              "stage": "physical",
+              "status": "start"
+            },
+            {
+              "stage": "physical",
+              "status": "done",
+              "seconds": 2.1473350669257343,
+              "cases": [
+                {
+                  "set_sites": 4100,
+                  "wait_sites": 4100,
+                  "barrier_sites": 0,
+                  "guard_sites": 32711,
+                  "constructed_guard_sites": 98304,
+                  "shared_guard_sites": 65593,
+                  "shared_composed_guard_sites": 0,
+                  "control_statement_visits": 36965,
+                  "simplified_guard_sites": 0,
+                  "shared_control_values": 4,
+                  "cut_domain_interval_visits": 18,
+                  "cut_case_comparisons": 10,
+                  "coalesced_cut_cases": 0,
+                  "case_sequence_visits": 49,
+                  "case_sequence_comparisons": 0,
+                  "factored_case_cuts": 0,
+                  "shared_disjoint_case_cuts": 0,
+                  "endpoint_domain_entries": 98316,
+                  "normalized_endpoint_bounds": 98304,
+                  "endpoint_predicates_constructed": 98304,
+                  "control_descriptors": 216894,
+                  "invocation_scheduled_loops": 0,
+                  "invocation_schedule_groups": 0,
+                  "invocation_schedule_visits": 0,
+                  "invocation_schedule_comparisons": 0,
+                  "invocation_schedule_model_saving": 0,
+                  "schedule_name_scans": 1,
+                  "schedule_name_visits": 79,
+                  "regular_schedule_candidates": 1,
+                  "regular_schedule_loops": 0,
+                  "regular_schedule_boundaries": 0,
+                  "regular_schedule_body_copies": 1,
+                  "regular_schedule_payload_copies": 2,
+                  "regular_schedule_model_saving": 0,
+                  "assigned_schedule_endpoints": 8200,
+                  "schedule_candidates": 0,
+                  "scheduled_loops": 0,
+                  "schedule_boundary_commands": 0,
+                  "schedule_size_refusals": 0,
+                  "schedule_body_visits": 81,
+                  "schedule_descriptor_visits": 0,
+                  "schedule_original_nodes": 0,
+                  "schedule_candidate_nodes": 0,
+                  "materialized_control_statements": 65438,
+                  "control_expression_visits": 343302,
+                  "reuse_queries": 17,
+                  "reserved_lanes": 6,
+                  "finite_minimum": false,
+                  "guarantee": "equal selected order under qualified direct-command model",
+                  "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit",
+                  "palette_attempts": [
+                    {
+                      "status": "certified",
+                      "reason": "",
+                      "attempted_budgets": 1,
+                      "publications": 4095,
+                      "grammar_nodes": 32760,
+                      "phase_visits": 8190,
+                      "domain_visits": 266091,
+                      "transition_queries": 4094,
+                      "routing_entries": 14,
+                      "boundary_node_visits": 73604,
+                      "proof_axis_entries": 0,
+                      "rank_pieces": 4095
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "command": [
+            "/usr/bin/python",
+            "-u",
+            "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_nested_sync_cost.py",
+            "--worker",
+            "12",
+            "2"
+          ],
+          "status": "passed",
+          "exit_code": 0
+        }
+      ]
+    },
+    "after": {
+      "watchdog_seconds_per_stage": 12,
+      "workers": 1,
+      "device_validation": false,
+      "execution_oracle": false,
+      "timing_scope": "single descriptive runs; diagnostic requests are separate, non-additive audit work",
+      "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+      "head": "1bafd4c00fd24e1e8462fb1ed90362514c099d91",
+      "script_sha256": "2e278f2a0e3a8eecbb8315d7a5cc940aa924d27d080676639c14e9c2a98aa458",
+      "rows": [
+        {
+          "depth": 2,
+          "trips_per_frame": 2,
+          "kind": "production",
+          "events": [
+            {
+              "stage": "analysis",
+              "status": "start"
+            },
+            {
+              "stage": "analysis",
+              "status": "done",
+              "seconds": 0.0006560967303812504,
+              "source_coordinate_entries": 7,
+              "source_region_nodes": 5
+            },
+            {
+              "stage": "logical",
+              "status": "start"
+            },
+            {
+              "stage": "logical",
+              "status": "done",
+              "seconds": 0.00022299867123365402,
+              "record_sites": 5,
+              "wait_sites": 7
+            },
+            {
+              "stage": "physical",
+              "status": "start"
+            },
+            {
+              "stage": "physical",
+              "status": "done",
+              "seconds": 0.001323893666267395,
+              "cases": [
+                {
+                  "set_sites": 7,
+                  "wait_sites": 7,
+                  "barrier_sites": 0,
+                  "guard_sites": 10,
+                  "constructed_guard_sites": 10,
+                  "shared_guard_sites": 0,
+                  "shared_composed_guard_sites": 0,
+                  "control_statement_visits": 86,
+                  "simplified_guard_sites": 0,
+                  "shared_control_values": 0,
+                  "cut_domain_interval_visits": 8,
+                  "cut_case_comparisons": 10,
+                  "coalesced_cut_cases": 0,
+                  "case_sequence_visits": 8,
+                  "case_sequence_comparisons": 0,
+                  "factored_case_cuts": 0,
+                  "shared_disjoint_case_cuts": 0,
+                  "endpoint_domain_entries": 14,
+                  "normalized_endpoint_bounds": 10,
+                  "endpoint_predicates_constructed": 10,
+                  "control_descriptors": 80,
+                  "invocation_scheduled_loops": 0,
+                  "invocation_schedule_groups": 0,
+                  "invocation_schedule_visits": 0,
+                  "invocation_schedule_comparisons": 0,
+                  "invocation_schedule_model_saving": 0,
+                  "schedule_name_scans": 1,
+                  "schedule_name_visits": 49,
+                  "regular_schedule_candidates": 1,
+                  "regular_schedule_loops": 0,
+                  "regular_schedule_boundaries": 0,
+                  "regular_schedule_body_copies": 1,
+                  "regular_schedule_payload_copies": 2,
+                  "regular_schedule_model_saving": 0,
+                  "assigned_schedule_endpoints": 14,
+                  "schedule_candidates": 0,
+                  "scheduled_loops": 0,
+                  "schedule_boundary_commands": 0,
+                  "schedule_size_refusals": 0,
+                  "schedule_body_visits": 21,
+                  "schedule_descriptor_visits": 0,
+                  "schedule_original_nodes": 0,
+                  "schedule_candidate_nodes": 0,
+                  "materialized_control_statements": 34,
+                  "control_expression_visits": 72,
+                  "reuse_queries": 7,
+                  "reserved_lanes": 7,
+                  "finite_minimum": false,
+                  "guarantee": "equal selected order under qualified direct-command model",
+                  "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit",
+                  "palette_attempts": []
+                }
+              ]
+            }
+          ],
+          "command": [
+            "/usr/bin/python",
+            "-u",
+            "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_nested_sync_cost.py",
+            "--worker",
+            "2",
+            "2"
+          ],
+          "status": "passed",
+          "exit_code": 0
+        },
+        {
+          "depth": 4,
+          "trips_per_frame": 2,
+          "kind": "production",
+          "events": [
+            {
+              "stage": "analysis",
+              "status": "start"
+            },
+            {
+              "stage": "analysis",
+              "status": "done",
+              "seconds": 0.000708071980625391,
+              "source_coordinate_entries": 9,
+              "source_region_nodes": 7
+            },
+            {
+              "stage": "logical",
+              "status": "start"
+            },
+            {
+              "stage": "logical",
+              "status": "done",
+              "seconds": 0.00031106406822800636,
+              "record_sites": 5,
+              "wait_sites": 9
+            },
+            {
+              "stage": "physical",
+              "status": "start"
+            },
+            {
+              "stage": "physical",
+              "status": "done",
+              "seconds": 0.0022057262249290943,
+              "cases": [
+                {
+                  "set_sites": 9,
+                  "wait_sites": 9,
+                  "barrier_sites": 0,
+                  "guard_sites": 28,
+                  "constructed_guard_sites": 28,
+                  "shared_guard_sites": 0,
+                  "shared_composed_guard_sites": 0,
+                  "control_statement_visits": 112,
+                  "simplified_guard_sites": 0,
+                  "shared_control_values": 0,
+                  "cut_domain_interval_visits": 10,
+                  "cut_case_comparisons": 10,
+                  "coalesced_cut_cases": 0,
+                  "case_sequence_visits": 12,
+                  "case_sequence_comparisons": 0,
+                  "factored_case_cuts": 0,
+                  "shared_disjoint_case_cuts": 0,
+                  "endpoint_domain_entries": 44,
+                  "normalized_endpoint_bounds": 28,
+                  "endpoint_predicates_constructed": 28,
+                  "control_descriptors": 174,
+                  "invocation_scheduled_loops": 0,
+                  "invocation_schedule_groups": 0,
+                  "invocation_schedule_visits": 0,
+                  "invocation_schedule_comparisons": 0,
+                  "invocation_schedule_model_saving": 0,
+                  "schedule_name_scans": 1,
+                  "schedule_name_visits": 55,
+                  "regular_schedule_candidates": 1,
+                  "regular_schedule_loops": 0,
+                  "regular_schedule_boundaries": 0,
+                  "regular_schedule_body_copies": 1,
+                  "regular_schedule_payload_copies": 2,
+                  "regular_schedule_model_saving": 0,
+                  "assigned_schedule_endpoints": 18,
+                  "schedule_candidates": 0,
+                  "scheduled_loops": 0,
+                  "schedule_boundary_commands": 0,
+                  "schedule_size_refusals": 0,
+                  "schedule_body_visits": 33,
+                  "schedule_descriptor_visits": 0,
+                  "schedule_original_nodes": 0,
+                  "schedule_candidate_nodes": 0,
+                  "materialized_control_statements": 66,
+                  "control_expression_visits": 240,
+                  "reuse_queries": 9,
+                  "reserved_lanes": 9,
+                  "finite_minimum": false,
+                  "guarantee": "equal selected order under qualified direct-command model",
+                  "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit",
+                  "palette_attempts": []
+                }
+              ]
+            }
+          ],
+          "command": [
+            "/usr/bin/python",
+            "-u",
+            "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_nested_sync_cost.py",
+            "--worker",
+            "4",
+            "2"
+          ],
+          "status": "passed",
+          "exit_code": 0
+        },
+        {
+          "depth": 8,
+          "trips_per_frame": 2,
+          "kind": "production",
+          "events": [
+            {
+              "stage": "analysis",
+              "status": "start"
+            },
+            {
+              "stage": "analysis",
+              "status": "done",
+              "seconds": 0.0007770941592752934,
+              "source_coordinate_entries": 13,
+              "source_region_nodes": 11
+            },
+            {
+              "stage": "logical",
+              "status": "start"
+            },
+            {
+              "stage": "logical",
+              "status": "done",
+              "seconds": 0.0005584908649325371,
+              "record_sites": 5,
+              "wait_sites": 13
+            },
+            {
+              "stage": "physical",
+              "status": "start"
+            },
+            {
+              "stage": "physical",
+              "status": "done",
+              "seconds": 0.005180427338927984,
+              "cases": [
+                {
+                  "set_sites": 13,
+                  "wait_sites": 13,
+                  "barrier_sites": 0,
+                  "guard_sites": 88,
+                  "constructed_guard_sites": 88,
+                  "shared_guard_sites": 0,
+                  "shared_composed_guard_sites": 0,
+                  "control_statement_visits": 188,
+                  "simplified_guard_sites": 0,
+                  "shared_control_values": 0,
+                  "cut_domain_interval_visits": 14,
+                  "cut_case_comparisons": 10,
+                  "coalesced_cut_cases": 0,
+                  "case_sequence_visits": 20,
+                  "case_sequence_comparisons": 0,
+                  "factored_case_cuts": 0,
+                  "shared_disjoint_case_cuts": 0,
+                  "endpoint_domain_entries": 152,
+                  "normalized_endpoint_bounds": 88,
+                  "endpoint_predicates_constructed": 88,
+                  "control_descriptors": 482,
+                  "invocation_scheduled_loops": 0,
+                  "invocation_schedule_groups": 0,
+                  "invocation_schedule_visits": 0,
+                  "invocation_schedule_comparisons": 0,
+                  "invocation_schedule_model_saving": 0,
+                  "schedule_name_scans": 1,
+                  "schedule_name_visits": 67,
+                  "regular_schedule_candidates": 1,
+                  "regular_schedule_loops": 0,
+                  "regular_schedule_boundaries": 0,
+                  "regular_schedule_body_copies": 1,
+                  "regular_schedule_payload_copies": 2,
+                  "regular_schedule_model_saving": 0,
+                  "assigned_schedule_endpoints": 26,
+                  "schedule_candidates": 0,
+                  "scheduled_loops": 0,
+                  "schedule_boundary_commands": 0,
+                  "schedule_size_refusals": 0,
+                  "schedule_body_visits": 57,
+                  "schedule_descriptor_visits": 0,
+                  "schedule_original_nodes": 0,
+                  "schedule_candidate_nodes": 0,
+                  "materialized_control_statements": 178,
+                  "control_expression_visits": 864,
+                  "reuse_queries": 13,
+                  "reserved_lanes": 6,
+                  "finite_minimum": false,
+                  "guarantee": "equal selected order under qualified direct-command model",
+                  "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit",
+                  "palette_attempts": [
+                    {
+                      "status": "certified",
+                      "reason": "",
+                      "attempted_budgets": 1,
+                      "publications": 255,
+                      "grammar_nodes": 0,
+                      "phase_visits": 0,
+                      "domain_visits": 0,
+                      "transition_queries": 16,
+                      "routing_entries": 0,
+                      "boundary_node_visits": 0,
+                      "proof_axis_entries": 56,
+                      "rank_pieces": 8
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "command": [
+            "/usr/bin/python",
+            "-u",
+            "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_nested_sync_cost.py",
+            "--worker",
+            "8",
+            "2"
+          ],
+          "status": "passed",
+          "exit_code": 0
+        },
+        {
+          "depth": 12,
+          "trips_per_frame": 2,
+          "kind": "production",
+          "events": [
+            {
+              "stage": "analysis",
+              "status": "start"
+            },
+            {
+              "stage": "analysis",
+              "status": "done",
+              "seconds": 0.0008682277984917164,
+              "source_coordinate_entries": 17,
+              "source_region_nodes": 15
+            },
+            {
+              "stage": "logical",
+              "status": "start"
+            },
+            {
+              "stage": "logical",
+              "status": "done",
+              "seconds": 0.001012612134218216,
+              "record_sites": 5,
+              "wait_sites": 17
+            },
+            {
+              "stage": "physical",
+              "status": "start"
+            },
+            {
+              "stage": "physical",
+              "status": "done",
+              "seconds": 0.009761676657944918,
+              "cases": [
+                {
+                  "set_sites": 17,
+                  "wait_sites": 17,
+                  "barrier_sites": 0,
+                  "guard_sites": 180,
+                  "constructed_guard_sites": 180,
+                  "shared_guard_sites": 0,
+                  "shared_composed_guard_sites": 0,
+                  "control_statement_visits": 296,
+                  "simplified_guard_sites": 0,
+                  "shared_control_values": 0,
+                  "cut_domain_interval_visits": 18,
+                  "cut_case_comparisons": 10,
+                  "coalesced_cut_cases": 0,
+                  "case_sequence_visits": 28,
+                  "case_sequence_comparisons": 0,
+                  "factored_case_cuts": 0,
+                  "shared_disjoint_case_cuts": 0,
+                  "endpoint_domain_entries": 324,
+                  "normalized_endpoint_bounds": 180,
+                  "endpoint_predicates_constructed": 180,
+                  "control_descriptors": 950,
+                  "invocation_scheduled_loops": 0,
+                  "invocation_schedule_groups": 0,
+                  "invocation_schedule_visits": 0,
+                  "invocation_schedule_comparisons": 0,
+                  "invocation_schedule_model_saving": 0,
+                  "schedule_name_scans": 1,
+                  "schedule_name_visits": 79,
+                  "regular_schedule_candidates": 1,
+                  "regular_schedule_loops": 0,
+                  "regular_schedule_boundaries": 0,
+                  "regular_schedule_body_copies": 1,
+                  "regular_schedule_payload_copies": 2,
+                  "regular_schedule_model_saving": 0,
+                  "assigned_schedule_endpoints": 34,
+                  "schedule_candidates": 0,
+                  "scheduled_loops": 0,
+                  "schedule_boundary_commands": 0,
+                  "schedule_size_refusals": 0,
+                  "schedule_body_visits": 81,
+                  "schedule_descriptor_visits": 0,
+                  "schedule_original_nodes": 0,
+                  "schedule_candidate_nodes": 0,
+                  "materialized_control_statements": 354,
+                  "control_expression_visits": 1872,
+                  "reuse_queries": 17,
+                  "reserved_lanes": 6,
+                  "finite_minimum": false,
+                  "guarantee": "equal selected order under qualified direct-command model",
+                  "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit",
+                  "palette_attempts": [
+                    {
+                      "status": "certified",
+                      "reason": "",
+                      "attempted_budgets": 1,
+                      "publications": 4095,
+                      "grammar_nodes": 0,
+                      "phase_visits": 0,
+                      "domain_visits": 0,
+                      "transition_queries": 24,
+                      "routing_entries": 0,
+                      "boundary_node_visits": 0,
+                      "proof_axis_entries": 132,
+                      "rank_pieces": 12
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "command": [
+            "/usr/bin/python",
+            "-u",
+            "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_nested_sync_cost.py",
+            "--worker",
+            "12",
+            "2"
+          ],
+          "status": "passed",
+          "exit_code": 0
+        },
+        {
+          "depth": 16,
+          "trips_per_frame": 2,
+          "kind": "production",
+          "events": [
+            {
+              "stage": "analysis",
+              "status": "start"
+            },
+            {
+              "stage": "analysis",
+              "status": "done",
+              "seconds": 0.0009329342283308506,
+              "source_coordinate_entries": 21,
+              "source_region_nodes": 19
+            },
+            {
+              "stage": "logical",
+              "status": "start"
+            },
+            {
+              "stage": "logical",
+              "status": "done",
+              "seconds": 0.0014546881429851055,
+              "record_sites": 5,
+              "wait_sites": 21
+            },
+            {
+              "stage": "physical",
+              "status": "start"
+            },
+            {
+              "stage": "physical",
+              "status": "done",
+              "seconds": 0.016155216842889786,
+              "cases": [
+                {
+                  "set_sites": 21,
+                  "wait_sites": 21,
+                  "barrier_sites": 0,
+                  "guard_sites": 304,
+                  "constructed_guard_sites": 304,
+                  "shared_guard_sites": 0,
+                  "shared_composed_guard_sites": 0,
+                  "control_statement_visits": 436,
+                  "simplified_guard_sites": 0,
+                  "shared_control_values": 0,
+                  "cut_domain_interval_visits": 22,
+                  "cut_case_comparisons": 10,
+                  "coalesced_cut_cases": 0,
+                  "case_sequence_visits": 36,
+                  "case_sequence_comparisons": 0,
+                  "factored_case_cuts": 0,
+                  "shared_disjoint_case_cuts": 0,
+                  "endpoint_domain_entries": 560,
+                  "normalized_endpoint_bounds": 304,
+                  "endpoint_predicates_constructed": 304,
+                  "control_descriptors": 1578,
+                  "invocation_scheduled_loops": 0,
+                  "invocation_schedule_groups": 0,
+                  "invocation_schedule_visits": 0,
+                  "invocation_schedule_comparisons": 0,
+                  "invocation_schedule_model_saving": 0,
+                  "schedule_name_scans": 1,
+                  "schedule_name_visits": 91,
+                  "regular_schedule_candidates": 1,
+                  "regular_schedule_loops": 0,
+                  "regular_schedule_boundaries": 0,
+                  "regular_schedule_body_copies": 1,
+                  "regular_schedule_payload_copies": 2,
+                  "regular_schedule_model_saving": 0,
+                  "assigned_schedule_endpoints": 42,
+                  "schedule_candidates": 0,
+                  "scheduled_loops": 0,
+                  "schedule_boundary_commands": 0,
+                  "schedule_size_refusals": 0,
+                  "schedule_body_visits": 105,
+                  "schedule_descriptor_visits": 0,
+                  "schedule_original_nodes": 0,
+                  "schedule_candidate_nodes": 0,
+                  "materialized_control_statements": 594,
+                  "control_expression_visits": 3264,
+                  "reuse_queries": 21,
+                  "reserved_lanes": 6,
+                  "finite_minimum": false,
+                  "guarantee": "equal selected order under qualified direct-command model",
+                  "native_mode": "manual a2a3; fresh flags at entry; closed notifications at exit",
+                  "palette_attempts": [
+                    {
+                      "status": "certified",
+                      "reason": "",
+                      "attempted_budgets": 1,
+                      "publications": 65535,
+                      "grammar_nodes": 0,
+                      "phase_visits": 0,
+                      "domain_visits": 0,
+                      "transition_queries": 32,
+                      "routing_entries": 0,
+                      "boundary_node_visits": 0,
+                      "proof_axis_entries": 240,
+                      "rank_pieces": 16
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "command": [
+            "/usr/bin/python",
+            "-u",
+            "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_nested_sync_cost.py",
+            "--worker",
+            "16",
+            "2"
+          ],
+          "status": "passed",
+          "exit_code": 0
+        }
+      ]
+    },
+    "build_pins": {
+      "before": {
+        "head": "1bafd4c00fd24e1e8462fb1ed90362514c099d91",
+        "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+        "producer_sha256": "c972489df99af2a9c4cff0d608c654c60db7bb4e88e162994b620be0c1d8e17d",
+        "dirty_source_sha256": {
+          "CMakeLists.txt": "cf6588105fe22cc9f3e51ded436d21d30522330e0ebf0e4236638830be89cc32",
+          "include/pypto/backend/common/buffer_sync_contract.h": "8ae453ea84c1ce0aaff72de3edf1c359f7df283ae9c3f458917e612f89526220",
+          "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "b1e519483b48e266290fde45b308d92b13b96c20a8e85e9fa86496d8645806ab",
+          "python/bindings/modules/testing.cpp": "7ad975f10de94705c4322e3aab1b6862ef31ca5ab3fbd01a872a1de5dec8b714",
+          "python/bindings/modules/testing_sync_support.cpp": "7162c1bcd8879a9e632f89bb0e696ec0df5662d3d9b46d5a5bacc18467f4e289",
+          "python/pypto/pypto_core/testing.pyi": "7e1310b75bac99e38ba89e7866d29925baa98d648b61a15ab5e8ba45f31eb371",
+          "src/backend/common/buffer_sync_contract.cpp": "f39b11be3343fddbfd04b1540a6a2ec6a3d127b954d776b9fe09a1ad25516904",
+          "src/codegen/pto/pto_buffer_codegen.cpp": "3267168ca0c7a784e99d7301b045d1132e718a344d5d45aa01294608a5018d3f",
+          "src/ir/op/buffer_ops/memory.cpp": "eac26709bce475819bb47050c824b9b7248b37a21767777136d0117304f50fc2",
+          "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "96edaedf9cd006c59dfdc19c21bf56cc6b3b9fc1b397bdd84cc82bf4d604505c",
+          "src/ir/transforms/token_sync.cpp": "196101e505ece15f45fd4ced24d2be496ba476fc43e50347f0cb0a1815af1ab4",
+          "src/ir/transforms/utils/compact_sync_analysis.cpp": "6903c144ca196f37296ebd79f1637edda0ead182bbe2cf156c9b6e5a307cec43",
+          "src/ir/transforms/utils/conservative_sync_dataflow.cpp": "18bd494e4b041566fb2b20b813e2ec23052f8a8dd6ff1aadf7987d47a47d17f1",
+          "src/ir/transforms/utils/invocation_sync_analysis.cpp": "ecc319fa6ac662aa5b61d4a4997eb89ec78c99929063bc612b0b1548c9bac314",
+          "src/ir/transforms/utils/physical_sync_schedule.cpp": "bc7f28510fe8c5924ceb3e9eff56c5db0b1b2f94851f1c948eb5967b51f0f2d2",
+          "src/ir/transforms/utils/placed_sync_import.cpp": "1ef2a54bec834df8f04201bbe8d46ecf2039a9d6d227959153420aa6248e2467",
+          "src/ir/transforms/utils/scoped_logical_sync.cpp": "9475ea94a748204133c8579db764ce4ec0678a6e5524bd04b9e18c281a91a8a7",
+          "src/ir/transforms/utils/scoped_token_families.cpp": "e31ed6180ffb14f74df827ef856c2ee5ee30cfa45338fac77bd650bf08589a75",
+          "src/ir/transforms/utils/structured_token_sync.cpp": "3105cf0eed98561b08ece2a553e4ebb85e344a4d04337710c16fbca23a3a5b21",
+          "src/ir/transforms/utils/sync_invocation_domains.h": "90d6cd50ad6c9e81aa29d63e98d85eb8560313ebd92a6d9232e224c5aea621c6",
+          "src/ir/transforms/utils/token_sync_lowering.cpp": "e006bce86ebc293300a133aaad09a515f9afea5383954fc4484522d201de695d",
+          "src/ir/transforms/utils/token_sync_lowering.h": "75dbb685d996b6057b72ebe98770826df5cbc62fe2435ce69f26c316ff0d7bac",
+          "tests/ut/ir/operators/test_buffer_row_recipes.py": "549ac6a1b290d00d15128d296bd9102e38eaa5302698b5485b6ce76deedc6598",
+          "tests/ut/ir/transforms/sync_closed_command_oracle.py": "a7c231d05e9c55b1c8b9d4b38546bb2cb1dcc5211bc466af978c16f839c2f720",
+          "tests/ut/ir/transforms/test_conservative_sync_child_api.py": "45ece2b7d5d5f42f50fe3ef08e1195d283b550e8114a69740598ca0f1c70bdec",
+          "tests/ut/ir/transforms/test_runtime_valid_reduction_axis.py": "f1e8945b6202efa8a2d8d24affcc8317b9f8bb69a4a8d573c8444d6edfb8bc7b",
+          "tests/ut/ir/transforms/test_scoped_sync_palette.py": "5730b00ccfb1b68208f661403bd09764c36f79f837e3d2c08fa957f40b9a5184",
+          "include/pypto/ir/transforms/utils/buffer_active_domain_analysis.h": "76cf9517a7c71cf2cc9ef47e3d3f2279fe1c546899b20dcd8479a1905550e5eb",
+          "src/ir/transforms/utils/buffer_active_domain_analysis.cpp": "043e48d129f7ad972628d023f63d65e9b1835d3e6a419c05521701caa279499c",
+          "tests/ut/ir/transforms/qualify_nested_sync_cost.py": "2e278f2a0e3a8eecbb8315d7a5cc940aa924d27d080676639c14e9c2a98aa458",
+          "tests/ut/ir/transforms/test_effective_invocation_coordinate.py": "3d9e555d767e23bfaf59bab7fe4b52685d76fcc62f469eb1447d6d6d9aaf1d3f",
+          "tests/ut/ir/transforms/test_sync_scalar_payload.py": "236938075bf73b45a042c9888f7cd1a7ccf6ebf359fc3117e0e48b305f311682"
+        },
+        "binary_sha256": {
+          "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "27c070cb34d519fb2b74c70a02bc2b3baf85316e3926ea623a9f8185087a5873"
+        }
+      },
+      "after": {
+        "head": "1bafd4c00fd24e1e8462fb1ed90362514c099d91",
+        "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+        "producer_sha256": "bda3450e85837107a6cd2dfe187117a1a8f83ab4a5c05d65d92f25f304b46075",
+        "dirty_source_sha256": {
+          "CMakeLists.txt": "cf6588105fe22cc9f3e51ded436d21d30522330e0ebf0e4236638830be89cc32",
+          "include/pypto/backend/common/buffer_sync_contract.h": "8ae453ea84c1ce0aaff72de3edf1c359f7df283ae9c3f458917e612f89526220",
+          "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "b1e519483b48e266290fde45b308d92b13b96c20a8e85e9fa86496d8645806ab",
+          "python/bindings/modules/testing.cpp": "7ad975f10de94705c4322e3aab1b6862ef31ca5ab3fbd01a872a1de5dec8b714",
+          "python/bindings/modules/testing_sync_support.cpp": "7162c1bcd8879a9e632f89bb0e696ec0df5662d3d9b46d5a5bacc18467f4e289",
+          "python/pypto/pypto_core/testing.pyi": "7e1310b75bac99e38ba89e7866d29925baa98d648b61a15ab5e8ba45f31eb371",
+          "src/backend/common/buffer_sync_contract.cpp": "f39b11be3343fddbfd04b1540a6a2ec6a3d127b954d776b9fe09a1ad25516904",
+          "src/codegen/pto/pto_buffer_codegen.cpp": "3267168ca0c7a784e99d7301b045d1132e718a344d5d45aa01294608a5018d3f",
+          "src/ir/op/buffer_ops/memory.cpp": "eac26709bce475819bb47050c824b9b7248b37a21767777136d0117304f50fc2",
+          "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "96edaedf9cd006c59dfdc19c21bf56cc6b3b9fc1b397bdd84cc82bf4d604505c",
+          "src/ir/transforms/token_sync.cpp": "196101e505ece15f45fd4ced24d2be496ba476fc43e50347f0cb0a1815af1ab4",
+          "src/ir/transforms/utils/compact_sync_analysis.cpp": "6903c144ca196f37296ebd79f1637edda0ead182bbe2cf156c9b6e5a307cec43",
+          "src/ir/transforms/utils/conservative_sync_dataflow.cpp": "18bd494e4b041566fb2b20b813e2ec23052f8a8dd6ff1aadf7987d47a47d17f1",
+          "src/ir/transforms/utils/invocation_sync_analysis.cpp": "ecc319fa6ac662aa5b61d4a4997eb89ec78c99929063bc612b0b1548c9bac314",
+          "src/ir/transforms/utils/physical_sync_schedule.cpp": "bc7f28510fe8c5924ceb3e9eff56c5db0b1b2f94851f1c948eb5967b51f0f2d2",
+          "src/ir/transforms/utils/placed_sync_import.cpp": "1ef2a54bec834df8f04201bbe8d46ecf2039a9d6d227959153420aa6248e2467",
+          "src/ir/transforms/utils/scoped_logical_sync.cpp": "9475ea94a748204133c8579db764ce4ec0678a6e5524bd04b9e18c281a91a8a7",
+          "src/ir/transforms/utils/scoped_sync_palette.cpp": "bda3450e85837107a6cd2dfe187117a1a8f83ab4a5c05d65d92f25f304b46075",
+          "src/ir/transforms/utils/scoped_token_families.cpp": "e31ed6180ffb14f74df827ef856c2ee5ee30cfa45338fac77bd650bf08589a75",
+          "src/ir/transforms/utils/structured_token_sync.cpp": "3105cf0eed98561b08ece2a553e4ebb85e344a4d04337710c16fbca23a3a5b21",
+          "src/ir/transforms/utils/sync_invocation_domains.h": "90d6cd50ad6c9e81aa29d63e98d85eb8560313ebd92a6d9232e224c5aea621c6",
+          "src/ir/transforms/utils/token_sync_lowering.cpp": "e006bce86ebc293300a133aaad09a515f9afea5383954fc4484522d201de695d",
+          "src/ir/transforms/utils/token_sync_lowering.h": "75dbb685d996b6057b72ebe98770826df5cbc62fe2435ce69f26c316ff0d7bac",
+          "tests/ut/ir/operators/test_buffer_row_recipes.py": "549ac6a1b290d00d15128d296bd9102e38eaa5302698b5485b6ce76deedc6598",
+          "tests/ut/ir/transforms/sync_closed_command_oracle.py": "7c7179a181cd5434d1de98f4448b5ed2340bb49b9af16a8c417949fa5a0dce07",
+          "tests/ut/ir/transforms/test_conservative_sync_child_api.py": "45ece2b7d5d5f42f50fe3ef08e1195d283b550e8114a69740598ca0f1c70bdec",
+          "tests/ut/ir/transforms/test_runtime_valid_reduction_axis.py": "f1e8945b6202efa8a2d8d24affcc8317b9f8bb69a4a8d573c8444d6edfb8bc7b",
+          "tests/ut/ir/transforms/test_scoped_sync_palette.py": "5730b00ccfb1b68208f661403bd09764c36f79f837e3d2c08fa957f40b9a5184",
+          "include/pypto/ir/transforms/utils/buffer_active_domain_analysis.h": "76cf9517a7c71cf2cc9ef47e3d3f2279fe1c546899b20dcd8479a1905550e5eb",
+          "src/ir/transforms/utils/buffer_active_domain_analysis.cpp": "043e48d129f7ad972628d023f63d65e9b1835d3e6a419c05521701caa279499c",
+          "tests/ut/ir/transforms/qualify_nested_sync_cost.py": "2e278f2a0e3a8eecbb8315d7a5cc940aa924d27d080676639c14e9c2a98aa458",
+          "tests/ut/ir/transforms/test_effective_invocation_coordinate.py": "3d9e555d767e23bfaf59bab7fe4b52685d76fcc62f469eb1447d6d6d9aaf1d3f",
+          "tests/ut/ir/transforms/test_sync_scalar_payload.py": "236938075bf73b45a042c9888f7cd1a7ccf6ebf359fc3117e0e48b305f311682"
+        },
+        "binary_sha256": {
+          "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "69e01a7508ef378ee873f72ce29be5583302dc336d006226de6a55e30ebd1fac"
+        }
+      }
+    },
+    "pin_qualification": "Only palette producer differs among compiled sources; scalar oracle test edits differ too but cost probe never executes it. These pinned mixed-worktree cost measurements are distinct from the isolated repair regression build.",
+    "verification": {
+      "hooks": "all applicable hooks passed including full pyright",
+      "ctest": {
+        "command": [
+          "ctest",
+          "--test-dir",
+          "build-py314",
+          "-R",
+          "pypto_(sync_resource_catalog|sync_isa_macro_resources|numerical_sync_order)_test",
+          "--parallel",
+          "1",
+          "--output-on-failure"
+        ],
+        "passed": 3,
+        "failed": 0
+      }
+    }
+  },
+  "isolated_build": {
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "binary_sha256": {
+      "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "146cb9a2a153f91ee1edd8887cb5ade5cac537b4254bd45b6892ab23a969d0f8"
+    },
+    "dirty_source_sha256": {
+      "docs/en/dev/ir/42-autosync-review-repairs.md": "cde7fb74fe62df4b57e6a9feed396c22aa277f813e9d79dc73d38d2c67fc9722",
+      "docs/zh/dev/ir/42-autosync-review-repairs.md": "69076fc3b66d418f7b25192c76e856ee44c4ab647ff542c34dd242151db8b086",
+      "src/ir/transforms/utils/scoped_sync_palette.cpp": "bda3450e85837107a6cd2dfe187117a1a8f83ab4a5c05d65d92f25f304b46075",
+      "tests/ut/ir/operators/test_buffer_row_recipes.py": "549ac6a1b290d00d15128d296bd9102e38eaa5302698b5485b6ce76deedc6598",
+      "tests/ut/ir/transforms/test_scoped_sync_palette.py": "8353c54edc46bcd6bc977a600a5587be24347299db5a8bea1659dece3d1b6134"
+    },
+    "command": [
+      "cmake",
+      "--build",
+      "build-py314",
+      "--parallel",
+      "1"
+    ],
+    "python_executable": "/usr/bin/python",
+    "environment_loader": "source .claude/skills/testing/load-env.sh",
+    "cwd": "repository worktree root",
+    "environment": {
+      "PYTHONPATH": "$PWD/python:$PWD/tests/ut/ir:$PWD/tests/ut/codegen:$PWD",
+      "PTOAS_ROOT": "$PWD/build-py314/architecture-correction/ptoas-launcher",
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "PYPTO_CODEGEN_MAX_WORKERS": "1",
+      "TMPDIR": "$PWD/build-py314/review-repairs-20261116/scratch",
+      "PYTHONDONTWRITEBYTECODE": "1"
+    }
+  },
+  "raw_receipt_sha256": {
+    "r4-isolated-final-gate.log": "d4d70dd0399bb26eb88f02ddc6ce43605517a3bd7b004b274a8daf5eac130d22",
+    "r4-isolated-build.log": "18e43c3fe992058691c41f6c87e62952ad0a9ea2beb76286b950ff9539de63d5",
+    "r4-operator-final.log": "52aa0c3ef151f21b151f7ba9ede409b6b0aa77eb560ad54c9f071a889dc5156e",
+    "r4-palette-final.log": "fc2856eed3be2a8ffac36f955860d8c8e18375defe2e802f43b3ccfff5068c68",
+    "nested-pinned-baseline.json": "5d8c31b345b3a8ffa1c62792a6934b2078f79bd8bfdf59477588171a1680d266",
+    "nested-pinned-candidate.json": "096e17f31052dbaa29147e77cb17e45d56def7da43f8b75613bfc687ceeea11c",
+    "r4-pinned-baseline.json": "57e4b0c9bf1105b42a0148d6ef2a256685fca188a81ee9f65df4575f8d33d4e1",
+    "r4-pinned-candidate.json": "80231117dd3c5ec120d0b2ed2ca77368dd59c211ee64b28bad9a08788d4d4732",
+    "r4-final-hooks.log": "2b62d659dd4b75ba968b9871dceecb9d7cde89615ba4d73151fbf6ad8eb47bee",
+    "r4-ctest.log": "ef83abf57f945b284bbaa24e0f807b37fbec1c78d82f0b9eb7a1a1694faf9ee1"
+  },
+  "remaining": "Restore and independently qualify preserved active-domain, scalar, invocation-coordinate and local-boundary packages; complete original milestones. No cross-core/inter-kernel protocol synthesis."
+}
