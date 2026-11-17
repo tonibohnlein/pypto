@@ -24,10 +24,10 @@
 
 #include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_config.h"
+#include "pypto/backend/common/buffer_axis_recipes.h"
 #include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
-#include "pypto/backend/common/buffer_row_recipes.h"
 #include "pypto/backend/common/buffer_sync_contract.h"
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
@@ -1210,18 +1210,17 @@ class Importer {
       whole(1, false);
       // TSCATTER clears the entire destination before its indexed writes.
       whole(recipe->input_count, true);
-    } else if (auto recipe = backend::FindBufferRowRecipe(call->op_->name_)) {
-      CHECK(result.owner->func_type_ == FunctionType::AIV) << "Row synchronization requires an AIV leaf";
+    } else if (auto recipe = backend::FindBufferAxisRecipe(call->op_->name_)) {
+      CHECK(result.owner->func_type_ == FunctionType::AIV) << "Axis synchronization requires an AIV leaf";
       whole(0, false);
       // The shared contract distinguishes writable reduction scratch from a
-      // read-only broadcast column. Model the full scratch window as a write
-      // enclosure; do not claim it is the exact native scratch footprint.
-      if (recipe->reduction) {
+      // read-only broadcast operand, and single-input column reductions have no scratch.
+      if (recipe->HasScratch()) {
         enclosure(1, true);
-      } else {
+      } else if (recipe->InputCount() > 1) {
         whole(1, false);
       }
-      whole(2, true);
+      whole(recipe->InputCount(), true);
     } else if (auto recipe = backend::FindBufferElementwiseRecipe(call->op_->name_)) {
       CHECK(result.owner->func_type_ == FunctionType::AIV) << "Vec synchronization requires an AIV leaf";
       for (size_t arg = 0; arg < recipe->inputs.size(); ++arg) {

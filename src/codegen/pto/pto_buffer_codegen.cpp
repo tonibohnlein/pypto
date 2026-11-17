@@ -419,7 +419,7 @@ class BufferEmissionPreflight : public ir::IRVisitor {
       CHECK_SPAN(conversion_supported_, call->span_)
           << "Direct Buffer cast/compare/select and indexed operations currently supports A2/A3 only";
     }
-    if (const auto* row = backend::FindBufferRowRecipe(call->op_->name_); row) {
+    if (const auto* axis = backend::FindBufferAxisRecipe(call->op_->name_); axis) {
       bool runtime_valid = false;
       for (const auto& arg : call->args_) {
         if (const auto type = As<ir::BufferType>(arg->GetType())) {

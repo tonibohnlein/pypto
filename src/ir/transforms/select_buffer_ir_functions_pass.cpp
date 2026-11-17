@@ -215,7 +215,10 @@ class BufferKernelSupport : public IRVisitor {
     const auto physical_result = assigned_slot_types_.find(expr.get());
     CheckType(physical_result == assigned_slot_types_.end() ? expr->GetType() : physical_result->second);
     if (const auto var = AsVarLike(expr)) {
-      if (As<TupleType>(var->GetType())) supported = false;
+      if (As<TupleType>(var->GetType())) {
+        admission.Require(false, BufferAdmissionProperty::ExpressionForm);
+        return;
+      }
       if (const auto tile = As<TileType>(var->GetType())) {
         if (const auto memory = tile->memref_.value_or(nullptr)) {
           const auto offset = As<ConstInt>(memory->byte_offset_);
@@ -283,8 +286,8 @@ class BufferKernelSupport : public IRVisitor {
   void VisitStmt_(const AssignStmtPtr& assign) override {
     if (As<TupleType>(assign->var_->GetType())) {
       const auto result = tuples_.Get(assign->var_);
-      supported &= result && result->call == assign->value_;
-      if (result) {
+      admission.Require(result && result->call == assign->value_, BufferAdmissionProperty::StatementForm);
+      if (result && admission.supported()) {
         for (const auto& output : result->outputs) CheckType(output->GetType());
         VisitExpr(result->call);
       }

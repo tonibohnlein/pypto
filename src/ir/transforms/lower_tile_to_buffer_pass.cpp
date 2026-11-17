@@ -1117,10 +1117,10 @@ class TileToBufferMutator : public IRMutator {
     const auto* conversion = backend::FindLogicalBufferConversionRecipe(call->op_->name_);
     const bool static_cast_recipe = conversion && conversion->kind == backend::BufferConversionKind::Cast &&
                                     backend::SupportsLogicalBufferConversion(*conversion, call);
-    const auto* row_recipe = backend::FindLogicalBufferRowRecipe(call->op_->name_);
-    const bool guarded_row_broadcast = row_recipe && backend::SupportsLogicalBufferRow(*row_recipe, call);
+    const auto* axis_recipe = backend::FindLogicalBufferAxisRecipe(call->op_->name_);
+    const bool guarded_axis_op = axis_recipe && backend::SupportsLogicalBufferAxis(*axis_recipe, call);
     const bool data_operation =
-        guarded_row_broadcast || store || IsOp(call, "tile.load") || IsOp(call, "tile.move") ||
+        guarded_axis_op || store || IsOp(call, "tile.load") || IsOp(call, "tile.move") ||
         backend::FindLogicalBufferElementwiseRecipe(call->op_->name_) || static_cast_recipe;
     if (!data_operation || (!store && !result)) {
       return WithValidState(call, result, LowerCall(call, result));
