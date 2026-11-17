@@ -28,9 +28,9 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/buffer_axis_recipes.h"
 #include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
-#include "pypto/backend/common/buffer_row_recipes.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memory_space.h"
@@ -106,11 +106,14 @@ bool IsCast(const CallPtr& call) {
 bool IsVectorReshape(const CallPtr& call) {
   return IsOp(call, "tile.reshape") && backend::SupportsLogicalContiguousVectorReshape(call);
 }
+bool IsRowAxisOp(const CallPtr& call) {
+  const auto* axis = backend::FindLogicalBufferAxisRecipe(call->op_->name_);
+  return axis && (axis->axis == 1 || !axis->reduction);
+}
 bool KnownData(const CallPtr& call) {
   return IsElementwise(call) || IsCast(call) || IsVectorReshape(call) || IsOp(call, "tile.full") ||
          IsOp(call, "tile.create") || IsOp(call, "tile.load") || IsOp(call, "tile.store") ||
-         IsOp(call, "tile.set_validshape") ||
-         backend::FindLogicalBufferRowRecipe(call->op_->name_) != nullptr;
+         IsOp(call, "tile.set_validshape") || IsRowAxisOp(call);
 }
 
 Domain AxisMap(Domain domain, const TypePtr& target) {
@@ -366,11 +369,12 @@ class DomainIndex : public IRVisitor {
         if (As<TileType>(arg->GetType())) result = Meet(result, Get(arg));
       return Meet(result, Declared(call->GetType()));
     }
-    if (const auto row = backend::FindLogicalBufferRowRecipe(call->op_->name_)) {
+    if (const auto axis = backend::FindLogicalBufferAxisRecipe(call->op_->name_);
+        axis && (axis->axis == 1 || !axis->reduction)) {
       auto source = Get(call->args_[0]);
       if (source.kind == DomainKind::Prefix && source.axis != 0) return {};
-      if (row->reduction) return Meet(source, Declared(call->GetType()));
-      if (!row->row_vector)
+      if (axis->reduction) return Meet(source, Declared(call->GetType()));
+      if (axis->axis == 1)
         source = Meet(source, Get(call->args_[1]));
       else if (Get(call->args_[1]).kind != DomainKind::Full)
         return {};
@@ -532,9 +536,10 @@ class MetadataUseIndex : public IRVisitor {
 Domain OperandDomain(const CallPtr& call, size_t argument, Domain output) {
   if (IsElementwise(call) || IsCast(call)) return output;
   if (IsVectorReshape(call)) return ReshapeDomain(output, call, call->args_[0]->GetType());
-  if (const auto row = backend::FindLogicalBufferRowRecipe(call->op_->name_)) {
-    if (row->reduction && argument == 1) return {DomainKind::Unused, nullptr, 0};
-    if (row->row_vector && argument == 1) return {DomainKind::Full, nullptr, 0};
+  if (const auto axis = backend::FindLogicalBufferAxisRecipe(call->op_->name_);
+      axis && (axis->axis == 1 || !axis->reduction)) {
+    if (axis->reduction && argument == 1) return {DomainKind::Unused, nullptr, 0};
+    if (axis->axis == 0 && !axis->reduction && argument == 1) return {DomainKind::Full, nullptr, 0};
     return output;
   }
   if (IsOp(call, "tile.set_validshape")) return output;

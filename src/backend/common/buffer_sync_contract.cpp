@@ -176,7 +176,7 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
     // is a different recipe and is rejected by shared call validation.
     result.audited_signal_free_variant_ = true;
   }
-  if (const auto row = FindBufferRowRecipe(call->op_->name_); row && row->reduction) {
+  if (const auto row = FindBufferAxisRecipe(call->op_->name_); row && row->reduction && row->axis == 1) {
     CHECK(target == "a2a3") << "FP32 row reduction requires a qualified native implementation";
     // pto-isa 5487a6b0 TRowSum/TRowMax dispatch FP32 to the generic vector
     // reduction helper, including runtime-row descriptors. Scratch is explicit;
