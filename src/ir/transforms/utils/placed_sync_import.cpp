@@ -862,7 +862,10 @@ class Importer {
       }
       // Inherit the parent's pitch, including through nested subviews.
     } else {
-      CHECK(view.pitch == Checked(__int128(view.type->shape_[1]) * view.type->dtype_.GetByte()))
+      // A single-row Vec subview has no inter-row stride gap even when it
+      // inherits a wider parent pitch (e.g., buffer.gather_compare's mask prefix).
+      CHECK(view.type->shape_[0] == 1 ||
+            view.pitch == Checked(__int128(view.type->shape_[1]) * view.type->dtype_.GetByte()))
           << "Synchronization cannot reshape a noncontiguous window";
       view.pitch = Checked(__int128(type->shape_[1]) * type->dtype_.GetByte());
     }
@@ -1182,6 +1185,12 @@ class Importer {
             << "Rotating accumulator protection requires same-physical-slot qualification";
         site.protected_accumulator = Storage(call->args_[2]);
       }
+    } else if (IsOp(call, "buffer.transpose")) {
+      CHECK(result.owner->func_type_ == FunctionType::AIV)
+          << "Transpose synchronization requires an AIV leaf";
+      whole(0, false);
+      enclosure(1, true);
+      whole(2, true);
     } else if (auto recipe = backend::FindBufferConversionRecipe(call->op_->name_)) {
       CHECK(result.owner->func_type_ == FunctionType::AIV &&
             recipe->kind == backend::BufferConversionKind::Cast)
@@ -1201,15 +1210,24 @@ class Importer {
       // The shared contract uses in-range physical element offsets into a
       // known local buffer, not arbitrary pointers. Data-dependent gather
       // reads and native scratch use are enclosed without inventing selectors.
-      if (recipe->scatter) {
+      if (recipe->compare) {
         whole(0, false);
-      } else {
-        enclosure(0, false);
+        ReadyScalar(call->args_[1], segment);
         enclosure(2, true);
+        enclosure(3, true);
+        whole(4, true);
+        whole(5, true);
+      } else {
+        if (recipe->scatter) {
+          whole(0, false);
+        } else {
+          enclosure(0, false);
+          enclosure(2, true);
+        }
+        whole(1, false);
+        // TSCATTER clears the entire destination before its indexed writes.
+        whole(recipe->input_count, true);
       }
-      whole(1, false);
-      // TSCATTER clears the entire destination before its indexed writes.
-      whole(recipe->input_count, true);
     } else if (auto recipe = backend::FindBufferAxisRecipe(call->op_->name_)) {
       CHECK(result.owner->func_type_ == FunctionType::AIV) << "Axis synchronization requires an AIV leaf";
       whole(0, false);
