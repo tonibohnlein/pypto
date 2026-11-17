@@ -1131,3 +1131,121 @@ def test_closed_prefix_refuses_stale_same_pipe_barrier_with_intervening_payload(
         with passes.PassContext([]):
             passes.lower_sync()(ir.Program([fn], "StaleSamePipe", span))
     assert ir.serialize(fn) == before
+
+
+@pytest.mark.parametrize("in_loop", [False, True])
+def test_128_sequential_one_sided_ifs_reuse_ids_without_pool_exhaustion(in_loop):
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+
+    def ci(v):
+        return ir.ConstInt(v, idx, span)
+
+    n = ir.Var("n", ir.ScalarType(idx), span)
+    choice = ir.Var("choice", ir.ScalarType(idx), span)
+    k = ir.Var("k", ir.ScalarType(idx), span)
+
+    def make_arm(i):
+        t_32 = ir.Var(f"t32_{i}", ir.SyncTokenType(ir.PipeType.MTE3), span)
+        t_2s = ir.Var(f"t2s_{i}", ir.SyncTokenType(ir.PipeType.MTE2), span)
+        t_s3a = ir.Var(f"ts3a_{i}", ir.SyncTokenType(ir.PipeType.S), span)
+        t_3s = ir.Var(f"t3s_{i}", ir.SyncTokenType(ir.PipeType.MTE3), span)
+        t_s3b = ir.Var(f"ts3b_{i}", ir.SyncTokenType(ir.PipeType.S), span)
+        return seq(
+            ir.AssignStmt(t_32, sync.record(ir.PipeType.MTE3), span),
+            ir.EvalStmt(sync.wait(t_32, ir.PipeType.MTE2), span),
+            ir.AssignStmt(t_2s, sync.record(ir.PipeType.MTE2), span),
+            ir.EvalStmt(sync.wait(t_2s, ir.PipeType.S), span),
+            ir.AssignStmt(t_s3a, sync.record(ir.PipeType.S), span),
+            ir.EvalStmt(sync.wait(t_s3a, ir.PipeType.MTE3), span),
+            ir.AssignStmt(t_3s, sync.record(ir.PipeType.MTE3), span),
+            ir.EvalStmt(sync.wait(t_3s, ir.PipeType.S), span),
+            ir.AssignStmt(t_s3b, sync.record(ir.PipeType.S), span),
+            ir.EvalStmt(sync.wait(t_s3b, ir.PipeType.MTE3), span),
+        )
+
+    init_tok = ir.Var("t_init", ir.SyncTokenType(ir.PipeType.S), span)
+    branches = []
+    for i in range(128):
+        lhs = ci(i) if not in_loop else ir.Add(k, ci(i), idx, span)
+        cond = ir.Eq(ir.FloorMod(lhs, ci(2), idx, span), choice, ir.DataType.BOOL, span)
+        branches.append(ir.IfStmt(cond, make_arm(i), None, [], span))
+
+    if in_loop:
+        body = seq(ir.ForStmt(k, ci(0), n, ci(1), [], seq(*branches, ir.YieldStmt([], span)), [], span))
+    else:
+        body = seq(*branches)
+
+    fn = ir.Function(
+        f"qkpv_branch_reuse_{'loop' if in_loop else 'flat'}",
+        [n, choice],
+        [],
+        seq(
+            ir.AssignStmt(init_tok, sync.record(ir.PipeType.S), span),
+            ir.EvalStmt(sync.wait(init_tok, ir.PipeType.MTE3), span),
+            body,
+            ir.ReturnStmt([], span),
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        attrs={"autosync_analysis_policy": "conservative_prefix"},
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    phys = lower(fn, eligible=range(8))
+    max_id_limit = 2 if in_loop else 1
+    for n_val, ch_val in product((0, 1, 2) if in_loop else (1,), (0, 1)):
+        _, after = check_closed_commands(fn, phys, {0: n_val, 1: ch_val}, range(8), compare_commands=False)
+        assert not after.live
+        assert all(max(ids) < max_id_limit for ids in after.ids.values() if ids)
+
+
+def test_loop_one_sided_if_set_wait_ack_propagates_relay_and_reuses_ids():
+    span = ir.Span.unknown()
+    idx = ir.DataType.INDEX
+
+    def ci(v):
+        return ir.ConstInt(v, idx, span)
+
+    n = ir.Var("n", ir.ScalarType(idx), span)
+    choice = ir.Var("choice", ir.ScalarType(idx), span)
+    k = ir.Var("k", ir.ScalarType(idx), span)
+
+    branches = []
+    for i in range(20):
+        t_s3 = ir.Var(f"ts3_{i}", ir.SyncTokenType(ir.PipeType.S), span)
+        t_3s = ir.Var(f"t3s_{i}", ir.SyncTokenType(ir.PipeType.MTE3), span)
+        cond = ir.Eq(
+            ir.FloorMod(ir.Add(k, ci(i), idx, span), ci(2), idx, span), choice, ir.DataType.BOOL, span
+        )
+        branches.append(
+            ir.IfStmt(
+                cond,
+                seq(
+                    ir.AssignStmt(t_s3, sync.record(ir.PipeType.S), span),
+                    ir.EvalStmt(sync.wait(t_s3, ir.PipeType.MTE3), span),
+                    ir.AssignStmt(t_3s, sync.record(ir.PipeType.MTE3), span),
+                    ir.EvalStmt(sync.wait(t_3s, ir.PipeType.S), span),
+                ),
+                None,
+                [],
+                span,
+            )
+        )
+
+    fn = ir.Function(
+        "loop_set_wait_ack_branch_relay",
+        [n, choice],
+        [],
+        seq(
+            ir.ForStmt(k, ci(0), n, ci(1), [], seq(*branches, ir.YieldStmt([], span)), [], span),
+            ir.ReturnStmt([], span),
+        ),
+        span,
+        type=ir.FunctionType.AIV,
+        attrs={"autosync_analysis_policy": "conservative_prefix"},
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    phys = lower(fn, eligible=[0, 1])
+    for n_val, ch_val in product((0, 1, 3), (0, 1)):
+        _, after = check_closed_commands(fn, phys, {0: n_val, 1: ch_val}, [0, 1], compare_commands=False)
+        assert not after.live
