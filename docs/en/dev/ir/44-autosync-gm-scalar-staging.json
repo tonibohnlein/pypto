@@ -1,5 +1,5 @@
 {
-  "status": "architecture accepted for implementation under existing normative TLOAD contract; implementation and semantic validation pending",
+  "status": "Source review accepted; coherent post-format build, corrected operator/GM gate and whole-model capture passed. Final hooks and accepted commit publication pending.",
   "date": "2026-11-16",
   "parent_milestones": [
     "M2",
@@ -44,8 +44,147 @@
     "no unqualified peer publication/polling or effectful control rewrite"
   ],
   "device_validation": false,
-  "implementation_changes": [],
-  "test_results": [],
+  "implementation_changes": [
+    "include/pypto/ir/transforms/utils/buffer_scalar_staging.h",
+    "src/ir/transforms/utils/buffer_scalar_staging.cpp",
+    "tests/ut/ir/transforms/test_gm_scalar_staging.py",
+    "include/pypto/backend/common/buffer_scalar_recipes.h",
+    "src/backend/common/buffer_scalar_recipes.cpp",
+    "src/backend/common/buffer_sync_contract.cpp",
+    "src/codegen/pto/pto_buffer_codegen.cpp",
+    "src/ir/op/buffer_ops/memory.cpp",
+    "src/ir/transforms/lower_tile_to_buffer_pass.cpp",
+    "src/ir/transforms/select_buffer_ir_functions_pass.cpp",
+    "src/ir/transforms/utils/placed_sync_import.cpp",
+    "tests/ut/ir/transforms/sync_closed_command_oracle.py",
+    "CMakeLists.txt"
+  ],
+  "test_results": [
+    {
+      "path": "build-py314/review-repairs-20261116/gm-staging-qualified-tests.log",
+      "sha256": "f506b56f3a1af425e19c106dad7c202b1bca00934d120b2125168fba17a0e486",
+      "passed": 53,
+      "failed": 0,
+      "seconds": 0.86,
+      "scope": "First coherent focused GM family gate.",
+      "workers": 1,
+      "watchdog_seconds": 120,
+      "command": [
+        "timeout",
+        "120s",
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "--require-ptoas",
+        "tests/ut/ir/transforms/test_gm_scalar_staging.py"
+      ]
+    },
+    {
+      "path": "build-py314/review-repairs-20261116/resumed-combined-gate.log",
+      "sha256": "a39bf57922bee7dcc8fd1b01c516d855f1f58aff3b3088ba7e07440eff2f1d57",
+      "passed": 3132,
+      "failed": 2,
+      "warnings": 4,
+      "seconds": 430.9,
+      "status": "Failed broad run, preserved. Both failures are stale rank-2 diagnostic expectations; invalid rank-one FP32 load/store remain refused.",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "--require-ptoas",
+        "--junitxml=build-py314/review-repairs-20261116/resumed-combined-gate.xml",
+        "tests/ut/ir/transforms/test_buffer_admission_obligations.py",
+        "tests/ut/ir/transforms/test_sync_operation_contract.py",
+        "tests/ut/ir/transforms/test_static_cast_valid_context.py",
+        "tests/ut/ir/transforms/test_contiguous_vector_views.py",
+        "tests/ut/ir/transforms/test_implicit_sync_effects.py",
+        "tests/ut/ir/transforms/test_sync_caller_correlations.py",
+        "tests/ut/ir/transforms/test_sync_range_proofs.py",
+        "tests/ut/ir/transforms/test_select_buffer_ir_functions.py",
+        "tests/ut/ir/transforms/test_buffer_loop_step_qualification.py",
+        "tests/ut/ir/transforms/test_lower_tile_to_buffer_slots.py",
+        "tests/ut/ir/transforms/test_slot_sync_import.py",
+        "tests/ut/ir/transforms/test_vec_sync_analysis.py",
+        "tests/ut/ir/transforms/test_autosync_switch.py",
+        "tests/ut/ir/transforms/test_compact_sync_analysis.py",
+        "tests/ut/ir/transforms/test_rotating_sync_analysis.py",
+        "tests/ut/ir/transforms/test_nested_phase_sync.py",
+        "tests/ut/ir/transforms/test_token_sync_lowering.py",
+        "tests/ut/ir/transforms/test_sync_construction_scaling.py",
+        "tests/ut/ir/transforms/test_scoped_token_families.py",
+        "tests/ut/ir/transforms/test_scoped_token_order.py",
+        "tests/ut/ir/transforms/test_scoped_sync_palette.py",
+        "tests/ut/ir/transforms/test_scoped_palette_realization.py",
+        "tests/ut/ir/transforms/test_scoped_resource_transitions.py",
+        "tests/ut/ir/transforms/test_scoped_physical_sync.py",
+        "tests/ut/ir/transforms/test_physical_sync_realization.py",
+        "tests/ut/ir/transforms/test_logical_sync_realization.py",
+        "tests/ut/ir/transforms/test_conservative_sync_dataflow.py",
+        "tests/ut/ir/transforms/test_closed_prefix_sync.py",
+        "tests/ut/ir/transforms/test_conservative_sync_children.py",
+        "tests/ut/ir/transforms/test_conservative_sync_child_api.py",
+        "tests/ut/ir/transforms/test_conservative_sync_child_commands.py",
+        "tests/ut/ir/transforms/test_conservative_sync_child_implicit_effects.py",
+        "tests/ut/ir/transforms/test_autosync_policy.py",
+        "tests/ut/ir/transforms/test_autosync_inventory.py",
+        "tests/ut/jit/test_cache.py",
+        "tests/ut/ir/transforms/test_slot_index_normalization.py",
+        "tests/ut/ir/transforms/test_rsqrt_buffer_sync.py",
+        "tests/ut/ir/transforms/test_atomic_buffer_sync.py",
+        "tests/ut/ir/transforms/test_lower_tile_to_buffer.py",
+        "tests/ut/ir/operators/test_buffer_ops.py",
+        "tests/ut/ir/operators/test_op_registry.py",
+        "tests/ut/ir/transforms/test_runtime_valid_broadcast.py",
+        "tests/ut/ir/transforms/test_runtime_valid_cast.py",
+        "tests/ut/ir/transforms/test_runtime_valid_reduction_axis.py",
+        "tests/ut/ir/transforms/test_runtime_valid_metadata.py",
+        "tests/ut/ir/transforms/test_eventful_sync_children.py",
+        "tests/ut/ir/transforms/test_whole_module_sync_ownership.py",
+        "tests/ut/runtime/test_pto_rebuild.py",
+        "tests/ut/ir/transforms/test_row_sync_analysis.py",
+        "tests/ut/ir/transforms/test_external_sync_geometry.py",
+        "tests/ut/ir/transforms/test_column_sync_transfer.py",
+        "tests/ut/codegen/test_buffer_view_codegen.py",
+        "tests/ut/ir/transforms/test_static_row_descriptor_bridge.py",
+        "tests/ut/ir/operators/test_buffer_row_recipes.py",
+        "tests/ut/ir/operators/test_buffer_conversion_recipes.py",
+        "tests/ut/ir/transforms/test_scalar_tile_buffer_bridge.py",
+        "tests/ut/ir/transforms/test_scalar_physical_pitch.py",
+        "tests/ut/ir/transforms/test_scalar_command_oracle.py",
+        "tests/ut/ir/transforms/test_sync_scalar_payload.py",
+        "tests/ut/ir/transforms/test_effective_invocation_coordinate.py",
+        "tests/ut/ir/transforms/test_parameterized_token_sync.py",
+        "tests/ut/ir/transforms/test_gm_scalar_staging.py"
+      ],
+      "junit": {
+        "path": "build-py314/review-repairs-20261116/resumed-combined-gate.xml",
+        "sha256": "e8eb7593e165e757a50dcf5b6401345f2f63f43d68abe875edb8bf4a48c0b085"
+      }
+    },
+    {
+      "path": "build-py314/review-repairs-20261116/gm-staging-operator-gate.log",
+      "sha256": "90196f62e92c2fe74476098b798e4e6fc6928a21e8bcf09fb0bdcd810b77a15e",
+      "passed": 202,
+      "failed": 0,
+      "seconds": 1.21,
+      "scope": "Fresh whole operator module plus 53-test GM family after correcting diagnostic expectations only.",
+      "workers": 1,
+      "watchdog_seconds": 120,
+      "command": [
+        "timeout",
+        "120s",
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "--require-ptoas",
+        "tests/ut/ir/operators/test_buffer_ops.py",
+        "tests/ut/ir/transforms/test_gm_scalar_staging.py"
+      ]
+    }
+  ],
   "native_evidence_locator": {
     "A2A3_product_and_INT32": "official DataCopyPad lines7\u20138,119\u2013126",
     "source_destination_alignment": "official DataCopyPad lines141\u2013142",
@@ -64,5 +203,520 @@
     "native_correctness": "existing selected-TLOAD supplied contract",
     "independently_reproduced_CCE_builtin_to_public_API_implementation": false,
     "reason": "CANN headers absent locally; authoritative source service rate limited"
-  }
+  },
+  "design_status_at_previous_commit": "architecture accepted for implementation under existing normative TLOAD contract; implementation and semantic validation pending",
+  "implementation_baseline_head": "04965c91cf7ddb3ea606ad2225ecff316ec85010",
+  "implementation_contract": {
+    "request": "Only enable_pypto_autosync=true, enable_buffer_ir=true, autosync_policy=conservative_prefix, A2/A3 AIV. Other requests preserve the original Functional read.",
+    "candidate": "StageBufferScalarReads returns an immutable candidate. Complete ordinary Buffer admission is required; otherwise retain the original function.",
+    "shape": "Packed rank-one INT32 GM source has a static positive or original symbolic INDEX length. Preserve the source ABI, root, index, scalar SSA and control.",
+    "definedness": "Retain the original in-bounds, nonwrapping tensor.read premise. Do not fabricate ranges, clamp addresses, or invent peer publication or cache premises.",
+    "storage": "One private 32-byte ordinarily planned Vec carrier per static read site, capacity [1,8], valid [1,1]. Distinguish the four-byte modeled GM source from the full 32-byte UB enclosure.",
+    "native_phases": "Ordinary MTE2 TLOAD followed by an original-result blocking S local UB read; use existing prefix services and reuse certificates.",
+    "planners": "PyPTO and DSA can qualify the PyPTO physical owner. The PTOAS planner stages Buffer input but delegates physical ownership to the existing downstream path; real C++ is tested.",
+    "negative": "Discarded/nested/INT64 reads, unsupported layouts/core/target and effectful predicates without a qualified cut retain refusal or delegation."
+  },
+  "test_coverage": {
+    "source_geometry": "Lengths one/nine and positions 0/1/7/8, including the final valid element; original rank-one ABI and one-element partition.",
+    "dynamic_extent": "Original symbolic rank-one INDEX extent, with unchanged Tensor root and actual index.",
+    "alias": "Both alias policies; permitted overlapping GM roots checked under may-alias.",
+    "values_control": "Actual positive/negative scalar values drive the original conditional write; compare output values.",
+    "control": "Zero/one/multiple loop visits, skipped branches and counter resets under one retained function.",
+    "commands": "Independent byte effects, modeled requirement coverage, matching, acyclicity, directional pool compliance and causal reuse.",
+    "physical_footprint": "Distinguish modeled four-byte GM reads from enclosing 32-byte UB writes; padding remains unobserved.",
+    "cpp": "Real PTOAS C++ for all three planners contains TLOAD and GetValue, without an S pipe barrier.",
+    "delegation": "Autosync-disabled and Buffer-disabled paths remain Functional. Discarded and INT64 reads retain the whole function.",
+    "compactness": "Production retains one scalar-read site, two load sites including the ordinary input, and the original two loops; runtime values are not unfolded."
+  },
+  "publication": {
+    "source_review": "accepted with focused and corrected integrated gates green",
+    "hooks": "pending final run after complete documentation freeze",
+    "commit": "pending accepted publication",
+    "device_validation": false
+  },
+  "remaining_obligations": [
+    "Existing normative selected-TLOAD correctness premise retained; exact CCE intrinsic/public API implementation mapping not independently reproduced.",
+    "Original caller access validity and publication/visibility remain premises.",
+    "No new peer synchronization or cache invalidation semantics.",
+    "Effectful while predicates, other dtypes and broader layouts remain unsupported.",
+    "No exact GM selector or minimum-demand claim for conservative enclosures.",
+    "M1\u2013M6 and complete Qwen ownership remain incomplete."
+  ],
+  "paper_consequences": [
+    {
+      "established": "Direct INT32 GM reads use ordinary DMA and local S payloads.",
+      "limitation": "Selected TLOAD and original access-validity/publication premises.",
+      "claim": "Reusable lowering recipe, not a new hardware theorem."
+    },
+    {
+      "established": "ABI, SSA, control and sound carrier enclosures pass bounded checks.",
+      "limitation": "Unsupported reads delegate; exact GM selectors remain unavailable.",
+      "claim": "Conservative local synchronization under explicit policy."
+    },
+    {
+      "established": "Three planners generate C++; actual PyPTO command checks use the existing pool.",
+      "limitation": "Host-only validation; no optimality claim.",
+      "claim": "Qualified-family host feasibility."
+    }
+  ],
+  "source_build_pin": {
+    "compiler_revision": "04965c91cf7ddb3ea606ad2225ecff316ec85010",
+    "compiler_dirty_sources": {
+      "include/pypto/backend/common/buffer_scalar_recipes.h": "9ce5929b97b039ff72f8d46fbf4d4d089ac83648da9aa9b8bfd152c61a706e7a",
+      "include/pypto/ir/transforms/utils/buffer_scalar_staging.h": "9263a74e70cd07e5d7152ae899b5e587e895105bf6f5380e7d2eace6b0132b88",
+      "src/backend/common/buffer_scalar_recipes.cpp": "4809eeb70a495b19c68455bfa559d8dfc036bf07a58d24f5fe3186ab7cb0242e",
+      "src/backend/common/buffer_sync_contract.cpp": "4da3ba4d2d01c5783dfa6c86480cee2f41ad5a8a5b1ed231527b50328fb61e16",
+      "src/codegen/pto/pto_buffer_codegen.cpp": "6f73af1bfd5c96cdd2fc88802b30ef1024f67f534ab95e64cc7943e36ba53313",
+      "src/ir/op/buffer_ops/memory.cpp": "e598a9493c6c3a70de2b01322e6d51aacbc0be88641b14ab5a8a5ea4c65fe0d7",
+      "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "d556845a07ca918e50a547a089bec00f07c0bc61de41f69dca830601f5a63163",
+      "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "f78a637e632b54578d763cc752119409f7e9907abb2e2db9f70757409384e9b4",
+      "src/ir/transforms/utils/buffer_scalar_staging.cpp": "16f761cd7df456d217b48a6b6d7c02699eb672a5451e6b3d2827eed1c6018ffd",
+      "src/ir/transforms/utils/placed_sync_import.cpp": "41212b1596691635db1a5328829ccd8227e020705e0c6ea144983d19fb8d77fb",
+      "tests/ut/ir/operators/test_buffer_ops.py": "1925404e38d9618029903f9678f46201d92b976f4097fc45caac6516c883a02e",
+      "tests/ut/ir/transforms/sync_closed_command_oracle.py": "1e722940cde26af411ef1b6ee7b7b5987d78ddb797ce7f296318d16f10d81c57",
+      "tests/ut/ir/transforms/test_gm_scalar_staging.py": "7d5d5d0110f79f0cbf10ca7689ca8f4541d161094d7b138be817c92864c70263"
+    },
+    "extension_hashes": {
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "4bdcc9ab52cc5259bf602c9d7011478de2b2be39d70824542adb11215ccf0ced"
+    },
+    "additional_build_files": {
+      "CMakeLists.txt": "e1b41502ecf004a3ef05ebefc048bc9ee457b6c4d0018e93b225dd0b5989e782"
+    },
+    "authority": "Fresh post-format coherent build and whole-model capture. After that build only operator test diagnostic expectations changed; the fresh 202-test gate passes."
+  },
+  "post_format_build": {
+    "path": "build-py314/review-repairs-20261116/gm-staging-qualified-build.log",
+    "sha256": "9fc3c850e87bca72d33ec0903546e59f0ef5aa930a3e36f181c9fd244eecd1a7",
+    "status": "passed",
+    "command": [
+      "cmake",
+      "--build",
+      "build-py314",
+      "--parallel",
+      "1"
+    ]
+  },
+  "whole_qwen": {
+    "compiler_revision": "04965c91cf7ddb3ea606ad2225ecff316ec85010",
+    "library_revision": "b72c66d9df69ba5f11982b212530a255c050988d",
+    "model_sources": {
+      "config.py": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+      "constants.py": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+      "contract.py": "f16c43df64c42769dc365a820e5fbc0ff6e9c4d3ceada21660003869ccbeaf15",
+      "decode_fwd.py": "c2f7288ce1e45cbe9fe99d60484aed7a4cb6b4d7255701c4692692a7586dd6f3",
+      "decode_layer_a8w8.py": "4074dea2e5225818108bc088d06dc1717cb2706dd004255a96c05843ba7a5fb8",
+      "decode_ssn_draft.py": "55016c298d42f77500e87bccdf020dbc3e78210cbe1a4c526b97f59466d77705",
+      "decode_tq_draft.py": "9daf2b9b1851d646552cb75504f33aad4766569ff740462a16cdf06d99f352ec",
+      "greedy_sample.py": "8f3fc3e4c533abf01140b299cac35a11185c5151e92df5ba84327afdfa3fceb8",
+      "paged_attention_cce.py": "aafa0bc6dde1758f5518081f3814449e0ca93d137451b67065a06f4b8a375b2d",
+      "paged_attention_pypto.py": "4087a49cd0b6c6396d4fef859576a02f8c6b096e9b94f5b55560e1f4b238e843",
+      "prefill_fwd.py": "3e05b6f910055549d6f89c24743dc384acfb0134be059efe4351b72092824dcb",
+      "prefill_fwd_a8w8.py": "3f359f5b5147c025efa21152117f75291c07826d9675f0a5bc9b76c3a13c67ac",
+      "prefill_tq_draft.py": "0eb51c30bfce55eabbb3318d39542813aef8687858957e41dcfafd5b93c5d8da",
+      "rms_lm_head.py": "0cafe8226d85659afd9d1c19e3c9ae46269a109a7c3c501d846a366e3826e3ce",
+      "rope_qkv_regen.py": "17d868b0527f6555e48426d4fe74526c8d72b5126d442efd2727cf9078c94076",
+      "test_paged_attention_cce.py": "7098e2cea21d017ef6f13f0261b19d37a3af62103045543862cf51b99d793f6c",
+      "test_paged_attention_pypto.py": "9bf0d2ea18b5d995a846858df23c301e32ff79849a08a1bb4250101ff468f32d",
+      "topk_select.py": "60ddb96ee27846c0dfb23f95a59cf53701eed94cca88bf7b5eb3802a5aaef267",
+      "turboquant_kv.py": "d49c3cb4764e524b96be5bffd57cbf6138061e65c5b762ac4781741d2181bf7d",
+      "weights.py": "d23e15850574369379e8140eb7a97be000274250dd6369544cc2108132125bf5"
+    },
+    "configuration": {
+      "layers": 2,
+      "sequence": 128,
+      "batch": 1
+    },
+    "mode": "pypto",
+    "policy": "conservative_prefix",
+    "command": [
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_qwen_whole_model.py",
+      "--library",
+      "/home/toni/work/pypto3/pypto-lib",
+      "--output",
+      "build-py314/review-repairs-20261116/qwen-gm-staging-qualified",
+      "--layers",
+      "2",
+      "--policy",
+      "conservative_prefix",
+      "--require-function",
+      "down_proj",
+      "--require-function",
+      "gate_up_proj",
+      "--require-function",
+      "kv_proj",
+      "--require-function",
+      "mlp_out_cast",
+      "--require-function",
+      "mlp_out_cast_0",
+      "--require-function",
+      "mlp_out_seed",
+      "--require-function",
+      "out_proj_aic",
+      "--require-function",
+      "q_proj",
+      "--require-function",
+      "save_prefill_last_token_group",
+      "--require-function",
+      "save_prefill_last_token_single",
+      "--require-function",
+      "silu",
+      "--tool-artifact",
+      "build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas",
+      "--tool-artifact",
+      "build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so",
+      "--tool-artifact",
+      "build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so",
+      "--require-function",
+      "final_rmsnorm",
+      "--require-function",
+      "attention_finalize_phase",
+      "--require-function",
+      "qk_pv_partial_merge",
+      "--require-function",
+      "x_gamma",
+      "--require-function",
+      "x_gamma_0",
+      "--require-domain-owners"
+    ],
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "compiler_dirty_sources": {
+      "include/pypto/backend/common/buffer_scalar_recipes.h": "9ce5929b97b039ff72f8d46fbf4d4d089ac83648da9aa9b8bfd152c61a706e7a",
+      "include/pypto/ir/transforms/utils/buffer_scalar_staging.h": "9263a74e70cd07e5d7152ae899b5e587e895105bf6f5380e7d2eace6b0132b88",
+      "src/backend/common/buffer_scalar_recipes.cpp": "4809eeb70a495b19c68455bfa559d8dfc036bf07a58d24f5fe3186ab7cb0242e",
+      "src/backend/common/buffer_sync_contract.cpp": "4da3ba4d2d01c5783dfa6c86480cee2f41ad5a8a5b1ed231527b50328fb61e16",
+      "src/codegen/pto/pto_buffer_codegen.cpp": "6f73af1bfd5c96cdd2fc88802b30ef1024f67f534ab95e64cc7943e36ba53313",
+      "src/ir/op/buffer_ops/memory.cpp": "e598a9493c6c3a70de2b01322e6d51aacbc0be88641b14ab5a8a5ea4c65fe0d7",
+      "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "d556845a07ca918e50a547a089bec00f07c0bc61de41f69dca830601f5a63163",
+      "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "f78a637e632b54578d763cc752119409f7e9907abb2e2db9f70757409384e9b4",
+      "src/ir/transforms/utils/buffer_scalar_staging.cpp": "16f761cd7df456d217b48a6b6d7c02699eb672a5451e6b3d2827eed1c6018ffd",
+      "src/ir/transforms/utils/placed_sync_import.cpp": "41212b1596691635db1a5328829ccd8227e020705e0c6ea144983d19fb8d77fb",
+      "tests/ut/ir/operators/test_buffer_ops.py": "1925404e38d9618029903f9678f46201d92b976f4097fc45caac6516c883a02e",
+      "tests/ut/ir/transforms/sync_closed_command_oracle.py": "1e722940cde26af411ef1b6ee7b7b5987d78ddb797ce7f296318d16f10d81c57",
+      "tests/ut/ir/transforms/test_gm_scalar_staging.py": "7d5d5d0110f79f0cbf10ca7689ca8f4541d161094d7b138be817c92864c70263"
+    },
+    "extension_hashes": {
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "4bdcc9ab52cc5259bf602c9d7011478de2b2be39d70824542adb11215ccf0ced"
+    },
+    "ptoas": {
+      "path": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher/ptoas",
+      "hash": "8b52c0bfe3259f37dd17331ec0b8ee534461f18e70042edce0e2b6ee2fd7adf8",
+      "version": "ptoas 0.72",
+      "additional_artifacts": {
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so": "86655444ce6e3470dbbbf061438046bc5f87c5f0f89f4145fd2a4340c8fd70e9",
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so": "0aa83ba0abbd3432c2ce9ecb6c854485b5502d51b181fa200ee87fd9254ea321"
+      }
+    },
+    "environment": {
+      "PYTHONPATH": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/codegen:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106",
+      "PTOAS_ROOT": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher",
+      "OMP_NUM_THREADS": "1",
+      "PYPTO_CODEGEN_MAX_WORKERS": "1"
+    },
+    "access_contract": "Whole-memory-space enclosures; no GM disjointness used; source access-validity preconditions remain",
+    "device": "not run",
+    "compile_success": true,
+    "all_generated_leaves_pypto": false,
+    "arguments": [
+      {
+        "name": "input_ids",
+        "shape": [
+          128
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "seq_lens",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "chunk_lens",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "chunk_offsets",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "input_rms_weight",
+        "shape": [
+          2,
+          5120
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "wq",
+        "shape": [
+          10240,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "wk",
+        "shape": [
+          10240,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "wv",
+        "shape": [
+          10240,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "q_norm_weight",
+        "shape": [
+          2,
+          128
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "k_norm_weight",
+        "shape": [
+          2,
+          128
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "rope_cos",
+        "shape": [
+          4096,
+          128
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "rope_sin",
+        "shape": [
+          4096,
+          128
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "block_table",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "slot_mapping",
+        "shape": [
+          128
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "k_cache",
+        "shape": [
+          2048,
+          128
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "v_cache",
+        "shape": [
+          2048,
+          128
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "wo",
+        "shape": [
+          10240,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "post_rms_weight",
+        "shape": [
+          2,
+          5120
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "w_gate",
+        "shape": [
+          10240,
+          17408
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "w_up",
+        "shape": [
+          10240,
+          17408
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "w_down",
+        "shape": [
+          34816,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "final_norm_weight",
+        "shape": [
+          1,
+          5120
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "lm_head_weight",
+        "shape": [
+          152064,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "embed_weight",
+        "shape": [
+          152064,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "out",
+        "shape": [
+          1,
+          152064
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "compile_seconds_inclusive": 6.691851230803877,
+    "domain_owner_counts": {
+      "verified_pypto_leaf": 19,
+      "task_control_owner_observed": 47,
+      "delegated": 13
+    },
+    "expected_ownership_failures": [],
+    "cpp": {
+      "compiled/kernels/aic/down_proj.cpp": "f2af1982d3d376c6e0bc9f7d848084881a4da7f711fa3292ccb21235c64138d4",
+      "compiled/kernels/aic/gate_up_proj.cpp": "063ca0153aab63a159bb2e043328be097b256bb4fd8efa46b0cdba191c7ca90a",
+      "compiled/kernels/aic/kv_proj.cpp": "8dc0d913057de88a19a43a5fd1c093472eb62b2aa5f34ece8a8ccdbcd6fdf734",
+      "compiled/kernels/aic/lm_head.cpp": "43014ae77df410549d7c1ca5c1167f1770cc967193df795548966c566002f215",
+      "compiled/kernels/aic/out_proj_aic.cpp": "ae90357d0bb3aa36376740f09beee16bf901915ddcee2fb5b013aa34818cb843",
+      "compiled/kernels/aic/q_proj.cpp": "40eaf9ac83563cbd1758357a0742f6b1678fb918fef972d882bb7c9fb7c7e6ec",
+      "compiled/kernels/aic/qk_pv_partial_plan_aic.cpp": "0c5895ad67f5289d7125063aed779a273f87ce9657057b1a75c1a34dedd47541",
+      "compiled/kernels/aic/qk_pv_single_block_0_aic.cpp": "b4b20480a75c5ca22c2947631f91f8683fa4dd2b8b80e9dde7e859f008ef8be8",
+      "compiled/kernels/aic/qk_pv_single_block_aic.cpp": "296a3826fcdf63b691af01d930ef7fc0133063f081d3457082a9c4a6c38fecec",
+      "compiled/kernels/aiv/attention_finalize_phase.cpp": "bfb86d8e1a6eb9bc1918b077cc3926fba51dd77da088dcfae9878a96ad0c9480",
+      "compiled/kernels/aiv/final_rmsnorm.cpp": "14bb704c998d31783881d49cf4dccbfb24350c553884bdadef153163915112f2",
+      "compiled/kernels/aiv/mlp_out_cast.cpp": "0ad35dba2abdad288a06cd57149f6242d708d8bdf52a130de326750174af2bcb",
+      "compiled/kernels/aiv/mlp_out_cast_0.cpp": "e9e120289296e66cd1bf0c4a183fd047764787e5aa805ff96c3db48d0f116377",
+      "compiled/kernels/aiv/mlp_out_seed.cpp": "e8a9024ef5f32ffff93eed4e4f8b2e84f5fce1f874c5719b519c619b8c0c6c47",
+      "compiled/kernels/aiv/out_proj_aiv.cpp": "bb985c05373b2288509d136582a6b2ca8f9c207df415bc0e313498fd9093845c",
+      "compiled/kernels/aiv/out_proj_aiv_0.cpp": "33b15fed228f48ffb6f01f7dfc7c732aa36285b87cfa119006caf9cef252023d",
+      "compiled/kernels/aiv/post_rmsnorm.cpp": "eae323d351ef4379aa24f6fdf116c84a917759a85d60309449d8cf1dc1cb8883",
+      "compiled/kernels/aiv/qk_pv_partial_merge.cpp": "35f6bfd4a68cae389bc958d7bc336259ca601e6b8568aae2e2b899448e203bc6",
+      "compiled/kernels/aiv/qk_pv_partial_plan_aiv.cpp": "dd2613b882b4a97446a42f61640eebb711d436de4b9ea2f13d7a277fea81271f",
+      "compiled/kernels/aiv/qk_pv_single_block_0_aiv.cpp": "252443ab88654e45afa8d331d6901f8fa558b91119c68889a6e02884b4bd71d0",
+      "compiled/kernels/aiv/qk_pv_single_block_aiv.cpp": "76f393c5e41ec631c6a5a39217de3dace6ba3b440153c6efafbf004d601e2fd9",
+      "compiled/kernels/aiv/qkpv_plan.cpp": "75f69c68d62a6e4202cd115ba7d6dbcaba5f83c94bef0a7d630edc59a5186fd3",
+      "compiled/kernels/aiv/rms_recip.cpp": "6b01deffac5c34612393fc42600a9bc413833058ebfab7d4922bf254f5a6c681",
+      "compiled/kernels/aiv/rms_recip_0.cpp": "5f5d018d8b2c944cb86273069cc23a0448971acc8350c0f52e070074bb639fc3",
+      "compiled/kernels/aiv/rope_kv_cache.cpp": "10b47b7a0638eae4994ae444a83e93c4582503a0ff0a4b2455f8fba0a9fcea62",
+      "compiled/kernels/aiv/save_prefill_last_token_group.cpp": "e18c16d807c5851099c463123ce2fa0847ccb3c99ca842b398e7c162d950f90e",
+      "compiled/kernels/aiv/save_prefill_last_token_single.cpp": "f05c146a3548f8319bb4e8e95713504d4c3f00db6ff0c7f5855ddec937ebd2c8",
+      "compiled/kernels/aiv/silu.cpp": "0dd6702c4d96efa861c0246aa141eb70b30715b86657cc9061a0c6f738feb5e5",
+      "compiled/kernels/aiv/token_embed_group.cpp": "b8d2a68ff71dfdf6941120f7f70794d503892b034f9e598ea7d2be8f75958abb",
+      "compiled/kernels/aiv/token_embed_single.cpp": "62630d4f4dd758a13faad3693a59c508deb4e8e8988b204e15b916cde135dcd8",
+      "compiled/kernels/aiv/x_gamma.cpp": "7d851b7624182bea2e67a02992d6f39bcaba124705530cd76c96f0f945799e41",
+      "compiled/kernels/aiv/x_gamma_0.cpp": "d69c2e2bd6c029eff80ea945f2abcbe967a82888398a469bc254daf4a006a27d"
+    },
+    "receipt": "build-py314/review-repairs-20261116/qwen-gm-staging-qualified/receipt.json",
+    "receipt_sha256": "3fcf47780eb9f7fcec8a39e3da58fd1f703a8d7169a83ad9f85d9630dda170fe",
+    "new_pypto_owners": [
+      "token_embed_single",
+      "token_embed_group"
+    ],
+    "previous_local_counts": {
+      "pypto_owned": 17,
+      "delegated": 15
+    },
+    "qualification": "Passed required ownership expectations, all32 leaf C++ files generated. Local19/13 does not establish complete whole-model ownership."
+  },
+  "environment": {
+    "loader": ".claude/skills/testing/load-env.sh",
+    "explicit_workers": 1,
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "capture_environment": {
+      "PYTHONPATH": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/codegen:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106",
+      "PTOAS_ROOT": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher",
+      "OMP_NUM_THREADS": "1",
+      "PYPTO_CODEGEN_MAX_WORKERS": "1"
+    },
+    "ptoas": {
+      "path": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher/ptoas",
+      "hash": "8b52c0bfe3259f37dd17331ec0b8ee534461f18e70042edce0e2b6ee2fd7adf8",
+      "version": "ptoas 0.72",
+      "additional_artifacts": {
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so": "86655444ce6e3470dbbbf061438046bc5f87c5f0f89f4145fd2a4340c8fd70e9",
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so": "0aa83ba0abbd3432c2ce9ecb6c854485b5502d51b181fa200ee87fd9254ea321"
+      }
+    }
+  },
+  "remaining_first_admission_diagnostics": {
+    "type_layout / Var": [
+      "lm_head",
+      "qk_pv_partial_plan_aic",
+      "qk_pv_partial_plan_aiv",
+      "qk_pv_single_block_0_aic",
+      "qk_pv_single_block_0_aiv",
+      "qk_pv_single_block_aic",
+      "qk_pv_single_block_aiv"
+    ],
+    "operation_recipe / tile.add": [
+      "out_proj_aiv",
+      "out_proj_aiv_0",
+      "rms_recip",
+      "rms_recip_0"
+    ],
+    "operation_recipe / tensor.write": [
+      "qkpv_plan"
+    ],
+    "operation_recipe / tile.reshape": [
+      "rope_kv_cache"
+    ]
+  },
+  "remaining_cause_qualification": {
+    "lm_head": "Acc row-trim descriptor adapter; separate design46, not yet implemented here.",
+    "six_qk_pv_leaves": "Existing mixed-peer GM pipe-buffer type not admitted; no new peer protocol construction requested.",
+    "qkpv_plan": "Scalar tensor.write operation recipe remains unsupported.",
+    "rope_kv_cache": "Tile.reshape recipe remains unsupported at first refusal.",
+    "four_ADD_leaves": "Mixed-valid value/metadata obligations; no silent narrowing or assumed initialized padding."
+  },
+  "cost_scope": "Static read-site recipe remains compact in runtime indices and visits. Single inclusive Qwen compilation time is descriptive and is not an analysis-only cost or device speedup.",
+  "final_broad_green_claim": false
 }

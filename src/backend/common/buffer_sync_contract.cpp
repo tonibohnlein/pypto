@@ -24,6 +24,7 @@
 #include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
+#include "pypto/backend/common/buffer_scalar_recipes.h"
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/pto_native_ops.h"
 #include "pypto/core/logging.h"
@@ -92,6 +93,16 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
     result.audited_signal_free_variant_ = true;
   } else if (IsOp(call, "buffer.load") || IsOp(call, "buffer.store")) {
     const bool load = IsOp(call, "buffer.load");
+    if (const auto tensor = As<ir::TensorType>(call->args_[load ? 0 : 3]->GetType());
+        tensor && tensor->shape_.size() == 1) {
+      CHECK(load && core == FunctionType::AIV && target == "a2a3" &&
+            SupportsBufferScalarTransfer(call->args_))
+          << "Rank-one scalar DMA requires the qualified A2/A3 AIV INT32 point-transfer contract";
+      // Native DMA reads one GM element and may write a dummy alignment tail
+      // inside the complete 32-byte carrier. Conservative import covers that
+      // entire Vec domain; no exact physical selector is granted here.
+      result.audited_signal_free_variant_ = true;
+    }
     const auto local = As<BufferType>(call->args_[load ? 3 : 0]->GetType());
     CHECK(local && (local->memory_space_ == MemorySpace::Vec ||
                     local->memory_space_ == (load ? MemorySpace::Mat : MemorySpace::Acc)))

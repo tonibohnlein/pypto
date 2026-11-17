@@ -52,6 +52,7 @@
 #include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/buffer_active_domain_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_indexed_analysis.h"
+#include "pypto/ir/transforms/utils/buffer_scalar_staging.h"
 #include "pypto/ir/transforms/utils/buffer_tuple_results.h"
 #include "pypto/ir/transforms/utils/buffer_valid_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_view_analysis.h"
@@ -179,6 +180,7 @@ class BufferKernelSupport : public IRVisitor {
           admission.Require(QualifySlot(tile, memory), BufferAdmissionProperty::SlotGeometry);
       }
     } else if (auto tensor = As<TensorType>(type)) {
+      if (backend::IsBufferScalarGMSource(tensor)) return;
       admission.Require(
           backend::IsBufferTensorShape(tensor->shape_) &&
               (backend::IsDenseBufferTransferDtype(tensor->dtype_) || tensor->dtype_ == DataType::INT8),
@@ -497,6 +499,9 @@ class BufferKernelSupport : public IRVisitor {
       has_load = true;
       CheckTransferParameter(call, 0, true);
       CheckTransferTypes(call, true);
+      if (const auto source = As<TensorType>(call->args_[0]->GetType()); source && source->shape_.size() == 1)
+        admission.Require(backend::SupportsLogicalBufferScalarTransfer(call),
+                          BufferAdmissionProperty::TransferTypes);
       admission.Require(GetIntKwarg(call->kwargs_, "cache", 0) == 0,
                         BufferAdmissionProperty::OperationRecipe);
     } else if (IsOp(call, "tile.store")) {
@@ -789,8 +794,9 @@ class BufferKernelSupport : public IRVisitor {
     // DN-to-DN preserves packed singleton columns. A column into a wider
     // ND tensor still needs a separate layout/footprint construction.
     const auto tensor_columns = As<ConstInt>(tensor->shape_.back());
-    if (backend::IsColumnVectorBufferTile(tile, tile_view_semantics::GetEffectiveTileView(*tile)) ||
-        (tensor_columns && tensor_columns->value_ == 1)) {
+    if (!backend::SupportsLogicalBufferScalarTransfer(call) &&
+        (backend::IsColumnVectorBufferTile(tile, tile_view_semantics::GetEffectiveTileView(*tile)) ||
+         (tensor_columns && tensor_columns->value_ == 1))) {
       admission.Require(
           backend::SupportsPackedColumnBufferTransfer(tensor, backend::StaticLogicalBufferDescriptor(tile)),
           BufferAdmissionProperty::TransferTypes);
@@ -1023,6 +1029,12 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper
     // candidate; they do not weaken whole-function recipe/storage admission.
     // In particular, no normalized metadata escapes on the Functional route.
     function = NormalizeBufferActiveDomains(original).Candidate();
+    // Staging changes the selected native implementation and is initially
+    // explicit/default-off. Ordinary whole-function admission must accept the
+    // complete candidate, otherwise the original Functional body is retained.
+    if (context && context->GetEnablePyptoAutoSync() &&
+        context->GetAutoSyncPolicy() == "conservative_prefix" && function->func_type_ == FunctionType::AIV)
+      function = StageBufferScalarReads(function);
   }
   BufferKernelSupport support(function);
   auto function_context = support.admission.At(function.get());

@@ -170,6 +170,12 @@ TypePtr DeduceBufferTransfer(const std::vector<ExprPtr>& args, bool load) {
   auto tensor = As<TensorType>(args[load ? 0 : 3]->GetType());
   auto buffer = As<BufferType>(args[load ? 3 : 0]->GetType());
   CHECK(tensor && buffer) << name << " requires an ordinary GM TensorType and a BufferType";
+  if (tensor->shape_.size() == 1) {
+    CHECK(load && backend::SupportsBufferScalarTransfer(args))
+        << "Rank-one Buffer transfers require a qualified INT32 point load into a private 32-byte Vec "
+           "carrier";
+    return GetVoidType();
+  }
   CHECK(tensor->shape_.size() == 2 && buffer->shape_.size() == 2)
       << name << " requires rank-2 tensor and buffer operands";
   CheckTransferEndpoints(*tensor, *buffer, load, name);

@@ -343,6 +343,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/acc_init_builder.cpp
     src/ir/transforms/utils/narrow_loop_carry.cpp
     src/ir/transforms/utils/buffer_active_domain_analysis.cpp
+    src/ir/transforms/utils/buffer_scalar_staging.cpp
     src/ir/transforms/utils/buffer_root_collector.cpp
     src/ir/transforms/utils/core_affinity.cpp
     src/ir/transforms/utils/core_side_ops.cpp

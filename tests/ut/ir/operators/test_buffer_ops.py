@@ -187,7 +187,9 @@ def test_gm_transfer_contract_exposes_window_and_memory_effects(name):
 @pytest.mark.parametrize(
     "field,value,message",
     [
-        ("tensor", ir.TensorType([32], DataType.FP32), "rank-2"),
+        # Rank-one transfers have a distinct INT32 point-load contract; this
+        # FP32 source still refuses for both load and store.
+        ("tensor", ir.TensorType([32], DataType.FP32), "qualified INT32 point load"),
         ("tensor", ir.TensorType([32, 64], DataType.FP16), "matching"),
         ("buffer", ir.BufferType([32], DataType.FP32, ir.Mem.Vec), "rank-2"),
         ("buffer", ir.BufferType([16, 32], DataType.FP16, ir.Mem.Vec), "matching"),
