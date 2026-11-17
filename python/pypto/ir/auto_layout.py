@@ -355,6 +355,7 @@ class LayoutCostModel:
     gm_pack_bytes_per_cycle: float = 64.0
     gm_pack_fixed_cycles: float = 120.0
     onchip_relayout_bytes_per_cycle: float = 256.0
+    allow_external_input_relayout: bool = True
     allow_external_output_relayout: bool = False
 
     @property
@@ -411,6 +412,14 @@ class LayoutCostModel:
     ) -> bool:
         """Check whether `tile.load` with `(src_layout, dst_layout)` is backend-legal."""
         if dst_node.memory_space == core_ir.MemorySpace.Mat:
+            if src_layout == core_ir.TensorLayout.NZ:
+                if not is_nz_compatible_shape(dst_node.shape, dst_node.dtype):
+                    return False
+                c0 = c0_elements(dst_node.dtype)
+                if c0 > 0 and len(dst_node.shape) >= 2 and len(src_node.shape) >= 2:
+                    col_blocks = dst_node.shape[-1] // c0
+                    if col_blocks > 1 and (src_node.shape[-2] - dst_node.shape[-2]) > 65535:
+                        return False
             return src_layout in (core_ir.TensorLayout.ND, core_ir.TensorLayout.NZ) and (
                 dst_layout == dst_node.current_layout
             )
@@ -437,7 +446,7 @@ class LayoutCostModel:
             src_node.memory_space == core_ir.MemorySpace.Mat
             and dst_node.memory_space == core_ir.MemorySpace.Right
         ):
-            return src_layout == FRACTAL_ZN and dst_layout == FRACTAL_ZN
+            return src_layout == src_node.current_layout and dst_layout == FRACTAL_ZN
         return True
 
     def required_input_tile_layout(self, op_name: str, input_index: int) -> core_ir.TileLayout | None:
@@ -484,19 +493,18 @@ class LayoutCostModel:
             parent_cols = src_node.shape[-1] if len(src_node.shape) >= 1 else cols
             bpe = _dtype_byte_width(dst_node.dtype)
             row_bytes = cols * bpe
-            parent_row_bytes = parent_cols * bpe
             gran_b = float(max(1, self.gm_access_granularity_bytes()))
-            wide_strided = (cols < parent_cols) and (parent_row_bytes > self.l2_cache_line_bytes)
+            strided = cols < parent_cols
             nd_bw = (
                 self.mte2_nd2nz_bytes_per_cycle
-                if wide_strided
+                if strided
                 else max(self.mte2_nd2nz_bytes_per_cycle, self.mte2_nd2nz_contiguous_bytes_per_cycle)
             )
             c0 = c0_elements(dst_node.dtype)
             col_blocks = max(1, (cols + c0 - 1) // c0)
             sub512_penalty = (
                 rows * max(0.0, (gran_b - float(row_bytes)) / gran_b) * self.mte2_nd2nz_sub512b_penalty_cycles
-                if wide_strided
+                if strided
                 else 0.0
             )
             return (
@@ -697,11 +705,11 @@ _TILE_MATMUL_OPS = frozenset(
 )
 
 
-_SSA_SUFFIX_RE = re.compile(r"__ssa_v\d+")
+_SSA_SUFFIX_RE = re.compile(r"__(?:ssa|rv|iter|idx)_v\d+")
 
 
 def _clean_ssa_name(name_hint: str) -> str:
-    """Strip compiler SSA suffixes (`__ssa_v0`) for human-readable value names."""
+    """Strip compiler SSA suffixes (`__ssa_v0`, `__rv_v2`, `__iter_v1`) for canonical value names."""
     return _SSA_SUFFIX_RE.sub("", name_hint)
 
 
@@ -734,6 +742,12 @@ def _effective_tile_layout(tile_type: core_ir.TileType) -> TileLayoutDesc:
     space = tile_type.memory_space
     view = tile_type.tile_view
     if view is not None:
+        if space in (core_ir.MemorySpace.Mat, core_ir.MemorySpace.Left) and (
+            view.slayout == core_ir.TileLayout.none_box
+        ):
+            return FRACTAL_NZ
+        if space == core_ir.MemorySpace.Right and view.slayout == core_ir.TileLayout.none_box:
+            return FRACTAL_ZN
         return TileLayoutDesc(view.blayout, view.slayout, int(view.fractal))
     if space in (core_ir.MemorySpace.Mat, core_ir.MemorySpace.Left):
         return FRACTAL_NZ
@@ -794,17 +808,68 @@ def run_post_layout_passes(program: core_ir.Program) -> core_ir.Program:
     return pipe.run(program)
 
 
-def _for_trip_count(op: core_ir.ForStmt) -> int:
-    """Return constant trip count of *op* when static, otherwise 1."""
-    if (
-        isinstance(op.start, core_ir.ConstInt)
-        and isinstance(op.stop, core_ir.ConstInt)
-        and isinstance(op.step, core_ir.ConstInt)
-        and int(op.step.value) > 0
-    ):
-        span = int(op.stop.value) - int(op.start.value)
-        step = int(op.step.value)
-        return max(1, (span + step - 1) // step)
+def _eval_scalar_expr(
+    expr: object,
+    scalar_defs: Mapping[int, core_ir.Expr] | None = None,
+    default_dyn: int = 128,
+) -> int | None:
+    """Evaluate a scalar IR expression to a positive integer when possible."""
+    if isinstance(expr, int):
+        return max(1, expr)
+    if isinstance(expr, core_ir.ConstInt):
+        return int(expr.value)
+    if isinstance(expr, core_ir.Var):
+        if scalar_defs is not None and expr.unique_id in scalar_defs:
+            return _eval_scalar_expr(scalar_defs[expr.unique_id], scalar_defs, default_dyn)
+        hint_upper = expr.name_hint.upper()
+        if any(tok in hint_upper for tok in ("DYN", "TOKEN", "ROW", "BATCH", "SEQ")):
+            return default_dyn
+        return None
+    if isinstance(expr, core_ir.Add):
+        lhs = _eval_scalar_expr(expr.left, scalar_defs, default_dyn)
+        rhs = _eval_scalar_expr(expr.right, scalar_defs, default_dyn)
+        return (lhs + rhs) if (lhs is not None and rhs is not None) else None
+    if isinstance(expr, core_ir.Sub):
+        lhs = _eval_scalar_expr(expr.left, scalar_defs, default_dyn)
+        rhs = _eval_scalar_expr(expr.right, scalar_defs, default_dyn)
+        return max(0, lhs - rhs) if (lhs is not None and rhs is not None) else None
+    if isinstance(expr, core_ir.Mul):
+        lhs = _eval_scalar_expr(expr.left, scalar_defs, default_dyn)
+        rhs = _eval_scalar_expr(expr.right, scalar_defs, default_dyn)
+        return (lhs * rhs) if (lhs is not None and rhs is not None) else None
+    if isinstance(expr, core_ir.FloorDiv):
+        lhs = _eval_scalar_expr(expr.left, scalar_defs, default_dyn)
+        rhs = _eval_scalar_expr(expr.right, scalar_defs, default_dyn)
+        return (lhs // max(1, rhs)) if (lhs is not None and rhs is not None and rhs > 0) else None
+    if isinstance(expr, core_ir.Min):
+        lhs = _eval_scalar_expr(expr.left, scalar_defs, default_dyn)
+        rhs = _eval_scalar_expr(expr.right, scalar_defs, default_dyn)
+        return min(lhs, rhs) if (lhs is not None and rhs is not None) else None
+    if isinstance(expr, core_ir.Max):
+        lhs = _eval_scalar_expr(expr.left, scalar_defs, default_dyn)
+        rhs = _eval_scalar_expr(expr.right, scalar_defs, default_dyn)
+        return max(lhs, rhs) if (lhs is not None and rhs is not None) else None
+    return None
+
+
+def _for_trip_count(
+    op: core_ir.ForStmt,
+    scalar_defs: Mapping[int, core_ir.Expr] | None = None,
+) -> int:
+    """Return estimated trip count of *op* (supporting static and grid-stride bounds)."""
+    step_val = _eval_scalar_expr(op.step, scalar_defs)
+    if step_val is None or step_val <= 0:
+        return 1
+    stop_val = _eval_scalar_expr(op.stop, scalar_defs)
+    if stop_val is None or stop_val <= 0:
+        return 1
+    start_val = _eval_scalar_expr(op.start, scalar_defs)
+    if start_val is not None:
+        span = max(0, stop_val - start_val)
+        return max(1, (span + step_val - 1) // step_val)
+    # Grid-stride loop `for i in range(worker_id, STOP, STEP)` where `0 <= worker_id < STEP`.
+    if isinstance(op.start, core_ir.Var):
+        return max(1, (stop_val + step_val - 1) // step_val)
     return 1
 
 
@@ -828,16 +893,24 @@ class _OrchCallMultiplierVisitor:
         self._func_by_name = func_by_name or {}
         self._mult = 1
         self._alias_by_uid: dict[int, str] = {}
+        self._tuple_aliases: dict[int, list[str | None]] = {}
+        self._scalar_defs: dict[int, core_ir.Expr] = {}
+        self._var_steps: dict[int, int] = {}
         self.call_counts: dict[str, int] = {}
         self.call_arg_names: dict[str, list[str | None]] = {}
         self.call_sites: dict[str, list[tuple[list[str | None], int]]] = {}
         self.call_order: dict[str, int] = {}
+        self.param_steps: dict[tuple[str, int], int] = {}
+        self.reshaped_names: set[str] = set()
+        self.internal_buffers: set[str] = set()
 
     def walk(self, func: core_ir.Function) -> None:
         caller_args = self.call_arg_names.get(func.name, [])
         for idx, param in enumerate(func.params):
             override = caller_args[idx] if idx < len(caller_args) else None
             self._alias_by_uid[param.unique_id] = override or _clean_ssa_name(param.name_hint)
+            if (func.name, idx) in self.param_steps:
+                self._var_steps[param.unique_id] = self.param_steps[(func.name, idx)]
         prev_mult = self._mult
         self._mult = self.call_counts.get(func.name, 1)
         try:
@@ -850,40 +923,75 @@ class _OrchCallMultiplierVisitor:
             return None
         return self._alias_by_uid.get(expr.unique_id, _clean_ssa_name(expr.name_hint))
 
+    def _call_core_multiplier(self, expr: core_ir.Call | core_ir.Submit) -> int:
+        if isinstance(expr, core_ir.Submit):
+            val = _eval_scalar_expr(expr.core_num, self._scalar_defs)
+            return max(1, val) if val is not None else 1
+        if expr.attrs and "core_num" in expr.attrs:
+            val = _eval_scalar_expr(expr.attrs["core_num"], self._scalar_defs)
+            return max(1, val) if val is not None else 1
+        return 1
+
+    def _record_global_call(
+        self,
+        expr: core_ir.Call | core_ir.Submit,
+        name: str,
+        assign_var: core_ir.Var | None,
+    ) -> None:
+        call_mult = self._mult * self._call_core_multiplier(expr)
+        self.call_order.setdefault(name, len(self.call_order))
+        self.call_counts[name] = self.call_counts.get(name, 0) + call_mult
+        resolved = [self._resolve_arg_name(arg) for arg in expr.args]
+        self.call_arg_names.setdefault(name, resolved)
+        for p_idx, arg in enumerate(expr.args):
+            if isinstance(arg, core_ir.Var) and arg.unique_id in self._var_steps:
+                step = self._var_steps[arg.unique_id]
+                prev_step = self.param_steps.get((name, p_idx))
+                self.param_steps[(name, p_idx)] = math.gcd(prev_step, step) if prev_step is not None else step
+        sites = self.call_sites.setdefault(name, [])
+        for idx, (prev_args, prev_mult) in enumerate(sites):
+            if prev_args == resolved:
+                sites[idx] = (prev_args, prev_mult + call_mult)
+                break
+        else:
+            sites.append((resolved, call_mult))
+        if assign_var is not None:
+            callee = self._func_by_name.get(name)
+            if callee is not None:
+                out_names = [
+                    arg_name
+                    for arg_name, direction in zip(resolved, callee.param_directions, strict=True)
+                    if direction in (core_ir.ParamDirection.Out, core_ir.ParamDirection.InOut)
+                ]
+                self._tuple_aliases[assign_var.unique_id] = out_names
+                if len(out_names) == 1 and out_names[0] is not None:
+                    self._alias_by_uid[assign_var.unique_id] = out_names[0]
+
     def _record_calls(self, expr: core_ir.Expr, assign_var: core_ir.Var | None = None) -> None:
-        if isinstance(expr, core_ir.Call):
+        if assign_var is not None and isinstance(assign_var.type, core_ir.ScalarType):
+            self._scalar_defs[assign_var.unique_id] = expr
+
+        if isinstance(expr, (core_ir.Call, core_ir.Submit)):
             if isinstance(expr.op, core_ir.GlobalVar):
-                name = expr.op.name
-                self.call_order.setdefault(name, len(self.call_order))
-                self.call_counts[name] = self.call_counts.get(name, 0) + self._mult
-                resolved = [self._resolve_arg_name(arg) for arg in expr.args]
-                self.call_arg_names.setdefault(name, resolved)
-                sites = self.call_sites.setdefault(name, [])
-                for idx, (prev_args, prev_mult) in enumerate(sites):
-                    if prev_args == resolved:
-                        sites[idx] = (prev_args, prev_mult + self._mult)
-                        break
-                else:
-                    sites.append((resolved, self._mult))
-                if assign_var is not None:
-                    callee = self._func_by_name.get(name)
-                    if callee is not None:
-                        for arg_name, direction in zip(resolved, callee.param_directions, strict=True):
-                            if (
-                                direction in (core_ir.ParamDirection.Out, core_ir.ParamDirection.InOut)
-                                and arg_name is not None
-                            ):
-                                self._alias_by_uid[assign_var.unique_id] = arg_name
-                                break
-            elif assign_var is not None and expr.op.name == _TENSOR_CREATE_OP:
-                self._alias_by_uid[assign_var.unique_id] = _clean_ssa_name(assign_var.name_hint)
-            elif (
-                assign_var is not None and expr.op.name in (_TENSOR_RESHAPE_OP, _TENSOR_VIEW_OP) and expr.args
-            ):
-                src_alias = self._resolve_arg_name(expr.args[0])
-                self._alias_by_uid[assign_var.unique_id] = src_alias or _clean_ssa_name(assign_var.name_hint)
+                self._record_global_call(expr, expr.op.name, assign_var)
+            elif isinstance(expr, core_ir.Call) and assign_var is not None:
+                if expr.op.name == _TENSOR_CREATE_OP:
+                    buf_name = _clean_ssa_name(assign_var.name_hint)
+                    self._alias_by_uid[assign_var.unique_id] = buf_name
+                    self.internal_buffers.add(buf_name)
+                elif expr.op.name in (_TENSOR_RESHAPE_OP, _TENSOR_VIEW_OP) and expr.args:
+                    src_alias = self._resolve_arg_name(expr.args[0])
+                    resolved_alias = src_alias or _clean_ssa_name(assign_var.name_hint)
+                    self._alias_by_uid[assign_var.unique_id] = resolved_alias
+                    self.reshaped_names.add(resolved_alias)
             for arg in expr.args:
                 self._record_calls(arg)
+        elif assign_var is not None and isinstance(expr, core_ir.TupleGetItemExpr):
+            if isinstance(expr.tuple, core_ir.Var):
+                out_list = self._tuple_aliases.get(expr.tuple.unique_id)
+                idx = int(expr.index)
+                if out_list is not None and 0 <= idx < len(out_list) and out_list[idx] is not None:
+                    self._alias_by_uid[assign_var.unique_id] = out_list[idx] or ""
         elif assign_var is not None and isinstance(expr, core_ir.Var):
             alias = self._resolve_arg_name(expr)
             if alias is not None:
@@ -891,6 +999,16 @@ class _OrchCallMultiplierVisitor:
 
     def _walk_stmt(self, stmt: core_ir.Stmt) -> None:
         if isinstance(stmt, core_ir.ForStmt):
+            start_val = _eval_scalar_expr(stmt.start, self._scalar_defs)
+            step_val = _eval_scalar_expr(stmt.step, self._scalar_defs)
+            if (
+                start_val is not None
+                and start_val >= 0
+                and step_val is not None
+                and step_val > 0
+                and start_val % step_val == 0
+            ):
+                self._var_steps[stmt.loop_var.unique_id] = step_val
             for iter_arg in stmt.iter_args:
                 init_val = getattr(iter_arg, "initValue", None)
                 if isinstance(init_val, core_ir.Expr):
@@ -898,7 +1016,7 @@ class _OrchCallMultiplierVisitor:
                     if alias is not None:
                         self._alias_by_uid[iter_arg.unique_id] = alias
             prev = self._mult
-            self._mult = prev * _for_trip_count(stmt)
+            self._mult = prev * _for_trip_count(stmt, self._scalar_defs)
             try:
                 self._walk_stmt(stmt.body)
             finally:
@@ -921,12 +1039,14 @@ class _OrchCallMultiplierVisitor:
 class _PostInferInstanceExtractor:
     """Extract `LayoutValueNode`s and `LayoutOperationNode`s from post-Pass-22 IR."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         cost_model: LayoutCostModel,
         reusable_tensors: set[str],
         *,
         external_out_names: set[str] | None = None,
+        reshaped_names: set[str] | None = None,
+        internal_buffers: set[str] | None = None,
         shared_values: dict[str, LayoutValueNode] | None = None,
         consumed_values: set[str] | None = None,
         op_offset: int = 0,
@@ -937,11 +1057,14 @@ class _PostInferInstanceExtractor:
         self._model = cost_model
         self._reusable = reusable_tensors
         self._external_out_names = external_out_names
+        self._reshaped_names = reshaped_names or set()
+        self._internal_buffers = internal_buffers or set()
         self._tile_prefix = tile_prefix
         self.values: dict[str, LayoutValueNode] = dict(shared_values) if shared_values else {}
         self.consumed_values: set[str] = set(consumed_values) if consumed_values else set()
         self.operations: list[LayoutOperationNode] = []
         self._uid_to_name: dict[int, str] = {}
+        self._scalar_defs: dict[int, core_ir.Expr] = {}
         self._op_counter = op_offset
         self._loop_multiplier = max(1, call_multiplier)
         self._yield_stack: list[list[int]] = []
@@ -955,7 +1078,7 @@ class _PostInferInstanceExtractor:
         for idx, (param, direction) in enumerate(zip(func.params, func.param_directions, strict=True)):
             if not isinstance(param.type, core_ir.TensorType):
                 continue
-            shape, _is_static = _tensor_shape_with_dynamic_fallback(param.type.shape)
+            shape, is_static = _tensor_shape_with_dynamic_fallback(param.type.shape)
             if not shape:
                 continue
             override = self._param_overrides[idx] if idx < len(self._param_overrides) else None
@@ -969,8 +1092,20 @@ class _PostInferInstanceExtractor:
                 is_ext_out = name in self._external_out_names
             else:
                 is_ext_out = direction in (core_ir.ParamDirection.Out, core_ir.ParamDirection.InOut)
+            is_reusable = name in self._reusable or param.name_hint in self._reusable
+            allow_nz = (
+                is_static
+                and name not in self._reshaped_names
+                and is_nz_compatible_shape(shape, param.type.dtype)
+                and (
+                    self._model.allow_external_input_relayout
+                    or is_reusable
+                    or is_ext_out
+                    or name in self._internal_buffers
+                )
+            )
             admissible: tuple[LayoutChoice, ...]
-            if is_nz_compatible_shape(shape, param.type.dtype):
+            if allow_nz:
                 admissible = (core_ir.TensorLayout.ND, core_ir.TensorLayout.NZ)
             else:
                 admissible = (cur_layout,)
@@ -982,7 +1117,7 @@ class _PostInferInstanceExtractor:
                 current_layout=cur_layout,
                 admissible_layouts=admissible,
                 producer_op_id=None,
-                is_reusable_weight=(name in self._reusable or param.name_hint in self._reusable),
+                is_reusable_weight=is_reusable,
                 is_external_output=is_ext_out,
             )
         self._walk_stmt(func.body)
@@ -1382,6 +1517,8 @@ class _PostInferInstanceExtractor:
         )
 
     def _walk_assign_stmt(self, op: core_ir.AssignStmt) -> None:
+        if isinstance(op.var.type, core_ir.ScalarType):
+            self._scalar_defs[op.var.unique_id] = op.value
         rhs = op.value
         if isinstance(rhs, core_ir.Call):
             op_name = rhs.op.name
@@ -1411,7 +1548,7 @@ class _PostInferInstanceExtractor:
                 self._uid_to_name[iter_arg.unique_id] = self._uid_to_name[init_val.unique_id]
         self._yield_stack.append([])
         prev_mult = self._loop_multiplier
-        self._loop_multiplier = prev_mult * _for_trip_count(op)
+        self._loop_multiplier = prev_mult * _for_trip_count(op, self._scalar_defs)
         try:
             self._walk_stmt(op.body)
         finally:
@@ -1471,20 +1608,23 @@ def extract_layout_instance(
     incore_funcs = [f for f in program.functions.values() if core_ir.is_incore_type(f.func_type)]
     non_incore_funcs = [f for f in program.functions.values() if not core_ir.is_incore_type(f.func_type)]
     ext_out_names: set[str] | None = None
+    reshaped_names: set[str] = set()
+    internal_buffers: set[str] = set()
     call_counts: dict[str, int] = {}
     call_arg_names: dict[str, list[str | None]] = {}
     call_sites: dict[str, list[tuple[list[str | None], int]]] = {}
     if non_incore_funcs:
+        top_orch = [f for f in non_incore_funcs if str(f.func_type).endswith("Orchestration")]
+        sub_orch = [f for f in non_incore_funcs if not str(f.func_type).endswith("Orchestration")]
+        entry_orch = top_orch if top_orch else non_incore_funcs
         ext_out_names = {
             _clean_ssa_name(p.name_hint)
-            for fn in non_incore_funcs
+            for fn in entry_orch
             for p, d in zip(fn.params, fn.param_directions, strict=True)
             if d in (core_ir.ParamDirection.Out, core_ir.ParamDirection.InOut)
         }
         func_by_name = {f.name: f for f in program.functions.values()}
         call_counter = _OrchCallMultiplierVisitor(func_by_name)
-        top_orch = [f for f in non_incore_funcs if str(f.func_type).endswith("Orchestration")]
-        sub_orch = [f for f in non_incore_funcs if not str(f.func_type).endswith("Orchestration")]
         for fn in top_orch:
             call_counter.walk(fn)
         sub_orch.sort(key=lambda fn: call_counter.call_order.get(fn.name, 10**9))
@@ -1493,6 +1633,8 @@ def extract_layout_instance(
         call_counts = call_counter.call_counts
         call_arg_names = call_counter.call_arg_names
         call_sites = call_counter.call_sites
+        reshaped_names = call_counter.reshaped_names
+        internal_buffers = call_counter.internal_buffers
         incore_funcs.sort(key=lambda fn: call_counter.call_order.get(fn.name, 10**9))
 
     multi_incore = len(incore_funcs) > 1
@@ -1506,6 +1648,8 @@ def extract_layout_instance(
                     model,
                     reusable,
                     external_out_names=ext_out_names,
+                    reshaped_names=reshaped_names,
+                    internal_buffers=internal_buffers,
                     shared_values=values,
                     consumed_values=consumed_values,
                     op_offset=op_offset,
@@ -1525,6 +1669,8 @@ def extract_layout_instance(
             model,
             reusable,
             external_out_names=ext_out_names,
+            reshaped_names=reshaped_names,
+            internal_buffers=internal_buffers,
             shared_values=values,
             consumed_values=consumed_values,
             op_offset=op_offset,
@@ -1537,6 +1683,32 @@ def extract_layout_instance(
         consumed_values = extractor.consumed_values
         operations.extend(extractor.operations)
         op_offset = extractor.op_counter
+
+    # A GM tensor in the IR can only be rewritten to `TensorLayout.NZ` if every
+    # operation that reads or writes it has at least one `NZ`-compatible config.
+    for val_name, val_node in list(values.items()):
+        if (
+            val_node.memory_space != core_ir.MemorySpace.DDR
+            or core_ir.TensorLayout.NZ not in val_node.admissible_layouts
+        ):
+            continue
+        nz_supported = True
+        for op in operations:
+            for in_idx, inp_name in enumerate(op.inputs):
+                if inp_name == val_name and not any(
+                    cfg.input_layouts[in_idx] == core_ir.TensorLayout.NZ for cfg in op.configs
+                ):
+                    nz_supported = False
+                    break
+            if not nz_supported:
+                break
+            if op.output == val_name and not any(
+                cfg.output_layout == core_ir.TensorLayout.NZ for cfg in op.configs
+            ):
+                nz_supported = False
+                break
+        if not nz_supported:
+            values[val_name] = replace(val_node, admissible_layouts=(val_node.current_layout,))
 
     filtered_operations: list[LayoutOperationNode] = []
     for op in operations:
@@ -1816,28 +1988,6 @@ def _with_tensor_layout(tensor_type: core_ir.TensorType, layout: core_ir.TensorL
     return TensorType(tensor_type.shape, tensor_type.dtype, tensor_type.memref, new_view)
 
 
-def _with_tile_layout(tile_type: core_ir.TileType, desc: TileLayoutDesc) -> core_ir.TileType:
-    if _effective_tile_layout(tile_type) == desc:
-        return tile_type
-    old_view = tile_type.tile_view
-    valid_shape = list(old_view.valid_shape) if (old_view and old_view.valid_shape) else list(tile_type.shape)
-    stride = list(old_view.stride) if old_view else []
-    start_offset = old_view.start_offset if old_view else None
-    pad = old_view.pad if old_view else core_ir.PadValue.null
-    compact = old_view.compact if old_view else core_ir.CompactMode.null
-    new_view = TileView(
-        valid_shape=valid_shape,
-        stride=stride,
-        start_offset=start_offset,
-        blayout=desc.blayout,
-        slayout=desc.slayout,
-        fractal=desc.fractal,
-        pad=pad,
-        compact=compact,
-    )
-    return TileType(tile_type.shape, tile_type.dtype, tile_type.memref, new_view, tile_type.memory_space)
-
-
 class _LayoutAssignmentWriter(core_ir.IRMutator):
     """Write a `LayoutAssignment` (both GM `TensorLayout` and on-chip `TileLayoutDesc`) back to IR."""
 
@@ -1846,6 +1996,7 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         self._tensor_layouts = assignment.tensor_layouts
         self._tile_layouts = assignment.tile_layouts
         self._scoped_tensor_layouts: dict[tuple[str, str], core_ir.TensorLayout] = {}
+        self._param_steps: dict[tuple[str, int], int] = {}
         self._var_remap: dict[int, core_ir.Var] = {}
         self._func_return_types: dict[str, list[core_ir.Type]] = {}
         self._current_func_name = ""
@@ -1862,24 +2013,38 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         funcs = list(program.functions.values())
         incore_funcs = [f for f in funcs if core_ir.is_incore_type(f.func_type)]
         other_funcs = [f for f in funcs if not core_ir.is_incore_type(f.func_type)]
+        top_orch = [f for f in other_funcs if str(f.func_type).endswith("Orchestration")]
+        sub_orch = [f for f in other_funcs if not str(f.func_type).endswith("Orchestration")]
         func_by_name = {f.name: f for f in funcs}
         if other_funcs:
             visitor = _OrchCallMultiplierVisitor(func_by_name)
-            for fn in other_funcs:
+            for fn in top_orch:
                 visitor.walk(fn)
-            for callee_name, arg_names in visitor.call_arg_names.items():
+            sub_orch.sort(key=lambda fn: visitor.call_order.get(fn.name, 10**9))
+            for fn in sub_orch:
+                visitor.walk(fn)
+            self._param_steps = visitor.param_steps
+            for callee_name, sites in visitor.call_sites.items():
                 callee = func_by_name.get(callee_name)
-                if callee is None:
+                if callee is None or not sites:
                     continue
-                for param, arg_name in zip(callee.params, arg_names, strict=True):
-                    if arg_name is None:
-                        continue
-                    lay = self._tensor_layouts.get(arg_name)
-                    if lay is not None:
-                        self._scoped_tensor_layouts[(callee_name, _clean_ssa_name(param.name_hint))] = lay
+                for p_idx, param in enumerate(callee.params):
+                    site_layouts: set[TensorLayout] = set()
+                    for site_args, _ in sites:
+                        if p_idx < len(site_args):
+                            arg_name = site_args[p_idx]
+                            if arg_name is not None:
+                                lay = self._tensor_layouts.get(arg_name)
+                                if lay is not None:
+                                    site_layouts.add(lay)
+                    if len(site_layouts) == 1:
+                        chosen_lay = next(iter(site_layouts))
+                        self._scoped_tensor_layouts[(callee_name, _clean_ssa_name(param.name_hint))] = (
+                            chosen_lay
+                        )
 
         rewritten_by_name: dict[str, core_ir.Function] = {}
-        for func in incore_funcs + other_funcs:
+        for func in incore_funcs + sub_orch + top_orch:
             rewritten_by_name[func.name] = self.visit_function(func)
         new_funcs = [rewritten_by_name[f.name] for f in funcs]
         if all(nf.same_as(of) for nf, of in zip(new_funcs, funcs, strict=True)):
@@ -1894,11 +2059,34 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
                 return scoped
         return self._tile_layouts.get(clean_name, self._tile_layouts.get(name_hint))
 
+    def _build_aligned_param_prologue(
+        self,
+        func_name: str,
+        new_params: Sequence[tuple[core_ir.Var, core_ir.ParamDirection]],
+    ) -> list[core_ir.Stmt]:
+        prologue_stmts: list[core_ir.Stmt] = []
+        for p_idx, (param, _) in enumerate(new_params):
+            step = self._param_steps.get((func_name, p_idx))
+            if step is not None and step > 1 and step % 8 == 0 and isinstance(param.type, core_ir.ScalarType):
+                dt = param.type.dtype
+                c0 = core_ir.ConstInt(0, dt, param.span)
+                c_step = core_ir.ConstInt(step, dt, param.span)
+                max_expr = core_ir.Max(param, c0, dt, param.span)
+                div_expr = core_ir.FloorDiv(max_expr, c_step, dt, param.span)
+                aligned_expr = core_ir.Mul(div_expr, c_step, dt, param.span)
+                aligned_var = core_ir.Var(
+                    f"{_clean_ssa_name(param.name_hint)}_aligned", param.type, param.span
+                )
+                self._var_remap[param.unique_id] = aligned_var
+                prologue_stmts.append(core_ir.AssignStmt(aligned_var, aligned_expr, param.span))
+        return prologue_stmts
+
     def visit_function(self, func: core_ir.Function) -> core_ir.Function:
         self._var_remap.clear()
         self._current_func_name = func.name
         new_params: list[tuple[core_ir.Var, core_ir.ParamDirection]] = []
         changed = False
+        has_nz_param = False
         for param, direction in zip(func.params, func.param_directions, strict=True):
             target_layout = self._lookup_tensor_layout(param.name_hint)
             if (
@@ -1911,10 +2099,30 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
                 self._var_remap[param.unique_id] = new_param
                 new_params.append((new_param, direction))
                 changed = True
+                if target_layout == core_ir.TensorLayout.NZ:
+                    has_nz_param = True
             else:
                 new_params.append((param, direction))
+                if (
+                    isinstance(param.type, core_ir.TensorType)
+                    and _tensor_type_layout(param.type) == core_ir.TensorLayout.NZ
+                ):
+                    has_nz_param = True
+
+        prologue_stmts: list[core_ir.Stmt] = []
+        if has_nz_param and core_ir.is_incore_type(func.func_type):
+            prologue_stmts = self._build_aligned_param_prologue(func.name, new_params)
+            if prologue_stmts:
+                changed = True
 
         new_body = self.visit_stmt(func.body)
+        if prologue_stmts:
+            stmts = (
+                [*prologue_stmts, *new_body.stmts]
+                if isinstance(new_body, core_ir.SeqStmts)
+                else [*prologue_stmts, new_body]
+            )
+            new_body = core_ir.SeqStmts(stmts, new_body.span)
         new_return_types: list[core_ir.Type] = list(func.return_types)
         if len(new_return_types) == 1 and isinstance(new_return_types[0], core_ir.TensorType):
             for param, direction in new_params:
@@ -2009,11 +2217,6 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         ):
             if isinstance(new_value.type, (core_ir.TensorType, core_ir.TileType)):
                 new_var = core_ir.Var(op.var.name_hint, new_value.type, op.var.span)
-                self._var_remap[op.var.unique_id] = new_var
-        elif target_tile_desc is not None and isinstance(op.var.type, core_ir.TileType):
-            updated_type = _with_tile_layout(op.var.type, target_tile_desc)
-            if updated_type != op.var.type:
-                new_var = core_ir.Var(op.var.name_hint, updated_type, op.var.span)
                 self._var_remap[op.var.unique_id] = new_var
 
         if new_var.same_as(op.var) and new_value.same_as(op.value):

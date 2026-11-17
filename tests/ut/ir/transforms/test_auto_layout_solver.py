@@ -13,6 +13,7 @@ import itertools
 import random
 from dataclasses import replace
 
+import pypto.language as pl
 import pytest
 from pypto import DataType, ir
 from pypto.backend import BackendType, reset_for_testing, set_backend_type
@@ -649,6 +650,56 @@ def test_solve_auto_layout_dispatches_by_max_treewidth_and_shared_qkv_case():
         rewritten_qkv = solver_pass(pre_qkv)
         lowered_qkv = run_post_layout_passes(rewritten_qkv)
         assert len(lowered_qkv.functions) >= 1
+
+
+def test_outlined_parallel_b_trans_false_and_weights_only_relayout():
+    from pypto.ir.auto_layout_production_bench import _prepare_nd_baseline_program  # noqa: PLC0415
+
+    set_backend_type(BackendType.Ascend910)
+
+    @pl.jit
+    def tiled_gemm_b_trans_false(
+        x: pl.Tensor[[64, 256], pl.FP32],
+        w: pl.Tensor[[256, 256], pl.FP32],
+        y: pl.Out[pl.Tensor[[64, 256], pl.FP32]],
+    ) -> pl.Tensor[[64, 256], pl.FP32]:
+        for nb in pl.parallel(0, 256, 64):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gemm_tile"):
+                acc = pl.create_tensor([64, 64], dtype=pl.FP32)
+                for kb in pl.range(4):
+                    k0 = kb * 64
+                    tile_x = x[0:64, k0 : k0 + 64]
+                    tile_w = w[k0 : k0 + 64, nb : nb + 64]
+                    acc = pl.matmul_acc(acc, tile_x, tile_w, init_cond=(kb == 0))
+                y[0:64, nb : nb + 64] = acc
+        return y
+
+    program, _ = _prepare_nd_baseline_program(tiled_gemm_b_trans_false)
+    cost_model = LayoutCostModel(
+        expected_uses=100,
+        backend_type=BackendType.Ascend910,
+        allow_external_input_relayout=False,
+    )
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
+        pre = run_pre_layout_passes(program)
+        inst = extract_layout_instance(pre, cost_model=cost_model, reusable_tensors={"w"})
+        # External input `x` is restricted to ND when allow_external_input_relayout=False.
+        assert inst.values["x"].admissible_layouts == (ND,)
+        assert inst.values["w"].admissible_layouts == (ND, NZ)
+
+        res = solve_auto_layout(inst)
+        assert res.assignment.tensor_layouts["x"] == ND
+        assert res.assignment.tensor_layouts["w"] == NZ
+        assert res.writeback_issues == ()
+
+        rewritten = apply_layout_assignment(pre, res.assignment)
+        lowered = run_post_layout_passes(rewritten)
+        assert any(
+            param.type.tensor_view is not None and param.type.tensor_view.layout == NZ
+            for fn in lowered.functions.values()
+            for param in fn.params
+            if isinstance(param.type, ir.TensorType) and param.name_hint.startswith("w")
+        )
 
 
 if __name__ == "__main__":
