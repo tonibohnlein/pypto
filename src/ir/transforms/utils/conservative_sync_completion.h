@@ -98,18 +98,12 @@ struct CompletionVertex {
 
 // Instrumentation counters emitted by SolveCompletionTransfer.
 struct CompletionTransferWork {
-  size_t vertices = 0;
-  size_t reachable_vertices = 0;
   size_t sccs = 0;
   size_t non_trivial_sccs = 0;
-  size_t vertex_evaluations = 0;
 };
 
 // Solved Section 8.3 completion transfer result for a sub-CFG.
 struct CompletionTransferResult {
-  std::vector<CompletionFacts> in_facts;
-  std::vector<CompletionFacts> out_facts;
-  std::vector<bool> reachable;
   CompletionSummary summary;
   CompletionTransferWork work;
 };

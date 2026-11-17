@@ -25,7 +25,6 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/stmt.h"
-#include "pypto/ir/transforms/utils/parent_stmt_analysis.h"
 #include "src/ir/transforms/utils/conservative_sync_completion.h"
 #include "src/ir/transforms/utils/retained_sync_child.h"
 
@@ -143,9 +142,6 @@ class ConservativeSyncAnalysis {
   bool HasIncomingDiagnostics() const { return incoming_diagnostics_; }
   bool SuppliedDisjointGM() const { return disjoint_gm_; }
   bool HasRefreshKill() const { return refresh_kill_; }
-  // Diagnostic, output-sensitive O(depth) walk of the shared original-parent
-  // index. Production sites retain only cuts, never one copied path per site.
-  std::vector<StmtPtr> ControlPath(size_t site) const;
 
  private:
   friend ConservativeSyncAnalysis AnalyzeConservativeSync(
@@ -154,7 +150,6 @@ class ConservativeSyncAnalysis {
       const SyncParameterBounds&, const std::optional<std::pair<int64_t, int64_t>>&);
   ConservativeSyncAnalysis(FunctionPtr function, std::vector<ConservativeSyncSite> sites,
                            ConservativeAccessSet exit, ConservativeSyncCost cost,
-                           std::shared_ptr<const ParentStmtAnalysis> parents,
                            std::vector<ConservativeSyncChildEntry> children,
                            std::vector<ConservativeStorageDomain> domains, bool incoming_diagnostics,
                            bool disjoint_gm, bool refresh_kill, AutomaticSyncChildren selection)
@@ -162,7 +157,6 @@ class ConservativeSyncAnalysis {
         sites_(std::move(sites)),
         exit_(std::move(exit)),
         cost_(cost),
-        parents_(std::move(parents)),
         children_(std::move(children)),
         domains_(std::move(domains)),
         incoming_diagnostics_(incoming_diagnostics),
@@ -173,7 +167,6 @@ class ConservativeSyncAnalysis {
   std::vector<ConservativeSyncSite> sites_;
   ConservativeAccessSet exit_;
   ConservativeSyncCost cost_;
-  std::shared_ptr<const ParentStmtAnalysis> parents_;
   std::vector<ConservativeSyncChildEntry> children_;
   std::vector<ConservativeStorageDomain> domains_;
   bool incoming_diagnostics_;

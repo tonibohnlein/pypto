@@ -556,7 +556,7 @@ struct ScopedPaletteResult;
 struct SyncAllocationAttemptReceipt {
   PipeType source, target;
   std::string status, reason;
-  size_t staged_lanes = 0, reuse_queries = 0;
+  size_t reuse_queries = 0;
 };
 struct PhysicalSyncRealization {
   std::vector<SyncAllocationAttemptReceipt> allocation_attempts;

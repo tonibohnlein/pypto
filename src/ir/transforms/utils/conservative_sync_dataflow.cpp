@@ -42,14 +42,6 @@
 
 namespace pypto::ir::sync {
 namespace {
-// ParentStmtAnalysis owns the shared statement index. Expressions cannot carry
-// admitted statements; skipping them avoids retraversing IterArg initializer
-// DAGs merely to establish statement ownership.
-class StatementParents : public ParentStmtAnalysis {
- public:
-  void VisitExpr(const ExprPtr&) override {}
-};
-
 void Union(ConservativeAccessSet& into, const ConservativeAccessSet& from) {
   into.insert(from.begin(), from.end());
 }
@@ -303,28 +295,6 @@ class DebtState {
       }
     }
     return changed;
-  }
-
-  // Ordered completion relay step `a -> b`. `a` itself is ready for events originated by `a`
-  // or already delivered to `a` on all reaching paths.
-  void DeliverOneWay(PipeType src, PipeType dst) {
-    const PipeMask src_mask = PipeToMask(src);
-    const PipeMask dst_mask = PipeToMask(dst);
-    if (src_mask == 0 || dst_mask == 0) return;
-    for (auto it = pending_.begin(); it != pending_.end();) {
-      const bool src_ready = (it->first.src == src) || ((it->second & src_mask) == 0);
-      if (src_ready) it->second &= ~dst_mask;
-      if (it->second == 0) {
-        it = pending_.erase(it);
-      } else {
-        ++it;
-      }
-    }
-  }
-
-  // Ordered 1-way service relay `src -> dst` (matching #3375 SyncToken IR).
-  void DeliverService(PipeType src, PipeType dst) {
-    DeliverOneWay(src, dst);
   }
 
   // Batched 1-way relay from all sources in `sources_mask` to `dst` in one pass.
@@ -1461,16 +1431,6 @@ class Builder {
 };
 }  // namespace
 
-std::vector<StmtPtr> ConservativeSyncAnalysis::ControlPath(size_t site) const {
-  CHECK(site < sites_.size()) << "Conservative synchronization: invalid diagnostic site index";
-  std::vector<StmtPtr> path;
-  for (auto parent = parents_->GetParent(sites_[site].cut); parent; parent = parents_->GetParent(parent)) {
-    if (As<IfStmt>(parent) || As<ForStmt>(parent) || As<WhileStmt>(parent)) path.push_back(parent);
-  }
-  std::reverse(path.begin(), path.end());
-  return path;
-}
-
 ConservativeSyncAnalysis AnalyzeConservativeSync(
     const FunctionPtr& function, const std::string& target,
     const std::vector<std::shared_ptr<const NativeSyncChild>>& children,
@@ -1500,11 +1460,9 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
     builder.cost.retained_facts += site.effects.size() + site.incoming.size();
   for (const auto& child : builder.children)
     builder.cost.retained_facts += child.effects.size() + child.incoming.size();
-  auto parents = std::make_shared<StatementParents>();
-  parents->BuildMap(function);
   builder.cost.parent_links = builder.cost.statements ? builder.cost.statements - 1 : 0;
   return ConservativeSyncAnalysis(function, builder.PrimitiveSites(), std::move(exit), builder.cost,
-                                  std::move(parents), std::move(builder.children), std::move(builder.domains),
+                                  std::move(builder.children), std::move(builder.domains),
                                   retain_incoming_diagnostics, builder.disjoint_gm_, enable_refresh_kill,
                                   std::move(selection));
 }

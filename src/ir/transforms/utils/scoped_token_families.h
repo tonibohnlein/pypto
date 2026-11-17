@@ -36,7 +36,6 @@ struct ScopedProtocolCut {
 };
 class ScopedSyncProtocol {
  public:
-  const FunctionPtr& TokenOwner() const { return tokens_; }
   const CompactSyncInput& Input() const { return input_; }
   const std::vector<PhysicalSyncFamily>& Families() const { return families_; }
   const std::vector<ScopedProtocolCut>& Cuts() const { return cuts_; }
