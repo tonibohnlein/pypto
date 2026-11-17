@@ -12,18 +12,57 @@
 #define SRC_IR_TRANSFORMS_UTILS_NATIVE_SYNC_PLACEMENT_H_
 
 #include <limits>
+#include <memory>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/buffer_sync_contract.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
+#include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
+#include "pypto/ir/verifier/verifier.h"
 
 namespace pypto::ir::sync {
+// Native scalar flattening needs actual inherited layout provenance. Reuse the
+// same indexed window proof as Buffer code generation and exact import rather
+// than treating a syntactically dense descriptor as a physical-layout proof.
+// The scan caches expression nodes; logical token DAGs remain compact.
+inline void RequireBufferSyncScalarLayout(const FunctionPtr& owner) {
+  class ScalarUse : public IRVisitor {
+   public:
+    bool found = false;
+    void VisitExpr(const ExprPtr& expression) override {
+      if (!found && expression && seen_.insert(expression.get()).second) IRVisitor::VisitExpr(expression);
+    }
+
+   protected:
+    void VisitVarLike_(const VarPtr&) override {}
+    void VisitExpr_(const IterArgPtr&) override {}
+    void VisitExpr_(const CallPtr& call) override {
+      found = IsOp(call, "buffer.read") || IsOp(call, "buffer.write");
+      if (!found) IRVisitor::VisitExpr_(call);
+    }
+
+   private:
+    std::unordered_set<const Expr*> seen_;
+  } scalar;
+  scalar.VisitFunction(owner);
+  if (!scalar.found) return;
+  CHECK(owner->ir_stage_ == FunctionIRStage::Buffer)
+      << "Local scalar synchronization requires Buffer IR layout evidence";
+  const auto program = std::make_shared<Program>(std::vector<FunctionPtr>{owner}, owner->name_, owner->span_);
+  std::vector<Diagnostic> diagnostics;
+  CreateBufferIRPropertyVerifier()->Verify(program, diagnostics);
+  for (const auto& diagnostic : diagnostics)
+    CHECK(diagnostic.severity != DiagnosticSeverity::Error) << diagnostic.message;
+}
+
 // Indexed physical enclosures, independent of exact storage selectors, GM
 // geometry and trip counts. Original SSA definitions are visited once. BufferIR
 // declares runtime subviews contained in their source (02-types.md); their
@@ -32,7 +71,10 @@ namespace pypto::ir::sync {
 // enclosures are not exact access footprints.
 class NativeSyncPlacement : public IRVisitor {
  public:
-  explicit NativeSyncPlacement(const FunctionPtr& owner) { VisitStmt(owner->body_); }
+  explicit NativeSyncPlacement(const FunctionPtr& owner) {
+    RequireBufferSyncScalarLayout(owner);
+    VisitStmt(owner->body_);
+  }
   void Require(const backend::BufferSyncOperation& operation) const {
     backend::RequireBufferSyncWorkspaceSeparation(operation, [this](const ExprPtr& value) {
       const auto found = windows_.find(value.get());

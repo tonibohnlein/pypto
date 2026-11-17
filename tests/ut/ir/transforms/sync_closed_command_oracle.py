@@ -11,7 +11,7 @@
 
 This oracle has no payload-per-record or payload-per-wait requirement. It reads
 actual logical tokens or physical flags and never inserts resource-reuse edges.
-Only the fixture load/copy/vector/Cube instruction model is supported; physical
+Only the fixture load/copy/vector/Cube and local scalar instruction model is supported; physical
 bytes and native accumulator exemptions come from the existing independent
 hardware oracle, never compiler effects, token generators or injected edges.
 """
@@ -42,7 +42,15 @@ _BARRIERS = {
 
 class ClosedCommands:
     def __init__(
-        self, function, parameters, eligible, tensor_bases=None, *, shape_parameters=None, block_index=None
+        self,
+        function,
+        parameters,
+        eligible,
+        tensor_bases=None,
+        *,
+        shape_parameters=None,
+        block_index=None,
+        scalar_memory=None,
     ):
         self.function = function
         self.env = {function.params[i]: x for i, x in parameters.items()}
@@ -69,6 +77,13 @@ class ClosedCommands:
         self.while_tests = 0
         self.returns = []
         self.last_all = None
+        self.scalar_dependencies = {}
+        self.control_gate = None
+        self.control_evaluations = 0
+        self.result_dependencies = ()
+        # Optional concrete byte-addressed values for scalar-control fixtures.
+        # These come from fixture inputs, independently of compiler effects.
+        self.scalar_memory = None if scalar_memory is None else dict(scalar_memory)
         for i, parameter in enumerate(function.params):
             if isinstance(parameter.type, ir.TensorType):
                 shape = tuple(value(x, self.env) for x in parameter.type.shape)
@@ -88,6 +103,11 @@ class ClosedCommands:
         self.vertices.add(node)
         self.edge(self.last_issue.get(pipe), node)
         self.edge(self.gates.get(pipe), node)
+        self.edge(self.control_gate, node)
+        # The native scalar exemption establishes completion before the next
+        # scalar instruction. It is not a completion fence for other pipes.
+        if pipe == ir.PipeType.S:
+            self.edge(self.last_payload.get(pipe), node)
         self.last_issue[pipe] = node
 
     def command_issue(self, pipe):
@@ -141,6 +161,7 @@ class ClosedCommands:
         node = ("all_barrier", self.barriers)
         self.barriers += 1
         self.vertices.add(node)
+        self.edge(self.control_gate, node)
         for previous in self.last_payload.values():
             self.edge(previous, node)
         for previous in self.last_issue.values():
@@ -212,8 +233,9 @@ class ClosedCommands:
             )
         return self.footprints[key]
 
-    def payload(self, call, env):
+    def memory_footprint(self, call, env):
         name, args = call.op.name, call.args
+        rect = None
         if name in (opname("buffer.load"), opname("buffer.store")):
             rect = tuple(value(x, env) for group in args[1:3] for x in group.elements)
             if name == opname("buffer.load"):
@@ -232,6 +254,14 @@ class ClosedCommands:
                 self.signature(args[3]),
                 call.kwargs.get("atomic", 0),
             )
+        elif name in (opname("buffer.read"), opname("buffer.write")):
+            coordinates = tuple(value(x, env) for x in args[1].elements)
+            cells = self.bytes(args[0], (*coordinates, 1, 1))
+            pipe = ir.PipeType.S
+            reads, writes = (cells, frozenset()) if name == opname("buffer.read") else (frozenset(), cells)
+            signature = name, self.signature(args[0]), coordinates
+            if name == opname("buffer.write"):
+                signature += (value(args[2], env),)
         elif name in (opname("buffer.copy"), opname("buffer.extract")):
             target = 3 if name == opname("buffer.extract") else 1
             rect = None
@@ -244,11 +274,22 @@ class ClosedCommands:
                 )
             pipe, reads, writes = ir.PipeType.MTE1, self.bytes(args[0], rect), self.bytes(args[target])
             signature = name, self.signature(args[0]), rect, self.signature(args[target])
-        elif name in (opname("buffer.add"), opname("buffer.mul")):
+        elif name == opname("buffer.full"):
+            # The initialization writes its current active destination; its
+            # scalar fill value is not a storage read or a completion fact.
+            pipe, reads, writes = ir.PipeType.V, frozenset(), self.bytes(args[-1])
+            signature = name, value(args[0], env), self.signature(args[-1])
+        else:
+            return None
+        return pipe, reads, writes, signature, rect
+
+    def compute_footprint(self, call, env):
+        name, args = call.op.name, call.args
+        if name in (opname("buffer.add"), opname("buffer.mul")):
             pipe = ir.PipeType.V
             reads, writes = self.bytes(args[0]) | self.bytes(args[1]), self.bytes(args[2])
             signature = name, *(self.signature(arg) for arg in args)
-        elif name == opname("buffer.adds"):
+        elif name in (opname("buffer.adds"), opname("buffer.muls")):
             pipe = ir.PipeType.V
             reads, writes = self.bytes(args[0]), self.bytes(args[2])
             signature = name, self.signature(args[0]), value(args[1], env), self.signature(args[2])
@@ -297,6 +338,12 @@ class ClosedCommands:
             )
             pipe, reads, writes = ir.PipeType.V, self.bytes(args[0]), self.bytes(args[1])
             signature = name, self.signature(args[0]), self.signature(args[1])
+        return pipe, reads, writes, signature, None
+
+    def payload(self, call, env):
+        name, args = call.op.name, call.args
+        footprint = self.memory_footprint(call, env) or self.compute_footprint(call, env)
+        pipe, reads, writes, signature, rect = footprint
         index = len(self.payloads)
         start, completion = ("payload", index, "I"), ("payload", index, "C")
         self.issue(pipe, start)
@@ -306,6 +353,27 @@ class ClosedCommands:
         self.last_payload[pipe] = completion
         self.payloads.append((signature, pipe, reads, writes))
         self.calls.append((call, dict(env), pipe, reads, writes))
+        for dependency in self.dependencies(call.args):
+            self.edge(dependency, start)
+        if self.scalar_memory is not None:
+            if name in (opname("buffer.load"), opname("buffer.store")):
+                assert rect is not None
+                if name == opname("buffer.load"):
+                    destination = self.bytes(args[3], (0, 0, rect[2], rect[3]))
+                    source = reads
+                else:
+                    source = self.bytes(args[0], (0, 0, rect[2], rect[3]))
+                    destination = writes
+                # Byte ordering here is only for the focused packed ND scalar
+                # fixtures; unsupported layouts remain outside this value model.
+                for src, dst in zip(
+                    sorted(source, key=lambda x: x[1]), sorted(destination, key=lambda x: x[1]), strict=True
+                ):
+                    if src in self.scalar_memory:
+                        self.scalar_memory[dst] = self.scalar_memory[src]
+            elif name == opname("buffer.write"):
+                for cell in writes:
+                    self.scalar_memory[cell] = value(args[2], env)
 
     def assign(self, statement, env):
         call = statement.value
@@ -320,6 +388,14 @@ class ClosedCommands:
             )
             self.layouts[statement.var] = kind
             self.descriptors.append(self.signature(statement.var))
+        elif isinstance(call, ir.Call) and call.op.name == opname("buffer.read"):
+            self.payload(call, env)
+            assert self.scalar_memory is not None, "scalar read requires independent fixture memory"
+            _, _, reads, _ = self.payloads[-1]
+            values = {self.scalar_memory[cell] for cell in reads}
+            assert len(values) == 1, "fixture scalar bytes disagree"
+            env[statement.var] = values.pop()
+            self.scalar_dependencies[statement.var] = frozenset({("payload", len(self.payloads) - 1, "C")})
         elif isinstance(call, ir.Call) and call.op.name == opname("sync.record"):
             self.logical_records = True
             pipe = ir.PipeType(call.kwargs["pipe"])
@@ -329,6 +405,7 @@ class ClosedCommands:
             env[statement.var] = pipe, publication
         else:
             env[statement.var] = value(statement.value, env)
+            self.scalar_dependencies[statement.var] = self.dependencies([statement.value])
 
     def evaluate(self, statement, env):
         call = statement.expr
@@ -350,17 +427,63 @@ class ClosedCommands:
         else:
             self.payload(call, env)
 
+    def dependencies(self, expressions):
+        """Completion facts required by actual scalar SSA operands, not memory effects."""
+        dependencies = set()
+        seen = set()
+        pending = list(expressions)
+        while pending:
+            expression = pending.pop()
+            if expression in seen:
+                continue
+            seen.add(expression)
+            if isinstance(expression, (ir.Var, ir.IterArg)):
+                dependencies.update(self.scalar_dependencies.get(expression, ()))
+            elif isinstance(expression, ir.BinaryExpr):
+                pending.extend([expression.left, expression.right])
+            elif isinstance(expression, ir.UnaryExpr):
+                pending.append(expression.operand)
+            elif isinstance(expression, ir.MakeTuple):
+                pending.extend(expression.elements)
+            elif isinstance(expression, ir.TupleGetItemExpr):
+                pending.append(expression.tuple)
+        return frozenset(dependencies)
+
+    def control(self, expressions):
+        # A dynamic decision must obtain its actual operand values before its
+        # selected body or continuation can issue. An unused scalar read and a
+        # scalar write create no such decision and impose no cross-pipe fence.
+        dependencies = self.dependencies(expressions)
+        if not dependencies:
+            return
+        node = ("control_evaluation", self.control_evaluations)
+        self.control_evaluations += 1
+        self.vertices.add(node)
+        self.edge(self.control_gate, node)
+        for dependency in dependencies:
+            self.edge(dependency, node)
+        self.control_gate = node
+
     def conditional(self, statement, env):
+        self.control([statement.condition])
+        condition_dependencies = self.dependencies([statement.condition])
+        self.result_dependencies = ()
         selected = statement.then_body if value(statement.condition, env) else statement.else_body
         result = self.execute(selected, dict(env)) if selected is not None else ()
-        result = () if result is None else result
+        if result is None:
+            result = ()
+            self.result_dependencies = ()
         assert len(result) == len(statement.return_vars)
         env.update(zip(statement.return_vars, result, strict=True))
+        for variable, dependencies in zip(statement.return_vars, self.result_dependencies, strict=True):
+            self.scalar_dependencies[variable] = dependencies | condition_dependencies
 
     def loop(self, statement, env):
         carried = tuple(value(arg.initValue, env) for arg in statement.iter_args)
+        carried_dependencies = tuple(self.dependencies([arg.initValue]) for arg in statement.iter_args)
         if isinstance(statement, ir.ForStmt):
             assert statement.kind == ir.ForKind.Sequential
+            self.control([statement.start, statement.stop, statement.step])
             start, stop, step = (value(x, env) for x in (statement.start, statement.stop, statement.step))
             assert isinstance(start, int) and isinstance(stop, int) and isinstance(step, int)
             assert step > 0
@@ -371,18 +494,25 @@ class ClosedCommands:
         for index in indices:
             local = dict(env)
             local.update(zip(statement.iter_args, carried, strict=True))
+            for argument, dependencies in zip(statement.iter_args, carried_dependencies, strict=True):
+                self.scalar_dependencies[argument] = dependencies
             if isinstance(statement, ir.ForStmt):
                 local[statement.loop_var] = index
             else:
                 self.while_tests += 1
+                self.control([statement.condition])
                 if not value(statement.condition, local):
                     break
                 assert index < 32, "bounded oracle trip limit"
+            self.result_dependencies = ()
             result = self.execute(statement.body, local)
             carried = () if result is None else result
+            carried_dependencies = () if result is None else self.result_dependencies
             assert len(carried) == len(statement.iter_args)
         assert len(carried) == len(statement.return_vars)
         env.update(zip(statement.return_vars, carried, strict=True))
+        for variable, dependencies in zip(statement.return_vars, carried_dependencies, strict=True):
+            self.scalar_dependencies[variable] = dependencies
 
     def execute(self, statement, env):
         if isinstance(statement, ir.SeqStmts):
@@ -399,6 +529,7 @@ class ClosedCommands:
         elif isinstance(statement, (ir.ForStmt, ir.WhileStmt)):
             self.loop(statement, env)
         elif isinstance(statement, ir.YieldStmt):
+            self.result_dependencies = tuple(self.dependencies([x]) for x in statement.value)
             return tuple(value(x, env) for x in statement.value)
         else:
             assert isinstance(statement, ir.ReturnStmt)
@@ -406,6 +537,10 @@ class ClosedCommands:
             self.vertices.add(node)
             self.returns.append(node)
             self.edge(self.last_all, node)
+            self.edge(self.control_gate, node)
+            for dependency in self.dependencies(statement.value):
+                self.edge(dependency, node)
+            self.result_dependencies = ()
             return ()
         return None
 

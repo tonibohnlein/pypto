@@ -346,6 +346,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/signature_symbols.cpp
     src/ir/transforms/utils/acc_init_builder.cpp
     src/ir/transforms/utils/narrow_loop_carry.cpp
+    src/ir/transforms/utils/buffer_active_domain_analysis.cpp
     src/ir/transforms/utils/buffer_root_collector.cpp
     src/ir/transforms/utils/core_affinity.cpp
     src/ir/transforms/utils/core_side_ops.cpp
@@ -478,6 +479,7 @@ set(PYPTO_SOURCES
     src/backend/common/buffer_indexed_recipes.cpp
     src/backend/common/buffer_elementwise_recipes.cpp
     src/backend/common/buffer_axis_recipes.cpp
+    src/backend/common/buffer_scalar_recipes.cpp
     src/backend/common/buffer_transpose_recipe.cpp
     src/backend/common/buffer_view_semantics.cpp
     src/backend/common/buffer_sync_contract.cpp

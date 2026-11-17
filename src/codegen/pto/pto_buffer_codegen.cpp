@@ -436,6 +436,7 @@ class BufferEmissionPreflight : public ir::IRVisitor {
                    ir::IsOp(call, "buffer.copy") || ir::IsOp(call, "buffer.subview") ||
                    ir::IsOp(call, "buffer.reshape") || ir::IsOp(call, "buffer.load") ||
                    ir::IsOp(call, "buffer.store") || ir::IsOp(call, "buffer.set_validshape") ||
+                   ir::IsOp(call, "buffer.read") || ir::IsOp(call, "buffer.write") ||
                    ir::IsOp(call, "buffer.get_block_idx") || ir::IsOp(call, "buffer.get_block_num") ||
                    ir::IsOp(call, "buffer.get_subblock_idx") || ir::IsOp(call, "buffer.matmul") ||
                    ir::IsOp(call, "buffer.matmul_acc") || ir::IsOp(call, "buffer.extract") ||
@@ -715,6 +716,30 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
     const auto name = NewNamedTemp(result->name_hint_);
     Emit(name + " = arith.index_cast " + argument + " : i32 to index");
     BindVarToMlir(result, name);
+  } else if (ir::IsOp(call, "buffer.read") || ir::IsOp(call, "buffer.write")) {
+    // Registry validation proves dense layout and constant active coordinates.
+    // Keep the exact payload cut: the result is a blocking S value, not a
+    // speculative descriptor read or a cacheable GM scalar load.
+    registry.ValidateBufferCall(call);
+    const bool read = ir::IsOp(call, "buffer.read");
+    INTERNAL_CHECK_SPAN(read == static_cast<bool>(result), call->span_)
+        << "Internal error: scalar Buffer result binding disagrees with its operation";
+    const auto type = As<ir::BufferType>(call->args_[0]->GetType());
+    const auto indices = As<ir::MakeTuple>(call->args_[1]);
+    const int64_t offset = As<ir::ConstInt>(indices->elements_[0])->value_ * type->shape_[1] +
+                           As<ir::ConstInt>(indices->elements_[1])->value_;
+    const auto index = GetOrEmitConstant(offset, DataType::INDEX);
+    const auto source = GetExprAsCode(call->args_[0]);
+    const auto descriptor = GetExprTypeAnnotation(call->args_[0]);
+    if (read) {
+      const auto name = NewNamedTemp(result->name_hint_);
+      Emit(name + " = pto.tgetval ins(" + source + ", " + index + " : " + descriptor +
+           ", index) outs : " + GetTypeString(type->dtype_));
+      BindVarToMlir(result, name);
+    } else {
+      Emit("pto.tsetval ins(" + index + ", " + GetExprAsCode(call->args_[2]) + " : index, " +
+           GetExprTypeAnnotation(call->args_[2]) + ") outs(" + source + " : " + descriptor + ")");
+    }
   } else if (ir::IsOp(call, "buffer.alloc_multi")) {
     INTERNAL_CHECK_SPAN(result, call->span_) << "Internal error: multi-buffer allocation needs an SSA result";
     const auto multi = As<ir::MultiBufferType>(result->GetType());

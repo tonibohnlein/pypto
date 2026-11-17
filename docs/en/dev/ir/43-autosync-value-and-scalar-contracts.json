@@ -1,0 +1,1010 @@
+{
+  "scope": "M2 active-prefix value normalization and local UB scalar bridge; M1-M6 remains incomplete",
+  "starting_revision": "005ebfd35d1b8955dbc1a8a8f7115d46471d57b4",
+  "source_snapshot": "Pure M2 isolation with M5 production changes parked; authoritative per-source hashes and extension hashes are recorded in the fresh whole-model captures below.",
+  "publication": {
+    "source_review": "Accepted; final integrated tests and source hooks passed",
+    "commit": "pending accepted package publication by root",
+    "device_validation": false
+  },
+  "packages": {
+    "active_prefix": {
+      "implementation": [
+        "include/pypto/ir/transforms/utils/buffer_active_domain_analysis.h",
+        "src/ir/transforms/utils/buffer_active_domain_analysis.cpp",
+        "src/ir/transforms/select_buffer_ir_functions_pass.cpp"
+      ],
+      "contract": [
+        "Separate guaranteed-defined boxes, backward observable requirements and metadata observations.",
+        "Ready lexically visible loop-invariant runtime prefix; one prefix per component; qualified FP32 recipes only.",
+        "Preserve seed-producing payload; loop initializer becomes explicit alias of the same initialized bytes; qualify zero-trip values.",
+        "Reject full observation of prefix-defined values, unknown metadata observers and Tile-bearing aggregates.",
+        "Publish only after whole-function ordinary Buffer admission; otherwise preserve original function."
+      ],
+      "work": "Statement occurrence indexes; bounded data/observer expression contexts and type identity inventories; finite-height backward worklist; immutable scalar stability proof and verbatim qualified scalar expressions; actual dispatch counters.",
+      "testing_adapter": "testing.normalize_buffer_active_domains reports only normalization candidate and request-local counters, not whole Buffer admission or executable ownership."
+    },
+    "local_scalar": {
+      "contract": [
+        "Selected A2/A3 AIV local dense rank-2 Vec FP32/INT32 constant point within static valid extents; uint32 flattened index.",
+        "Ordinary S read/write payloads; selected blocking UB TGETVAL/TSETVAL, no GM DCache contract.",
+        "Keep original read SSA definition and cut; discarded/nested read delegates.",
+        "Tile.write aliases original complete MemRef/window and mutates original storage; no copy or fresh allocation.",
+        "Physical row pitch must be established by existing placement/window inventory; reject unproved narrow/borrowed layouts.",
+        "Original static point can use existing runtime-owner descriptor restoration; actual dynamic points remain unavailable."
+      ],
+      "oracle_correction": "S completion orders subsequent S instructions and actual scalar value/control consumers only; unrelated pipes are not globally fenced."
+    }
+  },
+  "preserved": {
+    "allocation_algorithms": true,
+    "protocols": true,
+    "hardware_exemptions": true,
+    "zero_inner_body_barriers": true,
+    "compact_K_and_replay": true,
+    "peer_protocols": true
+  },
+  "not_implemented": [
+    "GM tensor.read visibility or DMA staging",
+    "INT64 scalar staging",
+    "new cross-core synchronization",
+    "general token/protocol realization",
+    "complete whole-Qwen ownership"
+  ],
+  "environment": {
+    "loader": ".claude/skills/testing/load-env.sh",
+    "workers": {
+      "PYPTO_BUILD_JOBS": "1",
+      "PYPTO_TEST_JOBS": "1",
+      "OMP_NUM_THREADS": "1",
+      "PYPTO_CODEGEN_MAX_WORKERS": "1"
+    },
+    "build_command": [
+      "cmake",
+      "--build",
+      "build-py314",
+      "--parallel",
+      "1"
+    ],
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "capture_environment": {
+      "PYTHONPATH": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/codegen:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106",
+      "PTOAS_ROOT": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher",
+      "OMP_NUM_THREADS": "1",
+      "PYPTO_CODEGEN_MAX_WORKERS": "1"
+    },
+    "tmpdir": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/review-repairs-20261116/scratch"
+  },
+  "focused_validation": [
+    {
+      "path": "build-py314/review-repairs-20261116/m2-normalizer-qualified.log",
+      "sha256": "ea0319f343a5cc621e826c6e78a51b46afb9cdb222a02377d6c48fe9638f7d04",
+      "passed": 31,
+      "failed": 0,
+      "seconds": 15.19,
+      "command": [
+        "timeout",
+        "120s",
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "--require-ptoas",
+        "tests/ut/ir/transforms/test_runtime_valid_reduction_axis.py"
+      ]
+    },
+    {
+      "path": "build-py314/review-repairs-20261116/m2-scalar-family-qualified.log",
+      "sha256": "65c364612c9a0e896f01546c7b7addf23c2966fecd67868117902a26a24489ff",
+      "passed": 124,
+      "failed": 0,
+      "seconds": 3.59,
+      "command": [
+        "timeout",
+        "120s",
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "--require-ptoas",
+        "tests/ut/ir/transforms/test_scalar_tile_buffer_bridge.py",
+        "tests/ut/ir/transforms/test_scalar_physical_pitch.py",
+        "tests/ut/ir/transforms/test_scalar_command_oracle.py",
+        "tests/ut/ir/transforms/test_sync_scalar_payload.py",
+        "tests/ut/ir/transforms/test_effective_invocation_coordinate.py",
+        "tests/ut/ir/transforms/test_static_row_descriptor_bridge.py",
+        "tests/ut/ir/transforms/test_runtime_valid_cast.py",
+        "tests/ut/ir/transforms/test_runtime_valid_broadcast.py"
+      ],
+      "scope": "Separate earlier eight-module run, includes pending M5 coordinate regression; not the isolated M2 gate."
+    },
+    {
+      "path": "build-py314/review-repairs-20261116/m2-isolated-gate.log",
+      "sha256": "bf163ddd73b43b6cb195cc98f67c2c6e78bb6d47efe7e9457375c4e895bcb18c",
+      "passed": 152,
+      "failed": 0,
+      "seconds": 17.68,
+      "command": [
+        "timeout",
+        "120s",
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "--require-ptoas",
+        "tests/ut/ir/transforms/test_scalar_tile_buffer_bridge.py",
+        "tests/ut/ir/transforms/test_scalar_physical_pitch.py",
+        "tests/ut/ir/transforms/test_scalar_command_oracle.py",
+        "tests/ut/ir/transforms/test_sync_scalar_payload.py",
+        "tests/ut/ir/transforms/test_static_row_descriptor_bridge.py",
+        "tests/ut/ir/transforms/test_runtime_valid_cast.py",
+        "tests/ut/ir/transforms/test_runtime_valid_broadcast.py",
+        "tests/ut/ir/transforms/test_runtime_valid_reduction_axis.py",
+        "tests/ut/ir/transforms/test_conservative_sync_child_api.py"
+      ],
+      "scope": "Fresh coherent pure M2 source/build; M5 coordinate module excluded, existing M4 child API included."
+    },
+    {
+      "path": "build-py314/review-repairs-20261116/m2-ctest.log",
+      "sha256": "ff668aaf832023bdd02c47e5ced9eda4a08769ccb0eb217c116ee657dc11e5c3",
+      "passed": 3,
+      "failed": 0,
+      "seconds": 0.4,
+      "tests": [
+        "pypto_sync_resource_catalog_test",
+        "pypto_sync_isa_macro_resources_test",
+        "pypto_numerical_sync_order_test"
+      ]
+    },
+    {
+      "path": "build-py314/review-repairs-20261116/m2-isolated-hooks.log",
+      "sha256": "b1c12e7d7805d4a6b74a42dd137abc924281d6256d34ac7c9a3e90960e180640",
+      "status": "all passed",
+      "checks": [
+        "large files",
+        "YAML",
+        "EOF",
+        "trailing whitespace",
+        "clang-format",
+        "cpplint",
+        "markdownlint",
+        "ruff check",
+        "ruff format",
+        "pyright"
+      ]
+    }
+  ],
+  "earlier_evidence_preserved": [
+    {
+      "path": "build-py314/review-repairs-20261116/m2-final-family-tests.log",
+      "sha256": "3e68d92beadf59a07a0c2a1d139e754bd5a69bc3441dcc2b509cf036692932dd",
+      "passed": 137,
+      "failed": 18,
+      "seconds": 20.11,
+      "status": "Failed fixtures/pipeline indexing before repair; superseded by fresh gates."
+    },
+    {
+      "path": "build-py314/review-repairs-20261116/m2-final-family-tests-retry.log",
+      "sha256": "4bc428ff17faa57ea9f470dc41e7197fcddf83cca98c995230f42fb3bafeea66",
+      "status": "120-second watchdog timeout; no complete result, not counted as passed."
+    },
+    {
+      "path": "build-py314/review-repairs-20261116/m2-shared-call-isolated.log",
+      "sha256": "65dea893d2bf0f6996b9f9d329fb30c333933a18bf7a3abb132bdd6eed9b9827",
+      "status": "Failed actual-dispatch counter regression; repaired, no bound weakening."
+    },
+    {
+      "path": "build-py314/review-repairs-20261116/m2-observer-isolated.log",
+      "sha256": "140cba9b4f8de0b416d5d22d018ca28250a0e1cc9155fb0d0b235fccd9da92e0",
+      "passed": 9,
+      "failed": 0,
+      "seconds": 0.13
+    },
+    {
+      "path": "build-py314/review-repairs-20261116/m2-scalar-hooks.log",
+      "sha256": "7b85fecb3b6f7dd4e6823db5a354435f55d31082df055feaaaa279233b2113ca",
+      "status": "Earlier static typing/style failures; repaired before final hooks."
+    },
+    {
+      "path": "build-py314/review-repairs-20261116/m2-scalar-bridge-pitch-tests.log",
+      "sha256": "df71a55b471e6907950420ee4ea5b0b0de8b4d6148e2ee053ff3dec9e581fac3",
+      "passed": 73,
+      "failed": 6,
+      "seconds": 2.18,
+      "status": "Earlier pitch/bridge failures, repaired."
+    }
+  ],
+  "whole_qwen_prefix": {
+    "compiler_revision": "005ebfd35d1b8955dbc1a8a8f7115d46471d57b4",
+    "library_revision": "b72c66d9df69ba5f11982b212530a255c050988d",
+    "model_sources": {
+      "config.py": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+      "constants.py": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+      "contract.py": "f16c43df64c42769dc365a820e5fbc0ff6e9c4d3ceada21660003869ccbeaf15",
+      "decode_fwd.py": "c2f7288ce1e45cbe9fe99d60484aed7a4cb6b4d7255701c4692692a7586dd6f3",
+      "decode_layer_a8w8.py": "4074dea2e5225818108bc088d06dc1717cb2706dd004255a96c05843ba7a5fb8",
+      "decode_ssn_draft.py": "55016c298d42f77500e87bccdf020dbc3e78210cbe1a4c526b97f59466d77705",
+      "decode_tq_draft.py": "9daf2b9b1851d646552cb75504f33aad4766569ff740462a16cdf06d99f352ec",
+      "greedy_sample.py": "8f3fc3e4c533abf01140b299cac35a11185c5151e92df5ba84327afdfa3fceb8",
+      "paged_attention_cce.py": "aafa0bc6dde1758f5518081f3814449e0ca93d137451b67065a06f4b8a375b2d",
+      "paged_attention_pypto.py": "4087a49cd0b6c6396d4fef859576a02f8c6b096e9b94f5b55560e1f4b238e843",
+      "prefill_fwd.py": "3e05b6f910055549d6f89c24743dc384acfb0134be059efe4351b72092824dcb",
+      "prefill_fwd_a8w8.py": "3f359f5b5147c025efa21152117f75291c07826d9675f0a5bc9b76c3a13c67ac",
+      "prefill_tq_draft.py": "0eb51c30bfce55eabbb3318d39542813aef8687858957e41dcfafd5b93c5d8da",
+      "rms_lm_head.py": "0cafe8226d85659afd9d1c19e3c9ae46269a109a7c3c501d846a366e3826e3ce",
+      "rope_qkv_regen.py": "17d868b0527f6555e48426d4fe74526c8d72b5126d442efd2727cf9078c94076",
+      "test_paged_attention_cce.py": "7098e2cea21d017ef6f13f0261b19d37a3af62103045543862cf51b99d793f6c",
+      "test_paged_attention_pypto.py": "9bf0d2ea18b5d995a846858df23c301e32ff79849a08a1bb4250101ff468f32d",
+      "topk_select.py": "60ddb96ee27846c0dfb23f95a59cf53701eed94cca88bf7b5eb3802a5aaef267",
+      "turboquant_kv.py": "d49c3cb4764e524b96be5bffd57cbf6138061e65c5b762ac4781741d2181bf7d",
+      "weights.py": "d23e15850574369379e8140eb7a97be000274250dd6369544cc2108132125bf5"
+    },
+    "configuration": {
+      "layers": 2,
+      "sequence": 128,
+      "batch": 1
+    },
+    "mode": "pypto",
+    "policy": "conservative_prefix",
+    "command": [
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_qwen_whole_model.py",
+      "--library",
+      "/home/toni/work/pypto3/pypto-lib",
+      "--output",
+      "build-py314/review-repairs-20261116/qwen-m2-qualified",
+      "--layers",
+      "2",
+      "--policy",
+      "conservative_prefix",
+      "--require-function",
+      "down_proj",
+      "--require-function",
+      "gate_up_proj",
+      "--require-function",
+      "kv_proj",
+      "--require-function",
+      "mlp_out_cast",
+      "--require-function",
+      "mlp_out_cast_0",
+      "--require-function",
+      "mlp_out_seed",
+      "--require-function",
+      "out_proj_aic",
+      "--require-function",
+      "q_proj",
+      "--require-function",
+      "save_prefill_last_token_group",
+      "--require-function",
+      "save_prefill_last_token_single",
+      "--require-function",
+      "silu",
+      "--tool-artifact",
+      "build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas",
+      "--tool-artifact",
+      "build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so",
+      "--tool-artifact",
+      "build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so",
+      "--require-function",
+      "final_rmsnorm",
+      "--require-function",
+      "attention_finalize_phase",
+      "--require-function",
+      "qk_pv_partial_merge",
+      "--require-function",
+      "x_gamma",
+      "--require-function",
+      "x_gamma_0",
+      "--require-domain-owners"
+    ],
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "compiler_dirty_sources": {
+      "include/pypto/backend/common/buffer_scalar_recipes.h": "073e7675c95d5c7686d4a42571909fcc1326e6f731195cd2a8997b92ca75e284",
+      "include/pypto/backend/common/buffer_sync_contract.h": "8ae453ea84c1ce0aaff72de3edf1c359f7df283ae9c3f458917e612f89526220",
+      "include/pypto/ir/transforms/utils/buffer_active_domain_analysis.h": "3c895463193275402be8aea754bc99c0b32d2a1f472f711ac01df301bbf6a959",
+      "python/bindings/modules/testing.cpp": "f8afd88390e88e45c53817ea986ccceaf85ecd370a8f86cfffce5541d7c6b869",
+      "python/pypto/pypto_core/testing.pyi": "8eb7bb841d5771c9787bc581167778b22268cdf77df4201e28c90287df86fa04",
+      "src/backend/common/buffer_scalar_recipes.cpp": "64e24fe988570dada45340ce67aada1e26e576b096530cc4ca7bc2f3a821d445",
+      "src/backend/common/buffer_sync_contract.cpp": "f39b11be3343fddbfd04b1540a6a2ec6a3d127b954d776b9fe09a1ad25516904",
+      "src/codegen/pto/pto_buffer_codegen.cpp": "3267168ca0c7a784e99d7301b045d1132e718a344d5d45aa01294608a5018d3f",
+      "src/ir/op/buffer_ops/memory.cpp": "36774276f52714b1e9eea38d85e40f535e5c32c871ad9a6874ba6f7f4840a2bd",
+      "src/ir/op/tile_ops/memory.cpp": "ed1b2caeaa56bd253e50b1584595a30daf4714525eccc55792facfdfa1b32cc4",
+      "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "941b38d1e0f8f17aed3a8d712d0f6bbd83b9edf79a136de4c641ea608873f81a",
+      "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "d05e5b8a41db41b8655aea1894d081e263712abea0efb7fb9ac38323afea3bac",
+      "src/ir/transforms/utils/buffer_active_domain_analysis.cpp": "721b95ae84927044463f665168379250b590567dd962a6703e9e33f4ac5c87d8",
+      "src/ir/transforms/utils/conservative_sync_dataflow.cpp": "18bd494e4b041566fb2b20b813e2ec23052f8a8dd6ff1aadf7987d47a47d17f1",
+      "src/ir/transforms/utils/native_sync_placement.h": "16819a3f3f106fff8ca10e7b2c56406e972cd1df544c3b1258751bcb1dc6b27f",
+      "src/ir/transforms/utils/token_sync_lowering.cpp": "ea29d306e0a021c36221cf9c86c4b052ef247a46a9f24c50aa8a0d837ebb8a12",
+      "src/ir/verifier/verify_buffer_ir.cpp": "a4b21a5e63c5b1cfc06e742303cff6df8d0ef0507bc0291c7d5db1f6655fe400",
+      "tests/ut/ir/transforms/sync_closed_command_oracle.py": "d22e694abab5fad15e0d99105419b5619db49145ad8b9ef58bcf8b7e30d458d3",
+      "tests/ut/ir/transforms/test_conservative_sync_child_api.py": "45ece2b7d5d5f42f50fe3ef08e1195d283b550e8114a69740598ca0f1c70bdec",
+      "tests/ut/ir/transforms/test_effective_invocation_coordinate.py": "40755fabf81656e2d8a848030d222e55995049223ecf480a363b11c887062ea0",
+      "tests/ut/ir/transforms/test_runtime_valid_reduction_axis.py": "4524f871deef31f2152f1a9deff54dc7a64a8a104db8ba7e241b47fe0c7a55de",
+      "tests/ut/ir/transforms/test_scalar_command_oracle.py": "55a0cea5ee3ab4e2776dee9b49c8c7a8ab87c50bb531fac4dd7b916d0fdfc302",
+      "tests/ut/ir/transforms/test_scalar_physical_pitch.py": "d0ee0b1ce411dd5c1da1cd933df0da44a95816e4a3943cf2721d250cf6f3ceaf",
+      "tests/ut/ir/transforms/test_scalar_tile_buffer_bridge.py": "177f571034d7cf00a642231336aa72db22e4135f3ca46094275a12fb1d8c547a",
+      "tests/ut/ir/transforms/test_sync_scalar_payload.py": "236938075bf73b45a042c9888f7cd1a7ccf6ebf359fc3117e0e48b305f311682"
+    },
+    "extension_hashes": {
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "2a31c5e466ef164e7ad13afe59c817df2cc5badef161050bf6ab2d7e26c2030b"
+    },
+    "ptoas": {
+      "path": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher/ptoas",
+      "hash": "8b52c0bfe3259f37dd17331ec0b8ee534461f18e70042edce0e2b6ee2fd7adf8",
+      "version": "ptoas 0.72",
+      "additional_artifacts": {
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so": "86655444ce6e3470dbbbf061438046bc5f87c5f0f89f4145fd2a4340c8fd70e9",
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so": "0aa83ba0abbd3432c2ce9ecb6c854485b5502d51b181fa200ee87fd9254ea321"
+      }
+    },
+    "environment": {
+      "PYTHONPATH": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/codegen:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106",
+      "PTOAS_ROOT": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher",
+      "OMP_NUM_THREADS": "1",
+      "PYPTO_CODEGEN_MAX_WORKERS": "1"
+    },
+    "access_contract": "Whole-memory-space enclosures; no GM disjointness used; source access-validity preconditions remain",
+    "device": "not run",
+    "compile_success": true,
+    "all_generated_leaves_pypto": false,
+    "arguments": [
+      {
+        "name": "input_ids",
+        "shape": [
+          128
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "seq_lens",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "chunk_lens",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "chunk_offsets",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "input_rms_weight",
+        "shape": [
+          2,
+          5120
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "wq",
+        "shape": [
+          10240,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "wk",
+        "shape": [
+          10240,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "wv",
+        "shape": [
+          10240,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "q_norm_weight",
+        "shape": [
+          2,
+          128
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "k_norm_weight",
+        "shape": [
+          2,
+          128
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "rope_cos",
+        "shape": [
+          4096,
+          128
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "rope_sin",
+        "shape": [
+          4096,
+          128
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "block_table",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "slot_mapping",
+        "shape": [
+          128
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "k_cache",
+        "shape": [
+          2048,
+          128
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "v_cache",
+        "shape": [
+          2048,
+          128
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "wo",
+        "shape": [
+          10240,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "post_rms_weight",
+        "shape": [
+          2,
+          5120
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "w_gate",
+        "shape": [
+          10240,
+          17408
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "w_up",
+        "shape": [
+          10240,
+          17408
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "w_down",
+        "shape": [
+          34816,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "final_norm_weight",
+        "shape": [
+          1,
+          5120
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "lm_head_weight",
+        "shape": [
+          152064,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "embed_weight",
+        "shape": [
+          152064,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "out",
+        "shape": [
+          1,
+          152064
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "compile_seconds_inclusive": 6.690221535041928,
+    "domain_owner_counts": {
+      "verified_pypto_leaf": 17,
+      "task_control_owner_observed": 47,
+      "delegated": 15
+    },
+    "expected_ownership_failures": [],
+    "cpp": {
+      "compiled/kernels/aic/down_proj.cpp": "f2af1982d3d376c6e0bc9f7d848084881a4da7f711fa3292ccb21235c64138d4",
+      "compiled/kernels/aic/gate_up_proj.cpp": "063ca0153aab63a159bb2e043328be097b256bb4fd8efa46b0cdba191c7ca90a",
+      "compiled/kernels/aic/kv_proj.cpp": "8dc0d913057de88a19a43a5fd1c093472eb62b2aa5f34ece8a8ccdbcd6fdf734",
+      "compiled/kernels/aic/lm_head.cpp": "43014ae77df410549d7c1ca5c1167f1770cc967193df795548966c566002f215",
+      "compiled/kernels/aic/out_proj_aic.cpp": "ae90357d0bb3aa36376740f09beee16bf901915ddcee2fb5b013aa34818cb843",
+      "compiled/kernels/aic/q_proj.cpp": "40eaf9ac83563cbd1758357a0742f6b1678fb918fef972d882bb7c9fb7c7e6ec",
+      "compiled/kernels/aic/qk_pv_partial_plan_aic.cpp": "0c5895ad67f5289d7125063aed779a273f87ce9657057b1a75c1a34dedd47541",
+      "compiled/kernels/aic/qk_pv_single_block_0_aic.cpp": "b4b20480a75c5ca22c2947631f91f8683fa4dd2b8b80e9dde7e859f008ef8be8",
+      "compiled/kernels/aic/qk_pv_single_block_aic.cpp": "296a3826fcdf63b691af01d930ef7fc0133063f081d3457082a9c4a6c38fecec",
+      "compiled/kernels/aiv/attention_finalize_phase.cpp": "bfb86d8e1a6eb9bc1918b077cc3926fba51dd77da088dcfae9878a96ad0c9480",
+      "compiled/kernels/aiv/final_rmsnorm.cpp": "14bb704c998d31783881d49cf4dccbfb24350c553884bdadef153163915112f2",
+      "compiled/kernels/aiv/mlp_out_cast.cpp": "0ad35dba2abdad288a06cd57149f6242d708d8bdf52a130de326750174af2bcb",
+      "compiled/kernels/aiv/mlp_out_cast_0.cpp": "e9e120289296e66cd1bf0c4a183fd047764787e5aa805ff96c3db48d0f116377",
+      "compiled/kernels/aiv/mlp_out_seed.cpp": "e8a9024ef5f32ffff93eed4e4f8b2e84f5fce1f874c5719b519c619b8c0c6c47",
+      "compiled/kernels/aiv/out_proj_aiv.cpp": "bb985c05373b2288509d136582a6b2ca8f9c207df415bc0e313498fd9093845c",
+      "compiled/kernels/aiv/out_proj_aiv_0.cpp": "33b15fed228f48ffb6f01f7dfc7c732aa36285b87cfa119006caf9cef252023d",
+      "compiled/kernels/aiv/post_rmsnorm.cpp": "eae323d351ef4379aa24f6fdf116c84a917759a85d60309449d8cf1dc1cb8883",
+      "compiled/kernels/aiv/qk_pv_partial_merge.cpp": "35f6bfd4a68cae389bc958d7bc336259ca601e6b8568aae2e2b899448e203bc6",
+      "compiled/kernels/aiv/qk_pv_partial_plan_aiv.cpp": "dd2613b882b4a97446a42f61640eebb711d436de4b9ea2f13d7a277fea81271f",
+      "compiled/kernels/aiv/qk_pv_single_block_0_aiv.cpp": "252443ab88654e45afa8d331d6901f8fa558b91119c68889a6e02884b4bd71d0",
+      "compiled/kernels/aiv/qk_pv_single_block_aiv.cpp": "76f393c5e41ec631c6a5a39217de3dace6ba3b440153c6efafbf004d601e2fd9",
+      "compiled/kernels/aiv/qkpv_plan.cpp": "75f69c68d62a6e4202cd115ba7d6dbcaba5f83c94bef0a7d630edc59a5186fd3",
+      "compiled/kernels/aiv/rms_recip.cpp": "6b01deffac5c34612393fc42600a9bc413833058ebfab7d4922bf254f5a6c681",
+      "compiled/kernels/aiv/rms_recip_0.cpp": "5f5d018d8b2c944cb86273069cc23a0448971acc8350c0f52e070074bb639fc3",
+      "compiled/kernels/aiv/rope_kv_cache.cpp": "10b47b7a0638eae4994ae444a83e93c4582503a0ff0a4b2455f8fba0a9fcea62",
+      "compiled/kernels/aiv/save_prefill_last_token_group.cpp": "e18c16d807c5851099c463123ce2fa0847ccb3c99ca842b398e7c162d950f90e",
+      "compiled/kernels/aiv/save_prefill_last_token_single.cpp": "f05c146a3548f8319bb4e8e95713504d4c3f00db6ff0c7f5855ddec937ebd2c8",
+      "compiled/kernels/aiv/silu.cpp": "0dd6702c4d96efa861c0246aa141eb70b30715b86657cc9061a0c6f738feb5e5",
+      "compiled/kernels/aiv/token_embed_group.cpp": "51fb14991a8209938a6dbfb1eb33f9a13ad23a12a2c031731af8a0ea70e4b127",
+      "compiled/kernels/aiv/token_embed_single.cpp": "fb366f26c8145ca88dc856aa24d806b50cc3f540e8929b0c4fb73d538425a7f2",
+      "compiled/kernels/aiv/x_gamma.cpp": "7d851b7624182bea2e67a02992d6f39bcaba124705530cd76c96f0f945799e41",
+      "compiled/kernels/aiv/x_gamma_0.cpp": "d69c2e2bd6c029eff80ea945f2abcbe967a82888398a469bc254daf4a006a27d"
+    },
+    "receipt": "build-py314/review-repairs-20261116/qwen-m2-qualified/receipt.json",
+    "receipt_sha256": "faaac8cf8263b778479dce9416e6692732491e8d2a44945cb9340bc50abe43ea",
+    "qualification": "Passed required ownership expectations; all32 C++ leaves generated; 17/32 PyPTO owners, 15 delegated. New post_rmsnorm owner; previous count16/16.",
+    "pypto_owned_leaves": [
+      "attention_finalize_phase",
+      "down_proj",
+      "final_rmsnorm",
+      "gate_up_proj",
+      "kv_proj",
+      "mlp_out_cast",
+      "mlp_out_cast_0",
+      "mlp_out_seed",
+      "out_proj_aic",
+      "post_rmsnorm",
+      "q_proj",
+      "qk_pv_partial_merge",
+      "save_prefill_last_token_group",
+      "save_prefill_last_token_single",
+      "silu",
+      "x_gamma",
+      "x_gamma_0"
+    ]
+  },
+  "remaining_delegated_first_admission_obligations": {
+    "type_layout / Var": [
+      "lm_head",
+      "qk_pv_partial_plan_aic",
+      "qk_pv_partial_plan_aiv",
+      "qk_pv_single_block_0_aic",
+      "qk_pv_single_block_0_aiv",
+      "qk_pv_single_block_aic",
+      "qk_pv_single_block_aiv",
+      "qkpv_plan",
+      "rope_kv_cache",
+      "token_embed_group",
+      "token_embed_single"
+    ],
+    "operation_recipe / tile.add": [
+      "out_proj_aiv",
+      "out_proj_aiv_0",
+      "rms_recip",
+      "rms_recip_0"
+    ]
+  },
+  "whole_qwen_exact": {
+    "compiler_revision": "005ebfd35d1b8955dbc1a8a8f7115d46471d57b4",
+    "library_revision": "b72c66d9df69ba5f11982b212530a255c050988d",
+    "model_sources": {
+      "config.py": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+      "constants.py": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+      "contract.py": "f16c43df64c42769dc365a820e5fbc0ff6e9c4d3ceada21660003869ccbeaf15",
+      "decode_fwd.py": "c2f7288ce1e45cbe9fe99d60484aed7a4cb6b4d7255701c4692692a7586dd6f3",
+      "decode_layer_a8w8.py": "4074dea2e5225818108bc088d06dc1717cb2706dd004255a96c05843ba7a5fb8",
+      "decode_ssn_draft.py": "55016c298d42f77500e87bccdf020dbc3e78210cbe1a4c526b97f59466d77705",
+      "decode_tq_draft.py": "9daf2b9b1851d646552cb75504f33aad4766569ff740462a16cdf06d99f352ec",
+      "greedy_sample.py": "8f3fc3e4c533abf01140b299cac35a11185c5151e92df5ba84327afdfa3fceb8",
+      "paged_attention_cce.py": "aafa0bc6dde1758f5518081f3814449e0ca93d137451b67065a06f4b8a375b2d",
+      "paged_attention_pypto.py": "4087a49cd0b6c6396d4fef859576a02f8c6b096e9b94f5b55560e1f4b238e843",
+      "prefill_fwd.py": "3e05b6f910055549d6f89c24743dc384acfb0134be059efe4351b72092824dcb",
+      "prefill_fwd_a8w8.py": "3f359f5b5147c025efa21152117f75291c07826d9675f0a5bc9b76c3a13c67ac",
+      "prefill_tq_draft.py": "0eb51c30bfce55eabbb3318d39542813aef8687858957e41dcfafd5b93c5d8da",
+      "rms_lm_head.py": "0cafe8226d85659afd9d1c19e3c9ae46269a109a7c3c501d846a366e3826e3ce",
+      "rope_qkv_regen.py": "17d868b0527f6555e48426d4fe74526c8d72b5126d442efd2727cf9078c94076",
+      "test_paged_attention_cce.py": "7098e2cea21d017ef6f13f0261b19d37a3af62103045543862cf51b99d793f6c",
+      "test_paged_attention_pypto.py": "9bf0d2ea18b5d995a846858df23c301e32ff79849a08a1bb4250101ff468f32d",
+      "topk_select.py": "60ddb96ee27846c0dfb23f95a59cf53701eed94cca88bf7b5eb3802a5aaef267",
+      "turboquant_kv.py": "d49c3cb4764e524b96be5bffd57cbf6138061e65c5b762ac4781741d2181bf7d",
+      "weights.py": "d23e15850574369379e8140eb7a97be000274250dd6369544cc2108132125bf5"
+    },
+    "configuration": {
+      "layers": 2,
+      "sequence": 128,
+      "batch": 1
+    },
+    "mode": "pypto",
+    "policy": "exact",
+    "command": [
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir/transforms/qualify_qwen_whole_model.py",
+      "--library",
+      "/home/toni/work/pypto3/pypto-lib",
+      "--output",
+      "build-py314/review-repairs-20261116/qwen-m2-exact",
+      "--layers",
+      "2",
+      "--policy",
+      "exact",
+      "--require-function",
+      "down_proj",
+      "--require-function",
+      "q_proj",
+      "--require-function",
+      "out_proj_aic",
+      "--require-domain-owners"
+    ],
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "compiler_dirty_sources": {
+      "include/pypto/backend/common/buffer_scalar_recipes.h": "073e7675c95d5c7686d4a42571909fcc1326e6f731195cd2a8997b92ca75e284",
+      "include/pypto/backend/common/buffer_sync_contract.h": "8ae453ea84c1ce0aaff72de3edf1c359f7df283ae9c3f458917e612f89526220",
+      "include/pypto/ir/transforms/utils/buffer_active_domain_analysis.h": "3c895463193275402be8aea754bc99c0b32d2a1f472f711ac01df301bbf6a959",
+      "python/bindings/modules/testing.cpp": "f8afd88390e88e45c53817ea986ccceaf85ecd370a8f86cfffce5541d7c6b869",
+      "python/pypto/pypto_core/testing.pyi": "8eb7bb841d5771c9787bc581167778b22268cdf77df4201e28c90287df86fa04",
+      "src/backend/common/buffer_scalar_recipes.cpp": "64e24fe988570dada45340ce67aada1e26e576b096530cc4ca7bc2f3a821d445",
+      "src/backend/common/buffer_sync_contract.cpp": "f39b11be3343fddbfd04b1540a6a2ec6a3d127b954d776b9fe09a1ad25516904",
+      "src/codegen/pto/pto_buffer_codegen.cpp": "3267168ca0c7a784e99d7301b045d1132e718a344d5d45aa01294608a5018d3f",
+      "src/ir/op/buffer_ops/memory.cpp": "36774276f52714b1e9eea38d85e40f535e5c32c871ad9a6874ba6f7f4840a2bd",
+      "src/ir/op/tile_ops/memory.cpp": "ed1b2caeaa56bd253e50b1584595a30daf4714525eccc55792facfdfa1b32cc4",
+      "src/ir/transforms/lower_tile_to_buffer_pass.cpp": "941b38d1e0f8f17aed3a8d712d0f6bbd83b9edf79a136de4c641ea608873f81a",
+      "src/ir/transforms/select_buffer_ir_functions_pass.cpp": "d05e5b8a41db41b8655aea1894d081e263712abea0efb7fb9ac38323afea3bac",
+      "src/ir/transforms/utils/buffer_active_domain_analysis.cpp": "721b95ae84927044463f665168379250b590567dd962a6703e9e33f4ac5c87d8",
+      "src/ir/transforms/utils/conservative_sync_dataflow.cpp": "18bd494e4b041566fb2b20b813e2ec23052f8a8dd6ff1aadf7987d47a47d17f1",
+      "src/ir/transforms/utils/native_sync_placement.h": "16819a3f3f106fff8ca10e7b2c56406e972cd1df544c3b1258751bcb1dc6b27f",
+      "src/ir/transforms/utils/token_sync_lowering.cpp": "ea29d306e0a021c36221cf9c86c4b052ef247a46a9f24c50aa8a0d837ebb8a12",
+      "src/ir/verifier/verify_buffer_ir.cpp": "a4b21a5e63c5b1cfc06e742303cff6df8d0ef0507bc0291c7d5db1f6655fe400",
+      "tests/ut/ir/transforms/sync_closed_command_oracle.py": "d22e694abab5fad15e0d99105419b5619db49145ad8b9ef58bcf8b7e30d458d3",
+      "tests/ut/ir/transforms/test_conservative_sync_child_api.py": "45ece2b7d5d5f42f50fe3ef08e1195d283b550e8114a69740598ca0f1c70bdec",
+      "tests/ut/ir/transforms/test_runtime_valid_reduction_axis.py": "4524f871deef31f2152f1a9deff54dc7a64a8a104db8ba7e241b47fe0c7a55de",
+      "tests/ut/ir/transforms/test_scalar_command_oracle.py": "55a0cea5ee3ab4e2776dee9b49c8c7a8ab87c50bb531fac4dd7b916d0fdfc302",
+      "tests/ut/ir/transforms/test_scalar_physical_pitch.py": "d0ee0b1ce411dd5c1da1cd933df0da44a95816e4a3943cf2721d250cf6f3ceaf",
+      "tests/ut/ir/transforms/test_scalar_tile_buffer_bridge.py": "177f571034d7cf00a642231336aa72db22e4135f3ca46094275a12fb1d8c547a",
+      "tests/ut/ir/transforms/test_sync_scalar_payload.py": "236938075bf73b45a042c9888f7cd1a7ccf6ebf359fc3117e0e48b305f311682"
+    },
+    "extension_hashes": {
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "2a31c5e466ef164e7ad13afe59c817df2cc5badef161050bf6ab2d7e26c2030b"
+    },
+    "ptoas": {
+      "path": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher/ptoas",
+      "hash": "8b52c0bfe3259f37dd17331ec0b8ee534461f18e70042edce0e2b6ee2fd7adf8",
+      "version": "ptoas 0.72",
+      "additional_artifacts": {}
+    },
+    "environment": {
+      "PYTHONPATH": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/codegen:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106",
+      "PTOAS_ROOT": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher",
+      "OMP_NUM_THREADS": "1",
+      "PYPTO_CODEGEN_MAX_WORKERS": "1"
+    },
+    "access_contract": "Distinct input GM arguments assumed disjoint; no runtime values inferred",
+    "device": "not run",
+    "compile_success": true,
+    "all_generated_leaves_pypto": false,
+    "arguments": [
+      {
+        "name": "input_ids",
+        "shape": [
+          128
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "seq_lens",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "chunk_lens",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "chunk_offsets",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "input_rms_weight",
+        "shape": [
+          2,
+          5120
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "wq",
+        "shape": [
+          10240,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "wk",
+        "shape": [
+          10240,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "wv",
+        "shape": [
+          10240,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "q_norm_weight",
+        "shape": [
+          2,
+          128
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "k_norm_weight",
+        "shape": [
+          2,
+          128
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "rope_cos",
+        "shape": [
+          4096,
+          128
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "rope_sin",
+        "shape": [
+          4096,
+          128
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "block_table",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "slot_mapping",
+        "shape": [
+          128
+        ],
+        "dtype": "torch.int32"
+      },
+      {
+        "name": "k_cache",
+        "shape": [
+          2048,
+          128
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "v_cache",
+        "shape": [
+          2048,
+          128
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "wo",
+        "shape": [
+          10240,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "post_rms_weight",
+        "shape": [
+          2,
+          5120
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "w_gate",
+        "shape": [
+          10240,
+          17408
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "w_up",
+        "shape": [
+          10240,
+          17408
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "w_down",
+        "shape": [
+          34816,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "final_norm_weight",
+        "shape": [
+          1,
+          5120
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "name": "lm_head_weight",
+        "shape": [
+          152064,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "embed_weight",
+        "shape": [
+          152064,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "name": "out",
+        "shape": [
+          1,
+          152064
+        ],
+        "dtype": "torch.float32"
+      }
+    ],
+    "compile_seconds_inclusive": 6.668342758901417,
+    "domain_owner_counts": {
+      "delegated": 29,
+      "task_control_owner_observed": 47,
+      "verified_pypto_leaf": 3
+    },
+    "expected_ownership_failures": [
+      {
+        "function": "down_proj",
+        "status": "delegated"
+      },
+      {
+        "function": "out_proj_aic",
+        "status": "delegated"
+      },
+      {
+        "function": "q_proj",
+        "status": "delegated"
+      }
+    ],
+    "cpp": {
+      "compiled/kernels/aic/down_proj.cpp": "d60e75fd42ab05089d05b7f1fbe5957844b05ca1441c7a106cde211a550ecc1c",
+      "compiled/kernels/aic/gate_up_proj.cpp": "43d60e29180b6b12c45ebcb96adea00ca9407cc59f2a6fc12fc6d45e360af4bc",
+      "compiled/kernels/aic/kv_proj.cpp": "b77134a75892bd5a62243034efdf93016846aa5a0f486b79cb82fec7b82a8a34",
+      "compiled/kernels/aic/lm_head.cpp": "43014ae77df410549d7c1ca5c1167f1770cc967193df795548966c566002f215",
+      "compiled/kernels/aic/out_proj_aic.cpp": "15d3106e586f1b2fcb5cf000bedec989634ee555fd616608792102dacf1dd18b",
+      "compiled/kernels/aic/q_proj.cpp": "1dd3c05be6c200c01108c59642a4d9a047046d659c3f783a64473c0b83743bb6",
+      "compiled/kernels/aic/qk_pv_partial_plan_aic.cpp": "0c5895ad67f5289d7125063aed779a273f87ce9657057b1a75c1a34dedd47541",
+      "compiled/kernels/aic/qk_pv_single_block_0_aic.cpp": "b4b20480a75c5ca22c2947631f91f8683fa4dd2b8b80e9dde7e859f008ef8be8",
+      "compiled/kernels/aic/qk_pv_single_block_aic.cpp": "296a3826fcdf63b691af01d930ef7fc0133063f081d3457082a9c4a6c38fecec",
+      "compiled/kernels/aiv/attention_finalize_phase.cpp": "b097b4f9abd8657c0bccdf68e40d0393491f7f44e15dede98d9ffa62308922c8",
+      "compiled/kernels/aiv/final_rmsnorm.cpp": "d6ab4834302a5aab6df43dd02f232cb06f20063e8d46429bf30f6efe2cb80370",
+      "compiled/kernels/aiv/mlp_out_cast.cpp": "05239ed0cb62895ce084510ce083101796abbd2e68fcdf0d08792746f30a2800",
+      "compiled/kernels/aiv/mlp_out_cast_0.cpp": "22f365c04397b1197785837f7a29b054531ba83d47efff5d7a6ff6762e28ae48",
+      "compiled/kernels/aiv/mlp_out_seed.cpp": "42b50fbe40584923467cf052ea9494ef87d759bec720874163c4f93ec990e03d",
+      "compiled/kernels/aiv/out_proj_aiv.cpp": "bb985c05373b2288509d136582a6b2ca8f9c207df415bc0e313498fd9093845c",
+      "compiled/kernels/aiv/out_proj_aiv_0.cpp": "33b15fed228f48ffb6f01f7dfc7c732aa36285b87cfa119006caf9cef252023d",
+      "compiled/kernels/aiv/post_rmsnorm.cpp": "03dcb68641cbb3583e39d2870d45367e8335a397e7a0f19838857de46e94f7e7",
+      "compiled/kernels/aiv/qk_pv_partial_merge.cpp": "0d1a276b8e84b7a8dab906b77a7a2d3c0785f2e8f8f289609f9d6f92cb7a55e2",
+      "compiled/kernels/aiv/qk_pv_partial_plan_aiv.cpp": "dd2613b882b4a97446a42f61640eebb711d436de4b9ea2f13d7a277fea81271f",
+      "compiled/kernels/aiv/qk_pv_single_block_0_aiv.cpp": "252443ab88654e45afa8d331d6901f8fa558b91119c68889a6e02884b4bd71d0",
+      "compiled/kernels/aiv/qk_pv_single_block_aiv.cpp": "76f393c5e41ec631c6a5a39217de3dace6ba3b440153c6efafbf004d601e2fd9",
+      "compiled/kernels/aiv/qkpv_plan.cpp": "75f69c68d62a6e4202cd115ba7d6dbcaba5f83c94bef0a7d630edc59a5186fd3",
+      "compiled/kernels/aiv/rms_recip.cpp": "6b01deffac5c34612393fc42600a9bc413833058ebfab7d4922bf254f5a6c681",
+      "compiled/kernels/aiv/rms_recip_0.cpp": "5f5d018d8b2c944cb86273069cc23a0448971acc8350c0f52e070074bb639fc3",
+      "compiled/kernels/aiv/rope_kv_cache.cpp": "10b47b7a0638eae4994ae444a83e93c4582503a0ff0a4b2455f8fba0a9fcea62",
+      "compiled/kernels/aiv/save_prefill_last_token_group.cpp": "cbadc570796bea3bcbd14d1921c3781b8b7eda9234e169029607e73c99fcb1b7",
+      "compiled/kernels/aiv/save_prefill_last_token_single.cpp": "4764fb9525b291d4023ae666e31d633a9ad27b2e149e5a9c111fe999996c4b7b",
+      "compiled/kernels/aiv/silu.cpp": "66af2983ef09d837c2a202809a542d62c96b5b8ecf28934f1328f0caa1463485",
+      "compiled/kernels/aiv/token_embed_group.cpp": "51fb14991a8209938a6dbfb1eb33f9a13ad23a12a2c031731af8a0ea70e4b127",
+      "compiled/kernels/aiv/token_embed_single.cpp": "fb366f26c8145ca88dc856aa24d806b50cc3f540e8929b0c4fb73d538425a7f2",
+      "compiled/kernels/aiv/x_gamma.cpp": "e6d8502c7282bb183a609e79871a1f4ce0649b3933ee449af1d98746a5ee25cd",
+      "compiled/kernels/aiv/x_gamma_0.cpp": "dc83a51104536f494b3aadd81ffa0fdcefd2514d96cf95fab5d2f254704626b8"
+    },
+    "receipt": "build-py314/review-repairs-20261116/qwen-m2-exact/receipt.json",
+    "receipt_sha256": "ff98b75e220f565faee947f0bbaa83bb941d2af92a71202041b30f5b37045b45",
+    "qualification": "Compiler generated32/32 C++; three existing exact owners. Command exited1 because it wrongly required three prefix-only projection owners; preserve as qualification expectation error, not green exact qualification or compiler failure.",
+    "pypto_owned_leaves": [
+      "final_rmsnorm",
+      "mlp_out_seed",
+      "silu"
+    ]
+  },
+  "cost_claim": "Single inclusive host timings are descriptive and non-additive, not demand-only timings or device speedups.",
+  "native_boundary": "Modeled-effect and host-command validation only. No device validation; no new cache, peer, native entry/return or publication premise.",
+  "paper_consequences": [
+    {
+      "established": "Qualified active-prefix normalization preserves observed values and control",
+      "limitation": "Unsupported producer, observer, aggregate and full observation refuse",
+      "claim": "Reusable input/native-metadata repair, not new exact-demand theorem"
+    },
+    {
+      "established": "Local scalar effects and SSA readiness consume existing synchronization services",
+      "limitation": "A2/A3 AIV static FP32/INT32 UB points and proved physical pitch",
+      "claim": "Qualified local scalar realization with bounded host checks"
+    },
+    {
+      "established": "Actual-command bounded tests check matching and causal reuse",
+      "limitation": "Finite oracle and declared native model, six eligible IDs",
+      "claim": "Checked feasibility, not minimum capacity or native correctness"
+    },
+    {
+      "established": "Unchanged two-layer model generates32 C++ leaves, prefix owns17 and delegates15",
+      "limitation": "Exact owns3; remaining effects/exports/control obligations",
+      "claim": "Improved host coverage, not complete Qwen ownership"
+    }
+  ]
+}

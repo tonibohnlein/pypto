@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/buffer_scalar_recipes.h"
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/core/dtype.h"
@@ -206,6 +207,21 @@ TypePtr DeduceBufferTransfer(const std::vector<ExprPtr>& args, bool load) {
   return GetVoidType();
 }
 
+TypePtr DeduceBufferScalarAccess(const std::vector<ExprPtr>& args, bool read) {
+  CHECK(args.size() == (read ? 2 : 3))
+      << "Buffer scalar access requires a buffer, constant coordinates and an optional stored value";
+  CHECK(args[0] && args[1] && (read || args[2])) << "Buffer scalar operands must not be missing";
+  const auto buffer = As<BufferType>(args[0]->GetType());
+  CHECK(backend::BufferScalarPointOffset(buffer, args[1]).has_value())
+      << "Buffer scalar access requires a static in-bounds point on a dense rank-2 FP32/INT32 Vec "
+         "descriptor within the native uint32 offset domain";
+  if (read) return std::make_shared<ScalarType>(buffer->dtype_);
+  const auto scalar = As<ScalarType>(args[2]->GetType());
+  CHECK(scalar && scalar->dtype_ == buffer->dtype_)
+      << "Buffer scalar write requires the descriptor's exact scalar dtype";
+  return GetVoidType();
+}
+
 }  // namespace
 
 // The immutable physical descriptor is Call::type_, never a duplicate kwarg.
@@ -335,6 +351,44 @@ REGISTER_OP("buffer.store")
                                              source->dtype_, destination->dtype_))
           << "buffer.store atomic Add requires FP32 Acc to FP32 GM";
       return result;
+    });
+
+// These are real synchronous scalar payloads, not descriptor queries. Their
+// operands still require synchronization against asynchronous Vec accesses.
+// The selected native implementation, rather than Value result behavior alone,
+// certifies when a read's original SSA becomes ready for control/address uses.
+REGISTER_OP("buffer.read")
+    .set_description("Read one active element synchronously from local Vec storage")
+    .set_op_category("BufferOp")
+    .set_ir_stage(OpIRStage::Buffer)
+    .set_internal_only()
+    .add_argument("src", "Source local Vec buffer")
+    .add_argument("indices", "Constant row and column inside the static active extent")
+    .set_output_arity(1)
+    .set_buffer_arg_effect(0, BufferAccess::Read, BufferAccess::Read)
+    .set_buffer_non_memory_arg(1)
+    .set_buffer_result_behavior(BufferResultBehavior::Value)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>&) {
+      return DeduceBufferScalarAccess(args, true);
+    });
+
+REGISTER_OP("buffer.write")
+    .set_description("Write one active element synchronously into local Vec storage")
+    .set_op_category("BufferOp")
+    .set_ir_stage(OpIRStage::Buffer)
+    .set_internal_only()
+    .add_argument("dst", "Destination local Vec buffer")
+    .add_argument("indices", "Constant row and column inside the static active extent")
+    .add_argument("value", "Scalar with the destination element dtype")
+    .set_output_arity(0)
+    .set_buffer_arg_effect(0, BufferAccess::Write, BufferAccess::Read)
+    .set_buffer_non_memory_arg(1)
+    .set_buffer_non_memory_arg(2)
+    .set_buffer_result_behavior(BufferResultBehavior::None)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>&) {
+      return DeduceBufferScalarAccess(args, false);
     });
 
 // Runtime identity reads are scalar values, not storage handles. They use the

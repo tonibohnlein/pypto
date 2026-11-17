@@ -31,6 +31,14 @@ from .ir import (
 )
 from .passes import EventfulSyncChild, NativeSyncChild
 
+def normalize_buffer_active_domains(function: Function) -> dict[str, Any]:
+    """Inspect the existing prefix candidate/work without whole Buffer admission.
+
+    ``candidate`` is the retained immutable input on refusal; ``changed`` names
+    only normalization, and ``work`` counts source occurrences and distinct DAG
+    identities. A changed candidate still requires ordinary Buffer admission.
+    """
+
 def validate_buffer_op_contract(
     stage: OpIRStage,
     arity: int | None,
