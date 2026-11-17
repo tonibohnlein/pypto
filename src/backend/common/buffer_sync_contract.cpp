@@ -197,8 +197,10 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
     result.audited_signal_free_variant_ = true;
   }
   if (const auto axis = FindBufferAxisRecipe(call->op_->name_); axis && !axis->reduction && axis->axis == 1) {
-    CHECK(target == "a2a3" && (IsOp(call, "buffer.row_expand_sub") || IsOp(call, "buffer.row_expand_div") ||
-                               IsOp(call, "buffer.row_expand_mul")))
+    CHECK(target == "a2a3" &&
+          (IsOp(call, "buffer.row_expand_add") || IsOp(call, "buffer.row_expand_sub") ||
+           IsOp(call, "buffer.row_expand_mul") || IsOp(call, "buffer.row_expand_div") ||
+           IsOp(call, "buffer.row_expand_max") || IsOp(call, "buffer.row_expand_min")))
         << "Row broadcast implicit effects require a qualified native implementation";
     // Registry validation selects FP32 Mode1 (a contiguous column carrier),
     // with no explicit temporary operand. Runtime-row CountMode has the same
@@ -211,10 +213,10 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
     // 5487a6b0: common/constants.hpp and npu/a2a3/TRowExpandBinOp.hpp.
     result.implicit_effects_.push_back({MemorySpace::Vec, 184 * 1024, 192 * 1024, ir::BufferAccess::ReadWrite,
                                         "a2a3-row-broadcast-mode1-implicit-scratch", false});
-    // These three selected wrappers and their shared Mode1 helper contain
+    // These six selected wrappers and their shared Mode1 helper contain
     // PIPE_V barriers, but no SET/WAIT or compiler-allocated event operations.
     // This positive source audit, not absence from the signal catalog, supplies
-    // the no-numbered-event premise for the new MUL family as well as SUB/DIV.
+    // the no-numbered-event premise for ADD/SUB/MUL/DIV/MAX/MIN.
     result.audited_signal_free_variant_ = true;
   }
   const bool vector = core == FunctionType::AIV;

@@ -157,6 +157,18 @@ def operand_signature(expr, env, storage):
     return tuple(descriptor)
 
 
+def _indexed_effects(name, args, access):
+    if name == ir.get_op("buffer.gather_compare").name:
+        reads = access(args[0])
+        writes = access(args[2]) | access(args[3]) | access(args[4]) | access(args[5])
+        return reads, writes, ir.PipeType.V
+    reads = access(args[0]) | access(args[1])
+    writes = access(args[-1])
+    if name == ir.get_op("buffer.gather").name:
+        writes |= access(args[2])
+    return reads, writes, ir.PipeType.V
+
+
 def _vector_effects(name, args, access):
     """Elementwise operations read inputs and write their typed destination."""
     # TCVT can change byte widths; partial native footprints are not qualified.
@@ -164,9 +176,12 @@ def _vector_effects(name, args, access):
     reads = set().union(*(access(a) for a in args[:-1] if isinstance(a.type, ir.BufferType)))
     writes = access(args[-1])
     if name in {
+        ir.get_op("buffer.row_expand_add").name,
         ir.get_op("buffer.row_expand_sub").name,
-        ir.get_op("buffer.row_expand_div").name,
         ir.get_op("buffer.row_expand_mul").name,
+        ir.get_op("buffer.row_expand_div").name,
+        ir.get_op("buffer.row_expand_max").name,
+        ir.get_op("buffer.row_expand_min").name,
     }:
         # Independently instantiate the declared native envelope from
         # pinned A2/A3 TRowExpandBin Mode1, not compiler partitions or
@@ -196,7 +211,7 @@ def define_storage(stmt, env, storage):
             row, col = [integer(e, env) for e in offsets.elements]
             base += row * pitch + col * scalar_bytes
         else:
-            assert pitch == width * scalar_bytes
+            assert height == 1 or pitch == width * scalar_bytes
             pitch = t.shape[1] * t.dtype.get_byte()
         storage[stmt.var] = storage[stmt.var.name_hint] = (
             space,
@@ -283,15 +298,21 @@ def interpret(
                 else None
             )
             reads, writes, pipe = access(args[0], rect), access(dest), ir.PipeType.MTE1
-        elif name in {ir.get_op("buffer.gather").name, ir.get_op("buffer.scatter").name}:
+        elif name in {
+            ir.get_op("buffer.gather").name,
+            ir.get_op("buffer.scatter").name,
+            ir.get_op("buffer.gather_compare").name,
+        }:
             # Independently construct the declared whole-buffer model; actual
             # indexed reads are checked separately with concrete index values.
-            reads = access(args[0]) | access(args[1])
-            writes = access(args[-1])
-            if name == ir.get_op("buffer.gather").name:
-                writes |= access(args[2])
-            pipe = ir.PipeType.V
-        elif name in {ir.get_op("buffer.row_max").name, ir.get_op("buffer.row_sum").name}:
+            reads, writes, pipe = _indexed_effects(name, args, access)
+        elif name in {
+            ir.get_op("buffer.row_max").name,
+            ir.get_op("buffer.row_sum").name,
+            ir.get_op("buffer.row_min").name,
+            ir.get_op("buffer.row_prod").name,
+            ir.get_op("buffer.transpose").name,
+        }:
             # Independently interpret the declared workspace effect. This
             # is an enclosure, not a reconstruction of native scratch use.
             reads = access(args[0])
@@ -310,9 +331,12 @@ def interpret(
             ir.get_op("buffer.sqrt").name,
             ir.get_op("buffer.muls").name,
             ir.get_op("buffer.exp").name,
+            ir.get_op("buffer.row_expand_add").name,
             ir.get_op("buffer.row_expand_sub").name,
-            ir.get_op("buffer.row_expand_div").name,
             ir.get_op("buffer.row_expand_mul").name,
+            ir.get_op("buffer.row_expand_div").name,
+            ir.get_op("buffer.row_expand_max").name,
+            ir.get_op("buffer.row_expand_min").name,
             ir.get_op("buffer.col_expand_mul").name,
         }:
             reads, writes, pipe = _vector_effects(name, args, access)
