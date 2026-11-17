@@ -39,8 +39,8 @@ class ScopedSyncProtocol {
   const CompactSyncInput& Input() const { return input_; }
   const std::vector<PhysicalSyncFamily>& Families() const { return families_; }
   const std::vector<ScopedProtocolCut>& Cuts() const { return cuts_; }
+  const FunctionPtr& Tokens() const { return tokens_; }
   void ValidateFor(const CompactSyncInput& input) const;
-  void ValidateTokens(const FunctionPtr& tokens) const;
 
  private:
   FunctionPtr tokens_;

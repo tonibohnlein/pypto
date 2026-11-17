@@ -11,17 +11,23 @@
 
 #include "python/bindings/modules/testing_sync_support.h"
 
+#include <algorithm>
 #include <limits>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "pypto/core/logging.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
+#include "src/ir/transforms/utils/numerical_sync_hierarchy.h"
+#include "src/ir/transforms/utils/numerical_sync_merge.h"
+#include "src/ir/transforms/utils/rotating_sync_analysis.h"
 #include "src/ir/transforms/utils/scoped_logical_sync.h"
+#include "src/ir/transforms/utils/sync_invocation_domains.h"
 #include "src/ir/transforms/utils/sync_token_names.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
 
@@ -135,19 +141,556 @@ std::vector<StmtPtr> EmitCases(const ExprPtr& block, const Intervals& possible,
 }
 std::pair<std::vector<Intervals>, PhysicalSyncRealization> InspectGroups(
     const FunctionPtr& owner, const std::vector<CommandCase>& supplied) {
+  CHECK(!supplied.empty()) << "Expected nonempty schedule cases";
   PhysicalSyncRealization work;
-  std::vector<CaseCommands> cases;
-  for (const auto& c : supplied) cases.push_back({c.blocks, ImportCommands(c.body, work)});
-  return InspectCommandGroups(owner, cases, std::move(work));
+  std::vector<std::pair<int64_t, int64_t>> domains;
+  auto cut = std::make_shared<physical::PhysicalCuts>();
+  const auto blocks = std::make_pair(supplied.front().blocks.first, supplied.back().blocks.second);
+  int64_t next = blocks.first;
+  for (const auto& item : supplied) {
+    CHECK(item.blocks.first == next && item.blocks.second >= next &&
+          item.blocks.second < std::numeric_limits<int64_t>::max())
+        << "Non-exhaustive cases";
+    next = item.blocks.second + 1;
+    domains.push_back(item.blocks);
+    cut->before_cases.push_back({item.blocks, ImportCommands(item.body, work)});
+  }
+  const std::vector<physical::PreparedSchedulePhase> phases{
+      {0, 1, 1, false, {physical::CutInventory{{nullptr, cut}}}}};
+  const auto grouped =
+      physical::GroupInvocationSchedules(phases, ir::sync::DominatingSyncBlock(owner), domains, work);
+  std::vector<Intervals> result;
+  for (const auto& group : grouped) result.push_back(group.intervals);
+  return {std::move(result), std::move(work)};
 }
 PhysicalSyncRealization EmitBoundaries(const FunctionPtr& owner,
                                        const std::vector<std::tuple<CallPtr, StmtPtr, StmtPtr>>& supplied,
                                        bool enabled, bool validate_scope) {
   PhysicalSyncRealization work;
-  std::vector<std::tuple<CallPtr, ControlForest, ControlForest>> cuts;
-  for (const auto& [call, before, after] : supplied)
-    cuts.push_back({call, {ImportCommands(before, work)}, {ImportCommands(after, work)}});
-  return EmitCommandBoundaries(owner, cuts, enabled, validate_scope, std::move(work));
+  physical::CutInventory inventory;
+  for (const auto& [call, before, after] : supplied) {
+    auto cut = std::make_shared<physical::PhysicalCuts>();
+    cut->before = {ImportCommands(before, work)};
+    cut->after = {ImportCommands(after, work)};
+    CHECK(inventory.emplace(call.get(), std::move(cut)).second) << "Duplicate diagnostic command cut";
+  }
+  if (validate_scope) {
+    physical::PopulateCutDomains(owner, inventory, work);
+    for (const auto& [call, cut] : inventory) {
+      CHECK(cut->predicate_scope) << "Diagnostic cut has no original owner scope";
+      physical::RequireCommandScope(cut->before, *cut->predicate_scope, work);
+      physical::RequireCommandScope(cut->after, *cut->predicate_scope, work);
+    }
+  }
+  SyncTokenNames names(owner);
+  ++work.schedule_name_scans;
+  work.schedule_name_visits += names.visits;
+  physical::PreparedLoops loops;
+  auto plans = physical::PlanCommandBoundaries(owner, inventory, enabled, work);
+  work.function =
+      physical::MaterializeSelectedSchedule(owner, nullptr, inventory, loops, plans, {}, work, names);
+  return work;
+}
+namespace {
+using ir::ForStmt;
+using ir::ForStmtPtr;
+using ir::PipeType;
+using ir::sync::CompactSyncView;
+using ir::sync::Crossing;
+using ir::sync::DecodeNumericalOccurrence;
+using ir::sync::EvaluateSyncCoordinate;
+using ir::sync::kPipeCount;
+using ir::sync::MergeNumericalBoundary;
+using ir::sync::NumericalAdd;
+using ir::sync::NumericalBoundary;
+using ir::sync::NumericalCell;
+using ir::sync::NumericalNode;
+using ir::sync::NumericalOrdinal;
+using ir::sync::NumericalReferenceBefore;
+using ir::sync::Occurrence;
+using ir::sync::PointBoundary;
+using ir::sync::RotatingBoundary;
+using ir::sync::SyncAccess;
+using ir::sync::SyncCoordinateNode;
+using ir::sync::SyncSegment;
+using ir::sync::SyncTranslation;
+
+NumericalOrdinal Length(int64_t count, size_t sites) { return NumericalOrdinal(count) * sites; }
+
+std::optional<std::pair<int64_t, int64_t>> Visits(const SyncAccess& a, int64_t count, int64_t row,
+                                                  int64_t col) {
+  if (count <= 0) return std::nullopt;
+  int64_t lo = a.after_first ? 1 : 0, hi = count - 1;
+  auto restrict = [&](int64_t x, int64_t start, int64_t step, int64_t size) {
+    if (step == 0) {
+      if (x < start || x - start >= size) hi = -1;
+      return;
+    }
+    if (x < start) {
+      hi = -1;
+      return;
+    }
+    hi = std::min(hi, (x - start) / step);
+    if (x - start >= size) lo = std::max(lo, (x - start - size) / step + 1);
+  };
+  restrict(row, a.row, a.row_step, a.rows);
+  restrict(col, a.column, a.column_step, a.columns);
+  if (lo > hi) return std::nullopt;
+  return std::make_pair(lo, hi);
+}
+
+std::optional<std::pair<int64_t, int64_t>> PointVisits(const SyncAccess& access, const SyncSegment& segment,
+                                                       int64_t row, int64_t column) {
+  if (!segment.count) return std::nullopt;
+  if (access.coordinate_frame && !segment.nested_frames.empty()) {
+    int64_t stride = 1;
+    for (auto frame = segment.nested_frames.rbegin(); frame != segment.nested_frames.rend(); ++frame) {
+      if (frame->loop == access.coordinate_frame) {
+        auto visits = Visits(access, frame->count, row, column);
+        if (!visits) return std::nullopt;
+        return std::make_pair(visits->first * stride,
+                              segment.count - 1 - (frame->count - 1 - visits->second) * stride);
+      }
+      INTERNAL_CHECK(!__builtin_mul_overflow(stride, frame->count, &stride))
+          << "Internal error: access coordinate stride overflow";
+    }
+    INTERNAL_CHECK(false) << "Internal error: missing original access frame";
+  }
+  const auto scope = segment.reset_period ? segment.reset_period : segment.count;
+  auto visits = Visits(access, scope, row, column);
+  if (visits) visits->second += segment.count - scope;
+  return visits;
+}
+
+std::optional<std::pair<int64_t, int64_t>> OriginalAccessPointVisits(const SyncAccess& access,
+                                                                     const SyncSegment& segment, int64_t row,
+                                                                     int64_t column) {
+  CHECK(!access.external) << "External point selector requires its qualified coordinate provider";
+  return PointVisits(access, segment, row, column);
+}
+
+std::optional<PointBoundary> RelativeBoundary(const CompactSyncView& view, size_t storage, int64_t row,
+                                              int64_t column, std::optional<size_t> leaf = std::nullopt) {
+  if (storage < view.State().input.storage.size() &&
+      (!view.State().input.storage[storage].boundary_available ||
+       view.State().input.unavailable_storage_spaces.count(view.State().input.storage[storage].space)))
+    return std::nullopt;
+  if (storage >= view.State().input.storage.size() || row < 0 || column < 0 ||
+      row >= view.State().input.storage[storage].rows || column >= view.State().input.storage[storage].columns)
+    return std::nullopt;
+  PointBoundary out;
+  struct Range {
+    size_t r, s;
+    int64_t lo, hi;
+    bool write;
+    PipeType pipe;
+  };
+  std::vector<Range> ranges;
+  for (size_t r = leaf.value_or(0); r < (leaf ? *leaf + 1 : view.State().input.segments.size()); ++r)
+    for (size_t s = 0; s < view.State().input.segments[r].sites.size(); ++s) {
+      const auto& site = view.State().input.segments[r].sites[s];
+      for (const auto& a : site.accesses)
+        if (a.storage == storage) {
+          if (a.external) return std::nullopt;
+          auto visits = [&](const SyncAccess& access) {
+            return leaf ? Visits(access, view.State().segments[r].internal_scope_count, row, column)
+                        : PointVisits(access, view.State().input.segments[r], row, column);
+          };
+          auto v = visits(a);
+          if (!v) continue;
+          bool rmw =
+              !a.write && std::any_of(site.accesses.begin(), site.accesses.end(), [&](const SyncAccess& w) {
+                return w.write && w.storage == storage && visits(w).has_value();
+              });
+          if (rmw) continue;
+          ranges.push_back({r, s, v->first, v->second, a.write, site.pipe});
+          if (a.write) {
+            Occurrence first{r, v->first, s}, last{r, v->second, s};
+            if (!out.first_writer || first < *out.first_writer) out.first_writer = first;
+            if (!out.last_writer || last > *out.last_writer) out.last_writer = last;
+          }
+        }
+    }
+  for (const auto& r : ranges)
+    if (!r.write) {
+      Occurrence first{r.r, r.lo, r.s}, last{r.r, r.hi, r.s};
+      if ((!out.first_writer || first < *out.first_writer) &&
+          (!out.first_readers[r.pipe] || first < *out.first_readers[r.pipe]))
+        out.first_readers[r.pipe] = first;
+      if ((!out.last_writer || last > *out.last_writer) &&
+          (!out.last_readers[r.pipe] || last > *out.last_readers[r.pipe]))
+        out.last_readers[r.pipe] = last;
+    }
+  return out;
+}
+
+PointBoundary LeafPointBoundary(const CompactSyncView& view, size_t region, size_t storage, int64_t row,
+                                int64_t column) {
+  CHECK(region < view.State().segments.size()) << "Invalid compact leaf";
+  CHECK(storage < view.State().input.storage.size() && view.State().input.storage[storage].boundary_available &&
+        !view.State().input.unavailable_storage_spaces.count(view.State().input.storage[storage].space))
+      << "Leaf storage selector unavailable for this storage domain";
+  for (const auto& site : view.State().input.segments[region].sites)
+    for (const auto& access : site.accesses)
+      CHECK(access.storage != storage ||
+            (!access.external && (!access.coordinate_frame ||
+                                  access.coordinate_frame == view.State().input.segments[region].original_loop)))
+          << "Leaf point selector requires its enclosing occurrence binding";
+  auto result = RelativeBoundary(view, storage, row, column, region);
+  CHECK(result) << "Leaf storage point outside the supplied domain";
+  return *result;
+}
+
+NumericalBoundary LeafBoundary(const CompactSyncView& result, size_t leaf, const NumericalCell& cell) {
+  if (result.State().hierarchy) {
+    const auto provider = result.State().hierarchy->finite_providers.find(leaf);
+    if (provider != result.State().hierarchy->finite_providers.end()) {
+      NumericalBoundary out;
+      for (size_t i = 0; i < provider->second.sites.size(); ++i) {
+        const auto& site = provider->second.sites[i];
+        bool reads = false, writes = false;
+        for (const auto& access : site.accesses) {
+          if (access.storage != cell.storage || access.slot_first != cell.slot || cell.row < access.row ||
+              cell.row >= access.row + access.rows || cell.column < access.column ||
+              cell.column >= access.column + access.columns)
+            continue;
+          (access.write ? writes : reads) = true;
+        }
+        if (writes) {
+          if (!out.first_writer) out.first_writer = i;
+          out.last_writer = i;
+          out.last_readers.fill(std::nullopt);
+        } else if (reads) {
+          if (!out.first_writer && !out.first_readers[site.pipe]) out.first_readers[site.pipe] = i;
+          out.last_readers[site.pipe] = i;
+        }
+      }
+      return out;
+    }
+  }
+  const auto selected = result.State().segments[leaf].rotating
+                            ? RotatingBoundary(result.State().input, result.State().segments[leaf],
+                                               cell.storage, cell.slot, cell.row, cell.column, leaf)
+                            : LeafPointBoundary(result, leaf, cell.storage, cell.row, cell.column);
+  const size_t sites = result.State().input.segments[leaf].sites.size();
+  auto ordinal = [&](const std::optional<Occurrence>& occurrence) -> std::optional<NumericalOrdinal> {
+    if (!occurrence) return std::nullopt;
+    return Length(std::get<1>(*occurrence), sites) + std::get<2>(*occurrence);
+  };
+  NumericalBoundary out;
+  out.first_writer = ordinal(selected.first_writer);
+  out.last_writer = ordinal(selected.last_writer);
+  for (size_t p = 0; p < kPipeCount; ++p) {
+    out.first_readers[p] = ordinal(selected.first_readers[p]);
+    out.last_readers[p] = ordinal(selected.last_readers[p]);
+  }
+  return out;
+}
+
+NumericalBoundary Point(const CompactSyncView& result, const std::shared_ptr<const NumericalNode>& node,
+                        const NumericalCell& cell,
+                        std::unordered_map<const NumericalNode*, NumericalBoundary>& cache) {
+  const auto found = cache.find(node.get());
+  if (found != cache.end()) return found->second;
+  NumericalBoundary out;
+  if (node->length) {
+    if (!node->left)
+      out = LeafBoundary(result, node->leaf, cell);
+    else
+      out = MergeNumericalBoundary(Point(result, node->left, cell, cache),
+                                   Point(result, node->right, cell, cache), node->left->length);
+  }
+  cache.emplace(node.get(), out);
+  return out;
+}
+
+std::optional<PointBoundary> QueryExternalNumericalBoundary(const CompactSyncView& result, size_t storage,
+                                                            int64_t slot, int64_t row, int64_t column,
+                                                            const std::map<size_t, int64_t>& parameters,
+                                                            std::optional<int64_t> block_index) {
+  const auto& domain = result.State().input.storage.at(storage);
+  if (slot != 0 || row < 0 || column < 0 || row >= domain.rows || column >= domain.columns)
+    return std::nullopt;
+  if (!result.State().hierarchy->phase_owned_outputs.count(storage)) return std::nullopt;
+  for (const auto& [parameter, value] : parameters) {
+    const auto bound = result.State().input.parameter_bounds.find(parameter);
+    if (bound == result.State().input.parameter_bounds.end() || value < bound->second.first ||
+        value > bound->second.second)
+      return std::nullopt;
+  }
+  if (block_index &&
+      (!result.State().input.block_bounds || *block_index < result.State().input.block_bounds->first ||
+       *block_index > result.State().input.block_bounds->second))
+    return std::nullopt;
+  const auto& directory = result.State().storage_access_index.at(storage);
+  INTERNAL_CHECK(directory.accesses.size() == 1) << "Owned output lost its complete access inventory";
+  const auto [r, s, a] = directory.accesses.front();
+  const auto& segment = result.State().input.segments[r];
+  const auto& access = segment.sites[s].accesses[a];
+  const auto& external = *access.external;
+  if (!segment.count) return PointBoundary{};
+  if (!external.row_major_tiles) {
+    INTERNAL_CHECK(segment.count == 1) << "Output ownership missing nontrivial inverse";
+    std::map<const ForStmt*, int64_t> binding;
+    std::set<const ForStmt*> needed_frames;
+    for (const auto& frame : segment.nested_frames) needed_frames.insert(frame.loop.get());
+    for (const auto& node : external.program->nodes) {
+      if (node.kind != SyncCoordinateNode::Kind::Loop || !needed_frames.count(node.frame.get())) continue;
+      auto start = node.dynamic_start ? EvaluateSyncCoordinate(*external.program, node.left, binding,
+                                                               parameters, block_index)
+                                      : std::optional<int64_t>(node.start);
+      if (!start) return std::nullopt;
+      binding[node.frame.get()] = *start;
+    }
+    const auto r0 = EvaluateSyncCoordinate(*external.program, external.row, binding, parameters, block_index);
+    const auto c0 =
+        EvaluateSyncCoordinate(*external.program, external.column, binding, parameters, block_index);
+    if (!r0 || !c0) return std::nullopt;
+    PointBoundary out;
+    if (row >= *r0 && row - *r0 < access.rows && column >= *c0 && column - *c0 < access.columns)
+      out.first_writer = out.last_writer = Occurrence{r, 0, s};
+    return out;
+  }
+  const auto& tiles = *external.row_major_tiles;
+  const auto tile_row = row / tiles.row_scale, tile_column = column / tiles.column_scale;
+  if (tile_row >= tiles.row_tiles || tile_column >= tiles.column_tiles) return PointBoundary{};
+  const auto inverse = __int128(tile_row) * tiles.column_tiles + tile_column;
+  if (inverse > std::numeric_limits<int64_t>::max()) return std::nullopt;
+  const auto tile = static_cast<int64_t>(inverse);
+  const auto& coordinate = external.program->nodes.at(tiles.tile_coordinate);
+  std::optional<int64_t> start = coordinate.start;
+  if (tiles.frame_start_root)
+    start = EvaluateSyncCoordinate(*external.program, *tiles.frame_start_root, {}, parameters, block_index);
+  if (!start) return std::nullopt;
+  if (tile < *start || (tile - *start) % coordinate.step) return PointBoundary{};
+  const auto visit = (tile - *start) / coordinate.step;
+  int64_t ordinal = 0;
+  for (const auto& frame : segment.nested_frames) {
+    if (!frame.count) return PointBoundary{};
+    const auto digit = frame.loop == tiles.frame ? visit : 0;
+    if (digit >= frame.count) return PointBoundary{};
+    const auto next = __int128(ordinal) * frame.count + digit;
+    if (next > std::numeric_limits<int64_t>::max()) return std::nullopt;
+    ordinal = static_cast<int64_t>(next);
+  }
+  const std::map<const ForStmt*, int64_t> binding{{tiles.frame.get(), tile}};
+  const auto first_row =
+      EvaluateSyncCoordinate(*external.program, external.row, binding, parameters, block_index);
+  const auto first_column =
+      EvaluateSyncCoordinate(*external.program, external.column, binding, parameters, block_index);
+  if (!first_row || !first_column) return std::nullopt;
+  INTERNAL_CHECK(row >= *first_row && row - *first_row < access.rows && column >= *first_column &&
+                 column - *first_column < access.columns)
+      << "Owned output inverse disagrees with its exact footprint";
+  PointBoundary out;
+  out.first_writer = out.last_writer = Occurrence{r, ordinal, s};
+  return out;
+}
+
+PointBoundary QueryNumericalBoundary(const CompactSyncView& result, size_t storage, int64_t slot, int64_t row,
+                                     int64_t column) {
+  if (result.State().hierarchy->phase_readonly_domains.count(storage)) {
+    PointBoundary out;
+    CHECK(slot == 0) << "External selector has an invalid physical slot";
+    for (const auto& [r, s, a] : result.State().storage_access_index.at(storage).accesses) {
+      ++result.Diagnostics().point_selector_access_visits;
+      const auto& segment = result.State().input.segments[r];
+      const auto& site = segment.sites[s];
+      const auto& access = site.accesses[a];
+      INTERNAL_CHECK(!access.write) << "Read-only phase domain contains a write";
+      const auto range = OriginalAccessPointVisits(access, segment, row, column);
+      if (!range) continue;
+      const Occurrence first{r, range->first, s}, last{r, range->second, s};
+      auto& earliest = out.first_readers[site.pipe];
+      auto& latest = out.last_readers[site.pipe];
+      if (!earliest || NumericalReferenceBefore(result, first, *earliest)) earliest = first;
+      if (!latest || NumericalReferenceBefore(result, *latest, last)) latest = last;
+    }
+    return out;
+  }
+  std::unordered_map<const NumericalNode*, NumericalBoundary> cache;
+  const auto selected = Point(result, result.State().hierarchy->root, {storage, slot, row, column}, cache);
+  auto decode = [&](const std::optional<NumericalOrdinal>& ordinal) -> std::optional<Occurrence> {
+    return ordinal ? std::optional<Occurrence>(DecodeNumericalOccurrence(result, *ordinal)) : std::nullopt;
+  };
+  PointBoundary out;
+  out.first_writer = decode(selected.first_writer);
+  out.last_writer = decode(selected.last_writer);
+  for (size_t p = 0; p < kPipeCount; ++p) {
+    out.first_readers[p] = decode(selected.first_readers[p]);
+    out.last_readers[p] = decode(selected.last_readers[p]);
+  }
+  return out;
+}
+
+void ExpandNodeDemands(const CompactSyncView& result, const std::shared_ptr<const NumericalNode>& node,
+                       NumericalOrdinal offset, std::vector<Crossing>& out) {
+  if (!node->length) return;
+  if (!node->left) {
+    if (const auto provider = result.State().hierarchy->finite_providers.find(node->leaf);
+        provider != result.State().hierarchy->finite_providers.end()) {
+      for (const auto& [a, b] : provider->second.order.demands)
+        out.emplace_back(DecodeNumericalOccurrence(result, NumericalAdd(offset, a)),
+                         DecodeNumericalOccurrence(result, NumericalAdd(offset, b)));
+      return;
+    }
+    const auto& segment = result.State().segments[node->leaf];
+    const auto sites = result.State().input.segments[node->leaf].sites.size();
+    for (const auto& demand : segment.demands)
+      for (int64_t i = 0; i < segment.internal_scope_count - demand.distance; ++i) {
+        const auto a = NumericalAdd(offset, Length(i, sites) + demand.source);
+        const auto b = NumericalAdd(offset, Length(i + demand.distance, sites) + demand.target);
+        out.emplace_back(DecodeNumericalOccurrence(result, a), DecodeNumericalOccurrence(result, b));
+      }
+    return;
+  }
+  ExpandNodeDemands(result, node->left, offset, out);
+  const auto right_offset = NumericalAdd(offset, node->left->length);
+  ExpandNodeDemands(result, node->right, right_offset, out);
+  for (const auto& crossing : node->crossings) {
+    if (crossing.native) continue;
+    const auto a = NumericalAdd(offset, node->left->chains[crossing.source.first][crossing.source.second]);
+    const auto b =
+        NumericalAdd(right_offset, node->right->chains[crossing.target.first][crossing.target.second]);
+    out.emplace_back(DecodeNumericalOccurrence(result, a), DecodeNumericalOccurrence(result, b));
+  }
+}
+}  // namespace
+
+std::optional<PointBoundary> BoundaryAt(const CompactSyncView& view, size_t storage, int64_t row,
+                                        int64_t column, const std::map<size_t, int64_t>& parameters,
+                                        std::optional<int64_t> block_index) {
+  if (storage >= view.State().input.storage.size() || view.State().input.storage[storage].slot_count != 1)
+    return std::nullopt;
+  return BoundarySlot(view, storage, 0, row, column, parameters, block_index);
+}
+std::optional<PointBoundary> BoundarySlot(const CompactSyncView& view, size_t storage, int64_t slot,
+                                          int64_t row, int64_t column,
+                                          const std::map<size_t, int64_t>& parameters,
+                                          std::optional<int64_t> block_index) {
+  if (storage >= view.State().input.storage.size() || slot < 0 ||
+      slot >= view.State().input.storage[storage].slot_count)
+    return std::nullopt;
+  if (const auto& coordinate = view.State().input.invocation_coordinate) {
+    if (!block_index) return std::nullopt;
+    block_index = coordinate->Map(*block_index, parameters);
+    if (!block_index || *block_index < view.State().input.block_bounds->first ||
+        *block_index > view.State().input.block_bounds->second)
+      return std::nullopt;
+  }
+  const auto& domain = view.State().input.storage[storage];
+  if (!domain.boundary_available || view.State().input.unavailable_storage_spaces.count(domain.space))
+    return std::nullopt;
+  if (domain.row_extent_parameter) {
+    const auto parameter = *domain.row_extent_parameter;
+    auto value = parameters.find(parameter);
+    const auto bounds = view.State().input.parameter_bounds.at(parameter);
+    if (value == parameters.end() || value->second < bounds.first || value->second > bounds.second ||
+        row >= value->second)
+      return std::nullopt;
+  }
+  if (row < 0 || column < 0 || row >= domain.rows || column >= domain.columns) return std::nullopt;
+  if (view.State().hierarchy && view.State().storage_access_index.at(storage).external_geometry)
+    return QueryExternalNumericalBoundary(view, storage, slot, row, column, parameters, block_index);
+  auto shift = [&](const SyncTranslation& translation) -> std::optional<int64_t> {
+    int64_t value = 0;
+    for (auto [index, coefficient] : translation) {
+      auto bound = view.State().input.parameter_bounds.find(index);
+      auto supplied = parameters.find(index);
+      if (bound == view.State().input.parameter_bounds.end() || supplied == parameters.end() ||
+          supplied->second < bound->second.first || supplied->second > bound->second.second)
+        return std::nullopt;
+      const auto sum = __int128(value) + __int128(coefficient) * supplied->second;
+      if (sum > std::numeric_limits<int64_t>::max()) return std::nullopt;
+      value = static_cast<int64_t>(sum);
+    }
+    return value;
+  };
+  auto r = shift(domain.row_parameters), c = shift(domain.column_parameters);
+  if (!r || !c) return std::nullopt;
+  if (domain.row_block || domain.column_block) {
+    if (!block_index || !view.State().input.block_bounds ||
+        *block_index < view.State().input.block_bounds->first ||
+        *block_index > view.State().input.block_bounds->second)
+      return std::nullopt;
+    const auto coordinate = *block_index - view.State().input.block_bounds->first;
+    const auto row_shift = __int128(*r) + __int128(domain.row_block) * coordinate;
+    const auto column_shift = __int128(*c) + __int128(domain.column_block) * coordinate;
+    if (row_shift > std::numeric_limits<int64_t>::max() || column_shift > std::numeric_limits<int64_t>::max())
+      return std::nullopt;
+    r = static_cast<int64_t>(row_shift);
+    c = static_cast<int64_t>(column_shift);
+  }
+  if (row < *r || column < *c) return PointBoundary{};
+  if (view.State().hierarchy && view.State().input.region_tree) {
+    const auto& index = view.State().storage_access_index.at(storage);
+    if (index.enclosing_motion) {
+      if (index.written) return std::nullopt;
+      PointBoundary out;
+      for (const auto& [leaf, site, access_index] : index.accesses) {
+        ++view.Diagnostics().point_selector_access_visits;
+        const auto& segment = view.State().input.segments[leaf];
+        const auto& access = segment.sites[site].accesses[access_index];
+        auto visits = PointVisits(access, segment, row - *r, column - *c);
+        if (!visits) continue;
+        const auto pipe = static_cast<size_t>(segment.sites[site].pipe);
+        const Occurrence first{leaf, visits->first, site}, last{leaf, visits->second, site};
+        if (!out.first_readers[pipe] || view.Precedes(first, false, *out.first_readers[pipe], false))
+          out.first_readers[pipe] = first;
+        if (!out.last_readers[pipe] || view.Precedes(*out.last_readers[pipe], false, last, false))
+          out.last_readers[pipe] = last;
+      }
+      return out;
+    }
+  }
+  if (view.State().hierarchy) return QueryNumericalBoundary(view, storage, slot, row - *r, column - *c);
+  if (view.State().segments.size() == 1 && view.State().segments.front().rotating)
+    return RotatingBoundary(view.State().input, view.State().segments.front(), storage, slot, row - *r,
+                            column - *c);
+  return RelativeBoundary(view, storage, row - *r, column - *c);
+}
+std::vector<Crossing> ExpandRetainedDemands(const CompactSyncView& view, size_t max_payloads) {
+  NumericalOrdinal count = 0;
+  for (const auto& segment : view.State().input.segments)
+    count = NumericalAdd(count, Length(segment.count, segment.sites.size()));
+  CHECK(count <= max_payloads) << "Retained-demand audit exceeds its requested payload bound";
+  std::vector<Crossing> out;
+  if (view.State().hierarchy) {
+    ExpandNodeDemands(view, view.State().hierarchy->root, 0, out);
+  } else {
+    out = view.State().crossing_demands;
+    for (size_t r = 0; r < view.State().segments.size(); ++r) {
+      const auto& segment = view.State().segments[r];
+      for (const auto& demand : segment.demands)
+        for (int64_t i = 0; i < segment.count - demand.distance; ++i)
+          out.push_back({{r, i, demand.source}, {r, i + demand.distance, demand.target}});
+    }
+  }
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
+std::shared_ptr<const CompactSyncResult> SelectInvocationCase(const SyncInvocationAnalysis& analysis,
+                                                              int64_t block_index,
+                                                              const std::map<size_t, int64_t>& parameters) {
+  if (block_index < analysis.block_bounds.first || block_index > analysis.block_bounds.second) return nullptr;
+  for (const auto& [parameter, bound] : analysis.parameter_bounds) {
+    auto value = parameters.find(parameter);
+    if (value == parameters.end() || value->second < bound.first || value->second > bound.second)
+      return nullptr;
+  }
+  if (analysis.coordinate) {
+    const auto mapped = analysis.coordinate->Map(block_index, parameters);
+    if (!mapped) return nullptr;
+    block_index = *mapped;
+  }
+  auto found = std::upper_bound(
+      analysis.cases.begin(), analysis.cases.end(), block_index,
+      [](int64_t value, const auto& candidate) { return value < candidate.block_first; });
+  if (found == analysis.cases.begin()) return nullptr;
+  --found;
+  if (block_index > found->block_last) return nullptr;
+  return found->mathematics;
 }
 }  // namespace pypto::python::sync_testing
 

@@ -94,7 +94,6 @@ struct ConservativeSyncSite {
 
 struct ConservativeSyncChildEntry {
   ForStmtPtr scope;
-  std::shared_ptr<const NativeSyncChild> child;
   ConservativeAccessSet incoming, effects;  // incoming requires HasIncomingDiagnostics().
   // A child has several participating pipes, never one fabricated payload pipe.
   std::vector<std::pair<PipeType, PipeType>> services;

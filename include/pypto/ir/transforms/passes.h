@@ -339,7 +339,7 @@ std::vector<std::shared_ptr<const sync::EventfulSyncChild>> PrepareEventfulSyncC
 Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accepted_children = {},
                 std::vector<std::shared_ptr<const sync::EventfulSyncChild>> eventful_children = {});
 
-/// Verify logical completion IR; initially an identity optimization stage.
+/// Verify and simplify logical synchronization (forward wait simplification and dead token elimination).
 Pass OptimizeSync();
 
 /// Lower the supported logical token subset using certified physical resources.

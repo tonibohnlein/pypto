@@ -77,18 +77,13 @@ FunctionPtr MaterializeSelectedSchedule(const FunctionPtr& owner, const ExprPtr&
                                         SyncTokenNames& names);
 ExprPtr InvocationGroupGuard(const ExprPtr& block, std::pair<int64_t, int64_t> domain,
                              const Intervals& intervals, const Span& span);
+std::vector<InvocationScheduleGroup> GroupInvocationSchedules(
+    const std::vector<PreparedSchedulePhase>& phases, const ExprPtr& block,
+    const std::vector<std::pair<int64_t, int64_t>>& domains, PhysicalSyncRealization& work);
+void PopulateCutDomains(const FunctionPtr& owner, CutInventory& cuts, PhysicalSyncRealization& work);
+BoundarySchedules PlanCommandBoundaries(const FunctionPtr& owner, CutInventory& cuts, bool enabled,
+                                        PhysicalSyncRealization& work);
 
 }  // namespace pypto::ir::sync::physical
-
-// Descriptor-level inspection hooks exercise private scheduling services without
-// accepting raw IR or maintaining a separate emission implementation.
-namespace pypto::ir::sync {
-std::pair<std::vector<physical::Intervals>, PhysicalSyncRealization> InspectCommandGroups(
-    const FunctionPtr&, const std::vector<physical::CaseCommands>&, PhysicalSyncRealization);
-PhysicalSyncRealization EmitCommandBoundaries(
-    const FunctionPtr&,
-    const std::vector<std::tuple<CallPtr, physical::ControlForest, physical::ControlForest>>&, bool, bool,
-    PhysicalSyncRealization);
-}  // namespace pypto::ir::sync
 
 #endif  // SRC_IR_TRANSFORMS_UTILS_PHYSICAL_SYNC_SCHEDULE_H_

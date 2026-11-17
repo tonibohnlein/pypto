@@ -52,23 +52,16 @@ class NativeSyncChild {
  public:
   const FunctionPtr& Owner() const { return mathematics_.State().input.owner; }
   const ForStmtPtr& Scope() const { return scope_; }
-  const CompactSyncResult& Mathematics() const { return mathematics_; }
-  const std::vector<backend::BufferSyncOperation>& Operations() const { return operations_; }
   void ValidateFor(const FunctionPtr& owner, const std::string& target) const;
 
  private:
   friend NativeSyncChildExport ExportNativeSyncChild(const CompactSyncResult&, const ForStmtPtr&,
                                                      const std::string&);
-  NativeSyncChild(CompactSyncResult mathematics, ForStmtPtr scope, std::string target,
-                  std::vector<backend::BufferSyncOperation> operations)
-      : mathematics_(std::move(mathematics)),
-        scope_(std::move(scope)),
-        target_(std::move(target)),
-        operations_(std::move(operations)) {}
+  NativeSyncChild(CompactSyncResult mathematics, ForStmtPtr scope, std::string target)
+      : mathematics_(std::move(mathematics)), scope_(std::move(scope)), target_(std::move(target)) {}
   CompactSyncResult mathematics_;
   ForStmtPtr scope_;
   std::string target_;
-  std::vector<backend::BufferSyncOperation> operations_;
 };
 
 // Routing hint only. LowerSync independently validates the marked token region,
@@ -139,7 +132,6 @@ class EventfulSyncChild {
   const FunctionPtr& Owner() const { return context_.original_owner; }
   const ForStmtPtr& Scope() const { return context_.original_scope; }
   const StmtPtr& LogicalRecipe() const { return logical_recipe_; }
-  const std::vector<PipeType>& Pipes() const { return pipes_; }
   const std::vector<SyncDirection>& RearmDirections() const { return rearm_dirs_; }
   std::map<std::string, size_t> Describe() const;
   void ValidateFor(const FunctionPtr& owner, const std::string& target) const;
@@ -150,15 +142,13 @@ class EventfulSyncChild {
   CompactSyncResult mathematics_;
   StmtPtr logical_recipe_;
   std::string target_;
-  std::vector<PipeType> pipes_;
   std::vector<SyncDirection> rearm_dirs_;
   EventfulSyncChild(SyncRegionContext context, CompactSyncResult mathematics, StmtPtr logical_recipe,
-                    std::string target, std::vector<PipeType> pipes, std::vector<SyncDirection> rearm_dirs)
+                    std::string target, std::vector<SyncDirection> rearm_dirs)
       : context_(std::move(context)),
         mathematics_(std::move(mathematics)),
         logical_recipe_(std::move(logical_recipe)),
         target_(std::move(target)),
-        pipes_(std::move(pipes)),
         rearm_dirs_(std::move(rearm_dirs)) {}
   friend std::shared_ptr<const EventfulSyncChild> PrepareEventfulSyncChild(const FunctionPtr&,
                                                                            const ForStmtPtr&,

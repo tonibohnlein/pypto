@@ -2257,22 +2257,25 @@ FunctionPtr CompileAssignedSyncSchedule(const FunctionPtr& owner, const std::vec
   return function;
 }
 
+void PopulateCutDomains(const FunctionPtr& owner, CutInventory& cuts, PhysicalSyncRealization& work) {
+  const AbsentLoops absent;
+  CutDomains(owner, absent, cuts, {0, 0}, work).VisitStmt(owner->body_);
+}
+
+BoundarySchedules PlanCommandBoundaries(const FunctionPtr& owner, CutInventory& cuts, bool enabled,
+                                        PhysicalSyncRealization& work) {
+  PreparedLoops loops;
+  BoundaryScheduleCollector boundary(cuts, loops, work);
+  if (enabled) {
+    boundary.VisitStmt(owner->body_);
+    CommandSeams(cuts, work, &boundary.plans, &loops).Run(owner->body_);
+  }
+  return std::move(boundary.plans);
+}
+
 }  // namespace physical
 
-using physical::AbsentLoops;
-using physical::BoundaryScheduleCollector;
-using physical::CaseCommands;
-using physical::CommandSeams;
-using physical::ControlForest;
-using physical::CutDomains;
-using physical::CutInventory;
-using physical::GroupInvocationSchedules;
 using physical::kScheduleModes;
-using physical::MaterializeSelectedSchedule;
-using physical::PhysicalCuts;
-using physical::PreparedLoops;
-using physical::PreparedSchedulePhase;
-using physical::RequireCommandScope;
 using physical::ScheduleTreeSize;
 void FinishSyncScheduleReceipt(const FunctionPtr& function, PhysicalSyncRealization& work,
                                const SyncSchedulePolicy& policy) {
@@ -2317,60 +2320,6 @@ void FinishSyncScheduleReceipt(const FunctionPtr& function, PhysicalSyncRealizat
     unknown.command_sites = measured.commands;
     work.schedule_choices.push_back(std::move(unknown));
   }
-}
-std::pair<std::vector<std::vector<std::pair<int64_t, int64_t>>>, PhysicalSyncRealization>
-InspectCommandGroups(const FunctionPtr& owner, const std::vector<CaseCommands>& supplied,
-                     PhysicalSyncRealization work) {
-  CHECK(!supplied.empty()) << "Expected nonempty schedule cases";
-  std::vector<std::pair<int64_t, int64_t>> domains;
-  auto cut = std::make_shared<PhysicalCuts>();
-  const auto blocks = std::make_pair(supplied.front().blocks.first, supplied.back().blocks.second);
-  int64_t next = blocks.first;
-  for (size_t c = 0; c < supplied.size(); ++c) {
-    CHECK(supplied[c].blocks.first == next && supplied[c].blocks.second >= next &&
-          supplied[c].blocks.second < std::numeric_limits<int64_t>::max())
-        << "Non-exhaustive cases";
-    next = supplied[c].blocks.second + 1;
-    domains.push_back(supplied[c].blocks);
-    cut->before_cases.push_back({supplied[c].blocks, supplied[c].body});
-  }
-  const std::vector<PreparedSchedulePhase> phases{{0, 1, 1, false, {CutInventory{{nullptr, cut}}}}};
-  const auto grouped = GroupInvocationSchedules(phases, DominatingSyncBlock(owner), domains, work);
-  std::vector<std::vector<std::pair<int64_t, int64_t>>> result;
-  for (const auto& group : grouped) result.push_back(group.intervals);
-  return {std::move(result), std::move(work)};
-}
-PhysicalSyncRealization EmitCommandBoundaries(
-    const FunctionPtr& owner, const std::vector<std::tuple<CallPtr, ControlForest, ControlForest>>& supplied,
-    bool enabled, bool validate_scope, PhysicalSyncRealization work) {
-  CutInventory inventory;
-  for (const auto& [call, before, after] : supplied) {
-    auto cut = std::make_shared<PhysicalCuts>();
-    cut->before = before;
-    cut->after = after;
-    CHECK(inventory.emplace(call.get(), std::move(cut)).second) << "Duplicate diagnostic command cut";
-  }
-  if (validate_scope) {
-    const AbsentLoops absent;
-    CutDomains(owner, absent, inventory, {0, 0}, work).VisitStmt(owner->body_);
-    for (const auto& [call, cut] : inventory) {
-      CHECK(cut->predicate_scope) << "Diagnostic cut has no original owner scope";
-      RequireCommandScope(cut->before, *cut->predicate_scope, work);
-      RequireCommandScope(cut->after, *cut->predicate_scope, work);
-    }
-  }
-  SyncTokenNames names(owner);
-  ++work.schedule_name_scans;
-  work.schedule_name_visits += names.visits;
-  PreparedLoops loops;
-  BoundaryScheduleCollector boundary(inventory, loops, work);
-  if (enabled) {
-    boundary.VisitStmt(owner->body_);
-    CommandSeams(inventory, work, &boundary.plans, &loops).Run(owner->body_);
-  }
-  work.function =
-      MaterializeSelectedSchedule(owner, nullptr, inventory, loops, boundary.plans, {}, work, names);
-  return work;
 }
 
 }  // namespace pypto::ir::sync

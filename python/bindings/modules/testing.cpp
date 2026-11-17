@@ -326,7 +326,7 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncView& result) {
 nb::object CompactBoundary(const ir::sync::CompactSyncResult& result, size_t storage, int64_t row,
                            int64_t col, const std::map<size_t, int64_t>& parameters,
                            std::optional<int64_t> block_index) {
-  auto b = result.BoundaryAt(storage, row, col, parameters, block_index);
+  auto b = sync_testing::BoundaryAt(result, storage, row, col, parameters, block_index);
   if (!b) return nb::none();
   nb::dict out;
   out["first_writer"] = b->first_writer;
@@ -338,7 +338,7 @@ nb::object CompactBoundary(const ir::sync::CompactSyncResult& result, size_t sto
 nb::object CompactSlotBoundary(const ir::sync::CompactSyncResult& result, size_t storage, int64_t slot,
                                int64_t row, int64_t col, const std::map<size_t, int64_t>& parameters,
                                std::optional<int64_t> block_index) {
-  auto boundary = result.BoundarySlot(storage, slot, row, col, parameters, block_index);
+  auto boundary = sync_testing::BoundarySlot(result, storage, slot, row, col, parameters, block_index);
   if (!boundary) return nb::none();
   nb::dict out;
   out["first_writer"] = boundary->first_writer;
@@ -801,7 +801,9 @@ nb::dict DescribePhysicalSync(const ir::sync::PhysicalSyncRealization& result) {
   out["native_reserved_ids"] = result.native_reserved_ids;
   out["finite_minimum"] = result.finite_minimum;
   nb::list families;
-  for (const auto& f : result.Families()) {
+  static const std::vector<ir::sync::PhysicalSyncFamily> empty_families;
+  const auto& family_list = result.assignment ? result.assignment->Families() : empty_families;
+  for (const auto& f : family_list) {
     nb::dict row;
     row["source"] = nb::make_tuple(f.source_region, f.source_first, f.source_site);
     row["target"] = nb::make_tuple(f.target_region, f.target_first, f.target_site);
@@ -1079,8 +1081,9 @@ void BindTesting(nb::module_& m) {
         INTERNAL_CHECK(assignment) << "Missing completed assignment";
         const auto copy = result;
         nb::dict out;
-        out["shared_family_storage"] = &result.Families() == &copy.Families();
-        out["families"] = result.Families().size();
+        out["shared_family_storage"] =
+            &result.assignment->Families() == &copy.assignment->Families();
+        out["families"] = result.assignment->Families().size();
         if (change == "preassigned_ids") {
           auto families = order->Families();  // Deliberately invalid diagnostic input.
           CHECK(!families.empty()) << "Expected a nonempty diagnostic plan";
@@ -1143,7 +1146,7 @@ void BindTesting(nb::module_& m) {
       .def(
           "expand_retained_demands",
           [](const ir::sync::CompactSyncResult& result, size_t maximum) {
-            return result.ExpandRetainedDemands(maximum);
+            return sync_testing::ExpandRetainedDemands(result, maximum);
           },
           nb::arg("max_payloads"), "Bounded audit expansion of retained records; never reruns analysis")
       .def(
@@ -1234,7 +1237,8 @@ void BindTesting(nb::module_& m) {
            })
       .def("validate_token_owner",
            [](const ir::sync::ScopedTokenOrder& order, const ir::FunctionPtr& function) {
-             order.Protocol()->ValidateTokens(function);
+             CHECK(order.Protocol()->Tokens() == function)
+                 << "Unassigned synchronization protocol belongs to different token IR";
            })
       .def_prop_ro("summary_nodes", &ir::sync::ScopedTokenOrder::SummaryNodes)
       .def_prop_ro("interface_entries", &ir::sync::ScopedTokenOrder::InterfaceEntries)
@@ -1421,7 +1425,7 @@ void BindTesting(nb::module_& m) {
           nb::arg("target"), nb::arg("eligible_ids") = nb::none(), nb::kw_only(),
           nb::arg("schedule_policy") = ir::sync::SyncSchedulePolicy{},
           "Test supplied-demand case adapter; does not exercise actual-token interpretation")
-      .def("select_case", &ir::sync::SyncInvocationAnalysis::SelectCase, nb::arg("block_index"),
+      .def("select_case", &sync_testing::SelectInvocationCase, nb::arg("block_index"),
            nb::arg("parameters"), "Retained case for a fully bound admitted invocation, or None")
       .def(
           "describe",
@@ -1632,7 +1636,8 @@ void BindTesting(nb::module_& m) {
         counters["child_discovery_nodes"] = selection.discovery_nodes;
         counters["child_index_nodes"] = selection.index_nodes;
         counters["child_parameter_nodes"] = selection.parameter_nodes;
-        result["exit_effects"] = facts(analysis.ExitEffects());
+        result["exit_effects"] =
+            analysis.HasIncomingDiagnostics() ? facts(analysis.ExitEffects()) : nb::none();
         result["cost"] = counters;
         nb::list domains;
         for (const auto& domain : analysis.StorageDomains()) {

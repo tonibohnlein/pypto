@@ -665,10 +665,6 @@ void AssignedSyncPlan::ValidateFor(const CompactSyncInput& input, const std::str
   CHECK(state_->segments == AssignmentSegments(input) && state_->regions == AssignmentRegions(input))
       << "Assigned synchronization occurrence frame changed";
 }
-const std::vector<PhysicalSyncFamily>& PhysicalSyncRealization::Families() const {
-  static const std::vector<PhysicalSyncFamily> empty;
-  return assignment ? assignment->Families() : empty;  // Unassigned command diagnostics only.
-}
 
 PhysicalSyncRealization AllocateDirectSync(const CompactSyncInput& input, std::vector<Family> families,
                                            const DirectSyncOrder& order, const std::string& target,

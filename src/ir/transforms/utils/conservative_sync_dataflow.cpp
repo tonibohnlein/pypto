@@ -473,14 +473,14 @@ class Builder {
       child->ValidateFor(function, target_);
       CHECK(child_index_.emplace(child->Scope().get(), children.size()).second)
           << "Conservative synchronization: duplicate retained child scope";
-      children.push_back({child->Scope(), child, {}, {}, {}, {}, {}, CompletionSummary::Identity()});
+      children.push_back({child->Scope(), {}, {}, {}, {}, {}, CompletionSummary::Identity()});
     }
     for (const auto& child : eventful) {
       CHECK(child) << "Conservative synchronization: missing eventful child certificate";
       child->ValidateFor(function, target_);
       CHECK(child_index_.emplace(child->Scope().get(), children.size()).second)
           << "Conservative synchronization: duplicate retained child scope";
-      children.push_back({child->Scope(), {}, {}, {}, {}, child, {}, CompletionSummary::Identity()});
+      children.push_back({child->Scope(), {}, {}, {}, child, {}, CompletionSummary::Identity()});
     }
   }
 
@@ -707,7 +707,7 @@ class Builder {
     ExtractSourcePipeServices(cfg, rpo, live_in, live_out);
     SelectAndCertifyDebts(cfg, rpo, rpo_pos, cfg_entry);
 
-    return live_out[cfg_exit].ToAccessSet();
+    return retain_incoming_diagnostics_ ? live_out[cfg_exit].ToAccessSet() : ConservativeAccessSet{};
   }
 
   std::vector<ConservativeSyncSite> sites;

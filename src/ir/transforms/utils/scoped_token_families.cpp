@@ -984,9 +984,6 @@ ScopedSyncProtocol::ScopedSyncProtocol(FunctionPtr tokens, CompactSyncInput inpu
 void ScopedSyncProtocol::ValidateFor(const CompactSyncInput& input) const {
   CHECK(&input == &input_) << "Unassigned synchronization protocol belongs to a different input case";
 }
-void ScopedSyncProtocol::ValidateTokens(const FunctionPtr& tokens) const {
-  CHECK(tokens_ == tokens) << "Unassigned synchronization protocol belongs to different token IR";
-}
 std::shared_ptr<const ScopedSyncProtocol> ParseScopedTokenProtocol(
     const FunctionPtr& function, CompactSyncInput input,
     const std::map<const ForStmt*, ForStmtPtr>& stripped_loops, ScopedTokenWork* work) {
