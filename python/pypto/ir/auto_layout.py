@@ -886,6 +886,451 @@ def _iter_child_stmts(stmt: core_ir.Stmt) -> Sequence[core_ir.Stmt]:
     return (body,) if isinstance(body, core_ir.Stmt) else ()
 
 
+def _is_whole_tensor_flatten(call: core_ir.Call) -> bool:
+    """Mirror `IsWholeTensorFlatten` from `block_nz_tensor_views_pass.cpp:198`."""
+    if call.op.name != _TENSOR_RESHAPE_OP or len(call.args) < 2:
+        return False
+    src_type = call.args[0].type
+    if not isinstance(src_type, core_ir.TensorType):
+        return False
+    src_shape = _static_shape(src_type.shape)
+    if src_shape is None:
+        return False
+    shape_tuple = call.args[1]
+    if not isinstance(shape_tuple, core_ir.MakeTuple) or len(shape_tuple.elements) != 1:
+        return False
+    flat_ext = shape_tuple.elements[0]
+    if not isinstance(flat_ext, core_ir.ConstInt):
+        return False
+    return math.prod(src_shape) == int(flat_ext.value)
+
+
+def _is_provable_multiple_of(  # noqa: PLR0913
+    expr: core_ir.Expr,
+    divisor: int,
+    scalar_defs: Mapping[int, core_ir.Expr],
+    loop_ranges: Mapping[int, tuple[core_ir.Expr, core_ir.Expr]],
+    param_steps_by_uid: Mapping[int, int],
+    budget: list[int],
+) -> bool:
+    """Mirror `IsProvableMultipleOf` from `tensor_view_semantics.h:356`."""
+    if divisor <= 0 or (divisor & (divisor - 1)) != 0 or budget[0] <= 0:
+        return False
+    budget[0] -= 1
+    if isinstance(expr, core_ir.ConstInt):
+        return int(expr.value) % divisor == 0
+    if isinstance(expr, core_ir.Mul):
+        return _is_provable_multiple_of(
+            expr.left, divisor, scalar_defs, loop_ranges, param_steps_by_uid, budget
+        ) or _is_provable_multiple_of(
+            expr.right, divisor, scalar_defs, loop_ranges, param_steps_by_uid, budget
+        )
+    if isinstance(expr, (core_ir.Add, core_ir.Sub, core_ir.Min, core_ir.Max)):
+        return _is_provable_multiple_of(
+            expr.left, divisor, scalar_defs, loop_ranges, param_steps_by_uid, budget
+        ) and _is_provable_multiple_of(
+            expr.right, divisor, scalar_defs, loop_ranges, param_steps_by_uid, budget
+        )
+    if isinstance(expr, core_ir.Var) and not isinstance(expr, core_ir.IterArg):
+        uid = expr.unique_id
+        step = param_steps_by_uid.get(uid)
+        if step is not None and step > 1 and step % 8 == 0 and step % divisor == 0:
+            return True
+        if uid in loop_ranges:
+            start_expr, step_expr = loop_ranges[uid]
+            if _is_provable_multiple_of(
+                start_expr, divisor, scalar_defs, loop_ranges, param_steps_by_uid, budget
+            ) and _is_provable_multiple_of(
+                step_expr, divisor, scalar_defs, loop_ranges, param_steps_by_uid, budget
+            ):
+                return True
+        if uid in scalar_defs:
+            return _is_provable_multiple_of(
+                scalar_defs[uid], divisor, scalar_defs, loop_ranges, param_steps_by_uid, budget
+            )
+    return False
+
+
+def _is_provable_non_negative(
+    expr: core_ir.Expr,
+    scalar_defs: Mapping[int, core_ir.Expr],
+    loop_ranges: Mapping[int, tuple[core_ir.Expr, core_ir.Expr]],
+    non_neg_uids: set[int],
+    budget: list[int],
+) -> bool:
+    """Mirror `IsProvableNonNegative` from `tensor_view_semantics.h:428` (`Sub` is always refused)."""
+    if budget[0] <= 0:
+        return False
+    budget[0] -= 1
+    if isinstance(expr, core_ir.ConstInt):
+        return int(expr.value) >= 0
+    if isinstance(expr, (core_ir.Mul, core_ir.Add, core_ir.Min)):
+        return _is_provable_non_negative(
+            expr.left, scalar_defs, loop_ranges, non_neg_uids, budget
+        ) and _is_provable_non_negative(expr.right, scalar_defs, loop_ranges, non_neg_uids, budget)
+    if isinstance(expr, core_ir.Max):
+        return _is_provable_non_negative(
+            expr.left, scalar_defs, loop_ranges, non_neg_uids, budget
+        ) or _is_provable_non_negative(expr.right, scalar_defs, loop_ranges, non_neg_uids, budget)
+    if isinstance(expr, (core_ir.FloorMod, core_ir.FloorDiv)):
+        return (
+            isinstance(expr.right, core_ir.ConstInt)
+            and int(expr.right.value) > 0
+            and _is_provable_non_negative(expr.left, scalar_defs, loop_ranges, non_neg_uids, budget)
+        )
+    if isinstance(expr, core_ir.Var) and not isinstance(expr, core_ir.IterArg):
+        uid = expr.unique_id
+        if uid in non_neg_uids:
+            return True
+        if uid in loop_ranges:
+            start_expr, step_expr = loop_ranges[uid]
+            if _is_provable_non_negative(
+                start_expr, scalar_defs, loop_ranges, non_neg_uids, budget
+            ) and _is_provable_non_negative(step_expr, scalar_defs, loop_ranges, non_neg_uids, budget):
+                return True
+        if uid in scalar_defs:
+            return _is_provable_non_negative(scalar_defs[uid], scalar_defs, loop_ranges, non_neg_uids, budget)
+    return False
+
+
+def _is_nz_compatible_offset_axis(  # noqa: PLR0913
+    offset_expr: core_ir.Expr,
+    divisor: int,
+    scalar_defs: Mapping[int, core_ir.Expr],
+    loop_ranges: Mapping[int, tuple[core_ir.Expr, core_ir.Expr]],
+    param_steps_by_uid: Mapping[int, int],
+    non_neg_uids: set[int],
+) -> bool:
+    """Mirror `block_axis` in `BlockNzOffsets` (`tensor_view_semantics.h:564`)."""
+    if isinstance(offset_expr, core_ir.ConstInt):
+        val = int(offset_expr.value)
+        return val >= 0 and val % divisor == 0
+    return _is_provable_multiple_of(
+        offset_expr, divisor, scalar_defs, loop_ranges, param_steps_by_uid, [256]
+    ) and _is_provable_non_negative(offset_expr, scalar_defs, loop_ranges, non_neg_uids, [256])
+
+
+def _is_nz_compatible_tensor_type(tensor_type: core_ir.Type) -> tuple[int, ...] | None:
+    """Check `BlockNzType` preconditions (`block_nz_tensor_views_pass.cpp:167-185`)."""
+    if not isinstance(tensor_type, core_ir.TensorType):
+        return None
+    view = tensor_type.tensor_view
+    if view is not None and (view.valid_shape or view.stride):
+        return None
+    shape = _static_shape(tensor_type.shape)
+    if shape is None or len(shape) not in (2, 3):
+        return None
+    if not is_nz_compatible_shape(shape, tensor_type.dtype):
+        return None
+    return shape
+
+
+def _is_nz_compatible_tensor_slice_call(call: core_ir.Call, tensor_type: core_ir.Type) -> bool:
+    """Mirror `BlockTensorSliceArgs` from `block_nz_tensor_views_pass.cpp:654-767`."""
+    shape = _is_nz_compatible_tensor_type(tensor_type)
+    if shape is None or len(call.args) < 3 or not isinstance(tensor_type, core_ir.TensorType):
+        return False
+    rank = len(shape)
+    shapes_arg, offsets_arg = call.args[1], call.args[2]
+    if not isinstance(shapes_arg, core_ir.MakeTuple) or not isinstance(offsets_arg, core_ir.MakeTuple):
+        return False
+    if len(shapes_arg.elements) != rank or len(offsets_arg.elements) != rank:
+        return False
+    shapes_static = _static_shape(shapes_arg.elements)
+    if shapes_static is None or not is_nz_compatible_shape(shapes_static, tensor_type.dtype):
+        return False
+    row_off, col_off = offsets_arg.elements[-2], offsets_arg.elements[-1]
+    if shapes_static[-2] != shape[-2] or shapes_static[-1] != shape[-1]:
+        return False
+    if not isinstance(row_off, core_ir.ConstInt) or int(row_off.value) != 0:
+        return False
+    if not isinstance(col_off, core_ir.ConstInt) or int(col_off.value) != 0:
+        return False
+    if len(call.args) >= 4:
+        valid_arg = call.args[3]
+        if isinstance(valid_arg, core_ir.MakeTuple) and valid_arg.elements:
+            if len(valid_arg.elements) != rank or _static_shape(valid_arg.elements) != shapes_static:
+                return False
+    if len(call.args) >= 5:
+        drop_arg = call.args[4]
+        if not isinstance(drop_arg, core_ir.MakeTuple):
+            return False
+        for d_expr in drop_arg.elements:
+            if (
+                not isinstance(d_expr, core_ir.ConstInt)
+                or int(d_expr.value) < 0
+                or int(d_expr.value) + 2 >= rank
+            ):
+                return False
+    return True
+
+
+def _is_nz_compatible_valid_shape(  # noqa: PLR0913
+    valid_arg: core_ir.Expr,
+    rank: int,
+    c0: int,
+    scalar_defs: Mapping[int, core_ir.Expr],
+    loop_ranges: Mapping[int, tuple[core_ir.Expr, core_ir.Expr]],
+    param_steps_by_uid: Mapping[int, int],
+) -> bool:
+    """Mirror `BlockNzValidShape` from `tensor_view_semantics.h:506-538`."""
+    if not isinstance(valid_arg, core_ir.MakeTuple) or len(valid_arg.elements) != rank:
+        return False
+    if any(not isinstance(el, core_ir.ConstInt) or int(el.value) <= 0 for el in valid_arg.elements[:-2]):
+        return False
+    v_cols = valid_arg.elements[-1]
+    if not isinstance(v_cols, core_ir.ConstInt) or int(v_cols.value) <= 0 or int(v_cols.value) % c0 != 0:
+        return False
+    v_rows = valid_arg.elements[-2]
+    if isinstance(v_rows, core_ir.ConstInt):
+        return int(v_rows.value) > 0 and int(v_rows.value) % 16 == 0
+    return _is_provable_multiple_of(v_rows, 16, scalar_defs, loop_ranges, param_steps_by_uid, [256])
+
+
+def _is_nz_compatible_tile_load_call(  # noqa: PLR0913
+    call: core_ir.Call,
+    tensor_type: core_ir.Type,
+    scalar_defs: Mapping[int, core_ir.Expr],
+    loop_ranges: Mapping[int, tuple[core_ir.Expr, core_ir.Expr]],
+    param_steps_by_uid: Mapping[int, int],
+    non_neg_uids: set[int],
+) -> bool:
+    """Mirror `BlockTileLoadArgs` from `block_nz_tensor_views_pass.cpp:771-813`."""
+    shape = _is_nz_compatible_tensor_type(tensor_type)
+    if (
+        shape is None
+        or len(call.args) < 3
+        or not isinstance(tensor_type, core_ir.TensorType)
+        or call.kwargs.get("target_memory") != core_ir.MemorySpace.Mat
+    ):
+        return False
+    rank = len(shape)
+    offsets_arg, shapes_arg = call.args[1], call.args[2]
+    if (
+        not isinstance(offsets_arg, core_ir.MakeTuple)
+        or not isinstance(shapes_arg, core_ir.MakeTuple)
+        or len(offsets_arg.elements) != rank
+        or len(shapes_arg.elements) != rank
+    ):
+        return False
+    shapes_static = _static_shape(shapes_arg.elements)
+    c0 = c0_elements(tensor_type.dtype)
+    if shapes_static is None or c0 <= 0 or not is_nz_compatible_shape(shapes_static, tensor_type.dtype):
+        return False
+    if not (
+        _is_nz_compatible_offset_axis(
+            offsets_arg.elements[-2], 16, scalar_defs, loop_ranges, param_steps_by_uid, non_neg_uids
+        )
+        and _is_nz_compatible_offset_axis(
+            offsets_arg.elements[-1], c0, scalar_defs, loop_ranges, param_steps_by_uid, non_neg_uids
+        )
+    ):
+        return False
+    part_tuple = shapes_arg
+    if len(call.args) >= 4:
+        if not _is_nz_compatible_valid_shape(
+            call.args[3], rank, c0, scalar_defs, loop_ranges, param_steps_by_uid
+        ):
+            return False
+        part_tuple = call.args[3]
+        assert isinstance(part_tuple, core_ir.MakeTuple)
+    col_blocks = (
+        int(part_tuple.elements[-1].value) // c0
+        if isinstance(part_tuple.elements[-1], core_ir.ConstInt)
+        else 2
+    )
+    loaded_rows = (
+        int(part_tuple.elements[-2].value) if isinstance(part_tuple.elements[-2], core_ir.ConstInt) else 0
+    )
+    return not (col_blocks > 1 and (shape[-2] - loaded_rows) > 65535)
+
+
+def _is_nz_compatible_tile_store_call(  # noqa: PLR0913
+    call: core_ir.Call,
+    tensor_type: core_ir.Type,
+    scalar_defs: Mapping[int, core_ir.Expr],
+    loop_ranges: Mapping[int, tuple[core_ir.Expr, core_ir.Expr]],
+    param_steps_by_uid: Mapping[int, int],
+    non_neg_uids: set[int],
+    model: LayoutCostModel,
+) -> bool:
+    """Mirror `BlockTileStoreArgs` from `block_nz_tensor_views_pass.cpp:528-638`."""
+    shape = _is_nz_compatible_tensor_type(tensor_type)
+    if shape is None or len(call.args) not in (3, 4) or not isinstance(tensor_type, core_ir.TensorType):
+        return False
+    if model.target_arch() == "a5":
+        return False
+    tile_type = call.args[0].type
+    if not isinstance(tile_type, core_ir.TileType):
+        return False
+    if (
+        tile_type.dtype != DataType.FP32
+        or tensor_type.dtype != DataType.FP32
+        or tile_type.memory_space != core_ir.MemorySpace.Acc
+        or _effective_tile_layout(tile_type) != FRACTAL_ACC_NZ
+    ):
+        return False
+    tile_shape = _static_shape(tile_type.shape)
+    if tile_shape is None or len(tile_shape) != 2:
+        return False
+    view = tile_type.tile_view
+    if view is not None and view.valid_shape and _static_shape(view.valid_shape) != tile_shape:
+        return False
+    if (
+        tile_shape[0] <= 0
+        or tile_shape[0] % 16 != 0
+        or tile_shape[0] > 65535
+        or tile_shape[1] <= 0
+        or tile_shape[1] % 16 != 0
+        or tile_shape[0] != shape[-2]
+    ):
+        return False
+    if (
+        int(call.kwargs.get("atomic", 0)) != 0
+        or "pre_quant" in call.kwargs
+        or bool(call.kwargs.get("pre_relu", False))
+    ):
+        return False
+    rank = len(shape)
+    offsets_arg = call.args[1]
+    if not isinstance(offsets_arg, core_ir.MakeTuple) or len(offsets_arg.elements) != rank:
+        return False
+    if len(call.args) == 4:
+        win_arg = call.args[3]
+        expected_win = (*(1 for _ in shape[:-2]), tile_shape[0], tile_shape[1])
+        if not isinstance(win_arg, core_ir.MakeTuple) or _static_shape(win_arg.elements) != expected_win:
+            return False
+    for lead_off in offsets_arg.elements[:-2]:
+        if not _is_provable_non_negative(lead_off, scalar_defs, loop_ranges, non_neg_uids, [256]):
+            return False
+    row_off = offsets_arg.elements[-2]
+    if not isinstance(row_off, core_ir.ConstInt) or int(row_off.value) != 0:
+        return False
+    return _is_nz_compatible_offset_axis(
+        offsets_arg.elements[-1], 16, scalar_defs, loop_ranges, param_steps_by_uid, non_neg_uids
+    )
+
+
+def _collect_func_nz_ineligible(  # noqa: PLR0913
+    func: core_ir.Function,
+    model: LayoutCostModel,
+    param_overrides: Sequence[str | None] | None,
+    param_steps: Mapping[tuple[str, int], int],
+) -> set[str]:
+    """Return canonical GM tensor names used in `func` in a way `BlockNzTensorViews` rejects."""
+    ineligible: set[str] = set()
+    tensor_aliases: dict[int, str] = {}
+    scalar_defs: dict[int, core_ir.Expr] = {}
+    loop_ranges: dict[int, tuple[core_ir.Expr, core_ir.Expr]] = {}
+    non_neg_uids: set[int] = set()
+    param_steps_by_uid: dict[int, int] = {}
+
+    overrides = list(param_overrides) if param_overrides is not None else []
+    already_blocked = bool(func.attrs and "nz_tensor_views_blocked" in func.attrs)
+    for idx, param in enumerate(func.params):
+        name = (overrides[idx] if idx < len(overrides) and overrides[idx] else None) or _clean_ssa_name(
+            param.name_hint
+        )
+        if isinstance(param.type, core_ir.TensorType):
+            tensor_aliases[param.unique_id] = name
+            if already_blocked or _is_nz_compatible_tensor_type(param.type) is None:
+                ineligible.add(name)
+        elif isinstance(param.type, core_ir.ScalarType):
+            step = param_steps.get((func.name, idx))
+            if step is not None and step > 1 and step % 8 == 0:
+                param_steps_by_uid[param.unique_id] = step
+                non_neg_uids.add(param.unique_id)
+
+    def _collect_facts(stmt: core_ir.Stmt) -> None:
+        if isinstance(stmt, core_ir.AssignStmt):
+            if isinstance(stmt.var.type, core_ir.ScalarType):
+                scalar_defs[stmt.var.unique_id] = stmt.value
+                if isinstance(stmt.value, core_ir.Call) and stmt.value.op.name in (
+                    "tile.get_block_idx",
+                    "tile.get_block_num",
+                ):
+                    non_neg_uids.add(stmt.var.unique_id)
+            elif isinstance(stmt.var.type, core_ir.TensorType):
+                if isinstance(stmt.value, core_ir.Var) and stmt.value.unique_id in tensor_aliases:
+                    tensor_aliases[stmt.var.unique_id] = tensor_aliases[stmt.value.unique_id]
+                elif isinstance(stmt.value, core_ir.Call):
+                    if stmt.value.op.name == _TENSOR_CREATE_OP:
+                        b_name = _clean_ssa_name(stmt.var.name_hint)
+                        tensor_aliases[stmt.var.unique_id] = b_name
+                        if _is_nz_compatible_tensor_type(stmt.var.type) is None:
+                            ineligible.add(b_name)
+                    elif (
+                        stmt.value.args
+                        and isinstance(stmt.value.args[0], core_ir.Var)
+                        and isinstance(stmt.value.args[0].type, core_ir.TensorType)
+                    ):
+                        src_v = stmt.value.args[0]
+                        src_name = tensor_aliases.get(src_v.unique_id, _clean_ssa_name(src_v.name_hint))
+                        tensor_aliases[stmt.var.unique_id] = src_name
+        elif isinstance(stmt, core_ir.ForStmt):
+            loop_ranges[stmt.loop_var.unique_id] = (stmt.start, stmt.step)
+            for iter_arg in stmt.iter_args:
+                init_val = getattr(iter_arg, "initValue", None)
+                if isinstance(init_val, core_ir.Var) and init_val.unique_id in tensor_aliases:
+                    tensor_aliases[iter_arg.unique_id] = tensor_aliases[init_val.unique_id]
+            for rv, iter_arg in zip(stmt.return_vars, stmt.iter_args, strict=False):
+                if iter_arg.unique_id in tensor_aliases:
+                    tensor_aliases[rv.unique_id] = tensor_aliases[iter_arg.unique_id]
+        for child in _iter_child_stmts(stmt):
+            _collect_facts(child)
+
+    _collect_facts(func.body)
+
+    def _check_expr(expr: core_ir.Expr) -> None:
+        if isinstance(expr, core_ir.Submit):
+            for arg in expr.args:
+                _check_expr(arg)
+            return
+        if not isinstance(expr, core_ir.Call):
+            return
+        for arg in expr.args:
+            _check_expr(arg)
+        if isinstance(expr.op, core_ir.GlobalVar):
+            return
+        op_name = expr.op.name
+        for i, arg in enumerate(expr.args):
+            if not isinstance(arg, core_ir.Var) or not isinstance(arg.type, core_ir.TensorType):
+                continue
+            t_name = tensor_aliases.get(arg.unique_id, _clean_ssa_name(arg.name_hint))
+            ok = False
+            if op_name == _TENSOR_CREATE_OP:
+                ok = _is_nz_compatible_tensor_type(expr.type) is not None
+            elif op_name == _TENSOR_RESHAPE_OP and i == 0:
+                ok = _is_whole_tensor_flatten(expr)
+            elif op_name == "tensor.slice" and i == 0:
+                ok = _is_nz_compatible_tensor_slice_call(expr, arg.type)
+            elif op_name == _TILE_LOAD_OP and i == 0:
+                ok = _is_nz_compatible_tile_load_call(
+                    expr, arg.type, scalar_defs, loop_ranges, param_steps_by_uid, non_neg_uids
+                )
+            elif op_name == _TILE_STORE_OP and i == 2:
+                ok = _is_nz_compatible_tile_store_call(
+                    expr, arg.type, scalar_defs, loop_ranges, param_steps_by_uid, non_neg_uids, model
+                )
+            if not ok:
+                ineligible.add(t_name)
+                ineligible.add(_clean_ssa_name(arg.name_hint))
+
+    def _check_stmt(stmt: core_ir.Stmt) -> None:
+        if isinstance(stmt, core_ir.AssignStmt):
+            _check_expr(stmt.value)
+        elif isinstance(stmt, core_ir.EvalStmt):
+            _check_expr(stmt.expr)
+        elif isinstance(stmt, core_ir.ReturnStmt):
+            for val in stmt.value:
+                _check_expr(val)
+        for child in _iter_child_stmts(stmt):
+            _check_stmt(child)
+
+    _check_stmt(func.body)
+    return ineligible
+
+
 class _OrchCallMultiplierVisitor:
     """Count static invocation multiplicity and resolve caller GM aliases per InCore callee."""
 
@@ -967,6 +1412,37 @@ class _OrchCallMultiplierVisitor:
                 if len(out_names) == 1 and out_names[0] is not None:
                     self._alias_by_uid[assign_var.unique_id] = out_names[0]
 
+    def _record_local_tensor_call(
+        self,
+        expr: core_ir.Call,
+        assign_var: core_ir.Var | None,
+    ) -> None:
+        if expr.op.name == _TENSOR_CREATE_OP and assign_var is not None:
+            buf_name = _clean_ssa_name(assign_var.name_hint)
+            self._alias_by_uid[assign_var.unique_id] = buf_name
+            target_set = (
+                self.internal_buffers
+                if _is_nz_compatible_tensor_type(assign_var.type) is not None
+                else self.reshaped_names
+            )
+            target_set.add(buf_name)
+            return
+        for i, arg in enumerate(expr.args):
+            if not isinstance(arg, core_ir.Var) or not isinstance(arg.type, core_ir.TensorType):
+                continue
+            src_alias = self._resolve_arg_name(arg) or _clean_ssa_name(arg.name_hint)
+            if i == 0 and assign_var is not None and isinstance(assign_var.type, core_ir.TensorType):
+                self._alias_by_uid[assign_var.unique_id] = src_alias
+            ok = (expr.op.name == _TENSOR_RESHAPE_OP and i == 0 and _is_whole_tensor_flatten(expr)) or (
+                expr.op.name == "tensor.slice"
+                and i == 0
+                and _is_nz_compatible_tensor_slice_call(expr, arg.type)
+            )
+            if not ok:
+                self.reshaped_names.add(src_alias)
+                if assign_var is not None:
+                    self.reshaped_names.add(_clean_ssa_name(assign_var.name_hint))
+
     def _record_calls(self, expr: core_ir.Expr, assign_var: core_ir.Var | None = None) -> None:
         if assign_var is not None and isinstance(assign_var.type, core_ir.ScalarType):
             self._scalar_defs[assign_var.unique_id] = expr
@@ -974,16 +1450,8 @@ class _OrchCallMultiplierVisitor:
         if isinstance(expr, (core_ir.Call, core_ir.Submit)):
             if isinstance(expr.op, core_ir.GlobalVar):
                 self._record_global_call(expr, expr.op.name, assign_var)
-            elif isinstance(expr, core_ir.Call) and assign_var is not None:
-                if expr.op.name == _TENSOR_CREATE_OP:
-                    buf_name = _clean_ssa_name(assign_var.name_hint)
-                    self._alias_by_uid[assign_var.unique_id] = buf_name
-                    self.internal_buffers.add(buf_name)
-                elif expr.op.name in (_TENSOR_RESHAPE_OP, _TENSOR_VIEW_OP) and expr.args:
-                    src_alias = self._resolve_arg_name(expr.args[0])
-                    resolved_alias = src_alias or _clean_ssa_name(assign_var.name_hint)
-                    self._alias_by_uid[assign_var.unique_id] = resolved_alias
-                    self.reshaped_names.add(resolved_alias)
+            elif isinstance(expr, core_ir.Call):
+                self._record_local_tensor_call(expr, assign_var)
             for arg in expr.args:
                 self._record_calls(arg)
         elif assign_var is not None and isinstance(expr, core_ir.TupleGetItemExpr):
@@ -1613,6 +2081,7 @@ def extract_layout_instance(
     call_counts: dict[str, int] = {}
     call_arg_names: dict[str, list[str | None]] = {}
     call_sites: dict[str, list[tuple[list[str | None], int]]] = {}
+    param_steps: dict[tuple[str, int], int] = {}
     if non_incore_funcs:
         top_orch = [f for f in non_incore_funcs if str(f.func_type).endswith("Orchestration")]
         sub_orch = [f for f in non_incore_funcs if not str(f.func_type).endswith("Orchestration")]
@@ -1633,9 +2102,20 @@ def extract_layout_instance(
         call_counts = call_counter.call_counts
         call_arg_names = call_counter.call_arg_names
         call_sites = call_counter.call_sites
+        param_steps = call_counter.param_steps
         reshaped_names = call_counter.reshaped_names
         internal_buffers = call_counter.internal_buffers
         incore_funcs.sort(key=lambda fn: call_counter.call_order.get(fn.name, 10**9))
+
+    for func in incore_funcs:
+        sites = call_sites.get(func.name)
+        if sites:
+            for site_args, _ in sites:
+                reshaped_names.update(_collect_func_nz_ineligible(func, model, site_args, param_steps))
+        else:
+            reshaped_names.update(
+                _collect_func_nz_ineligible(func, model, call_arg_names.get(func.name), param_steps)
+            )
 
     multi_incore = len(incore_funcs) > 1
     op_offset = 0
@@ -1684,31 +2164,7 @@ def extract_layout_instance(
         operations.extend(extractor.operations)
         op_offset = extractor.op_counter
 
-    # A GM tensor in the IR can only be rewritten to `TensorLayout.NZ` if every
-    # operation that reads or writes it has at least one `NZ`-compatible config.
-    for val_name, val_node in list(values.items()):
-        if (
-            val_node.memory_space != core_ir.MemorySpace.DDR
-            or core_ir.TensorLayout.NZ not in val_node.admissible_layouts
-        ):
-            continue
-        nz_supported = True
-        for op in operations:
-            for in_idx, inp_name in enumerate(op.inputs):
-                if inp_name == val_name and not any(
-                    cfg.input_layouts[in_idx] == core_ir.TensorLayout.NZ for cfg in op.configs
-                ):
-                    nz_supported = False
-                    break
-            if not nz_supported:
-                break
-            if op.output == val_name and not any(
-                cfg.output_layout == core_ir.TensorLayout.NZ for cfg in op.configs
-            ):
-                nz_supported = False
-                break
-        if not nz_supported:
-            values[val_name] = replace(val_node, admissible_layouts=(val_node.current_layout,))
+    _prune_incompatible_gm_nz(values, operations, reshaped_names)
 
     filtered_operations: list[LayoutOperationNode] = []
     for op in operations:
@@ -1724,6 +2180,41 @@ def extract_layout_instance(
         filtered_operations.append(replace(op, configs=valid_cfgs if valid_cfgs else op.configs))
 
     return LayoutProblemInstance(values=values, operations=filtered_operations, cost_model=model)
+
+
+def _prune_incompatible_gm_nz(
+    values: dict[str, LayoutValueNode],
+    operations: Sequence[LayoutOperationNode],
+    reshaped_names: set[str],
+) -> None:
+    """Prune `TensorLayout.NZ` from any GM tensor lacking an `NZ`-compatible config on all ops."""
+    for val_name, val_node in list(values.items()):
+        if (
+            val_node.memory_space != core_ir.MemorySpace.DDR
+            or core_ir.TensorLayout.NZ not in val_node.admissible_layouts
+        ):
+            continue
+        nz_supported = val_name not in reshaped_names
+        for op in operations:
+            if not nz_supported:
+                break
+            for in_idx, inp_name in enumerate(op.inputs):
+                if inp_name == val_name and not any(
+                    cfg.input_layouts[in_idx] == core_ir.TensorLayout.NZ for cfg in op.configs
+                ):
+                    nz_supported = False
+                    break
+            if (
+                nz_supported
+                and op.output == val_name
+                and not any(cfg.output_layout == core_ir.TensorLayout.NZ for cfg in op.configs)
+            ):
+                nz_supported = False
+        if not nz_supported:
+            fallback = tuple(
+                lay for lay in val_node.admissible_layouts if lay != core_ir.TensorLayout.NZ
+            ) or (core_ir.TensorLayout.ND,)
+            values[val_name] = replace(val_node, admissible_layouts=fallback)
 
 
 def _operator_cost_multiplier(instance: LayoutProblemInstance, op: LayoutOperationNode) -> float:
@@ -2237,6 +2728,15 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
                 dict(op.kwargs),
                 dict(op.attrs) if op.attrs else None,
                 ret_type,
+                op.span,
+            )
+        if op.op.name in (_TILE_LOAD_OP, _TILE_STORE_OP):
+            return core_ir.Call(
+                op.op,
+                new_args,
+                dict(op.kwargs),
+                dict(op.attrs) if op.attrs else None,
+                op.type,
                 op.span,
             )
         rebuilt = core_ir.create_op_call(op.op.name, new_args, dict(op.kwargs), op.span)

@@ -702,5 +702,53 @@ def test_outlined_parallel_b_trans_false_and_weights_only_relayout():
         )
 
 
+def test_block_nz_legality_guards_prune_invalid_nz_candidates():
+    from pypto.ir.auto_layout_production_bench import _prepare_nd_baseline_program  # noqa: PLC0415
+
+    set_backend_type(BackendType.Ascend910)
+
+    @pl.jit
+    def kernel_with_sub_offset_and_partial_row_store(
+        x: pl.Tensor[[64, 64], pl.FP32],
+        w_bad_off: pl.Tensor[[128, 64], pl.FP32],
+        w_good: pl.Tensor[[64, 64], pl.FP32],
+        y: pl.Out[pl.Tensor[[128, 64], pl.FP32]],
+    ) -> pl.Tensor[[128, 64], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="guard_kernel"):
+            bid = pl.tile.get_block_idx()
+            # `64 - bid * 16` is a Sub expression: divisible by 16, but rejected by IsProvableNonNegative.
+            bad_r0 = 64 - bid * 16
+            tx = x[0:64, 0:64]
+            tw_bad = w_bad_off[bad_r0 : bad_r0 + 64, 0:64]
+            tw_good = w_good[0:64, 0:64]
+            acc = pl.matmul(tx, tw_bad)
+            acc = pl.matmul_acc(acc, tx, tw_good)
+            # Partial row store (64 rows into 128-row output `y`) cannot use Acc->NZ store.
+            y[0:64, 0:64] = acc
+        return y
+
+    program, _ = _prepare_nd_baseline_program(kernel_with_sub_offset_and_partial_row_store)
+    cost_model = LayoutCostModel(
+        expected_uses=100,
+        backend_type=BackendType.Ascend910,
+        allow_external_input_relayout=False,
+        allow_external_output_relayout=True,
+    )
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
+        pre = run_pre_layout_passes(program)
+        inst = extract_layout_instance(pre, cost_model=cost_model, reusable_tensors={"w_bad_off", "w_good"})
+        assert inst.values["w_bad_off"].admissible_layouts == (ND,)
+        assert inst.values["y"].admissible_layouts == (ND,)
+        assert inst.values["w_good"].admissible_layouts == (ND, NZ)
+
+        res = solve_auto_layout(inst)
+        assert res.assignment.tensor_layouts["w_bad_off"] == ND
+        assert res.assignment.tensor_layouts["y"] == ND
+        assert res.assignment.tensor_layouts["w_good"] == NZ
+        rewritten = apply_layout_assignment(pre, res.assignment)
+        lowered = run_post_layout_passes(rewritten)
+        assert len(lowered.functions) >= 1
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
