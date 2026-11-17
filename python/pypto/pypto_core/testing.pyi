@@ -251,12 +251,6 @@ class CompactSyncAnalysis:
         """Audit actual retained records within an explicit payload budget; no new analysis."""
         ...
 
-    def export_crossing_demands(
-        self,
-    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]] | None:
-        """Return original-coordinate flat crossings, or unavailable for unsupported shared uses."""
-        ...
-
     def export_scoped_demands(self) -> dict[str, Any] | None:
         """Return cached original-frame Cartesian demand families, or unavailable."""
         ...

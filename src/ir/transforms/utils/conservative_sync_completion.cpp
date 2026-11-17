@@ -261,11 +261,7 @@ CompletionTransferResult SolveCompletionTransfer(const std::vector<CompletionVer
   }
 
   CompletionTransferResult result;
-  result.in_facts.assign(n, CompletionFacts::AtEntry());
-  result.out_facts.assign(n, CompletionFacts::AtEntry());
-  result.reachable = reachable;
-  result.work.vertices = n;
-  result.work.reachable_vertices = post_order.size();
+  std::vector<CompletionFacts> out_facts(n, CompletionFacts::AtEntry());
   result.work.sccs = sccs.size();
 
   std::vector<bool> visited(n, false);
@@ -275,10 +271,10 @@ CompletionTransferResult SolveCompletionTransfer(const std::vector<CompletionVer
     for (const size_t p : preds[u]) {
       if (!reachable[p] || !visited[p]) continue;
       if (!has_in) {
-        dst = result.out_facts[p];
+        dst = out_facts[p];
         has_in = true;
       } else {
-        dst.MergeFrom(result.out_facts[p]);
+        dst.MergeFrom(out_facts[p]);
       }
     }
     return has_in;
@@ -291,10 +287,8 @@ CompletionTransferResult SolveCompletionTransfer(const std::vector<CompletionVer
       CompletionFacts in_u;
       const bool has_in = compute_in(u, in_u);
       INTERNAL_CHECK(has_in) << "Internal error: reachable topological vertex missing visited predecessor";
-      result.in_facts[u] = in_u;
-      result.out_facts[u] = EvaluateVertex(vertices[u], in_u);
+      out_facts[u] = EvaluateVertex(vertices[u], in_u);
       visited[u] = true;
-      ++result.work.vertex_evaluations;
       continue;
     }
 
@@ -323,11 +317,9 @@ CompletionTransferResult SolveCompletionTransfer(const std::vector<CompletionVer
       CompletionFacts in_u;
       if (!compute_in(u, in_u)) continue;
       const CompletionFacts out_u = EvaluateVertex(vertices[u], in_u);
-      ++result.work.vertex_evaluations;
-      result.in_facts[u] = in_u;
-      if (!visited[u] || out_u != result.out_facts[u]) {
+      if (!visited[u] || out_u != out_facts[u]) {
         visited[u] = true;
-        result.out_facts[u] = out_u;
+        out_facts[u] = out_u;
         for (const size_t v : succs[u]) {
           if (scc_id[v] == cid && !in_queue[v]) {
             queue.push_back(v);
@@ -338,7 +330,7 @@ CompletionTransferResult SolveCompletionTransfer(const std::vector<CompletionVer
     }
   }
 
-  result.summary = reachable[exit] ? result.out_facts[exit].ToSummary() : CompletionSummary::Identity();
+  result.summary = reachable[exit] ? out_facts[exit].ToSummary() : CompletionSummary::Identity();
   return result;
 }
 

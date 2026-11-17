@@ -27,6 +27,7 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
+#include <algorithm>
 #include <any>
 #include <cassert>
 #include <chrono>
@@ -58,6 +59,7 @@
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/finite_sync_analysis.h"
+#include "pypto/ir/transforms/utils/parent_stmt_analysis.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/sync.h"
 #include "python/bindings/modules/testing_sync_support.h"
@@ -842,7 +844,6 @@ nb::dict DescribePhysicalSync(const ir::sync::PhysicalSyncRealization& result) {
     row["direction"] = nb::make_tuple(attempt.source, attempt.target);
     row["status"] = attempt.status;
     row["reason"] = attempt.reason;
-    row["staged_lanes"] = attempt.staged_lanes;
     row["reuse_queries"] = attempt.reuse_queries;
     allocation_attempts.append(row);
   }
@@ -1107,10 +1108,6 @@ void BindTesting(nb::module_& m) {
       "Test immutable assignment storage and rejection of foreign or changed synchronous contexts");
 
   nb::class_<ir::sync::CompactSyncResult>(testing, "CompactSyncAnalysis")
-      .def(
-          "export_crossing_demands",
-          [](const ir::sync::CompactSyncResult& result) { return result.ExportCrossingDemands(); },
-          "Export retained crossings for a flat regional use; unavailable is distinct from empty")
       .def(
           "realize",
           [](const ir::sync::CompactSyncResult& analysis) {
@@ -1528,6 +1525,12 @@ void BindTesting(nb::module_& m) {
           }
           return result;
         };
+        class StatementParents : public ir::ParentStmtAnalysis {
+         public:
+          void VisitExpr(const ir::ExprPtr&) override {}
+        };
+        StatementParents parents;
+        parents.BuildMap(analysis.Function());
         nb::list sites;
         size_t control_output_nodes = 0;
         for (size_t index = 0; index < analysis.Sites().size(); ++index) {
@@ -1536,7 +1539,12 @@ void BindTesting(nb::module_& m) {
           record["cut"] = site.cut;
           record["operation"] = site.operation.Operation();
           record["pipe"] = site.operation.Implementation().Pipe();
-          auto control = analysis.ControlPath(index);
+          std::vector<ir::StmtPtr> control;
+          for (auto parent = parents.GetParent(site.cut); parent; parent = parents.GetParent(parent)) {
+            if (ir::As<ir::IfStmt>(parent) || ir::As<ir::ForStmt>(parent) || ir::As<ir::WhileStmt>(parent))
+              control.push_back(parent);
+          }
+          std::reverse(control.begin(), control.end());
           control_output_nodes += control.size();
           record["control"] = control;
           record["effects"] = facts(site.effects);

@@ -178,7 +178,7 @@ class Allocator {
                                              : legacy.status == LegacyStatus::NoEligible    ? "no-eligible"
                                              : legacy.status == LegacyStatus::ExactScarcity ? "exact-scarcity"
                                                                                             : "unproved",
-                                             legacy.reason, legacy.lanes.size(),
+                                             legacy.reason,
                                              result_.reuse_queries - before_queries});
       if (legacy.status == LegacyStatus::Accepted) {
         for (const auto& [index, width] : legacy.widths) families_[index].ids.resize(width, -1);

@@ -106,13 +106,6 @@ CallPtr SyncWait(const StmtPtr& statement) {
   return call && IsOp(call, "sync.wait") ? call : nullptr;
 }
 
-// Explicit four-command closed prefix transaction.
-struct Transaction {
-  PipeType source;
-  PipeType destination;
-  std::array<StmtPtr, 4> cuts;
-};
-
 // Local same-pipe hardware barrier (`record(p); wait(p)`).
 struct LocalCompletion {
   PipeType pipe;
@@ -149,7 +142,6 @@ bool ContainsSyncTokenType(const TypePtr& type) {
 
 class Discover : public IRVisitor {
  public:
-  std::vector<Transaction> transactions;
   std::vector<LocalCompletion> local;
   std::vector<OneWayTransaction> one_way;
   std::vector<StmtPtr> erased_waits;
@@ -159,6 +151,7 @@ class Discover : public IRVisitor {
   std::map<const Stmt*, uint32_t> loop_scope_ids;
   std::unordered_set<const ForStmt*> spmd_one_trip_loops;
   bool unsupported_syntax = false;
+  bool has_closed_pair = false;
   bool has_for = false;
   bool has_while = false;
   bool has_if = false;
@@ -303,7 +296,9 @@ class Discover : public IRVisitor {
         }
       }
 
-      // Recognize adjacent closed four-command or local two-command patterns first.
+      // Record whether this function contains an explicit 4-command closed pair
+      // so HasOnlyClosedPrefixSyntax keeps closed-prefix ownership without
+      // bypassing general 1-way allocation.
       if (index + 3 < statements.size()) {
         const auto r0 = SyncRecord(statements[index]);
         const auto w0 = SyncWait(statements[index + 1]);
@@ -317,16 +312,12 @@ class Discover : public IRVisitor {
           if (src != dst && Pipe(r1, "pipe") == dst && Pipe(w1, "dst_pipe") == src &&
               w0->args_.size() == 1 && w0->args_[0] == t0 && w1->args_.size() == 1 &&
               w1->args_[0] == t1) {
-            transactions.push_back({src, dst,
-                                    {statements[index], statements[index + 1], statements[index + 2],
-                                     statements[index + 3]}});
-            ApplyRelayEdge(preceding_relay, src, dst);
-            ApplyRelayEdge(preceding_relay, dst, src);
-            index += 3;
-            continue;
+            has_closed_pair = true;
           }
         }
       }
+
+      // Recognize local two-command same-pipe barrier patterns first.
       if (index + 1 < statements.size()) {
         const auto r0 = SyncRecord(statements[index]);
         const auto w0 = SyncWait(statements[index + 1]);
@@ -549,10 +540,6 @@ class Assignment {
     // Index statement ordering/edges inside loops so we only fall back to the
     // 4-command protocol when a 1-way loop edge lacks an unconditional reverse cycle.
     std::map<const Stmt*, std::vector<std::pair<PipeType, PipeType>>> cut_edges;
-    for (const auto& t : discovered.transactions) {
-      cut_edges[t.cuts[1].get()].emplace_back(t.source, t.destination);
-      cut_edges[t.cuts[3].get()].emplace_back(t.destination, t.source);
-    }
     for (const auto& ow : discovered.one_way) {
       cut_edges[ow.wait_cut.get()].emplace_back(ow.source, ow.destination);
     }
@@ -659,26 +646,6 @@ class Assignment {
         }
       }
       ow.needs_return_ack = !closed_all;
-    }
-
-    // Reserve constant-role pairs for explicit legacy ClosedTransactions.
-    std::map<SyncDirection, std::set<bool>> roles;
-    for (const auto& transaction : discovered.transactions) {
-      roles[{transaction.source, transaction.destination}].insert(false);
-      roles[{transaction.destination, transaction.source}].insert(true);
-    }
-    std::map<std::pair<SyncDirection, bool>, int> assignment;
-    for (const auto& [direction, uses] : roles) {
-      const auto ids = SyncEligibleIds(owner, target, direction, eligible, reservations_);
-      CHECK(ids.size() >= uses.size())
-          << "Closed prefix role reservation unavailable; this is not a fixed-plan capacity lower bound";
-      size_t next = 0;
-      for (const bool ack : uses) {
-        const int chosen = ids[next++];
-        assignment.emplace(std::make_pair(direction, ack), chosen);
-        reservations_[direction].insert(chosen);
-      }
-      roles_count_ += uses.size();
     }
 
     // Allocate directional IDs for all 1-way transactions (both 2-cmd and 4-cmd fallback),
@@ -1023,19 +990,6 @@ class Assignment {
     for (const auto& d : discovered.erased_defs) {
       commands_.emplace(d.get(), AssignedCommand{CommandKind::Erase, {}, -1});
     }
-    for (const auto& transaction : discovered.transactions) {
-      for (size_t i = 0; i < 4; ++i) {
-        const bool set = i % 2 == 0;
-        const auto direction = i < 2 ? std::make_pair(transaction.source, transaction.destination)
-                                     : std::make_pair(transaction.destination, transaction.source);
-        const int id = assignment.at({direction, i >= 2});
-        CHECK(commands_
-                  .emplace(transaction.cuts[i].get(),
-                           AssignedCommand{set ? CommandKind::SetFlag : CommandKind::WaitFlag, direction, id})
-                  .second)
-            << "Closed prefix protocol reuses an original static command cut";
-      }
-    }
     for (const auto& ow : discovered.one_way) {
       const SyncDirection fwd{ow.source, ow.destination};
       if (!ow.needs_return_ack) {
@@ -1134,11 +1088,8 @@ class Assignment {
 
 class Emit : public SyncStatementMutator {
  public:
-  Emit(const Assignment& assignment, FunctionType core, const std::map<const ForStmt*, StmtPtr>& children,
-       const std::vector<Transaction>&, const std::vector<LocalCompletion>&, bool strip_tokens = true)
-      : assignment_(assignment), core_(core == FunctionType::AIV ? "aiv" : "aic"), children_(children) {
-    (void)strip_tokens;
-  }
+  Emit(const Assignment& assignment, FunctionType core, const std::map<const ForStmt*, StmtPtr>& children)
+      : assignment_(assignment), core_(core == FunctionType::AIV ? "aiv" : "aic"), children_(children) {}
 
   FunctionPtr Rewrite(const FunctionPtr& function) {
     const auto body = VisitStmt(function->body_);
@@ -1246,8 +1197,7 @@ bool QualifyLocalSyncInvocation(const FunctionPtr& function, const std::string& 
 namespace {
 bool HasMatchingClosedPrefixUses(const FunctionPtr& function, const Discover& discovered) {
   if (discovered.unsupported_syntax) return false;
-  if (discovered.transactions.empty() && discovered.local.empty() && discovered.one_way.empty() &&
-      discovered.children.empty())
+  if (discovered.local.empty() && discovered.one_way.empty() && discovered.children.empty())
     return false;
 
   // Reject token fanout, carried iter_args, or non-trivial token containers (e.g. TupleType([SyncTokenType]))
@@ -1290,8 +1240,7 @@ bool HasMatchingClosedPrefixUses(const FunctionPtr& function, const Discover& di
   } check(discovered.children);
   check.VisitFunction(function);
   if (!check.supported) return false;
-  const size_t expected_uses = 2 * discovered.transactions.size() + discovered.local.size() +
-                               discovered.one_way.size() + discovered.erased_waits.size();
+  const size_t expected_uses = discovered.local.size() + discovered.one_way.size() + discovered.erased_waits.size();
   return check.uses == expected_uses;
 }
 }  // namespace
@@ -1303,7 +1252,7 @@ bool HasOnlyClosedPrefixSyntax(const FunctionPtr& function) {
   if (function->HasAttr(kAttrAutosyncAnalysisPolicy) &&
       function->GetAttr<std::string>(kAttrAutosyncAnalysisPolicy) == "conservative_prefix")
     return true;
-  if (!discovered.transactions.empty() || !discovered.children.empty()) return true;
+  if (discovered.has_closed_pair || !discovered.children.empty()) return true;
   return discovered.has_while || !discovered.has_payload || (discovered.has_if && !discovered.has_for);
 }
 
@@ -1459,13 +1408,11 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     }
   }
 
-  Emit emit(assignment, function->func_type_, children, discovered.transactions, discovered.local);
+  Emit emit(assignment, function->func_type_, children);
   PhysicalSyncRealization result;
   result.function = emit.Rewrite(function);
-  result.set_sites = 2 * discovered.transactions.size() + assignment.OneWaySites() +
-                     assignment.OneWayFallbackSites() + child_sets;
-  result.wait_sites = 2 * discovered.transactions.size() + assignment.OneWaySites() +
-                      assignment.OneWayFallbackSites() + child_waits;
+  result.set_sites = assignment.OneWaySites() + assignment.OneWayFallbackSites() + child_sets;
+  result.wait_sites = assignment.OneWaySites() + assignment.OneWayFallbackSites() + child_waits;
   result.barrier_sites = assignment.Barriers() + child_barriers;
   result.reserved_lanes = assignment.Roles() + child_lanes;
   result.native_reserved_ids = assignment.NativeClaimed();
