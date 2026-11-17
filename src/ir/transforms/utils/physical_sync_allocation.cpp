@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <queue>
 #include <set>
 #include <sstream>
 #include <string>
@@ -461,19 +462,20 @@ LaneColorAttempt TryColorOrderedSyncLanes(size_t count,
     release[i] = next;
     INTERNAL_CHECK(next > i) << "Internal error: cyclic physical lane span";
   }
-  std::vector<std::vector<int>> buckets(count + 1);
-  std::vector<int> free, result(count);
+  std::vector<std::vector<size_t>> buckets(count + 1);
+  std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>> free_idx;
+  std::vector<int> result(count);
   size_t colors = 0;
   for (size_t i = 0; i < count; ++i) {
-    free.insert(free.end(), buckets[i].begin(), buckets[i].end());
-    if (free.empty()) {
+    for (size_t idx : buckets[i]) free_idx.push(idx);
+    if (free_idx.empty()) {
       if (colors >= eligible.size()) return {false, {}, i, colors + 1};
-      free.push_back(eligible[colors++]);
+      free_idx.push(colors++);
     }
-    const int id = free.back();
-    free.pop_back();
-    result[i] = id;
-    buckets[release[i]].push_back(id);
+    const size_t idx = free_idx.top();
+    free_idx.pop();
+    result[i] = eligible[idx];
+    buckets[release[i]].push_back(idx);
   }
   return {true, std::move(result), 0, 0};
 }

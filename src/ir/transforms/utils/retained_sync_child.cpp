@@ -640,9 +640,43 @@ EventfulSyncChildAttempt TryPrepareEventfulSyncChild(
         std::string(policy == SyncExternalPolicy::ReadOnlyProjection ? "readonly_projection" : "geometry"));
     recipe.push_back(marked);
     auto logical_recipe = std::make_shared<SeqStmts>(recipe, scope->span_);
+    std::set<SyncDirection> rearm_dirs;
+    class CollectRearms : public IRVisitor {
+     public:
+      explicit CollectRearms(std::set<SyncDirection>& out) : out_(out) {}
+
+     protected:
+      void VisitExpr(const ExprPtr& expression) override {
+        if (expression && seen_.insert(expression.get()).second) IRVisitor::VisitExpr(expression);
+      }
+      void VisitExpr_(const CallPtr& call) override {
+        if (IsOp(call, "sync.wait") && !call->args_.empty()) {
+          if (const auto tok = As<SyncTokenType>(call->args_[0]->GetType())) {
+            for (const auto& [name, value] : call->kwargs_) {
+              if (name == "dst_pipe") {
+                const auto dst = static_cast<PipeType>(AnyCast<int>(value, name));
+                if (tok->pipe_ != dst) out_.emplace(dst, tok->pipe_);
+                break;
+              }
+            }
+          }
+        }
+        IRVisitor::VisitExpr_(call);
+      }
+
+     private:
+      std::set<SyncDirection>& out_;
+      std::unordered_set<const Expr*> seen_;
+    } collector(rearm_dirs);
+    collector.VisitStmt(logical_recipe);
+    for (const auto& [dir, ids] : SyncNativeClaims(mathematics.State().input, target)) {
+      (void)ids;
+      if (dir.first != dir.second) rearm_dirs.emplace(dir.second, dir.first);
+    }
     attempt.child = std::shared_ptr<const EventfulSyncChild>(
         new EventfulSyncChild(std::move(context), mathematics, logical_recipe, target,
-                              std::vector<PipeType>(participating.begin(), participating.end())));
+                              std::vector<PipeType>(participating.begin(), participating.end()),
+                              std::vector<SyncDirection>(rearm_dirs.begin(), rearm_dirs.end())));
     enter_phase(EventfulSyncChildStage::Ready);
   } catch (const pypto::ValueError& error) {
     finish_phase();
@@ -830,5 +864,61 @@ void EventfulSyncChild::ValidateFor(const FunctionPtr& owner, const std::string&
       << "Eventful child belongs to a different original owner or native context";
   // The original owner is immutable. Identity and target bind the retained
   // original scope/ancestor proof without rescanning the entire owner per use.
+}
+
+namespace {
+bool IsProvablyNonNegativeExpr(const ExprPtr& expr, const std::unordered_map<const Var*, ExprPtr>& ssa_defs,
+                               std::unordered_set<const Var*>& visiting) {
+  if (!expr) return false;
+  if (const auto c = As<ConstInt>(expr)) return c->value_ >= 0;
+  if (const auto v = As<Var>(expr)) {
+    const auto it = ssa_defs.find(v.get());
+    if (it == ssa_defs.end() || !visiting.insert(v.get()).second) return false;
+    const bool ok = IsProvablyNonNegativeExpr(it->second, ssa_defs, visiting);
+    visiting.erase(v.get());
+    return ok;
+  }
+  if (const auto call = As<Call>(expr)) {
+    return IsOp(call, "buffer.get_block_idx") || IsOp(call, "buffer.get_block_num") ||
+           IsOp(call, "buffer.get_subblock_idx");
+  }
+  if (const auto add = As<Add>(expr)) {
+    return IsProvablyNonNegativeExpr(add->left_, ssa_defs, visiting) &&
+           IsProvablyNonNegativeExpr(add->right_, ssa_defs, visiting);
+  }
+  if (const auto mul = As<Mul>(expr)) {
+    return IsProvablyNonNegativeExpr(mul->left_, ssa_defs, visiting) &&
+           IsProvablyNonNegativeExpr(mul->right_, ssa_defs, visiting);
+  }
+  if (const auto fdiv = As<FloorDiv>(expr)) {
+    const auto rhs = As<ConstInt>(fdiv->right_);
+    return rhs && rhs->value_ > 0 && IsProvablyNonNegativeExpr(fdiv->left_, ssa_defs, visiting);
+  }
+  if (const auto fmod = As<FloorMod>(expr)) {
+    const auto rhs = As<ConstInt>(fmod->right_);
+    return rhs && rhs->value_ > 0 && IsProvablyNonNegativeExpr(fmod->left_, ssa_defs, visiting);
+  }
+  if (const auto mn = As<Min>(expr)) {
+    return IsProvablyNonNegativeExpr(mn->left_, ssa_defs, visiting) &&
+           IsProvablyNonNegativeExpr(mn->right_, ssa_defs, visiting);
+  }
+  if (const auto mx = As<Max>(expr)) {
+    return IsProvablyNonNegativeExpr(mx->left_, ssa_defs, visiting) ||
+           IsProvablyNonNegativeExpr(mx->right_, ssa_defs, visiting);
+  }
+  return false;
+}
+}  // namespace
+
+bool IsSpmdAtMostOneTripFor(const ForStmtPtr& loop,
+                             const std::unordered_map<const Var*, ExprPtr>& ssa_defs) {
+  if (!loop || loop->kind_ != ForKind::Sequential || As<ConstInt>(loop->start_)) return false;
+  const auto stop = As<ConstInt>(loop->stop_);
+  const auto step = As<ConstInt>(loop->step_);
+  if (!stop || !step || step->value_ <= 1 || stop->value_ <= 0 || stop->value_ > step->value_) {
+    return false;
+  }
+  std::unordered_set<const Var*> visiting;
+  return IsProvablyNonNegativeExpr(loop->start_, ssa_defs, visiting);
 }
 }  // namespace pypto::ir::sync

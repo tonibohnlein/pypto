@@ -16,11 +16,13 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "pypto/backend/common/buffer_sync_contract.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
+#include "src/ir/transforms/utils/physical_sync_allocation.h"
 
 namespace pypto::ir::sync {
 class NativeSyncChild;
@@ -74,6 +76,14 @@ class NativeSyncChild {
 inline constexpr const char* kClosedSyncChildAttr = "pypto.closed_sync_child";
 inline constexpr const char* kClosedSyncChildExternalPolicyAttr =
     "pypto.closed_sync_child_external_policy";
+inline constexpr const char* kClosedSyncChildFirstVisitAttr =
+    "pypto.closed_sync_child_first_visit";
+
+// Returns true when `loop` is a sequential ForStmt whose symbolic non-negative
+// SPMD start and constant bounds (`0 < stop <= step` with `step > 1`) ensure
+// at most one dynamic iteration (0 or 1 trip, zero backedges).
+bool IsSpmdAtMostOneTripFor(const ForStmtPtr& loop,
+                             const std::unordered_map<const Var*, ExprPtr>& ssa_defs);
 
 // Inspect actual selected instruction effects, including implicit effects.
 // Returns true only when external effects exist and every such effect reads.
@@ -130,6 +140,7 @@ class EventfulSyncChild {
   const ForStmtPtr& Scope() const { return context_.original_scope; }
   const StmtPtr& LogicalRecipe() const { return logical_recipe_; }
   const std::vector<PipeType>& Pipes() const { return pipes_; }
+  const std::vector<SyncDirection>& RearmDirections() const { return rearm_dirs_; }
   std::map<std::string, size_t> Describe() const;
   void ValidateFor(const FunctionPtr& owner, const std::string& target) const;
 
@@ -140,13 +151,15 @@ class EventfulSyncChild {
   StmtPtr logical_recipe_;
   std::string target_;
   std::vector<PipeType> pipes_;
+  std::vector<SyncDirection> rearm_dirs_;
   EventfulSyncChild(SyncRegionContext context, CompactSyncResult mathematics, StmtPtr logical_recipe,
-                    std::string target, std::vector<PipeType> pipes)
+                    std::string target, std::vector<PipeType> pipes, std::vector<SyncDirection> rearm_dirs)
       : context_(std::move(context)),
         mathematics_(std::move(mathematics)),
         logical_recipe_(std::move(logical_recipe)),
         target_(std::move(target)),
-        pipes_(std::move(pipes)) {}
+        pipes_(std::move(pipes)),
+        rearm_dirs_(std::move(rearm_dirs)) {}
   friend std::shared_ptr<const EventfulSyncChild> PrepareEventfulSyncChild(const FunctionPtr&,
                                                                            const ForStmtPtr&,
                                                                            const std::string&,

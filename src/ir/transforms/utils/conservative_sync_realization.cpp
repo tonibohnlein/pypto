@@ -98,8 +98,24 @@ class Insert : public IRMutator {
       Wrap(site.cut, services);
     }
     for (const auto& entry : analysis.ChildEntries()) {
-      const auto recipe = entry.eventful ? FreshChildTokens(names_).VisitStmt(entry.eventful->LogicalRecipe())
-                                         : StmtPtr(entry.scope);
+      auto recipe = entry.eventful ? FreshChildTokens(names_).VisitStmt(entry.eventful->LogicalRecipe())
+                                   : StmtPtr(entry.scope);
+      if (entry.first_visit && entry.eventful) {
+        if (const auto marked = As<ForStmt>(recipe); marked && marked->HasAttr(kClosedSyncChildAttr)) {
+          auto updated = std::make_shared<ForStmt>(*marked);
+          updated->attrs_.emplace_back(kClosedSyncChildFirstVisitAttr, true);
+          recipe = std::move(updated);
+        } else if (const auto seq = As<SeqStmts>(recipe); seq && !seq->stmts_.empty()) {
+          if (const auto marked_back = As<ForStmt>(seq->stmts_.back());
+              marked_back && marked_back->HasAttr(kClosedSyncChildAttr)) {
+            auto updated = std::make_shared<ForStmt>(*marked_back);
+            updated->attrs_.emplace_back(kClosedSyncChildFirstVisitAttr, true);
+            auto stmts = seq->stmts_;
+            stmts.back() = std::move(updated);
+            recipe = std::make_shared<SeqStmts>(std::move(stmts), seq->span_);
+          }
+        }
+      }
       Wrap(entry.scope, entry.services, recipe);
     }
   }

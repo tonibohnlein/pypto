@@ -132,6 +132,41 @@ def test_existing_constant_assignment_is_retained_before_palette():
     assert all(not case["palette_attempts"] for case in public["physical_cases"])
 
 
+def _collect_case_metrics(physical_cases):
+    return [
+        {
+            "families": len(case["families"]),
+            "reserved_lanes": case["reserved_lanes"],
+            "legacy_attempts": case["allocation_attempts"],
+            "palettes": case["palettes"],
+            "palette_work": [
+                {
+                    key: attempt[key]
+                    for key in (
+                        "status",
+                        "reason",
+                        "attempted_budgets",
+                        "publications",
+                        "grammar_nodes",
+                        "phase_visits",
+                        "domain_visits",
+                        "routing_entries",
+                        "boundary_node_visits",
+                        "proof_axis_entries",
+                        "transition_queries",
+                    )
+                }
+                for attempt in case["palette_attempts"]
+            ],
+            "endpoint_domains": case["endpoint_domain_entries"],
+            "endpoint_predicates": case["endpoint_predicates_constructed"],
+            "control_descriptors": case["control_descriptors"],
+            "control_expression_visits": case["control_expression_visits"],
+        }
+        for case in physical_cases
+    ]
+
+
 def palette_scaling_sample(count, visits, slices) -> dict[str, Any]:
     """Inspect compact construction and emitted IR; never expand large visits.
 
@@ -171,39 +206,7 @@ def palette_scaling_sample(count, visits, slices) -> dict[str, Any]:
     emitted = production["function"]
     row["emitted_static_control"] = dict(static_control(emitted))
     row["emitted_statement_occurrences"] = sum(1 for _ in statements(emitted.body))
-    row["cases"] = []
-    for case in production["physical_cases"]:
-        row["cases"].append(
-            {
-                "families": len(case["families"]),
-                "reserved_lanes": case["reserved_lanes"],
-                "legacy_attempts": case["allocation_attempts"],
-                "palettes": case["palettes"],
-                "palette_work": [
-                    {
-                        key: attempt[key]
-                        for key in (
-                            "status",
-                            "reason",
-                            "attempted_budgets",
-                            "publications",
-                            "grammar_nodes",
-                            "phase_visits",
-                            "domain_visits",
-                            "routing_entries",
-                            "boundary_node_visits",
-                            "proof_axis_entries",
-                            "transition_queries",
-                        )
-                    }
-                    for attempt in case["palette_attempts"]
-                ],
-                "endpoint_domains": case["endpoint_domain_entries"],
-                "endpoint_predicates": case["endpoint_predicates_constructed"],
-                "control_descriptors": case["control_descriptors"],
-                "control_expression_visits": case["control_expression_visits"],
-            }
-        )
+    row["cases"] = _collect_case_metrics(production["physical_cases"])
     # Explicitly labeled audit requests; these are not included in production
     # timing and do not change its ordinary incumbent-first route selection.
     order = testing.analyze_scoped_token_order(logical)
@@ -217,9 +220,10 @@ def palette_scaling_sample(count, visits, slices) -> dict[str, Any]:
     row["legacy_six_audit_seconds"] = time.perf_counter() - start
     start = time.perf_counter()
     try:
-        six = order.realize(eligible_ids=list(range(6)))
+        six = testing.lower_sync_schedule(logical, eligible_ids=list(range(6)))
         row["six_status"] = "allocated"
-        row["six_static_control"] = dict(static_control(six))
+        row["six_static_control"] = dict(static_control(six["function"]))
+        row["six_cases"] = _collect_case_metrics(six["physical_cases"])
     except ValueError as error:
         row["six_status"] = "refused"
         row["six_reason"] = str(error)
@@ -234,21 +238,24 @@ def test_emitted_palette_representation_is_compact_in_fixed_period_trip_counts()
         assert row["six_status"] == "allocated", row
         assert row["legacy_six_status"] == "refused", row
         assert "unproved" in row["legacy_six_reason"].lower(), row
-        assert any(case["palettes"] for case in row["cases"]), row
+        assert not any(case["palettes"] for case in row["cases"]), row
+        assert any(case["palettes"] for case in row["six_cases"]), row
     baseline = rows[0]
     for row in rows[1:]:
         assert row["emitted_static_control"] == baseline["emitted_static_control"]
         assert row["emitted_statement_occurrences"] == baseline["emitted_statement_occurrences"]
-        assert len(row["cases"]) == len(baseline["cases"])
-        for actual, expected in zip(row["cases"], baseline["cases"], strict=True):
-            assert actual["families"] == expected["families"]
-            assert actual["endpoint_domains"] == expected["endpoint_domains"]
-            assert actual["endpoint_predicates"] == expected["endpoint_predicates"]
-            assert actual["control_descriptors"] == expected["control_descriptors"]
-            assert [(p["rank_pieces"], len(p["ids"])) for p in actual["palettes"]] == [
-                (p["rank_pieces"], len(p["ids"])) for p in expected["palettes"]
-            ]
-            assert len(actual["palette_work"]) == len(expected["palette_work"])
-            for a, b in zip(actual["palette_work"], expected["palette_work"], strict=True):
-                for key in ("grammar_nodes", "phase_visits", "domain_visits", "routing_entries"):
-                    assert a[key] == b[key], (key, a, b)
+        assert row["six_static_control"] == baseline["six_static_control"]
+        for key in ("cases", "six_cases"):
+            assert len(row[key]) == len(baseline[key])
+            for actual, expected in zip(row[key], baseline[key], strict=True):
+                assert actual["families"] == expected["families"]
+                assert actual["endpoint_domains"] == expected["endpoint_domains"]
+                assert actual["endpoint_predicates"] == expected["endpoint_predicates"]
+                assert actual["control_descriptors"] == expected["control_descriptors"]
+                assert [(p["rank_pieces"], len(p["ids"])) for p in actual["palettes"]] == [
+                    (p["rank_pieces"], len(p["ids"])) for p in expected["palettes"]
+                ]
+                assert len(actual["palette_work"]) == len(expected["palette_work"])
+                for a, b in zip(actual["palette_work"], expected["palette_work"], strict=True):
+                    for metric in ("grammar_nodes", "phase_visits", "domain_visits", "routing_entries"):
+                        assert a[metric] == b[metric], (metric, a, b)

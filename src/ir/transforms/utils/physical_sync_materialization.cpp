@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "pypto/core/logging.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
@@ -141,9 +142,22 @@ class ScheduleMaterializer : public IRMutator {
     return SeqStmts::Flatten(std::move(output), loop->span_);
   }
   static const Call* ArmCall(StmtPtr arm) {
-    if (auto seq = As<SeqStmts>(arm)) {
-      if (seq->stmts_.size() != 1) return nullptr;
-      arm = seq->stmts_.front();
+    while (auto seq = As<SeqStmts>(arm)) {
+      size_t end = seq->stmts_.size();
+      if (end > 0) {
+        if (const auto yield = As<YieldStmt>(seq->stmts_[end - 1]); yield && yield->value_.empty()) {
+          --end;
+        }
+      }
+      if (end == 0) return nullptr;
+      for (size_t i = 0; i + 1 < end; ++i) {
+        const auto assign = As<AssignStmt>(seq->stmts_[i]);
+        if (!assign) return nullptr;
+        if (!As<ScalarType>(assign->var_->GetType()) && !IsOp(As<Call>(assign->value_), "buffer.slot")) {
+          return nullptr;
+        }
+      }
+      arm = seq->stmts_[end - 1];
     }
     const auto eval = As<EvalStmt>(arm);
     return eval ? As<Call>(eval->expr_).get() : nullptr;

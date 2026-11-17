@@ -330,7 +330,11 @@ class ScopedTokenOrder::State {
  private:
   // Prove the complete query rectangle with a single actual token edge between
   // two native chains. Queries never become evidence in the retained graph.
-  bool NativeTokenWitness(const PhysicalSyncFamily& query) const {
+  bool NativeTokenWitness(const PhysicalSyncFamily& query, size_t split_budget = 2) const {
+    if (query.count == 1) {
+      return Query({query.source_region, query.source_first, query.source_site}, true,
+                   {query.target_region, query.target_first, query.target_site}, false);
+    }
     const auto pr = query.source_region, ps = query.source_site;
     const auto nr = query.target_region, ns = query.target_site;
     const auto previous_pipe = input.segments[pr].sites[ps].pipe;
@@ -345,6 +349,7 @@ class ScopedTokenOrder::State {
       before_steps.push_back(Product(paths_[pr].frames[j].second, AxisStep(query, j, false)));
       after_steps.push_back(Product(paths_[nr].frames[j].second, AxisStep(query, j, true)));
     }
+    std::optional<std::pair<size_t, int64_t>> split_candidate;
     for (const auto index : directional_families_[previous_pipe][next_pipe]) {
       ++candidate_visits;
       const auto& edge = families[index];
@@ -373,6 +378,10 @@ class ScopedTokenOrder::State {
         }
         const auto step = AxisStep(query, j, false), edge_step = AxisStep(edge, e, false);
         if (step % edge_step) {
+          if (split_budget > 0 && edge_step % step == 0 && edge_step / step <= 4 && counts[j] > 1) {
+            const auto ratio = edge_step / step;
+            if (!split_candidate || ratio < split_candidate->second) split_candidate = {j, ratio};
+          }
           compatible = false;
           break;
         }
@@ -392,6 +401,23 @@ class ScopedTokenOrder::State {
         if (before < 0 || after < 0) compatible = false;
       }
       if (compatible) return true;
+    }
+    if (split_candidate && split_budget > 0) {
+      const auto [j, k] = *split_candidate;
+      for (int64_t r = 0; r < k && r < counts[j]; ++r) {
+        PhysicalSyncFamily sub = query;
+        const int64_t sub_count = (counts[j] - r + k - 1) / k;
+        sub.source_first += r * query.axes[j].source_stride;
+        sub.target_first += r * query.axes[j].target_stride;
+        sub.axes[j].count = sub_count;
+        sub.axes[j].source_stride *= k;
+        sub.axes[j].target_stride *= k;
+        sub.axes[j].source_step *= k;
+        sub.axes[j].target_step *= k;
+        sub.count = (query.count / counts[j]) * sub_count;
+        if (!NativeTokenWitness(sub, split_budget - 1)) return false;
+      }
+      return true;
     }
     return false;
   }
@@ -789,19 +815,29 @@ DirectSyncOrder ScopedTokenOrder::View() const {
 std::unique_ptr<ScopedTokenOrder> PrepareScopedTokenOrder(std::shared_ptr<const ScopedSyncProtocol> protocol,
                                                           ScopedTokenWork* work) {
   auto original = std::make_unique<ScopedTokenOrder>(std::move(protocol));
-  auto normalized = NormalizeScopedTokenFamilies(
-      original->Input(), original->Families(),
-      [&](const PhysicalSyncFamily& candidate) { return original->CanReuseFamily(candidate); }, work);
-  if (normalized.size() == original->Families().size()) return original;
-  auto candidate =
-      std::unique_ptr<ScopedTokenOrder>(new ScopedTokenOrder(original->Protocol(), std::move(normalized)));
-  // Normalization preserves actual uses, but this sufficient proof graph may
-  // change. Never replace an available preparation with an unproved one.
-  for (const auto& family : candidate->Families()) {
-    const auto direction = SyncFamilyPipes(candidate->Input(), family);
-    if (direction.first != direction.second && family.count > 1 && !candidate->CanReuseFamily(family))
-      return original;
+  std::unique_ptr<ScopedTokenOrder> accepted;
+  const ScopedTokenOrder* active = original.get();
+  for (;;) {
+    auto normalized = NormalizeScopedTokenFamilies(
+        active->Input(), active->Families(),
+        [&](const PhysicalSyncFamily& candidate) { return active->CanReuseFamily(candidate); }, work);
+    if (normalized.size() == active->Families().size()) break;
+    auto next =
+        std::unique_ptr<ScopedTokenOrder>(new ScopedTokenOrder(original->Protocol(), std::move(normalized)));
+    // Normalization preserves actual uses, but this sufficient proof graph may
+    // change. Never replace an available preparation with an unproved one.
+    bool valid = true;
+    for (const auto& family : next->Families()) {
+      const auto direction = SyncFamilyPipes(next->Input(), family);
+      if (direction.first != direction.second && family.count > 1 && !next->CanReuseFamily(family)) {
+        valid = false;
+        break;
+      }
+    }
+    if (!valid) break;
+    accepted = std::move(next);
+    active = accepted.get();
   }
-  return candidate;
+  return accepted ? std::move(accepted) : std::move(original);
 }
 }  // namespace pypto::ir::sync

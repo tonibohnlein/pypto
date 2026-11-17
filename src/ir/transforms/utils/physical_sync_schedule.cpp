@@ -278,7 +278,9 @@ class AssignedRegionSchedule {
         for (const auto& original : protocol->Cuts()) {
           const auto& payload = input.segments[original.region].sites[original.site];
           AssignedCut cut{c, payload.original, payload.continuation, {}, {}};
-          auto append = [&](size_t raw, bool publish, std::vector<AssignedEndpoint>& endpoints) {
+          std::set<size_t> seen_before, seen_after;
+          auto append = [&](size_t raw, bool publish, std::vector<AssignedEndpoint>& endpoints,
+                            std::set<size_t>& seen) {
             const auto& use = protocol->Families()[raw];
             const auto assigned = mapping.at(raw);
             const auto& raw_palettes = cases[c].assignment->RawPalettes();
@@ -302,15 +304,15 @@ class AssignedRegionSchedule {
                 endpoints.push_back({c, assigned, publish, std::move(domain), &palette, &piece});
                 ++work.assigned_schedule_endpoints;
               }
-            } else {
+            } else if (seen.insert(assigned).second) {
               INTERNAL_CHECK(families[assigned].ids.size() <= 1)
                   << "Protocol view requires a certified raw-record physical rank map";
-              endpoints.push_back({c, assigned, publish, domains.Get(use, publish)});
+              endpoints.push_back({c, assigned, publish, domains.Get(families[assigned], publish)});
               ++work.assigned_schedule_endpoints;
             }
           };
-          for (auto raw : original.before) append(raw, false, cut.before);
-          for (auto raw : original.after) append(raw, true, cut.after);
+          for (auto raw : original.before) append(raw, false, cut.before, seen_before);
+          for (auto raw : original.after) append(raw, true, cut.after, seen_after);
           cuts.push_back(std::move(cut));
         }
         continue;
@@ -349,9 +351,22 @@ class AssignedRegionSchedule {
   }
 };
 const Call* SingletonCall(StmtPtr body) {
-  if (auto seq = As<SeqStmts>(body)) {
-    if (seq->stmts_.size() != 1) return nullptr;
-    body = seq->stmts_.front();
+  while (auto seq = As<SeqStmts>(body)) {
+    size_t end = seq->stmts_.size();
+    if (end > 0) {
+      if (const auto yield = As<YieldStmt>(seq->stmts_[end - 1]); yield && yield->value_.empty()) {
+        --end;
+      }
+    }
+    if (end == 0) return nullptr;
+    for (size_t i = 0; i + 1 < end; ++i) {
+      const auto assign = As<AssignStmt>(seq->stmts_[i]);
+      if (!assign) return nullptr;
+      if (!As<ScalarType>(assign->var_->GetType()) && !IsOp(As<Call>(assign->value_), "buffer.slot")) {
+        return nullptr;
+      }
+    }
+    body = seq->stmts_[end - 1];
   }
   auto eval = As<EvalStmt>(body);
   return eval ? As<Call>(eval->expr_).get() : nullptr;
@@ -826,14 +841,27 @@ class AssignedCommandLowering {
       for (auto guard = guards.rbegin(); guard != guards.rend(); ++guard) body = Guard(*guard, body);
       return body;
     }
-    if (first + f.count < input_.segments[r].count && (!phase_ || phase_->end > first + f.count))
-      body = Guard(Conditions(r).Simplify(
-                       std::make_shared<Lt>(ordinal, Integer(first + f.count, span), DataType::BOOL, span)),
+    const auto& seg = input_.segments[r];
+    const bool need_lt = first + f.count < seg.count && (!phase_ || phase_->end > first + f.count);
+    const bool need_ge = first && (!phase_ || phase_->first < first);
+    std::optional<int64_t> ge_bound, lt_bound;
+    if (seg.original_loop) {
+      const SyncLoopFrame frame{seg.original_loop, seg.count, seg.start, seg.step, nullptr};
+      if (need_ge) ge_bound = OriginalBoundary(frame, first);
+      if (need_lt) lt_bound = OriginalBoundary(frame, first + f.count);
+    }
+    if (need_lt) {
+      const ExprPtr lhs = lt_bound ? seg.original_loop->loop_var_ : ordinal;
+      const int64_t rhs = lt_bound ? *lt_bound : first + f.count;
+      body = Guard(Conditions(r).Simplify(std::make_shared<Lt>(lhs, Integer(rhs, span), DataType::BOOL, span)),
                    body);
-    if (first && (!phase_ || phase_->first < first))
-      body = Guard(
-          Conditions(r).Simplify(std::make_shared<Ge>(ordinal, Integer(first, span), DataType::BOOL, span)),
-          body);
+    }
+    if (need_ge) {
+      const ExprPtr lhs = ge_bound ? seg.original_loop->loop_var_ : ordinal;
+      const int64_t rhs = ge_bound ? *ge_bound : first;
+      body = Guard(Conditions(r).Simplify(std::make_shared<Ge>(lhs, Integer(rhs, span), DataType::BOOL, span)),
+                   body);
+    }
     return body;
   }
   PhysicalCuts LowerCut(const AssignedCut& cut) {
