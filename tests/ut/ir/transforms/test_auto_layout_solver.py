@@ -760,7 +760,7 @@ def test_review_fixes_alignment_multi_call_omitted_out_and_budget():
     def mm_helper(
         x: pl.Tensor[[32, 32], pl.FP16],
         w: pl.Tensor[[32, 32], pl.FP16],
-        out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+        out: pl.Tensor[[32, 32], pl.FP32],
         row: pl.Scalar[pl.INT32],
     ) -> pl.Tensor[[32, 32], pl.FP32]:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm_helper"):
@@ -842,52 +842,116 @@ def test_review_fixes_alignment_multi_call_omitted_out_and_budget():
         ),
     )
     tiny_inst = LayoutProblemInstance(
-        values={"x": small_x, "t": small_t}, operations=(small_op,), cost_model=cost_model
+        values={"x": small_x, "t": small_t}, operations=[small_op], cost_model=cost_model
     )
     budget_res = solve_auto_layout(tiny_inst, config=LayoutSolverConfig(max_evaluations=1))
     assert budget_res.stats.termination_reason == "evaluation_budget"
     with pytest.raises(ValueError, match="max_evaluations"):
         solve_treewidth_dp(tiny_inst, config=LayoutSolverConfig(max_evaluations=1))
 
-    # nz_config_vs_admissible: already-blocked rank-5 NZ GM tensor must keep admissible_layouts=(NZ,).
-    nz_gm = LayoutValueNode(
-        name="nz_in",
-        memory_space=ir.MemorySpace.DDR,
-        shape=(1, 1, 16, 16, 8),
-        dtype=DataType.FP16,
-        current_layout=NZ,
-        admissible_layouts=(NZ,),
-        producer_op_id=None,
+    # nz_config_vs_admissible: blocked rank-5 NZ tensor keeps admissible_layouts=(NZ,) on extraction.
+    import torch  # noqa: PLC0415
+    from pypto.ir.auto_layout import pack_nz  # noqa: PLC0415
+
+    @pl.jit
+    def blocked_nz_kernel(
+        x: pl.Tensor[[64, 64], pl.FP16, pl.NZ],
+        w: pl.Tensor[[64, 64], pl.FP16],
+        y: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+        row: pl.Scalar[pl.INT32],
+    ) -> pl.Tensor[[64, 64], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="blocked_nz"):
+            off = pl.max(pl.cast(row, pl.INDEX), 0) * 16
+            tx = pl.load(x, [off, 0], [64, 64], target_memory=pl.Mem.Mat)
+            tw = pl.load(w, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
+            y = pl.store(pl.matmul(tx, tw), [0, 0], y)
+        return y
+
+    x_nz_stub = pack_nz(torch.zeros((64, 64), dtype=torch.float16))
+    w_nd_stub = torch.zeros((64, 64), dtype=torch.float16)
+    y_nd_stub = torch.zeros((64, 64), dtype=torch.float32)
+    nz_prog = blocked_nz_kernel.specialize(x_nz_stub, w_nd_stub, y_nd_stub, 0)
+    nz_pre = run_pre_layout_passes(nz_prog)
+    re_inst = extract_layout_instance(nz_pre, cost_model=cost_model, reusable_tensors={"x", "w"})
+    assert any(
+        n.current_layout == NZ and n.admissible_layouts == (NZ,)
+        for n in re_inst.values.values()
+        if n.memory_space == ir.MemorySpace.DDR
     )
-    nz_tile = LayoutValueNode(
-        name="nz_t",
-        memory_space=ir.MemorySpace.Mat,
-        shape=(16, 16),
-        dtype=DataType.FP16,
-        current_layout=ROW_MAJOR_FLAT,
-        admissible_layouts=(ROW_MAJOR_FLAT,),
-        producer_op_id="op_nz",
-    )
-    nz_op = LayoutOperationNode(
-        op_id="op_nz",
-        op_name="tile.load",
-        inputs=("nz_in",),
-        output="nz_t",
-        configs=(
-            OperatorConfig(
-                op_id="op_nz",
-                op_name="tile.load",
-                input_layouts=(NZ,),
-                output_layout=ROW_MAJOR_FLAT,
-                op_cost_cycles=5.0,
-            ),
-        ),
-    )
-    nz_inst = LayoutProblemInstance(
-        values={"nz_in": nz_gm, "nz_t": nz_tile}, operations=(nz_op,), cost_model=cost_model
-    )
-    nz_res = solve_auto_layout(nz_inst)
-    assert nz_res.assignment.tensor_layouts["nz_in"] == NZ
+    re_res = solve_auto_layout(re_inst)
+    assert re_res.writeback_issues == ()
+    assert apply_layout_assignment(nz_pre, re_res.assignment) is not None
+
+    # Cast.operand in NZ offset + Submit with omitted Out + distinct allocation identity + name collision.
+    @pl.program
+    class _SubmitAndCastProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def mm_incore(
+            self,
+            x: pl.Tensor[[64, 16], pl.FP16],
+            w: pl.Tensor[[16, 16], pl.FP16],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            off = pl.max(pl.cast(0, pl.INDEX), 0) * 16
+            tx = pl.load(x, [off, 0], [16, 16], target_memory=pl.Mem.Mat)
+            tw = pl.load(w, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            out = pl.store(pl.matmul(tx, tw), [0, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def mm_incore_site1(
+            self,
+            a: pl.Tensor[[16, 16], pl.FP32],
+            b: pl.Tensor[[16, 16], pl.FP32],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            ta = a[0:16, 0:16]
+            tb = b[0:16, 0:16]
+            out[0:16, 0:16] = pl.add(ta, tb)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def entry(
+            self,
+            x1: pl.Tensor[[64, 16], pl.FP16],
+            x2: pl.Tensor[[64, 16], pl.FP16],
+            w: pl.Tensor[[16, 16], pl.FP16],
+            row: pl.Scalar[pl.INT32],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            with pl.manual_scope():
+                y1, t1 = pl.submit(self.mm_incore, x1, w)
+                y2, t2 = pl.submit(self.mm_incore, x2, w)
+                out, _t3 = pl.submit(self.mm_incore_site1, y1, y2, out, deps=[t1, t2])
+            return out
+
+    from pypto.ir.auto_layout import _OrchCallMultiplierVisitor  # noqa: PLC0415
+
+    sub_prog = _SubmitAndCastProgram
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
+        sub_pre = run_pre_layout_passes(sub_prog)
+        visitor = _OrchCallMultiplierVisitor(dict(sub_pre.functions))
+        for fn in sub_pre.functions.values():
+            if not ir.is_incore_type(fn.func_type):
+                visitor.walk(fn)
+        mm_sites = visitor.call_sites["mm_incore"]
+        assert len(mm_sites) == 2
+        sub_cost = LayoutCostModel(
+            expected_uses=10000,
+            backend_type=BackendType.Ascend910,
+            allow_external_input_relayout=True,
+        )
+        sub_inst = extract_layout_instance(sub_pre, cost_model=sub_cost, reusable_tensors={"x1", "w"})
+        sub_res = solve_auto_layout(sub_inst)
+        assert sub_res.writeback_issues == ()
+        sub_rewritten = apply_layout_assignment(sub_pre, sub_res.assignment)
+        # Verify both Submit calls target distinct helpers (no collision with mm_incore_site1).
+        func_names = {gv.name for gv in sub_rewritten.functions}
+        assert "mm_incore" in func_names
+        assert "mm_incore_site1" in func_names
+        assert any(n.startswith("mm_incore_site") and n != "mm_incore_site1" for n in func_names)
+        sub_lowered = run_post_layout_passes(sub_rewritten)
+        assert len(sub_lowered.functions) >= 4
 
 
 if __name__ == "__main__":

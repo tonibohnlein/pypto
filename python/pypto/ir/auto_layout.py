@@ -1407,7 +1407,11 @@ class _OrchCallMultiplierVisitor:
         resolved = [self._resolve_arg_name(arg) for arg in expr.args]
         callee = self._func_by_name.get(name)
         if callee is not None and len(resolved) < len(callee.params):
-            base_hint = _clean_ssa_name(assign_var.name_hint) if assign_var is not None else name
+            if assign_var is not None:
+                base_hint = f"{_clean_ssa_name(assign_var.name_hint)}_u{assign_var.unique_id}"
+            else:
+                site_idx = len(self.call_sites.get(name, ()))
+                base_hint = f"{name}_site{site_idx}"
             for p_idx in range(len(resolved), len(callee.params)):
                 omitted_name = f"{base_hint}_out{p_idx}"
                 resolved.append(omitted_name)
@@ -2516,7 +2520,7 @@ def _collect_expr_var_uids(expr: core_ir.Expr, out: set[int]) -> None:
             _collect_expr_var_uids(el, out)
         return
     if isinstance(expr, core_ir.Cast):
-        _collect_expr_var_uids(expr.expr, out)
+        _collect_expr_var_uids(expr.operand, out)
         return
     for attr in ("left", "right"):
         child = getattr(expr, attr, None)
@@ -2617,6 +2621,7 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         self._scoped_tensor_layouts: dict[tuple[str, str], core_ir.TensorLayout] = {}
         self._tile_prefix_override: dict[str, str] = {}
         self._specialized_callees: dict[tuple[str, tuple[core_ir.TensorLayout | None, ...]], str] = {}
+        self._callee_formal_params: dict[str, tuple[core_ir.Var, ...]] = {}
         self._param_steps: dict[tuple[str, int], int] = {}
         self._var_remap: dict[int, core_ir.Var] = {}
         self._func_return_types: dict[str, list[core_ir.Type]] = {}
@@ -2653,10 +2658,12 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         visitor: _OrchCallMultiplierVisitor,
     ) -> list[core_ir.Function]:
         extra_incore: list[core_ir.Function] = []
+        used_names: set[str] = set(func_by_name.keys())
         for callee_name, sites in visitor.call_sites.items():
             callee = func_by_name.get(callee_name)
             if callee is None or not sites:
                 continue
+            self._callee_formal_params[callee_name] = tuple(callee.params)
             if len(sites) == 1:
                 site_args, _ = sites[0]
                 for p_idx, param in enumerate(callee.params):
@@ -2674,8 +2681,13 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
                 elif (callee_name, sig_t) in self._specialized_callees:
                     continue
                 else:
-                    spec_name = f"{callee_name}_site{site_idx}"
-                    self._tile_prefix_override[spec_name] = f"{callee_name}_{site_idx}"
+                    suffix = site_idx
+                    spec_name = f"{callee_name}_site{suffix}"
+                    while spec_name in used_names:
+                        suffix += 1
+                        spec_name = f"{callee_name}_site{suffix}"
+                    used_names.add(spec_name)
+                    self._tile_prefix_override[spec_name] = f"{callee_name}_{suffix}"
                     self._specialized_callees[(callee_name, sig_t)] = spec_name
                     for p_idx in range(len(callee.params)):
                         if (callee_name, p_idx) in self._param_steps:
@@ -2861,10 +2873,16 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         callee_name: str,
         new_args: Sequence[core_ir.Expr],
     ) -> str:
-        sig = tuple(
+        sig_list: list[core_ir.TensorLayout | None] = [
             _tensor_type_layout(a.type) if isinstance(a.type, core_ir.TensorType) else None for a in new_args
-        )
-        return self._specialized_callees.get((callee_name, sig), callee_name)
+        ]
+        callee_params = self._callee_formal_params.get(callee_name)
+        if callee_params is not None and len(sig_list) < len(callee_params):
+            for param in callee_params[len(sig_list) :]:
+                sig_list.append(
+                    _tensor_type_layout(param.type) if isinstance(param.type, core_ir.TensorType) else None
+                )
+        return self._specialized_callees.get((callee_name, tuple(sig_list)), callee_name)
 
     def visit_var(self, op: core_ir.Var) -> core_ir.Expr:
         return self._var_remap.get(op.unique_id, op)
@@ -3445,16 +3463,16 @@ def _fit_within_case_differentials(  # noqa: PLR0913
     yd_vec = np.asarray(d_rows_y, dtype=np.float64)
     xd_norms = np.sqrt(np.sum(xd_mat * xd_mat, axis=0))
     xd_scales = [float(s) if float(s) > 0.0 else 1.0 for s in xd_norms.tolist()]
-    active_cols = sum(1 for s in xd_norms.tolist() if float(s) > 0.0)
     xd_scaled = np.asarray(xd_mat / np.asarray(xd_scales, dtype=np.float64), dtype=np.float64)
-    yd_scaled_coef, _, _, _ = np.linalg.lstsq(xd_scaled, yd_vec, rcond=None)
+    yd_scaled_coef, _, xd_rank, _ = np.linalg.lstsq(xd_scaled, yd_vec, rcond=None)
     delta_coef = [float(yd_scaled_coef[j]) / xd_scales[j] for j in range(2)]
     yd_pred = xd_mat @ np.asarray(delta_coef, dtype=np.float64)
     ss_res = float(np.sum((yd_vec - yd_pred) ** 2))
     ss_tot = float(np.sum(yd_vec * yd_vec))
     within_r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 1e-12 else 1.0
-    dof_within = max(1, len(rows_y) - len(case_groups) - active_cols)
-    sigma2_within = ss_res / float(dof_within)
+    active_cases = sum(1 for idxs in case_groups.values() if len(idxs) >= 2)
+    raw_dof_within = len(rows_y) - active_cases - int(xd_rank)
+    sigma2_within = ss_res / float(max(1, raw_dof_within))
     gram_within: list[list[float]] = [
         [
             sum((d_rows_x[r][i] / xd_scales[i]) * (d_rows_x[r][j] / xd_scales[j]) for r in range(len(rows_y)))
@@ -3462,19 +3480,27 @@ def _fit_within_case_differentials(  # noqa: PLR0913
         ]
         for i in range(2)
     ]
-    xd_inv: np.ndarray = np.linalg.pinv(np.asarray(gram_within, dtype=np.float64))
+    gram_within_arr = np.asarray(gram_within, dtype=np.float64)
+    xd_inv: np.ndarray = np.linalg.pinv(gram_within_arr)
+    proj_within: np.ndarray = xd_inv @ gram_within_arr
+    estimable_within = [
+        raw_dof_within > 0 and float(xd_norms[j]) > 0.0 and abs(1.0 - float(proj_within[j, j])) <= 1e-7
+        for j in range(2)
+    ]
     se_within = [math.sqrt(max(0.0, float(xd_inv[j, j]) * sigma2_within)) / xd_scales[j] for j in range(2)]
     norm_mte2 = float(xd_norms[0])
     norm_fixpipe = float(xd_norms[1])
-    delta_mte2 = delta_coef[0] if norm_mte2 > 0.0 else 0.0
-    delta_fixpipe = delta_coef[1] if norm_fixpipe > 0.0 else 0.0
+    delta_mte2 = delta_coef[0] if estimable_within[0] else 0.0
+    delta_fixpipe = delta_coef[1] if estimable_within[1] else 0.0
     t_mte2 = (
-        (delta_mte2 / se_within[0]) if se_within[0] > 1e-18 else (float("inf") if delta_mte2 > 1e-9 else 0.0)
+        (delta_mte2 / se_within[0])
+        if estimable_within[0] and se_within[0] > 1e-18
+        else (float("inf") if estimable_within[0] and delta_mte2 > 1e-9 else 0.0)
     )
     t_fixpipe = (
         (delta_fixpipe / se_within[1])
-        if se_within[1] > 1e-18
-        else (float("inf") if abs(delta_fixpipe) > 1e-9 else 0.0)
+        if estimable_within[1] and se_within[1] > 1e-18
+        else (float("inf") if estimable_within[1] and abs(delta_fixpipe) > 1e-9 else 0.0)
     )
     within_op_rho = float(np.median(within_case_rhos)) if within_case_rhos else 1.0
     return (

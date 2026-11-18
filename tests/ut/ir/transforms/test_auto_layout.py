@@ -1157,7 +1157,7 @@ def test_differential_anchoring_and_short_row_strided_classification():
     )
     inst = LayoutProblemInstance(
         values={"x": src, "tx": dst},
-        operations=(op,),
+        operations=[op],
         cost_model=base_model,
     )
     bd = evaluate_assignment(
@@ -1290,6 +1290,7 @@ def test_bench_metrics_and_variant_matching_fixes():
     matched = _match_variant_record(recs, {"x": "ND"}, {"x": "ND", "t": "NZ"})
     assert matched is not None
     assert matched["variant_id"] == "v_nz_tile"
+    assert _match_variant_record(recs, {"x": "ND"}, {"x": "ND", "t": "CM"}) is None
 
     x_node = LayoutValueNode(
         name="x",
@@ -1300,7 +1301,7 @@ def test_bench_metrics_and_variant_matching_fixes():
         admissible_layouts=(nd,),
         producer_op_id=None,
     )
-    inst = LayoutProblemInstance(values={"x": x_node}, operations=(), cost_model=LayoutCostModel())
+    inst = LayoutProblemInstance(values={"x": x_node}, operations=[], cost_model=LayoutCostModel())
     bad_res = LayoutSolverResult(
         breakdown=evaluate_assignment(inst, LayoutAssignment(value_layouts={"x": nd})),
         stats=LayoutSolverStats(1, 0, 0, 1.0, "optimal", 0, 0),
@@ -1320,6 +1321,32 @@ def test_bench_metrics_and_variant_matching_fixes():
     assert summary["auto_layout"]["variant_id"] is None
     assert summary["auto_layout"]["device_us_median"] is None
     assert summary["auto_layout"]["writeback_issues"] == ["incompatible helper signature"]
+
+    # Item 5: paired collinear within-case measurements (x_store = 2 * x_load) must keep fallback params.
+    set_backend_type(BackendType.Ascend910)
+    col_model = LayoutCostModel(expected_uses=100, backend_type=BackendType.Ascend910)
+    col_meas: list[CalibrationMeasurement] = []
+    for s_idx, (m_dim, k_dim, n_dim) in enumerate([(64, 128, 64), (64, 256, 64), (128, 128, 128)]):
+        case = auto_layout_bench.build_single_matmul_case(m_dim, k_dim, n_dim, expected_uses=100, seed=s_idx)
+        c_inst = extract_layout_instance(run_pre_layout_passes(case.program), cost_model=col_model)
+        # Keep only paired all-ND and all-NZ variants where load/store diffs are collinear.
+        for v_idx, c_bd in enumerate(enumerate_assignments(c_inst, deduplicate=True)):
+            lays = set(c_bd.assignment.tensor_layouts.values())
+            if len(lays) != 1:
+                continue
+            col_meas.append(
+                CalibrationMeasurement(
+                    variant_id=f"col_{s_idx}_{v_idx}",
+                    measured_us=10.0 + (c_bd.total_cost_cycles / 100.0) / (1.8 * 1000.0),
+                    instance=c_inst,
+                    breakdown=c_bd,
+                )
+            )
+    col_rep = fit_cost_model_from_measurements(col_meas, col_model)
+    assert "fixpipe_acc_to_nd_bytes_per_cycle" in col_rep.fallback_params
+    assert col_rep.fitted_model.fixpipe_acc_to_nd_bytes_per_cycle == pytest.approx(
+        col_model.fixpipe_acc_to_nd_bytes_per_cycle
+    )
 
 
 if __name__ == "__main__":

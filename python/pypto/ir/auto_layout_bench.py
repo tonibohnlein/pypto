@@ -713,6 +713,7 @@ def _match_variant_record(
             rec_vals = rec.get("value_layouts")
             if isinstance(rec_vals, dict) and rec_vals == value_layouts:
                 return rec
+        return None
     for rec in variant_records:
         if rec.get("gm_layouts") == gm_layouts:
             return rec
