@@ -888,14 +888,18 @@ def test_review_fixes_alignment_multi_call_omitted_out_and_budget():
         @pl.function(type=pl.FunctionType.InCore)
         def mm_incore(
             self,
-            x: pl.Tensor[[64, 16], pl.FP16],
-            w: pl.Tensor[[16, 16], pl.FP16],
+            x: pl.Tensor[[64, 16], pl.FP32],
+            w: pl.Tensor[[16, 16], pl.FP32],
+            row: pl.Scalar[pl.INT32],
             out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
         ) -> pl.Tensor[[16, 16], pl.FP32]:
-            off = pl.max(pl.cast(0, pl.INDEX), 0) * 16
+            off = pl.max(pl.cast(row, pl.INDEX), 0) * 16
             tx = pl.load(x, [off, 0], [16, 16], target_memory=pl.Mem.Mat)
             tw = pl.load(w, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
-            out = pl.store(pl.matmul(tx, tw), [0, 0], out)
+            acc = pl.matmul(tx, tw)
+            mid = pl.tile.move(acc, target_memory=pl.Mem.Mat)
+            mid_t = pl.tile.transpose_view(mid)
+            out = pl.store(pl.matmul(mid_t, tw), [0, 0], out)
             return out
 
         @pl.function(type=pl.FunctionType.InCore)
@@ -913,15 +917,15 @@ def test_review_fixes_alignment_multi_call_omitted_out_and_budget():
         @pl.function(type=pl.FunctionType.Orchestration)
         def entry(
             self,
-            x1: pl.Tensor[[64, 16], pl.FP16],
-            x2: pl.Tensor[[64, 16], pl.FP16],
-            w: pl.Tensor[[16, 16], pl.FP16],
+            x1: pl.Tensor[[64, 16], pl.FP32],
+            x2: pl.Tensor[[64, 16], pl.FP32],
+            w: pl.Tensor[[16, 16], pl.FP32],
             row: pl.Scalar[pl.INT32],
             out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
         ) -> pl.Tensor[[16, 16], pl.FP32]:
             with pl.manual_scope():
-                y1, t1 = pl.submit(self.mm_incore, x1, w)
-                y2, t2 = pl.submit(self.mm_incore, x2, w)
+                y1, t1 = pl.submit(self.mm_incore, x1, w, row)
+                y2, t2 = pl.submit(self.mm_incore, x2, w, row)
                 out, _t3 = pl.submit(self.mm_incore_site1, y1, y2, out, deps=[t1, t2])
             return out
 
@@ -930,12 +934,14 @@ def test_review_fixes_alignment_multi_call_omitted_out_and_budget():
     sub_prog = _SubmitAndCastProgram
     with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
         sub_pre = run_pre_layout_passes(sub_prog)
-        visitor = _OrchCallMultiplierVisitor(dict(sub_pre.functions))
+        visitor = _OrchCallMultiplierVisitor({fn.name: fn for fn in sub_pre.functions.values()})
         for fn in sub_pre.functions.values():
             if not ir.is_incore_type(fn.func_type):
                 visitor.walk(fn)
         mm_sites = visitor.call_sites["mm_incore"]
         assert len(mm_sites) == 2
+        assert mm_sites[0][0][-1] is not None
+        assert mm_sites[0][0][-1] != mm_sites[1][0][-1]
         sub_cost = LayoutCostModel(
             expected_uses=10000,
             backend_type=BackendType.Ascend910,
@@ -946,10 +952,14 @@ def test_review_fixes_alignment_multi_call_omitted_out_and_budget():
         assert sub_res.writeback_issues == ()
         sub_rewritten = apply_layout_assignment(sub_pre, sub_res.assignment)
         # Verify both Submit calls target distinct helpers (no collision with mm_incore_site1).
-        func_names = {gv.name for gv in sub_rewritten.functions}
-        assert "mm_incore" in func_names
-        assert "mm_incore_site1" in func_names
-        assert any(n.startswith("mm_incore_site") and n != "mm_incore_site1" for n in func_names)
+        func_by_str = {gv.name: fn for gv, fn in sub_rewritten.functions.items()}
+        assert "mm_incore" in func_by_str
+        assert "mm_incore_site1" in func_by_str
+        assert "mm_incore_site2" in func_by_str
+        # Verify mm_incore_site2 received the solver-selected tile layout from mm_incore_1.*.
+        site1_mid = sub_res.assignment.tile_layouts.get("mm_incore_1.mid")
+        assert site1_mid is not None
+        assert site1_mid.blayout.name in str(func_by_str["mm_incore_site2"])
         sub_lowered = run_post_layout_passes(sub_rewritten)
         assert len(sub_lowered.functions) >= 4
 

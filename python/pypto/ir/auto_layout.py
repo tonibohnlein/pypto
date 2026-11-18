@@ -1597,6 +1597,7 @@ class _PostInferInstanceExtractor:
             is_reusable = name in self._reusable or param.name_hint in self._reusable
             allow_nz = (
                 is_static
+                and cur_layout == core_ir.TensorLayout.ND
                 and name not in self._reshaped_names
                 and is_nz_compatible_shape(shape, param.type.dtype)
                 and (
@@ -2687,7 +2688,7 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
                         suffix += 1
                         spec_name = f"{callee_name}_site{suffix}"
                     used_names.add(spec_name)
-                    self._tile_prefix_override[spec_name] = f"{callee_name}_{suffix}"
+                    self._tile_prefix_override[spec_name] = f"{callee_name}_{site_idx}"
                     self._specialized_callees[(callee_name, sig_t)] = spec_name
                     for p_idx in range(len(callee.params)):
                         if (callee_name, p_idx) in self._param_steps:
@@ -2789,6 +2790,8 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         return prologue_stmts
 
     def visit_function(self, func: core_ir.Function) -> core_ir.Function:
+        if func.level is not None and core_ir.level_to_linqu_level(func.level) >= 3:
+            return func
         self._var_remap.clear()
         self._current_func_name = func.name
         new_params: list[tuple[core_ir.Var, core_ir.ParamDirection]] = []
@@ -2936,15 +2939,41 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         new_value = self.visit_expr(op.value)
         new_var = op.var
         if not new_value.same_as(op.value) and isinstance(
-            op.var.type, (core_ir.TensorType, core_ir.TileType)
+            op.var.type, (core_ir.TensorType, core_ir.TileType, core_ir.TupleType)
         ):
-            if isinstance(new_value.type, (core_ir.TensorType, core_ir.TileType)):
+            if isinstance(new_value.type, (core_ir.TensorType, core_ir.TileType, core_ir.TupleType)):
                 new_var = core_ir.Var(op.var.name_hint, new_value.type, op.var.span)
                 self._var_remap[op.var.unique_id] = new_var
 
         if new_var.same_as(op.var) and new_value.same_as(op.value):
             return op
         return core_ir.AssignStmt(new_var, new_value, op.span)
+
+    @staticmethod
+    def _sync_call_return_type(
+        call_type: core_ir.Type,
+        ret_types: Sequence[core_ir.Type] | None,
+    ) -> core_ir.Type:
+        if not ret_types:
+            return call_type
+        if isinstance(call_type, core_ir.TensorType) and isinstance(ret_types[0], core_ir.TensorType):
+            return _with_tensor_layout(call_type, _tensor_type_layout(ret_types[0]))
+        if isinstance(call_type, core_ir.TupleType):
+            elems = list(call_type.types)
+            changed = False
+            for idx, r_type in enumerate(ret_types):
+                if (
+                    idx < len(elems)
+                    and isinstance(elems[idx], core_ir.TensorType)
+                    and isinstance(r_type, core_ir.TensorType)
+                ):
+                    updated = _with_tensor_layout(elems[idx], _tensor_type_layout(r_type))
+                    if updated is not elems[idx]:
+                        elems[idx] = updated
+                        changed = True
+            if changed:
+                return core_ir.TupleType(elems)
+        return call_type
 
     def visit_call(self, op: core_ir.Call) -> core_ir.Expr:
         new_args = [self.visit_expr(arg) for arg in op.args]
@@ -2954,8 +2983,7 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
             if not args_changed and target_name == op.op.name:
                 return op
             target_gv = core_ir.GlobalVar(target_name) if target_name != op.op.name else op.op
-            ret_types = self._func_return_types.get(target_name)
-            ret_type = ret_types[0] if ret_types and len(ret_types) == 1 else op.type
+            ret_type = self._sync_call_return_type(op.type, self._func_return_types.get(target_name))
             return core_ir.Call(
                 target_gv,
                 new_args,
@@ -2998,9 +3026,7 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         if isinstance(op.op, core_ir.GlobalVar):
             if callee_changed:
                 target_op = core_ir.GlobalVar(target_name)
-            ret_types = self._func_return_types.get(target_name)
-            if ret_types is not None:
-                ret_type = core_ir.make_call_result_type(ret_types, is_submit=True)
+            ret_type = self._sync_call_return_type(op.type, self._func_return_types.get(target_name))
         return core_ir.Submit(
             target_op,
             new_args,
@@ -3470,8 +3496,7 @@ def _fit_within_case_differentials(  # noqa: PLR0913
     ss_res = float(np.sum((yd_vec - yd_pred) ** 2))
     ss_tot = float(np.sum(yd_vec * yd_vec))
     within_r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 1e-12 else 1.0
-    active_cases = sum(1 for idxs in case_groups.values() if len(idxs) >= 2)
-    raw_dof_within = len(rows_y) - active_cases - int(xd_rank)
+    raw_dof_within = sum(len(idxs) - 1 for idxs in case_groups.values() if len(idxs) >= 2) - int(xd_rank)
     sigma2_within = ss_res / float(max(1, raw_dof_within))
     gram_within: list[list[float]] = [
         [

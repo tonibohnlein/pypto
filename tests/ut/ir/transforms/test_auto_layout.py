@@ -1253,6 +1253,7 @@ def test_differential_anchoring_and_short_row_strided_classification():
 def test_bench_metrics_and_variant_matching_fixes():
     from unittest import mock  # noqa: PLC0415
 
+    from pypto.ir.auto_layout import ROW_MAJOR_FLAT, _calibration_prediction_cycles  # noqa: PLC0415
     from pypto.ir.auto_layout_bench import _evaluate_solvers_for_case, _match_variant_record  # noqa: PLC0415
     from pypto.ir.auto_layout_production_bench import _extract_bench_metrics  # noqa: PLC0415
     from pypto.ir.auto_layout_solver import (  # noqa: PLC0415
@@ -1261,6 +1262,7 @@ def test_bench_metrics_and_variant_matching_fixes():
     )
 
     nd = ir.TensorLayout.ND
+    nz = ir.TensorLayout.NZ
 
     class _FakeStats:
         def per_round(self, metric: str) -> list[float]:
@@ -1322,31 +1324,289 @@ def test_bench_metrics_and_variant_matching_fixes():
     assert summary["auto_layout"]["device_us_median"] is None
     assert summary["auto_layout"]["writeback_issues"] == ["incompatible helper signature"]
 
-    # Item 5: paired collinear within-case measurements (x_store = 2 * x_load) must keep fallback params.
-    set_backend_type(BackendType.Ascend910)
-    col_model = LayoutCostModel(expected_uses=100, backend_type=BackendType.Ascend910)
+    # Item 5: paired collinear within-case measurements (x_store = 2 * x_load) with estimable clock.
+    col_model = LayoutCostModel(
+        expected_uses=1,
+        backend_type=BackendType.Ascend910,
+        mte2_nd2nz_bytes_per_cycle=77.0,
+        mte2_nd2nz_contiguous_bytes_per_cycle=77.0,
+    )
     col_meas: list[CalibrationMeasurement] = []
-    for s_idx, (m_dim, k_dim, n_dim) in enumerate([(64, 128, 64), (64, 256, 64), (128, 128, 128)]):
-        case = auto_layout_bench.build_single_matmul_case(m_dim, k_dim, n_dim, expected_uses=100, seed=s_idx)
-        c_inst = extract_layout_instance(run_pre_layout_passes(case.program), cost_model=col_model)
-        # Keep only paired all-ND and all-NZ variants where load/store diffs are collinear.
-        for v_idx, c_bd in enumerate(enumerate_assignments(c_inst, deduplicate=True)):
-            lays = set(c_bd.assignment.tensor_layouts.values())
-            if len(lays) != 1:
-                continue
+    for c_idx, comp_cyc in enumerate([100.0, 200.0, 300.0]):
+        x_val = LayoutValueNode(
+            name="x",
+            shape=(16, 16),
+            dtype=DataType.FP16,
+            memory_space=ir.MemorySpace.DDR,
+            current_layout=nd,
+            admissible_layouts=(nd, nz),
+            producer_op_id=None,
+        )
+        tx_val = LayoutValueNode(
+            name="tx",
+            shape=(16, 16),
+            dtype=DataType.FP16,
+            memory_space=ir.MemorySpace.Mat,
+            current_layout=ROW_MAJOR_FLAT,
+            admissible_layouts=(ROW_MAJOR_FLAT,),
+            producer_op_id="ld",
+        )
+        tacc_val = LayoutValueNode(
+            name="ta",
+            shape=(16, 16),
+            dtype=DataType.FP32,
+            memory_space=ir.MemorySpace.Acc,
+            current_layout=ROW_MAJOR_FLAT,
+            admissible_layouts=(ROW_MAJOR_FLAT,),
+            producer_op_id="mm",
+        )
+        y_val = LayoutValueNode(
+            name="y",
+            shape=(16, 16),
+            dtype=DataType.FP32,
+            memory_space=ir.MemorySpace.DDR,
+            current_layout=nd,
+            admissible_layouts=(nd, nz),
+            producer_op_id="st",
+            is_external_output=True,
+        )
+        ld_op = LayoutOperationNode(
+            op_id="ld",
+            op_name="tile.load",
+            inputs=("x",),
+            output="tx",
+            configs=(
+                OperatorConfig(
+                    "ld",
+                    "tile.load",
+                    (nd,),
+                    ROW_MAJOR_FLAT,
+                    col_model.estimate_load_cost(x_val, tx_val, nd, ROW_MAJOR_FLAT),
+                ),
+                OperatorConfig(
+                    "ld",
+                    "tile.load",
+                    (nz,),
+                    ROW_MAJOR_FLAT,
+                    col_model.estimate_load_cost(x_val, tx_val, nz, ROW_MAJOR_FLAT),
+                ),
+            ),
+        )
+        mm_op = LayoutOperationNode(
+            op_id="mm",
+            op_name="compute",
+            inputs=("tx",),
+            output="ta",
+            configs=(OperatorConfig("mm", "compute", (ROW_MAJOR_FLAT,), ROW_MAJOR_FLAT, comp_cyc),),
+        )
+        st_op = LayoutOperationNode(
+            op_id="st",
+            op_name="tile.store",
+            inputs=("ta",),
+            output="y",
+            configs=(
+                OperatorConfig(
+                    "st",
+                    "tile.store",
+                    (ROW_MAJOR_FLAT,),
+                    nd,
+                    col_model.estimate_store_cost(tacc_val, y_val, nd),
+                ),
+                OperatorConfig(
+                    "st",
+                    "tile.store",
+                    (ROW_MAJOR_FLAT,),
+                    nz,
+                    col_model.estimate_store_cost(tacc_val, y_val, nz),
+                ),
+            ),
+        )
+        c_inst = LayoutProblemInstance(
+            values={"x": x_val, "tx": tx_val, "ta": tacc_val, "y": y_val},
+            operations=[ld_op, mm_op, st_op],
+            cost_model=col_model,
+        )
+        for v_idx, gm_l in enumerate([nd, nz]):
+            bd = evaluate_assignment(
+                c_inst,
+                LayoutAssignment(
+                    value_layouts={"x": gm_l, "tx": ROW_MAJOR_FLAT, "ta": ROW_MAJOR_FLAT, "y": gm_l},
+                    op_configs={
+                        "ld": ld_op.configs[v_idx],
+                        "mm": mm_op.configs[0],
+                        "st": st_op.configs[v_idx],
+                    },
+                ),
+            )
+            stub_m = CalibrationMeasurement(f"col_{c_idx}/v_{v_idx}", 0.0, c_inst, bd)
+            cyc = _calibration_prediction_cycles(col_model, stub_m)
             col_meas.append(
                 CalibrationMeasurement(
-                    variant_id=f"col_{s_idx}_{v_idx}",
-                    measured_us=10.0 + (c_bd.total_cost_cycles / 100.0) / (1.8 * 1000.0),
+                    variant_id=f"col_{c_idx}/v_{v_idx}",
+                    measured_us=10.0 + cyc / 1800.0,
                     instance=c_inst,
-                    breakdown=c_bd,
+                    breakdown=bd,
                 )
             )
     col_rep = fit_cost_model_from_measurements(col_meas, col_model)
+    assert col_rep.effective_freq_fallback is False
+    assert col_rep.param_t_stats["fixpipe_acc_to_nd_bytes_per_cycle"] == 0.0
     assert "fixpipe_acc_to_nd_bytes_per_cycle" in col_rep.fallback_params
     assert col_rep.fitted_model.fixpipe_acc_to_nd_bytes_per_cycle == pytest.approx(
         col_model.fixpipe_acc_to_nd_bytes_per_cycle
     )
+
+    # Singleton cases must not inflate within-case residual degrees of freedom.
+    sing_meas: list[CalibrationMeasurement] = []
+    for c_idx, comp_cyc in enumerate([100.0, 200.0, 300.0, 400.0, 500.0]):
+        ta_v = LayoutValueNode(
+            name="ta",
+            shape=(64, 16),
+            dtype=DataType.FP32,
+            memory_space=ir.MemorySpace.Acc,
+            current_layout=ROW_MAJOR_FLAT,
+            admissible_layouts=(ROW_MAJOR_FLAT,),
+            producer_op_id="mm",
+        )
+        y_v = LayoutValueNode(
+            name="y",
+            shape=(64, 16),
+            dtype=DataType.FP32,
+            memory_space=ir.MemorySpace.DDR,
+            current_layout=nd,
+            admissible_layouts=(nd, nz),
+            producer_op_id="st",
+            is_external_output=True,
+        )
+        mm_s = LayoutOperationNode(
+            op_id="mm",
+            op_name="compute",
+            inputs=(),
+            output="ta",
+            configs=(OperatorConfig("mm", "compute", (), ROW_MAJOR_FLAT, comp_cyc),),
+        )
+        st_s = LayoutOperationNode(
+            op_id="st",
+            op_name="tile.store",
+            inputs=("ta",),
+            output="y",
+            configs=(
+                OperatorConfig(
+                    "st",
+                    "tile.store",
+                    (ROW_MAJOR_FLAT,),
+                    nd,
+                    col_model.estimate_store_cost(ta_v, y_v, nd),
+                ),
+                OperatorConfig(
+                    "st",
+                    "tile.store",
+                    (ROW_MAJOR_FLAT,),
+                    nz,
+                    col_model.estimate_store_cost(ta_v, y_v, nz),
+                ),
+            ),
+        )
+        s_inst = LayoutProblemInstance(
+            values={"ta": ta_v, "y": y_v}, operations=[mm_s, st_s], cost_model=col_model
+        )
+        variants = [(0, nd), (1, nz)] if c_idx == 0 else [(1, nz)]
+        for cfg_i, gm_l in variants:
+            bd = evaluate_assignment(
+                s_inst,
+                LayoutAssignment(
+                    value_layouts={"ta": ROW_MAJOR_FLAT, "y": gm_l},
+                    op_configs={"mm": mm_s.configs[0], "st": st_s.configs[cfg_i]},
+                ),
+            )
+            stub_s = CalibrationMeasurement(f"s_{c_idx}/v_{cfg_i}", 0.0, s_inst, bd)
+            cyc_s = _calibration_prediction_cycles(col_model, stub_s)
+            perturb = 0.01 if (c_idx == 0 and gm_l == nd) else 0.0
+            sing_meas.append(
+                CalibrationMeasurement(
+                    variant_id=f"s_{c_idx}/v_{cfg_i}",
+                    measured_us=100.0 + cyc_s / 1800.0 + perturb,
+                    instance=s_inst,
+                    breakdown=bd,
+                )
+            )
+    sing_rep = fit_cost_model_from_measurements(sing_meas, col_model)
+    assert sing_rep.param_t_stats["fixpipe_acc_to_nd_bytes_per_cycle"] == 0.0
+    assert "fixpipe_acc_to_nd_bytes_per_cycle" in sing_rep.fallback_params
+    assert sing_rep.fitted_model.fixpipe_acc_to_nd_bytes_per_cycle == pytest.approx(
+        col_model.fixpipe_acc_to_nd_bytes_per_cycle
+    )
+
+    # Device-sweep fixes:
+    # 1) _sync_call_return_type preserves caller dynamic DimExpr shapes on TupleType while updating layout.
+    from pypto.ir.auto_layout import _LayoutAssignmentWriter  # noqa: PLC0415
+
+    span = ir.Span.unknown()
+    c16 = ir.ConstInt(16, DataType.INDEX, span)
+    caller_dim = ir.Var("caller_t", ir.ScalarType(DataType.INDEX), span)
+    callee_dim = ir.Var("callee_t", ir.ScalarType(DataType.INDEX), span)
+    nd_view = ir.TensorView([], ir.TensorLayout.ND)
+    nz_view = ir.TensorView([], ir.TensorLayout.NZ)
+    caller_t = ir.TensorType([caller_dim, c16], DataType.FP32, None, nd_view)
+    callee_t = ir.TensorType([callee_dim, c16], DataType.FP32, None, nz_view)
+    call_tuple = ir.TupleType([caller_t, ir.ScalarType(DataType.INT64)])
+    synced_tuple = _LayoutAssignmentWriter._sync_call_return_type(call_tuple, [callee_t])
+    assert isinstance(synced_tuple, ir.TupleType)
+    synced_elem0 = synced_tuple.types[0]
+    assert isinstance(synced_elem0, ir.TensorType)
+    assert synced_elem0.tensor_view is not None and synced_elem0.tensor_view.layout == ir.TensorLayout.NZ
+    assert synced_elem0.shape[0].same_as(caller_dim)
+
+    # 2) Pre-blocked rank-5 NZ GM weight keeps admissible_layouts == (NZ,) so it is never demoted to ND.
+    empty_body = ir.SeqStmts([], span)
+    wo_a_rank5_nz = ir.Var(
+        "wo_a",
+        ir.TensorType([1, 16, 8, 16, 16], DataType.FP16, None, nz_view),
+        span,
+    )
+    fn_rank5 = ir.Function(
+        "incore_rank5",
+        [wo_a_rank5_nz],
+        [],
+        empty_body,
+        span,
+        type=ir.FunctionType.AIC,
+        level=ir.Level.AIC,
+    )
+    mod_rank5 = ir.Program([fn_rank5], "mod_rank5", span)
+    inst_rank5 = extract_layout_instance(mod_rank5)
+    assert inst_rank5.values["wo_a"].admissible_layouts == (nz,)
+
+    # 3) L3 HOST orchestrator functions keep logical ND parameter layouts when AutoLayout writes back NZ.
+    w_host = ir.Var("wq_a", ir.TensorType([2, 64, 64], DataType.FP16, None, nd_view), span)
+    fn_host = ir.Function(
+        "l3_host",
+        [w_host],
+        [],
+        empty_body,
+        span,
+        level=ir.Level.HOST,
+    )
+    w_chip = ir.Var("wq_a", ir.TensorType([64, 64], DataType.FP16, None, nd_view), span)
+    fn_chip = ir.Function(
+        "l2_chip",
+        [w_chip],
+        [],
+        empty_body,
+        span,
+        type=ir.FunctionType.Orchestration,
+        level=ir.Level.CHIP,
+    )
+    mod_dist = ir.Program([fn_host, fn_chip], "mod_dist", span)
+    assign_dist = LayoutAssignment(value_layouts={"wq_a": nz}, op_configs={})
+    rewritten_dist = apply_layout_assignment(mod_dist, assign_dist)
+    fns_by_name = {fn.name: fn for fn in rewritten_dist.functions.values()}
+    host_param_t = fns_by_name["l3_host"].params[0].type
+    chip_param_t = fns_by_name["l2_chip"].params[0].type
+    from pypto.ir.auto_layout import _tensor_type_layout  # noqa: PLC0415
+
+    assert isinstance(host_param_t, ir.TensorType) and _tensor_type_layout(host_param_t) == ir.TensorLayout.ND
+    assert isinstance(chip_param_t, ir.TensorType) and _tensor_type_layout(chip_param_t) == ir.TensorLayout.NZ
 
 
 if __name__ == "__main__":
