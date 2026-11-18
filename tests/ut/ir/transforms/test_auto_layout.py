@@ -37,9 +37,12 @@ from pypto import DataType, ir
 from pypto.backend import BackendType, reset_for_testing, set_backend_type
 from pypto.ir import auto_layout, auto_layout_bench
 from pypto.ir.auto_layout import (
+    COL_MAJOR_FLAT,
     FRACTAL_ACC_NZ,
     FRACTAL_NZ,
     FRACTAL_ZN,
+    ROW_BCAST_FLAT,
+    ROW_MAJOR_FLAT,
     CalibrationMeasurement,
     CostBreakdown,
     LayoutAssignment,
@@ -58,9 +61,11 @@ from pypto.ir.auto_layout import (
     fit_cost_model_from_measurements,
     is_nz_compatible_shape,
     make_auto_layout_pass,
+    pack_dn,
     pack_nz,
     run_post_layout_passes,
     run_pre_layout_passes,
+    unpack_dn,
     unpack_nz,
 )
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
@@ -1798,6 +1803,665 @@ def test_device_sweep_l3_host_tuple_sync_and_rank5_reshape_fixes():
         cost_model=cm,
     )
     assert _calibration_op_cost(cm, red_inst, red_op, red_cfg) == pytest.approx(8192.0 / 128.0)
+
+
+def _run_resolve_layouts_pass(prog: ir.Program) -> ir.Program:
+    pipe = passes.PassPipeline()
+    pipe.add_pass(passes.resolve_backend_op_layouts())
+    return pipe.run(prog)
+
+
+def test_pack_unpack_dn_roundtrip():
+    """Verify pack_dn / unpack_dn preserve 2D and 3D logical tensors and reject invalid ranks."""
+    t2 = torch.arange(24, dtype=torch.float16).reshape(4, 6)
+    p2 = pack_dn(t2)
+    assert p2.shape == (4, 6)
+    assert p2.is_contiguous()
+    assert torch.equal(unpack_dn(p2), t2)
+
+    t3 = torch.arange(48, dtype=torch.float32).reshape(2, 4, 6)
+    p3 = pack_dn(t3)
+    assert p3.shape == (2, 4, 6)
+    assert p3.is_contiguous()
+    assert torch.equal(unpack_dn(p3), t3)
+
+    with pytest.raises(ValueError, match="rank >= 2"):
+        pack_dn(torch.zeros((4,)))
+    with pytest.raises(ValueError, match="rank >= 2"):
+        unpack_dn(torch.zeros((4,)))
+
+
+def test_direction_a_reduction_elementwise_broadcast_writeback_and_pto():
+    """Direction A: eliminate [M, 1] <-> [1, M] ping-pong and share ROW_BCAST_FLAT across consumers."""
+    from pypto.ir.auto_layout_solver import solve_auto_layout  # noqa: PLC0415
+
+    set_backend_type(BackendType.Ascend910)
+
+    @pl.jit
+    def vec_softmax_style(
+        x: pl.Tensor[[32, 32], pl.FP32],
+        q0: pl.Tensor[[32, 32], pl.FP32],
+        q1: pl.Tensor[[32, 32], pl.FP32],
+        q2: pl.Tensor[[32, 32], pl.FP32],
+        out0: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+        out1: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+        out2: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+    ) -> pl.Tuple[
+        pl.Tensor[[32, 32], pl.FP32],
+        pl.Tensor[[32, 32], pl.FP32],
+        pl.Tensor[[32, 32], pl.FP32],
+    ]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="vec_softmax"):
+            tx = pl.load(x, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            tq0 = pl.load(q0, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            tq1 = pl.load(q1, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            tq2 = pl.load(q2, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            tmp = pl.tile.create([32, 32], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+            rsum = pl.tile.row_sum(tx, tmp)
+            # Chain of row-major scalar ops on [32, 1]: would ping-pong without Direction A.
+            scaled = pl.tile.muls(rsum, 0.5)
+            shifted = pl.tile.adds(scaled, 1.0)
+            y0 = pl.tile.row_expand_add(tq0, shifted)
+            y1 = pl.tile.row_expand_add(tq1, shifted)
+            y2 = pl.tile.row_expand_add(tq2, shifted)
+            out0 = pl.store(y0, [0, 0], out0)
+            out1 = pl.store(y1, [0, 0], out1)
+            out2 = pl.store(y2, [0, 0], out2)
+        return out0, out1, out2
+
+    stub = torch.zeros((32, 32), dtype=torch.float32)
+    prog = vec_softmax_style.specialize(stub, stub, stub, stub, stub, stub, stub)
+    with passes.PassContext(
+        [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+    ):
+        pre = run_pre_layout_passes(prog)
+        inst = extract_layout_instance(pre, cost_model=LayoutCostModel(backend_type=BackendType.Ascend910))
+
+        # Both [32, 1] nodes should expose COL_MAJOR_FLAT, ROW_MAJOR_FLAT, and ROW_BCAST_FLAT.
+        shifted_node = next(v for k, v in inst.values.items() if k.endswith("shifted"))
+        assert COL_MAJOR_FLAT in shifted_node.admissible_layouts
+        assert ROW_MAJOR_FLAT in shifted_node.admissible_layouts
+        assert ROW_BCAST_FLAT in shifted_node.admissible_layouts
+
+        res = solve_auto_layout(inst)
+        assert res.writeback_issues == ()
+        # All 3 row_expand_add consumers should share ROW_BCAST_FLAT to amortize vbrcb.
+        re_adds = [op for op in inst.operations if op.op_name == "tile.row_expand_add"]
+        assert len(re_adds) == 3
+        for op in re_adds:
+            assert res.assignment.op_configs[op.op_id].input_layouts[1] == ROW_BCAST_FLAT
+
+        rewritten = apply_layout_assignment(pre, res.writeback_assignment())
+        ir_text = str(rewritten)
+        # Only 2 reshapes total: one entry ([32, 1] -> [1, 32]) + one exit ([1, 32] -> [32, 1]),
+        # plus one shared tile.row_expand instead of 3 per-consumer vbrcb broadcasts.
+        assert ir_text.count("tile.reshape") == 2
+        assert ir_text.count("tile.row_expand(") == 1
+
+        # ResolveBackendOpLayouts must be a no-op after AutoLayout writeback.
+        after_p24 = _run_resolve_layouts_pass(rewritten)
+        ir.assert_structural_equal(after_p24, rewritten)
+
+        lowered = run_post_layout_passes(rewritten)
+        pto_text = _emit_pto_from_lowered(lowered)
+        assert "pto.trowexpand" in pto_text
+
+    # Single consumer (K=1): stays COL_MAJOR_FLAT without materializing ROW_BCAST_FLAT.
+    @pl.jit
+    def vec_single_row_expand(
+        x: pl.Tensor[[32, 32], pl.FP32],
+        q0: pl.Tensor[[32, 32], pl.FP32],
+        out0: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+    ) -> pl.Tensor[[32, 32], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="vec_k1"):
+            tx = pl.load(x, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            tq0 = pl.load(q0, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            tmp = pl.tile.create([32, 32], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+            rsum = pl.tile.row_sum(tx, tmp)
+            y0 = pl.tile.row_expand_add(tq0, rsum)
+            out0 = pl.store(y0, [0, 0], out0)
+        return out0
+
+    k1_prog = vec_single_row_expand.specialize(stub, stub, stub)
+    with passes.PassContext(
+        [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+    ):
+        k1_pre = run_pre_layout_passes(k1_prog)
+        k1_inst = extract_layout_instance(
+            k1_pre, cost_model=LayoutCostModel(backend_type=BackendType.Ascend910)
+        )
+        k1_res = solve_auto_layout(k1_inst)
+        assert k1_res.writeback_issues == ()
+        k1_re = next(op for op in k1_inst.operations if op.op_name == "tile.row_expand_add")
+        assert k1_res.assignment.op_configs[k1_re.op_id].input_layouts[1] == COL_MAJOR_FLAT
+        k1_rewritten = apply_layout_assignment(k1_pre, k1_res.writeback_assignment())
+        assert "tile.row_expand(" not in str(k1_rewritten)
+        ir.assert_structural_equal(_run_resolve_layouts_pass(k1_rewritten), k1_rewritten)
+
+    # User-authored tile.reshape(rsum, [1, 32]) keeps exactly 1 reshape + col_sum/col_expand_add chain.
+    @pl.jit
+    def vec_user_reshape_and_col_chain(
+        x: pl.Tensor[[32, 32], pl.FP32],
+        q0: pl.Tensor[[32, 32], pl.FP32],
+        out_vec: pl.Out[pl.Tensor[[32, 1], pl.FP32]],
+        out_col: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+    ) -> pl.Tuple[pl.Tensor[[32, 1], pl.FP32], pl.Tensor[[32, 32], pl.FP32]]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="vec_user_rm"):
+            tx = pl.load(x, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            tq0 = pl.load(q0, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            tmp_r = pl.tile.create([32, 32], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+            rsum = pl.tile.row_sum(tx, tmp_r)
+            r_rm = pl.tile.reshape(rsum, [1, 32])
+            r_scaled = pl.tile.muls(r_rm, 0.5)
+            r_back = pl.tile.reshape(r_scaled, [32, 1])
+            out_vec = pl.store(r_back, [0, 0], out_vec)
+            tmp_c = pl.tile.create([32, 32], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+            csum = pl.tile.col_sum(tx, tmp_c)
+            y_col = pl.tile.col_expand_add(tq0, csum)
+            out_col = pl.store(y_col, [0, 0], out_col)
+        return out_vec, out_col
+
+    vec_out_stub = torch.zeros((32, 1), dtype=torch.float32)
+    ur_prog = vec_user_reshape_and_col_chain.specialize(stub, stub, vec_out_stub, stub)
+    with passes.PassContext(
+        [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+    ):
+        ur_pre = run_pre_layout_passes(ur_prog)
+        ur_inst = extract_layout_instance(
+            ur_pre, cost_model=LayoutCostModel(backend_type=BackendType.Ascend910)
+        )
+        ur_res = solve_auto_layout(ur_inst)
+        assert ur_res.writeback_issues == ()
+        assert ur_res.breakdown.conversion_cost_cycles == pytest.approx(0.0)
+        ur_rewritten = apply_layout_assignment(ur_pre, ur_res.writeback_assignment())
+        assert str(ur_rewritten).count("tile.reshape") == 2
+        ir.assert_structural_equal(_run_resolve_layouts_pass(ur_rewritten), ur_rewritten)
+        _emit_pto_from_lowered(run_post_layout_passes(ur_rewritten))
+
+
+def test_direction_b_dn_gm_and_col_major_vec_writeback_and_pto():
+    """Direction B: DN GM + COL_MAJOR_FLAT Vec load/store beats strided ND MTE2/MTE3 and lowers cleanly."""
+    from pypto.ir.auto_layout_solver import solve_auto_layout  # noqa: PLC0415
+
+    set_backend_type(BackendType.Ascend910)
+
+    @pl.program
+    class _DnVecProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def vec_copy(
+            self,
+            x: pl.Tensor[[64, 128], pl.FP32],
+            out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+        ) -> pl.Tensor[[64, 128], pl.FP32]:
+            for j in pl.range(0, 8, 1):
+                tx = pl.load(x, [0, j * 16], [64, 16], target_memory=pl.Mem.Vec)
+                out = pl.store(tx, [0, j * 16], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def vec_consume(
+            self,
+            mid: pl.Tensor[[64, 128], pl.FP32],
+            y: pl.Out[pl.Tensor[[64, 16], pl.FP32]],
+        ) -> pl.Tensor[[64, 16], pl.FP32]:
+            tm = pl.load(mid, [0, 0], [64, 16], target_memory=pl.Mem.Vec)
+            ts = pl.tile.muls(tm, 2.0)
+            y = pl.store(ts, [0, 0], y)
+            return y
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def entry(
+            self,
+            x: pl.Tensor[[64, 128], pl.FP32],
+            y: pl.Out[pl.Tensor[[64, 16], pl.FP32]],
+        ) -> pl.Tensor[[64, 16], pl.FP32]:
+            with pl.manual_scope():
+                mid = pl.tensor.create([64, 128], dtype=pl.FP32)
+                mid, t0 = pl.submit(self.vec_copy, x, mid)
+                y, _t1 = pl.submit(self.vec_consume, mid, y, deps=[t0])
+            return y
+
+    cm = LayoutCostModel(
+        expected_uses=100,
+        backend_type=BackendType.Ascend910,
+        allow_external_input_relayout=True,
+    )
+    with passes.PassContext(
+        [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+    ):
+        pre = run_pre_layout_passes(_DnVecProgram)
+        inst = extract_layout_instance(pre, cost_model=cm, reusable_tensors={"x"})
+        assert ir.TensorLayout.DN in inst.values["x"].admissible_layouts
+        assert ir.TensorLayout.DN in inst.values["mid"].admissible_layouts
+
+        res = solve_auto_layout(inst)
+        assert res.writeback_issues == ()
+        # Reading/writing [64, 16] columns out of [64, 128] is contiguous under DN+COL_MAJOR_FLAT.
+        assert res.assignment.tensor_layouts["x"] == ir.TensorLayout.DN
+        assert res.assignment.tensor_layouts["mid"] == ir.TensorLayout.DN
+        assert res.assignment.tile_layouts["vec_copy.tx"] == COL_MAJOR_FLAT
+        assert res.assignment.tile_layouts["vec_consume.tm"] == COL_MAJOR_FLAT
+        assert res.assignment.tile_layouts["vec_consume.ts"] == ROW_MAJOR_FLAT
+
+        rewritten = apply_layout_assignment(pre, res.writeback_assignment())
+        ir_text = str(rewritten)
+        assert "DN" in ir_text
+        assert "col_major" in ir_text
+        assert "tile.move" in ir_text
+
+        after_p24 = _run_resolve_layouts_pass(rewritten)
+        ir.assert_structural_equal(after_p24, rewritten)
+
+        lowered = run_post_layout_passes(rewritten)
+        pto_text = _emit_pto_from_lowered(lowered)
+        assert "pto.tload" in pto_text
+        assert "pto.tstore" in pto_text
+        assert "pto.tmov" in pto_text
+
+    # Wide row slice [8, 128] out of [64, 128] is contiguous under ND and chooses ND + ROW_MAJOR_FLAT.
+    @pl.jit
+    def wide_row_slice_vec(
+        x: pl.Tensor[[64, 128], pl.FP32],
+        out: pl.Out[pl.Tensor[[8, 128], pl.FP32]],
+    ) -> pl.Tensor[[8, 128], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="wide_row_slice"):
+            tx = pl.load(x, [0, 0], [8, 128], target_memory=pl.Mem.Vec)
+            ts = pl.tile.muls(tx, 2.0)
+            out = pl.store(ts, [0, 0], out)
+        return out
+
+    wide_prog = wide_row_slice_vec.specialize(
+        torch.zeros((64, 128), dtype=torch.float32),
+        torch.zeros((8, 128), dtype=torch.float32),
+    )
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
+        wide_pre = run_pre_layout_passes(wide_prog)
+        wide_inst = extract_layout_instance(wide_pre, cost_model=cm, reusable_tensors={"x"})
+        wide_res = solve_auto_layout(wide_inst)
+        assert wide_res.writeback_issues == ()
+        assert wide_res.assignment.tensor_layouts["x"] == ir.TensorLayout.ND
+        assert wide_res.assignment.tile_layouts["tx"] == ROW_MAJOR_FLAT
+
+    # (i) Implicit col_major on [32, 1] load + muls + store keeps ResolveBackendOpLayouts a no-op.
+    @pl.jit
+    def col_vec_muls_store(
+        x: pl.Tensor[[32, 1], pl.FP32],
+        out: pl.Out[pl.Tensor[[32, 1], pl.FP32]],
+    ) -> pl.Tensor[[32, 1], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="col_vec_muls"):
+            vx = pl.load(x, [0, 0], [32, 1], target_memory=pl.Mem.Vec)
+            vs = pl.tile.muls(vx, 2.0)
+            out = pl.store(vs, [0, 0], out)
+        return out
+
+    col_vec_stub = torch.zeros((32, 1), dtype=torch.float32)
+    col_prog = col_vec_muls_store.specialize(col_vec_stub, col_vec_stub)
+    with passes.PassContext(
+        [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+    ):
+        col_pre = run_pre_layout_passes(col_prog)
+        col_inst = extract_layout_instance(
+            col_pre, cost_model=LayoutCostModel(backend_type=BackendType.Ascend910)
+        )
+        assert col_inst.values["vx"].current_layout == COL_MAJOR_FLAT
+        col_res = solve_auto_layout(col_inst)
+        assert col_res.writeback_issues == ()
+        col_rw = apply_layout_assignment(col_pre, col_res.writeback_assignment())
+        ir.assert_structural_equal(_run_resolve_layouts_pass(col_rw), col_rw)
+
+    # (ii) [1, 32] row-vector load + muls + store on [16, 32] never reshapes to col_major [32, 1].
+    @pl.jit
+    def row_vec_muls_store(
+        x: pl.Tensor[[16, 32], pl.FP32],
+        out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+    ) -> pl.Tensor[[16, 32], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="row_vec_muls"):
+            tx = pl.load(x, [0, 0], [1, 32], target_memory=pl.Mem.Vec)
+            ts = pl.tile.muls(tx, 2.0)
+            out = pl.store(ts, [0, 0], out)
+        return out
+
+    row_mat_stub = torch.zeros((16, 32), dtype=torch.float32)
+    row_prog = row_vec_muls_store.specialize(row_mat_stub, row_mat_stub)
+    with passes.PassContext(
+        [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+    ):
+        row_pre = run_pre_layout_passes(row_prog)
+        row_inst = extract_layout_instance(
+            row_pre,
+            cost_model=LayoutCostModel(
+                backend_type=BackendType.Ascend910, allow_external_input_relayout=True
+            ),
+            reusable_tensors={"x"},
+        )
+        assert ir.TensorLayout.DN not in row_inst.values["x"].admissible_layouts
+        assert ir.TensorLayout.DN not in row_inst.values["out"].admissible_layouts
+        variants = enumerate_assignments(row_inst)
+        assert len(variants) >= 1
+        for bd in variants:
+            rw = apply_layout_assignment(row_pre, bd.assignment)
+            ir.assert_structural_equal(_run_resolve_layouts_pass(rw), rw)
+            run_post_layout_passes(rw)
+
+
+def test_direction_c_fractal_nz_vec_pointwise_between_cube_matmuls_and_pto():
+    """Direction C: Pointwise Mem.Vec ops stay FRACTAL_NZ between Cube Mat/Acc boundaries."""
+    from pypto.ir.auto_layout_solver import solve_auto_layout  # noqa: PLC0415
+
+    set_backend_type(BackendType.Ascend910)
+
+    @pl.program
+    class _CubeVecCubeProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def mm_prod(
+            self,
+            a: pl.Tensor[[64, 64], pl.FP16],
+            b: pl.Tensor[[64, 64], pl.FP16],
+            mid_fp32: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+        ) -> pl.Tensor[[64, 128], pl.FP32]:
+            for _i in pl.range(0, 32, 1):
+                ta = pl.load(a, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
+                tb = pl.load(b, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
+                mid_fp32 = pl.store(pl.matmul(ta, tb), [0, 0], mid_fp32)
+            return mid_fp32
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def vec_nz_fp16(
+            self,
+            x: pl.Tensor[[64, 128], pl.FP16],
+            scale: pl.Scalar[pl.FP16],
+            out_fp16: pl.Out[pl.Tensor[[64, 128], pl.FP16]],
+        ) -> pl.Tensor[[64, 128], pl.FP16]:
+            tx = pl.load(x, [0, 0], [64, 64], target_memory=pl.Mem.Vec)
+            tzero = pl.tile.full([64, 64], pl.FP16, 0.0)
+            texp = pl.tile.adds(tzero, scale)
+            tact = pl.tile.relu(tx)
+            tout16 = pl.tile.add(tact, texp)
+            out_fp16 = pl.store(tout16, [0, 0], out_fp16)
+            return out_fp16
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def vec_nz_fp32(
+            self,
+            mid_in: pl.Tensor[[64, 128], pl.FP32],
+            out_fp32: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+        ) -> pl.Tensor[[64, 128], pl.FP32]:
+            for _i in pl.range(0, 32, 1):
+                tm = pl.load(mid_in, [0, 0], [64, 64], target_memory=pl.Mem.Vec)
+                tm_cast = pl.tile.cast(tm, pl.INT32)
+                tm_back = pl.tile.cast(tm_cast, pl.FP32)
+                tm_scaled = pl.tile.muls(tm_back, 0.5)
+                out_fp32 = pl.store(tm_scaled, [0, 0], out_fp32)
+            return out_fp32
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def mm_cons(
+            self,
+            a: pl.Tensor[[64, 128], pl.FP16],
+            w: pl.Tensor[[64, 64], pl.FP16],
+            y: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+        ) -> pl.Tensor[[64, 64], pl.FP32]:
+            ta = pl.load(a, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
+            tw = pl.load(w, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
+            y = pl.store(pl.matmul(ta, tw), [0, 0], y)
+            return y
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def entry(
+            self,
+            a: pl.Tensor[[64, 64], pl.FP16],
+            b: pl.Tensor[[64, 64], pl.FP16],
+            x: pl.Tensor[[64, 128], pl.FP16],
+            w: pl.Tensor[[64, 64], pl.FP16],
+            scale: pl.Scalar[pl.FP16],
+            out_fp32: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            y: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+        ) -> pl.Tuple[pl.Tensor[[64, 128], pl.FP32], pl.Tensor[[64, 64], pl.FP32]]:
+            with pl.manual_scope():
+                mid = pl.tensor.create([64, 128], dtype=pl.FP32)
+                mid2 = pl.tensor.create([64, 128], dtype=pl.FP16)
+                mid, t0 = pl.submit(self.mm_prod, a, b, mid)
+                out_fp32, t1 = pl.submit(self.vec_nz_fp32, mid, out_fp32, deps=[t0])
+                mid2, t2 = pl.submit(self.vec_nz_fp16, x, scale, mid2)
+                y, _t3 = pl.submit(self.mm_cons, mid2, w, y, deps=[t1, t2])
+            return out_fp32, y
+
+    with passes.PassContext(
+        [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+    ):
+        pre = run_pre_layout_passes(_CubeVecCubeProgram)
+        cm = LayoutCostModel(
+            expected_uses=100,
+            backend_type=BackendType.Ascend910,
+            allow_external_input_relayout=True,
+        )
+        inst = extract_layout_instance(pre, cost_model=cm, reusable_tensors={"a", "b", "x", "w"})
+
+        # All eligible Vec tiles inside vec_nz_fp16 / vec_nz_fp32 must admit FRACTAL_NZ.
+        for key in ("tx", "tzero", "texp", "tact", "tout16"):
+            assert FRACTAL_NZ in inst.values[f"vec_nz_fp16.{key}"].admissible_layouts
+        for key in ("tm", "tm_cast", "tm_back", "tm_scaled"):
+            assert FRACTAL_NZ in inst.values[f"vec_nz_fp32.{key}"].admissible_layouts
+
+        res = solve_auto_layout(inst)
+        assert res.writeback_issues == ()
+        assert res.assignment.tensor_layouts["mid"] == ir.TensorLayout.NZ
+        assert res.assignment.tensor_layouts["mid2"] == ir.TensorLayout.NZ
+        assert res.assignment.tile_layouts["vec_nz_fp32.tm_scaled"] == FRACTAL_NZ
+        assert res.assignment.tile_layouts["vec_nz_fp16.tout16"] == FRACTAL_NZ
+
+        rewritten = apply_layout_assignment(pre, res.writeback_assignment())
+        fns = {fn.name: fn for fn in rewritten.functions.values()}
+        assert "tensor.view" in str(fns["vec_nz_fp16"])
+        assert "tensor.view" in str(fns["vec_nz_fp32"])
+
+        after_p24 = _run_resolve_layouts_pass(rewritten)
+        ir.assert_structural_equal(after_p24, rewritten)
+
+        lowered = run_post_layout_passes(rewritten)
+        pto_text = _emit_pto_from_lowered(lowered)
+        assert "pto.trelu" in pto_text
+        assert "pto.tadd" in pto_text
+        assert "pto.tmuls" in pto_text
+
+    # Expected_uses=1 + allow_external_input_relayout=False: internal mid1, mid2 stay NZ across tiled Vec!
+    @pl.program
+    class _CubeTiledVecCubeProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def mm_prod(
+            self,
+            a: pl.Tensor[[64, 64], pl.FP16],
+            b: pl.Tensor[[64, 64], pl.FP16],
+            mid1: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+        ) -> pl.Tensor[[64, 128], pl.FP32]:
+            for c in pl.range(0, 128, 64):
+                ta = pl.load(a, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
+                tb = pl.load(b, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
+                mid1 = pl.store(pl.matmul(ta, tb), [0, c], mid1)
+            return mid1
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def vec_nz_multi(
+            self,
+            m1: pl.Tensor[[64, 128], pl.FP32],
+            x: pl.Tensor[[64, 64], pl.FP16],
+            out1: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            out2: pl.Out[pl.Tensor[[64, 64], pl.FP16]],
+        ) -> tuple[pl.Tensor[[64, 128], pl.FP32], pl.Tensor[[64, 64], pl.FP16]]:
+            for c in pl.range(0, 128, 32):
+                t1 = pl.load(m1, [0, c], [64, 32], target_memory=pl.Mem.Vec)
+                t1_s = pl.tile.muls(t1, 0.5)
+                out1 = pl.store(t1_s, [0, c], out1)
+            tx = pl.load(x, [0, 0], [64, 64], target_memory=pl.Mem.Vec)
+            tx_r = pl.tile.relu(tx)
+            out2 = pl.store(tx_r, [0, 0], out2)
+            return out1, out2
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def vec_relu_twice(
+            self,
+            m1: pl.Tensor[[64, 128], pl.FP32],
+            m2: pl.Tensor[[64, 128], pl.FP32],
+            out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+        ) -> pl.Tensor[[64, 128], pl.FP32]:
+            for _it in pl.range(0, 32, 1):
+                t1 = pl.load(m1, [0, 0], [64, 32], target_memory=pl.Mem.Vec)
+                t2 = pl.load(m2, [0, 0], [64, 32], target_memory=pl.Mem.Vec)
+                s = pl.tile.add(pl.tile.relu(t1), t2)
+                out = pl.store(s, [0, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def entry(
+            self,
+            a: pl.Tensor[[64, 64], pl.FP16],
+            b: pl.Tensor[[64, 64], pl.FP16],
+            x: pl.Tensor[[64, 64], pl.FP16],
+            y: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+        ) -> pl.Tensor[[64, 128], pl.FP32]:
+            with pl.manual_scope():
+                mid1 = pl.tensor.create([64, 128], dtype=pl.FP32)
+                mid2 = pl.tensor.create([64, 128], dtype=pl.FP32)
+                mid3 = pl.tensor.create([64, 64], dtype=pl.FP16)
+                mid1, t0 = pl.submit(self.mm_prod, a, b, mid1)
+                (mid2, mid3), t1 = pl.submit(self.vec_nz_multi, mid1, x, mid2, mid3, deps=[t0])
+                y, _t2 = pl.submit(self.vec_relu_twice, mid1, mid2, y, deps=[t0, t1])
+            return y
+
+    with passes.PassContext(
+        [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+    ):
+        c_pre = run_pre_layout_passes(_CubeTiledVecCubeProgram)
+        c_cm = LayoutCostModel(
+            expected_uses=1,
+            backend_type=BackendType.Ascend910,
+            allow_external_input_relayout=False,
+        )
+        c_inst = extract_layout_instance(c_pre, cost_model=c_cm)
+        c_res = solve_auto_layout(c_inst)
+        assert c_res.writeback_issues == ()
+        # External a, b, x stay ND; internal Cube->Vec buffers mid1 & mid2 promote to NZ!
+        assert c_res.assignment.tensor_layouts["a"] == ir.TensorLayout.ND
+        assert c_res.assignment.tensor_layouts["x"] == ir.TensorLayout.ND
+        assert c_res.assignment.tensor_layouts["mid1"] == ir.TensorLayout.NZ
+        assert c_res.assignment.tensor_layouts["mid2"] == ir.TensorLayout.NZ
+        c_rewritten = apply_layout_assignment(c_pre, c_res.writeback_assignment())
+        c_fns = {fn.name: fn for fn in c_rewritten.functions.values()}
+        # Multi-output return_types sync: vec_nz_multi returns (mid2=NZ, mid3=ND).
+        ret_types = c_fns["vec_nz_multi"].return_types
+        assert len(ret_types) == 2
+        assert ret_types[0].tensor_view.layout == ir.TensorLayout.NZ
+        assert c_fns["vec_nz_multi"].return_types[1].tensor_view is None
+        ir.assert_structural_equal(_run_resolve_layouts_pass(c_rewritten), c_rewritten)
+        run_post_layout_passes(c_rewritten)
+
+    # Negative gates: row_sum or unaligned [16, 8] FP16 excludes FRACTAL_NZ from the Mem.Vec component.
+    @pl.jit
+    def vec_ineligible_ops(
+        x: pl.Tensor[[16, 8], pl.FP16],
+        y: pl.Tensor[[32, 32], pl.FP16],
+        out_x: pl.Out[pl.Tensor[[16, 8], pl.FP16]],
+        out_y: pl.Out[pl.Tensor[[32, 1], pl.FP16]],
+    ) -> pl.Tuple[pl.Tensor[[16, 8], pl.FP16], pl.Tensor[[32, 1], pl.FP16]]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="vec_neg"):
+            tx = pl.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+            tx1 = pl.tile.relu(tx)
+            out_x = pl.store(tx1, [0, 0], out_x)
+            ty = pl.load(y, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            ty_act = pl.tile.relu(ty)
+            tmp = pl.tile.create([32, 32], dtype=pl.FP16, target_memory=pl.Mem.Vec)
+            ty_sum = pl.tile.row_sum(ty_act, tmp)
+            out_y = pl.store(ty_sum, [0, 0], out_y)
+        return out_x, out_y
+
+    neg_prog = vec_ineligible_ops.specialize(
+        torch.zeros((16, 8), dtype=torch.float16),
+        torch.zeros((32, 32), dtype=torch.float16),
+        torch.zeros((16, 8), dtype=torch.float16),
+        torch.zeros((32, 1), dtype=torch.float16),
+    )
+    neg_pre = run_pre_layout_passes(neg_prog)
+    neg_inst = extract_layout_instance(
+        neg_pre,
+        cost_model=LayoutCostModel(backend_type=BackendType.Ascend910, allow_external_input_relayout=True),
+    )
+    assert FRACTAL_NZ not in neg_inst.values["tx"].admissible_layouts
+    assert FRACTAL_NZ not in neg_inst.values["tx1"].admissible_layouts
+    assert FRACTAL_NZ not in neg_inst.values["ty"].admissible_layouts
+    assert FRACTAL_NZ not in neg_inst.values["ty_act"].admissible_layouts
+
+    # Verify `tile.expands` disqualifies FRACTAL_NZ on Vec tiles and NZ/DN promotion on GM tensors.
+    @pl.jit
+    def vec_expands_nz(
+        x: pl.Tensor[[64, 128], pl.FP16],
+        s: pl.Scalar[pl.FP16],
+        out: pl.Out[pl.Tensor[[64, 128], pl.FP16]],
+    ) -> pl.Tensor[[64, 128], pl.FP16]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="vec_exp_nz"):
+            tx = pl.load(x, [0, 0], [64, 64], target_memory=pl.Mem.Vec)
+            te = pl.tile.expands(tx, s)
+            out = pl.store(te, [0, 0], out)
+        return out
+
+    exp_prog = vec_expands_nz.specialize(
+        torch.zeros((64, 128), dtype=torch.float16),
+        0.0,
+        torch.zeros((64, 128), dtype=torch.float16),
+    )
+    exp_pre = run_pre_layout_passes(exp_prog)
+    exp_inst = extract_layout_instance(
+        exp_pre,
+        cost_model=LayoutCostModel(backend_type=BackendType.Ascend910, allow_external_input_relayout=True),
+        reusable_tensors={"x"},
+    )
+    assert FRACTAL_NZ not in exp_inst.values["te"].admissible_layouts
+    assert ir.TensorLayout.NZ not in exp_inst.values["x"].admissible_layouts
+    assert ir.TensorLayout.DN not in exp_inst.values["x"].admissible_layouts
+
+    # K2 probe: identity tensor.view folded into `xs = x` propagates `_uid_to_name` cleanly.
+    @pl.jit
+    def folded_view_add(
+        x: pl.Tensor[[64, 16], pl.FP16],
+        w: pl.Tensor[[64, 16], pl.FP16],
+        y: pl.Out[pl.Tensor[[64, 16], pl.FP16]],
+    ) -> pl.Tensor[[64, 16], pl.FP16]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="folded_view_add"):
+            xs = pl.tensor.view(x, layout=pl.ND)
+            t1 = pl.load(xs, [0, 0], [64, 16], target_memory=pl.Mem.Vec)
+            tw = pl.load(w, [0, 0], [64, 16], target_memory=pl.Mem.Vec)
+            ts = pl.tile.add(t1, tw)
+            y = pl.store(ts, [0, 0], y)
+        return y
+
+    k2_stub = torch.zeros((64, 16), dtype=torch.float16)
+    k2_prog = folded_view_add.specialize(k2_stub, k2_stub, k2_stub)
+    with passes.PassContext(
+        [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+    ):
+        k2_pre = run_pre_layout_passes(k2_prog)
+        k2_inst = extract_layout_instance(
+            k2_pre,
+            cost_model=LayoutCostModel(
+                backend_type=BackendType.Ascend910, allow_external_input_relayout=True
+            ),
+            reusable_tensors={"x", "w"},
+        )
+        assert "t1" in k2_inst.values
+        k2_variants = enumerate_assignments(k2_inst)
+        assert len(k2_variants) >= 1
+        for bd in k2_variants:
+            k2_rw = apply_layout_assignment(k2_pre, bd.assignment)
+            ir.assert_structural_equal(_run_resolve_layouts_pass(k2_rw), k2_rw)
+            run_post_layout_passes(k2_rw)
 
 
 if __name__ == "__main__":

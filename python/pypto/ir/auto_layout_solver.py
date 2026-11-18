@@ -689,20 +689,29 @@ def _conversion_report(state: _State) -> tuple[tuple[LayoutConversion, ...], tup
         for target in state.counts[name]:
             if target == source:
                 continue
-            consumers = tuple(
-                problem.ops[i].op_id
+            consumer_indices = tuple(
+                i
                 for i in sorted(problem.participants[name])
                 if target in problem.uses[i][state.choices[i]].get(name, {})
             )
+            consumers = tuple(problem.ops[i].op_id for i in consumer_indices)
             boundary_output = not consumers and node.is_external_output and target == node.current_layout
             boundary = external_input or boundary_output
-            conversions.append(
-                LayoutConversion(
-                    name, source, target, problem.conversion_costs[name][source][target], consumers, boundary
-                )
-            )
+            conv_cost = problem.conversion_costs[name][source][target]
+            conversions.append(LayoutConversion(name, source, target, conv_cost, consumers, boundary))
             if not boundary:
-                issues.append(f"Value {name!r} needs an internal conversion {source!r} -> {target!r}")
+                producer_ok = name not in problem.producers or problem.ops[
+                    problem.producers[name]
+                ].op_name.startswith("tile.")
+                consumers_ok = all(problem.ops[i].op_name.startswith("tile.") for i in consumer_indices)
+                realizable_vec = (
+                    node.memory_space == MemorySpace.Vec
+                    and problem.instance.cost_model.supports_vec_tile_conversion(node, source, target)
+                    and producer_ok
+                    and consumers_ok
+                )
+                if not realizable_vec:
+                    issues.append(f"Value {name!r} needs an internal conversion {source!r} -> {target!r}")
     return tuple(conversions), tuple(issues)
 
 

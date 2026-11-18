@@ -20,6 +20,7 @@ from pypto.backend import BackendType, reset_for_testing, set_backend_type
 from pypto.ir import auto_layout_bench
 from pypto.ir.auto_layout import (
     COL_MAJOR_FLAT,
+    ROW_BCAST_FLAT,
     ROW_MAJOR_FLAT,
     CostBreakdown,
     LayoutAssignment,
@@ -962,6 +963,69 @@ def test_review_fixes_alignment_multi_call_omitted_out_and_budget():
         assert site1_mid.blayout.name in str(func_by_str["mm_incore_site2"])
         sub_lowered = run_post_layout_passes(sub_rewritten)
         assert len(sub_lowered.functions) >= 4
+
+
+def test_unified_abc_solver_dedup_and_pass_pipeline():
+    """Verify exact/DP equivalence on ROW_BCAST_FLAT + ROW_MAJOR_FLAT dedup and Pass integration."""
+    import torch  # noqa: PLC0415
+
+    set_backend_type(BackendType.Ascend910)
+
+    @pl.jit
+    def mixed_consumer_kernel(
+        x: pl.Tensor[[32, 32], pl.FP32],
+        q0: pl.Tensor[[32, 32], pl.FP32],
+        q1: pl.Tensor[[32, 32], pl.FP32],
+        out0: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+        out1: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+        out_vec: pl.Out[pl.Tensor[[32, 1], pl.FP32]],
+    ) -> pl.Tuple[
+        pl.Tensor[[32, 32], pl.FP32],
+        pl.Tensor[[32, 32], pl.FP32],
+        pl.Tensor[[32, 1], pl.FP32],
+    ]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mixed_dedup"):
+            tx = pl.load(x, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            tq0 = pl.load(q0, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            tq1 = pl.load(q1, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            tmp = pl.tile.create([32, 32], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+            rsum = pl.tile.row_sum(tx, tmp)
+            # Consumer 1: scalar chain (wants ROW_MAJOR_FLAT [1, 32] -> exit [32, 1] store)
+            r_scaled = pl.tile.muls(rsum, 2.0)
+            out_vec = pl.store(r_scaled, [0, 0], out_vec)
+            # Consumers 2 & 3: multi-consumer row_expand_add on rsum itself (ROW_BCAST_FLAT)
+            y0 = pl.tile.row_expand_add(tq0, rsum)
+            y1 = pl.tile.row_expand_add(tq1, rsum)
+            out0 = pl.store(y0, [0, 0], out0)
+            out1 = pl.store(y1, [0, 0], out1)
+        return out0, out1, out_vec
+
+    mat_stub = torch.zeros((32, 32), dtype=torch.float32)
+    vec_stub = torch.zeros((32, 1), dtype=torch.float32)
+    prog = mixed_consumer_kernel.specialize(mat_stub, mat_stub, mat_stub, mat_stub, mat_stub, vec_stub)
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
+        pre = run_pre_layout_passes(prog)
+        inst = extract_layout_instance(pre, cost_model=LayoutCostModel(backend_type=BackendType.Ascend910))
+        exact_all = enumerate_assignments(inst)
+        dp_res = solve_treewidth_dp(inst)
+        auto_res = solve_auto_layout(inst)
+        assert dp_res.writeback_issues == ()
+        assert auto_res.writeback_issues == ()
+        assert dp_res.total_cost_cycles == pytest.approx(exact_all[0].total_cost_cycles)
+        assert auto_res.total_cost_cycles == pytest.approx(exact_all[0].total_cost_cycles)
+        assert any(
+            len(cfg.input_layouts) >= 2 and cfg.input_layouts[1] == ROW_BCAST_FLAT
+            for cfg in auto_res.assignment.op_configs.values()
+        )
+        # Solver pass integrates cleanly into PassPipeline.
+        pipeline = passes.PassPipeline()
+        pipeline.add_pass(make_solver_auto_layout_pass(LayoutCostModel(backend_type=BackendType.Ascend910)))
+        pass_prog = pipeline.run(pre)
+        p24_pipe = passes.PassPipeline()
+        p24_pipe.add_pass(passes.resolve_backend_op_layouts())
+        ir.assert_structural_equal(p24_pipe.run(pass_prog), pass_prog)
+        lowered = run_post_layout_passes(pass_prog)
+        assert len(lowered.functions) >= 1
 
 
 if __name__ == "__main__":

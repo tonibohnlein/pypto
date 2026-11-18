@@ -44,6 +44,7 @@ import itertools
 import json
 import math
 import re
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -162,13 +163,31 @@ def unpack_nz(packed: torch.Tensor) -> torch.Tensor:
     return permuted.contiguous().reshape(packed.shape)
 
 
+def pack_dn(logical: torch.Tensor) -> torch.Tensor:
+    """Pack a logical tensor (`ndim >= 2`) into Ascend DN (column-major trailing plane) byte order."""
+    if logical.ndim < 2:
+        raise ValueError(f"pack_dn expects rank >= 2, got shape {tuple(logical.shape)}")
+    return logical.transpose(-2, -1).contiguous().reshape(logical.shape)
+
+
+def unpack_dn(packed: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`pack_dn`: convert a DN-packed tensor back to logical ND order."""
+    if packed.ndim < 2:
+        raise ValueError(f"unpack_dn expects rank >= 2, got shape {tuple(packed.shape)}")
+    lead: tuple[int, ...] = tuple(int(d) for d in packed.shape[:-2])
+    rows: int = int(packed.shape[-2])
+    cols: int = int(packed.shape[-1])
+    return packed.reshape(*lead, cols, rows).transpose(-2, -1).contiguous()
+
+
 @dataclass(frozen=True)
 class TileLayoutDesc:
-    """On-chip tile layout descriptor `(blayout, slayout, fractal)`.
+    """On-chip tile layout descriptor `(blayout, slayout, fractal[, tag])`.
 
     Common Ascend on-chip layouts:
     - `ROW_MAJOR_FLAT`: `(row_major, none_box, 512)` — UB (`Vec`) row-major
     - `COL_MAJOR_FLAT`: `(col_major, none_box, 512)` — UB (`Vec`) col-major
+    - `ROW_BCAST_FLAT`: `(row_major, none_box, 512, "row_bcast")` — UB (`Vec`) pre-expanded `[M, c0]` carrier
     - `FRACTAL_NZ`: `(col_major, row_major, 512)` — L1 (`Mat`) / L0A (`Left`) NZ
     - `FRACTAL_ZN`: `(row_major, col_major, 512)` — L1 (`Mat`) transposed / L0B (`Right`) ZN
     - `FRACTAL_ACC_NZ`: `(col_major, row_major, 1024)` — L0C (`Acc`) 16x16 accumulator NZ
@@ -177,9 +196,12 @@ class TileLayoutDesc:
     blayout: core_ir.TileLayout
     slayout: core_ir.TileLayout
     fractal: int = 512
+    tag: str = ""
 
     def short_name(self) -> str:
         """Return a concise human-readable layout label."""
+        if self.tag == "row_bcast":
+            return "flat_row_bcast"
         if self.slayout == core_ir.TileLayout.none_box:
             return f"flat_{self.blayout.name}"
         if self.fractal == 1024 and self.blayout == core_ir.TileLayout.col_major:
@@ -201,6 +223,7 @@ class TileLayoutDesc:
 
 ROW_MAJOR_FLAT = TileLayoutDesc(core_ir.TileLayout.row_major, core_ir.TileLayout.none_box, 512)
 COL_MAJOR_FLAT = TileLayoutDesc(core_ir.TileLayout.col_major, core_ir.TileLayout.none_box, 512)
+ROW_BCAST_FLAT = TileLayoutDesc(core_ir.TileLayout.row_major, core_ir.TileLayout.none_box, 512, "row_bcast")
 FRACTAL_NZ = TileLayoutDesc(core_ir.TileLayout.col_major, core_ir.TileLayout.row_major, 512)
 FRACTAL_ZN = TileLayoutDesc(core_ir.TileLayout.row_major, core_ir.TileLayout.col_major, 512)
 FRACTAL_ACC_NZ = TileLayoutDesc(core_ir.TileLayout.col_major, core_ir.TileLayout.row_major, 1024)
@@ -294,6 +317,17 @@ class LayoutOperationNode:
     configs: tuple[OperatorConfig, ...] = ()
 
 
+def _is_col_major_32b_aligned(shape: Sequence[int], dtype: DataType) -> bool:
+    return len(shape) == 2 and shape[0] > 1 and (int(shape[0]) * _dtype_byte_width(dtype)) % 32 == 0
+
+
+def _dtype_byte_width_safe(dtype: DataType) -> int:
+    try:
+        return _dtype_byte_width(dtype)
+    except ValueError:
+        return 0
+
+
 @dataclass
 class LayoutCostModel:
     """Calibratable analytical cost model for GM, L1 (`Mat`), UB (`Vec`), and L0 (`Left`/`Right`/`Acc`) ops.
@@ -340,7 +374,10 @@ class LayoutCostModel:
     mte2_l2_reread_discount: float = 0.30
     l2_cache_line_bytes: int = 512
     mte2_vec_bytes_per_cycle: float = 192.0
+    mte2_vec_strided_bytes_per_cycle: float = 96.0
     mte3_vec_bytes_per_cycle: float = 192.0
+    mte3_vec_strided_bytes_per_cycle: float = 96.0
+    vec_strided_burst_penalty_cycles: float = 3.0
     mte1_l1_to_l0_bytes_per_cycle: float = 129.7
     mte1_l0a_bytes_per_cycle: float = 129.7
     mte1_l0b_bytes_per_cycle: float = 85.4
@@ -349,6 +386,12 @@ class LayoutCostModel:
     cube_issue_overhead_cycles: float = 21.0
     mad_fp32_passes: int | None = None
     vec_elements_per_cycle: float = 128.0
+    vec_reshape_metadata_cycles: float = 1.0
+    vec_transpose_fixed_cycles: float = 0.0
+    vec_vbrcb_fixed_cycles: float = 4.0
+    vec_vbrcb_cycles_per_row: float = 0.5
+    vec_row_expand_issue_cycles: float = 4.0
+    vec_unsupported_conversion_cycles: float = 1e12
     fixpipe_acc_to_nd_bytes_per_cycle: float = 118.0
     fixpipe_acc_to_nz_bytes_per_cycle: float = 122.0
     fixpipe_drain_fixed_cycles: float = 0.0
@@ -404,6 +447,12 @@ class LayoutCostModel:
             and is_nz_compatible_shape(dst_node.shape, dst_node.dtype)
         )
 
+    def estimate_vbrcb_cost(self, rows: int) -> float:
+        """Estimate per-consumer `vbrcb` broadcast overhead on A2/A3 (`a2a3`)."""
+        if self.target_arch() == "a2a3":
+            return self.vec_vbrcb_fixed_cycles + float(rows) * self.vec_vbrcb_cycles_per_row
+        return 0.0
+
     def is_valid_load_config(
         self,
         src_node: LayoutValueNode,
@@ -412,9 +461,9 @@ class LayoutCostModel:
         dst_layout: LayoutChoice,
     ) -> bool:
         """Check whether `tile.load` with `(src_layout, dst_layout)` is backend-legal."""
-        if src_layout == src_node.current_layout and len(src_node.admissible_layouts) == 1:
-            return dst_layout == dst_node.current_layout
         if dst_node.memory_space == core_ir.MemorySpace.Mat:
+            if src_layout == src_node.current_layout and len(src_node.admissible_layouts) == 1:
+                return dst_layout == dst_node.current_layout
             if src_layout == core_ir.TensorLayout.NZ:
                 if not is_nz_compatible_shape(dst_node.shape, dst_node.dtype):
                     return False
@@ -426,8 +475,50 @@ class LayoutCostModel:
             return src_layout in (core_ir.TensorLayout.ND, core_ir.TensorLayout.NZ) and (
                 dst_layout == dst_node.current_layout
             )
-        # Vec/other loads cannot read NZ tensors directly (`BlockNzTensorViews` requires Mat).
+        if dst_node.memory_space == core_ir.MemorySpace.Vec:
+            if src_layout == core_ir.TensorLayout.ND:
+                return dst_layout == dst_node.current_layout
+            if src_layout == core_ir.TensorLayout.DN:
+                return (
+                    dst_layout == COL_MAJOR_FLAT
+                    and len(src_node.shape) == 2
+                    and _is_col_major_32b_aligned(dst_node.shape, dst_node.dtype)
+                )
+            if src_layout == core_ir.TensorLayout.NZ:
+                return (
+                    dst_layout == FRACTAL_NZ
+                    and FRACTAL_NZ in dst_node.admissible_layouts
+                    and is_nz_compatible_shape(dst_node.shape, dst_node.dtype)
+                )
+            return False
         return src_layout == core_ir.TensorLayout.ND and dst_layout == dst_node.current_layout
+
+    def is_valid_vec_store_config(
+        self,
+        src_node: LayoutValueNode,
+        dst_node: LayoutValueNode,
+        src_layout: LayoutChoice,
+        dst_layout: LayoutChoice,
+    ) -> bool:
+        """Check whether `Mem.Vec` `tile.store` with `(src_layout, dst_layout)` is backend-legal."""
+        if src_layout == ROW_BCAST_FLAT:
+            return False
+        if src_layout == FRACTAL_NZ:
+            return (
+                dst_layout == core_ir.TensorLayout.NZ
+                and FRACTAL_NZ in src_node.admissible_layouts
+                and is_nz_compatible_shape(src_node.shape, src_node.dtype)
+            )
+        is_col_vec = len(src_node.shape) == 2 and src_node.shape[1] == 1 and src_node.shape[0] > 1
+        if src_layout == COL_MAJOR_FLAT:
+            if dst_layout == core_ir.TensorLayout.DN:
+                return len(dst_node.shape) == 2 and _is_col_major_32b_aligned(src_node.shape, src_node.dtype)
+            if dst_layout == core_ir.TensorLayout.ND:
+                return is_col_vec
+            return False
+        if src_layout == ROW_MAJOR_FLAT:
+            return dst_layout == core_ir.TensorLayout.ND and not is_col_vec
+        return False
 
     def is_valid_move_config(
         self,
@@ -479,6 +570,47 @@ class LayoutCostModel:
             return 1.0
         return (uniq_b + self.mte2_l2_reread_discount * (load_b - uniq_b)) / load_b
 
+    def _estimate_vec_gm_transfer_cost(
+        self,
+        tile_node: LayoutValueNode,
+        gm_node: LayoutValueNode,
+        gm_layout: LayoutChoice,
+        contig_bw: float,
+        strided_bw: float,
+    ) -> float:
+        """Estimate geometry-aware MTE2/MTE3 transfer cycles between `Mem.Vec` and GM."""
+        total_bytes = float(tile_node.byte_size)
+        if len(tile_node.shape) != 2 or len(gm_node.shape) < 2:
+            return total_bytes / contig_bw
+        rows = int(tile_node.shape[-2])
+        cols = int(tile_node.shape[-1])
+        parent_rows = int(gm_node.shape[-2])
+        parent_cols = int(gm_node.shape[-1])
+        bpe = _dtype_byte_width(tile_node.dtype)
+        gran_b = float(max(1, self.gm_access_granularity_bytes()))
+        if gm_layout == core_ir.TensorLayout.DN:
+            strided = rows < parent_rows
+            burst_bytes = float(rows * bpe)
+            num_bursts = cols
+        elif gm_layout == core_ir.TensorLayout.NZ:
+            c0 = c0_elements(tile_node.dtype)
+            strided = rows < parent_rows
+            burst_bytes = float(rows * 32)
+            num_bursts = max(1, cols // c0)
+        else:
+            strided = cols < parent_cols
+            burst_bytes = float(cols * bpe)
+            num_bursts = rows
+        if not strided:
+            return total_bytes / contig_bw
+        eff_bw = min(contig_bw, strided_bw)
+        penalty = (
+            float(num_bursts)
+            * max(0.0, (gran_b - burst_bytes) / gran_b)
+            * self.vec_strided_burst_penalty_cycles
+        )
+        return (total_bytes / eff_bw) + penalty
+
     def estimate_load_cost(
         self,
         src_node: LayoutValueNode,
@@ -487,6 +619,7 @@ class LayoutCostModel:
         dst_layout: LayoutChoice,
     ) -> float:
         """Estimate `tile.load` cost from GM (`src_node`) to `Mat` or `Vec` (`dst_node`)."""
+        del dst_layout
         total_bytes = float(dst_node.byte_size)
         if dst_node.memory_space == core_ir.MemorySpace.Mat:
             if src_layout == core_ir.TensorLayout.NZ:
@@ -513,7 +646,13 @@ class LayoutCostModel:
             return (
                 total_bytes / nd_bw + rows * col_blocks * self.mte2_nd2nz_row_penalty_cycles + sub512_penalty
             )
-        return total_bytes / self.mte2_vec_bytes_per_cycle
+        return self._estimate_vec_gm_transfer_cost(
+            dst_node,
+            src_node,
+            src_layout,
+            self.mte2_vec_bytes_per_cycle,
+            self.mte2_vec_strided_bytes_per_cycle,
+        )
 
     def estimate_move_cost(
         self,
@@ -575,18 +714,26 @@ class LayoutCostModel:
         src_node: LayoutValueNode,
         dst_node: LayoutValueNode,
         dst_layout: LayoutChoice,
+        src_layout: LayoutChoice | None = None,
     ) -> float:
         """Estimate `tile.store` (`Acc -> GM` via FIXPIPE or `Vec -> GM` via MTE3) cost.
 
         For `MemorySpace.Acc`, follows `DrainCycles` in `l0_tile_chooser.cpp`
         (`pto-isa fixpipe-model.md`), including optional per-drain fixed overhead
         and non-power-of-2 N-fractal (`odd(N1) - 1`) burst serialization penalty.
-        For `MemorySpace.Vec`, uses MTE3 UB -> GM transfer bandwidth.
+        For `MemorySpace.Vec`, uses geometry-aware MTE3 UB -> GM transfer bandwidth.
         """
-        del dst_node
+        del src_layout
         total_bytes = float(src_node.byte_size)
         if src_node.memory_space == core_ir.MemorySpace.Vec:
-            return total_bytes / self.mte3_vec_bytes_per_cycle
+            return self._estimate_vec_gm_transfer_cost(
+                src_node,
+                dst_node,
+                dst_layout,
+                self.mte3_vec_bytes_per_cycle,
+                self.mte3_vec_strided_bytes_per_cycle,
+            )
+        del dst_node
         bw = (
             self.fixpipe_acc_to_nz_bytes_per_cycle
             if dst_layout == core_ir.TensorLayout.NZ
@@ -603,6 +750,30 @@ class LayoutCostModel:
         odd_penalty = float(m_rows) * self.fixpipe_odd_n1_penalty_cycles * float(odd_n1 - 1)
         return self.fixpipe_drain_fixed_cycles + (total_bytes / bw) + odd_penalty
 
+    def supports_vec_tile_conversion(
+        self,
+        val_node: LayoutValueNode,
+        src_layout: LayoutChoice,
+        dst_layout: LayoutChoice,
+    ) -> bool:
+        """Check whether an on-chip `Mem.Vec` conversion `src_layout -> dst_layout` is realizable."""
+        if val_node.memory_space != core_ir.MemorySpace.Vec or src_layout == dst_layout:
+            return False
+        if not isinstance(src_layout, TileLayoutDesc) or not isinstance(dst_layout, TileLayoutDesc):
+            return False
+        if FRACTAL_NZ in (src_layout, dst_layout):
+            return False
+        if {src_layout, dst_layout} == {ROW_MAJOR_FLAT, COL_MAJOR_FLAT}:
+            return True
+        if dst_layout == ROW_BCAST_FLAT and src_layout in (COL_MAJOR_FLAT, ROW_MAJOR_FLAT):
+            return (
+                len(val_node.shape) == 2
+                and val_node.shape[1] == 1
+                and val_node.shape[0] > 1
+                and ROW_BCAST_FLAT in val_node.admissible_layouts
+            )
+        return False
+
     def estimate_conversion_cost(
         self,
         val_node: LayoutValueNode,
@@ -615,6 +786,26 @@ class LayoutCostModel:
         total_bytes = float(val_node.byte_size)
         if val_node.memory_space == core_ir.MemorySpace.DDR:
             return self.gm_pack_fixed_cycles + (total_bytes / self.gm_pack_bytes_per_cycle)
+        if val_node.memory_space == core_ir.MemorySpace.Vec:
+            if not self.supports_vec_tile_conversion(val_node, src_layout, dst_layout):
+                return self.vec_unsupported_conversion_cycles
+            if dst_layout == ROW_BCAST_FLAT:
+                rows = int(val_node.shape[0])
+                c0 = c0_elements(val_node.dtype)
+                extra_reshape = self.vec_reshape_metadata_cycles if src_layout == ROW_MAJOR_FLAT else 0.0
+                return (
+                    extra_reshape
+                    + self.vec_row_expand_issue_cycles
+                    + float(rows * c0) / self.vec_elements_per_cycle
+                    + self.estimate_vbrcb_cost(rows)
+                )
+            if (
+                {src_layout, dst_layout} == {ROW_MAJOR_FLAT, COL_MAJOR_FLAT}
+                and len(val_node.shape) == 2
+                and (val_node.shape[0] == 1 or val_node.shape[1] == 1)
+            ):
+                return self.vec_reshape_metadata_cycles
+            return self.vec_transpose_fixed_cycles + (total_bytes / self.onchip_relayout_bytes_per_cycle)
         return total_bytes / self.onchip_relayout_bytes_per_cycle
 
 
@@ -709,6 +900,112 @@ _TILE_MATMUL_OPS = frozenset(
         core_ir.get_op("tile.matmul_bias").name,
     }
 )
+_ROW_REDUCTION_OPS = frozenset(
+    {
+        "tile.row_sum",
+        "tile.row_max",
+        "tile.row_min",
+        "tile.row_prod",
+        "tile.row_argmax",
+        "tile.row_argmin",
+    }
+)
+_COL_REDUCTION_OPS = frozenset(
+    {
+        "tile.col_sum",
+        "tile.col_max",
+        "tile.col_min",
+        "tile.col_prod",
+        "tile.col_argmax",
+        "tile.col_argmin",
+    }
+)
+_OTHER_ROW_EXPAND_OPS = frozenset(
+    {
+        "tile.row_expand",
+        "tile.row_expand_sub",
+        "tile.row_expand_mul",
+        "tile.row_expand_div",
+        "tile.row_expand_max",
+        "tile.row_expand_min",
+        "tile.row_expand_expdif",
+    }
+)
+_COL_EXPAND_OPS = frozenset(
+    {
+        "tile.col_expand",
+        "tile.col_expand_mul",
+        "tile.col_expand_add",
+        "tile.col_expand_div",
+        "tile.col_expand_sub",
+        "tile.col_expand_max",
+        "tile.col_expand_min",
+        "tile.col_expand_expdif",
+    }
+)
+_FRACTAL_NZ_POINTWISE_OPS = frozenset(
+    {
+        "tile.add",
+        "tile.sub",
+        "tile.mul",
+        "tile.div",
+        "tile.maximum",
+        "tile.minimum",
+        "tile.part_add",
+        "tile.part_max",
+        "tile.part_min",
+        "tile.part_mul",
+        "tile.partadd",
+        "tile.partmax",
+        "tile.partmin",
+        "tile.addc",
+        "tile.subc",
+        "tile.selc",
+        "tile.abs",
+        "tile.exp",
+        "tile.neg",
+        "tile.sqrt",
+        "tile.rsqrt",
+        "tile.log",
+        "tile.recip",
+        "tile.not",
+        "tile.relu",
+        "tile.lrelu",
+        "tile.adds",
+        "tile.subs",
+        "tile.muls",
+        "tile.divs",
+        "tile.maximums",
+        "tile.minimums",
+        "tile.sels",
+        "tile.and",
+        "tile.or",
+        "tile.shl",
+        "tile.shr",
+        "tile.ands",
+        "tile.ors",
+        "tile.shls",
+        "tile.shrs",
+        "tile.fmod",
+        "tile.fmods",
+        "tile.addsc",
+        "tile.subsc",
+        "tile.full",
+    }
+)
+
+
+def _tmp_arg_indices(op_name: str, num_args: int) -> tuple[int, ...]:
+    """Return positional argument indices that hold scratch `tmp` tiles."""
+    if op_name in _ROW_REDUCTION_OPS:
+        return (1,) if num_args >= 2 else ()
+    if op_name in {"tile.col_sum", "tile.col_argmax", "tile.col_argmin"}:
+        return (1,) if num_args >= 2 else ()
+    if op_name in {"tile.row_expand_add", "tile.prelu", "tile.xor", "tile.xors", "tile.rem", "tile.rems"}:
+        return (2,) if num_args >= 3 else ()
+    if op_name == "tile.rsqrt":
+        return (1,) if num_args >= 2 else ()
+    return ()
 
 
 _SSA_SUFFIX_RE = re.compile(r"__(?:ssa|rv|iter|idx)_v\d+")
@@ -761,6 +1058,9 @@ def _effective_tile_layout(tile_type: core_ir.TileType) -> TileLayoutDesc:
         return FRACTAL_ZN
     if space == core_ir.MemorySpace.Acc:
         return FRACTAL_ACC_NZ
+    shape = _static_shape(tile_type.shape)
+    if shape is not None and len(shape) == 2 and shape[0] > 1 and shape[1] == 1:
+        return COL_MAJOR_FLAT
     return ROW_MAJOR_FLAT
 
 
@@ -1104,14 +1404,12 @@ def _is_nz_compatible_tile_load_call(  # noqa: PLR0913
     param_steps_by_uid: Mapping[int, int],
     non_neg_uids: set[int],
 ) -> bool:
-    """Mirror `BlockTileLoadArgs` from `block_nz_tensor_views_pass.cpp:771-813`."""
+    """Check whether `tile.load` (Mat or Vec) is compatible with `TensorLayout.NZ`."""
     shape = _is_nz_compatible_tensor_type(tensor_type)
-    if (
-        shape is None
-        or len(call.args) < 3
-        or not isinstance(tensor_type, core_ir.TensorType)
-        or call.kwargs.get("target_memory") != core_ir.MemorySpace.Mat
-    ):
+    if shape is None or len(call.args) < 3 or not isinstance(tensor_type, core_ir.TensorType):
+        return False
+    target_mem = call.kwargs.get("target_memory", core_ir.MemorySpace.Vec)
+    if target_mem not in (core_ir.MemorySpace.Mat, core_ir.MemorySpace.Vec):
         return False
     rank = len(shape)
     offsets_arg, shapes_arg = call.args[1], call.args[2]
@@ -1126,6 +1424,12 @@ def _is_nz_compatible_tile_load_call(  # noqa: PLR0913
     c0 = c0_elements(tensor_type.dtype)
     if shapes_static is None or c0 <= 0 or not is_nz_compatible_shape(shapes_static, tensor_type.dtype):
         return False
+    if target_mem == core_ir.MemorySpace.Vec:
+        if rank == 3 and shapes_static[0] != 1:
+            return False
+        for lead_off in offsets_arg.elements[:-2]:
+            if not _is_provable_non_negative(lead_off, scalar_defs, loop_ranges, non_neg_uids, [256]):
+                return False
     if not (
         _is_nz_compatible_offset_axis(
             offsets_arg.elements[-2], 16, scalar_defs, loop_ranges, param_steps_by_uid, non_neg_uids
@@ -1137,12 +1441,21 @@ def _is_nz_compatible_tile_load_call(  # noqa: PLR0913
         return False
     part_tuple = shapes_arg
     if len(call.args) >= 4:
-        if not _is_nz_compatible_valid_shape(
-            call.args[3], rank, c0, scalar_defs, loop_ranges, param_steps_by_uid
-        ):
-            return False
-        part_tuple = call.args[3]
-        assert isinstance(part_tuple, core_ir.MakeTuple)
+        if target_mem == core_ir.MemorySpace.Vec:
+            valid_arg = call.args[3]
+            if (
+                not isinstance(valid_arg, core_ir.MakeTuple)
+                or _static_shape(valid_arg.elements) != shapes_static
+            ):
+                return False
+            part_tuple = valid_arg
+        else:
+            if not _is_nz_compatible_valid_shape(
+                call.args[3], rank, c0, scalar_defs, loop_ranges, param_steps_by_uid
+            ):
+                return False
+            part_tuple = call.args[3]
+            assert isinstance(part_tuple, core_ir.MakeTuple)
     col_blocks = (
         int(part_tuple.elements[-1].value) // c0
         if isinstance(part_tuple.elements[-1], core_ir.ConstInt)
@@ -1154,6 +1467,60 @@ def _is_nz_compatible_tile_load_call(  # noqa: PLR0913
     return not (col_blocks > 1 and (shape[-2] - loaded_rows) > 65535)
 
 
+def _is_nz_compatible_vec_tile_store_call(  # noqa: PLR0913
+    call: core_ir.Call,
+    tensor_type: core_ir.Type,
+    scalar_defs: Mapping[int, core_ir.Expr],
+    loop_ranges: Mapping[int, tuple[core_ir.Expr, core_ir.Expr]],
+    param_steps_by_uid: Mapping[int, int],
+    non_neg_uids: set[int],
+) -> bool:
+    """Check whether a `Mem.Vec` `tile.store` can write an `NZ` tensor via its ND backing view."""
+    shape = _is_nz_compatible_tensor_type(tensor_type)
+    if shape is None or len(call.args) not in (3, 4) or not isinstance(tensor_type, core_ir.TensorType):
+        return False
+    tile_type = call.args[0].type
+    if not isinstance(tile_type, core_ir.TileType):
+        return False
+    if tile_type.memory_space != core_ir.MemorySpace.Vec or tile_type.dtype != tensor_type.dtype:
+        return False
+    tile_shape = _static_shape(tile_type.shape)
+    if tile_shape is None or len(tile_shape) != 2:
+        return False
+    view = tile_type.tile_view
+    if view is not None and view.valid_shape and _static_shape(view.valid_shape) != tile_shape:
+        return False
+    try:
+        c0 = c0_elements(tensor_type.dtype)
+    except ValueError:
+        return False
+    if tile_shape[0] <= 0 or tile_shape[0] % 16 != 0 or tile_shape[1] <= 0 or tile_shape[1] % c0 != 0:
+        return False
+    if (
+        int(call.kwargs.get("atomic", 0)) != 0
+        or "pre_quant" in call.kwargs
+        or bool(call.kwargs.get("pre_relu", False))
+    ):
+        return False
+    rank = len(shape)
+    offsets_arg = call.args[1]
+    if not isinstance(offsets_arg, core_ir.MakeTuple) or len(offsets_arg.elements) != rank:
+        return False
+    if len(call.args) == 4:
+        win_arg = call.args[3]
+        expected_win = (*(1 for _ in shape[:-2]), tile_shape[0], tile_shape[1])
+        if not isinstance(win_arg, core_ir.MakeTuple) or _static_shape(win_arg.elements) != expected_win:
+            return False
+    for lead_off in offsets_arg.elements[:-2]:
+        if not _is_provable_non_negative(lead_off, scalar_defs, loop_ranges, non_neg_uids, [256]):
+            return False
+    return _is_nz_compatible_offset_axis(
+        offsets_arg.elements[-2], 16, scalar_defs, loop_ranges, param_steps_by_uid, non_neg_uids
+    ) and _is_nz_compatible_offset_axis(
+        offsets_arg.elements[-1], c0, scalar_defs, loop_ranges, param_steps_by_uid, non_neg_uids
+    )
+
+
 def _is_nz_compatible_tile_store_call(  # noqa: PLR0913
     call: core_ir.Call,
     tensor_type: core_ir.Type,
@@ -1163,13 +1530,17 @@ def _is_nz_compatible_tile_store_call(  # noqa: PLR0913
     non_neg_uids: set[int],
     model: LayoutCostModel,
 ) -> bool:
-    """Mirror `BlockTileStoreArgs` from `block_nz_tensor_views_pass.cpp:528-638`."""
+    """Mirror `BlockTileStoreArgs` (`Acc->NZ`) plus aligned `Mem.Vec` backing stores."""
+    tile_type = call.args[0].type if call.args else None
+    if isinstance(tile_type, core_ir.TileType) and tile_type.memory_space == core_ir.MemorySpace.Vec:
+        return _is_nz_compatible_vec_tile_store_call(
+            call, tensor_type, scalar_defs, loop_ranges, param_steps_by_uid, non_neg_uids
+        )
     shape = _is_nz_compatible_tensor_type(tensor_type)
     if shape is None or len(call.args) not in (3, 4) or not isinstance(tensor_type, core_ir.TensorType):
         return False
     if model.target_arch() == "a5":
         return False
-    tile_type = call.args[0].type
     if not isinstance(tile_type, core_ir.TileType):
         return False
     if (
@@ -1218,6 +1589,69 @@ def _is_nz_compatible_tile_store_call(  # noqa: PLR0913
     return _is_nz_compatible_offset_axis(
         offsets_arg.elements[-1], 16, scalar_defs, loop_ranges, param_steps_by_uid, non_neg_uids
     )
+
+
+def _func_contains_tile_expands(body: core_ir.Stmt) -> bool:
+    found = False
+
+    def _check(expr: core_ir.Expr) -> None:
+        nonlocal found
+        if found:
+            return
+        if isinstance(expr, core_ir.Call):
+            if expr.op.name == "tile.expands":
+                found = True
+                return
+            for arg in expr.args:
+                _check(arg)
+        elif isinstance(expr, core_ir.Submit):
+            for arg in expr.args:
+                _check(arg)
+
+    def _walk(stmt: core_ir.Stmt) -> None:
+        if found:
+            return
+        if isinstance(stmt, core_ir.AssignStmt):
+            _check(stmt.value)
+        elif isinstance(stmt, core_ir.EvalStmt):
+            _check(stmt.expr)
+        elif isinstance(stmt, core_ir.ReturnStmt):
+            for val in stmt.value:
+                _check(val)
+        for child in _iter_child_stmts(stmt):
+            _walk(child)
+
+    _walk(body)
+    return found
+
+
+def _collect_func_expands_gm_names(
+    func: core_ir.Function,
+    param_overrides: Sequence[str | None] | None,
+) -> set[str]:
+    """Return GM tensor names referenced in `func` when it uses `tile.expands` (no PTOCodegen)."""
+    if not _func_contains_tile_expands(func.body):
+        return set()
+    overrides = list(param_overrides) if param_overrides is not None else []
+    names: set[str] = set()
+    for idx, param in enumerate(func.params):
+        if isinstance(param.type, core_ir.TensorType):
+            override = overrides[idx] if idx < len(overrides) and overrides[idx] else None
+            names.add(override or _clean_ssa_name(param.name_hint))
+
+    def _walk(stmt: core_ir.Stmt) -> None:
+        if (
+            isinstance(stmt, core_ir.AssignStmt)
+            and isinstance(stmt.var.type, core_ir.TensorType)
+            and isinstance(stmt.value, core_ir.Call)
+            and stmt.value.op.name == _TENSOR_CREATE_OP
+        ):
+            names.add(_clean_ssa_name(stmt.var.name_hint))
+        for child in _iter_child_stmts(stmt):
+            _walk(child)
+
+    _walk(func.body)
+    return names
 
 
 def _collect_func_nz_ineligible(  # noqa: PLR0913
@@ -1360,6 +1794,7 @@ class _OrchCallMultiplierVisitor:
         self.call_order: dict[str, int] = {}
         self.param_steps: dict[tuple[str, int], int] = {}
         self.reshaped_names: set[str] = set()
+        self.nz_ineligible_names: set[str] = set()
         self.internal_buffers: set[str] = set()
 
     def walk(self, func: core_ir.Function) -> None:
@@ -1460,12 +1895,9 @@ class _OrchCallMultiplierVisitor:
         if expr.op.name == _TENSOR_CREATE_OP and assign_var is not None:
             buf_name = _clean_ssa_name(assign_var.name_hint)
             self._alias_by_uid[assign_var.unique_id] = buf_name
-            target_set = (
-                self.internal_buffers
-                if _is_nz_compatible_tensor_type(assign_var.type) is not None
-                else self.reshaped_names
-            )
-            target_set.add(buf_name)
+            self.internal_buffers.add(buf_name)
+            if _is_nz_compatible_tensor_type(assign_var.type) is None:
+                self.nz_ineligible_names.add(buf_name)
             return
         for i, arg in enumerate(expr.args):
             if not isinstance(arg, core_ir.Var) or not isinstance(arg.type, core_ir.TensorType):
@@ -1478,17 +1910,22 @@ class _OrchCallMultiplierVisitor:
                 and expr.op.name != _TENSOR_RESHAPE_OP
             ):
                 self._alias_by_uid[assign_var.unique_id] = src_alias
-            ok = (expr.op.name == _TENSOR_RESHAPE_OP and i == 0 and _is_whole_tensor_flatten(expr)) or (
+            ok_nz = (expr.op.name == _TENSOR_RESHAPE_OP and i == 0 and _is_whole_tensor_flatten(expr)) or (
                 expr.op.name == "tensor.slice"
                 and i == 0
                 and _is_nz_compatible_tensor_slice_call(expr, arg.type)
             )
             if expr.op.name == _TENSOR_RESHAPE_OP and assign_var is not None:
                 self.reshaped_names.add(_clean_ssa_name(assign_var.name_hint))
-            if not ok:
-                self.reshaped_names.add(src_alias)
+            if not ok_nz:
+                self.nz_ineligible_names.add(src_alias)
+                if expr.op.name != "tensor.slice":
+                    self.reshaped_names.add(src_alias)
                 if assign_var is not None:
-                    self.reshaped_names.add(_clean_ssa_name(assign_var.name_hint))
+                    out_clean = _clean_ssa_name(assign_var.name_hint)
+                    self.nz_ineligible_names.add(out_clean)
+                    if expr.op.name != "tensor.slice":
+                        self.reshaped_names.add(out_clean)
 
     def _record_calls(self, expr: core_ir.Expr, assign_var: core_ir.Var | None = None) -> None:
         if assign_var is not None and isinstance(assign_var.type, core_ir.ScalarType):
@@ -1562,6 +1999,7 @@ class _PostInferInstanceExtractor:
         *,
         external_out_names: set[str] | None = None,
         reshaped_names: set[str] | None = None,
+        nz_ineligible_names: set[str] | None = None,
         internal_buffers: set[str] | None = None,
         shared_values: dict[str, LayoutValueNode] | None = None,
         consumed_values: set[str] | None = None,
@@ -1569,13 +2007,16 @@ class _PostInferInstanceExtractor:
         tile_prefix: str = "",
         call_multiplier: int = 1,
         param_name_overrides: Sequence[str | None] | None = None,
+        param_steps: Mapping[tuple[str, int], int] | None = None,
     ) -> None:
         self._model = cost_model
         self._reusable = reusable_tensors
         self._external_out_names = external_out_names
         self._reshaped_names = reshaped_names or set()
+        self._nz_ineligible_names = nz_ineligible_names or set()
         self._internal_buffers = internal_buffers or set()
         self._tile_prefix = tile_prefix
+        self._param_steps = param_steps or {}
         self.values: dict[str, LayoutValueNode] = dict(shared_values) if shared_values else {}
         self.consumed_values: set[str] = set(consumed_values) if consumed_values else set()
         self.operations: list[LayoutOperationNode] = []
@@ -1585,10 +2026,333 @@ class _PostInferInstanceExtractor:
         self._loop_multiplier = max(1, call_multiplier)
         self._yield_stack: list[list[int]] = []
         self._param_overrides = list(param_name_overrides) if param_name_overrides is not None else []
+        self._vec_tmp_uids: set[int] = set()
+        self._vec_non_tmp_uids: set[int] = set()
+        self._vec_cmp_uids: set[int] = set()
+        self._vec_row_expand_add_uids: set[int] = set()
+        self._vec_row_reduction_uids: set[int] = set()
+        self._vec_nz_eligible_uids: set[int] = set()
+        self._nz_scalar_defs: dict[int, core_ir.Expr] = {}
+        self._nz_loop_ranges: dict[int, tuple[core_ir.Expr, core_ir.Expr]] = {}
+        self._nz_param_steps_by_uid: dict[int, int] = {}
+        self._nz_non_neg_uids: set[int] = set()
 
     @property
     def op_counter(self) -> int:
         return self._op_counter
+
+    @staticmethod
+    def _is_vec_nz_tile_shape_eligible(var: core_ir.Var) -> tuple[tuple[int, ...], int] | None:
+        if not isinstance(var.type, core_ir.TileType):
+            return None
+        space = var.type.memory_space or core_ir.MemorySpace.Vec
+        if space != core_ir.MemorySpace.Vec or _effective_tile_layout(var.type) != ROW_MAJOR_FLAT:
+            return None
+        shape = _static_shape(var.type.shape)
+        view = var.type.tile_view
+        try:
+            c0 = c0_elements(var.type.dtype)
+        except ValueError:
+            return None
+        if (
+            shape is None
+            or len(shape) != 2
+            or shape[0] <= 0
+            or shape[1] <= 0
+            or c0 <= 0
+            or shape[0] % 16 != 0
+            or shape[1] % c0 != 0
+            or (view is not None and view.valid_shape and _static_shape(view.valid_shape) != shape)
+        ):
+            return None
+        return shape, c0
+
+    def _collect_vec_ir_facts(
+        self,
+        func: core_ir.Function,
+        tensor_uids: dict[int, str],
+        disqualified_uids: set[int],
+    ) -> tuple[dict[int, core_ir.Expr], dict[int, tuple[core_ir.Expr, core_ir.Expr]], set[int]]:
+        scalar_defs: dict[int, core_ir.Expr] = {}
+        loop_ranges: dict[int, tuple[core_ir.Expr, core_ir.Expr]] = {}
+        non_neg_uids: set[int] = set()
+        for idx, param in enumerate(func.params):
+            if isinstance(param.type, core_ir.ScalarType):
+                step = self._param_steps.get((func.name, idx))
+                if step is not None and step > 1 and step % 8 == 0:
+                    non_neg_uids.add(param.unique_id)
+            elif isinstance(param.type, core_ir.TileType):
+                disqualified_uids.add(param.unique_id)
+
+        def _scan(stmt: core_ir.Stmt) -> None:
+            if isinstance(stmt, core_ir.AssignStmt):
+                self._record_fact_assign(stmt, scalar_defs, non_neg_uids, tensor_uids)
+            elif isinstance(stmt, core_ir.ForStmt):
+                self._record_fact_for(stmt, loop_ranges, tensor_uids, disqualified_uids)
+            for child in _iter_child_stmts(stmt):
+                _scan(child)
+
+        _scan(func.body)
+        return scalar_defs, loop_ranges, non_neg_uids
+
+    @staticmethod
+    def _record_fact_assign(
+        stmt: core_ir.AssignStmt,
+        scalar_defs: dict[int, core_ir.Expr],
+        non_neg_uids: set[int],
+        tensor_uids: dict[int, str],
+    ) -> None:
+        if isinstance(stmt.var.type, core_ir.ScalarType):
+            scalar_defs[stmt.var.unique_id] = stmt.value
+            if isinstance(stmt.value, core_ir.Call) and stmt.value.op.name in (
+                "tile.get_block_idx",
+                "tile.get_block_num",
+            ):
+                non_neg_uids.add(stmt.var.unique_id)
+        elif isinstance(stmt.var.type, core_ir.TensorType):
+            if isinstance(stmt.value, core_ir.Var) and stmt.value.unique_id in tensor_uids:
+                tensor_uids[stmt.var.unique_id] = tensor_uids[stmt.value.unique_id]
+            elif (
+                isinstance(stmt.value, core_ir.Call)
+                and stmt.value.op.name == _TILE_STORE_OP
+                and len(stmt.value.args) >= 3
+                and isinstance(stmt.value.args[2], core_ir.Var)
+                and stmt.value.args[2].unique_id in tensor_uids
+            ):
+                tensor_uids[stmt.var.unique_id] = tensor_uids[stmt.value.args[2].unique_id]
+
+    @staticmethod
+    def _record_fact_for(
+        stmt: core_ir.ForStmt,
+        loop_ranges: dict[int, tuple[core_ir.Expr, core_ir.Expr]],
+        tensor_uids: dict[int, str],
+        disqualified_uids: set[int],
+    ) -> None:
+        loop_ranges[stmt.loop_var.unique_id] = (stmt.start, stmt.step)
+        for iter_arg in stmt.iter_args:
+            init_val = getattr(iter_arg, "initValue", None)
+            if (
+                isinstance(iter_arg.type, core_ir.TensorType)
+                and isinstance(init_val, core_ir.Var)
+                and init_val.unique_id in tensor_uids
+            ):
+                tensor_uids[iter_arg.unique_id] = tensor_uids[init_val.unique_id]
+            elif isinstance(iter_arg.type, core_ir.TileType):
+                disqualified_uids.add(iter_arg.unique_id)
+                if isinstance(init_val, core_ir.Var):
+                    disqualified_uids.add(init_val.unique_id)
+        for rv, iter_arg in zip(stmt.return_vars, stmt.iter_args, strict=False):
+            if isinstance(iter_arg.type, core_ir.TensorType) and iter_arg.unique_id in tensor_uids:
+                tensor_uids[rv.unique_id] = tensor_uids[iter_arg.unique_id]
+            elif isinstance(rv.type, core_ir.TileType):
+                disqualified_uids.add(rv.unique_id)
+
+    def _classify_vec_call_roles(self, call: core_ir.Call, lhs: core_ir.Var | None) -> set[int]:
+        op_name = call.op.name
+        tmp_idxs = set(_tmp_arg_indices(op_name, len(call.args)))
+        for idx, arg in enumerate(call.args):
+            if isinstance(arg, core_ir.Var) and isinstance(arg.type, core_ir.TileType):
+                (self._vec_tmp_uids if idx in tmp_idxs else self._vec_non_tmp_uids).add(arg.unique_id)
+        if lhs is not None and isinstance(lhs.type, core_ir.TileType) and op_name != _TILE_CREATE_OP:
+            self._vec_non_tmp_uids.add(lhs.unique_id)
+        if lhs is not None and op_name in _ROW_REDUCTION_OPS:
+            self._vec_row_reduction_uids.add(lhs.unique_id)
+        if op_name in ("tile.cmp", "tile.cmps"):
+            for arg in call.args:
+                if isinstance(arg, core_ir.Var) and isinstance(arg.type, core_ir.TileType):
+                    self._vec_cmp_uids.add(arg.unique_id)
+        if op_name == "tile.row_expand_add" and len(call.args) >= 2 and isinstance(call.args[1], core_ir.Var):
+            self._vec_row_expand_add_uids.add(call.args[1].unique_id)
+        return tmp_idxs
+
+    def _analyze_vec_tiles(self, func: core_ir.Function) -> None:
+        """Pre-scan `Mem.Vec` tiles for scratch/broadcast/cmp/DN roles and FRACTAL_NZ components."""
+        self._vec_tmp_uids = set()
+        self._vec_non_tmp_uids = set()
+        self._vec_cmp_uids = set()
+        self._vec_row_expand_add_uids = set()
+        self._vec_row_reduction_uids = set()
+        self._vec_nz_eligible_uids = set()
+
+        param_steps_by_uid = {
+            param.unique_id: step
+            for idx, param in enumerate(func.params)
+            if isinstance(param.type, core_ir.ScalarType)
+            and (step := self._param_steps.get((func.name, idx))) is not None
+            and step > 1
+            and step % 8 == 0
+        }
+        tensor_uids: dict[int, str] = dict(self._uid_to_name)
+        parent: dict[int, int] = {}
+        disqualified_uids: set[int] = set()
+        comp_sig: dict[int, tuple[tuple[int, ...], int]] = {}
+        scalar_defs, loop_ranges, non_neg_uids = self._collect_vec_ir_facts(
+            func, tensor_uids, disqualified_uids
+        )
+
+        def _find(u: int) -> int:
+            while parent.setdefault(u, u) != u:
+                parent[u] = parent[parent[u]]
+                u = parent[u]
+            return u
+
+        def _union(u: int, v: int) -> None:
+            ru, rv = _find(u), _find(v)
+            if ru != rv:
+                parent[rv] = ru
+                if ru in disqualified_uids or rv in disqualified_uids:
+                    disqualified_uids.add(ru)
+                if ru in comp_sig and rv in comp_sig and comp_sig[ru] != comp_sig[rv]:
+                    disqualified_uids.add(ru)
+                elif rv in comp_sig and ru not in comp_sig:
+                    comp_sig[ru] = comp_sig[rv]
+
+        def _check_tile_var_eligible(var: core_ir.Var) -> None:
+            sig = self._is_vec_nz_tile_shape_eligible(var)
+            if sig is None:
+                disqualified_uids.add(var.unique_id)
+                return
+            root = _find(var.unique_id)
+            if root in comp_sig and comp_sig[root] != sig:
+                disqualified_uids.add(root)
+            else:
+                comp_sig[root] = sig
+
+        def _check_load_or_store_nz(
+            call: core_ir.Call, tile_var: core_ir.Var, gm_arg: core_ir.Expr | None, is_store: bool
+        ) -> None:
+            if (tile_var.type.memory_space or core_ir.MemorySpace.Vec) != core_ir.MemorySpace.Vec:
+                return
+            _check_tile_var_eligible(tile_var)
+            gm_name = tensor_uids.get(gm_arg.unique_id) if isinstance(gm_arg, core_ir.Var) else None
+            gm_node = self.values.get(gm_name) if gm_name else None
+            checker = _is_nz_compatible_vec_tile_store_call if is_store else _is_nz_compatible_tile_load_call
+            nz_ok = (
+                gm_node is not None
+                and core_ir.TensorLayout.NZ in gm_node.admissible_layouts
+                and isinstance(gm_arg, core_ir.Var)
+                and checker(call, gm_arg.type, scalar_defs, loop_ranges, param_steps_by_uid, non_neg_uids)
+            )
+            if not nz_ok:
+                disqualified_uids.add(tile_var.unique_id)
+
+        def _visit_call(call: core_ir.Call, lhs: core_ir.Var | None) -> None:
+            op_name = call.op.name
+            tmp_idxs = self._classify_vec_call_roles(call, lhs)
+            if op_name == _TILE_LOAD_OP and lhs is not None and isinstance(lhs.type, core_ir.TileType):
+                _check_load_or_store_nz(call, lhs, call.args[0] if call.args else None, False)
+            elif op_name == _TILE_STORE_OP and len(call.args) >= 3:
+                tile_arg = call.args[0]
+                if isinstance(tile_arg, core_ir.Var) and isinstance(tile_arg.type, core_ir.TileType):
+                    _check_load_or_store_nz(call, tile_arg, call.args[2], True)
+            elif op_name == _TILE_CREATE_OP and lhs is not None and isinstance(lhs.type, core_ir.TileType):
+                disqualified_uids.add(lhs.unique_id)
+            elif op_name == "tile.full" and lhs is not None and isinstance(lhs.type, core_ir.TileType):
+                _check_tile_var_eligible(lhs)
+            elif op_name.startswith("tile."):
+                self._visit_generic_nz_call(
+                    call, lhs, tmp_idxs, _check_tile_var_eligible, _union, disqualified_uids
+                )
+
+        def _scan_calls(stmt: core_ir.Stmt) -> None:
+            if isinstance(stmt, core_ir.AssignStmt) and isinstance(stmt.value, core_ir.Call):
+                _visit_call(stmt.value, stmt.var)
+            elif isinstance(stmt, core_ir.EvalStmt) and isinstance(stmt.expr, core_ir.Call):
+                _visit_call(stmt.expr, None)
+            elif isinstance(stmt, core_ir.ReturnStmt):
+                for val in stmt.value:
+                    if isinstance(val, core_ir.Call):
+                        _visit_call(val, None)
+            elif isinstance(stmt, core_ir.YieldStmt):
+                for val in stmt.value:
+                    if isinstance(val, core_ir.Var) and isinstance(val.type, core_ir.TileType):
+                        disqualified_uids.add(val.unique_id)
+            for child in _iter_child_stmts(stmt):
+                _scan_calls(child)
+
+        _scan_calls(func.body)
+        disqualified_uids.update(self._vec_tmp_uids & self._vec_non_tmp_uids)
+        disqualified_roots = {_find(uid) for uid in disqualified_uids}
+        self._vec_nz_eligible_uids = {
+            uid
+            for uid in self._vec_non_tmp_uids
+            if uid not in self._vec_tmp_uids and _find(uid) not in disqualified_roots
+        }
+        self._nz_scalar_defs = scalar_defs
+        self._nz_loop_ranges = loop_ranges
+        self._nz_param_steps_by_uid = param_steps_by_uid
+        self._nz_non_neg_uids = non_neg_uids
+
+    @staticmethod
+    def _visit_generic_nz_call(  # noqa: PLR0913
+        call: core_ir.Call,
+        lhs: core_ir.Var | None,
+        tmp_idxs: set[int],
+        check_fn: Any,
+        union_fn: Any,
+        disqualified_uids: set[int],
+    ) -> None:
+        data_tiles = [
+            arg
+            for idx, arg in enumerate(call.args)
+            if idx not in tmp_idxs and isinstance(arg, core_ir.Var) and isinstance(arg.type, core_ir.TileType)
+        ]
+        if lhs is not None and isinstance(lhs.type, core_ir.TileType):
+            data_tiles.append(lhs)
+        for tv in data_tiles:
+            check_fn(tv)
+        for tv in data_tiles[1:]:
+            union_fn(data_tiles[0].unique_id, tv.unique_id)
+        if not data_tiles:
+            return
+        op_name = call.op.name
+        op_ok = (
+            op_name in _FRACTAL_NZ_POINTWISE_OPS and (op_name != "tile.rsqrt" or len(call.args) == 1)
+        ) or (
+            op_name == "tile.cast"
+            and len(data_tiles) == 2
+            and _dtype_byte_width(data_tiles[0].type.dtype) == _dtype_byte_width(data_tiles[1].type.dtype)
+        )
+        if not op_ok:
+            disqualified_uids.add(data_tiles[0].unique_id)
+
+    def _admissible_vec_tile_layouts(self, var: core_ir.Var) -> tuple[TileLayoutDesc, ...]:
+        assert isinstance(var.type, core_ir.TileType)
+        cur_layout = _effective_tile_layout(var.type)
+        if var.unique_id in self._vec_tmp_uids and var.unique_id not in self._vec_non_tmp_uids:
+            return (cur_layout,)
+        shape = _static_shape(var.type.shape)
+        if shape is None or len(shape) != 2:
+            return (cur_layout,)
+        m_dim, n_dim = shape
+        bpe = _dtype_byte_width_safe(var.type.dtype)
+        if n_dim == 1 and (m_dim > 1 or var.unique_id in self._vec_row_reduction_uids):
+            if var.unique_id in self._vec_cmp_uids or m_dim <= 1:
+                candidates = [cur_layout]
+            else:
+                other = ROW_MAJOR_FLAT if cur_layout == COL_MAJOR_FLAT else COL_MAJOR_FLAT
+                candidates = [cur_layout, other]
+            view = var.type.tile_view
+            if (
+                var.unique_id in self._vec_row_expand_add_uids
+                and m_dim > 1
+                and bpe > 0
+                and (m_dim * bpe) % 32 == 0
+                and var.type.dtype
+                in (DataType.INT8, DataType.INT16, DataType.INT32, DataType.FP16, DataType.FP32)
+                and (view is None or not view.valid_shape or _static_shape(view.valid_shape) == shape)
+            ):
+                candidates.append(ROW_BCAST_FLAT)
+            return tuple(candidates)
+        if m_dim == 1 and var.unique_id not in self._vec_row_reduction_uids:
+            return (cur_layout,)
+        candidates = [cur_layout]
+        if bpe > 0 and (m_dim * bpe) % 32 == 0 and (n_dim * bpe) % 32 == 0:
+            other = COL_MAJOR_FLAT if cur_layout == ROW_MAJOR_FLAT else ROW_MAJOR_FLAT
+            candidates.append(other)
+        if var.unique_id in self._vec_nz_eligible_uids:
+            candidates.append(FRACTAL_NZ)
+        return tuple(candidates)
 
     def extract(self, func: core_ir.Function) -> None:
         for idx, (param, direction) in enumerate(zip(func.params, func.param_directions, strict=True)):
@@ -1606,23 +2370,33 @@ class _PostInferInstanceExtractor:
             else:
                 is_ext_out = direction in (core_ir.ParamDirection.Out, core_ir.ParamDirection.InOut)
             is_reusable = name in self._reusable or param.name_hint in self._reusable
+            allow_relayout = (
+                self._model.allow_external_input_relayout
+                or is_reusable
+                or is_ext_out
+                or name in self._internal_buffers
+            )
             allow_nz = (
                 is_static
                 and cur_layout == core_ir.TensorLayout.ND
                 and name not in self._reshaped_names
+                and name not in self._nz_ineligible_names
                 and is_nz_compatible_shape(shape, param.type.dtype)
-                and (
-                    self._model.allow_external_input_relayout
-                    or is_reusable
-                    or is_ext_out
-                    or name in self._internal_buffers
-                )
+                and allow_relayout
             )
-            admissible: tuple[LayoutChoice, ...]
-            if allow_nz:
-                admissible = (core_ir.TensorLayout.ND, core_ir.TensorLayout.NZ)
-            else:
-                admissible = (cur_layout,)
+            allow_dn = (
+                is_static
+                and len(shape) == 2
+                and cur_layout in (core_ir.TensorLayout.ND, core_ir.TensorLayout.DN)
+                and name not in self._reshaped_names
+                and allow_relayout
+            )
+            adm_list: list[LayoutChoice] = [cur_layout]
+            if allow_dn and core_ir.TensorLayout.DN != cur_layout:
+                adm_list.append(core_ir.TensorLayout.DN)
+            if allow_nz and core_ir.TensorLayout.NZ != cur_layout:
+                adm_list.append(core_ir.TensorLayout.NZ)
+            admissible: tuple[LayoutChoice, ...] = tuple(adm_list)
             if name in self.values:
                 prev_node = self.values[name]
                 if (
@@ -1656,6 +2430,7 @@ class _PostInferInstanceExtractor:
                 is_reusable_weight=is_reusable,
                 is_external_output=is_ext_out,
             )
+        self._analyze_vec_tiles(func)
         self._walk_stmt(func.body)
 
     def _register_tile_var(
@@ -1688,7 +2463,12 @@ class _PostInferInstanceExtractor:
         self._uid_to_name[var.unique_id] = name
         space = var.type.memory_space or core_ir.MemorySpace.Vec
         cur_layout = _effective_tile_layout(var.type)
-        admissible = _admissible_tile_layouts(var.type)
+        if space == core_ir.MemorySpace.Vec:
+            admissible: tuple[TileLayoutDesc, ...] = self._admissible_vec_tile_layouts(var)
+            if producer_op_id is None:
+                admissible = tuple(lay for lay in admissible if lay != FRACTAL_NZ) or (cur_layout,)
+        else:
+            admissible = _admissible_tile_layouts(var.type)
         node = LayoutValueNode(
             name=name,
             shape=shape,
@@ -1708,7 +2488,7 @@ class _PostInferInstanceExtractor:
         if not isinstance(src_arg, core_ir.Var) or src_arg.unique_id not in self._uid_to_name:
             return
         src_name = self._uid_to_name[src_arg.unique_id]
-        op_id = f"op_{self._op_counter}_{op.var.name_hint}_load"
+        op_id = f"{self._tile_prefix}op_{self._op_counter}_{op.var.name_hint}_load"
         self._op_counter += 1
         dst_node = self._register_tile_var(op.var, op_id, op_inputs=(src_name,))
         src_node = self.values.get(src_name)
@@ -1719,8 +2499,28 @@ class _PostInferInstanceExtractor:
             for d_lay in dst_node.admissible_layouts:
                 if not self._model.is_valid_load_config(src_node, dst_node, s_lay, d_lay):
                     continue
+                if (
+                    dst_node.memory_space == core_ir.MemorySpace.Vec
+                    and s_lay == core_ir.TensorLayout.NZ
+                    and not _is_nz_compatible_tile_load_call(
+                        rhs,
+                        src_arg.type,
+                        self._nz_scalar_defs,
+                        self._nz_loop_ranges,
+                        self._nz_param_steps_by_uid,
+                        self._nz_non_neg_uids,
+                    )
+                ):
+                    continue
                 cost = self._model.estimate_load_cost(src_node, dst_node, s_lay, d_lay)
-                kind = "NZ2NZ" if s_lay == core_ir.TensorLayout.NZ else "ND2NZ"
+                if s_lay == core_ir.TensorLayout.NZ:
+                    kind = "NZ2NZ"
+                elif s_lay == core_ir.TensorLayout.DN:
+                    kind = "DN2CM"
+                elif dst_node.memory_space == core_ir.MemorySpace.Vec:
+                    kind = "ND2RM"
+                else:
+                    kind = "ND2NZ"
                 src_label = s_lay.name if isinstance(s_lay, core_ir.TensorLayout) else str(s_lay)
                 configs.append(
                     OperatorConfig(
@@ -1750,7 +2550,7 @@ class _PostInferInstanceExtractor:
         if not isinstance(src_arg, core_ir.Var) or src_arg.unique_id not in self._uid_to_name:
             return
         src_name = self._uid_to_name[src_arg.unique_id]
-        op_id = f"op_{self._op_counter}_{op.var.name_hint}_tview"
+        op_id = f"{self._tile_prefix}op_{self._op_counter}_{op.var.name_hint}_tview"
         self._op_counter += 1
         dst_node = self._register_tile_var(op.var, op_id, op_inputs=(src_name,))
         src_node = self.values.get(src_name)
@@ -1792,7 +2592,7 @@ class _PostInferInstanceExtractor:
         if not isinstance(src_arg, core_ir.Var) or src_arg.unique_id not in self._uid_to_name:
             return
         src_name = self._uid_to_name[src_arg.unique_id]
-        op_id = f"op_{self._op_counter}_{op.var.name_hint}_move"
+        op_id = f"{self._tile_prefix}op_{self._op_counter}_{op.var.name_hint}_move"
         self._op_counter += 1
         dst_node = self._register_tile_var(op.var, op_id, op_inputs=(src_name,))
         src_node = self.values.get(src_name)
@@ -1800,7 +2600,11 @@ class _PostInferInstanceExtractor:
             return
         configs: list[OperatorConfig] = []
         for s_lay in src_node.admissible_layouts:
+            if s_lay in (ROW_BCAST_FLAT, FRACTAL_NZ) and dst_node.memory_space == core_ir.MemorySpace.Vec:
+                continue
             for d_lay in dst_node.admissible_layouts:
+                if d_lay in (ROW_BCAST_FLAT, FRACTAL_NZ) and dst_node.memory_space == core_ir.MemorySpace.Vec:
+                    continue
                 if not self._model.is_valid_move_config(src_node, dst_node, s_lay, d_lay):
                     continue
                 cost = self._model.estimate_move_cost(src_node, dst_node, s_lay, d_lay)
@@ -1843,7 +2647,7 @@ class _PostInferInstanceExtractor:
             return
         lhs_name = self._uid_to_name[lhs_arg.unique_id]
         rhs_name = self._uid_to_name[rhs_arg.unique_id]
-        op_id = f"op_{self._op_counter}_{op.var.name_hint}_matmul"
+        op_id = f"{self._tile_prefix}op_{self._op_counter}_{op.var.name_hint}_matmul"
         self._op_counter += 1
         dst_node = self._register_tile_var(op.var, op_id, op_inputs=(lhs_name, rhs_name))
         lhs_node = self.values.get(lhs_name)
@@ -1872,7 +2676,7 @@ class _PostInferInstanceExtractor:
             )
         )
 
-    def _extract_store(self, rhs: core_ir.Call) -> None:
+    def _extract_store(self, rhs: core_ir.Call, *, lhs_var: core_ir.Var | None = None) -> None:
         if len(rhs.args) < 3:
             return
         tile_arg = rhs.args[0]
@@ -1886,23 +2690,42 @@ class _PostInferInstanceExtractor:
             return
         tile_name = self._uid_to_name[tile_arg.unique_id]
         dst_name = self._uid_to_name[dst_arg.unique_id]
+        if lhs_var is not None:
+            self._uid_to_name[lhs_var.unique_id] = dst_name
         src_node = self.values.get(tile_name)
         dst_node = self.values.get(dst_name)
         if src_node is None or dst_node is None:
             return
         self.consumed_values.add(tile_name)
-        op_id = f"op_{self._op_counter}_{dst_name}_store"
+        op_id = f"{self._tile_prefix}op_{self._op_counter}_{dst_name}_store"
         self._op_counter += 1
         is_additional_store = dst_node.producer_op_id is not None or dst_name in self.consumed_values
+        is_vec = src_node.memory_space == core_ir.MemorySpace.Vec
         configs: list[OperatorConfig] = []
         for s_lay in src_node.admissible_layouts:
             for d_lay in dst_node.admissible_layouts:
-                if d_lay == core_ir.TensorLayout.NZ and not self._model.supports_acc_nz_store(
-                    src_node, dst_node
-                ):
-                    continue
-                cost = self._model.estimate_store_cost(src_node, dst_node, d_lay)
+                if is_vec:
+                    if not self._model.is_valid_vec_store_config(src_node, dst_node, s_lay, d_lay):
+                        continue
+                    if d_lay == core_ir.TensorLayout.NZ and not _is_nz_compatible_vec_tile_store_call(
+                        rhs,
+                        dst_arg.type,
+                        self._nz_scalar_defs,
+                        self._nz_loop_ranges,
+                        self._nz_param_steps_by_uid,
+                        self._nz_non_neg_uids,
+                    ):
+                        continue
+                else:
+                    if d_lay == core_ir.TensorLayout.NZ and not self._model.supports_acc_nz_store(
+                        src_node, dst_node
+                    ):
+                        continue
+                    if d_lay == core_ir.TensorLayout.DN:
+                        continue
+                cost = self._model.estimate_store_cost(src_node, dst_node, d_lay, src_layout=s_lay)
                 dst_label = d_lay.name if isinstance(d_lay, core_ir.TensorLayout) else str(d_lay)
+                pipe = "MTE3" if is_vec else "FIXPIPE"
                 configs.append(
                     OperatorConfig(
                         op_id=op_id,
@@ -1910,7 +2733,7 @@ class _PostInferInstanceExtractor:
                         input_layouts=(s_lay, d_lay) if is_additional_store else (s_lay,),
                         output_layout=s_lay if is_additional_store else d_lay,
                         op_cost_cycles=cost,
-                        notes=f"FIXPIPE {src_node.memory_space.name}->GM({dst_label})",
+                        notes=f"{pipe} {src_node.memory_space.name}->GM({dst_label})",
                     )
                 )
         supported_out_layouts = tuple(
@@ -1971,81 +2794,285 @@ class _PostInferInstanceExtractor:
             )
         )
 
-    def _extract_generic_tile_op(self, op: core_ir.AssignStmt, rhs: core_ir.Call) -> None:
-        """Extract a general `tile.*` op, filtering configs by `Backend::GetTileLayoutSpec`."""
-        if not isinstance(op.var.type, core_ir.TileType):
-            return
+    def _build_pointwise_vec_configs(
+        self,
+        op_id: str,
+        op_name: str,
+        rhs: core_ir.Call,
+        tile_inputs: list[tuple[int, str, LayoutValueNode]],
+        dst_node: LayoutValueNode,
+    ) -> list[OperatorConfig]:
+        nz_pointwise_ok = (
+            op_name in _FRACTAL_NZ_POINTWISE_OPS and (op_name != "tile.rsqrt" or len(rhs.args) == 1)
+        ) or (
+            op_name == "tile.cast"
+            and len(tile_inputs) == 1
+            and _dtype_byte_width(tile_inputs[0][2].dtype) == _dtype_byte_width(dst_node.dtype)
+        )
+        allowed_per_input: list[tuple[LayoutChoice, ...]] = []
+        any_row_major_req = False
+        for idx, _, in_node in tile_inputs:
+            req = self._model.required_input_tile_layout(op_name, idx)
+            base_adm = tuple(
+                lay
+                for lay in in_node.admissible_layouts
+                if lay != ROW_BCAST_FLAT and (lay != FRACTAL_NZ or nz_pointwise_ok)
+            )
+            if req is not None:
+                any_row_major_req = any_row_major_req or (req == core_ir.TileLayout.row_major)
+                filtered = tuple(
+                    lay
+                    for lay in base_adm
+                    if isinstance(lay, TileLayoutDesc)
+                    and (lay.blayout == req or (nz_pointwise_ok and lay == FRACTAL_NZ))
+                )
+                allowed_per_input.append(filtered if filtered else (in_node.current_layout,))
+            elif nz_pointwise_ok and FRACTAL_NZ in base_adm:
+                allowed_per_input.append((in_node.current_layout, FRACTAL_NZ))
+            else:
+                allowed_per_input.append((in_node.current_layout,))
+
+        dst_base_adm = tuple(
+            lay
+            for lay in dst_node.admissible_layouts
+            if lay != ROW_BCAST_FLAT and (lay != FRACTAL_NZ or nz_pointwise_ok)
+        )
+        if any_row_major_req:
+            allowed_outputs: tuple[LayoutChoice, ...] = tuple(
+                lay
+                for lay in dst_base_adm
+                if isinstance(lay, TileLayoutDesc)
+                and (lay.blayout == core_ir.TileLayout.row_major or (nz_pointwise_ok and lay == FRACTAL_NZ))
+            ) or (dst_node.current_layout,)
+        elif nz_pointwise_ok and FRACTAL_NZ in dst_base_adm:
+            allowed_outputs = (dst_node.current_layout, FRACTAL_NZ)
+        else:
+            allowed_outputs = (dst_node.current_layout,)
+
+        work_elements = max([dst_node.num_elements, *(in_node.num_elements for _, _, in_node in tile_inputs)])
+        cost = float(work_elements) / self._model.vec_elements_per_cycle
+        configs = [
+            OperatorConfig(
+                op_id=op_id,
+                op_name=op_name,
+                input_layouts=tuple(in_combo),
+                output_layout=out_lay,
+                op_cost_cycles=cost,
+                notes=f"Backend-validated {op_name}",
+            )
+            for in_combo in itertools.product(*allowed_per_input)
+            for out_lay in allowed_outputs
+            if len(set(in_combo)) == 1 and out_lay == in_combo[0]
+        ]
+        if not configs:
+            configs.append(
+                OperatorConfig(
+                    op_id=op_id,
+                    op_name=op_name,
+                    input_layouts=tuple(in_node.current_layout for _, _, in_node in tile_inputs),
+                    output_layout=dst_node.current_layout,
+                    op_cost_cycles=cost,
+                    notes=f"Backend-validated {op_name}",
+                )
+            )
+        return configs
+
+    def _build_tile_full_configs(self, op_id: str, dst_node: LayoutValueNode) -> list[OperatorConfig]:
+        cost = float(dst_node.num_elements) / self._model.vec_elements_per_cycle
+        configs = [
+            OperatorConfig(
+                op_id=op_id,
+                op_name="tile.full",
+                input_layouts=(),
+                output_layout=ROW_MAJOR_FLAT,
+                op_cost_cycles=cost,
+                notes="tile.full (row_major)",
+            )
+        ]
+        if FRACTAL_NZ in dst_node.admissible_layouts:
+            configs.append(
+                OperatorConfig(
+                    op_id=op_id,
+                    op_name="tile.full",
+                    input_layouts=(),
+                    output_layout=FRACTAL_NZ,
+                    op_cost_cycles=cost,
+                    notes="tile.full (FRACTAL_NZ)",
+                )
+            )
+        return configs
+
+    def _build_tile_reshape_configs(
+        self,
+        op_id: str,
+        in_node: LayoutValueNode,
+        dst_node: LayoutValueNode,
+    ) -> list[OperatorConfig]:
+        if (
+            len(in_node.shape) == 2
+            and len(dst_node.shape) == 2
+            and 1 in in_node.shape
+            and 1 in dst_node.shape
+        ):
+            in_choices = [
+                lay for lay in in_node.admissible_layouts if lay not in (ROW_BCAST_FLAT, FRACTAL_NZ)
+            ] or [in_node.current_layout]
+            out_choices = [
+                lay for lay in dst_node.admissible_layouts if lay not in (ROW_BCAST_FLAT, FRACTAL_NZ)
+            ] or [dst_node.current_layout]
+            return [
+                OperatorConfig(
+                    op_id=op_id,
+                    op_name="tile.reshape",
+                    input_layouts=(in_lay,),
+                    output_layout=out_lay,
+                    op_cost_cycles=0.0,
+                    notes=f"tile.reshape 1D vector ({in_lay} -> {out_lay})",
+                )
+                for in_lay in in_choices
+                for out_lay in out_choices
+            ]
+        return [
+            OperatorConfig(
+                op_id=op_id,
+                op_name="tile.reshape",
+                input_layouts=(ROW_MAJOR_FLAT,),
+                output_layout=ROW_MAJOR_FLAT,
+                op_cost_cycles=0.0,
+                notes="tile.reshape 2D (row_major)",
+            )
+        ]
+
+    def _collect_generic_tile_inputs(self, rhs: core_ir.Call) -> list[tuple[int, str, LayoutValueNode]]:
         tile_inputs: list[tuple[int, str, LayoutValueNode]] = []
         for idx, arg in enumerate(rhs.args):
-            if isinstance(arg, core_ir.Var) and arg.unique_id in self._uid_to_name:
-                in_name = self._uid_to_name[arg.unique_id]
-                in_node = self.values.get(in_name)
-                if in_node is not None and in_node.memory_space != core_ir.MemorySpace.DDR:
-                    tile_inputs.append((idx, in_name, in_node))
-        if not tile_inputs:
+            if not (isinstance(arg, core_ir.Var) and isinstance(arg.type, core_ir.TileType)):
+                continue
+            if arg.unique_id not in self._uid_to_name:
+                self._register_tile_var(arg, producer_op_id=None)
+            in_name = self._uid_to_name.get(arg.unique_id)
+            in_node = self.values.get(in_name) if in_name is not None else None
+            if (
+                in_name is not None
+                and in_node is not None
+                and in_node.memory_space != core_ir.MemorySpace.DDR
+            ):
+                tile_inputs.append((idx, in_name, in_node))
+        return tile_inputs
+
+    def _extract_generic_tile_op(self, op: core_ir.AssignStmt, rhs: core_ir.Call) -> None:
+        """Extract a general `tile.*` op with explicit ISA contracts and `Backend::GetTileLayoutSpec`."""
+        if not isinstance(op.var.type, core_ir.TileType):
+            return
+        op_name = rhs.op.name
+        tile_inputs = self._collect_generic_tile_inputs(rhs)
+        if not tile_inputs and op_name != "tile.full":
             return
 
-        op_id = f"op_{self._op_counter}_{op.var.name_hint}_{rhs.op.name.replace('.', '_')}"
+        op_id = f"{self._tile_prefix}op_{self._op_counter}_{op.var.name_hint}_{op_name.replace('.', '_')}"
         self._op_counter += 1
         dst_node = self._register_tile_var(op.var, op_id, op_inputs=tuple(name for _, name, _ in tile_inputs))
         if dst_node is None:
             return
 
-        allowed_per_input: list[tuple[LayoutChoice, ...]] = []
-        any_row_major_req = False
-        for idx, _, in_node in tile_inputs:
-            req = self._model.required_input_tile_layout(rhs.op.name, idx)
-            if req is not None:
-                any_row_major_req = any_row_major_req or (req == core_ir.TileLayout.row_major)
-                filtered = tuple(
-                    lay
-                    for lay in in_node.admissible_layouts
-                    if isinstance(lay, TileLayoutDesc) and lay.blayout == req
-                )
-                allowed_per_input.append(filtered if filtered else (in_node.current_layout,))
-            else:
-                allowed_per_input.append(in_node.admissible_layouts)
-
-        if any_row_major_req:
-            allowed_outputs: tuple[LayoutChoice, ...] = tuple(
-                lay
-                for lay in dst_node.admissible_layouts
-                if isinstance(lay, TileLayoutDesc) and lay.blayout == core_ir.TileLayout.row_major
-            ) or (dst_node.current_layout,)
-        else:
-            allowed_outputs = dst_node.admissible_layouts
-
-        work_elements = max([dst_node.num_elements, *(in_node.num_elements for _, _, in_node in tile_inputs)])
-        cost = float(work_elements) / self._model.vec_elements_per_cycle
         configs: list[OperatorConfig] = []
-        for in_combo in itertools.product(*allowed_per_input):
-            for out_lay in allowed_outputs:
-                if len(set(in_combo)) == 1 and out_lay == in_combo[0]:
-                    configs.append(
-                        OperatorConfig(
-                            op_id=op_id,
-                            op_name=rhs.op.name,
-                            input_layouts=tuple(in_combo),
-                            output_layout=out_lay,
-                            op_cost_cycles=cost,
-                            notes=f"Backend-validated {rhs.op.name}",
-                        )
-                    )
-        if not configs:
+        if op_name == "tile.full":
+            configs.extend(self._build_tile_full_configs(op_id, dst_node))
+        elif op_name == "tile.reshape" and len(tile_inputs) == 1:
+            configs.extend(self._build_tile_reshape_configs(op_id, tile_inputs[0][2], dst_node))
+        elif op_name in _ROW_REDUCTION_OPS:
+            cost = float(tile_inputs[0][2].num_elements) / self._model.vec_elements_per_cycle
+            in_lays = tuple(ROW_MAJOR_FLAT for _ in tile_inputs)
             configs.append(
                 OperatorConfig(
                     op_id=op_id,
-                    op_name=rhs.op.name,
-                    input_layouts=tuple(in_node.current_layout for _, _, in_node in tile_inputs),
-                    output_layout=dst_node.current_layout,
+                    op_name=op_name,
+                    input_layouts=in_lays,
+                    output_layout=COL_MAJOR_FLAT,
                     op_cost_cycles=cost,
-                    notes=f"Backend-validated {rhs.op.name}",
+                    notes=f"Row reduction {op_name}",
                 )
             )
+        elif op_name in _COL_REDUCTION_OPS:
+            cost = float(tile_inputs[0][2].num_elements) / self._model.vec_elements_per_cycle
+            in_lays = tuple(ROW_MAJOR_FLAT for _ in tile_inputs)
+            configs.append(
+                OperatorConfig(
+                    op_id=op_id,
+                    op_name=op_name,
+                    input_layouts=in_lays,
+                    output_layout=ROW_MAJOR_FLAT,
+                    op_cost_cycles=cost,
+                    notes=f"Col reduction {op_name}",
+                )
+            )
+        elif op_name == "tile.row_expand_add" and len(tile_inputs) >= 2:
+            tile_mn = tile_inputs[0][2]
+            row_vec = tile_inputs[1][2]
+            m_dim = int(tile_mn.shape[-2]) if len(tile_mn.shape) >= 2 else 1
+            base_cost = (
+                float(max(tile_mn.num_elements, dst_node.num_elements)) / self._model.vec_elements_per_cycle
+            )
+            tail = (ROW_MAJOR_FLAT,) * (len(tile_inputs) - 2)
+            configs.append(
+                OperatorConfig(
+                    op_id=op_id,
+                    op_name=op_name,
+                    input_layouts=(ROW_MAJOR_FLAT, COL_MAJOR_FLAT, *tail),
+                    output_layout=ROW_MAJOR_FLAT,
+                    op_cost_cycles=base_cost + self._model.estimate_vbrcb_cost(m_dim),
+                    notes="tile.row_expand_add (compact col_major + vbrcb)",
+                )
+            )
+            if ROW_BCAST_FLAT in row_vec.admissible_layouts:
+                configs.append(
+                    OperatorConfig(
+                        op_id=op_id,
+                        op_name=op_name,
+                        input_layouts=(ROW_MAJOR_FLAT, ROW_BCAST_FLAT, *tail),
+                        output_layout=ROW_MAJOR_FLAT,
+                        op_cost_cycles=base_cost,
+                        notes="tile.row_expand_add (pre-expanded [M, c0] row_major)",
+                    )
+                )
+        elif op_name in _OTHER_ROW_EXPAND_OPS and len(tile_inputs) >= 2:
+            tile_mn = tile_inputs[0][2]
+            m_dim = int(tile_mn.shape[-2]) if len(tile_mn.shape) >= 2 else 1
+            base_cost = (
+                float(max(tile_mn.num_elements, dst_node.num_elements)) / self._model.vec_elements_per_cycle
+            )
+            tail = (ROW_MAJOR_FLAT,) * (len(tile_inputs) - 2)
+            configs.append(
+                OperatorConfig(
+                    op_id=op_id,
+                    op_name=op_name,
+                    input_layouts=(ROW_MAJOR_FLAT, COL_MAJOR_FLAT, *tail),
+                    output_layout=ROW_MAJOR_FLAT,
+                    op_cost_cycles=base_cost + self._model.estimate_vbrcb_cost(m_dim),
+                    notes=f"Row expand {op_name} (compact col_major + vbrcb)",
+                )
+            )
+        elif op_name in _COL_EXPAND_OPS and len(tile_inputs) >= 2:
+            tile_mn = tile_inputs[0][2]
+            base_cost = (
+                float(max(tile_mn.num_elements, dst_node.num_elements)) / self._model.vec_elements_per_cycle
+            )
+            configs.append(
+                OperatorConfig(
+                    op_id=op_id,
+                    op_name=op_name,
+                    input_layouts=tuple(ROW_MAJOR_FLAT for _ in tile_inputs),
+                    output_layout=ROW_MAJOR_FLAT,
+                    op_cost_cycles=base_cost,
+                    notes=f"Col expand {op_name}",
+                )
+            )
+        else:
+            configs.extend(self._build_pointwise_vec_configs(op_id, op_name, rhs, tile_inputs, dst_node))
         self.operations.append(
             LayoutOperationNode(
                 op_id=op_id,
-                op_name=rhs.op.name,
+                op_name=op_name,
                 inputs=tuple(name for _, name, _ in tile_inputs),
                 output=dst_node.name,
                 invocations=self._model.expected_uses * self._loop_multiplier,
@@ -2074,9 +3101,11 @@ class _PostInferInstanceExtractor:
             elif op_name in _TILE_MATMUL_OPS:
                 self._extract_matmul(op, rhs)
             elif op_name == _TILE_STORE_OP:
-                self._extract_store(rhs)
+                self._extract_store(rhs, lhs_var=op.var)
             elif op_name.startswith("tile."):
                 self._extract_generic_tile_op(op, rhs)
+        elif isinstance(rhs, core_ir.Var) and rhs.unique_id in self._uid_to_name:
+            self._uid_to_name[op.var.unique_id] = self._uid_to_name[rhs.unique_id]
 
     def _walk_for_stmt(self, op: core_ir.ForStmt) -> None:
         for iter_arg in op.iter_args:
@@ -2146,6 +3175,7 @@ def extract_layout_instance(
     non_incore_funcs = [f for f in program.functions.values() if not core_ir.is_incore_type(f.func_type)]
     ext_out_names: set[str] | None = None
     reshaped_names: set[str] = set()
+    nz_ineligible_names: set[str] = set()
     internal_buffers: set[str] = set()
     call_counts: dict[str, int] = {}
     call_arg_names: dict[str, list[str | None]] = {}
@@ -2173,6 +3203,7 @@ def extract_layout_instance(
         call_sites = call_counter.call_sites
         param_steps = call_counter.param_steps
         reshaped_names = call_counter.reshaped_names
+        nz_ineligible_names = call_counter.nz_ineligible_names
         internal_buffers = call_counter.internal_buffers
         incore_funcs.sort(key=lambda fn: call_counter.call_order.get(fn.name, 10**9))
 
@@ -2180,11 +3211,17 @@ def extract_layout_instance(
         sites = call_sites.get(func.name)
         if sites:
             for site_args, _ in sites:
-                reshaped_names.update(_collect_func_nz_ineligible(func, model, site_args, param_steps))
+                nz_ineligible_names.update(_collect_func_nz_ineligible(func, model, site_args, param_steps))
+                expands_gm = _collect_func_expands_gm_names(func, site_args)
+                nz_ineligible_names.update(expands_gm)
+                reshaped_names.update(expands_gm)
         else:
-            reshaped_names.update(
+            nz_ineligible_names.update(
                 _collect_func_nz_ineligible(func, model, call_arg_names.get(func.name), param_steps)
             )
+            expands_gm = _collect_func_expands_gm_names(func, call_arg_names.get(func.name))
+            nz_ineligible_names.update(expands_gm)
+            reshaped_names.update(expands_gm)
 
     multi_incore = len(incore_funcs) > 1
     op_offset = 0
@@ -2198,6 +3235,7 @@ def extract_layout_instance(
                     reusable,
                     external_out_names=ext_out_names,
                     reshaped_names=reshaped_names,
+                    nz_ineligible_names=nz_ineligible_names,
                     internal_buffers=internal_buffers,
                     shared_values=values,
                     consumed_values=consumed_values,
@@ -2205,6 +3243,7 @@ def extract_layout_instance(
                     tile_prefix=prefix,
                     call_multiplier=site_mult,
                     param_name_overrides=site_args,
+                    param_steps=param_steps,
                 )
                 extractor.extract(func)
                 values = extractor.values
@@ -2219,6 +3258,7 @@ def extract_layout_instance(
             reusable,
             external_out_names=ext_out_names,
             reshaped_names=reshaped_names,
+            nz_ineligible_names=nz_ineligible_names,
             internal_buffers=internal_buffers,
             shared_values=values,
             consumed_values=consumed_values,
@@ -2226,6 +3266,7 @@ def extract_layout_instance(
             tile_prefix=prefix,
             call_multiplier=call_counts.get(func.name, 1),
             param_name_overrides=call_arg_names.get(func.name),
+            param_steps=param_steps,
         )
         extractor.extract(func)
         values = extractor.values
@@ -2233,55 +3274,119 @@ def extract_layout_instance(
         operations.extend(extractor.operations)
         op_offset = extractor.op_counter
 
-    _prune_incompatible_gm_nz(values, operations, reshaped_names)
-
-    filtered_operations: list[LayoutOperationNode] = []
-    for op in operations:
-        valid_cfgs = tuple(
-            cfg
-            for cfg in op.configs
-            if cfg.output_layout in values[op.output].admissible_layouts
-            and all(
-                lay in values[inp].admissible_layouts
-                for inp, lay in zip(op.inputs, cfg.input_layouts, strict=True)
-            )
-        )
-        filtered_operations.append(replace(op, configs=valid_cfgs if valid_cfgs else op.configs))
+    filtered_operations = _prune_unsupported_gm_and_fractal_layouts(
+        values, operations, nz_ineligible_names, reshaped_names
+    )
 
     return LayoutProblemInstance(values=values, operations=filtered_operations, cost_model=model)
 
 
-def _prune_incompatible_gm_nz(
+def _is_gm_layout_supported_by_ops(
+    val_name: str,
+    lay: core_ir.TensorLayout,
+    participating: Sequence[LayoutOperationNode],
+) -> bool:
+    for op in participating:
+        for in_idx, inp_name in enumerate(op.inputs):
+            if inp_name == val_name and not any(cfg.input_layouts[in_idx] == lay for cfg in op.configs):
+                return False
+        if op.output == val_name and not any(cfg.output_layout == lay for cfg in op.configs):
+            return False
+    return True
+
+
+def _prune_unsupported_gm_layouts(
     values: dict[str, LayoutValueNode],
     operations: Sequence[LayoutOperationNode],
+    nz_ineligible_names: set[str],
     reshaped_names: set[str],
-) -> None:
-    """Prune `TensorLayout.NZ` from any GM tensor lacking an `NZ`-compatible config on all ops."""
+) -> bool:
+    """Independently prune unsupported `TensorLayout.NZ` / `TensorLayout.DN` from GM tensors."""
+    changed = False
     for val_name, val_node in list(values.items()):
-        if (
-            val_node.memory_space != core_ir.MemorySpace.DDR
-            or len(val_node.admissible_layouts) <= 1
-            or core_ir.TensorLayout.NZ not in val_node.admissible_layouts
-        ):
+        if val_node.memory_space != core_ir.MemorySpace.DDR or len(val_node.admissible_layouts) <= 1:
             continue
-        nz_supported = val_name not in reshaped_names
-        for op in operations:
-            if not nz_supported:
-                break
-            for in_idx, inp_name in enumerate(op.inputs):
-                if inp_name == val_name and not any(
-                    cfg.input_layouts[in_idx] == core_ir.TensorLayout.NZ for cfg in op.configs
+        participating = [op for op in operations if val_name in op.inputs or op.output == val_name]
+        kept: list[LayoutChoice] = []
+        for lay in val_node.admissible_layouts:
+            if lay == val_node.current_layout:
+                kept.append(lay)
+            elif lay == core_ir.TensorLayout.NZ:
+                if (
+                    val_name not in nz_ineligible_names
+                    and val_name not in reshaped_names
+                    and _is_gm_layout_supported_by_ops(val_name, lay, participating)
                 ):
-                    nz_supported = False
-                    break
+                    kept.append(lay)
+            elif lay == core_ir.TensorLayout.DN:
+                if (
+                    val_name not in reshaped_names
+                    and bool(participating)
+                    and _is_gm_layout_supported_by_ops(val_name, lay, participating)
+                ):
+                    kept.append(lay)
+            else:
+                kept.append(lay)
+        kept_tuple = tuple(kept) if kept else (val_node.current_layout,)
+        if kept_tuple != val_node.admissible_layouts:
+            values[val_name] = replace(val_node, admissible_layouts=kept_tuple)
+            changed = True
+    return changed
+
+
+def _prune_unsupported_gm_and_fractal_layouts(
+    values: dict[str, LayoutValueNode],
+    operations: Sequence[LayoutOperationNode],
+    nz_ineligible_names: set[str],
+    reshaped_names: set[str],
+) -> list[LayoutOperationNode]:
+    """Filter configs and propagate GM/FRACTAL_NZ pruning to a fixed point."""
+    cur_ops = list(operations)
+    for _ in range(len(values) + len(operations) + 2):
+        gm_changed = _prune_unsupported_gm_layouts(values, cur_ops, nz_ineligible_names, reshaped_names)
+        next_ops: list[LayoutOperationNode] = []
+        for op in cur_ops:
+            valid_cfgs = tuple(
+                cfg
+                for cfg in op.configs
+                if cfg.output_layout in values[op.output].admissible_layouts
+                and all(
+                    lay in values[inp].admissible_layouts
+                    for inp, lay in zip(op.inputs, cfg.input_layouts, strict=True)
+                )
+            )
+            next_ops.append(replace(op, configs=valid_cfgs if valid_cfgs else op.configs))
+        cur_ops = next_ops
+
+        vec_changed = False
+        for val_name, val_node in list(values.items()):
             if (
-                nz_supported
-                and op.output == val_name
-                and not any(cfg.output_layout == core_ir.TensorLayout.NZ for cfg in op.configs)
+                val_node.memory_space != core_ir.MemorySpace.Vec
+                or FRACTAL_NZ not in val_node.admissible_layouts
             ):
-                nz_supported = False
-        if not nz_supported:
-            values[val_name] = replace(val_node, admissible_layouts=(val_node.current_layout,))
+                continue
+            nz_viable = True
+            for op in cur_ops:
+                if op.output == val_name and not any(cfg.output_layout == FRACTAL_NZ for cfg in op.configs):
+                    nz_viable = False
+                    break
+                for in_idx, inp_name in enumerate(op.inputs):
+                    if inp_name == val_name and not any(
+                        cfg.input_layouts[in_idx] == FRACTAL_NZ for cfg in op.configs
+                    ):
+                        nz_viable = False
+                        break
+                if not nz_viable:
+                    break
+            if not nz_viable:
+                kept = tuple(lay for lay in val_node.admissible_layouts if lay != FRACTAL_NZ)
+                values[val_name] = replace(
+                    val_node, admissible_layouts=kept if kept else (val_node.current_layout,)
+                )
+                vec_changed = True
+        if not gm_changed and not vec_changed:
+            break
+    return cur_ops
 
 
 def _operator_cost_multiplier(instance: LayoutProblemInstance, op: LayoutOperationNode) -> float:
@@ -2486,9 +3591,13 @@ def enumerate_assignments(
                 inp_node = instance.values[inp_name]
                 existing = val_map.get(inp_name)
                 if existing is not None:
-                    # Only Vec -> tile.move can change on-chip layout on an existing edge.
-                    can_relayout = (
-                        inp_node.memory_space == core_ir.MemorySpace.Vec and op.op_name == _TILE_MOVE_OP
+                    # Only Vec conversions or Vec->Vec tile.move can relayout an edge.
+                    can_relayout = inp_node.memory_space == core_ir.MemorySpace.Vec and (
+                        op.op_name == _TILE_MOVE_OP
+                        or (
+                            op.op_name.startswith("tile.")
+                            and instance.cost_model.supports_vec_tile_conversion(inp_node, existing, req_lay)
+                        )
                     )
                     if not can_relayout and existing != req_lay:
                         consistent = False
@@ -2510,7 +3619,12 @@ def enumerate_assignments(
             for k in new_vals:
                 val_map.pop(k, None)
 
-    _search(0, {}, {})
+    initial_vals: dict[str, LayoutChoice] = {
+        name: node.current_layout
+        for name, node in instance.values.items()
+        if node.producer_op_id is None and node.memory_space != core_ir.MemorySpace.DDR
+    }
+    _search(0, initial_vals, {})
 
     if deduplicate:
         best_by_layout: dict[tuple[tuple[str, str], ...], CostBreakdown] = {}
@@ -2539,7 +3653,7 @@ def _with_tensor_layout(tensor_type: core_ir.TensorType, layout: core_ir.TensorL
     ):
         return TensorType(tensor_type.shape, tensor_type.dtype, tensor_type.memref, None)
 
-    stride = list(old_view.stride) if old_view is not None else []
+    stride: list[core_ir.Expr] = []
     valid_shape = list(old_view.valid_shape) if old_view is not None else []
     pad = old_view.pad if old_view is not None else core_ir.PadValue.null
     new_view = TensorView(stride=stride, layout=layout, valid_shape=valid_shape, pad=pad)
@@ -2646,6 +3760,165 @@ def _nz_offset_scalar_uids(
     return expanded
 
 
+def _with_vec_memory_space(
+    t: core_ir.Type,
+    tile_view: core_ir.TileView | None = None,
+) -> core_ir.Type:
+    if not isinstance(t, core_ir.TileType):
+        return t
+    return core_ir.TileType(
+        t.shape,
+        t.dtype,
+        t.memref,
+        tile_view if tile_view is not None else t.tile_view,
+        core_ir.MemorySpace.Vec,
+    )
+
+
+def _with_call_type(call: core_ir.Call, new_type: core_ir.Type) -> core_ir.Call:
+    return core_ir.Call(
+        call.op,
+        list(call.args),
+        dict(call.kwargs),
+        dict(call.attrs) if call.attrs else None,
+        new_type,
+        call.span,
+    )
+
+
+def _col_major_tile_view(tile_type: core_ir.TileType) -> core_ir.TileView:
+    old = tile_type.tile_view
+    valid_shape = list(old.valid_shape) if (old is not None and old.valid_shape) else list(tile_type.shape)
+    return core_ir.TileView(
+        valid_shape,
+        list(old.stride) if old is not None else [],
+        old.start_offset if old is not None else None,
+        core_ir.TileLayout.col_major,
+        core_ir.TileLayout.none_box,
+        512,
+        old.pad if old is not None else core_ir.PadValue.null,
+        bool(old.compact) if old is not None else False,
+    )
+
+
+def _row_major_tile_view(tile_type: core_ir.TileType) -> core_ir.TileView:
+    old = tile_type.tile_view
+    valid_shape = list(old.valid_shape) if (old is not None and old.valid_shape) else list(tile_type.shape)
+    return core_ir.TileView(
+        valid_shape,
+        list(old.stride) if old is not None else [],
+        old.start_offset if old is not None else None,
+        core_ir.TileLayout.row_major,
+        core_ir.TileLayout.none_box,
+        512,
+        old.pad if old is not None else core_ir.PadValue.null,
+        bool(old.compact) if old is not None else False,
+    )
+
+
+def _nz_backing_nd_shape_exprs(
+    shape: Sequence[core_ir.Expr],
+    c0: int,
+    span: core_ir.Span,
+) -> list[core_ir.Expr]:
+    static = _static_shape(shape)
+    if static is not None and len(static) >= 2:
+        batch = math.prod(static[:-2]) if len(static) > 2 else 1
+        rows, cols = static[-2], static[-1]
+        return [
+            core_ir.ConstInt(batch * (cols // c0), DataType.INDEX, span),
+            core_ir.ConstInt(rows * c0, DataType.INDEX, span),
+        ]
+    c0_expr = core_ir.ConstInt(c0, DataType.INDEX, span)
+    cb_expr = core_ir.FloorDiv(shape[-1], c0_expr, DataType.INDEX, span)
+    row_expr = cb_expr
+    for dim in reversed(shape[:-2]):
+        row_expr = core_ir.Mul(dim, row_expr, DataType.INDEX, span)
+    col_expr = core_ir.Mul(shape[-2], c0_expr, DataType.INDEX, span)
+    return [row_expr, col_expr]
+
+
+def _nz_backing_nd_offsets_and_window(  # noqa: PLR0913
+    offsets: Sequence[core_ir.Expr],
+    gm_shape: Sequence[core_ir.Expr],
+    tr: int,
+    tc: int,
+    c0: int,
+    span: core_ir.Span,
+) -> tuple[list[core_ir.Expr], list[core_ir.Expr]]:
+    b_idx: core_ir.Expr | None = None
+    if len(gm_shape) > 2:
+        stride_expr: core_ir.Expr | None = None
+        for idx in range(len(gm_shape) - 3, -1, -1):
+            off = offsets[idx]
+            if not (isinstance(off, core_ir.ConstInt) and int(off.value) == 0):
+                term = off if stride_expr is None else core_ir.Mul(off, stride_expr, DataType.INDEX, span)
+                b_idx = term if b_idx is None else core_ir.Add(b_idx, term, DataType.INDEX, span)
+            dim_expr = gm_shape[idx]
+            stride_expr = (
+                dim_expr if stride_expr is None else core_ir.Mul(dim_expr, stride_expr, DataType.INDEX, span)
+            )
+
+    off_r, off_c = offsets[-2], offsets[-1]
+    c0_expr = core_ir.ConstInt(c0, DataType.INDEX, span)
+    if isinstance(off_c, core_ir.ConstInt):
+        cb_expr: core_ir.Expr = core_ir.ConstInt(int(off_c.value) // c0, DataType.INDEX, span)
+    else:
+        cb_expr = core_ir.FloorDiv(off_c, c0_expr, DataType.INDEX, span)
+
+    if b_idx is None or (isinstance(b_idx, core_ir.ConstInt) and int(b_idx.value) == 0):
+        nd_row = cb_expr
+    else:
+        if isinstance(gm_shape[-1], core_ir.ConstInt):
+            c_blocks_expr: core_ir.Expr = core_ir.ConstInt(
+                int(gm_shape[-1].value) // c0, DataType.INDEX, span
+            )
+        else:
+            c_blocks_expr = core_ir.FloorDiv(gm_shape[-1], c0_expr, DataType.INDEX, span)
+        b_scaled = core_ir.Mul(b_idx, c_blocks_expr, DataType.INDEX, span)
+        if isinstance(cb_expr, core_ir.ConstInt) and int(cb_expr.value) == 0:
+            nd_row = b_scaled
+        else:
+            nd_row = core_ir.Add(b_scaled, cb_expr, DataType.INDEX, span)
+
+    if isinstance(off_r, core_ir.ConstInt):
+        nd_col: core_ir.Expr = core_ir.ConstInt(int(off_r.value) * c0, DataType.INDEX, span)
+    else:
+        nd_col = core_ir.Mul(off_r, c0_expr, DataType.INDEX, span)
+
+    nd_win = [
+        core_ir.ConstInt(tc // c0, DataType.INDEX, span),
+        core_ir.ConstInt(tr * c0, DataType.INDEX, span),
+    ]
+    return [nd_row, nd_col], nd_win
+
+
+def _parse_op_id_counter(op_id: str, prefix: str) -> int | None:
+    if prefix:
+        if not op_id.startswith(prefix):
+            return None
+        rest = op_id[len(prefix) :]
+    else:
+        if "." in op_id.split("op_", 1)[0]:
+            return None
+        rest = op_id
+    if not rest.startswith("op_"):
+        return None
+    parts = rest.split("_", 2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        return None
+    return int(parts[1])
+
+
+def _find_return_stmts(stmt: core_ir.Stmt) -> list[core_ir.ReturnStmt]:
+    if isinstance(stmt, core_ir.ReturnStmt):
+        return [stmt]
+    out: list[core_ir.ReturnStmt] = []
+    for child in _iter_child_stmts(stmt):
+        out.extend(_find_return_stmts(child))
+    return out
+
+
 class _LayoutAssignmentWriter(core_ir.IRMutator):
     """Write a `LayoutAssignment` (both GM `TensorLayout` and on-chip `TileLayoutDesc`) back to IR."""
 
@@ -2653,6 +3926,7 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         super().__init__()
         self._tensor_layouts = assignment.tensor_layouts
         self._tile_layouts = assignment.tile_layouts
+        self._op_configs = dict(assignment.op_configs)
         self._scoped_tensor_layouts: dict[tuple[str, str], core_ir.TensorLayout] = {}
         self._tile_prefix_override: dict[str, str] = {}
         self._specialized_callees: dict[tuple[str, tuple[core_ir.TensorLayout | None, ...]], str] = {}
@@ -2662,6 +3936,18 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         self._func_return_types: dict[str, list[core_ir.Type]] = {}
         self._current_func_name = ""
         self._func_promoted_gm_to_nz = False
+        self._multi_incore = False
+        # Per-function state populated in `visit_function`.
+        self._assign_op_cfg: dict[int, OperatorConfig] = {}
+        self._eval_store_cfgs: deque[OperatorConfig | None] = deque()
+        self._vec_prod_lay: dict[int, TileLayoutDesc] = {}
+        self._vec_demanded: dict[int, list[TileLayoutDesc]] = {}
+        self._vec_conv_vars: dict[tuple[int, TileLayoutDesc], core_ir.Var] = {}
+        self._vec_logical_shapes: dict[int, tuple[int, ...]] = {}
+        self._orig_tile_shapes: dict[int, tuple[int, ...]] = {}
+        self._nz_nd_needed_uids: set[int] = set()
+        self._nz_nd_backing_vars: dict[int, core_ir.Var] = {}
+        self._for_iter_arg_layouts: list[list[TileLayoutDesc | None]] = []
 
     def _lookup_tensor_layout(self, name_hint: str) -> core_ir.TensorLayout | None:
         clean_name = _clean_ssa_name(name_hint)
@@ -2767,6 +4053,7 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
             self._param_steps = visitor.param_steps
             extra_incore = self._register_callee_specializations(func_by_name, visitor)
 
+        self._multi_incore = len(incore_funcs) > 1
         rewritten_by_name: dict[str, core_ir.Function] = {}
         for func in incore_funcs + extra_incore + sub_orch + top_orch:
             rewritten_by_name[func.name] = self.visit_function(func)
@@ -2824,12 +4111,539 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
                 prologue_stmts.append(core_ir.AssignStmt(aligned_var, aligned_expr, param.span))
         return prologue_stmts
 
-    def visit_function(self, func: core_ir.Function) -> core_ir.Function:
-        if func.level is not None and core_ir.level_to_linqu_level(func.level) >= 3:
-            return func
-        self._var_remap.clear()
-        self._current_func_name = func.name
-        self._func_promoted_gm_to_nz = False
+    def _func_tile_prefix(self, func_name: str) -> str:
+        ov = self._tile_prefix_override.get(func_name)
+        if ov is not None:
+            return f"{ov}."
+        if self._multi_incore:
+            return f"{func_name}."
+        return ""
+
+    def _collect_func_op_configs(self, func_name: str) -> list[tuple[str, OperatorConfig]]:
+        prefix = self._func_tile_prefix(func_name)
+        matched: list[tuple[int, str, OperatorConfig]] = []
+        for op_id, cfg in self._op_configs.items():
+            cnt = _parse_op_id_counter(op_id, prefix)
+            if cnt is not None:
+                matched.append((cnt, op_id, cfg))
+        matched.sort(key=lambda item: item[0])
+        return [(op_id, cfg) for _, op_id, cfg in matched]
+
+    def _infer_load_config(
+        self,
+        rhs: core_ir.Call,
+        lhs_var: core_ir.Var | None,
+        var_tensor_lays: Mapping[int, core_ir.TensorLayout],
+    ) -> OperatorConfig | None:
+        if lhs_var is None or not rhs.args or not isinstance(rhs.args[0], core_ir.Var):
+            return None
+        src_arg = rhs.args[0]
+        gm_lay = var_tensor_lays.get(src_arg.unique_id)
+        if gm_lay is None and isinstance(src_arg.type, core_ir.TensorType):
+            gm_lay = self._lookup_tensor_layout(src_arg.name_hint) or _tensor_type_layout(src_arg.type)
+        dst_lay: TileLayoutDesc | None = self._lookup_tile_desc(lhs_var.name_hint)
+        if dst_lay is None and isinstance(lhs_var.type, core_ir.TileType):
+            dst_lay = _effective_tile_layout(lhs_var.type)
+        if (
+            gm_lay == core_ir.TensorLayout.DN
+            and isinstance(lhs_var.type, core_ir.TileType)
+            and (lhs_var.type.memory_space or core_ir.MemorySpace.Vec) == core_ir.MemorySpace.Vec
+        ):
+            dst_lay = COL_MAJOR_FLAT
+        if gm_lay is None or dst_lay is None:
+            return None
+        return OperatorConfig("fallback", rhs.op.name, (gm_lay,), dst_lay, 0.0)
+
+    def _infer_store_config(
+        self,
+        rhs: core_ir.Call,
+        var_tensor_lays: Mapping[int, core_ir.TensorLayout],
+    ) -> OperatorConfig | None:
+        if len(rhs.args) < 3:
+            return None
+        tile_arg, dst_arg = rhs.args[0], rhs.args[2]
+        if not isinstance(tile_arg, core_ir.Var) or not isinstance(dst_arg, core_ir.Var):
+            return None
+        gm_lay = var_tensor_lays.get(dst_arg.unique_id)
+        if gm_lay is None and isinstance(dst_arg.type, core_ir.TensorType):
+            gm_lay = self._lookup_tensor_layout(dst_arg.name_hint) or _tensor_type_layout(dst_arg.type)
+        if not isinstance(tile_arg.type, core_ir.TileType) or gm_lay is None:
+            return None
+        tile_lay = self._vec_prod_lay.get(tile_arg.unique_id) or _effective_tile_layout(tile_arg.type)
+        if (tile_arg.type.memory_space or core_ir.MemorySpace.Vec) == core_ir.MemorySpace.Vec:
+            t_shape = self._orig_tile_shapes.get(tile_arg.unique_id) or _static_shape(tile_arg.type.shape)
+            if gm_lay == core_ir.TensorLayout.NZ:
+                tile_lay = FRACTAL_NZ
+            elif gm_lay == core_ir.TensorLayout.DN:
+                tile_lay = COL_MAJOR_FLAT
+            elif t_shape and len(t_shape) == 2 and t_shape[1] == 1 and t_shape[0] > 1:
+                tile_lay = COL_MAJOR_FLAT
+            else:
+                tile_lay = ROW_MAJOR_FLAT
+        return OperatorConfig("fallback", rhs.op.name, (tile_lay,), gm_lay, 0.0)
+
+    def _infer_load_store_or_move_config(
+        self,
+        rhs: core_ir.Call,
+        lhs_var: core_ir.Var | None,
+        var_tensor_lays: Mapping[int, core_ir.TensorLayout],
+    ) -> OperatorConfig | None:
+        op_name = rhs.op.name
+        if op_name == _TILE_LOAD_OP:
+            return self._infer_load_config(rhs, lhs_var, var_tensor_lays)
+        if op_name == _TILE_STORE_OP:
+            return self._infer_store_config(rhs, var_tensor_lays)
+        if op_name == _TILE_MOVE_OP and lhs_var is not None and rhs.args:
+            src_arg = rhs.args[0]
+            if not isinstance(src_arg, core_ir.Var) or not isinstance(src_arg.type, core_ir.TileType):
+                return None
+            src_lay = self._vec_prod_lay.get(src_arg.unique_id) or _effective_tile_layout(src_arg.type)
+            dst_lay = self._lookup_tile_desc(lhs_var.name_hint) or (
+                _effective_tile_layout(lhs_var.type)
+                if isinstance(lhs_var.type, core_ir.TileType)
+                else src_lay
+            )
+            return OperatorConfig("fallback", op_name, (src_lay,), dst_lay, 0.0)
+        return None
+
+    def _infer_op_config(
+        self,
+        rhs: core_ir.Call,
+        lhs_var: core_ir.Var | None,
+        var_tensor_lays: Mapping[int, core_ir.TensorLayout],
+    ) -> OperatorConfig | None:
+        op_name = rhs.op.name
+        if op_name in (_TILE_LOAD_OP, _TILE_STORE_OP, _TILE_MOVE_OP):
+            return self._infer_load_store_or_move_config(rhs, lhs_var, var_tensor_lays)
+        if lhs_var is None or not isinstance(lhs_var.type, core_ir.TileType):
+            return None
+        tile_args = [
+            a for a in rhs.args if isinstance(a, core_ir.Var) and isinstance(a.type, core_ir.TileType)
+        ]
+        if not tile_args and op_name != "tile.full":
+            return None
+        if op_name == "tile.reshape" and len(tile_args) == 1:
+            in_shape = self._orig_tile_shapes.get(tile_args[0].unique_id) or _static_shape(
+                tile_args[0].type.shape  # type: ignore[arg-type]
+            )
+            dst_shape = _static_shape(lhs_var.type.shape)
+            if (
+                in_shape
+                and dst_shape
+                and len(in_shape) == 2
+                and len(dst_shape) == 2
+                and 1 in in_shape
+                and 1 in dst_shape
+            ):
+                in_lay = self._vec_prod_lay.get(tile_args[0].unique_id) or _effective_tile_layout(
+                    tile_args[0].type  # type: ignore[arg-type]
+                )
+                out_lay = self._lookup_tile_desc(lhs_var.name_hint) or _effective_tile_layout(lhs_var.type)
+                return OperatorConfig("fallback", op_name, (in_lay,), out_lay, 0.0)
+            return OperatorConfig("fallback", op_name, (ROW_MAJOR_FLAT,), ROW_MAJOR_FLAT, 0.0)
+        if op_name in _ROW_REDUCTION_OPS:
+            return OperatorConfig(
+                "fallback", op_name, tuple(ROW_MAJOR_FLAT for _ in tile_args), COL_MAJOR_FLAT, 0.0
+            )
+        if op_name in _COL_REDUCTION_OPS or op_name in _COL_EXPAND_OPS:
+            return OperatorConfig(
+                "fallback", op_name, tuple(ROW_MAJOR_FLAT for _ in tile_args), ROW_MAJOR_FLAT, 0.0
+            )
+        if op_name in _OTHER_ROW_EXPAND_OPS and len(tile_args) >= 2:
+            tail = (ROW_MAJOR_FLAT,) * (len(tile_args) - 2)
+            return OperatorConfig(
+                "fallback", op_name, (ROW_MAJOR_FLAT, COL_MAJOR_FLAT, *tail), ROW_MAJOR_FLAT, 0.0
+            )
+        if op_name == "tile.row_expand_add" and len(tile_args) >= 2:
+            vec_lay = self._lookup_tile_desc(tile_args[1].name_hint)
+            in1 = ROW_BCAST_FLAT if vec_lay == ROW_BCAST_FLAT else COL_MAJOR_FLAT
+            tail = (ROW_MAJOR_FLAT,) * (len(tile_args) - 2)
+            return OperatorConfig("fallback", op_name, (ROW_MAJOR_FLAT, in1, *tail), ROW_MAJOR_FLAT, 0.0)
+        out_lay = self._lookup_tile_desc(lhs_var.name_hint) or _effective_tile_layout(lhs_var.type)
+        if out_lay == FRACTAL_NZ:
+            return OperatorConfig("fallback", op_name, tuple(FRACTAL_NZ for _ in tile_args), FRACTAL_NZ, 0.0)
+        in_lays: list[LayoutChoice] = [
+            ROW_MAJOR_FLAT
+            if (
+                core_backend.is_backend_configured()
+                and core_backend.get_input_tile_layout(op_name, idx) == core_ir.TileLayout.row_major
+            )
+            else (self._vec_prod_lay.get(arg.unique_id) or _effective_tile_layout(arg.type))
+            for idx, arg in enumerate(tile_args)
+        ]
+        return OperatorConfig("fallback", op_name, tuple(in_lays), out_lay, 0.0)
+
+    def _clear_prescan_state(self) -> None:
+        self._assign_op_cfg.clear()
+        self._eval_store_cfgs.clear()
+        self._vec_prod_lay.clear()
+        self._vec_demanded.clear()
+        self._vec_conv_vars.clear()
+        self._vec_logical_shapes.clear()
+        self._orig_tile_shapes.clear()
+        self._nz_nd_needed_uids.clear()
+        self._nz_nd_backing_vars.clear()
+        self._for_iter_arg_layouts.clear()
+
+    def _record_vec_demand(self, tile_var: core_ir.Var, req_lay: LayoutChoice) -> None:
+        if not isinstance(req_lay, TileLayoutDesc) or not isinstance(tile_var.type, core_ir.TileType):
+            return
+        if (tile_var.type.memory_space or core_ir.MemorySpace.Vec) != core_ir.MemorySpace.Vec:
+            return
+        prod_lay = self._vec_prod_lay.get(tile_var.unique_id)
+        if prod_lay in (None, req_lay, FRACTAL_NZ) or req_lay == FRACTAL_NZ:
+            return
+        demanded = self._vec_demanded.setdefault(tile_var.unique_id, [])
+        if req_lay not in demanded:
+            demanded.append(req_lay)
+
+    def _record_prescan_call_outputs(
+        self,
+        stmt: core_ir.Stmt,
+        op_name: str,
+        lhs_var: core_ir.Var | None,
+        cfg: OperatorConfig,
+        var_tensor_lays: dict[int, core_ir.TensorLayout],
+    ) -> None:
+        if lhs_var is not None:
+            self._assign_op_cfg[lhs_var.unique_id] = cfg
+        elif isinstance(stmt, core_ir.EvalStmt):
+            self._eval_store_cfgs.append(cfg)
+        if lhs_var is None:
+            return
+        if isinstance(lhs_var.type, core_ir.TileType):
+            space = lhs_var.type.memory_space or core_ir.MemorySpace.Vec
+            if space == core_ir.MemorySpace.Vec and isinstance(cfg.output_layout, TileLayoutDesc):
+                shape = _static_shape(lhs_var.type.shape)
+                if shape is not None:
+                    self._orig_tile_shapes[lhs_var.unique_id] = shape
+                self._vec_prod_lay[lhs_var.unique_id] = cfg.output_layout
+                if cfg.output_layout == FRACTAL_NZ and shape is not None:
+                    self._vec_logical_shapes[lhs_var.unique_id] = shape
+        elif op_name == _TILE_STORE_OP and isinstance(lhs_var.type, core_ir.TensorType):
+            if len(cfg.input_layouts) >= 2 and isinstance(cfg.input_layouts[1], core_ir.TensorLayout):
+                var_tensor_lays[lhs_var.unique_id] = cfg.input_layouts[1]
+
+    def _record_prescan_call_demands(
+        self,
+        rhs: core_ir.Call,
+        lhs_var: core_ir.Var | None,
+        cfg: OperatorConfig,
+    ) -> None:
+        op_name = rhs.op.name
+        if op_name == _TILE_LOAD_OP and len(rhs.args) >= 1 and isinstance(rhs.args[0], core_ir.Var):
+            if (
+                lhs_var is not None
+                and isinstance(lhs_var.type, core_ir.TileType)
+                and (lhs_var.type.memory_space or core_ir.MemorySpace.Vec) == core_ir.MemorySpace.Vec
+                and cfg.output_layout == FRACTAL_NZ
+                and cfg.input_layouts
+                and cfg.input_layouts[0] == core_ir.TensorLayout.NZ
+            ):
+                self._nz_nd_needed_uids.add(rhs.args[0].unique_id)
+        elif op_name == _TILE_STORE_OP and len(rhs.args) >= 3:
+            tile_arg, dst_arg = rhs.args[0], rhs.args[2]
+            tile_is_vec = (
+                isinstance(tile_arg, core_ir.Var)
+                and isinstance(tile_arg.type, core_ir.TileType)
+                and (tile_arg.type.memory_space or core_ir.MemorySpace.Vec) == core_ir.MemorySpace.Vec
+            )
+            gm_out_lay = cfg.input_layouts[1] if len(cfg.input_layouts) >= 2 else cfg.output_layout
+            if tile_is_vec and cfg.input_layouts and cfg.input_layouts[0] != FRACTAL_NZ:
+                self._record_vec_demand(tile_arg, cfg.input_layouts[0])
+            if (
+                tile_is_vec
+                and isinstance(dst_arg, core_ir.Var)
+                and cfg.input_layouts
+                and cfg.input_layouts[0] == FRACTAL_NZ
+                and gm_out_lay == core_ir.TensorLayout.NZ
+            ):
+                self._nz_nd_needed_uids.add(dst_arg.unique_id)
+        elif op_name == _TILE_MOVE_OP and len(rhs.args) >= 1 and isinstance(rhs.args[0], core_ir.Var):
+            if cfg.input_layouts:
+                self._record_vec_demand(rhs.args[0], cfg.input_layouts[0])
+        else:
+            tile_args = [
+                a for a in rhs.args if isinstance(a, core_ir.Var) and isinstance(a.type, core_ir.TileType)
+            ]
+            for t_arg, req_lay in zip(tile_args, cfg.input_layouts, strict=False):
+                self._record_vec_demand(t_arg, req_lay)
+
+    def _alias_var_prescan_info(
+        self,
+        dst_var: core_ir.Var,
+        src_uid: int,
+        var_tensor_lays: dict[int, core_ir.TensorLayout],
+    ) -> None:
+        if isinstance(dst_var.type, core_ir.TensorType) and src_uid in var_tensor_lays:
+            var_tensor_lays[dst_var.unique_id] = var_tensor_lays[src_uid]
+        elif isinstance(dst_var.type, core_ir.TileType) and src_uid in self._vec_prod_lay:
+            self._vec_prod_lay[dst_var.unique_id] = self._vec_prod_lay[src_uid]
+            if src_uid in self._orig_tile_shapes:
+                self._orig_tile_shapes[dst_var.unique_id] = self._orig_tile_shapes[src_uid]
+            if src_uid in self._vec_logical_shapes:
+                self._vec_logical_shapes[dst_var.unique_id] = self._vec_logical_shapes[src_uid]
+
+    def _prescan_function(
+        self,
+        func: core_ir.Function,
+        new_params: Sequence[tuple[core_ir.Var, core_ir.ParamDirection]],
+    ) -> None:
+        self._clear_prescan_state()
+        var_tensor_lays: dict[int, core_ir.TensorLayout] = {}
+        for (new_p, _), old_p in zip(new_params, func.params, strict=True):
+            if isinstance(new_p.type, core_ir.TensorType):
+                var_tensor_lays[old_p.unique_id] = _tensor_type_layout(new_p.type)
+            elif isinstance(new_p.type, core_ir.TileType):
+                if (new_p.type.memory_space or core_ir.MemorySpace.Vec) == core_ir.MemorySpace.Vec:
+                    shape = _static_shape(new_p.type.shape)
+                    if shape is not None:
+                        self._orig_tile_shapes[old_p.unique_id] = shape
+                    lay = self._lookup_tile_desc(old_p.name_hint) or _effective_tile_layout(new_p.type)
+                    self._vec_prod_lay[old_p.unique_id] = lay
+                    if lay == FRACTAL_NZ and shape is not None:
+                        self._vec_logical_shapes[old_p.unique_id] = shape
+
+        op_queue: deque[tuple[str, OperatorConfig]] = deque(self._collect_func_op_configs(func.name))
+        has_op_configs = bool(op_queue)
+        prefix = self._func_tile_prefix(func.name)
+
+        def _pop_cfg(op_name: str, lhs_hint: str | None) -> OperatorConfig | None:
+            if not op_queue:
+                return None
+            head_id, head_cfg = op_queue[0]
+            if head_cfg.op_name != op_name:
+                return None
+            if lhs_hint is not None and op_name != _TILE_STORE_OP:
+                cnt = _parse_op_id_counter(head_id, prefix)
+                if cnt is None:
+                    return None
+                rest_prefix = f"{prefix}op_{cnt}_"
+                if not head_id[len(rest_prefix) :].startswith(f"{lhs_hint}_"):
+                    return None
+            return op_queue.popleft()[1]
+
+        def _handle_call(stmt: core_ir.Stmt, rhs: core_ir.Call, lhs_var: core_ir.Var | None) -> None:
+            op_name = rhs.op.name
+            if (
+                op_name == _TENSOR_CREATE_OP
+                and lhs_var is not None
+                and isinstance(lhs_var.type, core_ir.TensorType)
+            ):
+                var_tensor_lays[lhs_var.unique_id] = self._lookup_tensor_layout(
+                    lhs_var.name_hint
+                ) or _tensor_type_layout(lhs_var.type)
+                return
+            if (
+                op_name == _TILE_CREATE_OP
+                and lhs_var is not None
+                and isinstance(lhs_var.type, core_ir.TileType)
+            ):
+                if (lhs_var.type.memory_space or core_ir.MemorySpace.Vec) == core_ir.MemorySpace.Vec:
+                    shape = _static_shape(lhs_var.type.shape)
+                    if shape is not None:
+                        self._orig_tile_shapes[lhs_var.unique_id] = shape
+                    self._vec_prod_lay[lhs_var.unique_id] = _effective_tile_layout(lhs_var.type)
+                return
+            if op_name == _TILE_TRANSPOSE_VIEW_OP or not op_name.startswith("tile."):
+                return
+            cfg = _pop_cfg(op_name, lhs_var.name_hint if lhs_var is not None else None)
+            if cfg is None and not has_op_configs:
+                cfg = self._infer_op_config(rhs, lhs_var, var_tensor_lays)
+            if cfg is None:
+                if lhs_var is not None and isinstance(lhs_var.type, core_ir.TileType):
+                    if (lhs_var.type.memory_space or core_ir.MemorySpace.Vec) == core_ir.MemorySpace.Vec:
+                        shape = _static_shape(lhs_var.type.shape)
+                        if shape is not None:
+                            self._orig_tile_shapes[lhs_var.unique_id] = shape
+                        self._vec_prod_lay[lhs_var.unique_id] = _effective_tile_layout(lhs_var.type)
+                return
+            self._record_prescan_call_outputs(stmt, op_name, lhs_var, cfg, var_tensor_lays)
+            self._record_prescan_call_demands(rhs, lhs_var, cfg)
+
+        yield_stacks: list[list[int]] = []
+
+        def _walk(stmt: core_ir.Stmt) -> None:
+            if isinstance(stmt, core_ir.AssignStmt):
+                if isinstance(stmt.value, core_ir.Call):
+                    _handle_call(stmt, stmt.value, stmt.var)
+                elif isinstance(stmt.value, core_ir.Var):
+                    self._alias_var_prescan_info(stmt.var, stmt.value.unique_id, var_tensor_lays)
+            elif isinstance(stmt, core_ir.ForStmt):
+                for ia in stmt.iter_args:
+                    init_v = getattr(ia, "initValue", None)
+                    if isinstance(init_v, core_ir.Var):
+                        self._alias_var_prescan_info(ia, init_v.unique_id, var_tensor_lays)
+                yield_stacks.append([])
+                _walk(stmt.body)
+                yielded = yield_stacks.pop()
+                for idx, rv in enumerate(stmt.return_vars):
+                    src_uid = (
+                        yielded[idx]
+                        if idx < len(yielded) and yielded[idx] >= 0
+                        else (stmt.iter_args[idx].unique_id if idx < len(stmt.iter_args) else -1)
+                    )
+                    if src_uid >= 0:
+                        self._alias_var_prescan_info(rv, src_uid, var_tensor_lays)
+                return
+            elif isinstance(stmt, core_ir.YieldStmt) and yield_stacks:
+                yield_stacks[-1] = [v.unique_id if isinstance(v, core_ir.Var) else -1 for v in stmt.value]
+            elif isinstance(stmt, core_ir.EvalStmt):
+                if isinstance(stmt.expr, core_ir.Call) and stmt.expr.op.name == _TILE_STORE_OP:
+                    _handle_call(stmt, stmt.expr, None)
+            elif isinstance(stmt, core_ir.ReturnStmt):
+                for val in stmt.value:
+                    if isinstance(val, core_ir.Call) and val.op.name == _TILE_STORE_OP:
+                        _handle_call(stmt, val, None)
+            for child in _iter_child_stmts(stmt):
+                _walk(child)
+
+        _walk(func.body)
+
+    def _emit_vec_conversion(  # noqa: PLR0913
+        self,
+        orig_uid: int,
+        src_var: core_ir.Var,
+        prod_lay: TileLayoutDesc,
+        target_lay: TileLayoutDesc,
+        orig_shape: tuple[int, ...],
+        span: core_ir.Span,
+    ) -> tuple[core_ir.Var, list[core_ir.Stmt]]:
+        cached = self._vec_conv_vars.get((orig_uid, target_lay))
+        if cached is not None:
+            return cached, []
+        if prod_lay == target_lay:
+            return src_var, []
+        stmts: list[core_ir.Stmt] = []
+        base_name = _clean_ssa_name(src_var.name_hint)
+        if not isinstance(src_var.type, core_ir.TileType) or len(orig_shape) != 2:
+            return src_var, []
+
+        if target_lay == ROW_BCAST_FLAT:
+            if prod_lay != COL_MAJOR_FLAT:
+                cm_var, extra = self._emit_vec_conversion(
+                    orig_uid, src_var, prod_lay, COL_MAJOR_FLAT, orig_shape, span
+                )
+                stmts.extend(extra)
+            else:
+                cm_var = src_var
+            rows = int(orig_shape[0])
+            c0 = c0_elements(cm_var.type.dtype)
+            shape_tuple = core_ir.MakeTuple(
+                [core_ir.ConstInt(rows, DataType.INDEX, span), core_ir.ConstInt(c0, DataType.INDEX, span)],
+                span,
+            )
+            tgt_call = core_ir.create_op_call(
+                _TILE_CREATE_OP,
+                [shape_tuple],
+                {"dtype": cm_var.type.dtype, "target_memory": core_ir.MemorySpace.Vec},
+                span,
+            )
+            tgt_call = _with_call_type(tgt_call, _with_vec_memory_space(tgt_call.type))
+            tgt_var = core_ir.Var(f"{base_name}_bcast_buf", tgt_call.type, span)
+            stmts.append(core_ir.AssignStmt(tgt_var, tgt_call, span))
+            exp_call = core_ir.create_op_call("tile.row_expand", [tgt_var, cm_var], {}, span)
+            exp_call = _with_call_type(exp_call, _with_vec_memory_space(exp_call.type))
+            exp_var = core_ir.Var(f"{base_name}_bcast", exp_call.type, span)
+            stmts.append(core_ir.AssignStmt(exp_var, exp_call, span))
+            self._vec_conv_vars[(orig_uid, ROW_BCAST_FLAT)] = exp_var
+            return exp_var, stmts
+
+        if {prod_lay, target_lay} == {ROW_MAJOR_FLAT, COL_MAJOR_FLAT} and (
+            orig_shape[0] == 1 or orig_shape[1] == 1
+        ):
+            big = max(int(orig_shape[0]), int(orig_shape[1]))
+            new_dims = [1, big] if target_lay == ROW_MAJOR_FLAT else [big, 1]
+            shape_tuple = core_ir.MakeTuple(
+                [
+                    core_ir.ConstInt(new_dims[0], DataType.INDEX, span),
+                    core_ir.ConstInt(new_dims[1], DataType.INDEX, span),
+                ],
+                span,
+            )
+            reshape_call = core_ir.create_op_call("tile.reshape", [src_var, shape_tuple], {}, span)
+            reshape_call = _with_call_type(reshape_call, _with_vec_memory_space(reshape_call.type))
+            suffix = "rm" if target_lay == ROW_MAJOR_FLAT else "cm"
+            conv_var = core_ir.Var(f"{base_name}_{suffix}", reshape_call.type, span)
+            stmts.append(core_ir.AssignStmt(conv_var, reshape_call, span))
+            self._vec_conv_vars[(orig_uid, target_lay)] = conv_var
+            return conv_var, stmts
+
+        if {prod_lay, target_lay} == {ROW_MAJOR_FLAT, COL_MAJOR_FLAT}:
+            move_call = core_ir.create_op_call(
+                _TILE_MOVE_OP,
+                [src_var],
+                {
+                    "target_memory": core_ir.MemorySpace.Vec,
+                    "blayout": target_lay.blayout,
+                    "slayout": target_lay.slayout,
+                },
+                span,
+            )
+            move_call = _with_call_type(move_call, _with_vec_memory_space(move_call.type))
+            suffix = "rm" if target_lay == ROW_MAJOR_FLAT else "cm"
+            conv_var = core_ir.Var(f"{base_name}_{suffix}", move_call.type, span)
+            stmts.append(core_ir.AssignStmt(conv_var, move_call, span))
+            self._vec_conv_vars[(orig_uid, target_lay)] = conv_var
+            return conv_var, stmts
+
+        return src_var, []
+
+    def _emit_demanded_conversions(
+        self,
+        orig_uid: int,
+        prod_var: core_ir.Var,
+        prod_lay: TileLayoutDesc,
+        span: core_ir.Span,
+    ) -> list[core_ir.Stmt]:
+        demanded = self._vec_demanded.get(orig_uid)
+        if not demanded or not isinstance(prod_var.type, core_ir.TileType):
+            return []
+        orig_shape = self._orig_tile_shapes.get(orig_uid) or _static_shape(prod_var.type.shape)
+        if orig_shape is None:
+            return []
+        stmts: list[core_ir.Stmt] = []
+        for target_lay in demanded:
+            _, extra = self._emit_vec_conversion(orig_uid, prod_var, prod_lay, target_lay, orig_shape, span)
+            stmts.extend(extra)
+        return stmts
+
+    def _get_tile_var_for_layout(self, orig_arg: core_ir.Var, req_lay: LayoutChoice) -> core_ir.Var:
+        if isinstance(req_lay, TileLayoutDesc):
+            conv = self._vec_conv_vars.get((orig_arg.unique_id, req_lay))
+            if conv is not None:
+                return conv
+        return self._var_remap.get(orig_arg.unique_id, orig_arg)
+
+    def _get_nz_nd_backing_var(
+        self,
+        orig_uid: int,
+        remapped_nz: core_ir.Expr,
+        span: core_ir.Span,
+    ) -> tuple[core_ir.Var, list[core_ir.Stmt]]:
+        existing = self._nz_nd_backing_vars.get(orig_uid)
+        if existing is not None:
+            return existing, []
+        if not isinstance(remapped_nz.type, core_ir.TensorType):
+            raise TypeError(f"Expected TensorType for NZ backing view, got {remapped_nz.type!r}")
+        c0 = c0_elements(remapped_nz.type.dtype)
+        nd_shape = _nz_backing_nd_shape_exprs(remapped_nz.type.shape, c0, span)
+        shape_tuple = core_ir.MakeTuple(nd_shape, span)
+        view_call = core_ir.create_op_call(
+            _TENSOR_VIEW_OP,
+            [remapped_nz, shape_tuple],
+            {"layout": core_ir.TensorLayout.ND},
+            span,
+        )
+        hint = _clean_ssa_name(remapped_nz.name_hint) if isinstance(remapped_nz, core_ir.Var) else "nz"
+        nd_var = core_ir.Var(f"{hint}_nd_view", view_call.type, span)
+        self._func_promoted_gm_to_nz = True
+        return nd_var, [core_ir.AssignStmt(nd_var, view_call, span)]
+
+    def _rewrite_func_params(
+        self,
+        func: core_ir.Function,
+    ) -> tuple[list[tuple[core_ir.Var, core_ir.ParamDirection]], bool, bool]:
         new_params: list[tuple[core_ir.Var, core_ir.ParamDirection]] = []
         changed = False
         has_nz_param = False
@@ -2859,22 +4673,59 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
                     and _tensor_type_layout(param.type) == core_ir.TensorLayout.NZ
                 ):
                     has_nz_param = True
+        return new_params, changed, has_nz_param
 
-        prologue_stmts: list[core_ir.Stmt] = []
-        if has_nz_param and core_ir.is_incore_type(func.func_type):
-            prologue_stmts = self._build_aligned_param_prologue(func.name, new_params, func.params, func.body)
-            if prologue_stmts:
-                changed = True
+    def _build_incore_vec_prologue(
+        self,
+        func: core_ir.Function,
+        new_params: Sequence[tuple[core_ir.Var, core_ir.ParamDirection]],
+    ) -> list[core_ir.Stmt]:
+        self._prescan_function(func, new_params)
+        stmts: list[core_ir.Stmt] = []
+        for (new_p, _), old_p in zip(new_params, func.params, strict=True):
+            if (
+                old_p.unique_id in self._nz_nd_needed_uids
+                and isinstance(new_p.type, core_ir.TensorType)
+                and _tensor_type_layout(new_p.type) == core_ir.TensorLayout.NZ
+            ):
+                nd_var, extra = self._get_nz_nd_backing_var(old_p.unique_id, new_p, new_p.span)
+                self._nz_nd_backing_vars[old_p.unique_id] = nd_var
+                stmts.extend(extra)
+            elif (
+                isinstance(new_p.type, core_ir.TileType)
+                and (new_p.type.memory_space or core_ir.MemorySpace.Vec) == core_ir.MemorySpace.Vec
+                and old_p.unique_id in self._vec_prod_lay
+            ):
+                stmts.extend(
+                    self._emit_demanded_conversions(
+                        old_p.unique_id, new_p, self._vec_prod_lay[old_p.unique_id], new_p.span
+                    )
+                )
+        return stmts
 
-        new_body = self.visit_stmt(func.body)
-        if prologue_stmts:
-            stmts = (
-                [*prologue_stmts, *new_body.stmts]
-                if isinstance(new_body, core_ir.SeqStmts)
-                else [*prologue_stmts, new_body]
-            )
-            new_body = core_ir.SeqStmts(stmts, new_body.span)
+    def _sync_func_return_types(
+        self,
+        func: core_ir.Function,
+        new_params: Sequence[tuple[core_ir.Var, core_ir.ParamDirection]],
+        new_body: core_ir.Stmt,
+    ) -> tuple[list[core_ir.Type], bool]:
         new_return_types: list[core_ir.Type] = list(func.return_types)
+        changed = False
+        ret_stmts = _find_return_stmts(new_body)
+        if ret_stmts:
+            for ret_stmt in ret_stmts:
+                for idx, val in enumerate(ret_stmt.value):
+                    if (
+                        idx < len(new_return_types)
+                        and isinstance(new_return_types[idx], core_ir.TensorType)
+                        and isinstance(val.type, core_ir.TensorType)
+                        and _tensor_type_layout(new_return_types[idx]) != _tensor_type_layout(val.type)
+                    ):
+                        new_return_types[idx] = _with_tensor_layout(
+                            new_return_types[idx], _tensor_type_layout(val.type)
+                        )
+                        changed = True
+            return new_return_types, changed
         if len(new_return_types) == 1 and isinstance(new_return_types[0], core_ir.TensorType):
             for param, direction in new_params:
                 if direction in (core_ir.ParamDirection.Out, core_ir.ParamDirection.InOut):
@@ -2885,8 +4736,37 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
                         and _tensor_type_layout(new_return_types[0]) != target_layout
                     ):
                         new_return_types[0] = _with_tensor_layout(new_return_types[0], target_layout)
-                        changed = True
-                        break
+                        return new_return_types, True
+        return new_return_types, False
+
+    def visit_function(self, func: core_ir.Function) -> core_ir.Function:
+        if func.level is not None and core_ir.level_to_linqu_level(func.level) >= 3:
+            return func
+        self._var_remap.clear()
+        self._current_func_name = func.name
+        self._func_promoted_gm_to_nz = False
+        new_params, changed, has_nz_param = self._rewrite_func_params(func)
+
+        prologue_stmts: list[core_ir.Stmt] = []
+        if has_nz_param and core_ir.is_incore_type(func.func_type):
+            prologue_stmts = self._build_aligned_param_prologue(func.name, new_params, func.params, func.body)
+        if core_ir.is_incore_type(func.func_type):
+            prologue_stmts.extend(self._build_incore_vec_prologue(func, new_params))
+        else:
+            self._clear_prescan_state()
+        if prologue_stmts:
+            changed = True
+
+        new_body = self.visit_stmt(func.body)
+        if prologue_stmts:
+            stmts = (
+                [*prologue_stmts, *new_body.stmts]
+                if isinstance(new_body, core_ir.SeqStmts)
+                else [*prologue_stmts, new_body]
+            )
+            new_body = core_ir.SeqStmts(stmts, new_body.span)
+        new_return_types, ret_changed = self._sync_func_return_types(func, new_params, new_body)
+        changed = changed or ret_changed
 
         self._func_return_types[func.name] = new_return_types
         if not changed and new_body.same_as(func.body):
@@ -2932,6 +4812,461 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
     def visit_var(self, op: core_ir.Var) -> core_ir.Expr:
         return self._var_remap.get(op.unique_id, op)
 
+    def visit_iter_arg(self, op: core_ir.IterArg) -> core_ir.Expr:
+        return self._var_remap.get(op.unique_id, op)
+
+    def visit_seq_stmts(self, op: core_ir.SeqStmts) -> core_ir.Stmt:
+        new_stmts: list[core_ir.Stmt] = []
+        changed = False
+        for s in op.stmts:
+            visited = self.visit_stmt(s)
+            if not visited.same_as(s):
+                changed = True
+            if isinstance(visited, core_ir.SeqStmts) and not isinstance(s, core_ir.SeqStmts):
+                new_stmts.extend(visited.stmts)
+            else:
+                new_stmts.append(visited)
+        if not changed:
+            return op
+        return core_ir.SeqStmts(new_stmts, op.span)
+
+    def visit_for_stmt(self, op: core_ir.ForStmt) -> core_ir.Stmt:
+        new_start = self.visit_expr(op.start)
+        new_stop = self.visit_expr(op.stop)
+        new_step = self.visit_expr(op.step)
+        new_iter_args: list[core_ir.IterArg] = []
+        iter_changed = False
+        loop_vec_lays: list[TileLayoutDesc | None] = []
+        ia_prologue: list[core_ir.Stmt] = []
+
+        for ia in op.iter_args:
+            old_init = getattr(ia, "initValue", None)
+            new_init = self.visit_expr(old_init) if isinstance(old_init, core_ir.Expr) else old_init
+            ia_lay: TileLayoutDesc | None = None
+            if (
+                isinstance(ia.type, core_ir.TileType)
+                and (ia.type.memory_space or core_ir.MemorySpace.Vec) == core_ir.MemorySpace.Vec
+            ):
+                ia_lay = self._vec_prod_lay.get(ia.unique_id)
+            loop_vec_lays.append(ia_lay)
+            if isinstance(new_init, core_ir.Expr) and (
+                not new_init.same_as(old_init) or new_init.type != ia.type
+            ):
+                new_ia = core_ir.IterArg(ia.name_hint, new_init.type, new_init, ia.span)
+                self._var_remap[ia.unique_id] = new_ia
+                new_iter_args.append(new_ia)
+                iter_changed = True
+            else:
+                new_ia = ia
+                new_iter_args.append(ia)
+            if ia_lay is not None and ia.unique_id in self._vec_demanded:
+                ia_prologue.extend(self._emit_demanded_conversions(ia.unique_id, new_ia, ia_lay, ia.span))
+
+        self._for_iter_arg_layouts.append(loop_vec_lays)
+        try:
+            new_body = self.visit_stmt(op.body)
+        finally:
+            self._for_iter_arg_layouts.pop()
+
+        if ia_prologue:
+            stmts = (
+                [*ia_prologue, *new_body.stmts]
+                if isinstance(new_body, core_ir.SeqStmts)
+                else [*ia_prologue, new_body]
+            )
+            new_body = core_ir.SeqStmts(stmts, new_body.span)
+
+        new_return_vars: list[core_ir.Var] = []
+        ret_changed = False
+        for idx, rv in enumerate(op.return_vars):
+            expected_type = new_iter_args[idx].type if idx < len(new_iter_args) else rv.type
+            if expected_type != rv.type:
+                new_rv = core_ir.Var(rv.name_hint, expected_type, rv.span)
+                self._var_remap[rv.unique_id] = new_rv
+                new_return_vars.append(new_rv)
+                ret_changed = True
+            else:
+                new_return_vars.append(rv)
+
+        if (
+            not iter_changed
+            and not ret_changed
+            and new_start.same_as(op.start)
+            and new_stop.same_as(op.stop)
+            and new_step.same_as(op.step)
+            and new_body.same_as(op.body)
+        ):
+            return op
+        return core_ir.ForStmt(
+            op.loop_var,
+            new_start,
+            new_stop,
+            new_step,
+            new_iter_args,
+            new_body,
+            new_return_vars,
+            op.span,
+            op.kind,
+            dict(op.attrs) if op.attrs else None,
+            op.hardware_loop_policy,
+        )
+
+    def visit_yield_stmt(self, op: core_ir.YieldStmt) -> core_ir.Stmt:
+        expected_lays = self._for_iter_arg_layouts[-1] if self._for_iter_arg_layouts else []
+        new_vals: list[core_ir.Expr] = []
+        extra_stmts: list[core_ir.Stmt] = []
+        changed = False
+        for idx, val in enumerate(op.value):
+            target_lay = expected_lays[idx] if idx < len(expected_lays) else None
+            if (
+                target_lay is not None
+                and isinstance(val, core_ir.Var)
+                and val.unique_id in self._vec_prod_lay
+                and self._vec_prod_lay[val.unique_id] != target_lay
+            ):
+                orig_shape = self._orig_tile_shapes.get(val.unique_id)
+                cur_var = self._var_remap.get(val.unique_id, val)
+                if orig_shape is not None:
+                    conv_var, conv_stmts = self._emit_vec_conversion(
+                        val.unique_id,
+                        cur_var,
+                        self._vec_prod_lay[val.unique_id],
+                        target_lay,
+                        orig_shape,
+                        op.span,
+                    )
+                    extra_stmts.extend(conv_stmts)
+                    new_vals.append(conv_var)
+                    changed = True
+                    continue
+            visited = self.visit_expr(val)
+            if not visited.same_as(val):
+                changed = True
+            new_vals.append(visited)
+        if not changed and not extra_stmts:
+            return op
+        new_yield = core_ir.YieldStmt(new_vals, op.span)
+        if extra_stmts:
+            return core_ir.SeqStmts([*extra_stmts, new_yield], op.span)
+        return new_yield
+
+    def _rewrite_tile_store(
+        self,
+        rhs: core_ir.Call,
+        cfg: OperatorConfig | None,
+        span: core_ir.Span,
+    ) -> tuple[core_ir.Call, list[core_ir.Stmt], core_ir.Expr | None]:
+        """Rewrite a `tile.store` call, returning `(store_call, pre_stmts, nz_logical_shape_src)`."""
+        store_gm_lay = (
+            cfg.input_layouts[1]
+            if (cfg is not None and len(cfg.input_layouts) >= 2)
+            else (cfg.output_layout if cfg is not None else None)
+        )
+        if (
+            cfg is not None
+            and len(cfg.input_layouts) >= 1
+            and cfg.input_layouts[0] == FRACTAL_NZ
+            and store_gm_lay == core_ir.TensorLayout.NZ
+            and len(rhs.args) >= 3
+            and isinstance(rhs.args[0], core_ir.Var)
+            and isinstance(rhs.args[0].type, core_ir.TileType)
+            and (rhs.args[0].type.memory_space or core_ir.MemorySpace.Vec) == core_ir.MemorySpace.Vec
+            and isinstance(rhs.args[2], core_ir.Var)
+            and isinstance(rhs.args[1], core_ir.MakeTuple)
+        ):
+            tile_orig = rhs.args[0]
+            dst_orig = rhs.args[2]
+            new_tile = self._var_remap.get(tile_orig.unique_id, tile_orig)
+            new_dst = self.visit_expr(dst_orig)
+            tr, tc = self._vec_logical_shapes.get(
+                tile_orig.unique_id,
+                _static_shape(tile_orig.type.shape) or (0, 0),  # type: ignore[arg-type]
+            )
+            c0 = c0_elements(new_dst.type.dtype)  # type: ignore[arg-type]
+            backing_var, pre_stmts = self._get_nz_nd_backing_var(dst_orig.unique_id, new_dst, span)
+            visited_offs = [self.visit_expr(el) for el in rhs.args[1].elements]
+            nd_offs, nd_win = _nz_backing_nd_offsets_and_window(
+                visited_offs,
+                new_dst.type.shape,  # type: ignore[arg-type]
+                tr,
+                tc,
+                c0,
+                rhs.span,
+            )
+            new_args: list[core_ir.Expr] = [
+                new_tile,
+                core_ir.MakeTuple(nd_offs, rhs.args[1].span),
+                backing_var,
+            ]
+            if len(rhs.args) >= 4:
+                new_args.append(core_ir.MakeTuple(nd_win, rhs.args[3].span))
+            store_call = core_ir.create_op_call(_TILE_STORE_OP, new_args, dict(rhs.kwargs), rhs.span)
+            if rhs.attrs:
+                store_call = core_ir.set_call_attrs(store_call, dict(rhs.attrs))
+            return store_call, pre_stmts, new_dst
+
+        new_args = []
+        for idx, arg in enumerate(rhs.args):
+            if (
+                idx == 0
+                and cfg is not None
+                and cfg.input_layouts
+                and isinstance(arg, core_ir.Var)
+                and isinstance(arg.type, core_ir.TileType)
+                and (arg.type.memory_space or core_ir.MemorySpace.Vec) == core_ir.MemorySpace.Vec
+            ):
+                new_args.append(self._get_tile_var_for_layout(arg, cfg.input_layouts[0]))
+            else:
+                new_args.append(self.visit_expr(arg))
+        args_changed = any(not a.same_as(b) for a, b in zip(new_args, rhs.args, strict=True))
+        if not args_changed:
+            return rhs, [], None
+        store_call = core_ir.create_op_call(_TILE_STORE_OP, new_args, dict(rhs.kwargs), rhs.span)
+        if rhs.attrs:
+            store_call = core_ir.set_call_attrs(store_call, dict(rhs.attrs))
+        return store_call, [], None
+
+    def visit_eval_stmt(self, op: core_ir.EvalStmt) -> core_ir.Stmt:
+        if isinstance(op.expr, core_ir.Call) and op.expr.op.name == _TILE_STORE_OP:
+            cfg = self._eval_store_cfgs.popleft() if self._eval_store_cfgs else None
+            store_call, pre_stmts, _ = self._rewrite_tile_store(op.expr, cfg, op.span)
+            if store_call.same_as(op.expr) and not pre_stmts:
+                return op
+            new_eval = core_ir.EvalStmt(store_call, op.span)
+            if pre_stmts:
+                return core_ir.SeqStmts([*pre_stmts, new_eval], op.span)
+            return new_eval
+        return super().visit_eval_stmt(op)
+
+    def _finish_vec_assign(
+        self,
+        orig_var: core_ir.Var,
+        new_value: core_ir.Expr,
+        prod_lay: TileLayoutDesc | None,
+        span: core_ir.Span,
+        orig_stmt: core_ir.AssignStmt,
+    ) -> core_ir.Stmt:
+        new_var = orig_var
+        if not new_value.same_as(orig_stmt.value) and isinstance(
+            orig_var.type, (core_ir.TensorType, core_ir.TileType, core_ir.TupleType)
+        ):
+            if isinstance(new_value.type, (core_ir.TensorType, core_ir.TileType, core_ir.TupleType)):
+                new_var = core_ir.Var(orig_var.name_hint, new_value.type, orig_var.span)
+                self._var_remap[orig_var.unique_id] = new_var
+
+        if new_var.same_as(orig_var) and new_value.same_as(orig_stmt.value):
+            main_stmt: core_ir.Stmt = orig_stmt
+        else:
+            main_stmt = core_ir.AssignStmt(new_var, new_value, span)
+
+        if prod_lay is not None and orig_var.unique_id in self._vec_demanded:
+            conv_stmts = self._emit_demanded_conversions(orig_var.unique_id, new_var, prod_lay, span)
+            if conv_stmts:
+                return core_ir.SeqStmts([main_stmt, *conv_stmts], span)
+        return main_stmt
+
+    def _rewrite_vec_load_assign(
+        self,
+        op: core_ir.AssignStmt,
+        rhs: core_ir.Call,
+        cfg: OperatorConfig,
+    ) -> core_ir.Stmt:
+        assert isinstance(op.var.type, core_ir.TileType)
+        assert isinstance(cfg.output_layout, TileLayoutDesc)
+        if (
+            cfg.output_layout == FRACTAL_NZ
+            and cfg.input_layouts
+            and cfg.input_layouts[0] == core_ir.TensorLayout.NZ
+            and len(rhs.args) >= 3
+            and isinstance(rhs.args[0], core_ir.Var)
+            and isinstance(rhs.args[1], core_ir.MakeTuple)
+        ):
+            new_gm = self.visit_expr(rhs.args[0])
+            tr, tc = self._vec_logical_shapes.get(
+                op.var.unique_id, _static_shape(op.var.type.shape) or (0, 0)
+            )
+            c0 = c0_elements(op.var.type.dtype)
+            backing_var, pre_stmts = self._get_nz_nd_backing_var(rhs.args[0].unique_id, new_gm, op.span)
+            visited_offs = [self.visit_expr(el) for el in rhs.args[1].elements]
+            nd_offs, nd_win = _nz_backing_nd_offsets_and_window(
+                visited_offs,
+                new_gm.type.shape,  # type: ignore[arg-type]
+                tr,
+                tc,
+                c0,
+                rhs.span,
+            )
+            new_args: list[core_ir.Expr] = [
+                backing_var,
+                core_ir.MakeTuple(nd_offs, rhs.args[1].span),
+                core_ir.MakeTuple(nd_win, rhs.args[2].span),
+            ]
+            if len(rhs.args) >= 4:
+                new_args.append(core_ir.MakeTuple(nd_win, rhs.args[3].span))
+            load_call = core_ir.create_op_call(_TILE_LOAD_OP, new_args, dict(rhs.kwargs), rhs.span)
+            if rhs.attrs:
+                load_call = core_ir.set_call_attrs(load_call, dict(rhs.attrs))
+            load_call = _with_call_type(load_call, _with_vec_memory_space(load_call.type))
+            new_var = core_ir.Var(op.var.name_hint, load_call.type, op.var.span)
+            self._var_remap[op.var.unique_id] = new_var
+            assign_load = core_ir.AssignStmt(new_var, load_call, op.span)
+            return core_ir.SeqStmts([*pre_stmts, assign_load], op.span) if pre_stmts else assign_load
+
+        new_args = [self.visit_expr(arg) for arg in rhs.args]
+        args_changed = any(not a.same_as(b) for a, b in zip(new_args, rhs.args, strict=True))
+        need_col_view = (
+            cfg.output_layout == COL_MAJOR_FLAT and _effective_tile_layout(op.var.type) != COL_MAJOR_FLAT
+        )
+        if args_changed or need_col_view:
+            load_type: core_ir.Type = (
+                _with_vec_memory_space(op.var.type, _col_major_tile_view(op.var.type))
+                if need_col_view
+                else op.var.type
+            )
+            new_value: core_ir.Expr = core_ir.Call(
+                rhs.op,
+                new_args,
+                dict(rhs.kwargs),
+                dict(rhs.attrs) if rhs.attrs else None,
+                load_type,
+                rhs.span,
+            )
+        else:
+            new_value = rhs
+        return self._finish_vec_assign(op.var, new_value, cfg.output_layout, op.span, op)
+
+    def _rewrite_tile_move_assign(
+        self,
+        op: core_ir.AssignStmt,
+        rhs: core_ir.Call,
+        cfg: OperatorConfig | None,
+        target_tile_desc: TileLayoutDesc | None,
+    ) -> core_ir.Stmt | None:
+        assert isinstance(op.var.type, core_ir.TileType)
+        dst_is_vec = op.var.type.memory_space == core_ir.MemorySpace.Vec
+        in_arg = rhs.args[0] if rhs.args else None
+        if (
+            dst_is_vec
+            and cfg is not None
+            and cfg.input_layouts
+            and isinstance(in_arg, core_ir.Var)
+            and isinstance(in_arg.type, core_ir.TileType)
+            and (in_arg.type.memory_space or core_ir.MemorySpace.Vec) == core_ir.MemorySpace.Vec
+        ):
+            new_src = self._get_tile_var_for_layout(in_arg, cfg.input_layouts[0])
+            new_args = [new_src, *(self.visit_expr(a) for a in rhs.args[1:])]
+        else:
+            new_args = [self.visit_expr(arg) for arg in rhs.args]
+        args_changed = any(not a.same_as(b) for a, b in zip(new_args, rhs.args, strict=True))
+        chosen_desc = (
+            cfg.output_layout
+            if (cfg is not None and isinstance(cfg.output_layout, TileLayoutDesc))
+            else target_tile_desc
+        )
+        if chosen_desc is None or (_effective_tile_layout(op.var.type) == chosen_desc and not args_changed):
+            return None
+        new_kwargs = dict(rhs.kwargs)
+        new_kwargs["blayout"] = chosen_desc.blayout
+        new_kwargs["slayout"] = chosen_desc.slayout
+        new_value = core_ir.create_op_call(rhs.op.name, new_args, new_kwargs, rhs.span)
+        if rhs.attrs:
+            new_value = core_ir.set_call_attrs(new_value, dict(rhs.attrs))
+        if dst_is_vec:
+            new_value = _with_call_type(new_value, _with_vec_memory_space(new_value.type))
+        return self._finish_vec_assign(op.var, new_value, chosen_desc if dst_is_vec else None, op.span, op)
+
+    def _rewrite_vec_generic_assign(
+        self,
+        op: core_ir.AssignStmt,
+        rhs: core_ir.Call,
+        cfg: OperatorConfig,
+    ) -> core_ir.Stmt:
+        assert isinstance(op.var.type, core_ir.TileType)
+        assert isinstance(cfg.output_layout, TileLayoutDesc)
+        new_args: list[core_ir.Expr] = []
+        if rhs.op.name == "tile.full" and len(rhs.args) >= 1 and isinstance(rhs.args[0], core_ir.MakeTuple):
+            cur_shape = _static_shape(op.var.type.shape)
+            shape_tuple = rhs.args[0]
+            if cfg.output_layout == FRACTAL_NZ and cur_shape is not None and len(cur_shape) == 2:
+                c0 = c0_elements(op.var.type.dtype)
+                shape_tuple = core_ir.MakeTuple(
+                    [
+                        core_ir.ConstInt(cur_shape[1] // c0, DataType.INDEX, rhs.args[0].span),
+                        core_ir.ConstInt(cur_shape[0] * c0, DataType.INDEX, rhs.args[0].span),
+                    ],
+                    rhs.args[0].span,
+                )
+            elif (
+                cfg.output_layout == ROW_MAJOR_FLAT
+                and cur_shape is not None
+                and len(cur_shape) == 2
+                and cur_shape[1] == 1
+                and cur_shape[0] > 1
+            ):
+                shape_tuple = core_ir.MakeTuple(
+                    [
+                        core_ir.ConstInt(1, DataType.INDEX, rhs.args[0].span),
+                        core_ir.ConstInt(cur_shape[0], DataType.INDEX, rhs.args[0].span),
+                    ],
+                    rhs.args[0].span,
+                )
+            new_args = [shape_tuple, *(self.visit_expr(a) for a in rhs.args[1:])]
+        elif (
+            rhs.op.name == "tile.reshape"
+            and len(rhs.args) >= 2
+            and isinstance(rhs.args[0], core_ir.Var)
+            and isinstance(rhs.args[1], core_ir.MakeTuple)
+        ):
+            cur_shape = _static_shape(op.var.type.shape)
+            in_arg = rhs.args[0]
+            req_lay = cfg.input_layouts[0] if cfg.input_layouts else cfg.output_layout
+            new_in = self._get_tile_var_for_layout(in_arg, req_lay)
+            shape_tuple = rhs.args[1]
+            if cur_shape is not None and len(cur_shape) == 2 and 1 in cur_shape:
+                big = max(cur_shape)
+                target_dims = (1, big) if cfg.output_layout == ROW_MAJOR_FLAT else (big, 1)
+                if cur_shape != target_dims:
+                    shape_tuple = core_ir.MakeTuple(
+                        [
+                            core_ir.ConstInt(target_dims[0], DataType.INDEX, rhs.args[1].span),
+                            core_ir.ConstInt(target_dims[1], DataType.INDEX, rhs.args[1].span),
+                        ],
+                        rhs.args[1].span,
+                    )
+            new_args = [new_in, shape_tuple]
+        else:
+            tile_idx = 0
+            for arg in rhs.args:
+                if isinstance(arg, core_ir.Var) and isinstance(arg.type, core_ir.TileType):
+                    req_lay = (
+                        cfg.input_layouts[tile_idx]
+                        if tile_idx < len(cfg.input_layouts)
+                        else cfg.output_layout
+                    )
+                    tile_idx += 1
+                    new_args.append(self._get_tile_var_for_layout(arg, req_lay))
+                else:
+                    new_args.append(self.visit_expr(arg))
+
+        args_changed = any(not a.same_as(b) for a, b in zip(new_args, rhs.args, strict=True))
+        if args_changed:
+            new_value: core_ir.Expr = core_ir.create_op_call(
+                rhs.op.name, new_args, dict(rhs.kwargs), rhs.span
+            )
+            if rhs.attrs:
+                new_value = core_ir.set_call_attrs(new_value, dict(rhs.attrs))
+            tv_override: core_ir.TileView | None = None
+            if (
+                cfg.output_layout == COL_MAJOR_FLAT
+                and isinstance(new_value.type, core_ir.TileType)
+                and _effective_tile_layout(new_value.type) != COL_MAJOR_FLAT
+            ):
+                tv_override = _col_major_tile_view(new_value.type)
+            new_value = _with_call_type(new_value, _with_vec_memory_space(new_value.type, tv_override))
+        else:
+            new_value = rhs
+        return self._finish_vec_assign(op.var, new_value, cfg.output_layout, op.span, op)
+
     def visit_assign_stmt(self, op: core_ir.AssignStmt) -> core_ir.Stmt:
         rhs = op.value
         clean_name = _clean_ssa_name(op.var.name_hint)
@@ -2960,38 +5295,76 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
                 self._func_promoted_gm_to_nz = True
             return core_ir.AssignStmt(new_var, new_value, op.span)
 
-        # If this is a `tile.move` and a specific L0/L1/UB `TileLayoutDesc` was chosen
-        # for its destination variable, pass `blayout` and `slayout` explicitly on `tile.move`.
+        cfg = self._assign_op_cfg.get(op.var.unique_id)
+        if (
+            isinstance(rhs, core_ir.Call)
+            and rhs.op.name == _TILE_LOAD_OP
+            and isinstance(op.var.type, core_ir.TileType)
+            and (op.var.type.memory_space or core_ir.MemorySpace.Vec) == core_ir.MemorySpace.Vec
+            and cfg is not None
+            and isinstance(cfg.output_layout, TileLayoutDesc)
+        ):
+            return self._rewrite_vec_load_assign(op, rhs, cfg)
+
+        if isinstance(rhs, core_ir.Call) and rhs.op.name == _TILE_STORE_OP:
+            store_call, pre_stmts, nz_src_gm = self._rewrite_tile_store(rhs, cfg, op.span)
+            if nz_src_gm is not None and isinstance(nz_src_gm.type, core_ir.TensorType):
+                store_nd_var = core_ir.Var(f"{clean_name}_nd_store", store_call.type, op.span)
+                assign_store = core_ir.AssignStmt(store_nd_var, store_call, op.span)
+                logical_shape = core_ir.MakeTuple(
+                    [
+                        d
+                        if isinstance(d, core_ir.Expr)
+                        else core_ir.ConstInt(int(d), DataType.INDEX, op.span)
+                        for d in nz_src_gm.type.shape
+                    ],
+                    op.span,
+                )
+                view_call = core_ir.create_op_call(
+                    _TENSOR_VIEW_OP,
+                    [store_nd_var, logical_shape],
+                    {"layout": core_ir.TensorLayout.NZ},
+                    op.span,
+                )
+                new_lhs = core_ir.Var(op.var.name_hint, view_call.type, op.var.span)
+                self._var_remap[op.var.unique_id] = new_lhs
+                self._func_promoted_gm_to_nz = True
+                return core_ir.SeqStmts(
+                    [*pre_stmts, assign_store, core_ir.AssignStmt(new_lhs, view_call, op.span)], op.span
+                )
+            return self._finish_vec_assign(op.var, store_call, None, op.span, op)
+
         if (
             isinstance(rhs, core_ir.Call)
             and rhs.op.name == _TILE_MOVE_OP
-            and target_tile_desc is not None
             and isinstance(op.var.type, core_ir.TileType)
-            and _effective_tile_layout(op.var.type) != target_tile_desc
         ):
-            new_args = [self.visit_expr(arg) for arg in rhs.args]
-            new_kwargs = dict(rhs.kwargs)
-            new_kwargs["blayout"] = target_tile_desc.blayout
-            new_kwargs["slayout"] = target_tile_desc.slayout
-            new_value = core_ir.create_op_call(rhs.op.name, new_args, new_kwargs, rhs.span)
-            if rhs.attrs:
-                new_value = core_ir.set_call_attrs(new_value, dict(rhs.attrs))
-            new_var = core_ir.Var(op.var.name_hint, new_value.type, op.var.span)
-            self._var_remap[op.var.unique_id] = new_var
-            return core_ir.AssignStmt(new_var, new_value, op.span)
+            moved = self._rewrite_tile_move_assign(op, rhs, cfg, target_tile_desc)
+            if moved is not None:
+                return moved
+
+        # General `Mem.Vec` `tile.*` op (`tile.full`, reductions, pointwise, row_expand_*).
+        if (
+            isinstance(rhs, core_ir.Call)
+            and rhs.op.name.startswith("tile.")
+            and rhs.op.name not in (_TILE_LOAD_OP, _TILE_STORE_OP, _TILE_TRANSPOSE_VIEW_OP)
+            and isinstance(op.var.type, core_ir.TileType)
+            and (op.var.type.memory_space or core_ir.MemorySpace.Vec) == core_ir.MemorySpace.Vec
+            and cfg is not None
+            and isinstance(cfg.output_layout, TileLayoutDesc)
+        ):
+            return self._rewrite_vec_generic_assign(op, rhs, cfg)
 
         new_value = self.visit_expr(op.value)
-        new_var = op.var
-        if not new_value.same_as(op.value) and isinstance(
-            op.var.type, (core_ir.TensorType, core_ir.TileType, core_ir.TupleType)
-        ):
-            if isinstance(new_value.type, (core_ir.TensorType, core_ir.TileType, core_ir.TupleType)):
-                new_var = core_ir.Var(op.var.name_hint, new_value.type, op.var.span)
-                self._var_remap[op.var.unique_id] = new_var
-
-        if new_var.same_as(op.var) and new_value.same_as(op.value):
-            return op
-        return core_ir.AssignStmt(new_var, new_value, op.span)
+        prod_lay = (
+            self._vec_prod_lay.get(op.var.unique_id)
+            if (
+                isinstance(op.var.type, core_ir.TileType)
+                and (op.var.type.memory_space or core_ir.MemorySpace.Vec) == core_ir.MemorySpace.Vec
+            )
+            else None
+        )
+        return self._finish_vec_assign(op.var, new_value, prod_lay, op.span, op)
 
     @staticmethod
     def _sync_call_return_type(
@@ -3406,7 +5779,12 @@ def _calibration_op_cost(
         in_lays = list(config.input_layouts)
         store_out_lay = in_lays[1] if len(in_lays) > 1 else config.output_layout
         store_dst_node = instance.values[in_names[1]] if len(in_names) > 1 else output
-        return model.estimate_store_cost(instance.values[in_names[0]], store_dst_node, store_out_lay)
+        return model.estimate_store_cost(
+            instance.values[in_names[0]],
+            store_dst_node,
+            store_out_lay,
+            src_layout=in_lays[0] if in_lays else None,
+        )
     if op.op_name in _TILE_MATMUL_OPS:
         return model.estimate_matmul_cost(
             instance.values[op.inputs[0]], instance.values[op.inputs[1]], output
@@ -3423,7 +5801,16 @@ def _calibration_op_cost(
                 ),
             ]
         )
-        return float(work_elements) / model.vec_elements_per_cycle
+        base = float(work_elements) / model.vec_elements_per_cycle
+        if (
+            (op.op_name == "tile.row_expand_add" or op.op_name in _OTHER_ROW_EXPAND_OPS)
+            and len(config.input_layouts) >= 2
+            and config.input_layouts[1] == COL_MAJOR_FLAT
+        ):
+            ref_shape = instance.values[op.inputs[0]].shape if op.inputs else output.shape
+            m_dim = int(ref_shape[-2]) if len(ref_shape) >= 2 else 1
+            base += model.estimate_vbrcb_cost(m_dim)
+        return base
     return config.op_cost_cycles
 
 
@@ -3492,17 +5879,18 @@ def _calibration_features(
                 continue
         elif op.op_name == _TILE_STORE_OP and op.inputs:
             src_node = instance.values[op.inputs[0]]
-            store_out_lay = cfg.input_layouts[1] if len(cfg.input_layouts) > 1 else cfg.output_layout
-            if store_out_lay == core_ir.TensorLayout.NZ:
-                store_nz_b += inv * float(src_node.byte_size)
-                store_bw = model.fixpipe_acc_to_nz_bytes_per_cycle
-            else:
-                store_nd_b += inv * float(src_node.byte_size)
-                store_bw = model.fixpipe_acc_to_nd_bytes_per_cycle
-            other_cycles += inv * (
-                _calibration_op_cost(model, instance, op, cfg) - float(src_node.byte_size) / store_bw
-            )
-            continue
+            if src_node.memory_space == core_ir.MemorySpace.Acc:
+                store_out_lay = cfg.input_layouts[1] if len(cfg.input_layouts) > 1 else cfg.output_layout
+                if store_out_lay == core_ir.TensorLayout.NZ:
+                    store_nz_b += inv * float(src_node.byte_size)
+                    store_bw = model.fixpipe_acc_to_nz_bytes_per_cycle
+                else:
+                    store_nd_b += inv * float(src_node.byte_size)
+                    store_bw = model.fixpipe_acc_to_nd_bytes_per_cycle
+                other_cycles += inv * (
+                    _calibration_op_cost(model, instance, op, cfg) - float(src_node.byte_size) / store_bw
+                )
+                continue
         other_cycles += inv * _calibration_op_cost(model, instance, op, cfg)
     return [1.0, nd2nz_b, nz2nz_b, store_nd_b, store_nz_b, other_cycles]
 
@@ -3885,6 +6273,7 @@ __all__ = [
     "LayoutValueNode",
     "LayoutVariantArtifact",
     "OperatorConfig",
+    "ROW_BCAST_FLAT",
     "ROW_MAJOR_FLAT",
     "TileLayoutDesc",
     "apply_layout_assignment",
@@ -3897,8 +6286,10 @@ __all__ = [
     "is_nz_compatible_shape",
     "make_auto_layout_pass",
     "make_solver_auto_layout_pass",
+    "pack_dn",
     "pack_nz",
     "run_post_layout_passes",
     "run_pre_layout_passes",
+    "unpack_dn",
     "unpack_nz",
 ]

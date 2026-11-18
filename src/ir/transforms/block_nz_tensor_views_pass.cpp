@@ -456,19 +456,22 @@ class BlockNzMutator : public IRMutator {
       const bool is_load = IsOp(op, "tile.load");
       const bool is_slice = IsOp(op, "tensor.slice");
       const bool is_flatten = IsWholeTensorFlatten(op);
-      CHECK_SPAN(is_store || ((is_load || is_slice || is_flatten) && nz_args.size() == 1 && nz_args[0] == 0),
+      const bool is_backing_alias =
+          IsOp(op, "tensor.view") && nz_args.size() == 1 && nz_args[0] == 0 && !IsNzTensorType(op->GetType());
+      CHECK_SPAN(is_store || ((is_load || is_slice || is_flatten || is_backing_alias) &&
+                              nz_args.size() == 1 && nz_args[0] == 0),
                  op->span_)
           << "NZ layout currently supports only 'tile.load' and 'tensor.slice' reading the tensor as "
-          << "their source, a whole-tensor 'tensor.reshape' flatten, and supported FP32 Acc 'tile.store' "
-          << "destinations, but it is used by '" << op->op_->name_ << "' at argument " << nz_args[0]
-          << ". Use pl.ND for unsupported NZ consumers or writers.";
+          << "their source, a whole-tensor 'tensor.reshape' flatten, a 'tensor.view' backing alias, "
+          << "and supported FP32 Acc 'tile.store' destinations, but it is used by '" << op->op_->name_
+          << "' at argument " << nz_args[0] << ". Use pl.ND for unsupported NZ consumers or writers.";
       auto logical_type = AsTensorTypeLike(op->args_[is_store ? 2 : 0]->GetType());
       INTERNAL_CHECK_SPAN(logical_type, op->span_)
           << "Internal error: the NZ source of '" << op->op_->name_ << "' must be a tensor";
       const std::vector<ExprPtr>& logical_shape = logical_type->shape_;
-      // The flatten keeps its arguments: the element count is layout-invariant
-      // and the result is already ND.
-      if (!is_flatten) {
+      // The flatten and ND backing alias keep their arguments: the element
+      // count / backing geometry are already in target coordinates.
+      if (!is_flatten && !is_backing_alias) {
         args_changed = true;
         if (is_store) {
           new_args = BlockTileStoreArgs(op, std::move(new_args), logical_shape);
@@ -487,6 +490,14 @@ class BlockNzMutator : public IRMutator {
       if (auto blocked_tensor = AsTensorTypeLike(new_return_type)) {
         auto shape_span = new_args[0] ? new_args[0]->span_ : op->span_;
         new_args[0] = std::make_shared<MakeTuple>(blocked_tensor->shape_, shape_span);
+        args_changed = true;
+      }
+    }
+    if (type_changed && IsOp(op, "tensor.view") && new_args.size() >= 2) {
+      if (auto blocked_tensor = AsTensorTypeLike(new_return_type);
+          blocked_tensor && IsNzTensorType(new_return_type)) {
+        auto shape_span = new_args[1] ? new_args[1]->span_ : op->span_;
+        new_args[1] = std::make_shared<MakeTuple>(blocked_tensor->shape_, shape_span);
         args_changed = true;
       }
     }
