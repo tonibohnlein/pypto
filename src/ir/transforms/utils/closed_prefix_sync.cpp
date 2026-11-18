@@ -129,6 +129,9 @@ struct OneWayTransaction {
   int forward_id = -1;
   int return_id = -1;
   uint64_t record_seq = 0;
+  const SeqStmts* parent_seq = nullptr;
+  size_t rec_idx = 0;
+  size_t wait_idx = 0;
 };
 
 bool ContainsSyncTokenType(const TypePtr& type) {
@@ -370,8 +373,22 @@ class Discover : public IRVisitor {
                            same_seq ? rec_it->second.index_in_seq : 0,
                            same_seq ? index : 0});
         } else {
-          one_way.push_back({src, dst, rec_it->second.stmt, statements[index], loop_stack_,
-                             loop_scope_stack_.back()});
+          const bool same_seq = rec_it->second.seq == sequence.get();
+          one_way.push_back({src,
+                             dst,
+                             rec_it->second.stmt,
+                             statements[index],
+                             loop_stack_,
+                             loop_scope_stack_.back(),
+                             false,
+                             0,
+                             0,
+                             -1,
+                             -1,
+                             0,
+                             same_seq ? sequence.get() : nullptr,
+                             same_seq ? rec_it->second.index_in_seq : 0,
+                             same_seq ? index : 0});
           ApplyRelayEdge(preceding_relay, src, dst);
         }
         continue;
@@ -541,9 +558,18 @@ class Assignment {
 
     // Index statement ordering/edges inside loops so we only fall back to the
     // 4-command protocol when a 1-way loop edge lacks an unconditional reverse cycle.
-    std::map<const Stmt*, std::vector<std::pair<PipeType, PipeType>>> cut_edges;
+    // A wait at `wait_idx` only relays completion facts captured on `source` at `rec_idx`.
+    struct SeqWaitEdge {
+      size_t rec_idx;
+      size_t wait_idx;
+      PipeType src;
+      PipeType dst;
+    };
+    std::unordered_map<const SeqStmts*, std::vector<SeqWaitEdge>> seq_wait_edges;
     for (const auto& ow : discovered.one_way) {
-      cut_edges[ow.wait_cut.get()].emplace_back(ow.source, ow.destination);
+      if (ow.parent_seq) {
+        seq_wait_edges[ow.parent_seq].push_back({ow.rec_idx, ow.wait_idx, ow.source, ow.destination});
+      }
     }
 
     // Precompute O(N) bottom-up relay summaries + prefix/suffix tables for SeqStmts so each
@@ -569,15 +595,55 @@ class Assignment {
           if (c) ancestors[c.get()] = {seq.get(), i};
           child_sums[i] = precompute(c);
         }
-        SeqRelays sr;
-        sr.prefix.assign(n + 1, IdentityRelay());
-        sr.suffix.assign(n, IdentityRelay());
-        for (size_t i = 0; i < n; ++i) {
-          sr.prefix[i + 1] = ComposeRelay(sr.prefix[i], child_sums[i]);
+        std::unordered_map<size_t, std::vector<SeqWaitEdge>> edges_at_wait;
+        bool has_non_adjacent_edge = false;
+        if (const auto found = seq_wait_edges.find(seq.get()); found != seq_wait_edges.end()) {
+          for (const auto& edge : found->second) {
+            edges_at_wait[edge.wait_idx].push_back(edge);
+            if (edge.wait_idx > edge.rec_idx + 1 || child_sums[edge.rec_idx] != IdentityRelay()) {
+              has_non_adjacent_edge = true;
+            }
+          }
         }
+        auto scan_from = [&](size_t start_idx, std::vector<RelayMatrix>& pref) {
+          pref.assign(n + 1, IdentityRelay());
+          for (size_t i = start_idx; i < n; ++i) {
+            RelayMatrix next = ComposeRelay(pref[i], child_sums[i]);
+            if (const auto wit = edges_at_wait.find(i); wit != edges_at_wait.end()) {
+              for (const auto& edge : wit->second) {
+                if (edge.rec_idx < start_idx) continue;
+                const RelayMask sm = RelayPipeBit(edge.src);
+                const RelayMask dm = RelayPipeBit(edge.dst);
+                if (sm == 0 || dm == 0) continue;
+                const RelayMatrix& captured = pref[edge.rec_idx];
+                for (size_t p = 0; p < kRelayPipeCount; ++p) {
+                  if ((captured[p] & sm) != 0) next[p] |= dm;
+                }
+              }
+            }
+            pref[i + 1] = next;
+          }
+        };
+        SeqRelays sr;
+        scan_from(0, sr.prefix);
+        sr.suffix.assign(n, IdentityRelay());
         if (n > 0) {
-          for (size_t i = n - 1; i-- > 0;) {
-            sr.suffix[i] = ComposeRelay(child_sums[i + 1], sr.suffix[i + 1]);
+          if (!has_non_adjacent_edge) {
+            std::vector<RelayMatrix> effective_child = child_sums;
+            for (const auto& [wait_idx, edges] : edges_at_wait) {
+              for (const auto& edge : edges) {
+                ApplyRelayEdge(effective_child[wait_idx], edge.src, edge.dst);
+              }
+            }
+            for (size_t i = n - 1; i-- > 0;) {
+              sr.suffix[i] = ComposeRelay(effective_child[i + 1], sr.suffix[i + 1]);
+            }
+          } else {
+            std::vector<RelayMatrix> scratch;
+            for (size_t i = 0; i < n; ++i) {
+              scan_from(i + 1, scratch);
+              sr.suffix[i] = scratch[n];
+            }
           }
         }
         const RelayMatrix total = sr.prefix[n];
@@ -602,11 +668,7 @@ class Assignment {
         precompute(loop->body_);
         return IdentityRelay();
       }
-      RelayMatrix m = IdentityRelay();
-      if (const auto found = cut_edges.find(s.get()); found != cut_edges.end()) {
-        for (const auto& [a, b] : found->second) ApplyRelayEdge(m, a, b);
-      }
-      return m;
+      return IdentityRelay();
     };
     const bool has_loop_one_way = std::any_of(discovered.one_way.begin(), discovered.one_way.end(),
                                               [](const OneWayTransaction& ow) { return !ow.loop_stack.empty(); });
@@ -675,6 +737,37 @@ class Assignment {
       RelayMask loop_post_reach = 0;
       uint32_t loop_scope_id = 0;
       uint64_t wait_seq = 0;
+      std::array<uint64_t, kRelayPipeCount> pipe_reach_seq{};
+      bool is_ack = false;
+
+      void AddReach(PipeType pipe, uint64_t seq) {
+        const RelayMask bit = RelayPipeBit(pipe);
+        if (bit == 0) return;
+        const int idx = static_cast<int>(pipe);
+        if ((reach_from_dst & bit) == 0) {
+          reach_from_dst |= bit;
+          if (idx >= 0 && static_cast<size_t>(idx) < kRelayPipeCount) {
+            pipe_reach_seq[static_cast<size_t>(idx)] = seq;
+          }
+        }
+      }
+      bool ReachedAtOrBefore(PipeType pipe, uint64_t seq) const {
+        const RelayMask bit = RelayPipeBit(pipe);
+        if ((reach_from_dst & bit) == 0) return false;
+        const int idx = static_cast<int>(pipe);
+        return idx >= 0 && static_cast<size_t>(idx) < kRelayPipeCount &&
+               pipe_reach_seq[static_cast<size_t>(idx)] <= seq;
+      }
+      void IntersectReach(const ActiveId& other) {
+        reach_from_dst &= other.reach_from_dst;
+        for (size_t p = 0; p < kRelayPipeCount; ++p) {
+          if ((reach_from_dst & (RelayMask{1} << p)) != 0) {
+            pipe_reach_seq[p] = std::max(pipe_reach_seq[p], other.pipe_reach_seq[p]);
+          } else {
+            pipe_reach_seq[p] = 0;
+          }
+        }
+      }
     };
     uint64_t next_seq = 1;
     std::map<SyncDirection, std::vector<ActiveId>> active_by_dir;
@@ -711,11 +804,12 @@ class Assignment {
                   entry.wait_seq != matched_se->wait_seq || entry.in_flight != matched_se->in_flight;
               if (touched) {
                 entry.reach_from_dst = 0;
+                entry.pipe_reach_seq.fill(0);
                 entry.acyclic = false;
                 entry.loop_pre_reach = 0;
                 entry.loop_post_reach = 0;
               } else {
-                entry.reach_from_dst &= matched_se->reach_from_dst;
+                entry.IntersectReach(*matched_se);
                 entry.acyclic = entry.acyclic && matched_se->acyclic;
                 entry.loop_pre_reach &= matched_se->loop_pre_reach;
                 entry.loop_post_reach &= matched_se->loop_post_reach;
@@ -724,6 +818,7 @@ class Assignment {
               entry.wait_seq = std::max(entry.wait_seq, matched_se->wait_seq);
             } else {
               entry.reach_from_dst = 0;
+              entry.pipe_reach_seq.fill(0);
               entry.acyclic = false;
               entry.loop_pre_reach = 0;
               entry.loop_post_reach = 0;
@@ -731,17 +826,17 @@ class Assignment {
           } else {
             if (!matched_se) {
               entry.in_flight = false;
-              entry.reach_from_dst |= RelayPipeBit(dir.second);
+              entry.AddReach(dir.second, entry.wait_seq);
               entry.acyclic = true;
               entry.loop_pre_reach = 0;
               entry.loop_post_reach = 0;
               entry.loop_scope_id = 0;
             } else {
               if (entry.wait_seq != matched_se->wait_seq) {
-                entry.reach_from_dst =
-                    (entry.reach_from_dst | RelayPipeBit(dir.second)) & matched_se->reach_from_dst;
+                entry.AddReach(dir.second, entry.wait_seq);
+                entry.IntersectReach(*matched_se);
               } else {
-                entry.reach_from_dst &= matched_se->reach_from_dst;
+                entry.IntersectReach(*matched_se);
               }
               entry.in_flight = entry.in_flight || matched_se->in_flight;
               entry.acyclic = matched_se->acyclic;
@@ -823,7 +918,7 @@ class Assignment {
             }
             if (matched_te) {
               entry.in_flight = entry.in_flight || matched_te->in_flight;
-              entry.reach_from_dst &= matched_te->reach_from_dst;
+              entry.IntersectReach(*matched_te);
               entry.acyclic = entry.acyclic && matched_te->acyclic;
               const bool same_scope = entry.loop_scope_id == matched_te->loop_scope_id;
               entry.loop_pre_reach = same_scope ? (entry.loop_pre_reach & matched_te->loop_pre_reach) : 0;
@@ -872,7 +967,7 @@ class Assignment {
                 }
                 if (matched_se) {
                   entry.in_flight = entry.in_flight || matched_se->in_flight;
-                  entry.reach_from_dst &= matched_se->reach_from_dst;
+                  entry.IntersectReach(*matched_se);
                   entry.acyclic = entry.acyclic && matched_se->acyclic;
                   entry.loop_pre_reach &= matched_se->loop_pre_reach;
                   entry.loop_post_reach &= matched_se->loop_post_reach;
@@ -916,6 +1011,7 @@ class Assignment {
         int chosen = -1;
         for (auto& entry : active) {
           if (entry.in_flight || is_branch_blocked(dir, entry.id)) continue;
+          if (ow.loop_scope_id != 0 && entry.is_ack) continue;
           if ((entry.reach_from_dst & RelayPipeBit(ow.source)) == 0) continue;
           if (entry.loop_scope_id != ow.loop_scope_id && entry.loop_scope_id != 0) continue;
           const bool acyclic_reuse = may_reuse && entry.acyclic;
@@ -926,7 +1022,9 @@ class Assignment {
           if (!acyclic_reuse && !loop_closed_reuse) continue;
           chosen = entry.id;
           entry.in_flight = true;
+          entry.is_ack = false;
           entry.reach_from_dst = 0;
+          entry.pipe_reach_seq.fill(0);
           entry.loop_scope_id = ow.loop_scope_id;
           entry.acyclic = may_reuse;
           if (acyclic_reuse) {
@@ -945,7 +1043,7 @@ class Assignment {
                              [&](const ActiveId& e) { return e.id == candidate; })) {
               chosen = candidate;
               active.push_back({chosen, true, 0, may_reuse, ow.loop_pre_reach, ow.loop_post_reach,
-                                ow.loop_scope_id, 0});
+                                ow.loop_scope_id, 0, {}, false});
               if (reservations_[dir].insert(chosen).second) ++roles_count_;
               break;
             }
@@ -969,12 +1067,12 @@ class Assignment {
         for (auto& [dir, vec] : active_by_dir) {
           for (auto& entry : vec) {
             if (dir == fwd && entry.id == ow.forward_id) {
-              entry.reach_from_dst |= RelayPipeBit(ow.destination);
-              if (ow.needs_return_ack) entry.reach_from_dst |= RelayPipeBit(ow.source);
+              entry.AddReach(ow.destination, seq_now);
+              if (ow.needs_return_ack) entry.AddReach(ow.source, seq_now);
             } else if (entry.wait_seq <= ow.record_seq &&
-                       (entry.reach_from_dst & RelayPipeBit(ow.source)) != 0) {
-              entry.reach_from_dst |= RelayPipeBit(ow.destination);
-              if (ow.needs_return_ack) entry.reach_from_dst |= RelayPipeBit(ow.source);
+                       entry.ReachedAtOrBefore(ow.source, ow.record_seq)) {
+              entry.AddReach(ow.destination, seq_now);
+              if (ow.needs_return_ack) entry.AddReach(ow.source, seq_now);
             }
           }
         }
@@ -983,11 +1081,14 @@ class Assignment {
           auto& rev_active = active_by_dir[rev];
           int ack_chosen = -1;
           for (auto& entry : rev_active) {
-            if (!entry.in_flight && entry.acyclic &&
+            if (!entry.in_flight && entry.acyclic && (ow.loop_scope_id == 0 || entry.is_ack) &&
                 (entry.loop_scope_id == ow.loop_scope_id || entry.loop_scope_id == 0) &&
                 (entry.reach_from_dst & RelayPipeBit(rev.first)) != 0 && !is_branch_blocked(rev, entry.id)) {
               ack_chosen = entry.id;
-              entry.reach_from_dst = RelayPipeBit(rev.second);
+              entry.is_ack = true;
+              entry.reach_from_dst = 0;
+              entry.pipe_reach_seq.fill(0);
+              entry.AddReach(rev.second, seq_now);
               entry.loop_scope_id = ow.loop_scope_id;
               entry.acyclic = true;
               entry.loop_pre_reach = 0;
@@ -1002,8 +1103,9 @@ class Assignment {
                   std::none_of(rev_active.begin(), rev_active.end(),
                                [&](const ActiveId& e) { return e.id == candidate; })) {
                 ack_chosen = candidate;
-                rev_active.push_back({ack_chosen, false, RelayPipeBit(rev.second), true, 0, 0,
-                                      ow.loop_scope_id, seq_now});
+                ActiveId fresh{ack_chosen, false, 0, true, 0, 0, ow.loop_scope_id, seq_now, {}, true};
+                fresh.AddReach(rev.second, seq_now);
+                rev_active.push_back(fresh);
                 if (reservations_[rev].insert(ack_chosen).second) ++roles_count_;
                 break;
               }
@@ -1018,23 +1120,12 @@ class Assignment {
             for (auto& entry : vec) {
               if (dir == rev && entry.id == ack_chosen) continue;
               if (!entry.in_flight && (entry.reach_from_dst & RelayPipeBit(rev.first)) != 0) {
-                entry.reach_from_dst |= RelayPipeBit(rev.second);
+                entry.AddReach(rev.second, seq_now);
               }
             }
           }
         }
         return;
-      }
-      if (const auto cit = cut_edges.find(stmt.get()); cit != cut_edges.end()) {
-        for (const auto& [src_e, dst_e] : cit->second) {
-          for (auto& [dir, vec] : active_by_dir) {
-            for (auto& entry : vec) {
-              if ((entry.reach_from_dst & RelayPipeBit(src_e)) != 0) {
-                entry.reach_from_dst |= RelayPipeBit(dst_e);
-              }
-            }
-          }
-        }
       }
     };
     allocate_walk(owner->body_);

@@ -950,6 +950,8 @@ _URMA_SCATTER_OP = _ir_core.get_op("pld.tile.get_async").name
 _URMA_SESSION_OP = _ir_core.get_op("pld.system.make_session").name
 _URMA_TRANSFER_OPS = frozenset({_URMA_PUT_ASYNC_OP, _URMA_GET_ASYNC_OP, _URMA_SCATTER_OP, _URMA_SESSION_OP})
 _TILE_LOAD_OP = _ir_core.get_op("tile.load").name
+_BUFFER_LOAD_OP = _ir_core.get_op("buffer.load").name
+_LOAD_OPS = frozenset({_TILE_LOAD_OP, _BUFFER_LOAD_OP})
 
 
 def _function_uses_ops(func: _ir_core.Function, op_names: frozenset[str]) -> bool:
@@ -1104,7 +1106,7 @@ def _uses_l2_cache_offset(func: _ir_core.Function) -> bool:
             if self.found:
                 return
             ir_op = getattr(op, "op", None)
-            if isinstance(ir_op, _ir_core.Op) and ir_op.name == _TILE_LOAD_OP:
+            if isinstance(ir_op, _ir_core.Op) and ir_op.name in _LOAD_OPS:
                 if int(op.kwargs.get("cache", 0)) == int(_ir_core.CachePolicy.BYPASS):
                     self.found = True
                     return

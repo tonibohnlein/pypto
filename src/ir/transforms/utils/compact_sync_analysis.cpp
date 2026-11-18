@@ -120,6 +120,7 @@ CompactSegmentResult Reduce(const SyncSegment& segment, size_t region,
   for (const auto& site : segment.sites) {
     FiniteOccurrence occurrence{site.pipe, true, {}, {}};
     for (const auto& a : site.accesses) {
+      model.exact_accesses &= a.exact_footprint;
       int64_t access_count = scope_count;
       if (a.coordinate_frame)
         for (const auto& frame : segment.nested_frames)

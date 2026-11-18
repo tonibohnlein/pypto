@@ -428,20 +428,51 @@ Pass LowerSync(bool require_whole_module) {
           auto result = sync::LowerLogicalSync(
               function, context->GetBackendHandler()->GetPtoTargetArch(), std::nullopt, parameters, blocks,
               {}, sync::SyncExternalPolicy::Geometry, FixedLaunchCount(evidence, global->name_));
-          // Default deployment still delegates plans lacking literal flags.
-          // The explicit request also qualifies resource-empty/native-only
-          // plans. A genuinely empty program has no asynchronous exit debt.
-          if (require_whole_module && !payloads && !HasPhysicalCommands(result))
+          // Default deployment still delegates automatically synthesized plans
+          // lacking literal flags when every barrier is already implied by
+          // storage hazards (where PTOAS will re-derive the barrier). Manual
+          // barrier-only token plans between independent buffers retain their
+          // lowered barriers and exit completion so user-specified same-pipe
+          // ordering is never dropped.
+          const auto target = context->GetBackendHandler()->GetPtoTargetArch();
+          const auto launch_count = FixedLaunchCount(evidence, global->name_);
+          if (require_whole_module && !payloads && !HasPhysicalCommands(result)) {
             function = sync::SyncOutcome(result.function, true, "");
-          else if (!require_whole_module && (!result.set_sites || !result.wait_sites))
-            function =
-                HasPhysicalCommands(result)
-                    ? sync::SyncOutcome(sync::StripAllLogicalSync(function), false,
-                                        "Candidate has no SET/WAIT marker; delegate the original kernel")
-                    : result.function;
-          else
-            function = CompleteOwnedInvocation(result.function,
-                                               context->GetBackendHandler()->GetPtoTargetArch());
+          } else if (!require_whole_module && (!result.set_sites || !result.wait_sites)) {
+            if (!HasPhysicalCommands(result)) {
+              function = result.function;
+            } else {
+              const auto stripped = sync::StripAllLogicalSync(function);
+              bool storage_implied = false;
+              try {
+                const bool prefix = context->GetAutoSyncPolicy() == "conservative_prefix";
+                const auto auto_logical = AnalyzeRegionSync(stripped, target, true, prefix, parameters,
+                                                            blocks, launch_count, {}, {});
+                const auto auto_lowered =
+                    sync::LowerLogicalSync(sync::OptimizeLogicalSync(auto_logical), target, std::nullopt,
+                                           parameters, blocks, {}, sync::SyncExternalPolicy::Geometry,
+                                           launch_count);
+                if (auto_lowered.physical_cases.size() == result.physical_cases.size()) {
+                  storage_implied = true;
+                  for (size_t i = 0; i < result.physical_cases.size(); ++i) {
+                    if (auto_lowered.physical_cases[i].barrier_sites <
+                        result.physical_cases[i].barrier_sites) {
+                      storage_implied = false;
+                      break;
+                    }
+                  }
+                }
+              } catch (const pypto::ValueError&) {
+                storage_implied = false;
+              }
+              function = storage_implied
+                             ? sync::SyncOutcome(stripped, false,
+                                                 "Candidate has no SET/WAIT marker; delegate the original kernel")
+                             : CompleteOwnedInvocation(result.function, target);
+            }
+          } else {
+            function = CompleteOwnedInvocation(result.function, target);
+          }
         }
         auto result = std::make_shared<Program>(functions, program->name_, program->span_);
         return require_whole_module ? PublishWholeModuleOutcome(result) : result;

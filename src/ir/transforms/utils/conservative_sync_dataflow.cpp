@@ -708,6 +708,21 @@ class Builder {
     std::vector<size_t> rpo_pos;
     ComputeRpo(cfg, cfg_entry, rpo, rpo_pos);
 
+    bool has_backedge = false;
+    for (const size_t u : rpo) {
+      for (const size_t v : cfg[u].succs) {
+        if (rpo_pos[v] <= rpo_pos[u]) {
+          has_backedge = true;
+          break;
+        }
+      }
+      if (has_backedge) break;
+    }
+
+    if (!has_backedge) {
+      return SolveAcyclic(cfg, rpo, cfg_exit);
+    }
+
     std::vector<LiveStorageState> live_in, live_out;
     SolveLiveStorage(cfg, rpo, rpo_pos, cfg_entry, live_in, live_out);
     ExtractSourcePipeServices(cfg, rpo, live_in, live_out);
@@ -823,6 +838,206 @@ class Builder {
       state.AddEffects(children[vertex.index].effects);
     }
     return state;
+  }
+
+  ConservativeAccessSet SolveAcyclic(const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo,
+                                     size_t cfg_exit) {
+    const size_t n = cfg.size();
+    std::vector<bool> has_reaching_child(n, false);
+    {
+      std::queue<size_t> q;
+      for (size_t w = 0; w < n; ++w) {
+        if (cfg[w].kind != CfgVertex::Kind::Child) continue;
+        for (const size_t nxt : cfg[w].succs) {
+          if (!has_reaching_child[nxt]) {
+            has_reaching_child[nxt] = true;
+            q.push(nxt);
+          }
+        }
+      }
+      while (!q.empty()) {
+        const size_t x = q.front();
+        q.pop();
+        for (const size_t nxt : cfg[x].succs) {
+          if (!has_reaching_child[nxt]) {
+            has_reaching_child[nxt] = true;
+            q.push(nxt);
+          }
+        }
+      }
+    }
+
+    // Pass 1: Fused live-storage transfer and conflict extraction with immediate
+    // predecessor state release so straight-line sequences hold O(1) active maps.
+    std::vector<LiveStorageState> live_out(n);
+    std::vector<size_t> rem_succs(n);
+    for (size_t u = 0; u < n; ++u) rem_succs[u] = cfg[u].succs.size();
+    ConservativeAccessSet tracked_facts;
+    for (const size_t u : rpo) {
+      const auto& v = cfg[u];
+      if (v.kind == CfgVertex::Kind::BranchMerge && !v.preds.empty()) {
+        cost.control_snapshot_facts += live_out[v.preds[0]].FactCount();
+        for (size_t i = 1; i < v.preds.size(); ++i) {
+          cost.control_merge_facts += live_out[v.preds[i]].FactCount();
+        }
+      }
+      LiveStorageState in_u;
+      if (v.preds.size() == 1) {
+        const size_t p = v.preds[0];
+        if (--rem_succs[p] == 0) {
+          in_u = std::move(live_out[p]);
+        } else {
+          in_u = live_out[p];
+        }
+      } else {
+        for (const size_t p : v.preds) {
+          in_u.MergeFrom(live_out[p]);
+          if (--rem_succs[p] == 0) live_out[p] = LiveStorageState{};
+        }
+      }
+      if (v.kind == CfgVertex::Kind::Child) {
+        auto& entry = children[v.index];
+        for (const auto& fact : entry.effects) {
+          if (tracked_facts.insert(fact).second) ++cost.conflict_summary_facts;
+        }
+        if (retain_incoming_diagnostics_) {
+          entry.incoming = in_u.ToAccessSet();
+          cost.incoming_diagnostic_facts += entry.incoming.size();
+        }
+        std::set<std::pair<PipeType, PipeType>> services;
+        for (const auto& effect : entry.effects) {
+          for (const auto source : in_u.QueryConflicts(effect, cost)) {
+            services.emplace(source, std::get<1>(effect));
+          }
+        }
+        entry.first_visit = !has_reaching_child[u];
+        if (has_reaching_child[u] && entry.eventful) {
+          for (const auto& dir : entry.eventful->RearmDirections()) services.insert(dir);
+        }
+        entry.services.assign(services.begin(), services.end());
+        entry.required_services = entry.services;
+        cost.baseline_services += services.size();
+        cost.services += services.size();
+        std::array<PipeMask, kPhysicalPipeCount> matrix{};
+        for (const auto& [src, dst] : entry.services) {
+          const PipeMask sm = PipeToMask(src);
+          const PipeMask dm = PipeToMask(dst);
+          if (sm == 0 || dm == 0) continue;
+          for (size_t p = 0; p < kPhysicalPipeCount; ++p) {
+            const PipeMask p_bit = PipeMask{1} << p;
+            if (((p_bit | matrix[p]) & sm) != 0) matrix[p] |= dm;
+          }
+        }
+        if (child_service_matrices_.size() <= v.index) child_service_matrices_.resize(v.index + 1);
+        child_service_matrices_[v.index] = matrix;
+      } else if (v.kind == CfgVertex::Kind::Site) {
+        auto& site = sites[v.index];
+        for (const auto& fact : site.effects) {
+          if (tracked_facts.insert(fact).second) ++cost.conflict_summary_facts;
+        }
+        if (retain_incoming_diagnostics_) {
+          site.incoming = in_u.ToAccessSet();
+          cost.incoming_diagnostic_facts += site.incoming.size();
+        }
+        if (enable_refresh_kill_) {
+          for (const auto& [space, domain] : site.refreshed_domains) {
+            cost.killed_facts += in_u.CountDomain(space, domain);
+          }
+        }
+        std::set<PipeType> sources;
+        for (const auto& effect : site.effects) {
+          const auto conflicting = in_u.QueryConflicts(effect, cost);
+          sources.insert(conflicting.begin(), conflicting.end());
+        }
+        site.required_source_pipes.assign(sources.begin(), sources.end());
+        cost.baseline_services += sources.size();
+      }
+      ++cost.dataflow_visits;
+      live_out[u] = TransferLiveStorage(v, std::move(in_u));
+      if (u != cfg_exit && rem_succs[u] == 0) live_out[u] = LiveStorageState{};
+    }
+    ConservativeAccessSet exit_set =
+        retain_incoming_diagnostics_ ? live_out[cfg_exit].ToAccessSet() : ConservativeAccessSet{};
+    live_out.clear();
+    live_out.shrink_to_fit();
+
+    // Pass 2: Fused debt selection and certification on the DAG with immediate
+    // predecessor state release.
+    std::vector<DebtState> debt_out(n);
+    for (size_t u = 0; u < n; ++u) rem_succs[u] = cfg[u].succs.size();
+    for (const size_t u : rpo) {
+      const auto& v = cfg[u];
+      DebtState cur_in;
+      if (v.preds.size() == 1) {
+        const size_t p = v.preds[0];
+        if (--rem_succs[p] == 0) {
+          cur_in = std::move(debt_out[p]);
+        } else {
+          cur_in = debt_out[p];
+        }
+      } else {
+        for (const size_t p : v.preds) {
+          cur_in.MergeFrom(debt_out[p]);
+          if (--rem_succs[p] == 0) debt_out[p] = DebtState{};
+        }
+      }
+      ++cost.certificate_visits;
+      if (v.kind == CfgVertex::Kind::Child) {
+        const auto& entry_child = children[v.index];
+        INTERNAL_CHECK(entry_child.services == entry_child.required_services)
+            << "Internal error: protected child/rearming services changed";
+        debt_out[u] = TransferDebt(v, std::move(cur_in), /*use_selected=*/true);
+      } else if (v.kind == CfgVertex::Kind::Site) {
+        auto& site = sites[v.index];
+        const auto destination = site.operation.Implementation().Pipe();
+        site.source_pipes = cur_in.Select(site.required_source_pipes, destination, site.effects);
+        PipeMask sources_mask = 0;
+        for (const auto source : site.source_pipes) sources_mask |= PipeToMask(source);
+        cur_in.DeliverSources(sources_mask, destination);
+        std::vector<PipeType> missing;
+        for (const auto req : site.required_source_pipes) {
+          if (!cur_in.CoversConflicts(req, destination, site.effects)) missing.push_back(req);
+        }
+        if (!missing.empty()) {
+          std::set<PipeType> unioned(site.source_pipes.begin(), site.source_pipes.end());
+          unioned.insert(missing.begin(), missing.end());
+          site.source_pipes.clear();
+          PipeMask extra_mask = 0;
+          for (const auto req : site.required_source_pipes) {
+            if (unioned.count(req)) {
+              site.source_pipes.push_back(req);
+              extra_mask |= PipeToMask(req);
+            }
+          }
+          cur_in.DeliverSources(extra_mask, destination);
+        }
+        size_t next = 0;
+        for (const auto source : site.required_source_pipes) {
+          if (next < site.source_pipes.size() && site.source_pipes[next] == source) ++next;
+        }
+        INTERNAL_CHECK(next == site.source_pipes.size())
+            << "Internal error: conservative service selection added or reordered a service";
+        for (const auto source : site.required_source_pipes) {
+          INTERNAL_CHECK(cur_in.CoversConflicts(source, destination, site.effects))
+              << "Internal error: conservative service selection omits a payload prerequisite";
+        }
+        const size_t omitted = site.required_source_pipes.size() - site.source_pipes.size();
+        cost.certificate_omissions += omitted;
+        cost.suppressed_services += omitted;
+        cost.services += site.source_pipes.size();
+        if (enable_refresh_kill_) {
+          for (const auto& [space, domain] : site.refreshed_domains) cur_in.KillDomain(space, domain);
+        }
+        cur_in.AddEffects(site.effects);
+        debt_out[u] = std::move(cur_in);
+      } else {
+        debt_out[u] = std::move(cur_in);
+      }
+      if (rem_succs[u] == 0) debt_out[u] = DebtState{};
+    }
+    INTERNAL_CHECK(cost.certificate_omissions == cost.suppressed_services)
+        << "Internal error: conservative service certificate omitted a proposed deletion";
+    return exit_set;
   }
 
   void SolveLiveStorage(const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo,
