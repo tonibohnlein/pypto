@@ -1639,7 +1639,7 @@ JIT_SUITE_SPECS: tuple[tuple[str, Any, list[tuple[tuple[int, ...], torch.dtype]]
             "m3_owned": False,
             "m1_max_ids": 4,
             "m2_max_ids": 5,
-            "m1_sw": (20, 20),
+            "m1_sw": (18, 18),
         },
     ),
     (

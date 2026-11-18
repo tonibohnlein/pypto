@@ -895,6 +895,7 @@ class Importer {
     ForStmtPtr scope;
   };
   std::unordered_map<const Expr*, SlotSelection> slots;
+  std::unordered_set<const Expr*> transposed_mat;
   ParameterIndices parameters;
   CoordinateGraph coordinates;
   std::set<size_t> translated_storage;
@@ -1354,6 +1355,7 @@ class Importer {
     auto scope = segment.original_loop;
     if (!scope && !segment.nested_frames.empty()) scope = segment.nested_frames.back().loop;
     objects[assign->var_.get()] = id;
+    if (transposed_mat.count(call->args_[0].get())) transposed_mat.insert(assign->var_.get());
     slots[assign->var_.get()] = {coordinate.first % count, stride % count, frame, scope};
   }
   void QualifySlot(const ExprPtr& handle, const SyncSegment& segment) const {
@@ -1516,12 +1518,23 @@ class Importer {
       if (old.space != t->memory_space_ || address >= old.address + old.bytes ||
           old.address >= address + bytes)
         continue;
-      CHECK(old.address == address && old.bytes == bytes && old.slot_count == slot_count && old.layout &&
-            old.rows == t->shape_[0] && old.columns == t->shape_[1] && old.layout->dtype_ == t->dtype_ &&
-            old.layout->blayout_ == t->blayout_ && old.layout->slayout_ == t->slayout_ &&
-            old.layout->fractal_ == t->fractal_)
+      const bool same_geom = old.address == address && old.bytes == bytes && old.slot_count == slot_count &&
+                             old.layout && old.layout->dtype_ == t->dtype_ &&
+                             old.layout->fractal_ == t->fractal_;
+      const bool identical_layout = same_geom && old.rows == t->shape_[0] && old.columns == t->shape_[1] &&
+                                    old.layout->blayout_ == t->blayout_ &&
+                                    old.layout->slayout_ == t->slayout_;
+      const bool transposed_mat_layout =
+          same_geom && t->memory_space_ == MemorySpace::Mat && t->slayout_ != TileLayout::none_box &&
+          t->fractal_ == 16 * 16 * t->dtype_.GetByte() && old.rows == t->shape_[1] &&
+          old.columns == t->shape_[0] && old.layout->blayout_ == t->slayout_ &&
+          old.layout->slayout_ == t->blayout_ &&
+          ((old.layout->blayout_ == TileLayout::col_major && old.layout->slayout_ == TileLayout::row_major) ||
+           (old.layout->blayout_ == TileLayout::row_major && old.layout->slayout_ == TileLayout::col_major));
+      CHECK(identical_layout || transposed_mat_layout)
           << "Overlapping placed buffers need a common physical-layout partition";
       objects[a->var_.get()] = i;
+      if (transposed_mat_layout) transposed_mat.insert(a->var_.get());
       return;
     }
     objects[a->var_.get()] = result.storage.size();
@@ -1806,19 +1819,23 @@ class Importer {
         auto column = extract ? Coordinate(call->args_[2], segment) : AffineCoordinate{};
         CHECK(row.parameters.empty() && column.parameters.empty() && !row.block && !column.block)
             << "Parameterized local extraction needs a separate membership and alignment certificate";
-        if (!extract) CHECK(s.rows == t.rows && s.columns == t.columns) << "Partial copy is not qualified";
+        const bool transposed = transposed_mat.count(call->args_[0].get()) != 0;
+        const int64_t ext_rows = transposed ? t.columns : t.rows;
+        const int64_t ext_cols = transposed ? t.rows : t.columns;
+        if (transposed) std::swap(row, column);
+        if (!extract) CHECK(s.rows == ext_rows && s.columns == ext_cols) << "Partial copy is not qualified";
         if (s.layout->slayout_ != TileLayout::none_box) {
           const auto box = s.layout->fractal_ / (16 * s.layout->dtype_.GetByte());
           const auto aligned_frames = [](const auto& frames, int64_t alignment) {
             return std::all_of(frames.begin(), frames.end(),
                                [&](const auto& entry) { return entry.second % alignment == 0; });
           };
-          CHECK(row.first % 16 == 0 && row.second % 16 == 0 && t.rows % 16 == 0 && column.first % box == 0 &&
-                column.second % box == 0 && t.columns % box == 0 && aligned_frames(row.frames, 16) &&
+          CHECK(row.first % 16 == 0 && row.second % 16 == 0 && ext_rows % 16 == 0 && column.first % box == 0 &&
+                column.second % box == 0 && ext_cols % box == 0 && aligned_frames(row.frames, 16) &&
                 aligned_frames(column.frames, box))
               << "Unaligned boxed extraction requires a separate footprint contract";
         }
-        auto source_access = Access(sid, false, row, column, t.rows, t.columns, segment);
+        auto source_access = Access(sid, false, row, column, ext_rows, ext_cols, segment);
         // The retained rectangle and physical layout are exact even when a
         // moving or boxed slice has no stationary contiguous interval export.
         // Consumers qualify their own representation: the periodic extractor
@@ -1841,18 +1858,22 @@ class Importer {
       auto column = Coordinate(call->args_[2], segment);
       CHECK(row.parameters.empty() && column.parameters.empty() && !row.block && !column.block)
           << "Parameterized local insertion needs a separate membership and alignment certificate";
+      const bool transposed = transposed_mat.count(call->args_[3].get()) != 0;
+      const int64_t ins_rows = transposed ? s.columns : s.rows;
+      const int64_t ins_cols = transposed ? s.rows : s.columns;
+      if (transposed) std::swap(row, column);
       const auto aligned_frames = [](const auto& frames, int64_t alignment) {
         return std::all_of(frames.begin(), frames.end(),
                            [&](const auto& entry) { return entry.second % alignment == 0; });
       };
       const auto box =
           t.layout->slayout_ != TileLayout::none_box ? t.layout->fractal_ / (16 * t.layout->dtype_.GetByte()) : 16;
-      CHECK(row.first % 16 == 0 && row.second % 16 == 0 && s.rows % 16 == 0 && column.first % 16 == 0 &&
-            column.second % 16 == 0 && s.columns % 16 == 0 && column.first % box == 0 && column.second % box == 0 &&
-            s.columns % box == 0 && aligned_frames(row.frames, 16) && aligned_frames(column.frames, 16) &&
+      CHECK(row.first % 16 == 0 && row.second % 16 == 0 && ins_rows % 16 == 0 && column.first % 16 == 0 &&
+            column.second % 16 == 0 && ins_cols % 16 == 0 && column.first % box == 0 && column.second % box == 0 &&
+            ins_cols % box == 0 && aligned_frames(row.frames, 16) && aligned_frames(column.frames, 16) &&
             aligned_frames(column.frames, box))
           << "Unaligned boxed insertion requires a separate footprint contract";
-      auto target_access = Access(tid, true, row, column, s.rows, s.columns, segment);
+      auto target_access = Access(tid, true, row, column, ins_rows, ins_cols, segment);
       ApplySlot(target_access, call->args_[3], segment);
       whole(0, false);
       if (recover_accesses) {

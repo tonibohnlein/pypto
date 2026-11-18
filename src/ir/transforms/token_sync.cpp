@@ -468,7 +468,9 @@ Pass LowerSync(bool require_whole_module) {
               function = storage_implied
                              ? sync::SyncOutcome(stripped, false,
                                                  "Candidate has no SET/WAIT marker; delegate the original kernel")
-                             : CompleteOwnedInvocation(result.function, target);
+                             : sync::SyncOutcome(
+                                   result.function, false,
+                                   "Candidate has no SET/WAIT marker; preserve manual barriers");
             }
           } else {
             function = CompleteOwnedInvocation(result.function, target);
