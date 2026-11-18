@@ -689,9 +689,12 @@ class AssignedCommandLowering {
     result_.endpoint_domain_entries += domain->ranges.size();
     std::vector<ExprPtr> guards;
     for (size_t i = 0; i < frames.size(); ++i) {
-      const auto [first, end] = domain->ranges[i];
-      INTERNAL_CHECK(first >= 0 && end > first && end <= frames[i].count) << "Invalid endpoint interval";
-      const auto stride = domain->steps.empty() ? 1 : domain->steps[i];
+      const auto [first, raw_end] = domain->ranges[i];
+      INTERNAL_CHECK(first >= 0 && raw_end > first && raw_end <= frames[i].count) << "Invalid endpoint interval";
+      const auto raw_stride = domain->steps.empty() ? 1 : domain->steps[i];
+      const auto active_visits = (raw_end - first - 1) / raw_stride + 1;
+      const auto stride = active_visits == 1 ? int64_t{1} : raw_stride;
+      const auto end = active_visits == 1 ? first + 1 : raw_end;
       if (stride > 1) {
         // Normalize with the admitted original frame origin, not a potentially
         // later first-active visit: the dividend is nonnegative on all visits.
@@ -714,7 +717,9 @@ class AssignedCommandLowering {
         }
         return Integer(digit, span);
       };
-      if (end - first == 1) {
+      if (end - first == 1 && first > 0 && end < frames[i].count) {
+        guards.push_back(std::make_shared<Eq>(value, boundary(first), DataType::BOOL, span));
+      } else if (end - first == 1 && first == 0 && frames[i].count > 2) {
         guards.push_back(std::make_shared<Eq>(value, boundary(first), DataType::BOOL, span));
       } else {
         if (first) guards.push_back(std::make_shared<Ge>(value, boundary(first), DataType::BOOL, span));
@@ -780,7 +785,7 @@ class AssignedCommandLowering {
         const auto& digits = publish ? endpoint.rank->source : endpoint.rank->target;
         for (size_t i = 0; i < endpoint.rank->rank_coefficients.size(); ++i) {
           const auto coefficient = endpoint.rank->rank_coefficients[i] % modulus;
-          if (!coefficient || endpoint.rank->source[i].count == 1) continue;
+          if (!coefficient || digits[i].count == 1) continue;
           INTERNAL_CHECK(i < digits.size() && i < endpoint.domain->frame->loops.size())
               << "Matched WAIT rank lost original source coordinate";
           ExprPtr digit = FrameDigit(endpoint.domain->frame->loops[i], span);

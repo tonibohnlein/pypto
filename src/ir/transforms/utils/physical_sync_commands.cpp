@@ -544,6 +544,22 @@ class CommandGuards {
         }
         ++i;
       }
+      for (size_t i = 0; i < nodes.size() && !changed; ++i) {
+        if (!nodes[i].condition || !nodes[i].alternative.empty()) continue;
+        for (size_t j = i + 2; j < nodes.size(); ++j) {
+          if (!SameKindDisjointCommands(nodes[i].children, nodes[j - 1])) break;
+          if (nodes[j].condition && nodes[j].alternative.empty() &&
+              SameControl(nodes[i].condition, nodes[j].condition)) {
+            nodes[i].children.insert(nodes[i].children.end(),
+                                     std::make_move_iterator(nodes[j].children.begin()),
+                                     std::make_move_iterator(nodes[j].children.end()));
+            nodes.erase(nodes.begin() + static_cast<std::ptrdiff_t>(j));
+            NormalizeNodes(nodes[i].children);
+            changed = true;
+            break;
+          }
+        }
+      }
       if (changed) continue;
       for (size_t i = 0; i < nodes.size() && !changed; ++i) {
         if (!nodes[i].condition || !nodes[i].alternative.empty()) continue;

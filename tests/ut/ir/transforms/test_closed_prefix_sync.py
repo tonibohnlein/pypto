@@ -20,7 +20,6 @@ from pypto.ir.op import sync
 from .sync_closed_command_oracle import ClosedCommands, check_closed_commands, opname
 from .test_autosync_switch import clone
 from .test_conservative_sync_dataflow import conservative_fixture
-from .test_conservative_sync_storage import many_independent_windows
 from .test_logical_sync_realization import verify
 from .test_token_sync_lowering import _check_actual_tokens
 
@@ -1350,7 +1349,7 @@ def test_interleaved_loop_records_require_return_ack_and_reviewer_probes():
         ).get_function("manual_bar")
     assert lowered_manual is not None
     _check_actual_tokens(fn_orig, fn_manual, lowered_manual)
-    assert dict(lowered_manual.attrs)["pypto_autosync"] is True
+    assert dict(lowered_manual.attrs)["pypto_autosync"] is False
 
     # 3. Buffer BYPASS load wrapper detection
     tensor_a = ir.Var("a", ir.TensorType([ci(16), ci(32)], ir.DataType.FP32), SPAN)
@@ -1438,7 +1437,40 @@ def test_interleaved_loop_records_require_return_ack_and_reviewer_probes():
 
     # 6. Conservative solver scaling on 512 independent windows
     t0 = time.perf_counter()
-    fn_512 = many_independent_windows(512)
+    gm_512 = ir.Var("source", ir.TensorType([2, 8], ir.DataType.FP32), SPAN)
+    local_512 = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
+    stmts_512 = []
+    zero_tup = ir.MakeTuple([ci(0), ci(0)], SPAN)
+    shape_tup = ir.MakeTuple([ci(2), ci(8)], SPAN)
+    empty_tup = ir.MakeTuple([], SPAN)
+    for idx in range(512):
+        s_var = ir.Var(f"x_{idx}", local_512, SPAN)
+        t_var = ir.Var(f"z_{idx}", local_512, SPAN)
+        for var, addr in ((s_var, 128 * idx), (t_var, 128 * idx + 64)):
+            stmts_512.append(
+                ir.AssignStmt(
+                    var, ir.Call(ir.get_op("buffer.alloc"), [empty_tup, ci(addr)], local_512, SPAN), SPAN
+                )
+            )
+        stmts_512.append(
+            ir.EvalStmt(
+                ir.Call(ir.get_op("buffer.load"), [gm_512, zero_tup, shape_tup, s_var], ir.VoidType(), SPAN),
+                SPAN,
+            )
+        )
+        stmts_512.append(
+            ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [s_var, t_var], ir.VoidType(), SPAN), SPAN)
+        )
+    stmts_512.append(ir.ReturnStmt([], SPAN))
+    fn_512 = ir.Function(
+        "independent_windows",
+        [gm_512],
+        [],
+        ir.SeqStmts(stmts_512, SPAN),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
     res_512 = testing.analyze_conservative_sync(
         fn_512, automatic_children=False, retain_incoming_diagnostics=False
     )

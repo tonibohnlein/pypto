@@ -787,6 +787,12 @@ class Builder {
       AddCfgEdge(cfg, entry, header);
       const size_t body_exit = BuildSubCfg(loop->body_, header, cfg);
       AddCfgEdge(cfg, body_exit, header);
+      const auto start = As<ConstInt>(loop->start_);
+      const auto stop = As<ConstInt>(loop->stop_);
+      const auto step = As<ConstInt>(loop->step_);
+      if (start && stop && step && step->value_ > 0 && stop->value_ > start->value_) {
+        return body_exit;
+      }
       return header;
     }
     if (const auto loop = As<WhileStmt>(statement)) {

@@ -121,6 +121,9 @@ class NativeSyncPlacement : public IRVisitor {
     const auto& value = statement->value_;
     if (const auto existing = windows_.find(value.get()); existing != windows_.end()) {
       windows_.emplace(statement->var_.get(), existing->second);
+      if (const auto pitch = pitches_.find(value.get()); pitch != pitches_.end()) {
+        pitches_.emplace(statement->var_.get(), pitch->second);
+      }
       if (const auto full = exact_full_windows_.find(value.get());
           full != exact_full_windows_.end() &&
           HasFullStaticValidShape(As<BufferType>(statement->var_->GetType()))) {
@@ -152,6 +155,11 @@ class NativeSyncPlacement : public IRVisitor {
       if (end > std::numeric_limits<int64_t>::max()) return;
       const backend::BufferSyncByteWindow window{address->value_, static_cast<int64_t>(end)};
       windows_.emplace(statement->var_.get(), window);
+      if (!multi && type && type->memory_space_ == MemorySpace::Vec && type->shape_.size() == 2 &&
+          type->shape_[0] > 0 && type->shape_[1] > 0 && type->dtype_.GetBit() % 8 == 0 &&
+          backend::DenseBufferBytes(type)) {
+        pitches_.emplace(statement->var_.get(), type->shape_[1] * type->dtype_.GetByte());
+      }
       if (!multi && HasFullStaticValidShape(type)) {
         exact_full_windows_.emplace(statement->var_.get(), window);
         spaces_.emplace(statement->var_.get(), type->memory_space_);
@@ -167,6 +175,37 @@ class NativeSyncPlacement : public IRVisitor {
         const auto multi = As<MultiBufferType>(call->args_[0]->GetType());
         const auto index = As<ConstInt>(call->args_[1]);
         if (!multi || !index || index->value_ < 0 || index->value_ >= multi->slot_count_) return;
+      }
+      if (IsOp(call, "buffer.subview") && call->args_.size() >= 2) {
+        const auto pitch_it = pitches_.find(call->args_[0].get());
+        const auto offsets = As<MakeTuple>(call->args_[1]);
+        const auto type = As<BufferType>(statement->var_->GetType());
+        if (pitch_it != pitches_.end() && offsets && offsets->elements_.size() == 2 && type &&
+            type->memory_space_ == MemorySpace::Vec && type->shape_.size() == 2 && type->shape_[0] > 0 &&
+            type->shape_[1] > 0 && type->dtype_.GetBit() % 8 == 0) {
+          const auto r0 = As<ConstInt>(offsets->elements_[0]);
+          const auto c0 = As<ConstInt>(offsets->elements_[1]);
+          const int64_t elem_bytes = type->dtype_.GetByte();
+          const int64_t pitch = pitch_it->second;
+          if (r0 && c0 && r0->value_ >= 0 && c0->value_ >= 0 && elem_bytes > 0 && pitch > 0) {
+            const __int128 begin =
+                __int128(parent->second.begin) + __int128(r0->value_) * pitch + __int128(c0->value_) * elem_bytes;
+            const __int128 end =
+                begin + __int128(type->shape_[0] - 1) * pitch + __int128(type->shape_[1]) * elem_bytes;
+            if (begin >= parent->second.begin && end > begin && end <= parent->second.end) {
+              const backend::BufferSyncByteWindow sub_win{static_cast<int64_t>(begin),
+                                                          static_cast<int64_t>(end)};
+              windows_.emplace(statement->var_.get(), sub_win);
+              pitches_.emplace(statement->var_.get(), pitch);
+              if (HasFullStaticValidShape(type) &&
+                  (type->shape_[0] == 1 || __int128(type->shape_[1]) * elem_bytes == pitch)) {
+                exact_full_windows_.emplace(statement->var_.get(), sub_win);
+                spaces_.emplace(statement->var_.get(), type->memory_space_);
+              }
+              return;
+            }
+          }
+        }
       }
       // Runtime subviews use the existing declared containment contract.
       // Slots have no corresponding automatic index proof: retain their
@@ -198,6 +237,7 @@ class NativeSyncPlacement : public IRVisitor {
     return std::nullopt;
   }
   std::unordered_map<const Expr*, backend::BufferSyncByteWindow> windows_;
+  std::unordered_map<const Expr*, int64_t> pitches_;
   std::unordered_map<const Expr*, backend::BufferSyncByteWindow> exact_full_windows_;
   std::unordered_map<const Expr*, MemorySpace> spaces_;
   std::unordered_set<const Expr*> dynamic_valid_targets_;
