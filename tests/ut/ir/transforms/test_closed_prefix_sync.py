@@ -10,15 +10,19 @@
 """Closed current-prefix protocols: actual commands, matching and causal reuse."""
 
 from itertools import product
+import time
 
 import pytest
 from pypto import ir, passes, testing
+from pypto.backend import pto_backend
 from pypto.ir.op import sync
 
 from .sync_closed_command_oracle import ClosedCommands, check_closed_commands, opname
 from .test_autosync_switch import clone
 from .test_conservative_sync_dataflow import conservative_fixture
+from .test_conservative_sync_storage import many_independent_windows
 from .test_logical_sync_realization import verify
+from .test_token_sync_lowering import _check_actual_tokens
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
 SPAN = ir.Span.unknown()
@@ -1249,3 +1253,195 @@ def test_loop_one_sided_if_set_wait_ack_propagates_relay_and_reuses_ids():
     for n_val, ch_val in product((0, 1, 3), (0, 1)):
         _, after = check_closed_commands(fn, phys, {0: n_val, 1: ch_val}, [0, 1], compare_commands=False)
         assert not after.live
+
+
+def test_interleaved_loop_records_require_return_ack_and_reviewer_probes():
+    # 1. Interleaved loop record/wait (b recorded before wait(a, V) cannot relay wait(a, V))
+    a = ir.Var("a", ir.SyncTokenType(ir.PipeType.MTE2), SPAN)
+    b = ir.Var("b", ir.SyncTokenType(ir.PipeType.V), SPAN)
+    iv = ir.Var("i", ir.ScalarType(ir.DataType.INDEX), SPAN)
+    loop_body = seq(
+        ir.AssignStmt(a, sync.record(ir.PipeType.MTE2), SPAN),
+        ir.AssignStmt(b, sync.record(ir.PipeType.V), SPAN),
+        ir.EvalStmt(sync.wait(a, ir.PipeType.V), SPAN),
+        ir.EvalStmt(sync.wait(b, ir.PipeType.MTE2), SPAN),
+        ir.YieldStmt([], SPAN),
+    )
+    for_loop = ir.ForStmt(iv, ci(0), ci(3), ci(1), [], loop_body, [], SPAN)
+    fn_for = ir.Function(
+        "interleaved_for",
+        [],
+        [],
+        seq(for_loop, ir.ReturnStmt([], SPAN)),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    verify(fn_for)
+    phys_for = lower(fn_for)
+    ClosedCommands(phys_for, {}, range(8)).run()
+    with passes.PassContext([], enable_pypto_autosync=True):
+        pub_for = passes.lower_sync()(ir.Program([fn_for], "P1", SPAN)).get_function("interleaved_for")
+    assert pub_for is not None
+    ClosedCommands(pub_for, {}, range(8)).run()
+
+    # 2. Manual barrier-only requirement on disjoint buffers in default LowerSync
+    buf_type = ir.BufferType([16, 32], ir.DataType.FP32, ir.MemorySpace.Vec, [16, 32])
+    x = ir.Var("x", buf_type, SPAN)
+    y = ir.Var("y", buf_type, SPAN)
+    tok = ir.Var("t", ir.SyncTokenType(ir.PipeType.V), SPAN)
+    alloc_x = ir.AssignStmt(
+        x, ir.Call(ir.get_op("buffer.alloc"), [ir.MakeTuple([], SPAN), ci(0)], {}, None, buf_type, SPAN), SPAN
+    )
+    alloc_y = ir.AssignStmt(
+        y,
+        ir.Call(ir.get_op("buffer.alloc"), [ir.MakeTuple([], SPAN), ci(4096)], {}, None, buf_type, SPAN),
+        SPAN,
+    )
+    full_x = ir.EvalStmt(
+        ir.Call(
+            ir.get_op("buffer.full"),
+            [ir.ConstFloat(1.0, ir.DataType.FP32, SPAN), x],
+            {},
+            ir.VoidType(),
+            SPAN,
+        ),
+        SPAN,
+    )
+    full_y = ir.EvalStmt(
+        ir.Call(
+            ir.get_op("buffer.full"),
+            [ir.ConstFloat(2.0, ir.DataType.FP32, SPAN), y],
+            {},
+            ir.VoidType(),
+            SPAN,
+        ),
+        SPAN,
+    )
+    fn_orig = ir.Function(
+        "manual_bar",
+        [],
+        [],
+        seq(alloc_x, alloc_y, full_x, full_y, ir.ReturnStmt([], SPAN)),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    fn_manual = ir.Function(
+        "manual_bar",
+        [],
+        [],
+        seq(
+            alloc_x,
+            alloc_y,
+            full_x,
+            ir.AssignStmt(tok, sync.record(ir.PipeType.V), SPAN),
+            ir.EvalStmt(sync.wait(tok, ir.PipeType.V), SPAN),
+            full_y,
+            ir.ReturnStmt([], SPAN),
+        ),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with passes.PassContext([], enable_pypto_autosync=True, autosync_disjoint_gm=True):
+        lowered_manual = passes.lower_sync(require_whole_module=False)(
+            ir.Program([fn_manual], "P2", SPAN)
+        ).get_function("manual_bar")
+    assert lowered_manual is not None
+    _check_actual_tokens(fn_orig, fn_manual, lowered_manual)
+    assert dict(lowered_manual.attrs)["pypto_autosync"] is True
+
+    # 3. Buffer BYPASS load wrapper detection
+    tensor_a = ir.Var("a", ir.TensorType([ci(16), ci(32)], ir.DataType.FP32), SPAN)
+    load_bypass = ir.EvalStmt(
+        ir.Call(
+            ir.get_op("buffer.load"),
+            [tensor_a, ir.MakeTuple([ci(0), ci(0)], SPAN), ir.MakeTuple([ci(16), ci(32)], SPAN), x],
+            {"cache": int(ir.CachePolicy.BYPASS)},
+            ir.VoidType(),
+            SPAN,
+        ),
+        SPAN,
+    )
+    fn_bypass = ir.Function(
+        "bypass_buf",
+        [tensor_a],
+        [],
+        seq(alloc_x, load_bypass, ir.ReturnStmt([], SPAN)),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    assert pto_backend._uses_l2_cache_offset(fn_bypass) is True
+
+    # 4. OptimizeSync nested join liveness
+    ta = ir.Var("ta", ir.SyncTokenType(ir.PipeType.MTE2), SPAN)
+    tb = ir.Var("tb", ir.SyncTokenType(ir.PipeType.MTE2), SPAN)
+    tj = ir.Var("tj", ir.SyncTokenType(ir.PipeType.MTE2), SPAN)
+    fn_join = ir.Function(
+        "nested_join",
+        [],
+        [],
+        seq(
+            ir.AssignStmt(ta, sync.record(ir.PipeType.MTE2), SPAN),
+            ir.AssignStmt(tb, sync.record(ir.PipeType.MTE2), SPAN),
+            ir.AssignStmt(tj, sync.join(sync.join(ta, tb), sync.completed(ir.PipeType.MTE2)), SPAN),
+            ir.EvalStmt(sync.wait(tj, ir.PipeType.V), SPAN),
+            ir.ReturnStmt([], SPAN),
+        ),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    verify(fn_join)
+    opt_join = passes.optimize_sync()(ir.Program([fn_join], "P4", SPAN)).get_function("nested_join")
+    assert opt_join is not None
+    verify(opt_join)
+
+    # 5. Vec->Vec extract enclosure precision
+    src_t = ir.BufferType([32, 64], ir.DataType.FP32, ir.MemorySpace.Vec, [32, 64])
+    dst_t = ir.BufferType([16, 32], ir.DataType.FP32, ir.MemorySpace.Vec, [16, 32])
+    v_src = ir.Var("v_src", src_t, SPAN)
+    v_dst = ir.Var("v_dst", dst_t, SPAN)
+    fn_ext = ir.Function(
+        "vec_ext",
+        [tensor_a],
+        [],
+        seq(
+            ir.AssignStmt(
+                v_src,
+                ir.Call(ir.get_op("buffer.alloc"), [ir.MakeTuple([], SPAN), ci(0)], {}, None, src_t, SPAN),
+                SPAN,
+            ),
+            ir.AssignStmt(
+                v_dst,
+                ir.Call(ir.get_op("buffer.alloc"), [ir.MakeTuple([], SPAN), ci(8192)], {}, None, dst_t, SPAN),
+                SPAN,
+            ),
+            ir.EvalStmt(
+                ir.Call(
+                    ir.get_op("buffer.extract"), [v_src, ci(8), ci(16), v_dst], {}, ir.VoidType(), SPAN
+                ),
+                SPAN,
+            ),
+            ir.ReturnStmt([], SPAN),
+        ),
+        SPAN,
+        type=ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    retained_ext = testing.analyze_placed_sync(fn_ext, True).describe()
+    ext_site = retained_ext["regions"][0]["sites"][0]
+    assert ext_site["access_precision"] == ["enclosure", "exact"]
+    assert ext_site["physical_intervals"][0] is None
+
+    # 6. Conservative solver scaling on 512 independent windows
+    t0 = time.perf_counter()
+    fn_512 = many_independent_windows(512)
+    res_512 = testing.analyze_conservative_sync(
+        fn_512, automatic_children=False, retain_incoming_diagnostics=False
+    )
+    dt = time.perf_counter() - t0
+    assert res_512["cost"]["retained_facts"] == 2048
+    assert dt < 0.25

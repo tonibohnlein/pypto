@@ -1786,9 +1786,18 @@ class Importer {
         CHECK(bound_in_source(row, dst_view.type->shape_[0], src_view.type->shape_[0]) &&
               bound_in_source(column, dst_view.type->shape_[1], src_view.type->shape_[1]))
             << "Synchronization access exceeds its proved allocation";
-        // Vec->Vec extraction may span non-contiguous physical rows; model the
-        // full Vec domain conservatively across both Exact and prefix analysis.
-        whole(0, false);
+        // Vec->Vec extraction may span non-contiguous physical rows; mark a proper
+        // subwindow read as an enclosure so precision certificates distinguish it
+        // from an exact full-buffer footprint.
+        const bool full_source = row.first == 0 && row.second == 0 && row.frames.empty() && column.first == 0 &&
+                                 column.second == 0 && column.frames.empty() &&
+                                 dst_view.type->shape_[0] == src_view.type->shape_[0] &&
+                                 dst_view.type->shape_[1] == src_view.type->shape_[1];
+        if (full_source) {
+          whole(0, false);
+        } else {
+          enclosure(0, false);
+        }
         whole(target, true);
       } else {
         CHECK(s.space == MemorySpace::Mat && (t.space == MemorySpace::Left || t.space == MemorySpace::Right))

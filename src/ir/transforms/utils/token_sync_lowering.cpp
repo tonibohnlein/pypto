@@ -517,35 +517,39 @@ class ForwardSyncOptimizer : public IRMutator {
         return op;
       }
       if (IsOp(call, "sync.join") && call->args_.size() == 2) {
-        const auto a = AsVarLike(call->args_[0]);
-        const auto b = AsVarLike(call->args_[1]);
-        const VarPtr ca = a ? Canonical(a) : VarPtr{};
-        const VarPtr cb = b ? Canonical(b) : VarPtr{};
-        if (ca && cb && ca.get() == cb.get()) {
-          return bind_alias(op->var_, ca);
+        auto is_completed_expr = [&](const ExprPtr& e) -> bool {
+          if (const auto c = As<Call>(e); c && IsOp(c, "sync.completed")) return true;
+          if (const auto v = AsVarLike(e)) return completed_.count(v.get()) != 0;
+          return false;
+        };
+        std::function<ExprPtr(const ExprPtr&)> simplify_join = [&](const ExprPtr& e) -> ExprPtr {
+          if (const auto v = AsVarLike(e)) return Canonical(v);
+          const auto c = As<Call>(e);
+          if (!c || !IsOp(c, "sync.join") || c->args_.size() != 2) return e;
+          ExprPtr lhs = simplify_join(c->args_[0]);
+          ExprPtr rhs = simplify_join(c->args_[1]);
+          const bool lc = is_completed_expr(lhs);
+          const bool rc = is_completed_expr(rhs);
+          if (lc && !rc) return rhs;
+          if (rc) return lhs;
+          const auto va = AsVarLike(lhs);
+          const auto vb = AsVarLike(rhs);
+          if (va && vb && va.get() == vb.get()) return va;
+          if (lhs.get() != c->args_[0].get() || rhs.get() != c->args_[1].get()) {
+            return OpRegistry::GetInstance().Create(c->op_->name_, {std::move(lhs), std::move(rhs)},
+                                                    c->kwargs_, c->span_);
+          }
+          return e;
+        };
+        const ExprPtr simplified_rhs = simplify_join(call);
+        if (const auto v = AsVarLike(simplified_rhs)) {
+          return bind_alias(op->var_, v);
         }
-        if (ca && completed_.count(ca.get())) {
-          if (cb) return bind_alias(op->var_, cb);
-          return std::make_shared<AssignStmt>(op->var_, call->args_[1], op->span_, op->leading_comments_);
+        if (is_completed_expr(simplified_rhs)) {
+          completed_.insert(op->var_.get());
         }
-        if (cb && completed_.count(cb.get())) {
-          if (ca) return bind_alias(op->var_, ca);
-          return std::make_shared<AssignStmt>(op->var_, call->args_[0], op->span_, op->leading_comments_);
-        }
-        bool changed = false;
-        std::vector<ExprPtr> next_args = call->args_;
-        if (ca && a && ca.get() != a.get()) {
-          next_args[0] = ca;
-          changed = true;
-        }
-        if (cb && b && cb.get() != b.get()) {
-          next_args[1] = cb;
-          changed = true;
-        }
-        if (changed) {
-          auto next_call = OpRegistry::GetInstance().Create(call->op_->name_, std::move(next_args),
-                                                            call->kwargs_, call->span_);
-          return std::make_shared<AssignStmt>(op->var_, std::move(next_call), op->span_, op->leading_comments_);
+        if (simplified_rhs.get() != op->value_.get()) {
+          return std::make_shared<AssignStmt>(op->var_, simplified_rhs, op->span_, op->leading_comments_);
         }
       }
     }
@@ -730,20 +734,22 @@ class SyncLivenessCollector : public IRVisitor {
       return;
     }
     auto& dst = deps_[op->var_.get()];
-    if (const auto v = AsVarLike(op->value_)) {
-      dst.push_back(v.get());
-      return;
-    }
-    if (const auto call = As<Call>(op->value_)) {
-      if (IsOp(call, "sync.completed") || IsOp(call, "sync.record")) return;
-      if (IsOp(call, "sync.join")) {
-        for (const auto& arg : call->args_) {
-          if (const auto v = AsVarLike(arg)) dst.push_back(v.get());
-        }
+    std::function<void(const ExprPtr&)> collect_token_deps = [&](const ExprPtr& expr) {
+      if (!expr) return;
+      if (const auto v = AsVarLike(expr)) {
+        dst.push_back(v.get());
         return;
       }
-    }
-    IRVisitor::VisitStmt_(op);
+      if (const auto call = As<Call>(expr)) {
+        if (IsOp(call, "sync.completed") || IsOp(call, "sync.record")) return;
+        if (IsOp(call, "sync.join")) {
+          for (const auto& arg : call->args_) collect_token_deps(arg);
+          return;
+        }
+      }
+      VisitExpr(expr);
+    };
+    collect_token_deps(op->value_);
   }
 
   void VisitStmt_(const IfStmtPtr& op) override {

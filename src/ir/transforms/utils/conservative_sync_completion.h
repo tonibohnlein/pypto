@@ -43,13 +43,17 @@ struct CompletionSyncEdge {
   bool bidirectional = true;
 };
 
-// Region completion summary corresponding to Draft Section 8.3 (A, E, S, t):
-// - active (A): pipes that may execute a memory access inside the region.
-// - post_write_safe (E): for each p in active, pipes q guaranteed ordered after every
-//   access on p along all paths in the region that touch p.
-// - relay (S): for each pipe p, pipes q guaranteed ordered after p along all paths from
-//   entry to exit (every path includes a sync chain p ->+ q or p == q).
-// - has_bypass_path (t): whether a path from entry to exit exists with zero sync edges.
+// Pipe-projected region completion summary and its soundness mapping to Draft Section 8.3 (A, E, S, t):
+// Unlike the access-set tuple (A, E, S, t) in Section 8.3 (where E and S partition accesses around
+// a region-wide common completion barrier), this summary tracks per-pipe ordering across all paths
+// through a promoted child region R:
+// - active: physical pipes p that may execute a memory access inside R (pipe projection of A).
+// - post_write_safe[p]: for each active pipe p, pipes q guaranteed ordered after *every* access on p
+//   along all paths through R that touch p (discharging exit obligations S on pipe p toward q).
+// - relay[p]: for each pipe p, pipes q guaranteed ordered after p along *every* entry-to-exit path
+//   through R (every path contains a directed sync chain p ->+ q, or p == q), allowing R to transitively
+//   relay pre-region completion obligations (E) from p to q.
+// - has_bypass_path: whether an entry-to-exit path exists with zero synchronization edges (t).
 struct CompletionSummary {
   PipeMask active = 0;
   std::array<PipeMask, kPhysicalPipeCount> post_write_safe{};
