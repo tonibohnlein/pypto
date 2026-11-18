@@ -1679,6 +1679,126 @@ def test_device_sweep_l3_host_tuple_sync_and_rank5_reshape_fixes():
     assert isinstance(host_param_t, ir.TensorType) and _tensor_type_layout(host_param_t) == ir.TensorLayout.ND
     assert isinstance(chip_param_t, ir.TensorType) and _tensor_type_layout(chip_param_t) == ir.TensorLayout.NZ
 
+    # 4) Full two-blocking-pass pipeline: Pass 10 BlockNzTensorViews -> AutoLayout tile rewrite ->
+    #    Pass 22.5 BlockNzTensorViews must NOT double-block an already-blocked NZ parameter.
+    from pypto.pypto_core import passes as core_passes  # noqa: PLC0415
+
+    wo_a_3d = ir.Var(
+        "wo_a__ssa_v0",
+        ir.TensorType([1, 256, 128], DataType.FP16, None, nz_view),
+        span,
+    )
+    t_src = ir.Var(
+        "t_src",
+        ir.TileType(
+            [16, 16],
+            DataType.FP16,
+            None,
+            ir.TileView(blayout=ir.TileLayout.col_major, slayout=ir.TileLayout.row_major, fractal=512),
+            ir.MemorySpace.Mat,
+        ),
+        span,
+    )
+    move_call = ir.create_op_call(
+        "tile.move",
+        [t_src],
+        {"target_memory": ir.MemorySpace.Left},
+        span,
+    )
+    t_dst = ir.Var("t_dst", move_call.type, span)
+    fn_pre_nz = ir.Function(
+        "proj_a_mm",
+        [wo_a_3d, t_src],
+        [],
+        ir.AssignStmt(t_dst, move_call, span),
+        span,
+        type=ir.FunctionType.AIC,
+        level=ir.Level.AIC,
+    )
+    wq_a_2d = ir.Var("wq_a__ssa_v0", ir.TensorType([64, 64], DataType.FP16, None, nd_view), span)
+    fn_other = ir.Function(
+        "other_mm",
+        [wq_a_2d],
+        [],
+        empty_body,
+        span,
+        type=ir.FunctionType.AIC,
+        level=ir.Level.AIC,
+    )
+    prog_two_pass = ir.Program([fn_pre_nz, fn_other], "prog_two_pass", span)
+    set_backend_type(BackendType.Ascend910)
+    block_pipe = core_passes.PassPipeline()
+    block_pipe.add_pass(core_passes.block_nz_tensor_views())
+    pass1_prog = block_pipe.run(prog_two_pass)
+    p1_fns = {fn.name: fn for fn in pass1_prog.functions.values()}
+    assert "nz_tensor_views_blocked" in p1_fns["proj_a_mm"].attrs
+    assert [int(d.value) for d in p1_fns["proj_a_mm"].params[0].type.shape] == [1, 8, 16, 16, 16]
+
+    rewritten_two_pass = apply_layout_assignment(
+        pass1_prog,
+        LayoutAssignment(
+            value_layouts={
+                "wo_a": nz,
+                "wq_a": nz,
+                "proj_a_mm.t_dst": FRACTAL_ZN,
+            },
+            op_configs={},
+        ),
+    )
+    pass2_prog = block_pipe.run(rewritten_two_pass)
+    p2_fns = {fn.name: fn for fn in pass2_prog.functions.values()}
+    assert [int(d.value) for d in p2_fns["proj_a_mm"].params[0].type.shape] == [1, 8, 16, 16, 16]
+    assert [int(d.value) for d in p2_fns["other_mm"].params[0].type.shape] == [1, 4, 4, 16, 16]
+
+    # 5) Vec tile.store uses MTE3 bandwidth (no Fixpipe odd_n1 penalty), and reductions price by max
+    #    input/output elements.
+    from pypto.ir.auto_layout import ROW_MAJOR_FLAT, _calibration_op_cost  # noqa: PLC0415
+
+    cm = LayoutCostModel(mte3_vec_bytes_per_cycle=200.0, vec_elements_per_cycle=128.0)
+    vec_src = LayoutValueNode(
+        name="v_out",
+        shape=(16, 48),  # odd_n1 = 3 if treated as Fixpipe
+        dtype=DataType.FP32,
+        memory_space=ir.MemorySpace.Vec,
+        current_layout=ROW_MAJOR_FLAT,
+        admissible_layouts=(ROW_MAJOR_FLAT,),
+    )
+    gm_dst = LayoutValueNode(
+        name="y_gm",
+        shape=(16, 48),
+        dtype=DataType.FP32,
+        memory_space=ir.MemorySpace.DDR,
+        current_layout=nd,
+        admissible_layouts=(nd,),
+    )
+    assert cm.estimate_store_cost(vec_src, gm_dst, nd) == pytest.approx(float(vec_src.byte_size) / 200.0)
+
+    red_in = LayoutValueNode(
+        name="x_ub",
+        shape=(64, 128),
+        dtype=DataType.FP32,
+        memory_space=ir.MemorySpace.Vec,
+        current_layout=ROW_MAJOR_FLAT,
+        admissible_layouts=(ROW_MAJOR_FLAT,),
+    )
+    red_out = LayoutValueNode(
+        name="s_ub",
+        shape=(64, 1),
+        dtype=DataType.FP32,
+        memory_space=ir.MemorySpace.Vec,
+        current_layout=ROW_MAJOR_FLAT,
+        admissible_layouts=(ROW_MAJOR_FLAT,),
+        producer_op_id="red",
+    )
+    red_cfg = OperatorConfig("red", "tile.row_sum", (ROW_MAJOR_FLAT,), ROW_MAJOR_FLAT, 0.0)
+    red_op = LayoutOperationNode("red", "tile.row_sum", ("x_ub",), "s_ub", configs=(red_cfg,))
+    red_inst = LayoutProblemInstance(
+        values={"x_ub": red_in, "s_ub": red_out},
+        operations=[red_op],
+        cost_model=cm,
+    )
+    assert _calibration_op_cost(cm, red_inst, red_op, red_cfg) == pytest.approx(8192.0 / 128.0)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

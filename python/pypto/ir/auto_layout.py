@@ -340,6 +340,7 @@ class LayoutCostModel:
     mte2_l2_reread_discount: float = 0.30
     l2_cache_line_bytes: int = 512
     mte2_vec_bytes_per_cycle: float = 192.0
+    mte3_vec_bytes_per_cycle: float = 192.0
     mte1_l1_to_l0_bytes_per_cycle: float = 129.7
     mte1_l0a_bytes_per_cycle: float = 129.7
     mte1_l0b_bytes_per_cycle: float = 85.4
@@ -575,14 +576,17 @@ class LayoutCostModel:
         dst_node: LayoutValueNode,
         dst_layout: LayoutChoice,
     ) -> float:
-        """Estimate `tile.store` (`Acc -> GM` or `Vec -> GM`) cost.
+        """Estimate `tile.store` (`Acc -> GM` via FIXPIPE or `Vec -> GM` via MTE3) cost.
 
-        Follows `DrainCycles` in `l0_tile_chooser.cpp` (`pto-isa fixpipe-model.md`):
-        includes optional per-drain fixed overhead and non-power-of-2 N-fractal
-        (`odd(N1) - 1`) burst serialization penalty per M-row.
+        For `MemorySpace.Acc`, follows `DrainCycles` in `l0_tile_chooser.cpp`
+        (`pto-isa fixpipe-model.md`), including optional per-drain fixed overhead
+        and non-power-of-2 N-fractal (`odd(N1) - 1`) burst serialization penalty.
+        For `MemorySpace.Vec`, uses MTE3 UB -> GM transfer bandwidth.
         """
         del dst_node
         total_bytes = float(src_node.byte_size)
+        if src_node.memory_space == core_ir.MemorySpace.Vec:
+            return total_bytes / self.mte3_vec_bytes_per_cycle
         bw = (
             self.fixpipe_acc_to_nz_bytes_per_cycle
             if dst_layout == core_ir.TensorLayout.NZ
@@ -1595,22 +1599,8 @@ class _PostInferInstanceExtractor:
                 continue
             override = self._param_overrides[idx] if idx < len(self._param_overrides) else None
             name = override or _clean_ssa_name(param.name_hint)
-            self._uid_to_name[param.unique_id] = name
             view = param.type.tensor_view
             cur_layout = view.layout if view is not None else core_ir.TensorLayout.ND
-            if name in self.values:
-                prev_node = self.values[name]
-                if (
-                    cur_layout == core_ir.TensorLayout.NZ
-                    and prev_node.current_layout != core_ir.TensorLayout.NZ
-                ):
-                    self.values[name] = replace(
-                        prev_node,
-                        shape=shape,
-                        current_layout=cur_layout,
-                        admissible_layouts=(cur_layout,),
-                    )
-                continue
             if self._external_out_names is not None:
                 is_ext_out = name in self._external_out_names
             else:
@@ -1633,6 +1623,28 @@ class _PostInferInstanceExtractor:
                 admissible = (core_ir.TensorLayout.ND, core_ir.TensorLayout.NZ)
             else:
                 admissible = (cur_layout,)
+            if name in self.values:
+                prev_node = self.values[name]
+                if (
+                    prev_node.current_layout == cur_layout
+                    and prev_node.dtype == param.type.dtype
+                    and prev_node.shape == shape
+                ):
+                    self._uid_to_name[param.unique_id] = name
+                    common_adm = tuple(lay for lay in prev_node.admissible_layouts if lay in admissible) or (
+                        prev_node.current_layout,
+                    )
+                    if common_adm != prev_node.admissible_layouts:
+                        self.values[name] = replace(prev_node, admissible_layouts=common_adm)
+                    continue
+                if prev_node.admissible_layouts != (prev_node.current_layout,):
+                    self.values[name] = replace(prev_node, admissible_layouts=(prev_node.current_layout,))
+                base_param = _clean_ssa_name(param.name_hint)
+                name = (
+                    f"{self._tile_prefix}{base_param}" if self._tile_prefix else f"{func.name}.{base_param}"
+                )
+                admissible = (cur_layout,)
+            self._uid_to_name[param.unique_id] = name
             self.values[name] = LayoutValueNode(
                 name=name,
                 shape=shape,
@@ -2003,7 +2015,8 @@ class _PostInferInstanceExtractor:
         else:
             allowed_outputs = dst_node.admissible_layouts
 
-        cost = float(dst_node.num_elements) / self._model.vec_elements_per_cycle
+        work_elements = max([dst_node.num_elements, *(in_node.num_elements for _, _, in_node in tile_inputs)])
+        cost = float(work_elements) / self._model.vec_elements_per_cycle
         configs: list[OperatorConfig] = []
         for in_combo in itertools.product(*allowed_per_input):
             for out_lay in allowed_outputs:
@@ -2648,6 +2661,7 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         self._var_remap: dict[int, core_ir.Var] = {}
         self._func_return_types: dict[str, list[core_ir.Type]] = {}
         self._current_func_name = ""
+        self._func_promoted_gm_to_nz = False
 
     def _lookup_tensor_layout(self, name_hint: str) -> core_ir.TensorLayout | None:
         clean_name = _clean_ssa_name(name_hint)
@@ -2815,6 +2829,7 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
             return func
         self._var_remap.clear()
         self._current_func_name = func.name
+        self._func_promoted_gm_to_nz = False
         new_params: list[tuple[core_ir.Var, core_ir.ParamDirection]] = []
         changed = False
         has_nz_param = False
@@ -2836,6 +2851,7 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
                 changed = True
                 if target_layout == core_ir.TensorLayout.NZ:
                     has_nz_param = True
+                    self._func_promoted_gm_to_nz = True
             else:
                 new_params.append((param, direction))
                 if (
@@ -2876,10 +2892,11 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         if not changed and new_body.same_as(func.body):
             return func
 
-        # If any parameter was newly set to `pl.NZ`, strip any stale `nz_tensor_views_blocked`
-        # stamp so `BlockNzTensorViews` can block the updated function.
+        # Strip `nz_tensor_views_blocked` only when THIS function newly promoted a GM
+        # parameter or local `tensor.create` to `pl.NZ`, so already-blocked NZ functions
+        # modified only for on-chip tile layouts are never double-blocked.
         new_attrs = dict(func.attrs) if func.attrs else {}
-        if any(lay == core_ir.TensorLayout.NZ for lay in self._tensor_layouts.values()):
+        if self._func_promoted_gm_to_nz:
             new_attrs.pop("nz_tensor_views_blocked", None)
 
         return core_ir.Function(
@@ -2939,6 +2956,8 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
                 new_value = core_ir.set_call_attrs(new_value, dict(rhs.attrs))
             new_var = core_ir.Var(op.var.name_hint, new_value.type, op.var.span)
             self._var_remap[op.var.unique_id] = new_var
+            if target_tensor_layout == core_ir.TensorLayout.NZ:
+                self._func_promoted_gm_to_nz = True
             return core_ir.AssignStmt(new_var, new_value, op.span)
 
         # If this is a `tile.move` and a specific L0/L1/UB `TileLayoutDesc` was chosen
@@ -3393,7 +3412,18 @@ def _calibration_op_cost(
             instance.values[op.inputs[0]], instance.values[op.inputs[1]], output
         )
     if op.op_name.startswith("tile."):
-        return float(output.num_elements) / model.vec_elements_per_cycle
+        work_elements = max(
+            [
+                output.num_elements,
+                *(
+                    instance.values[in_name].num_elements
+                    for in_name in op.inputs
+                    if in_name in instance.values
+                    and instance.values[in_name].memory_space != core_ir.MemorySpace.DDR
+                ),
+            ]
+        )
+        return float(work_elements) / model.vec_elements_per_cycle
     return config.op_cost_cycles
 
 
@@ -3799,11 +3829,9 @@ def fit_cost_model_from_measurements(
         fixpipe_acc_to_nz_bytes_per_cycle=fit_acc_to_nz,
     )
 
+    fitted_op_cycles = [_calibration_prediction_cycles(fitted, measurement) for measurement in measurements]
     y_pred = np.asarray(
-        [
-            float(coef[0]) + us_per_cycle * _calibration_prediction_cycles(fitted, measurement)
-            for measurement in measurements
-        ],
+        [float(coef[0]) + us_per_cycle * cyc for cyc in fitted_op_cycles],
         dtype=np.float64,
     )
     ss_res = float(np.sum((y_vec - y_pred) ** 2))
@@ -3811,7 +3839,15 @@ def fit_cost_model_from_measurements(
     r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 1e-12 else float(ss_res <= 1e-12)
     mape = 100.0 * float(np.mean(np.abs(y_vec - y_pred) / np.maximum(np.abs(y_vec), 1e-9)))
     rho = _spearman_rank_correlation([float(yp) for yp in y_pred], rows_y)
-    pooled_op_rho = _spearman_rank_correlation(op_cycles_list, rows_y)
+    post_fit_within_rhos: list[float] = []
+    for idxs in case_groups.values():
+        if len(idxs) < 2:
+            continue
+        grp_ops = [fitted_op_cycles[i] for i in idxs]
+        if max(grp_ops) > min(grp_ops):
+            post_fit_within_rhos.append(_spearman_rank_correlation(grp_ops, [rows_y[i] for i in idxs]))
+    within_op_rho = float(np.median(post_fit_within_rhos)) if post_fit_within_rhos else within_op_rho
+    pooled_op_rho = _spearman_rank_correlation(fitted_op_cycles, rows_y)
     residuals = {vid: float(yp - yt) for vid, yt, yp in zip(variant_ids, y_vec, y_pred, strict=True)}
     return CalibrationReport(
         fitted_model=fitted,
