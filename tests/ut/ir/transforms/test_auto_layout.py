@@ -1537,10 +1537,14 @@ def test_bench_metrics_and_variant_matching_fixes():
         col_model.fixpipe_acc_to_nd_bytes_per_cycle
     )
 
-    # Device-sweep fixes:
-    # 1) _sync_call_return_type preserves caller dynamic DimExpr shapes on TupleType while updating layout.
-    from pypto.ir.auto_layout import _LayoutAssignmentWriter  # noqa: PLC0415
 
+def test_device_sweep_l3_host_tuple_sync_and_rank5_reshape_fixes():
+    from pypto.ir.auto_layout import _LayoutAssignmentWriter, _tensor_type_layout  # noqa: PLC0415
+
+    nd = ir.TensorLayout.ND
+    nz = ir.TensorLayout.NZ
+
+    # 1) _sync_call_return_type preserves caller dynamic DimExpr shapes on TupleType while updating layout.
     span = ir.Span.unknown()
     c16 = ir.ConstInt(16, DataType.INDEX, span)
     caller_dim = ir.Var("caller_t", ir.ScalarType(DataType.INDEX), span)
@@ -1557,15 +1561,46 @@ def test_bench_metrics_and_variant_matching_fixes():
     assert synced_elem0.tensor_view is not None and synced_elem0.tensor_view.layout == ir.TensorLayout.NZ
     assert synced_elem0.shape[0].same_as(caller_dim)
 
-    # 2) Pre-blocked rank-5 NZ GM weight keeps admissible_layouts == (NZ,) so it is never demoted to ND.
+    # 2) Pre-blocked rank-5 NZ GM weight keeps admissible_layouts == (NZ,) even when preceded by a
+    #    1D flat ND reshape alias passed to a prefetch helper (`prefetch_o_proj_w` before `proj_a_mm`).
     empty_body = ir.SeqStmts([], span)
+    wo_a_orch = ir.Var(
+        "wo_a__ssa_v0",
+        ir.TensorType([1, 16, 8, 16, 16], DataType.FP16, None, nz_view),
+        span,
+    )
+    wo_a_flat_var = ir.Var(
+        "wo_a_flat__ssa_v0",
+        ir.TensorType([32768], DataType.FP16, None, nd_view),
+        span,
+    )
+    reshape_call = ir.create_op_call(
+        "tensor.reshape",
+        [wo_a_orch, ir.MakeTuple([ir.ConstInt(32768, DataType.INDEX, span)], span)],
+        {},
+        span,
+    )
+    prefetch_param = ir.Var(
+        "wo_a_flat__ssa_v0",
+        ir.TensorType([32768], DataType.FP16, None, nd_view),
+        span,
+    )
+    fn_prefetch = ir.Function(
+        "prefetch_o_proj_w",
+        [prefetch_param],
+        [],
+        empty_body,
+        span,
+        type=ir.FunctionType.AIV,
+        level=ir.Level.AIV,
+    )
     wo_a_rank5_nz = ir.Var(
-        "wo_a",
+        "wo_a__ssa_v0",
         ir.TensorType([1, 16, 8, 16, 16], DataType.FP16, None, nz_view),
         span,
     )
     fn_rank5 = ir.Function(
-        "incore_rank5",
+        "proj_a_mm",
         [wo_a_rank5_nz],
         [],
         empty_body,
@@ -1573,9 +1608,47 @@ def test_bench_metrics_and_variant_matching_fixes():
         type=ir.FunctionType.AIC,
         level=ir.Level.AIC,
     )
-    mod_rank5 = ir.Program([fn_rank5], "mod_rank5", span)
+    orch_body = ir.SeqStmts(
+        [
+            ir.AssignStmt(wo_a_flat_var, reshape_call, span),
+            ir.EvalStmt(
+                ir.Call(
+                    ir.GlobalVar("prefetch_o_proj_w"), [wo_a_flat_var], {}, None, ir.VoidType.get(), span
+                ),
+                span,
+            ),
+            ir.EvalStmt(
+                ir.Call(ir.GlobalVar("proj_a_mm"), [wo_a_orch], {}, None, ir.VoidType.get(), span),
+                span,
+            ),
+        ],
+        span,
+    )
+    fn_orch = ir.Function(
+        "decode_csa_orch",
+        [wo_a_orch],
+        [],
+        orch_body,
+        span,
+        type=ir.FunctionType.Orchestration,
+        level=ir.Level.CHIP,
+    )
+    mod_rank5 = ir.Program([fn_orch, fn_prefetch, fn_rank5], "mod_rank5", span)
     inst_rank5 = extract_layout_instance(mod_rank5)
+    assert inst_rank5.values["wo_a"].current_layout == nz
     assert inst_rank5.values["wo_a"].admissible_layouts == (nz,)
+    assert inst_rank5.values["wo_a_flat"].current_layout == nd
+    assert inst_rank5.values["wo_a_flat"].admissible_layouts == (nd,)
+    rewritten_rank5 = apply_layout_assignment(
+        mod_rank5,
+        LayoutAssignment(
+            value_layouts={"wo_a": nz, "wo_a_flat": nd},
+            op_configs={},
+        ),
+    )
+    r5_fns = {fn.name: fn for fn in rewritten_rank5.functions.values()}
+    assert _tensor_type_layout(r5_fns["proj_a_mm"].params[0].type) == nz
+    assert _tensor_type_layout(r5_fns["prefetch_o_proj_w"].params[0].type) == nd
 
     # 3) L3 HOST orchestrator functions keep logical ND parameter layouts when AutoLayout writes back NZ.
     w_host = ir.Var("wq_a", ir.TensorType([2, 64, 64], DataType.FP16, None, nd_view), span)
@@ -1603,8 +1676,6 @@ def test_bench_metrics_and_variant_matching_fixes():
     fns_by_name = {fn.name: fn for fn in rewritten_dist.functions.values()}
     host_param_t = fns_by_name["l3_host"].params[0].type
     chip_param_t = fns_by_name["l2_chip"].params[0].type
-    from pypto.ir.auto_layout import _tensor_type_layout  # noqa: PLC0415
-
     assert isinstance(host_param_t, ir.TensorType) and _tensor_type_layout(host_param_t) == ir.TensorLayout.ND
     assert isinstance(chip_param_t, ir.TensorType) and _tensor_type_layout(chip_param_t) == ir.TensorLayout.NZ
 

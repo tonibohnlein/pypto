@@ -1259,10 +1259,13 @@ def _collect_func_nz_ineligible(  # noqa: PLR0913
                 if isinstance(stmt.value, core_ir.Var) and stmt.value.unique_id in tensor_aliases:
                     tensor_aliases[stmt.var.unique_id] = tensor_aliases[stmt.value.unique_id]
                 elif isinstance(stmt.value, core_ir.Call):
-                    if stmt.value.op.name == _TENSOR_CREATE_OP:
+                    if stmt.value.op.name in (_TENSOR_CREATE_OP, _TENSOR_RESHAPE_OP):
                         b_name = _clean_ssa_name(stmt.var.name_hint)
                         tensor_aliases[stmt.var.unique_id] = b_name
-                        if _is_nz_compatible_tensor_type(stmt.var.type) is None:
+                        if (
+                            stmt.value.op.name == _TENSOR_RESHAPE_OP
+                            or _is_nz_compatible_tensor_type(stmt.var.type) is None
+                        ):
                             ineligible.add(b_name)
                     elif (
                         stmt.value.args
@@ -1464,13 +1467,20 @@ class _OrchCallMultiplierVisitor:
             if not isinstance(arg, core_ir.Var) or not isinstance(arg.type, core_ir.TensorType):
                 continue
             src_alias = self._resolve_arg_name(arg) or _clean_ssa_name(arg.name_hint)
-            if i == 0 and assign_var is not None and isinstance(assign_var.type, core_ir.TensorType):
+            if (
+                i == 0
+                and assign_var is not None
+                and isinstance(assign_var.type, core_ir.TensorType)
+                and expr.op.name != _TENSOR_RESHAPE_OP
+            ):
                 self._alias_by_uid[assign_var.unique_id] = src_alias
             ok = (expr.op.name == _TENSOR_RESHAPE_OP and i == 0 and _is_whole_tensor_flatten(expr)) or (
                 expr.op.name == "tensor.slice"
                 and i == 0
                 and _is_nz_compatible_tensor_slice_call(expr, arg.type)
             )
+            if expr.op.name == _TENSOR_RESHAPE_OP and assign_var is not None:
+                self.reshaped_names.add(_clean_ssa_name(assign_var.name_hint))
             if not ok:
                 self.reshaped_names.add(src_alias)
                 if assign_var is not None:
@@ -1586,10 +1596,21 @@ class _PostInferInstanceExtractor:
             override = self._param_overrides[idx] if idx < len(self._param_overrides) else None
             name = override or _clean_ssa_name(param.name_hint)
             self._uid_to_name[param.unique_id] = name
-            if name in self.values:
-                continue
             view = param.type.tensor_view
             cur_layout = view.layout if view is not None else core_ir.TensorLayout.ND
+            if name in self.values:
+                prev_node = self.values[name]
+                if (
+                    cur_layout == core_ir.TensorLayout.NZ
+                    and prev_node.current_layout != core_ir.TensorLayout.NZ
+                ):
+                    self.values[name] = replace(
+                        prev_node,
+                        shape=shape,
+                        current_layout=cur_layout,
+                        admissible_layouts=(cur_layout,),
+                    )
+                continue
             if self._external_out_names is not None:
                 is_ext_out = name in self._external_out_names
             else:
@@ -2803,6 +2824,10 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
                 isinstance(param.type, core_ir.TensorType)
                 and target_layout is not None
                 and _tensor_type_layout(param.type) != target_layout
+                and not (
+                    _tensor_type_layout(param.type) == core_ir.TensorLayout.NZ and len(param.type.shape) >= 4
+                )
+                and not (target_layout == core_ir.TensorLayout.NZ and len(param.type.shape) < 2)
             ):
                 new_type = _with_tensor_layout(param.type, target_layout)
                 new_param = core_ir.Var(param.name_hint, new_type, param.span)
