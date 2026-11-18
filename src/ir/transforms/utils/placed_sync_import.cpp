@@ -43,6 +43,7 @@
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/verifier/verifier.h"
+#include "src/ir/transforms/utils/sync_footprint_resolver.h"
 #include "src/ir/transforms/utils/sync_scalar_readiness.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
 
@@ -242,7 +243,8 @@ class CoordinateGraph {
     }
     if (auto cast = As<Cast>(e)) {
       const auto child = BuildInContext(cast->operand_, segment, parameters, input);
-      if (maximum) CHECK(nodes_[child].upper <= *maximum) << "Synchronization coordinate cast may change its value";
+      if (maximum)
+        CHECK(nodes_[child].upper <= *maximum) << "Synchronization coordinate cast may change its value";
       memo_.emplace(key, child);
       return child;
     }
@@ -401,36 +403,47 @@ class CoordinateGraph {
         } else {
           CHECK(false) << "Unavailable affine synchronization access";
         }
-        CHECK(SameCoordinateType(left, right))
-            << "Coordinate comparison requires matching operand types";
+        CHECK(SameCoordinateType(left, right)) << "Coordinate comparison requires matching operand types";
         n.left = BuildInContext(left, segment, parameters, input);
         n.right = BuildInContext(right, segment, parameters, input);
         const auto x = nodes_[n.left], y = nodes_[n.right];
         std::optional<bool> folded;
         switch (cmp_kind) {
           case Kind::Equal:
-            if (x.constant && y.constant) folded = (x.upper == y.upper);
-            else if (x.upper < y.lower || y.upper < x.lower) folded = false;
+            if (x.constant && y.constant)
+              folded = (x.upper == y.upper);
+            else if (x.upper < y.lower || y.upper < x.lower)
+              folded = false;
             break;
           case Kind::NotEqual:
-            if (x.constant && y.constant) folded = (x.upper != y.upper);
-            else if (x.upper < y.lower || y.upper < x.lower) folded = true;
+            if (x.constant && y.constant)
+              folded = (x.upper != y.upper);
+            else if (x.upper < y.lower || y.upper < x.lower)
+              folded = true;
             break;
           case Kind::LessThan:
-            if (x.upper < y.lower) folded = true;
-            else if (x.lower >= y.upper) folded = false;
+            if (x.upper < y.lower)
+              folded = true;
+            else if (x.lower >= y.upper)
+              folded = false;
             break;
           case Kind::LessEqual:
-            if (x.upper <= y.lower) folded = true;
-            else if (x.lower > y.upper) folded = false;
+            if (x.upper <= y.lower)
+              folded = true;
+            else if (x.lower > y.upper)
+              folded = false;
             break;
           case Kind::GreaterThan:
-            if (x.lower > y.upper) folded = true;
-            else if (x.upper <= y.lower) folded = false;
+            if (x.lower > y.upper)
+              folded = true;
+            else if (x.upper <= y.lower)
+              folded = false;
             break;
           case Kind::GreaterEqual:
-            if (x.lower >= y.upper) folded = true;
-            else if (x.upper < y.lower) folded = false;
+            if (x.lower >= y.upper)
+              folded = true;
+            else if (x.upper < y.lower)
+              folded = false;
             break;
           default:
             break;
@@ -544,13 +557,12 @@ class CoordinateGraph {
     return id;
   }
   void DefineSelect(const ExprPtr& var, const ExprPtr& cond, const ExprPtr& then_value,
-                    const ExprPtr& else_value, const SyncSegment& segment,
-                    const ParameterIndices& parameters, CompactSyncInput& input, bool lazy = false) {
+                    const ExprPtr& else_value, const SyncSegment& segment, const ParameterIndices& parameters,
+                    CompactSyncInput& input, bool lazy = false) {
     CHECK(SameCoordinateType(var, then_value) && SameCoordinateType(var, else_value))
         << "Coordinate selection requires matching operand types";
     if (lazy || (input.invocation_coordinate && input.invocation_coordinate->SupportsDefinition(var))) {
-      deferred_selects_.emplace(var.get(),
-                                DeferredSelect{cond, then_value, else_value, ContextFor(segment)});
+      deferred_selects_.emplace(var.get(), DeferredSelect{cond, then_value, else_value, ContextFor(segment)});
       return;
     }
     const auto cond_id = Build(cond, segment, parameters, input);
@@ -661,9 +673,8 @@ class CoordinateGraph {
   }
   std::optional<SyncSwizzledTileMap> MatchSwizzled(size_t primary_id, size_t secondary_id,
                                                    int64_t primary_tiles, int64_t secondary_tiles,
-                                                   int64_t row_tiles, int64_t col_tiles,
-                                                   int64_t rows, int64_t columns,
-                                                   bool col_major_groups) const {
+                                                   int64_t row_tiles, int64_t col_tiles, int64_t rows,
+                                                   int64_t columns, bool col_major_groups) const {
     const auto& sec = nodes_.at(secondary_id);
     if (sec.kind != Kind::Add) return std::nullopt;
     for (int swap = 0; swap < 2; ++swap) {
@@ -699,9 +710,9 @@ class CoordinateGraph {
       if (tile.kind != Kind::Loop || group_size != __int128(primary_tiles) * group_tiles) continue;
       const int64_t full_groups = secondary_tiles / group_tiles;
       const int64_t tail_cols = secondary_tiles % group_tiles;
-      const __int128 max_tiles = tail_cols == 0
-                                     ? __int128(primary_tiles) * secondary_tiles
-                                     : __int128(full_groups) * group_size + __int128(primary_tiles) * tail_cols;
+      const __int128 max_tiles =
+          tail_cols == 0 ? __int128(primary_tiles) * secondary_tiles
+                         : __int128(full_groups) * group_size + __int128(primary_tiles) * tail_cols;
       if (tile.upper >= max_tiles) continue;
       if (tail_cols != 0) continue;  // Exact group_size requires full tail divisor unless generalized.
       bool snake = false;
@@ -736,17 +747,11 @@ class CoordinateGraph {
       } else {
         continue;
       }
-      return SyncSwizzledTileMap{tile.frame,
-                                 tile_id,
-                                 tile.dynamic_start ? std::optional<size_t>(tile.left) : std::nullopt,
-                                 row_tiles,
-                                 col_tiles,
-                                 rows,
-                                 columns,
-                                 group_tiles,
-                                 group_size,
-                                 col_major_groups,
-                                 snake};
+      return SyncSwizzledTileMap{
+          tile.frame,       tile_id,     tile.dynamic_start ? std::optional<size_t>(tile.left) : std::nullopt,
+          row_tiles,        col_tiles,   rows,
+          columns,          group_tiles, group_size,
+          col_major_groups, snake};
     }
     return std::nullopt;
   }
@@ -775,20 +780,16 @@ class CoordinateGraph {
         quotient.left == remainder.left && nodes_[quotient.right].upper == nodes_[remainder.right].upper) {
       const auto& tile = nodes_[quotient.left];
       const auto divisor = nodes_[quotient.right].upper;
-      const bool band_ok = remainder.kind != Kind::ModularShift ||
-                           (tile.lower / divisor == tile.upper / divisor &&
-                            remainder.factor == (tile.lower / divisor) * divisor);
+      const bool band_ok =
+          remainder.kind != Kind::ModularShift || (tile.lower / divisor == tile.upper / divisor &&
+                                                   remainder.factor == (tile.lower / divisor) * divisor);
       if (band_ok && tile.kind == Kind::Loop && divisor == col_tiles &&
           tile.upper < __int128(row_tiles) * divisor) {
         // Paired quotient/remainder is an injective tile map: t = rowTile*C+colTile.
-        out->row_major_tiles =
-            SyncRowMajorTileMap{tile.frame,
-                                quotient.left,
-                                tile.dynamic_start ? std::optional<size_t>(tile.left) : std::nullopt,
-                                row_tiles,
-                                divisor,
-                                rows,
-                                columns};
+        out->row_major_tiles = SyncRowMajorTileMap{
+            tile.frame, quotient.left, tile.dynamic_start ? std::optional<size_t>(tile.left) : std::nullopt,
+            row_tiles,  divisor,       rows,
+            columns};
         return out;
       }
     }
@@ -896,6 +897,8 @@ class Importer {
   };
   std::unordered_map<const Expr*, SlotSelection> slots;
   std::unordered_set<const Expr*> transposed_mat;
+  std::unique_ptr<SyncControlRangeProver> prover;
+  std::unique_ptr<SyncFootprintResolver> resolver;
   ParameterIndices parameters;
   CoordinateGraph coordinates;
   std::set<size_t> translated_storage;
@@ -991,10 +994,12 @@ class Importer {
     ExprPtr normalized = subst.VisitExpr(condition);
     if (subst.missing_bounds) return std::nullopt;
     if (subst.used && result.block_bounds) {
-      analyzer.const_int_bound.Update(subst.block_var, {result.block_bounds->first, result.block_bounds->second});
+      analyzer.const_int_bound.Update(subst.block_var,
+                                      {result.block_bounds->first, result.block_bounds->second});
     }
 
-    std::function<std::optional<bool>(const ExprPtr&)> eval = [&](const ExprPtr& expr) -> std::optional<bool> {
+    std::function<std::optional<bool>(const ExprPtr&)> eval =
+        [&](const ExprPtr& expr) -> std::optional<bool> {
       const ExprPtr s = analyzer.Simplify(expr);
       if (const auto c = As<ConstBool>(s)) return c->value_;
       if (const auto c = As<ConstInt>(s)) return c->value_ != 0;
@@ -1200,11 +1205,13 @@ class Importer {
         std::vector<ExprPtr> then_res, else_res;
         {
           auto ctx = analyzer->GetConstraintContext(expanded_cond);
-          then_res = ResolvePureScalarArm(nested->then_body_, segment, analyzer, bool_defs, unconstrained_defs);
+          then_res =
+              ResolvePureScalarArm(nested->then_body_, segment, analyzer, bool_defs, unconstrained_defs);
         }
         {
           auto ctx = analyzer->GetConstraintContext(MakeNot(expanded_cond));
-          else_res = ResolvePureScalarArm(*nested->else_body_, segment, analyzer, bool_defs, unconstrained_defs);
+          else_res =
+              ResolvePureScalarArm(*nested->else_body_, segment, analyzer, bool_defs, unconstrained_defs);
         }
         for (size_t k = 0; k < nested->return_vars_.size(); ++k) {
           const auto& rv = nested->return_vars_[k];
@@ -1275,8 +1282,7 @@ class Importer {
         ReadyScalar(else_val, segment);
         ready_scalars.insert(rv.get());
       }
-      coordinates.DefineSelect(rv, cond, then_val, else_val, segment, parameters, result,
-                               readonly_external);
+      coordinates.DefineSelect(rv, cond, then_val, else_val, segment, parameters, result, readonly_external);
     };
 
     const auto verdict = EvaluateStaticBranchCondition(branch->condition_, segment);
@@ -1422,6 +1428,19 @@ class Importer {
   }
   void View(const AssignStmtPtr& assign, const CallPtr& call, const SyncSegment& segment = {}) {
     OpRegistry::GetInstance().ValidateBufferCall(call);
+    if (IsOp(call, "buffer.reshape")) {
+      const auto src_type = As<BufferType>(call->args_[0]->GetType());
+      const auto dst_type = As<BufferType>(assign->var_->GetType());
+      if (src_type && dst_type && src_type->memory_space_ != MemorySpace::Vec) {
+        const auto* resolved = resolver ? resolver->ViewOf(assign->var_) : nullptr;
+        CHECK(resolved && resolved->valid_matrix_coords)
+            << "Exact synchronization only supports layout-compatible or transposed Matrix reshapes";
+        const auto sid = Storage(call->args_[0]);
+        objects[assign->var_.get()] = sid;
+        if (resolved->axis_swapped) transposed_mat.insert(assign->var_.get());
+        return;
+      }
+    }
     auto source = vec_views.find(call->args_[0].get());
     CHECK(source != vec_views.end()) << "Synchronization storage/view needs a qualified Vec source";
     auto view = source->second;
@@ -1661,9 +1680,9 @@ class Importer {
       const bool gm_write = gm_mode == BufferAccess::Write || gm_mode == BufferAccess::ReadWrite;
       auto offsets = As<MakeTuple>(call->args_[1]), shape = As<MakeTuple>(call->args_[2]);
       const auto gm_tensor = As<TensorType>(call->args_[gm_arg]->GetType());
-      const bool rank1_gm =
-          gm_tensor && gm_tensor->shape_.size() == 1 && offsets && shape &&
-          offsets->elements_.size() == 1 && shape->elements_.size() == 1 && !recover_accesses;
+      const bool rank1_gm = gm_tensor && gm_tensor->shape_.size() == 1 && offsets && shape &&
+                            offsets->elements_.size() == 1 && shape->elements_.size() == 1 &&
+                            !recover_accesses;
       const bool scalar_point = backend::SupportsBufferScalarTransfer(call->args_, load);
       CHECK(rank1_gm || (offsets && shape && offsets->elements_.size() == 2 && shape->elements_.size() == 2))
           << "Synchronization DMA requires a rank-two rectangle or conservative rank-one transfer";
@@ -1680,89 +1699,89 @@ class Importer {
         const auto local = As<BufferType>(call->args_[load ? 3 : 0]->GetType());
         const bool valid_shape_match =
             local && local->shape_[0] == 1 &&
-            (scalar_point ? (local->shape_[1] == 8 && Constant(shape->elements_[0]) == 1)
-                          : (local->valid_shape_[1] == -1 ||
-                             local->shape_[1] == Constant(shape->elements_[0])));
+            (scalar_point
+                 ? (local->shape_[1] == 8 && Constant(shape->elements_[0]) == 1)
+                 : (local->valid_shape_[1] == -1 || local->shape_[1] == Constant(shape->elements_[0])));
         CHECK(valid_shape_match) << "Partial DMA local footprint is not qualified";
         CHECK(local->memory_space_ == MemorySpace::Vec) << "Rank-one DMA requires Vec storage";
         whole(load ? 3 : 0, load);
       } else {
-      // Coordinate readiness and checked arithmetic remain native admission
-      // evidence even when no dependence footprint is requested.
-      RequireIndex(offsets->elements_[0]);
-      RequireIndex(offsets->elements_[1]);
-      if (readonly_external) {
-        CHECK(load && gm_read && !gm_write) << "Read-only external projection requires a read-only DMA";
-        ReadyScalar(offsets->elements_[0], segment);
-        ReadyScalar(offsets->elements_[1], segment);
-      } else {
-        const auto row_root = coordinates.Build(offsets->elements_[0], segment, parameters, result);
-        const auto column_root = coordinates.Build(offsets->elements_[1], segment, parameters, result);
-        coordinates.CheckScope(row_root, segment);
-        coordinates.CheckScope(column_root, segment);
-        if (recover_accesses) {
-          const auto id = Storage(call->args_[load ? 0 : 3]);
-          auto& storage = result.storage[id];
-          const auto rows = Constant(shape->elements_[0]), columns = Constant(shape->elements_[1]);
-          CHECK(rows > 0 && columns > 0 &&
-                __int128(coordinates.Upper(row_root)) + rows <=
-                    (storage.row_extent_parameter
-                         ? result.parameter_bounds.at(*storage.row_extent_parameter).first
-                         : storage.rows) &&
-                __int128(coordinates.Upper(column_root)) + columns <= storage.columns)
-              << "Synchronization access exceeds its proved allocation";
-          std::optional<AffineCoordinate> row, column;
-          if (coordinates.IsAffine(row_root) && coordinates.IsAffine(column_root)) {
-            row = Coordinate(offsets->elements_[0], segment);
-            column = Coordinate(offsets->elements_[1], segment);
-          }
-          std::set<const ForStmt*> moving;
-          if (row && column) {
-            for (const auto& coordinate : {*row, *column}) {
-              for (const auto& [frame, coefficient] : coordinate.frames)
-                if (coefficient) moving.insert(frame);
-              if (coordinate.second) moving.insert(segment.original_loop.get());
+        // Coordinate readiness and checked arithmetic remain native admission
+        // evidence even when no dependence footprint is requested.
+        RequireIndex(offsets->elements_[0]);
+        RequireIndex(offsets->elements_[1]);
+        if (readonly_external) {
+          CHECK(load && gm_read && !gm_write) << "Read-only external projection requires a read-only DMA";
+          ReadyScalar(offsets->elements_[0], segment);
+          ReadyScalar(offsets->elements_[1], segment);
+        } else {
+          const auto row_root = coordinates.Build(offsets->elements_[0], segment, parameters, result);
+          const auto column_root = coordinates.Build(offsets->elements_[1], segment, parameters, result);
+          coordinates.CheckScope(row_root, segment);
+          coordinates.CheckScope(column_root, segment);
+          if (recover_accesses) {
+            const auto id = Storage(call->args_[load ? 0 : 3]);
+            auto& storage = result.storage[id];
+            const auto rows = Constant(shape->elements_[0]), columns = Constant(shape->elements_[1]);
+            CHECK(rows > 0 && columns > 0 &&
+                  __int128(coordinates.Upper(row_root)) + rows <=
+                      (storage.row_extent_parameter
+                           ? result.parameter_bounds.at(*storage.row_extent_parameter).first
+                           : storage.rows) &&
+                  __int128(coordinates.Upper(column_root)) + columns <= storage.columns)
+                << "Synchronization access exceeds its proved allocation";
+            std::optional<AffineCoordinate> row, column;
+            if (coordinates.IsAffine(row_root) && coordinates.IsAffine(column_root)) {
+              row = Coordinate(offsets->elements_[0], segment);
+              column = Coordinate(offsets->elements_[1], segment);
             }
-          }
-          if (!row || !column || moving.size() > 1) {
-            CHECK(storage.space == MemorySpace::DDR) << "External coordinate needs a global storage domain";
-            SyncAccess access{id, gm_write, 0, 0, 0, 0, rows, columns};
-            access.external = coordinates.External(row_root, column_root, storage, rows, columns);
-            site.accesses.push_back(std::move(access));
-          } else {
-            if (translated_storage.insert(id).second) {
-              storage.row_parameters = row->parameters;
-              storage.column_parameters = column->parameters;
-              storage.row_block = row->block;
-              storage.column_block = column->block;
+            std::set<const ForStmt*> moving;
+            if (row && column) {
+              for (const auto& coordinate : {*row, *column}) {
+                for (const auto& [frame, coefficient] : coordinate.frames)
+                  if (coefficient) moving.insert(frame);
+                if (coordinate.second) moving.insert(segment.original_loop.get());
+              }
+            }
+            if (!row || !column || moving.size() > 1) {
+              CHECK(storage.space == MemorySpace::DDR) << "External coordinate needs a global storage domain";
+              SyncAccess access{id, gm_write, 0, 0, 0, 0, rows, columns};
+              access.external = coordinates.External(row_root, column_root, storage, rows, columns);
+              site.accesses.push_back(std::move(access));
             } else {
-              CHECK(storage.row_parameters == row->parameters &&
-                    storage.column_parameters == column->parameters && storage.row_block == row->block &&
-                    storage.column_block == column->block)
-                  << "GM accesses need a common invocation translation; parameter-dependent overlap is "
-                     "unproved";
+              if (translated_storage.insert(id).second) {
+                storage.row_parameters = row->parameters;
+                storage.column_parameters = column->parameters;
+                storage.row_block = row->block;
+                storage.column_block = column->block;
+              } else {
+                CHECK(storage.row_parameters == row->parameters &&
+                      storage.column_parameters == column->parameters && storage.row_block == row->block &&
+                      storage.column_block == column->block)
+                    << "GM accesses need a common invocation translation; parameter-dependent overlap is "
+                       "unproved";
+              }
+              site.accesses.push_back(Access(id, gm_write, *row, *column, rows, columns, segment));
             }
-            site.accesses.push_back(Access(id, gm_write, *row, *column, rows, columns, segment));
-          }
-          if (gm_read && gm_write) {
-            // Atomic accumulation reads and writes exactly the same GM window.
-            // Both effects belong to this occurrence; no new storage root or
-            // cross-worker ordering is inferred from the atomic mode.
-            auto write = site.accesses.back();
-            site.accesses.back().write = false;
-            site.accesses.push_back(std::move(write));
+            if (gm_read && gm_write) {
+              // Atomic accumulation reads and writes exactly the same GM window.
+              // Both effects belong to this occurrence; no new storage root or
+              // cross-worker ordering is inferred from the atomic mode.
+              auto write = site.accesses.back();
+              site.accesses.back().write = false;
+              site.accesses.push_back(std::move(write));
+            }
           }
         }
-      }
-      modes[gm_arg] = {gm_read, gm_write};
-      const auto local = As<BufferType>(call->args_[load ? 3 : 0]->GetType());
-      CHECK(local && local->shape_[0] == Constant(shape->elements_[0]) &&
-            local->shape_[1] == Constant(shape->elements_[1]))
-          << "Partial DMA local footprint is not qualified";
-      CHECK(local->memory_space_ == MemorySpace::Vec ||
-            (load ? local->memory_space_ == MemorySpace::Mat : local->memory_space_ == MemorySpace::Acc))
-          << "Only GM/Mat, Acc/GM and GM/Vec DMA contracts are qualified";
-      whole(load ? 3 : 0, load);
+        modes[gm_arg] = {gm_read, gm_write};
+        const auto local = As<BufferType>(call->args_[load ? 3 : 0]->GetType());
+        CHECK(local && local->shape_[0] == Constant(shape->elements_[0]) &&
+              local->shape_[1] == Constant(shape->elements_[1]))
+            << "Partial DMA local footprint is not qualified";
+        CHECK(local->memory_space_ == MemorySpace::Vec ||
+              (load ? local->memory_space_ == MemorySpace::Mat : local->memory_space_ == MemorySpace::Acc))
+            << "Only GM/Mat, Acc/GM and GM/Vec DMA contracts are qualified";
+        whole(load ? 3 : 0, load);
       }
     } else if (IsOp(call, "buffer.copy") || IsOp(call, "buffer.extract")) {
       const bool extract = IsOp(call, "buffer.extract");
@@ -1802,8 +1821,8 @@ class Importer {
         // Vec->Vec extraction may span non-contiguous physical rows; mark a proper
         // subwindow read as an enclosure so precision certificates distinguish it
         // from an exact full-buffer footprint.
-        const bool full_source = row.first == 0 && row.second == 0 && row.frames.empty() && column.first == 0 &&
-                                 column.second == 0 && column.frames.empty() &&
+        const bool full_source = row.first == 0 && row.second == 0 && row.frames.empty() &&
+                                 column.first == 0 && column.second == 0 && column.frames.empty() &&
                                  dst_view.type->shape_[0] == src_view.type->shape_[0] &&
                                  dst_view.type->shape_[1] == src_view.type->shape_[1];
         if (full_source) {
@@ -1830,9 +1849,9 @@ class Importer {
             return std::all_of(frames.begin(), frames.end(),
                                [&](const auto& entry) { return entry.second % alignment == 0; });
           };
-          CHECK(row.first % 16 == 0 && row.second % 16 == 0 && ext_rows % 16 == 0 && column.first % box == 0 &&
-                column.second % box == 0 && ext_cols % box == 0 && aligned_frames(row.frames, 16) &&
-                aligned_frames(column.frames, box))
+          CHECK(row.first % 16 == 0 && row.second % 16 == 0 && ext_rows % 16 == 0 &&
+                column.first % box == 0 && column.second % box == 0 && ext_cols % box == 0 &&
+                aligned_frames(row.frames, 16) && aligned_frames(column.frames, box))
               << "Unaligned boxed extraction requires a separate footprint contract";
         }
         auto source_access = Access(sid, false, row, column, ext_rows, ext_cols, segment);
@@ -1866,12 +1885,13 @@ class Importer {
         return std::all_of(frames.begin(), frames.end(),
                            [&](const auto& entry) { return entry.second % alignment == 0; });
       };
-      const auto box =
-          t.layout->slayout_ != TileLayout::none_box ? t.layout->fractal_ / (16 * t.layout->dtype_.GetByte()) : 16;
+      const auto box = t.layout->slayout_ != TileLayout::none_box
+                           ? t.layout->fractal_ / (16 * t.layout->dtype_.GetByte())
+                           : 16;
       CHECK(row.first % 16 == 0 && row.second % 16 == 0 && ins_rows % 16 == 0 && column.first % 16 == 0 &&
-            column.second % 16 == 0 && ins_cols % 16 == 0 && column.first % box == 0 && column.second % box == 0 &&
-            ins_cols % box == 0 && aligned_frames(row.frames, 16) && aligned_frames(column.frames, 16) &&
-            aligned_frames(column.frames, box))
+            column.second % 16 == 0 && ins_cols % 16 == 0 && column.first % box == 0 &&
+            column.second % box == 0 && ins_cols % box == 0 && aligned_frames(row.frames, 16) &&
+            aligned_frames(column.frames, 16) && aligned_frames(column.frames, box))
           << "Unaligned boxed insertion requires a separate footprint contract";
       auto target_access = Access(tid, true, row, column, ins_rows, ins_cols, segment);
       ApplySlot(target_access, call->args_[3], segment);
@@ -1983,16 +2003,22 @@ class Importer {
     }
     backend::RequireBufferSyncWorkspaceSeparation(
         operation, [&](const ExprPtr& operand) -> std::optional<backend::BufferSyncByteWindow> {
-          const auto& storage = result.storage[Storage(operand)];
-          int64_t begin = storage.address, end = Checked(__int128(storage.address) + storage.bytes);
           if (const auto view = vec_views.find(operand.get()); view != vec_views.end()) {
             const auto& value = view->second;
-            begin = Checked(__int128(value.address) + std::min<int64_t>(0, value.last_displacement));
-            end = Checked(__int128(value.address) + std::max<int64_t>(0, value.last_displacement) +
-                          __int128(value.type->shape_[0] - 1) * value.pitch +
-                          __int128(value.type->shape_[1]) * value.type->dtype_.GetByte());
+            const int64_t begin =
+                Checked(__int128(value.address) + std::min<int64_t>(0, value.last_displacement));
+            const int64_t end =
+                Checked(__int128(value.address) + std::max<int64_t>(0, value.last_displacement) +
+                        __int128(value.type->shape_[0] - 1) * value.pitch +
+                        __int128(value.type->shape_[1]) * value.type->dtype_.GetByte());
+            return backend::BufferSyncByteWindow{begin, end};
           }
-          return backend::BufferSyncByteWindow{begin, end};
+          if (resolver) {
+            if (const auto hull = resolver->ByteHull(operand)) return hull;
+          }
+          const auto& storage = result.storage[Storage(operand)];
+          return backend::BufferSyncByteWindow{storage.address,
+                                               Checked(__int128(storage.address) + storage.bytes)};
         });
     for (const auto& effect : implementation.ImplicitEffects()) {
       if (readonly_external && effect.space == MemorySpace::DDR) continue;
@@ -2089,22 +2115,55 @@ class Importer {
             continue;
           }
         }
-        // Admit exactly a suffix of first-visit frame tests. Testing only an
-        // outer coordinate would reinitialize on every untested inner visit.
+        auto frames = segment.nested_frames;
+        if (frames.empty() && segment.original_loop)
+          frames.push_back({segment.original_loop, segment.count, segment.start, segment.step});
+        auto is_frame_var = [&](const Expr* expr) {
+          return std::any_of(frames.begin(), frames.end(),
+                             [&](const auto& f) { return f.loop && f.loop->loop_var_.get() == expr; });
+        };
+        bool has_parameter_guard = false;
         std::map<const Expr*, int64_t> first_visits;
         std::function<bool(const ExprPtr&)> collect = [&](const ExprPtr& condition) {
           if (auto both = As<And>(condition)) return collect(both->left_) && collect(both->right_);
           auto eq = As<Eq>(condition);
           auto value = eq ? As<ConstInt>(eq->right_) : nullptr;
-          return eq && value && first_visits.emplace(eq->left_.get(), value->value_).second;
+          if (!eq || !value) return false;
+          const auto lhs_var = As<Var>(eq->left_);
+          if (lhs_var && parameters.count(lhs_var.get())) {
+            has_parameter_guard = true;
+            return true;
+          }
+          if (lhs_var && is_frame_var(lhs_var.get())) {
+            return first_visits.emplace(lhs_var.get(), value->value_).second;
+          }
+          if (!lhs_var || coordinates.Defined(lhs_var)) {
+            if (const auto st = As<ScalarType>(eq->left_->GetType()); st && st->dtype_ == DataType::INDEX) {
+              const auto coord = Coordinate(eq->left_, segment);
+              std::map<const ForStmt*, int64_t> coord_frames = coord.frames;
+              if (coord.second != 0 && segment.original_loop) {
+                coord_frames[segment.original_loop.get()] = coord.second;
+              }
+              if (coord_frames.empty()) {
+                has_parameter_guard = true;
+                return true;
+              }
+              if (coord.parameters.empty() && coord.block == 0 && coord_frames.size() == 1) {
+                const auto [frame, coeff] = *coord_frames.begin();
+                if (coeff != 0 && (value->value_ - coord.first) % coeff == 0) {
+                  return first_visits.emplace(frame->loop_var_.get(), (value->value_ - coord.first) / coeff)
+                      .second;
+                }
+              }
+              return false;
+            }
+          }
+          return first_visits.emplace(eq->left_.get(), value->value_).second;
         };
         CHECK(segment.original_loop && collect(branch->condition_) && branch->else_body_ &&
               branch->return_vars_.empty())
             << "Only first-visit initialization/continuation selection is qualified";
-        auto frames = segment.nested_frames;
-        if (frames.empty())
-          frames.push_back({segment.original_loop, segment.count, segment.start, segment.step});
-        CHECK(!first_visits.empty() && first_visits.size() <= frames.size())
+        CHECK((!first_visits.empty() || has_parameter_guard) && first_visits.size() <= frames.size())
             << "Initialization guard has an unavailable occurrence frame";
         // The current shared boundary view changes one enclosing repeat seam.
         // More frames need continuation views at every intermediate seam, not
@@ -2126,21 +2185,28 @@ class Importer {
               std::equal(first->args_.begin(), first->args_.end(), later->args_.begin(),
                          [&](const auto& a, const auto& b) { return SameInitializationOperand(a, b); }))
             << "Conditional payloads must preserve operands and destination";
-        auto site = Site(first, segment);
-        auto continuation = Site(later, segment);
-        site.continuation = later;
-        if (frames[first_frame].loop != segment.original_loop)
-          site.initialization_scope = frames[first_frame].loop;
-        // A nonleading initialization has startup-only internal demands. Keep
-        // the existing uniform family contract conservative for that site.
-        if (preceding_matrix) site.protected_accumulator.reset();
-        preceding_matrix = true;
-        for (auto a : continuation.accesses)
-          if (!a.write && result.storage[a.storage].space == MemorySpace::Acc) {
-            a.after_first = true;
-            site.accesses.push_back(a);
-          }
-        segment.sites.push_back(std::move(site));
+        if (has_parameter_guard) {
+          auto site = Site(later, segment);
+          site.continuation = first;
+          preceding_matrix = true;
+          segment.sites.push_back(std::move(site));
+        } else {
+          auto site = Site(first, segment);
+          auto continuation = Site(later, segment);
+          site.continuation = later;
+          if (frames[first_frame].loop != segment.original_loop)
+            site.initialization_scope = frames[first_frame].loop;
+          // A nonleading initialization has startup-only internal demands. Keep
+          // the existing uniform family contract conservative for that site.
+          if (preceding_matrix) site.protected_accumulator.reset();
+          preceding_matrix = true;
+          for (auto a : continuation.accesses)
+            if (!a.write && result.storage[a.storage].space == MemorySpace::Acc) {
+              a.after_first = true;
+              site.accesses.push_back(a);
+            }
+          segment.sites.push_back(std::move(site));
+        }
       } else {
         CHECK(As<YieldStmt>(s)) << "Nested or data-dependent control is outside this compact provider";
         CHECK(As<YieldStmt>(s)->value_.empty()) << "Loop-carried scalar readiness is not qualified";
@@ -2826,6 +2892,11 @@ static CompactSyncInput ImportQualifiedSync(
           range.second < std::numeric_limits<int64_t>::max() && range.second <= *maximum)
         << "Invalid invocation coordinate range";
   }
+  if (recover_accesses) {
+    importer.prover = std::make_unique<SyncControlRangeProver>(function, parameter_bounds, block_bounds);
+  }
+  importer.resolver = std::make_unique<SyncFootprintResolver>(function, importer.prover.get(),
+                                                              /*run_scalar_layout_check=*/false, target);
   // Discover scalar identities before tensor shapes, regardless of ABI order.
   for (size_t index = 0; index < function->params_.size(); ++index) {
     const auto& param = function->params_[index];

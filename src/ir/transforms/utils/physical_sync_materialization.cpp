@@ -59,8 +59,7 @@ class ScheduleMaterializer : public IRMutator {
       arith::Analyzer at_first, after_first;
       at_first.Bind(loop.var, loop.start, loop.start + 1);
       after_first.Bind(loop.var, loop.start + loop.step, loop.last + 1);
-      return ProvePredicate(at_first, predicate) == true &&
-             ProvePredicate(after_first, predicate) == false;
+      return ProvePredicate(at_first, predicate) == true && ProvePredicate(after_first, predicate) == false;
     } catch (const StructuralComparisonUnsupported&) {
       return false;
     }
@@ -83,8 +82,10 @@ class ScheduleMaterializer : public IRMutator {
           const auto& cuts = prepared.visits[residue];
           ScheduleMaterializer payload(cuts, names_, work_);
           if (copies == 1 && (end - first) >= 2 && plan.loop->loop_var_) {
-            const int64_t loop_start = static_cast<int64_t>(__int128(plan.start) + __int128(first) * plan.step);
-            const int64_t loop_last = static_cast<int64_t>(__int128(plan.start) + __int128(end - 1) * plan.step);
+            const int64_t loop_start =
+                static_cast<int64_t>(__int128(plan.start) + __int128(first) * plan.step);
+            const int64_t loop_last =
+                static_cast<int64_t>(__int128(plan.start) + __int128(end - 1) * plan.step);
             payload.loop_ranges_.push_back(LoopRange{plan.loop->loop_var_, loop_start, plan.step, loop_last});
           }
           auto body = payload.VisitStmt(plan.loop->body_);
@@ -170,13 +171,12 @@ class ScheduleMaterializer : public IRMutator {
                  step = As<ConstInt>(loop->step_);
       if (type && type->dtype_ == DataType::INDEX && start && stop && step && step->value_ > 0 &&
           start->value_ < stop->value_) {
-        const __int128 count =
-            (__int128(stop->value_) - start->value_ + step->value_ - 1) / step->value_;
+        const __int128 count = (__int128(stop->value_) - start->value_ + step->value_ - 1) / step->value_;
         if (count >= 2 && count <= std::numeric_limits<int64_t>::max()) {
           const __int128 last = __int128(start->value_) + (count - 1) * step->value_;
           if (last + step->value_ <= std::numeric_limits<int64_t>::max())
-            pushed_range = LoopRange{loop->loop_var_, start->value_, step->value_,
-                                     static_cast<int64_t>(last)};
+            pushed_range =
+                LoopRange{loop->loop_var_, start->value_, step->value_, static_cast<int64_t>(last)};
         }
       }
     }
@@ -249,8 +249,8 @@ class ScheduleMaterializer : public IRMutator {
       for (auto it = loop_ranges_.rbegin(); it != loop_ranges_.rend(); ++it) {
         if (!IsFirstIterationPredicate(statement->condition_, *it)) continue;
         ControlForest moved_reversed;
-        while (!before.empty() && before.back()->condition && before.back()->alternative.empty() &&
-               IsFirstIterationPredicate(before.back()->condition, *it)) {
+        while (!before.empty() && !before.back()->guard.IsTautology() && before.back()->alternative.empty() &&
+               before.back()->guard.IsFirstIterationOf(it->var, it->start, it->step)) {
           moved_reversed.insert(moved_reversed.end(), before.back()->body.rbegin(),
                                 before.back()->body.rend());
           before.pop_back();

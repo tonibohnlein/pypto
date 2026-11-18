@@ -98,6 +98,33 @@ class Insert : public IRMutator {
       Wrap(site.cut, services);
     }
     for (const auto& entry : analysis.ChildEntries()) {
+      if (entry.inline_subblock) {
+        const auto& block = *entry.inline_subblock;
+        const auto first_stmt = entry.window_seq->stmts_[entry.window_begin];
+        std::vector<StmtPtr> statements;
+        for (const auto& [source, destination] : entry.services) {
+          const auto forward = Record(source, statements, first_stmt->span_);
+          Wait(forward, destination, statements, first_stmt->span_);
+        }
+        const auto fresh_spliced = FreshChildTokens(names_).VisitStmt(block.spliced_seq);
+        if (const auto sseq = As<SeqStmts>(fresh_spliced)) {
+          statements.insert(statements.end(), sseq->stmts_.begin(), sseq->stmts_.end());
+        }
+        CHECK(replacements_
+                  .emplace(first_stmt.get(),
+                           std::make_shared<SeqStmts>(std::move(statements), first_stmt->span_))
+                  .second)
+            << "Conservative prefix entries require distinct original static cuts";
+        for (size_t k = entry.window_begin + 1; k < entry.window_end; ++k) {
+          const auto& drop = entry.window_seq->stmts_[k];
+          CHECK(replacements_
+                    .emplace(drop.get(), std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, drop->span_))
+                    .second)
+              << "Conservative prefix sub-block statements require distinct original cuts";
+        }
+        continue;
+      }
+
       auto recipe = entry.eventful ? FreshChildTokens(names_).VisitStmt(entry.eventful->LogicalRecipe())
                                    : StmtPtr(entry.scope);
       if (entry.first_visit && entry.eventful) {
@@ -116,7 +143,19 @@ class Insert : public IRMutator {
           }
         }
       }
-      Wrap(entry.scope, entry.services, recipe);
+      if (entry.IsSubblockSlice()) {
+        const auto first_stmt = entry.window_seq->stmts_[entry.window_begin];
+        Wrap(first_stmt, entry.services, recipe);
+        for (size_t k = entry.window_begin + 1; k < entry.window_end; ++k) {
+          const auto& drop = entry.window_seq->stmts_[k];
+          CHECK(replacements_
+                    .emplace(drop.get(), std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, drop->span_))
+                    .second)
+              << "Conservative prefix sub-block statements require distinct original cuts";
+        }
+      } else {
+        Wrap(entry.scope, entry.services, recipe);
+      }
     }
   }
   StmtPtr VisitStmt(const StmtPtr& statement) override {
@@ -193,8 +232,10 @@ FunctionPtr InsertConservativePrefixes(const ConservativeSyncAnalysis& analysis)
   // original scopes. LowerSync never treats these counters as certificates.
   const auto& selection = analysis.ChildSelection();
   reported->attrs_.emplace_back("autosync_child_attempt_count", static_cast<int>(selection.attempts.size()));
-  reported->attrs_.emplace_back("autosync_retained_child_count",
-                                static_cast<int>(analysis.ChildEntries().size()));
+  const auto retained_child_count = static_cast<int>(std::count_if(
+      analysis.ChildEntries().begin(), analysis.ChildEntries().end(),
+      [](const ConservativeSyncChildEntry& entry) { return !entry.inline_subblock.has_value(); }));
+  reported->attrs_.emplace_back("autosync_retained_child_count", retained_child_count);
   std::string refusals;
   for (const auto& attempt : selection.attempts) {
     if (attempt.child) continue;

@@ -82,7 +82,8 @@ std::vector<InvocationScheduleGroup> GroupInvocationSchedules(
     const std::vector<std::pair<int64_t, int64_t>>& domains, PhysicalSyncRealization& work);
 void PopulateCutDomains(const FunctionPtr& owner, CutInventory& cuts, PhysicalSyncRealization& work);
 BoundarySchedules PlanCommandBoundaries(const FunctionPtr& owner, CutInventory& cuts, bool enabled,
-                                        PhysicalSyncRealization& work);
+                                        PhysicalSyncRealization& work,
+                                        const std::shared_ptr<GuardDomainArena>& arena = nullptr);
 
 }  // namespace pypto::ir::sync::physical
 

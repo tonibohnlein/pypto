@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -32,6 +33,202 @@ namespace pypto::ir::sync::physical {
 // Internal command descriptors retain original coordinates and assigned IDs.
 // All implementation visitors and sharing tables remain in the command translation unit.
 using Intervals = std::vector<std::pair<int64_t, int64_t>>;
+
+using AxisId = uint32_t;
+
+enum class AxisKind : uint8_t {
+  LaunchBlock,  // Dominating block coordinate over [blocks.first, blocks.second]
+  LoopFrame,    // Normalized loop digit d in [0, count) for iv = start_expr_or_lit + d * step
+};
+
+struct AxisInfo {
+  AxisId id = 0;
+  AxisKind kind = AxisKind::LoopFrame;
+  VarPtr var;                // loop->loop_var_ or dominating block Var
+  ForStmtPtr loop;           // Non-null iff kind == LoopFrame
+  int64_t count = 1;         // >= 1; normalized digit domain is [0, count)
+  int64_t start = 0;         // Literal start when start_expression == nullptr (or blocks.first)
+  int64_t step = 1;          // >= 1
+  ExprPtr start_expression;  // Non-null only for symbolic-start LoopFrame
+};
+
+// Transaction-owned deterministic registry of finite coordinate axes.
+class GuardDomainArena {
+ public:
+  AxisId RegisterLaunchBlock(const VarPtr& block_var, std::pair<int64_t, int64_t> bounds);
+  AxisId RegisterLoopFrame(const SyncLoopFrame& frame);
+  const AxisInfo& Axis(AxisId id) const { return axes_.at(id); }
+  size_t NumAxes() const { return axes_.size(); }
+
+ private:
+  std::vector<AxisInfo> axes_;
+  std::map<std::tuple<const Var*, uint8_t, int64_t, int64_t, int64_t, const Expr*>, AxisId> index_;
+};
+
+// Canonical non-empty arithmetic progression {first + k * stride < end} subseteq [0, axis_count).
+// Canonical Invariants:
+//   (C1) 0 <= first < end <= axis_count, stride >= 1, (end - 1 - first) % stride == 0.
+//   (C2) Tight upper bound: end == Last() + 1 == first + (Count() - 1) * stride + 1.
+//   (C3) Singleton normalization: if Count() == 1 (i.e. end - first == 1), then stride == 1.
+struct AxisAP {
+  int64_t first = 0;
+  int64_t end = 1;
+  int64_t stride = 1;
+
+  int64_t Count() const { return (end - 1 - first) / stride + 1; }
+  int64_t Last() const { return end - 1; }
+  bool IsFull(int64_t axis_count) const { return first == 0 && end == axis_count && stride == 1; }
+  bool IsSingleton() const { return end - first == 1; }
+  bool operator==(const AxisAP& o) const { return first == o.first && end == o.end && stride == o.stride; }
+  bool operator!=(const AxisAP& o) const { return !(*this == o); }
+  bool operator<(const AxisAP& o) const {
+    return std::tie(first, end, stride) < std::tie(o.first, o.end, o.stride);
+  }
+  static std::optional<AxisAP> MakeCanonical(int64_t raw_first, int64_t raw_end, int64_t raw_stride,
+                                             int64_t axis_count);
+};
+
+struct AxisConstraint {
+  AxisId axis = 0;
+  AxisAP ap;  // Invariant (I1): strictly proper (!ap.IsFull(arena.Axis(axis).count))
+  bool operator==(const AxisConstraint& o) const { return axis == o.axis && ap == o.ap; }
+  bool operator!=(const AxisConstraint& o) const { return !(*this == o); }
+  bool operator<(const AxisConstraint& o) const { return std::tie(axis, ap) < std::tie(o.axis, o.ap); }
+};
+
+// Compact bitmask over {0 .. modulus-1}. Inline for modulus <= 64.
+class ResidueMask {
+ public:
+  explicit ResidueMask(int64_t modulus = 1, uint64_t bits = 0);
+  int64_t Modulus() const { return modulus_; }
+  bool Empty() const;
+  bool Full() const;
+  size_t PopCount() const;
+  bool Test(int64_t r) const;
+  void Set(int64_t r);
+  ResidueMask operator&(const ResidueMask& o) const;
+  ResidueMask operator|(const ResidueMask& o) const;
+  ResidueMask Complement() const;
+  ResidueMask Shift(int64_t delta) const;  // (r + delta) mod M
+  std::optional<int64_t> SmallestPeriod() const;
+  bool operator==(const ResidueMask& o) const;
+  bool operator!=(const ResidueMask& o) const { return !(*this == o); }
+  bool operator<(const ResidueMask& o) const;
+  size_t Hash() const;
+
+ private:
+  int64_t modulus_ = 1;
+  uint64_t inline_bits_ = 0;
+  std::vector<uint64_t> ext_bits_;
+  void MaskUnusedBits();
+};
+
+struct RankTerm {
+  AxisId axis = 0;
+  int64_t first = 0;
+  int64_t step = 1;
+  int64_t coeff = 1;
+  bool operator==(const RankTerm& o) const {
+    return std::tie(axis, first, step, coeff) == std::tie(o.axis, o.first, o.step, o.coeff);
+  }
+  bool operator<(const RankTerm& o) const {
+    return std::tie(axis, first, step, coeff) < std::tie(o.axis, o.first, o.step, o.coeff);
+  }
+};
+
+// Coupled multi-axis modular rank constraint:
+//   (base + sum_t coeff_t * ((d_{axis_t} - first_t) / step_t)) mod modulus in residues
+struct RankCongruence {
+  int64_t modulus = 2;
+  int64_t base = 0;
+  std::vector<RankTerm> terms;
+  ResidueMask residues;
+  bool operator==(const RankCongruence& o) const {
+    return modulus == o.modulus && base == o.base && terms == o.terms && residues == o.residues;
+  }
+  bool operator!=(const RankCongruence& o) const { return !(*this == o); }
+  bool operator<(const RankCongruence& o) const {
+    return std::tie(modulus, base, terms, residues) < std::tie(o.modulus, o.base, o.terms, o.residues);
+  }
+};
+
+// Sparse canonical Cartesian progression box (+ coupled multi-axis rank congruences).
+struct RadixBox {
+  std::vector<AxisConstraint> constraints;  // Sorted by AxisId, all proper subsets
+  std::vector<RankCongruence> ranks;        // Sorted; supports intersection closure
+  bool IsUnconstrained() const { return constraints.empty() && ranks.empty(); }
+  AxisAP AxisRange(AxisId axis, const GuardDomainArena& arena) const;
+  bool operator==(const RadixBox& o) const { return constraints == o.constraints && ranks == o.ranks; }
+  bool operator!=(const RadixBox& o) const { return !(*this == o); }
+  bool operator<(const RadixBox& o) const {
+    return std::tie(constraints, ranks) < std::tie(o.constraints, o.ranks);
+  }
+};
+
+// Canonical domain-aware guard carried on immutable CommandControl.
+class RadixBoxGuard {
+ public:
+  static constexpr size_t kMaxGuardBoxes = 16;
+
+  RadixBoxGuard() = default;
+  static RadixBoxGuard False() { return {}; }
+  static RadixBoxGuard True();
+  static RadixBoxGuard FromBox(std::shared_ptr<const GuardDomainArena> arena, std::optional<RadixBox> box);
+  static RadixBoxGuard FromBoxes(std::shared_ptr<const GuardDomainArena> arena, std::vector<RadixBox> boxes);
+  static RadixBoxGuard OpaqueDiagnostic(ExprPtr expr, std::vector<const Var*> inputs, bool qualified);
+
+  bool IsEmpty() const { return kind_ == Kind::kFalse; }
+  bool IsTautology() const {
+    return kind_ == Kind::kBoxes && boxes_.size() == 1 && boxes_[0].IsUnconstrained();
+  }
+  bool IsOpaque() const { return kind_ == Kind::kOpaqueExpr; }
+  bool IsDisjoint() const { return disjoint_; }
+  const std::shared_ptr<const GuardDomainArena>& Arena() const { return arena_; }
+  const std::vector<RadixBox>& Boxes() const { return boxes_; }
+  const ExprPtr& OpaqueExpr() const { return opaque_; }
+  const std::vector<const Var*>& OpaqueInputs() const { return opaque_inputs_; }
+  bool PredicateQualified() const { return kind_ != Kind::kOpaqueExpr || opaque_qualified_; }
+  bool IsFirstIterationOf(const VarPtr& loop_var, int64_t lr_start, int64_t lr_step) const;
+
+ private:
+  enum class Kind : uint8_t { kFalse, kBoxes, kOpaqueExpr };
+  Kind kind_ = Kind::kFalse;
+  std::shared_ptr<const GuardDomainArena> arena_;
+  std::vector<RadixBox> boxes_;
+  ExprPtr opaque_;
+  std::vector<const Var*> opaque_inputs_;
+  bool opaque_qualified_ = true;
+  bool disjoint_ = true;
+};
+
+// Core RadixBoxGuard algebra & lowering primitives (exposed for scheduling & unit testing).
+std::optional<AxisAP> CRTIntersect(const AxisAP& a, const AxisAP& b, int64_t axis_count);
+std::optional<RadixBox> IntersectBox(const RadixBox& a, const RadixBox& b, const GuardDomainArena& arena);
+std::optional<unsigned __int128> BoxCardinality(const RadixBox& box, const std::vector<AxisId>& universe,
+                                                const GuardDomainArena& arena);
+bool CoalesceBoxes(std::vector<RadixBox>& boxes, const GuardDomainArena& arena);
+std::optional<std::vector<RadixBox>> SubtractBox(const RadixBox& s, const RadixBox& g,
+                                                 const GuardDomainArena& arena);
+
+RadixBoxGuard IntersectGuards(const RadixBoxGuard& a, const RadixBoxGuard& b);
+std::optional<RadixBoxGuard> UnionGuards(const RadixBoxGuard& a, const RadixBoxGuard& b);
+std::optional<RadixBoxGuard> SubtractGuards(const RadixBoxGuard& s, const RadixBoxGuard& g);
+std::optional<unsigned __int128> GuardCardinality(const RadixBoxGuard& g,
+                                                  const std::vector<AxisId>& universe);
+std::vector<AxisId> ReferencedAxes(const RadixBoxGuard& a, const RadixBoxGuard& b = {},
+                                   const RadixBoxGuard& c = {});
+bool AreDisjointGuardsInScope(const RadixBoxGuard& a, const RadixBoxGuard& b, const RadixBoxGuard& scope);
+bool AreComplementaryGuardsInScope(const RadixBoxGuard& a, const RadixBoxGuard& b,
+                                   const RadixBoxGuard& scope);
+bool EquivalentGuardsInScope(const RadixBoxGuard& a, const RadixBoxGuard& b, const RadixBoxGuard& scope);
+bool SameGuard(const RadixBoxGuard& a, const RadixBoxGuard& b);
+RadixBoxGuard SimplifyGuardGiven(const RadixBoxGuard& g, const RadixBoxGuard& scope);
+RadixBoxGuard RestrictGuardAxis(const RadixBoxGuard& g, AxisId axis, const AxisAP& range,
+                                const std::shared_ptr<const GuardDomainArena>& arena);
+ExprPtr LowerRadixGuardToExpr(const RadixBoxGuard& g, const RadixBoxGuard& scope, const Span& span);
+std::vector<ExprPtr> LowerBoxToSplitPredicates(const RadixBox& box, const RadixBoxGuard& scope,
+                                               const GuardDomainArena& arena, const Span& span);
+
 struct CommandControl;
 using ControlPtr = std::shared_ptr<const CommandControl>;
 struct FrozenCommandForest;
@@ -40,7 +237,8 @@ struct ControlForest : std::vector<ControlPtr> {
   mutable std::shared_ptr<const FrozenCommandForest> frozen;
 };
 struct CommandControl {
-  ExprPtr condition, command;
+  RadixBoxGuard guard = RadixBoxGuard::True();
+  ExprPtr command;
   ControlForest body, alternative;
   Span span;
   // Cached requirements of this node's validated predicate, not readiness
@@ -64,6 +262,7 @@ struct ScalarBinding {
 };
 struct FrozenCommand {
   ControlPtr original;
+  ExprPtr condition_expr;
   ScalarRecipePtr condition;
   std::vector<ScalarBinding> definitions;
   std::array<size_t, 6> scalar_cost{};
@@ -71,12 +270,15 @@ struct FrozenCommand {
 };
 struct FrozenCommandForest {
   std::vector<ControlPtr> roots;
+  RadixBoxGuard scope = RadixBoxGuard::True();
   std::vector<FrozenCommand> commands;
 };
-std::shared_ptr<const FrozenCommandForest> FreezeCommandForest(const ControlForest& forest,
-                                                               PhysicalSyncRealization& work);
+std::shared_ptr<const FrozenCommandForest> FreezeCommandForest(
+    const ControlForest& forest, PhysicalSyncRealization& work,
+    const RadixBoxGuard& scope = RadixBoxGuard::True());
 std::vector<StmtPtr> MaterializeFrozenCommands(const ControlForest& forest, SyncTokenNames& names,
-                                               PhysicalSyncRealization& work);
+                                               PhysicalSyncRealization& work,
+                                               const RadixBoxGuard& scope = RadixBoxGuard::True());
 struct CommandPredicateScope {
   FunctionPtr owner;
   // Share entry facts once per owner, rather than copying every formal at
@@ -112,32 +314,40 @@ bool SameControl(const ControlPtr& left, const ControlPtr& right);
 bool CommandValueCandidate(const ExprPtr& expression);
 bool PureCommandExpression(const ExprPtr& expression, size_t* inspections);
 ControlPtr ControlSequence(ControlForest body, const Span& span, PhysicalSyncRealization& work);
+ControlPtr ControlBranch(RadixBoxGuard guard, ControlPtr body, std::optional<ControlPtr> alternative,
+                         const Span& span, PhysicalSyncRealization& work);
 ControlPtr ControlBranch(ExprPtr condition, ControlPtr body, std::optional<ControlPtr> alternative,
                          const Span& span, PhysicalSyncRealization& work);
 ControlPtr ControlCommand(ExprPtr command, const Span& span, PhysicalSyncRealization& work);
-// Rebuilding preserves tree shape. Changed predicates renew their requirements;
-// unchanged predicates retain the original qualification, including refusal.
-ControlPtr RebuildControl(const ControlPtr& original, ExprPtr condition, ExprPtr command, ControlForest body,
-                          ControlForest alternative, PhysicalSyncRealization& work);
+ControlPtr RebuildControl(const ControlPtr& original, RadixBoxGuard guard, ExprPtr command,
+                          ControlForest body, ControlForest alternative, PhysicalSyncRealization& work);
 void FlattenControlSequence(const ControlPtr& node, ControlForest& commands, PhysicalSyncRealization& work);
 // Endpoint accounting applies only before invocation-case composition.
 ControlForest ShareCommandGuards(const ControlForest& commands, PhysicalSyncRealization& work,
-                                 bool endpoint = true);
+                                 bool endpoint = true, bool pair_else_branches = true,
+                                 const RadixBoxGuard& scope = RadixBoxGuard::True());
 void AppendCase(std::vector<CaseCommands>& cases, std::pair<int64_t, int64_t> blocks,
                 const ControlForest& commands, const Span& span, PhysicalSyncRealization& work);
 Intervals SubtractIntervals(const Intervals& domain, const Intervals& absent);
 bool DomainIntersects(const Intervals& domain, int64_t lo, int64_t hi);
 ControlForest ScheduleCommandCases(const ExprPtr& block, const Intervals& possible,
                                    const std::vector<CaseCommands>& source, PhysicalSyncRealization& work,
-                                   const Span& span, const std::set<const Var*>& uniform_variables);
+                                   const Span& span, const std::set<const Var*>& uniform_variables,
+                                   const std::shared_ptr<GuardDomainArena>& arena = nullptr);
 struct CaseCodeSize {
   size_t commands = 0, guards = 0, expressions = 0, statements = 0;
-  explicit CaseCodeSize(const ControlForest& body);
+  explicit CaseCodeSize(const ControlForest& body, const RadixBoxGuard& scope = RadixBoxGuard::True());
   bool Improves(const CaseCodeSize& old) const;
 
  private:
-  void Visit(const ControlPtr& node);
+  void Visit(const ControlPtr& node, const RadixBoxGuard& scope);
 };
+
+// Shared guard inspection helpers for scheduling and hashing.
+void VisitControlGuardExpressions(const RadixBoxGuard& guard, IRVisitor& visitor);
+size_t HashRadixBoxGuard(const RadixBoxGuard& guard);
+std::vector<const Var*> GuardPredicateInputs(const RadixBoxGuard& guard, PhysicalSyncRealization& work,
+                                             bool& qualified);
 
 }  // namespace pypto::ir::sync::physical
 

@@ -30,9 +30,9 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/sync/isa_macro_resources.h"
 #include "pypto/sync/resource_catalog.h"
-#include "src/ir/transforms/utils/native_sync_placement.h"
 #include "src/ir/transforms/utils/scoped_sync_palette.h"
 #include "src/ir/transforms/utils/scoped_token_families.h"
+#include "src/ir/transforms/utils/sync_footprint_resolver.h"
 #include "src/ir/transforms/utils/sync_placement.h"
 
 namespace pypto::ir::sync {
@@ -178,8 +178,7 @@ class Allocator {
                                              : legacy.status == LegacyStatus::NoEligible    ? "no-eligible"
                                              : legacy.status == LegacyStatus::ExactScarcity ? "exact-scarcity"
                                                                                             : "unproved",
-                                             legacy.reason,
-                                             result_.reuse_queries - before_queries});
+                                             legacy.reason, result_.reuse_queries - before_queries});
       if (legacy.status == LegacyStatus::Accepted) {
         for (const auto& [index, width] : legacy.widths) families_[index].ids.resize(width, -1);
         for (size_t i = 0; i < legacy.lanes.size(); ++i)
@@ -395,12 +394,12 @@ SyncNativeReservations SyncNativeClaims(const FunctionPtr& owner, const std::vec
                                         const std::string& target) {
   backend::RequireLocalSyncExecutionContract(target);
   SyncNativeReservations claimed;
-  NativeSyncPlacement placement(owner);
+  SyncFootprintResolver resolver(owner, nullptr, /*run_scalar_layout_check=*/true, target);
   std::set<const Call*> checked;
   for (const auto& call : calls) {
     if (!checked.insert(call.get()).second) continue;
     const auto operation = backend::QualifyBufferSyncOperation(call, owner->func_type_, target);
-    placement.Require(operation);
+    resolver.RequireWorkspaceSeparation(operation);
     ReserveNativeClaims(operation.Implementation(), claimed);
   }
   return claimed;

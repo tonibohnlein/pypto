@@ -36,25 +36,36 @@ using ir::As;
 using ir::EvalStmt;
 using ir::Function;
 using ir::IfStmt;
+using ir::IRVisitor;
 using ir::ParamDirection;
 using ir::SeqStmts;
 using ir::TypePtr;
+using ir::Var;
 using ir::VarPtr;
 using ir::sync::LowerLogicalSync;
 using ir::sync::OptimizeLogicalSync;
 using ir::sync::RealizeCompactSync;
 using ir::sync::RealizeLogicalInvocation;
 using ir::sync::SyncTokenNames;
+using ir::sync::physical::AxisAP;
+using ir::sync::physical::AxisConstraint;
+using ir::sync::physical::AxisId;
 using ir::sync::physical::CaseCommands;
 using ir::sync::physical::ControlBranch;
 using ir::sync::physical::ControlCommand;
 using ir::sync::physical::ControlForest;
 using ir::sync::physical::ControlPtr;
 using ir::sync::physical::ControlSequence;
+using ir::sync::physical::GuardDomainArena;
+using ir::sync::physical::IntersectGuards;
 using ir::sync::physical::Intervals;
 using ir::sync::physical::MaterializeFrozenCommands;
+using ir::sync::physical::RadixBox;
+using ir::sync::physical::RadixBoxGuard;
 using ir::sync::physical::ScheduleCommandCases;
 using ir::sync::physical::ShareCommandGuards;
+using ir::sync::physical::SubtractGuards;
+using ir::sync::physical::UnionGuards;
 PhysicalSyncRealization RealizeDemandPlan(const CompactSyncResult& analysis, const std::string& target,
                                           const std::optional<std::vector<int>>& eligible_ids,
                                           const SyncSchedulePolicy& policy) {
@@ -84,23 +95,232 @@ DemandInvocation RealizeDemandInvocation(const SyncInvocationAnalysis& analysis,
   return {std::move(lowered.function), std::move(lowered.physical_cases)};
 }
 
-ControlPtr ImportCommands(const StmtPtr& stmt, PhysicalSyncRealization& work) {
+namespace {
+void CollectOwnerLoopAxes(const FunctionPtr& owner, const std::shared_ptr<GuardDomainArena>& arena,
+                          std::map<const Var*, AxisId>& loop_vars) {
+  std::set<const Var*> duplicate_vars;
+  class Collector : public ir::IRVisitor {
+    const std::shared_ptr<GuardDomainArena>& arena_;
+    std::map<const Var*, AxisId>& loop_vars_;
+    std::set<const Var*>& duplicate_vars_;
+
+   public:
+    Collector(const std::shared_ptr<GuardDomainArena>& arena, std::map<const Var*, AxisId>& loop_vars,
+              std::set<const Var*>& duplicate_vars)
+        : arena_(arena), loop_vars_(loop_vars), duplicate_vars_(duplicate_vars) {}
+    void VisitStmt_(const ir::ForStmtPtr& loop) override {
+      if (loop->kind_ == ir::ForKind::Sequential && loop->iter_args_.empty() && loop->return_vars_.empty() &&
+          loop->attrs_.empty() && loop->hardware_loop_policy_ == ir::HardwareLoopPolicy::Auto) {
+        const auto type = As<ir::ScalarType>(loop->loop_var_->GetType());
+        const auto start = As<ir::ConstInt>(loop->start_), stop = As<ir::ConstInt>(loop->stop_),
+                   step = As<ir::ConstInt>(loop->step_);
+        if (type && type->dtype_ == DataType::INDEX && start && stop && step && step->value_ > 0 &&
+            start->value_ < stop->value_) {
+          const __int128 wide_count =
+              (__int128(stop->value_) - start->value_ + step->value_ - 1) / step->value_;
+          if (wide_count >= 1 && wide_count <= std::numeric_limits<int64_t>::max()) {
+            const __int128 last = __int128(start->value_) + (wide_count - 1) * step->value_;
+            if (last + step->value_ <= std::numeric_limits<int64_t>::max()) {
+              const AxisId ax = arena_->RegisterLoopFrame(ir::sync::SyncLoopFrame{
+                  loop, static_cast<int64_t>(wide_count), start->value_, step->value_, nullptr});
+              if (duplicate_vars_.count(loop->loop_var_.get()) == 0) {
+                if (!loop_vars_.emplace(loop->loop_var_.get(), ax).second) {
+                  loop_vars_.erase(loop->loop_var_.get());
+                  duplicate_vars_.insert(loop->loop_var_.get());
+                }
+              }
+            }
+          }
+        }
+      }
+      IRVisitor::VisitStmt_(loop);
+    }
+  };
+  Collector(arena, loop_vars, duplicate_vars).VisitStmt(owner->body_);
+}
+
+std::optional<AxisId> MatchNormalizedDigit(const ir::ExprPtr& expr, const GuardDomainArena& arena,
+                                           const std::map<const Var*, AxisId>& loop_vars) {
+  if (const auto var = As<ir::Var>(expr)) {
+    const auto it = loop_vars.find(var.get());
+    if (it == loop_vars.end()) return std::nullopt;
+    const auto& info = arena.Axis(it->second);
+    if (info.start == 0 && info.step == 1) return it->second;
+    return std::nullopt;
+  }
+  if (const auto div = As<ir::FloorDiv>(expr)) {
+    const auto step_c = As<ir::ConstInt>(div->right_);
+    if (!step_c || step_c->value_ <= 0) return std::nullopt;
+    if (const auto sub = As<ir::Sub>(div->left_)) {
+      const auto var = As<ir::Var>(sub->left_);
+      const auto start_c = As<ir::ConstInt>(sub->right_);
+      if (!var || !start_c) return std::nullopt;
+      const auto it = loop_vars.find(var.get());
+      if (it == loop_vars.end()) return std::nullopt;
+      const auto& info = arena.Axis(it->second);
+      if (info.start == start_c->value_ && info.step == step_c->value_) return it->second;
+    } else if (const auto var = As<ir::Var>(div->left_)) {
+      const auto it = loop_vars.find(var.get());
+      if (it == loop_vars.end()) return std::nullopt;
+      const auto& info = arena.Axis(it->second);
+      if (info.start == 0 && info.step == step_c->value_) return it->second;
+    }
+    return std::nullopt;
+  }
+  if (const auto sub = As<ir::Sub>(expr)) {
+    const auto var = As<ir::Var>(sub->left_);
+    const auto start_c = As<ir::ConstInt>(sub->right_);
+    if (!var || !start_c) return std::nullopt;
+    const auto it = loop_vars.find(var.get());
+    if (it == loop_vars.end()) return std::nullopt;
+    const auto& info = arena.Axis(it->second);
+    if (info.start == start_c->value_ && info.step == 1) return it->second;
+  }
+  return std::nullopt;
+}
+
+std::optional<RadixBoxGuard> TryLiftExprToRadixGuard(const ExprPtr& expr,
+                                                     const std::shared_ptr<GuardDomainArena>& arena,
+                                                     const std::map<const Var*, AxisId>& loop_vars) {
+  if (!arena || loop_vars.empty()) return std::nullopt;
+  if (const auto b = As<ir::ConstBool>(expr)) {
+    return b->value_ ? RadixBoxGuard::True() : RadixBoxGuard::False();
+  }
+  if (const auto n = As<ir::Not>(expr)) {
+    const auto inner = TryLiftExprToRadixGuard(n->operand_, arena, loop_vars);
+    if (!inner) return std::nullopt;
+    return SubtractGuards(RadixBoxGuard::True(), *inner);
+  }
+  if (const auto a = As<ir::And>(expr)) {
+    const auto l = TryLiftExprToRadixGuard(a->left_, arena, loop_vars);
+    const auto r = TryLiftExprToRadixGuard(a->right_, arena, loop_vars);
+    if (!l || !r) return std::nullopt;
+    return IntersectGuards(*l, *r);
+  }
+  if (const auto o = As<ir::Or>(expr)) {
+    const auto l = TryLiftExprToRadixGuard(o->left_, arena, loop_vars);
+    const auto r = TryLiftExprToRadixGuard(o->right_, arena, loop_vars);
+    if (!l || !r) return std::nullopt;
+    return UnionGuards(*l, *r);
+  }
+  const auto binary = As<ir::BinaryExpr>(expr);
+  if (!binary) return std::nullopt;
+  if (const auto eq = As<ir::Eq>(expr)) {
+    const auto mod = As<ir::FloorMod>(eq->left_);
+    const auto rem = As<ir::ConstInt>(eq->right_);
+    if (mod && rem) {
+      const auto divisor = As<ir::ConstInt>(mod->right_);
+      const auto ax =
+          divisor && divisor->value_ > 0 ? MatchNormalizedDigit(mod->left_, *arena, loop_vars) : std::nullopt;
+      if (ax) {
+        const int64_t M = divisor->value_;
+        const int64_t r = rem->value_;
+        if (r < 0 || r >= M) return RadixBoxGuard::False();
+        const int64_t cnt = arena->Axis(*ax).count;
+        const auto ap = AxisAP::MakeCanonical(r, cnt, M, cnt);
+        if (!ap) return RadixBoxGuard::False();
+        RadixBox box;
+        if (!ap->IsFull(cnt)) box.constraints.push_back(AxisConstraint{*ax, *ap});
+        return RadixBoxGuard::FromBox(arena, std::move(box));
+      }
+    }
+  }
+  auto var = As<ir::Var>(binary->left_);
+  auto cst = As<ir::ConstInt>(binary->right_);
+  bool flipped = false;
+  if (!var || !cst) {
+    var = As<ir::Var>(binary->right_);
+    cst = As<ir::ConstInt>(binary->left_);
+    flipped = true;
+  }
+  if (!var || !cst) return std::nullopt;
+  const auto it = loop_vars.find(var.get());
+  if (it == loop_vars.end()) return std::nullopt;
+  const AxisId ax = it->second;
+  const auto& info = arena->Axis(ax);
+  const int64_t start = info.start, step = info.step, cnt = info.count;
+  const __int128 v = cst->value_;
+  auto make_box = [&](std::optional<AxisAP> ap) -> RadixBoxGuard {
+    if (!ap) return RadixBoxGuard::False();
+    RadixBox box;
+    if (!ap->IsFull(cnt)) box.constraints.push_back(AxisConstraint{ax, *ap});
+    return RadixBoxGuard::FromBox(arena, std::move(box));
+  };
+  const bool is_eq = As<ir::Eq>(expr) != nullptr;
+  const bool is_ne = As<ir::Ne>(expr) != nullptr;
+  const bool is_lt = (!flipped && As<ir::Lt>(expr)) || (flipped && As<ir::Gt>(expr));
+  const bool is_le = (!flipped && As<ir::Le>(expr)) || (flipped && As<ir::Ge>(expr));
+  const bool is_gt = (!flipped && As<ir::Gt>(expr)) || (flipped && As<ir::Lt>(expr));
+  const bool is_ge = (!flipped && As<ir::Ge>(expr)) || (flipped && As<ir::Le>(expr));
+  if (!is_eq && !is_ne && !is_lt && !is_le && !is_gt && !is_ge) return std::nullopt;
+
+  if (is_eq || is_ne) {
+    const __int128 diff = v - start;
+    if (diff < 0 || diff % step != 0) return is_eq ? RadixBoxGuard::False() : RadixBoxGuard::True();
+    const __int128 d = diff / step;
+    if (d >= cnt) return is_eq ? RadixBoxGuard::False() : RadixBoxGuard::True();
+    const auto eq_box = make_box(AxisAP{static_cast<int64_t>(d), static_cast<int64_t>(d) + 1, 1});
+    if (is_eq) return eq_box;
+    return SubtractGuards(RadixBoxGuard::True(), eq_box);
+  }
+  if (is_lt) {
+    if (v <= start) return RadixBoxGuard::False();
+    const __int128 d_end = (v - start - 1) / step + 1;
+    const int64_t hi = d_end > cnt ? cnt : static_cast<int64_t>(d_end);
+    return make_box(AxisAP::MakeCanonical(0, hi, 1, cnt));
+  }
+  if (is_le) {
+    if (v < start) return RadixBoxGuard::False();
+    const __int128 d_end = (v - start) / step + 1;
+    const int64_t hi = d_end > cnt ? cnt : static_cast<int64_t>(d_end);
+    return make_box(AxisAP::MakeCanonical(0, hi, 1, cnt));
+  }
+  if (is_gt) {
+    if (v < start) return RadixBoxGuard::True();
+    const __int128 d_first = (v - start) / step + 1;
+    if (d_first >= cnt) return RadixBoxGuard::False();
+    return make_box(AxisAP::MakeCanonical(static_cast<int64_t>(d_first), cnt, 1, cnt));
+  }
+  // is_ge
+  if (v <= start) return RadixBoxGuard::True();
+  const __int128 d_first = (v - start + step - 1) / step;
+  if (d_first >= cnt) return RadixBoxGuard::False();
+  return make_box(AxisAP::MakeCanonical(static_cast<int64_t>(d_first), cnt, 1, cnt));
+}
+
+ControlPtr ImportCommandsImpl(const StmtPtr& stmt, PhysicalSyncRealization& work,
+                              const std::shared_ptr<GuardDomainArena>& arena,
+                              const std::map<const Var*, AxisId>& loop_vars) {
   if (auto sequence = As<SeqStmts>(stmt)) {
     ControlForest children;
-    for (const auto& child : sequence->stmts_) children.push_back(ImportCommands(child, work));
+    for (const auto& child : sequence->stmts_)
+      children.push_back(ImportCommandsImpl(child, work, arena, loop_vars));
     return ControlSequence(std::move(children), stmt->span_, work);
   }
   if (auto branch = As<IfStmt>(stmt)) {
     CHECK(branch->return_vars_.empty()) << "Command schedule cannot move definitions";
-    return ControlBranch(branch->condition_, ImportCommands(branch->then_body_, work),
-                         branch->else_body_
-                             ? std::optional<ControlPtr>(ImportCommands(*branch->else_body_, work))
-                             : std::nullopt,
-                         stmt->span_, work);
+    auto then_ctrl = ImportCommandsImpl(branch->then_body_, work, arena, loop_vars);
+    auto else_ctrl =
+        branch->else_body_
+            ? std::optional<ControlPtr>(ImportCommandsImpl(*branch->else_body_, work, arena, loop_vars))
+            : std::nullopt;
+    // Validate predicate syntax & qualification first.
+    auto opaque = ControlBranch(branch->condition_, then_ctrl, else_ctrl, stmt->span_, work);
+    if (opaque->predicate_qualified) {
+      if (const auto lifted = TryLiftExprToRadixGuard(branch->condition_, arena, loop_vars)) {
+        return ControlBranch(*lifted, then_ctrl, else_ctrl, stmt->span_, work);
+      }
+    }
+    return opaque;
   }
   auto command = As<EvalStmt>(stmt);
   CHECK(command) << "Command schedule requires command-only input";
   return ControlCommand(command->expr_, stmt->span_, work);
+}
+}  // namespace
+
+ControlPtr ImportCommands(const StmtPtr& stmt, PhysicalSyncRealization& work) {
+  return ImportCommandsImpl(stmt, work, nullptr, {});
 }
 
 namespace {
@@ -167,11 +387,14 @@ PhysicalSyncRealization EmitBoundaries(const FunctionPtr& owner,
                                        const std::vector<std::tuple<CallPtr, StmtPtr, StmtPtr>>& supplied,
                                        bool enabled, bool validate_scope) {
   PhysicalSyncRealization work;
+  auto arena = std::make_shared<GuardDomainArena>();
+  std::map<const Var*, AxisId> loop_vars;
+  CollectOwnerLoopAxes(owner, arena, loop_vars);
   physical::CutInventory inventory;
   for (const auto& [call, before, after] : supplied) {
     auto cut = std::make_shared<physical::PhysicalCuts>();
-    cut->before = {ImportCommands(before, work)};
-    cut->after = {ImportCommands(after, work)};
+    cut->before = {ImportCommandsImpl(before, work, arena, loop_vars)};
+    cut->after = {ImportCommandsImpl(after, work, arena, loop_vars)};
     CHECK(inventory.emplace(call.get(), std::move(cut)).second) << "Duplicate diagnostic command cut";
   }
   if (validate_scope) {
@@ -186,7 +409,7 @@ PhysicalSyncRealization EmitBoundaries(const FunctionPtr& owner,
   ++work.schedule_name_scans;
   work.schedule_name_visits += names.visits;
   physical::PreparedLoops loops;
-  auto plans = physical::PlanCommandBoundaries(owner, inventory, enabled, work);
+  auto plans = physical::PlanCommandBoundaries(owner, inventory, enabled, work, arena);
   work.function =
       physical::MaterializeSelectedSchedule(owner, nullptr, inventory, loops, plans, {}, work, names);
   return work;
@@ -276,7 +499,8 @@ std::optional<PointBoundary> RelativeBoundary(const CompactSyncView& view, size_
        view.State().input.unavailable_storage_spaces.count(view.State().input.storage[storage].space)))
     return std::nullopt;
   if (storage >= view.State().input.storage.size() || row < 0 || column < 0 ||
-      row >= view.State().input.storage[storage].rows || column >= view.State().input.storage[storage].columns)
+      row >= view.State().input.storage[storage].rows ||
+      column >= view.State().input.storage[storage].columns)
     return std::nullopt;
   PointBoundary out;
   struct Range {
@@ -327,14 +551,16 @@ std::optional<PointBoundary> RelativeBoundary(const CompactSyncView& view, size_
 PointBoundary LeafPointBoundary(const CompactSyncView& view, size_t region, size_t storage, int64_t row,
                                 int64_t column) {
   CHECK(region < view.State().segments.size()) << "Invalid compact leaf";
-  CHECK(storage < view.State().input.storage.size() && view.State().input.storage[storage].boundary_available &&
+  CHECK(storage < view.State().input.storage.size() &&
+        view.State().input.storage[storage].boundary_available &&
         !view.State().input.unavailable_storage_spaces.count(view.State().input.storage[storage].space))
       << "Leaf storage selector unavailable for this storage domain";
   for (const auto& site : view.State().input.segments[region].sites)
     for (const auto& access : site.accesses)
       CHECK(access.storage != storage ||
-            (!access.external && (!access.coordinate_frame ||
-                                  access.coordinate_frame == view.State().input.segments[region].original_loop)))
+            (!access.external &&
+             (!access.coordinate_frame ||
+              access.coordinate_frame == view.State().input.segments[region].original_loop)))
           << "Leaf point selector requires its enclosing occurrence binding";
   auto result = RelativeBoundary(view, storage, row, column, region);
   CHECK(result) << "Leaf storage point outside the supplied domain";
@@ -717,9 +943,9 @@ std::shared_ptr<const CompactSyncResult> SelectInvocationCase(const SyncInvocati
     if (!mapped) return nullptr;
     block_index = *mapped;
   }
-  auto found = std::upper_bound(
-      analysis.cases.begin(), analysis.cases.end(), block_index,
-      [](int64_t value, const auto& candidate) { return value < candidate.block_first; });
+  auto found =
+      std::upper_bound(analysis.cases.begin(), analysis.cases.end(), block_index,
+                       [](int64_t value, const auto& candidate) { return value < candidate.block_first; });
   if (found == analysis.cases.begin()) return nullptr;
   --found;
   if (block_index > found->block_last) return nullptr;
@@ -751,9 +977,8 @@ std::optional<int64_t> EvaluateSyncCoordinate(const SyncCoordinateProgram& progr
       if (!dependency(n.left)) return std::nullopt;
     } else if (n.kind == Kind::Add || n.kind == Kind::Sub || n.kind == Kind::FloorDivide ||
                n.kind == Kind::Remainder || n.kind == Kind::Equal || n.kind == Kind::NotEqual ||
-               n.kind == Kind::LessThan || n.kind == Kind::LessEqual ||
-               n.kind == Kind::GreaterThan || n.kind == Kind::GreaterEqual ||
-               n.kind == Kind::And || n.kind == Kind::Or) {
+               n.kind == Kind::LessThan || n.kind == Kind::LessEqual || n.kind == Kind::GreaterThan ||
+               n.kind == Kind::GreaterEqual || n.kind == Kind::And || n.kind == Kind::Or) {
       if (!dependency(n.left) || !dependency(n.right)) return std::nullopt;
     } else if (n.kind == Kind::Select) {
       if (!dependency(n.condition) || !dependency(n.left) || !dependency(n.right)) return std::nullopt;

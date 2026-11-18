@@ -66,7 +66,7 @@ void SnapshotPhase(const SyncRegion& source, PhaseBindings& bindings, NumericalF
             first &= found->second == 0;
           }
         }
-        if (site.continuation) {
+        if (site.continuation && site.initializes_accumulator) {
           if (!first) site.original = site.continuation;
           site.initializes_accumulator &= first;
         }

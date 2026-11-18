@@ -24,10 +24,8 @@
 #include <vector>
 
 #include "pypto/core/logging.h"
-#include "pypto/ir/arith/analyzer.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
-#include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "src/ir/transforms/utils/scoped_sync_palette.h"
@@ -38,35 +36,6 @@
 
 namespace pypto::ir::sync {
 namespace physical {
-// Only generated predicates enter this simplifier. Original payload/control
-// expressions are never rewritten. Bounds come from the retained occurrence
-// frame. Each region caches an analyzer containing only immutable original-loop
-// bounds; it never learns branch-local assumptions or a previous visit's values.
-class CommandConditions {
-  arith::Analyzer analyzer_;
-
- public:
-  ExprPtr Simplify(const ExprPtr& expression) {
-    try {
-      return analyzer_.Simplify(expression);
-    } catch (const StructuralComparisonUnsupported&) {
-      return expression;
-    }
-  }
-  explicit CommandConditions(const SyncSegment& segment) {
-    auto bind = [&](const ForStmtPtr& loop) {
-      const auto start = As<ConstInt>(loop->start_), stop = As<ConstInt>(loop->stop_),
-                 step = As<ConstInt>(loop->step_);
-      if (start && stop && step && step->value_ > 0 && start->value_ < stop->value_)
-        analyzer_.Bind(loop->loop_var_, start->value_, stop->value_);
-    };
-    if (!segment.nested_frames.empty()) {
-      for (const auto& frame : segment.nested_frames) bind(frame.loop);
-    } else if (segment.original_loop) {
-      bind(segment.original_loop);
-    }
-  }
-};
 using Family = PhysicalSyncFamily;
 using AbsentLoops = std::map<const ForStmt*, Intervals>;
 void RetainAbsentLoops(const SyncRegion& region, std::pair<int64_t, int64_t> blocks, AbsentLoops& absent) {
@@ -254,6 +223,7 @@ class AssignedRegionSchedule {
   const FunctionPtr owner;
   const ExprPtr block;  // One source-invariant dominating launch lookup.
   const std::vector<AssignedSyncCase> cases;
+  std::shared_ptr<GuardDomainArena> arena = std::make_shared<GuardDomainArena>();
   std::vector<AssignedCut> cuts;
   AssignedRegionSchedule(FunctionPtr function, std::vector<AssignedSyncCase> supplied)
       : owner(std::move(function)),
@@ -610,134 +580,149 @@ class AssignedCommandLowering {
   size_t case_;
   PhysicalSyncRealization& result_;
   const SchedulePhase* phase_;
-  std::map<const SyncEndpointDomain*, std::vector<ExprPtr>> endpoint_guards_;
-  std::map<size_t, std::unique_ptr<CommandConditions>> conditions_;
-  std::map<size_t, ExprPtr> ordinals_;
-  CommandConditions& Conditions(size_t region) {
-    auto& value = conditions_[region];
-    if (!value) value = std::make_unique<CommandConditions>(input_.segments[region]);
-    return *value;
-  }
+  struct ScopedDomainEntry {
+    bool active = false;
+    RadixBoxGuard guard = RadixBoxGuard::True();
+    std::vector<AxisId> axes;
+  };
+  std::map<const SyncEndpointDomain*, ScopedDomainEntry> scoped_domains_;
 
-  ExprPtr Integer(int64_t n, const Span& span) {
-    return std::make_shared<ConstInt>(n, DataType::INDEX, span);
-  }
-  ExprPtr Ordinal(size_t region, const Span& span) {
-    auto& value = ordinals_[region];
-    if (!value) value = BuildOrdinal(region, span);
-    return value;
-  }
-  ExprPtr BuildOrdinal(size_t region, const Span& span) {
-    const auto& s = input_.segments[region];
-    if (!s.original_loop) return Integer(0, span);
-    if (!s.nested_frames.empty()) {
-      ExprPtr ordinal = Integer(0, span);
-      for (const auto& frame : s.nested_frames) {
-        ExprPtr digit = frame.loop->loop_var_;
-        if (frame.start)
-          digit = std::make_shared<Sub>(digit, Integer(frame.start, span), DataType::INDEX, span);
-        if (frame.step != 1)
-          digit = std::make_shared<FloorDiv>(digit, Integer(frame.step, span), DataType::INDEX, span);
-        ordinal = std::make_shared<Add>(
-            std::make_shared<Mul>(ordinal, Integer(frame.count, span), DataType::INDEX, span), digit,
-            DataType::INDEX, span);
-      }
-      return ordinal;
-    }
-    ExprPtr ordinal = s.original_loop->loop_var_;
-    if (s.start) ordinal = std::make_shared<Sub>(ordinal, Integer(s.start, span), DataType::INDEX, span);
-    if (s.step != 1)
-      ordinal = std::make_shared<FloorDiv>(ordinal, Integer(s.step, span), DataType::INDEX, span);
-    return ordinal;
-  }
-  ExprPtr FrameDigit(const SyncLoopFrame& frame, const Span& span) {
-    // This original loop has exactly one admitted visit regardless of its
-    // invocation-dependent start. No normalized placeholder is read as an IV.
-    if (frame.count == 1) return Integer(0, span);
-    ExprPtr value = frame.loop->loop_var_;
-    if (frame.start_expression || frame.start)
-      value = std::make_shared<Sub>(
-          value, frame.start_expression ? frame.start_expression : Integer(frame.start, span),
-          DataType::INDEX, span);
-    if (frame.step != 1)
-      value = std::make_shared<FloorDiv>(value, Integer(frame.step, span), DataType::INDEX, span);
-    return value;
-  }
-  // Rewrite only on the original positive-step lattice. In addition to each
-  // threshold, prove the normalized subtraction itself cannot wrap: endpoints
-  // can both fit int64 while their difference does not. A symbolic start keeps
-  // the established quotient expression; no new range assumption is introduced.
-  std::optional<int64_t> OriginalBoundary(const SyncLoopFrame& frame, int64_t digit) const {
+  static bool FitsOriginalBoundary(const SyncLoopFrame& frame, int64_t digit) {
     const auto start = As<ConstInt>(frame.loop->start_), step = As<ConstInt>(frame.loop->step_);
     if (!start || !step || frame.start_expression || frame.step <= 0 || frame.count <= 0 ||
         start->value_ != frame.start || step->value_ != frame.step || digit < 0 || digit >= frame.count)
-      return std::nullopt;
+      return false;
     const auto extent = __int128(frame.count - 1) * frame.step;
     const auto last = __int128(frame.start) + extent;
     const auto bound = __int128(frame.start) + __int128(digit) * frame.step;
-    if (extent > std::numeric_limits<int64_t>::max() || last > std::numeric_limits<int64_t>::max() ||
-        last < std::numeric_limits<int64_t>::min() || bound > std::numeric_limits<int64_t>::max() ||
-        bound < std::numeric_limits<int64_t>::min())
-      return std::nullopt;
-    return static_cast<int64_t>(bound);
+    return extent <= std::numeric_limits<int64_t>::max() && last <= std::numeric_limits<int64_t>::max() &&
+           last >= std::numeric_limits<int64_t>::min() && bound <= std::numeric_limits<int64_t>::max() &&
+           bound >= std::numeric_limits<int64_t>::min();
   }
-  const std::vector<ExprPtr>& ScopedGuards(const AssignedEndpoint& endpoint, const Span& span) {
-    const auto& domain = endpoint.domain;
-    if (auto found = endpoint_guards_.find(domain.get()); found != endpoint_guards_.end())
-      return found->second;
-    const auto& frames = domain->frame->loops;
-    result_.endpoint_domain_entries += domain->ranges.size();
-    std::vector<ExprPtr> guards;
+
+  ScopedDomainEntry ResolveScopedDomain(const SyncEndpointDomain& domain) {
+    auto it = scoped_domains_.find(&domain);
+    if (it != scoped_domains_.end()) return it->second;
+    ScopedDomainEntry entry;
+    const auto& frames = domain.frame->loops;
+    result_.endpoint_domain_entries += domain.ranges.size();
+    RadixBox base_box;
+    entry.axes.reserve(frames.size());
     for (size_t i = 0; i < frames.size(); ++i) {
-      const auto [first, raw_end] = domain->ranges[i];
-      INTERNAL_CHECK(first >= 0 && raw_end > first && raw_end <= frames[i].count) << "Invalid endpoint interval";
-      const auto raw_stride = domain->steps.empty() ? 1 : domain->steps[i];
-      const auto active_visits = (raw_end - first - 1) / raw_stride + 1;
-      const auto stride = active_visits == 1 ? int64_t{1} : raw_stride;
-      const auto end = active_visits == 1 ? first + 1 : raw_end;
-      if (stride > 1) {
-        // Normalize with the admitted original frame origin, not a potentially
-        // later first-active visit: the dividend is nonnegative on all visits.
-        auto residue = std::make_shared<FloorMod>(FrameDigit(frames[i], span), Integer(stride, span),
-                                                  DataType::INDEX, span);
-        guards.push_back(std::make_shared<Eq>(residue, Integer(first % stride, span), DataType::BOOL, span));
+      const AxisId ax = schedule_.arena->RegisterLoopFrame(frames[i]);
+      entry.axes.push_back(ax);
+      const auto [raw_first, raw_end] = domain.ranges[i];
+      INTERNAL_CHECK(raw_first >= 0 && raw_end > raw_first && raw_end <= frames[i].count)
+          << "Invalid endpoint interval";
+      const int64_t raw_stride = domain.steps.empty() ? 1 : domain.steps[i];
+      auto ap = AxisAP::MakeCanonical(raw_first, raw_end, raw_stride, frames[i].count);
+      if (!ap) return scoped_domains_.emplace(&domain, std::move(entry)).first->second;
+      if (phase_ && frames[i].loop == phase_->loop) {
+        const auto phase_ap = AxisAP::MakeCanonical(phase_->first, phase_->end, 1, frames[i].count);
+        if (!phase_ap) return scoped_domains_.emplace(&domain, std::move(entry)).first->second;
+        ap = CRTIntersect(*ap, *phase_ap, frames[i].count);
+        if (!ap) return scoped_domains_.emplace(&domain, std::move(entry)).first->second;
+        if (phase_->first >= raw_first && phase_->end <= raw_end && ap->stride == 1) continue;
       }
-      if (phase_ && frames[i].loop == phase_->loop && phase_->first >= first && phase_->end <= end) continue;
-      if (!first && end == frames[i].count) continue;
-      // Each requested threshold is within the admitted frame, including
-      // nondivisible stop values. Never substitute stop-step for the last IV.
-      const auto first_bound = OriginalBoundary(frames[i], first);
-      const auto end_bound = end < frames[i].count ? OriginalBoundary(frames[i], end) : first_bound;
-      const bool original = first_bound && end_bound;
-      const auto value = original ? frames[i].loop->loop_var_ : FrameDigit(frames[i], span);
-      auto boundary = [&](int64_t digit) {
-        if (original) {
-          ++result_.normalized_endpoint_bounds;
-          return Integer(*OriginalBoundary(frames[i], digit), span);
+      if (!ap->IsFull(frames[i].count)) {
+        if (ap->IsSingleton()) {
+          ++result_.endpoint_predicates_constructed;
+          if (FitsOriginalBoundary(frames[i], ap->first)) ++result_.normalized_endpoint_bounds;
+        } else {
+          const bool need_mod = ap->stride > 1;
+          const bool need_ge = ap->first - ap->stride >= 0;
+          const bool need_lt = ap->Last() + ap->stride < frames[i].count;
+          if (need_mod) ++result_.endpoint_predicates_constructed;
+          if (need_ge) ++result_.endpoint_predicates_constructed;
+          if (need_lt) ++result_.endpoint_predicates_constructed;
+          if ((need_ge || need_lt) && (!need_ge || FitsOriginalBoundary(frames[i], ap->first)) &&
+              (!need_lt || FitsOriginalBoundary(frames[i], ap->Last() + 1))) {
+            if (need_ge) ++result_.normalized_endpoint_bounds;
+            if (need_lt) ++result_.normalized_endpoint_bounds;
+          }
         }
-        return Integer(digit, span);
-      };
-      if (end - first == 1 && first > 0 && end < frames[i].count) {
-        guards.push_back(std::make_shared<Eq>(value, boundary(first), DataType::BOOL, span));
-      } else if (end - first == 1 && first == 0 && frames[i].count > 2) {
-        guards.push_back(std::make_shared<Eq>(value, boundary(first), DataType::BOOL, span));
-      } else {
-        if (first) guards.push_back(std::make_shared<Ge>(value, boundary(first), DataType::BOOL, span));
-        if (end < frames[i].count)
-          guards.push_back(std::make_shared<Lt>(value, boundary(end), DataType::BOOL, span));
+        base_box.constraints.push_back(AxisConstraint{ax, *ap});
       }
     }
-    result_.endpoint_predicates_constructed += guards.size();
-    for (auto& guard : guards) guard = Conditions(domain->frame->region).Simplify(guard);
-    return endpoint_guards_.emplace(domain.get(), std::move(guards)).first->second;
+    entry.active = true;
+    entry.guard = RadixBoxGuard::FromBox(schedule_.arena, std::move(base_box));
+    return scoped_domains_.emplace(&domain, std::move(entry)).first->second;
   }
-  ControlPtr Guard(ExprPtr condition, ControlPtr body) {
-    ++result_.guard_sites;
-    if (auto known = As<ConstBool>(condition)) {
-      return known->value_ ? body : ControlSequence({}, body->span, result_);
+
+  static void DecomposeMixedRadix(int64_t lo, int64_t hi, size_t depth, int64_t total,
+                                  const std::vector<AxisId>& axes, const std::vector<SyncLoopFrame>& frames,
+                                  const RadixBox& prefix, std::vector<RadixBox>& out, bool& overflow) {
+    if (overflow || lo >= hi) return;
+    if (lo == 0 && hi == total) {
+      out.push_back(prefix);
+      if (out.size() > RadixBoxGuard::kMaxGuardBoxes) overflow = true;
+      return;
     }
-    return ControlBranch(condition, body, std::nullopt, body->span, result_);
+    const int64_t stride = total / frames[depth].count;
+    int64_t d_lo = lo / stride;
+    const int64_t r_lo = lo % stride;
+    int64_t d_hi = (hi - 1) / stride;
+    const int64_t r_hi = (hi - 1) % stride + 1;
+    auto push_axis = [&](RadixBox box, int64_t first, int64_t end) {
+      if (const auto ap = AxisAP::MakeCanonical(first, end, 1, frames[depth].count)) {
+        if (!ap->IsFull(frames[depth].count)) {
+          box.constraints.push_back(AxisConstraint{axes[depth], *ap});
+        }
+      }
+      return box;
+    };
+    if (d_lo == d_hi) {
+      DecomposeMixedRadix(r_lo, r_hi, depth + 1, stride, axes, frames, push_axis(prefix, d_lo, d_lo + 1), out,
+                          overflow);
+      return;
+    }
+    if (r_lo > 0) {
+      DecomposeMixedRadix(r_lo, stride, depth + 1, stride, axes, frames, push_axis(prefix, d_lo, d_lo + 1),
+                          out, overflow);
+      ++d_lo;
+    }
+    int64_t d_mid_end = d_hi;
+    if (r_hi < stride) {
+      --d_mid_end;
+    }
+    if (d_lo <= d_mid_end) {
+      out.push_back(push_axis(prefix, d_lo, d_mid_end + 1));
+      if (out.size() > RadixBoxGuard::kMaxGuardBoxes) overflow = true;
+    }
+    if (r_hi < stride) {
+      DecomposeMixedRadix(0, r_hi, depth + 1, stride, axes, frames, push_axis(prefix, d_hi, d_hi + 1), out,
+                          overflow);
+    }
   }
+
+  RadixBoxGuard BuildPhaseScope() const {
+    if (!phase_ || !phase_->loop) return RadixBoxGuard::True();
+    for (const auto& seg : input_.segments) {
+      for (const auto& frame : seg.nested_frames) {
+        if (frame.loop == phase_->loop) {
+          const AxisId ax = schedule_.arena->RegisterLoopFrame(frame);
+          const auto ap = AxisAP::MakeCanonical(phase_->first, phase_->end, 1, frame.count);
+          if (!ap) return RadixBoxGuard::False();
+          if (ap->IsFull(frame.count)) return RadixBoxGuard::True();
+          RadixBox box;
+          box.constraints.push_back(AxisConstraint{ax, *ap});
+          return RadixBoxGuard::FromBox(schedule_.arena, std::move(box));
+        }
+      }
+      if (seg.original_loop == phase_->loop) {
+        const SyncLoopFrame frame{seg.original_loop, seg.count, seg.start, seg.step, nullptr};
+        const AxisId ax = schedule_.arena->RegisterLoopFrame(frame);
+        const auto ap = AxisAP::MakeCanonical(phase_->first, phase_->end, 1, frame.count);
+        if (!ap) return RadixBoxGuard::False();
+        if (ap->IsFull(frame.count)) return RadixBoxGuard::True();
+        RadixBox box;
+        box.constraints.push_back(AxisConstraint{ax, *ap});
+        return RadixBoxGuard::FromBox(schedule_.arena, std::move(box));
+      }
+    }
+    return RadixBoxGuard::True();
+  }
+
   ControlPtr LowerAssignedCommand(const AssignedEndpoint& endpoint, const Span& span) {
     INTERNAL_CHECK(endpoint.case_index == case_) << "Foreign assigned endpoint case";
     const auto& f = schedule_.Record(endpoint);
@@ -749,8 +734,7 @@ class AssignedCommandLowering {
     const auto& ids = endpoint.palette ? endpoint.palette->ids : f.ids;
     INTERNAL_CHECK(!scoped || endpoint.palette || ids.size() <= 1)
         << "Internal error: unsupported scoped physical period";
-    // Decide activity before constructing calls or predicates. Unknown outer
-    // dimensions remain in the retained domain and are emitted normally.
+
     if (phase_) {
       int64_t lo = first, hi = scoped ? 0 : first + f.count;
       bool local = input_.segments[r].original_loop == phase_->loop;
@@ -762,9 +746,51 @@ class AssignedCommandLowering {
       INTERNAL_CHECK(local) << "Assigned schedule phase belongs to another endpoint loop";
       if (phase_->end <= lo || phase_->first >= hi) return ControlSequence({}, span, result_);
     }
-    const auto ordinal = scoped ? Integer(0, span) : Ordinal(r, span);
-    ExprPtr index = ordinal;
-    if (!scoped && first) index = std::make_shared<Sub>(index, Integer(first, span), DataType::INDEX, span);
+
+    std::vector<AxisId> region_axes;
+    RadixBoxGuard base_guard = RadixBoxGuard::True();
+    if (scoped) {
+      const auto resolved = ResolveScopedDomain(*endpoint.domain);
+      if (!resolved.active) return ControlSequence({}, span, result_);
+      region_axes = resolved.axes;
+      base_guard = resolved.guard;
+    } else {
+      const auto& seg = input_.segments[r];
+      if (!seg.original_loop && seg.nested_frames.empty()) {
+        base_guard = RadixBoxGuard::True();
+      } else if (seg.nested_frames.empty()) {
+        const SyncLoopFrame frame{seg.original_loop, seg.count, seg.start, seg.step, nullptr};
+        const AxisId ax = schedule_.arena->RegisterLoopFrame(frame);
+        region_axes.push_back(ax);
+        int64_t lo = first;
+        int64_t hi = first + f.count;
+        if (phase_ && seg.original_loop == phase_->loop) {
+          lo = std::max(lo, phase_->first);
+          hi = std::min(hi, phase_->end);
+        }
+        const auto ap = AxisAP::MakeCanonical(lo, hi, 1, seg.count);
+        if (!ap) return ControlSequence({}, span, result_);
+        RadixBox base_box;
+        if (!ap->IsFull(seg.count) && !(phase_ && seg.original_loop == phase_->loop &&
+                                        phase_->first >= first && phase_->end <= first + f.count)) {
+          base_box.constraints.push_back(AxisConstraint{ax, *ap});
+        }
+        base_guard = RadixBoxGuard::FromBox(schedule_.arena, std::move(base_box));
+      } else {
+        for (const auto& frame : seg.nested_frames) {
+          region_axes.push_back(schedule_.arena->RegisterLoopFrame(frame));
+        }
+        if (first > 0 || first + f.count < seg.count) {
+          std::vector<RadixBox> boxes;
+          bool overflow = false;
+          DecomposeMixedRadix(first, first + f.count, 0, seg.count, region_axes, seg.nested_frames,
+                              RadixBox{}, boxes, overflow);
+          CHECK(!overflow) << "Flat mixed-radix presence range exceeded box budget";
+          base_guard = RadixBoxGuard::FromBoxes(schedule_.arena, std::move(boxes));
+        }
+      }
+    }
+
     ControlForest commands;
     if (src == dst) {
       INTERNAL_CHECK(dst == PipeType::M || dst == PipeType::V)
@@ -774,119 +800,124 @@ class AssignedCommandLowering {
       commands.push_back(ControlCommand(call, span, result_));
       ++result_.barrier_sites;
     } else {
-      ExprPtr residue;
       const bool literal_residue = phase_ && phase_->residue.has_value() && !scoped;
-      if (endpoint.palette && ids.size() > 1) {
-        INTERNAL_CHECK(endpoint.rank && endpoint.domain) << "Missing certified publication rank";
-        const auto modulus = static_cast<int64_t>(ids.size());
-        INTERNAL_CHECK(static_cast<__int128>(modulus) * (modulus - 1) <= std::numeric_limits<int64_t>::max())
-            << "Directional palette is too large for bounded modular INDEX arithmetic";
-        residue = Integer(endpoint.rank->rank_base % modulus, span);
-        const auto& digits = publish ? endpoint.rank->source : endpoint.rank->target;
-        for (size_t i = 0; i < endpoint.rank->rank_coefficients.size(); ++i) {
-          const auto coefficient = endpoint.rank->rank_coefficients[i] % modulus;
-          if (!coefficient || digits[i].count == 1) continue;
-          INTERNAL_CHECK(i < digits.size() && i < endpoint.domain->frame->loops.size())
-              << "Matched WAIT rank lost original source coordinate";
-          ExprPtr digit = FrameDigit(endpoint.domain->frame->loops[i], span);
-          if (digits[i].first)
-            digit = std::make_shared<Sub>(digit, Integer(digits[i].first, span), DataType::INDEX, span);
-          if (digits[i].step != 1)
-            digit = std::make_shared<FloorDiv>(digit, Integer(digits[i].step, span), DataType::INDEX, span);
-          digit = std::make_shared<FloorMod>(digit, Integer(modulus, span), DataType::INDEX, span);
-          if (coefficient != 1)
-            digit = std::make_shared<Mul>(digit, Integer(coefficient, span), DataType::INDEX, span);
-          residue = std::make_shared<FloorMod>(std::make_shared<Add>(residue, digit, DataType::INDEX, span),
-                                               Integer(modulus, span), DataType::INDEX, span);
-        }
-        residue = Conditions(r).Simplify(residue);
-      } else if (ids.size() > 1 && !literal_residue) {
-        residue = std::make_shared<FloorMod>(index, Integer(ids.size(), span), DataType::INDEX, span);
-      }
-      ControlPtr selection;
-      // This is the complete table for FloorMod(index, positive table size),
-      // whose range is [0, size). After excluding residues 0..size-2, the last
-      // entry is exhaustive. This proof belongs to this table constructor,
-      // not arbitrary conditional trees. Keep the entire selection beneath
-      // the original presence guards, including lower bounds on index.
-      for (size_t i = ids.size(); i-- > 0;) {
-        if (literal_residue) {
-          const auto period = static_cast<int64_t>(ids.size());
-          const auto digit =
+      if (ids.size() <= 1 || literal_residue) {
+        size_t idx = 0;
+        if (literal_residue && ids.size() > 1) {
+          const int64_t period = static_cast<int64_t>(ids.size());
+          const int64_t digit =
               static_cast<int64_t>((__int128(phase_->first) + *phase_->residue - first) % period);
-          if (i != static_cast<size_t>((digit + period) % period)) continue;
+          idx = static_cast<size_t>((digit + period) % period);
         }
         auto call = OpRegistry::GetInstance().Create(
             publish ? "system.set_flag" : "system.wait_flag", {},
             {{"src_pipe", static_cast<int>(src)},
              {"dst_pipe", static_cast<int>(dst)},
-             {"event_id", ids[i]},
+             {"event_id", ids[idx]},
              {"core_type", std::string(input_.owner->func_type_ == FunctionType::AIV ? "aiv" : "aic")}},
             span);
-        ControlPtr command = ControlCommand(call, span, result_);
-        if (residue && i + 1 < ids.size()) {
-          ++result_.guard_sites;
-          command = ControlBranch(
-              Conditions(r).Simplify(std::make_shared<Eq>(residue, Integer(i, span), DataType::BOOL, span)),
-              command, selection ? std::optional<ControlPtr>(selection) : std::nullopt, span, result_);
-        }
-        selection = command;
+        commands.push_back(ControlCommand(call, span, result_));
         if (publish)
           ++result_.set_sites;
         else
           ++result_.wait_sites;
+      } else {
+        const int64_t modulus = static_cast<int64_t>(ids.size());
+        RankCongruence template_rc;
+        template_rc.modulus = modulus;
+        if (endpoint.palette) {
+          INTERNAL_CHECK(endpoint.rank && endpoint.domain) << "Missing certified publication rank";
+          INTERNAL_CHECK(static_cast<__int128>(modulus) * (modulus - 1) <=
+                         std::numeric_limits<int64_t>::max())
+              << "Directional palette is too large for bounded modular INDEX arithmetic";
+          template_rc.base = ((endpoint.rank->rank_base % modulus) + modulus) % modulus;
+          const auto& src_digits = endpoint.rank->source;
+          const auto& digits = publish ? endpoint.rank->source : endpoint.rank->target;
+          for (size_t i = 0; i < endpoint.rank->rank_coefficients.size(); ++i) {
+            const int64_t coefficient = ((endpoint.rank->rank_coefficients[i] % modulus) + modulus) % modulus;
+            INTERNAL_CHECK(i < src_digits.size()) << "Rank coefficient out of source bounds";
+            if (!coefficient || src_digits[i].count == 1) continue;
+            INTERNAL_CHECK(i < digits.size() && i < endpoint.domain->frame->loops.size() &&
+                           digits[i].count == src_digits[i].count)
+                << "Matched WAIT rank lost original source coordinate";
+            template_rc.terms.push_back(
+                RankTerm{region_axes[i], digits[i].first, digits[i].step, coefficient});
+          }
+        } else {
+          template_rc.base = (((-first) % modulus) + modulus) % modulus;
+          const auto& seg = input_.segments[r];
+          if (seg.nested_frames.empty()) {
+            if (seg.original_loop) template_rc.terms.push_back(RankTerm{region_axes[0], 0, 1, 1 % modulus});
+          } else {
+            int64_t stride = 1;
+            for (size_t i = seg.nested_frames.size(); i-- > 0;) {
+              const int64_t coeff = stride % modulus;
+              if (coeff != 0 && seg.nested_frames[i].count > 1) {
+                template_rc.terms.push_back(RankTerm{region_axes[i], 0, 1, coeff});
+              }
+              stride = (stride * (seg.nested_frames[i].count % modulus)) % modulus;
+            }
+          }
+        }
+
+        struct Arm {
+          RadixBoxGuard guard;
+          ControlPtr cmd;
+        };
+        std::vector<Arm> arms;
+        for (size_t i = 0; i < ids.size(); ++i) {
+          RankCongruence arm_rc = template_rc;
+          arm_rc.residues = ResidueMask(modulus);
+          arm_rc.residues.Set(static_cast<int64_t>(i));
+          RadixBox rc_box;
+          rc_box.ranks.push_back(std::move(arm_rc));
+          const RadixBoxGuard arm_guard =
+              IntersectGuards(base_guard, RadixBoxGuard::FromBox(schedule_.arena, std::move(rc_box)));
+          if (arm_guard.IsEmpty()) continue;
+          auto call = OpRegistry::GetInstance().Create(
+              publish ? "system.set_flag" : "system.wait_flag", {},
+              {{"src_pipe", static_cast<int>(src)},
+               {"dst_pipe", static_cast<int>(dst)},
+               {"event_id", ids[i]},
+               {"core_type", std::string(input_.owner->func_type_ == FunctionType::AIV ? "aiv" : "aic")}},
+              span);
+          arms.push_back({SimplifyGuardGiven(arm_guard, base_guard), ControlCommand(call, span, result_)});
+          if (publish)
+            ++result_.set_sites;
+          else
+            ++result_.wait_sites;
+        }
+        if (!arms.empty()) {
+          ControlPtr selection = arms.back().cmd;
+          for (size_t i = arms.size() - 1; i-- > 0;) {
+            selection = ControlBranch(arms[i].guard, arms[i].cmd, selection, span, result_);
+          }
+          commands.push_back(selection);
+        }
       }
-      if (selection) commands.push_back(selection);
     }
+
     ControlPtr body = ControlSequence(commands, span, result_);
-    // The range guard surrounds residue arithmetic: no absent predecessor is
-    // evaluated/consumed. Final-only exports never publish on earlier visits.
-    if (scoped) {
-      const auto& guards = ScopedGuards(endpoint, span);
-      for (auto guard = guards.rbegin(); guard != guards.rend(); ++guard) body = Guard(*guard, body);
-      return body;
-    }
-    const auto& seg = input_.segments[r];
-    const bool need_lt = first + f.count < seg.count && (!phase_ || phase_->end > first + f.count);
-    const bool need_ge = first && (!phase_ || phase_->first < first);
-    std::optional<int64_t> ge_bound, lt_bound;
-    if (seg.original_loop) {
-      const SyncLoopFrame frame{seg.original_loop, seg.count, seg.start, seg.step, nullptr};
-      if (need_ge) ge_bound = OriginalBoundary(frame, first);
-      if (need_lt) lt_bound = OriginalBoundary(frame, first + f.count);
-    }
-    if (need_lt) {
-      const ExprPtr lhs = lt_bound ? seg.original_loop->loop_var_ : ordinal;
-      const int64_t rhs = lt_bound ? *lt_bound : first + f.count;
-      body = Guard(Conditions(r).Simplify(std::make_shared<Lt>(lhs, Integer(rhs, span), DataType::BOOL, span)),
-                   body);
-    }
-    if (need_ge) {
-      const ExprPtr lhs = ge_bound ? seg.original_loop->loop_var_ : ordinal;
-      const int64_t rhs = ge_bound ? *ge_bound : first;
-      body = Guard(Conditions(r).Simplify(std::make_shared<Ge>(lhs, Integer(rhs, span), DataType::BOOL, span)),
-                   body);
+    if (!base_guard.IsTautology()) {
+      body = ControlBranch(base_guard, body, std::nullopt, span, result_);
     }
     return body;
   }
+
   PhysicalCuts LowerCut(const AssignedCut& cut) {
     INTERNAL_CHECK(cut.case_index == case_) << "Foreign assigned cut";
     PhysicalCuts cuts;
-    const auto previous_guards = result_.guard_sites;
     const auto& span = cut.original->span_;
-    // The shared owner already ordered barriers, WAITs and SETs. Consume its
-    // immutable inventories directly; no second site directory is needed.
     for (const auto& endpoint : cut.before) cuts.before.push_back(LowerAssignedCommand(endpoint, span));
     for (const auto& endpoint : cut.after) cuts.after.push_back(LowerAssignedCommand(endpoint, span));
-    const auto remaining = CaseCodeSize(cuts.before).guards + CaseCodeSize(cuts.after).guards;
-    INTERNAL_CHECK(result_.guard_sites >= previous_guards + remaining) << "Unexpected new command guards";
-    result_.simplified_guard_sites += result_.guard_sites - previous_guards - remaining;
-    result_.guard_sites = previous_guards + remaining;
-    cuts.before = ShareCommandGuards(cuts.before, result_);
-    cuts.after = ShareCommandGuards(cuts.after, result_);
+    const RadixBoxGuard scope = BuildPhaseScope();
+    result_.guard_sites += CaseCodeSize(cuts.before, scope).guards + CaseCodeSize(cuts.after, scope).guards;
+    cuts.before = ShareCommandGuards(cuts.before, result_, true, false, scope);
+    cuts.after = ShareCommandGuards(cuts.after, result_, true, false, scope);
     return cuts;
   }
 };
+
 CutInventory LowerScheduleCuts(const AssignedRegionSchedule& schedule, const CutInventory& domains,
                                const std::vector<std::vector<size_t>>& selected,
                                std::pair<int64_t, int64_t> blocks, PhysicalSyncRealization& work,
@@ -906,9 +937,9 @@ CutInventory LowerScheduleCuts(const AssignedRegionSchedule& schedule, const Cut
     for (const auto& item : cut->before_cases) RequireCommandScope({item.body}, *cut->predicate_scope, work);
     for (const auto& item : cut->after_cases) RequireCommandScope({item.body}, *cut->predicate_scope, work);
     cut->before = ScheduleCommandCases(block, facts.domain, cut->before_cases, work, schedule.owner->span_,
-                                       facts.uniform_variables);
+                                       facts.uniform_variables, schedule.arena);
     cut->after = ScheduleCommandCases(block, facts.domain, cut->after_cases, work, schedule.owner->span_,
-                                      facts.uniform_variables);
+                                      facts.uniform_variables, schedule.arena);
     RequireCommandScope(cut->before, *cut->predicate_scope, work);
     RequireCommandScope(cut->after, *cut->predicate_scope, work);
   }
@@ -966,96 +997,98 @@ class BoundaryInput {
     cuts.push_back(found->second.get());
   }
 };
-class BoundarySpecializer {
-  arith::Analyzer analyzer_;
-  PhysicalSyncRealization& work_;
-
- public:
-  BoundarySpecializer(const VarPtr& iv, int64_t first, int64_t end, PhysicalSyncRealization& work)
-      : work_(work) {
-    analyzer_.Bind(iv, first, end);
-  }
-  ControlForest Run(const ControlForest& forest) {
-    ControlForest out;
-    for (const auto& node : forest) {
-      ++work_.schedule_descriptor_visits;
-      if (node->command) {
+ControlForest RestrictForestAxis(const ControlForest& forest, AxisId axis, const AxisAP& range,
+                                 const std::shared_ptr<const GuardDomainArena>& arena,
+                                 PhysicalSyncRealization& work) {
+  ControlForest out;
+  const Var* axis_var = arena->Axis(axis).var.get();
+  for (const auto& node : forest) {
+    ++work.schedule_descriptor_visits;
+    if (node->command) {
+      out.push_back(node);
+      continue;
+    }
+    if (node->guard.IsTautology()) {
+      auto body = RestrictForestAxis(node->body, axis, range, arena, work);
+      out.insert(out.end(), body.begin(), body.end());
+      continue;
+    }
+    if (node->guard.IsOpaque()) {
+      const bool uses_axis = std::find(node->predicate_inputs.begin(), node->predicate_inputs.end(),
+                                       axis_var) != node->predicate_inputs.end();
+      if (uses_axis) {
         out.push_back(node);
         continue;
       }
-      if (node->condition) {
-        ExprPtr simplified = node->condition;
-        try {
-          simplified = analyzer_.Simplify(node->condition);
-          if (!As<ConstBool>(simplified)) {
-            if (analyzer_.CanProve(simplified))
-              simplified = std::make_shared<ConstBool>(true, node->span);
-            else if (analyzer_.CanProve(MakeNot(simplified)))
-              simplified = std::make_shared<ConstBool>(false, node->span);
-          }
-        } catch (const StructuralComparisonUnsupported&) { /* Unproved remains unchanged. */
-        }
-        if (auto known = As<ConstBool>(simplified)) {
-          auto selected = Run(known->value_ ? node->body : node->alternative);
-          out.insert(out.end(), selected.begin(), selected.end());
-          continue;
-        }
-      }
-      auto body = Run(node->body), alternative = Run(node->alternative);
-      if (body.empty() && alternative.empty()) continue;
-      if (!node->condition) {
-        out.insert(out.end(), body.begin(), body.end());
-        continue;
-      }
-      out.push_back(
-          RebuildControl(node, node->condition, nullptr, std::move(body), std::move(alternative), work_));
+      auto body = RestrictForestAxis(node->body, axis, range, arena, work);
+      auto alt = RestrictForestAxis(node->alternative, axis, range, arena, work);
+      if (body.empty() && alt.empty()) continue;
+      out.push_back(RebuildControl(node, node->guard, nullptr, std::move(body), std::move(alt), work));
+      continue;
     }
-    return out;
+    auto restricted = RestrictGuardAxis(node->guard, axis, range, arena);
+    if (restricted.IsEmpty()) {
+      auto alt = RestrictForestAxis(node->alternative, axis, range, arena, work);
+      out.insert(out.end(), alt.begin(), alt.end());
+      continue;
+    }
+    if (restricted.IsTautology()) {
+      auto body = RestrictForestAxis(node->body, axis, range, arena, work);
+      out.insert(out.end(), body.begin(), body.end());
+      continue;
+    }
+    auto body = RestrictForestAxis(node->body, axis, range, arena, work);
+    auto alt = RestrictForestAxis(node->alternative, axis, range, arena, work);
+    if (body.empty() && alt.empty()) continue;
+    out.push_back(
+        RebuildControl(node, std::move(restricted), nullptr, std::move(body), std::move(alt), work));
   }
-};
-class BindBoundary : public IRMutator {
-  const VarPtr& iv_;
-  int64_t value_;
-  ExprPtr VisitExpr_(const VarPtr& var) override {
-    if (var == iv_)
-      return std::make_shared<ConstInt>(value_, As<ScalarType>(iv_->GetType())->dtype_, var->span_);
-    return var;
-  }
+  return out;
+}
 
- public:
-  BindBoundary(const VarPtr& iv, int64_t value) : iv_(iv), value_(value) {}
-  ControlForest Run(const ControlForest& forest, PhysicalSyncRealization& work) {
-    ControlForest out;
-    for (const auto& node : forest) {
-      out.push_back(RebuildControl(node, node->condition ? VisitExpr(node->condition) : nullptr,
-                                   node->command ? VisitExpr(node->command) : nullptr, Run(node->body, work),
-                                   Run(node->alternative, work), work));
-    }
-    return out;
+bool ForestUsesVar(const ControlForest& forest, const Var* var) {
+  for (const auto& node : forest) {
+    if (std::find(node->predicate_inputs.begin(), node->predicate_inputs.end(), var) !=
+        node->predicate_inputs.end())
+      return true;
+    if (ForestUsesVar(node->body, var) || ForestUsesVar(node->alternative, var)) return true;
   }
-};
+  return false;
+}
+
+std::shared_ptr<const GuardDomainArena> FindArenaInForest(const ControlForest& forest) {
+  for (const auto& node : forest) {
+    if (node->guard.Arena()) return node->guard.Arena();
+    if (auto a = FindArenaInForest(node->body)) return a;
+    if (auto a = FindArenaInForest(node->alternative)) return a;
+  }
+  return nullptr;
+}
+
 // Scan only a leading/trailing command sequence. A command active on the
 // boundary is a movement fence unless it is itself extracted. Commands proved
 // absent there are retained in place and do not fence other boundary commands.
-ControlForest ExtractBoundary(ControlForest& original, BoundarySpecializer& boundary,
-                              BoundarySpecializer& rest, bool reverse, const VarPtr& iv, int64_t value,
+ControlForest ExtractBoundary(ControlForest& original, AxisId axis, const AxisAP& boundary_ap,
+                              const AxisAP& rest_ap, bool reverse,
+                              const std::shared_ptr<const GuardDomainArena>& arena,
                               PhysicalSyncRealization& work) {
   ControlForest flat;
   for (const auto& node : original) FlattenControlSequence(node, flat, work);
   if (reverse) std::reverse(flat.begin(), flat.end());
   ControlForest retained, moved;
   std::vector<ControlForest> groups;
+  const Var* axis_var = arena->Axis(axis).var.get();
   bool fence = false;
   for (const auto& node : flat) {
     if (!fence) {
-      auto active = boundary.Run({node});
+      auto active = RestrictForestAxis({node}, axis, boundary_ap, arena, work);
       if (active.empty()) {
         retained.push_back(node);
         continue;
       }
-      if (rest.Run({node}).empty()) {
-        auto bound = BindBoundary(iv, value).Run(active, work);
-        groups.push_back(std::move(bound));
+      if (RestrictForestAxis({node}, axis, rest_ap, arena, work).empty() &&
+          !ForestUsesVar(active, axis_var)) {
+        groups.push_back(std::move(active));
         continue;
       }
       fence = true;
@@ -1070,8 +1103,10 @@ ControlForest ExtractBoundary(ControlForest& original, BoundarySpecializer& boun
   original = std::move(retained);
   return moved;
 }
+
 BoundarySchedule PlanBoundarySchedule(const ForStmtPtr& loop, const CutInventory& inventory,
-                                      PhysicalSyncRealization& work) {
+                                      PhysicalSyncRealization& work,
+                                      std::shared_ptr<GuardDomainArena> arena = nullptr) {
   if (loop->kind_ != ForKind::Sequential || !loop->iter_args_.empty() || !loop->return_vars_.empty() ||
       !loop->attrs_.empty() || loop->hardware_loop_policy_ != HardwareLoopPolicy::Auto)
     return {};
@@ -1097,16 +1132,42 @@ BoundarySchedule PlanBoundarySchedule(const ForStmtPtr& loop, const CutInventory
   const auto* final = input.cuts.back();
   plan.cuts[first] = {first->before, first->after};
   plan.cuts[final] = {final->before, final->after};
-  BoundarySpecializer at_first(loop->loop_var_, start->value_, start->value_ + 1, work);
-  BoundarySpecializer after_first(loop->loop_var_, start->value_ + step->value_,
-                                  static_cast<int64_t>(last) + 1, work);
-  BoundarySpecializer at_last(loop->loop_var_, static_cast<int64_t>(last), static_cast<int64_t>(last) + 1,
-                              work);
-  BoundarySpecializer before_last(loop->loop_var_, start->value_, static_cast<int64_t>(last), work);
-  plan.entry = ExtractBoundary(plan.cuts[first].first, at_first, after_first, false, loop->loop_var_,
-                               start->value_, work);
-  plan.exit = ExtractBoundary(plan.cuts[final].second, at_last, before_last, true, loop->loop_var_,
-                              static_cast<int64_t>(last), work);
+  std::shared_ptr<const GuardDomainArena> use_arena = arena;
+  if (!use_arena) use_arena = FindArenaInForest(first->before);
+  if (!use_arena) use_arena = FindArenaInForest(final->after);
+  if (!arena && !use_arena) arena = std::make_shared<GuardDomainArena>();
+  // Register loop axis if not already present (note: const_cast avoided by using mutable arena when
+  // supplied).
+  std::shared_ptr<GuardDomainArena> reg_arena = arena;
+  if (!reg_arena) reg_arena = std::make_shared<GuardDomainArena>();
+  const int64_t cnt = static_cast<int64_t>(count);
+  const AxisId axis =
+      reg_arena->RegisterLoopFrame(SyncLoopFrame{loop, cnt, start->value_, step->value_, nullptr});
+  // If cuts came from another arena that already contains this loop axis, find its AxisId there.
+  std::shared_ptr<const GuardDomainArena> slice_arena = reg_arena;
+  AxisId slice_axis = axis;
+  if (use_arena && use_arena != reg_arena) {
+    bool found_axis = false;
+    for (AxisId id = 0; id < use_arena->NumAxes(); ++id) {
+      const auto& info = use_arena->Axis(id);
+      if (info.kind == AxisKind::LoopFrame && info.var == loop->loop_var_ && info.count == cnt &&
+          info.start == start->value_ && info.step == step->value_ && !info.start_expression) {
+        slice_arena = use_arena;
+        slice_axis = id;
+        found_axis = true;
+        break;
+      }
+    }
+    if (!found_axis) return {};
+  }
+  const AxisAP at_first_ap{0, 1, 1};
+  const AxisAP after_first_ap{1, cnt, 1};
+  const AxisAP at_last_ap{cnt - 1, cnt, 1};
+  const AxisAP before_last_ap{0, cnt - 1, 1};
+  plan.entry = ExtractBoundary(plan.cuts[first].first, slice_axis, at_first_ap, after_first_ap, false,
+                               slice_arena, work);
+  plan.exit = ExtractBoundary(plan.cuts[final].second, slice_axis, at_last_ap, before_last_ap, true,
+                              slice_arena, work);
   if (plan.entry.empty() && plan.exit.empty()) return {};
   ControlForest old = first->before, candidate = plan.cuts[first].first;
   old.insert(old.end(), final->after.begin(), final->after.end());
@@ -1156,7 +1217,7 @@ size_t ScheduleHash(const ControlPtr& node, std::map<const CommandControl*, size
   }
   size_t result = 1;
   auto mix = [&](size_t h) { result ^= h + size_t(0x9e3779b9) + (result << 6) + (result >> 2); };
-  if (node->condition) mix(structural_hash(node->condition, false));
+  if (!node->guard.IsTautology()) mix(HashRadixBoxGuard(node->guard));
   if (node->command) mix(structural_hash(node->command, false));
   mix(node->body.size());
   for (const auto& child : node->body) mix(ScheduleHash(child, cache));
@@ -1215,15 +1276,18 @@ class InvocationCasePartition {
     const auto bound = As<ConstInt>(binary->right_);
     if (binary->left_ != block_ || !bound) return {};
     const bool inclusive = As<Le>(expression) || As<Gt>(expression);
-    if (!inclusive && !As<Lt>(expression) && !As<Ge>(expression) && !As<Eq>(expression)) return {};
+    if (!inclusive && !As<Lt>(expression) && !As<Ge>(expression) && !As<Eq>(expression) &&
+        !As<Ne>(expression))
+      return {};
     auto split = Split(__int128(bound->value_) + inclusive);
     if (!split) return {};
     Intervals yes;
     const auto size = static_cast<int64_t>(splits_.size() - 1);
-    if (As<Eq>(expression)) {
+    if (As<Eq>(expression) || As<Ne>(expression)) {
       const auto end = Split(__int128(bound->value_) + 1);
       if (!end) return {};
       if (*split < *end) yes.emplace_back(*split, *end - 1);
+      if (As<Ne>(expression)) yes = SubtractIntervals(all_, yes);
     } else if (As<Lt>(expression) || As<Le>(expression)) {
       if (*split) yes.emplace_back(0, *split - 1);
     } else if (*split < size) {
@@ -1411,28 +1475,26 @@ CutInventory CopyScheduleCuts(const CutInventory& inventory) {
 // and final residue use different original-coordinate lattices. Conservative
 // interval proofs may include unused gaps, never exclude executed coordinates.
 void PrepareBoundaryMotion(const RegularLoopSchedule& loop, PreparedSchedulePhase& phase,
-                           PhysicalSyncRealization& work) {
+                           const std::shared_ptr<GuardDomainArena>& arena, PhysicalSyncRealization& work) {
   if ((phase.end - phase.first) / phase.period < 2) return;
   BoundaryInput first_input(phase.visits.front(), work), last_input(phase.visits.back(), work);
   first_input.Visit(loop.loop->body_);
   last_input.Visit(loop.loop->body_);
   if (!first_input.valid || !last_input.valid || first_input.cuts.empty() || last_input.cuts.empty()) return;
-  auto coordinate = [&](int64_t ordinal) {
-    return static_cast<int64_t>(__int128(loop.start) + __int128(ordinal) * loop.step);
-  };
-  const auto first = coordinate(phase.first), final = coordinate(phase.end - 1);
-  const auto first_last = coordinate(phase.end - phase.period);
-  const auto last_first = coordinate(phase.first + phase.period - 1);
   const auto* a = first_input.cuts.front();
   const auto* b = last_input.cuts.back();
   auto before = a->before, after = b->after;
-  BoundarySpecializer at_first(loop.loop->loop_var_, first, first + 1, work);
-  BoundarySpecializer rest_first(loop.loop->loop_var_, coordinate(phase.first + phase.period), first_last + 1,
-                                 work);
-  BoundarySpecializer at_last(loop.loop->loop_var_, final, final + 1, work);
-  BoundarySpecializer rest_last(loop.loop->loop_var_, last_first, final, work);
-  auto entry = ExtractBoundary(before, at_first, rest_first, false, loop.loop->loop_var_, first, work);
-  auto exit = ExtractBoundary(after, at_last, rest_last, true, loop.loop->loop_var_, final, work);
+  const AxisId axis =
+      arena->RegisterLoopFrame(SyncLoopFrame{loop.loop, loop.count, loop.start, loop.step, nullptr});
+  const AxisAP at_first_ap{phase.first, phase.first + 1, 1};
+  const auto rest_first_ap = AxisAP::MakeCanonical(phase.first + phase.period, phase.end - phase.period + 1,
+                                                   phase.period, loop.count);
+  const AxisAP at_last_ap{phase.end - 1, phase.end, 1};
+  const auto rest_last_ap =
+      AxisAP::MakeCanonical(phase.first + phase.period - 1, phase.end - 1, phase.period, loop.count);
+  if (!rest_first_ap || !rest_last_ap) return;
+  auto entry = ExtractBoundary(before, axis, at_first_ap, *rest_first_ap, false, arena, work);
+  auto exit = ExtractBoundary(after, axis, at_last_ap, *rest_last_ap, true, arena, work);
   if (entry.empty() && exit.empty()) return;
   ControlForest old = a->before, candidate = before;
   old.insert(old.end(), b->after.begin(), b->after.end());
@@ -1471,7 +1533,7 @@ class CommandSeams {
     ControlForest joined = *pending_;
     joined.insert(joined.end(), before.begin(), before.end());
     const auto previous_shared = work_.shared_composed_guard_sites;
-    auto shared = ShareCommandGuards(joined, work_, false);
+    auto shared = ShareCommandGuards(joined, work_, false, true);
     const CaseCodeSize original(joined), replacement(shared);
     // Charge inspections even on refusal. Crossing a selected-candidate
     // boundary additionally preserves its charged raw descriptor bound. Ordinary
@@ -1765,6 +1827,12 @@ class ScheduleCostModel {
       else if (a->hi < b->lo || b->hi < a->lo)
         truth = false;
     }
+    if (As<Ne>(expression)) {
+      if (a->lo == a->hi && b->lo == b->hi)
+        truth = a->lo != b->lo;
+      else if (a->hi < b->lo || b->hi < a->lo)
+        truth = true;
+    }
     if (As<And>(expression)) {
       if (a->hi == 0 || b->hi == 0)
         truth = false;
@@ -1789,17 +1857,61 @@ class ScheduleCostModel {
     if (active.empty()) return;
     ++work_.schedule_inspected_descriptors;
     const auto& node = command.original;
-    if (!node->condition) {
+    if (!command.condition_expr) {
       if (command.body) Forest(*command.body, profile, weight, active);
       return;
     }
     Intervals yes;
-    const auto condition = Evaluate(node->condition);
+    const auto condition = Evaluate(command.condition_expr);
     if (condition && condition->lo == condition->hi) {
       if (condition->lo) yes = active;
+    } else if (!node->guard.IsOpaque() && !node->guard.IsEmpty() && !node->guard.IsTautology() &&
+               node->guard.Arena() && partition_) {
+      const auto& arena = node->guard.Arena();
+      std::optional<AxisId> loop_ax;
+      for (AxisId ax : ReferencedAxes(node->guard)) {
+        const auto& info = arena->Axis(ax);
+        if (info.kind == AxisKind::LoopFrame && info.loop == loop_.loop) {
+          loop_ax = ax;
+          break;
+        }
+      }
+      RadixBoxGuard specialized = node->guard;
+      if (loop_ax) {
+        const auto phase_ap = AxisAP::MakeCanonical(first_, last_ + 1, stride_, arena->Axis(*loop_ax).count);
+        if (!phase_ap) {
+          profile.valid = false;
+          return;
+        }
+        specialized = RestrictGuardAxis(node->guard, *loop_ax, *phase_ap, arena);
+      }
+      bool only_block = true;
+      for (AxisId ax : ReferencedAxes(specialized)) {
+        if (arena->Axis(ax).kind != AxisKind::LaunchBlock) {
+          only_block = false;
+          break;
+        }
+      }
+      if (!only_block) {
+        profile.valid = false;
+        return;
+      }
+      if (specialized.IsTautology()) {
+        yes = active;
+      } else if (!specialized.IsEmpty()) {
+        const ExprPtr block_expr = LowerRadixGuardToExpr(specialized, RadixBoxGuard::True(), node->span);
+        const auto before = work_.invocation_schedule_visits;
+        const auto partition = partition_->Partition(block_expr);
+        work_.schedule_inspected_descriptors += work_.invocation_schedule_visits - before;
+        if (!partition) {
+          profile.valid = false;
+          return;
+        }
+        yes = InvocationCasePartition::Intersection(active, partition->yes);
+      }
     } else {
       const auto before = work_.invocation_schedule_visits;
-      const auto partition = partition_ ? partition_->Partition(node->condition) : std::nullopt;
+      const auto partition = partition_ ? partition_->Partition(command.condition_expr) : std::nullopt;
       work_.schedule_inspected_descriptors += work_.invocation_schedule_visits - before;
       if (!partition) {
         profile.valid = false;
@@ -1875,8 +1987,21 @@ CandidateSchedule PrepareCandidate(const RegularLoopSchedule& loop, unsigned mod
                          cuts, *assigned.cases[candidate.plan.groups[v].representative].input->block_bounds)
                    : CopyScheduleCuts(cuts);
       }
-      if (policy.boundary_motion) PrepareBoundaryMotion(loop, phase, candidate.work);
+      if (policy.boundary_motion) PrepareBoundaryMotion(loop, phase, assigned.arena, candidate.work);
       for (auto& cuts : phase.visits) CommandSeams(cuts, candidate.work).Run(loop.loop->body_);
+      auto finalize = [&](ControlForest& forest) {
+        if (!forest.empty()) forest = ShareCommandGuards(forest, candidate.work, false, true);
+      };
+      finalize(phase.entry);
+      finalize(phase.exit);
+      for (auto& cuts : phase.visits) {
+        std::set<const PhysicalCuts*> seen;
+        for (auto& [anchor, cut] : cuts) {
+          if (!seen.insert(cut.get()).second) continue;
+          finalize(cut->before);
+          finalize(cut->after);
+        }
+      }
     }
     candidate.plan.versions.push_back(std::move(selected));
   }
@@ -2210,9 +2335,10 @@ class BoundaryScheduleCollector : public IRVisitor {
   const CutInventory& cuts_;
   const PreparedLoops& loops_;
   PhysicalSyncRealization& work_;
+  std::shared_ptr<GuardDomainArena> arena_;
   void VisitStmt_(const ForStmtPtr& loop) override {
     if (loops_.count(loop.get())) return;
-    auto plan = PlanBoundarySchedule(loop, cuts_, work_);
+    auto plan = PlanBoundarySchedule(loop, cuts_, work_, arena_);
     if (!plan.entry.empty() || !plan.exit.empty()) plans.emplace(loop.get(), std::move(plan));
     IRVisitor::VisitStmt_(loop);
   }
@@ -2220,9 +2346,30 @@ class BoundaryScheduleCollector : public IRVisitor {
  public:
   BoundarySchedules plans;
   BoundaryScheduleCollector(const CutInventory& cuts, const PreparedLoops& loops,
-                            PhysicalSyncRealization& work)
-      : cuts_(cuts), loops_(loops), work_(work) {}
+                            PhysicalSyncRealization& work, std::shared_ptr<GuardDomainArena> arena = nullptr)
+      : cuts_(cuts), loops_(loops), work_(work), arena_(std::move(arena)) {}
 };
+
+void FinalizePostBoundaryGuards(CutInventory& cuts, BoundarySchedules& boundaries,
+                                PhysicalSyncRealization& work) {
+  auto finalize = [&](ControlForest& forest) {
+    if (!forest.empty()) forest = ShareCommandGuards(forest, work, false, true);
+  };
+  std::set<const PhysicalCuts*> seen;
+  for (auto& [anchor, cut] : cuts) {
+    if (!seen.insert(cut.get()).second) continue;
+    finalize(cut->before);
+    finalize(cut->after);
+  }
+  for (auto& [loop, plan] : boundaries) {
+    finalize(plan.entry);
+    finalize(plan.exit);
+    for (auto& [cut_ptr, pair] : plan.cuts) {
+      finalize(pair.first);
+      finalize(pair.second);
+    }
+  }
+}
 
 FunctionPtr CompileAssignedSyncSchedule(const FunctionPtr& owner, const std::vector<AssignedSyncCase>& cases,
                                         std::pair<int64_t, int64_t> blocks,
@@ -2253,9 +2400,10 @@ FunctionPtr CompileAssignedSyncSchedule(const FunctionPtr& owner, const std::vec
   SyncTokenNames names(schedule.owner);
   ++work.schedule_name_scans;
   work.schedule_name_visits += names.visits;
-  BoundaryScheduleCollector boundary(cuts, plans, work);
+  BoundaryScheduleCollector boundary(cuts, plans, work, schedule.arena);
   if (policy.boundary_motion) boundary.VisitStmt(schedule.owner->body_);
   CommandSeams(cuts, work, &boundary.plans, &plans).Run(schedule.owner->body_);
+  FinalizePostBoundaryGuards(cuts, boundary.plans, work);
   auto function = MaterializeSelectedSchedule(schedule.owner, schedule.block, cuts, plans, boundary.plans,
                                               blocks, work, names);
   FinishSyncScheduleReceipt(function, work, policy);
@@ -2268,12 +2416,14 @@ void PopulateCutDomains(const FunctionPtr& owner, CutInventory& cuts, PhysicalSy
 }
 
 BoundarySchedules PlanCommandBoundaries(const FunctionPtr& owner, CutInventory& cuts, bool enabled,
-                                        PhysicalSyncRealization& work) {
+                                        PhysicalSyncRealization& work,
+                                        const std::shared_ptr<GuardDomainArena>& arena) {
   PreparedLoops loops;
-  BoundaryScheduleCollector boundary(cuts, loops, work);
+  BoundaryScheduleCollector boundary(cuts, loops, work, arena);
   if (enabled) {
     boundary.VisitStmt(owner->body_);
     CommandSeams(cuts, work, &boundary.plans, &loops).Run(owner->body_);
+    FinalizePostBoundaryGuards(cuts, boundary.plans, work);
   }
   return std::move(boundary.plans);
 }

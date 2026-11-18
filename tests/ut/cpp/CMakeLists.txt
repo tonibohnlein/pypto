@@ -112,3 +112,32 @@ target_include_directories(pypto_conservative_sync_completion_test PRIVATE
 target_link_libraries(pypto_conservative_sync_completion_test PRIVATE libbacktrace)
 target_compile_options(pypto_conservative_sync_completion_test PRIVATE -UNDEBUG)
 add_test(NAME pypto_conservative_sync_completion_test COMMAND pypto_conservative_sync_completion_test)
+
+list(TRANSFORM PYPTO_SOURCES PREPEND "${CMAKE_SOURCE_DIR}/" OUTPUT_VARIABLE TEST_PYPTO_SOURCES)
+add_executable(pypto_radix_box_guard_test
+    radix_box_guard_test.cpp
+    ${TEST_PYPTO_SOURCES}
+)
+target_include_directories(pypto_radix_box_guard_test PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
+    ${LIBBACKTRACE_INSTALL_DIR}/include
+    ${CMAKE_SOURCE_DIR}/runtime/src/common
+)
+target_link_libraries(pypto_radix_box_guard_test PRIVATE libbacktrace msgpackc-cxx)
+target_compile_options(pypto_radix_box_guard_test PRIVATE -UNDEBUG)
+add_test(NAME pypto_radix_box_guard_test COMMAND pypto_radix_box_guard_test)
+
+add_executable(pypto_refactor_b_test
+    refactor_b_test.cpp
+    ${TEST_PYPTO_SOURCES}
+)
+target_include_directories(pypto_refactor_b_test PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
+    ${LIBBACKTRACE_INSTALL_DIR}/include
+    ${CMAKE_SOURCE_DIR}/runtime/src/common
+)
+target_link_libraries(pypto_refactor_b_test PRIVATE libbacktrace msgpackc-cxx)
+target_compile_options(pypto_refactor_b_test PRIVATE -UNDEBUG)
+add_test(NAME pypto_refactor_b_test COMMAND pypto_refactor_b_test)
