@@ -489,10 +489,10 @@ def _extract_bench_metrics(bench_stats: Any) -> tuple[float | None, float | None
     """Extract `(device_us_median, effective_us_median, host_us_median)` from `BenchmarkStats`."""
     if bench_stats is None:
         return None, None, None
-    invocations: Sequence[Any] = bench_stats.invocations or ()
+    dev_round: Sequence[Any] = bench_stats.per_round("device") or ()
     eff_round: Sequence[Any] = bench_stats.per_round("effective") or ()
-    host_round: Sequence[Any] = bench_stats.host_wall_us or ()
-    dev_samples = [float(iv.device_us) for iv in invocations if float(iv.device_us) > 0.0]
+    host_round: Sequence[Any] = bench_stats.per_round("host") or ()
+    dev_samples = [float(d) for d in dev_round if float(d) > 0.0]
     eff_samples = [float(e) for e in eff_round if float(e) > 0.0]
     host_samples = [float(h) for h in host_round if float(h) > 0.0]
     dev_med = float(statistics.median(dev_samples)) if dev_samples else None

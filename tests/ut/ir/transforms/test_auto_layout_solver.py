@@ -750,5 +750,145 @@ def test_block_nz_legality_guards_prune_invalid_nz_candidates():
         assert len(lowered.functions) >= 1
 
 
+def test_review_fixes_alignment_multi_call_omitted_out_and_budget():
+    from pypto.ir.auto_layout_production_bench import _prepare_nd_baseline_program  # noqa: PLC0415
+
+    set_backend_type(BackendType.Ascend910)
+
+    # Item 1 & Item 3: unaligned call site + multi-call-site helper specialization.
+    @pl.jit.inline
+    def mm_helper(
+        x: pl.Tensor[[32, 32], pl.FP16],
+        w: pl.Tensor[[32, 32], pl.FP16],
+        out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+        row: pl.Scalar[pl.INT32],
+    ) -> pl.Tensor[[32, 32], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm_helper"):
+            tx = x[row : row + 16, 0:32]
+            tw = w[0:32, 0:32]
+            acc = pl.matmul(tx, tw)
+            out[0:16, 0:32] = acc
+        return out
+
+    @pl.jit
+    def multi_call_entry(
+        x1: pl.Tensor[[32, 32], pl.FP16],
+        x2: pl.Tensor[[32, 32], pl.FP16],
+        w: pl.Tensor[[32, 32], pl.FP16],
+        out1: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+        out2: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+    ) -> pl.Tensor[[32, 32], pl.FP32]:
+        for r in pl.range(0, 32, 16):
+            out1 = mm_helper(x1, w, out1, r)
+        out2 = mm_helper(x2, w, out2, 1)
+        return out2
+
+    prog, _ = _prepare_nd_baseline_program(multi_call_entry)
+    cost_model = LayoutCostModel(
+        expected_uses=100,
+        backend_type=BackendType.Ascend910,
+        allow_external_input_relayout=False,
+    )
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
+        pre = run_pre_layout_passes(prog)
+        inst = extract_layout_instance(pre, cost_model=cost_model, reusable_tensors={"x1", "w"})
+        res = solve_auto_layout(inst)
+        assert res.writeback_issues == ()
+        rewritten = apply_layout_assignment(pre, res.assignment)
+        # Verify no rounding (`// 16 * 16`) was injected for `row`.
+        assert "floordiv" not in str(rewritten).lower()
+        lowered = run_post_layout_passes(rewritten)
+        assert len(lowered.functions) >= 1
+
+    # Item 9: max_evaluations=1 must not leak _EvaluationLimit.
+    small_x = LayoutValueNode(
+        name="x",
+        memory_space=ir.MemorySpace.DDR,
+        shape=(16, 16),
+        dtype=DataType.FP16,
+        current_layout=ND,
+        admissible_layouts=(ND, NZ),
+        producer_op_id=None,
+    )
+    small_t = LayoutValueNode(
+        name="t",
+        memory_space=ir.MemorySpace.Mat,
+        shape=(16, 16),
+        dtype=DataType.FP16,
+        current_layout=ROW_MAJOR_FLAT,
+        admissible_layouts=(ROW_MAJOR_FLAT,),
+        producer_op_id="op0",
+    )
+    small_op = LayoutOperationNode(
+        op_id="op0",
+        op_name="tile.load",
+        inputs=("x",),
+        output="t",
+        configs=(
+            OperatorConfig(
+                op_id="op0",
+                op_name="tile.load",
+                input_layouts=(ND,),
+                output_layout=ROW_MAJOR_FLAT,
+                op_cost_cycles=10.0,
+            ),
+            OperatorConfig(
+                op_id="op0",
+                op_name="tile.load",
+                input_layouts=(NZ,),
+                output_layout=ROW_MAJOR_FLAT,
+                op_cost_cycles=5.0,
+            ),
+        ),
+    )
+    tiny_inst = LayoutProblemInstance(
+        values={"x": small_x, "t": small_t}, operations=(small_op,), cost_model=cost_model
+    )
+    budget_res = solve_auto_layout(tiny_inst, config=LayoutSolverConfig(max_evaluations=1))
+    assert budget_res.stats.termination_reason == "evaluation_budget"
+    with pytest.raises(ValueError, match="max_evaluations"):
+        solve_treewidth_dp(tiny_inst, config=LayoutSolverConfig(max_evaluations=1))
+
+    # nz_config_vs_admissible: already-blocked rank-5 NZ GM tensor must keep admissible_layouts=(NZ,).
+    nz_gm = LayoutValueNode(
+        name="nz_in",
+        memory_space=ir.MemorySpace.DDR,
+        shape=(1, 1, 16, 16, 8),
+        dtype=DataType.FP16,
+        current_layout=NZ,
+        admissible_layouts=(NZ,),
+        producer_op_id=None,
+    )
+    nz_tile = LayoutValueNode(
+        name="nz_t",
+        memory_space=ir.MemorySpace.Mat,
+        shape=(16, 16),
+        dtype=DataType.FP16,
+        current_layout=ROW_MAJOR_FLAT,
+        admissible_layouts=(ROW_MAJOR_FLAT,),
+        producer_op_id="op_nz",
+    )
+    nz_op = LayoutOperationNode(
+        op_id="op_nz",
+        op_name="tile.load",
+        inputs=("nz_in",),
+        output="nz_t",
+        configs=(
+            OperatorConfig(
+                op_id="op_nz",
+                op_name="tile.load",
+                input_layouts=(NZ,),
+                output_layout=ROW_MAJOR_FLAT,
+                op_cost_cycles=5.0,
+            ),
+        ),
+    )
+    nz_inst = LayoutProblemInstance(
+        values={"nz_in": nz_gm, "nz_t": nz_tile}, operations=(nz_op,), cost_model=cost_model
+    )
+    nz_res = solve_auto_layout(nz_inst)
+    assert nz_res.assignment.tensor_layouts["nz_in"] == NZ
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

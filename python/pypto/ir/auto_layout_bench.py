@@ -706,7 +706,13 @@ def default_a2_calibration_suite(
 def _match_variant_record(
     variant_records: Sequence[dict[str, Any]],
     gm_layouts: dict[str, str],
+    value_layouts: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
+    if value_layouts is not None:
+        for rec in variant_records:
+            rec_vals = rec.get("value_layouts")
+            if isinstance(rec_vals, dict) and rec_vals == value_layouts:
+                return rec
     for rec in variant_records:
         if rec.get("gm_layouts") == gm_layouts:
             return rec
@@ -743,7 +749,11 @@ def _evaluate_solvers_for_case(
 
     def _pack_solver_entry(res: Any, solve_us: float) -> dict[str, Any]:
         gm_lay = {k: v.name for k, v in res.assignment.tensor_layouts.items()}
-        matched = _match_variant_record(variant_records, gm_lay)
+        val_lay = {
+            k: (v.name if isinstance(v, core_ir.TensorLayout) else v.short_name())
+            for k, v in res.assignment.value_layouts.items()
+        }
+        matched = None if res.writeback_issues else _match_variant_record(variant_records, gm_lay, val_lay)
         dev_us = matched.get("device_us_median") if matched else None
         eff_us = matched.get("effective_us_median") if matched else None
         swim_us = matched.get("swimlane_aicore_us") if matched else None
@@ -760,6 +770,7 @@ def _evaluate_solvers_for_case(
         return {
             "gm_layouts": gm_lay,
             "variant_id": matched.get("variant_id") if matched else None,
+            "writeback_issues": list(res.writeback_issues),
             "predicted_total_cycles": res.total_cost_cycles,
             "predicted_op_cycles": res.breakdown.operator_cost_cycles,
             "predicted_conv_cycles": res.breakdown.conversion_cost_cycles,
@@ -915,6 +926,10 @@ def run_calibration_suite(  # noqa: PLR0913
                 "gm_input_layouts": variant.gm_input_layouts,
                 "gm_output_layouts": variant.gm_output_layouts,
                 "gm_layouts": variant.gm_layouts,
+                "value_layouts": {
+                    k: (v.name if isinstance(v, core_ir.TensorLayout) else v.short_name())
+                    for k, v in variant.breakdown.assignment.value_layouts.items()
+                },
                 "predicted_total_cycles": variant.breakdown.total_cost_cycles,
                 "predicted_op_cycles": variant.breakdown.operator_cost_cycles,
                 "predicted_conv_cycles": variant.breakdown.conversion_cost_cycles,

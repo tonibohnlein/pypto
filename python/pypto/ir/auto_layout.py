@@ -411,6 +411,8 @@ class LayoutCostModel:
         dst_layout: LayoutChoice,
     ) -> bool:
         """Check whether `tile.load` with `(src_layout, dst_layout)` is backend-legal."""
+        if src_layout == src_node.current_layout and len(src_node.admissible_layouts) == 1:
+            return dst_layout == dst_node.current_layout
         if dst_node.memory_space == core_ir.MemorySpace.Mat:
             if src_layout == core_ir.TensorLayout.NZ:
                 if not is_nz_compatible_shape(dst_node.shape, dst_node.dtype):
@@ -811,19 +813,20 @@ def run_post_layout_passes(program: core_ir.Program) -> core_ir.Program:
 def _eval_scalar_expr(
     expr: object,
     scalar_defs: Mapping[int, core_ir.Expr] | None = None,
-    default_dyn: int = 128,
+    default_dyn: int | None = 128,
 ) -> int | None:
-    """Evaluate a scalar IR expression to a positive integer when possible."""
+    """Evaluate a scalar IR expression to an integer when possible (`default_dyn=None` for exact)."""
     if isinstance(expr, int):
-        return max(1, expr)
+        return expr if default_dyn is None else max(1, expr)
     if isinstance(expr, core_ir.ConstInt):
         return int(expr.value)
     if isinstance(expr, core_ir.Var):
         if scalar_defs is not None and expr.unique_id in scalar_defs:
             return _eval_scalar_expr(scalar_defs[expr.unique_id], scalar_defs, default_dyn)
-        hint_upper = expr.name_hint.upper()
-        if any(tok in hint_upper for tok in ("DYN", "TOKEN", "ROW", "BATCH", "SEQ")):
-            return default_dyn
+        if default_dyn is not None:
+            hint_upper = expr.name_hint.upper()
+            if any(tok in hint_upper for tok in ("DYN", "TOKEN", "ROW", "BATCH", "SEQ")):
+                return default_dyn
         return None
     if isinstance(expr, core_ir.Add):
         lhs = _eval_scalar_expr(expr.left, scalar_defs, default_dyn)
@@ -832,7 +835,9 @@ def _eval_scalar_expr(
     if isinstance(expr, core_ir.Sub):
         lhs = _eval_scalar_expr(expr.left, scalar_defs, default_dyn)
         rhs = _eval_scalar_expr(expr.right, scalar_defs, default_dyn)
-        return max(0, lhs - rhs) if (lhs is not None and rhs is not None) else None
+        if lhs is None or rhs is None:
+            return None
+        return (lhs - rhs) if default_dyn is None else max(0, lhs - rhs)
     if isinstance(expr, core_ir.Mul):
         lhs = _eval_scalar_expr(expr.left, scalar_defs, default_dyn)
         rhs = _eval_scalar_expr(expr.right, scalar_defs, default_dyn)
@@ -840,7 +845,7 @@ def _eval_scalar_expr(
     if isinstance(expr, core_ir.FloorDiv):
         lhs = _eval_scalar_expr(expr.left, scalar_defs, default_dyn)
         rhs = _eval_scalar_expr(expr.right, scalar_defs, default_dyn)
-        return (lhs // max(1, rhs)) if (lhs is not None and rhs is not None and rhs > 0) else None
+        return (lhs // rhs) if (lhs is not None and rhs is not None and rhs > 0) else None
     if isinstance(expr, core_ir.Min):
         lhs = _eval_scalar_expr(expr.left, scalar_defs, default_dyn)
         rhs = _eval_scalar_expr(expr.right, scalar_defs, default_dyn)
@@ -1341,6 +1346,7 @@ class _OrchCallMultiplierVisitor:
         self._tuple_aliases: dict[int, list[str | None]] = {}
         self._scalar_defs: dict[int, core_ir.Expr] = {}
         self._var_steps: dict[int, int] = {}
+        self._invalid_param_steps: set[tuple[str, int]] = set()
         self.call_counts: dict[str, int] = {}
         self.call_arg_names: dict[str, list[str | None]] = {}
         self.call_sites: dict[str, list[tuple[list[str | None], int]]] = {}
@@ -1354,14 +1360,26 @@ class _OrchCallMultiplierVisitor:
         for idx, param in enumerate(func.params):
             override = caller_args[idx] if idx < len(caller_args) else None
             self._alias_by_uid[param.unique_id] = override or _clean_ssa_name(param.name_hint)
-            if (func.name, idx) in self.param_steps:
-                self._var_steps[param.unique_id] = self.param_steps[(func.name, idx)]
+            step = self.param_steps.get((func.name, idx))
+            if step is not None and step > 1:
+                self._var_steps[param.unique_id] = step
         prev_mult = self._mult
         self._mult = self.call_counts.get(func.name, 1)
         try:
             self._walk_stmt(func.body)
         finally:
             self._mult = prev_mult
+
+    def _arg_alignment_step(self, arg: core_ir.Expr) -> int | None:
+        if isinstance(arg, core_ir.Var) and arg.unique_id in self._var_steps:
+            return self._var_steps[arg.unique_id]
+        c_val = _eval_scalar_expr(arg, self._scalar_defs, default_dyn=None)
+        if c_val is not None and c_val >= 0:
+            if c_val == 0:
+                return 0
+            if c_val % 8 == 0:
+                return c_val
+        return None
 
     def _resolve_arg_name(self, expr: core_ir.Expr) -> str | None:
         if not isinstance(expr, core_ir.Var):
@@ -1387,12 +1405,25 @@ class _OrchCallMultiplierVisitor:
         self.call_order.setdefault(name, len(self.call_order))
         self.call_counts[name] = self.call_counts.get(name, 0) + call_mult
         resolved = [self._resolve_arg_name(arg) for arg in expr.args]
+        callee = self._func_by_name.get(name)
+        if callee is not None and len(resolved) < len(callee.params):
+            base_hint = _clean_ssa_name(assign_var.name_hint) if assign_var is not None else name
+            for p_idx in range(len(resolved), len(callee.params)):
+                omitted_name = f"{base_hint}_out{p_idx}"
+                resolved.append(omitted_name)
+                self.reshaped_names.add(omitted_name)
         self.call_arg_names.setdefault(name, resolved)
         for p_idx, arg in enumerate(expr.args):
-            if isinstance(arg, core_ir.Var) and arg.unique_id in self._var_steps:
-                step = self._var_steps[arg.unique_id]
-                prev_step = self.param_steps.get((name, p_idx))
-                self.param_steps[(name, p_idx)] = math.gcd(prev_step, step) if prev_step is not None else step
+            key = (name, p_idx)
+            if key in self._invalid_param_steps:
+                continue
+            step = self._arg_alignment_step(arg)
+            if step is None:
+                self._invalid_param_steps.add(key)
+                self.param_steps.pop(key, None)
+            else:
+                prev_step = self.param_steps.get(key)
+                self.param_steps[key] = math.gcd(prev_step, step) if prev_step is not None else step
         sites = self.call_sites.setdefault(name, [])
         for idx, (prev_args, prev_mult) in enumerate(sites):
             if prev_args == resolved:
@@ -1400,17 +1431,15 @@ class _OrchCallMultiplierVisitor:
                 break
         else:
             sites.append((resolved, call_mult))
-        if assign_var is not None:
-            callee = self._func_by_name.get(name)
-            if callee is not None:
-                out_names = [
-                    arg_name
-                    for arg_name, direction in zip(resolved, callee.param_directions, strict=True)
-                    if direction in (core_ir.ParamDirection.Out, core_ir.ParamDirection.InOut)
-                ]
-                self._tuple_aliases[assign_var.unique_id] = out_names
-                if len(out_names) == 1 and out_names[0] is not None:
-                    self._alias_by_uid[assign_var.unique_id] = out_names[0]
+        if assign_var is not None and callee is not None:
+            out_names = [
+                arg_name
+                for arg_name, direction in zip(resolved, callee.param_directions, strict=False)
+                if direction in (core_ir.ParamDirection.Out, core_ir.ParamDirection.InOut)
+            ]
+            self._tuple_aliases[assign_var.unique_id] = out_names
+            if len(out_names) == 1 and out_names[0] is not None:
+                self._alias_by_uid[assign_var.unique_id] = out_names[0]
 
     def _record_local_tensor_call(
         self,
@@ -1467,13 +1496,14 @@ class _OrchCallMultiplierVisitor:
 
     def _walk_stmt(self, stmt: core_ir.Stmt) -> None:
         if isinstance(stmt, core_ir.ForStmt):
-            start_val = _eval_scalar_expr(stmt.start, self._scalar_defs)
-            step_val = _eval_scalar_expr(stmt.step, self._scalar_defs)
+            start_val = _eval_scalar_expr(stmt.start, self._scalar_defs, default_dyn=None)
+            step_val = _eval_scalar_expr(stmt.step, self._scalar_defs, default_dyn=None)
             if (
                 start_val is not None
                 and start_val >= 0
                 and step_val is not None
                 and step_val > 0
+                and step_val % 8 == 0
                 and start_val % step_val == 0
             ):
                 self._var_steps[stmt.loop_var.unique_id] = step_val
@@ -2191,6 +2221,7 @@ def _prune_incompatible_gm_nz(
     for val_name, val_node in list(values.items()):
         if (
             val_node.memory_space != core_ir.MemorySpace.DDR
+            or len(val_node.admissible_layouts) <= 1
             or core_ir.TensorLayout.NZ not in val_node.admissible_layouts
         ):
             continue
@@ -2211,10 +2242,7 @@ def _prune_incompatible_gm_nz(
             ):
                 nz_supported = False
         if not nz_supported:
-            fallback = tuple(
-                lay for lay in val_node.admissible_layouts if lay != core_ir.TensorLayout.NZ
-            ) or (core_ir.TensorLayout.ND,)
-            values[val_name] = replace(val_node, admissible_layouts=fallback)
+            values[val_name] = replace(val_node, admissible_layouts=(val_node.current_layout,))
 
 
 def _operator_cost_multiplier(instance: LayoutProblemInstance, op: LayoutOperationNode) -> float:
@@ -2479,6 +2507,106 @@ def _with_tensor_layout(tensor_type: core_ir.TensorType, layout: core_ir.TensorL
     return TensorType(tensor_type.shape, tensor_type.dtype, tensor_type.memref, new_view)
 
 
+def _collect_expr_var_uids(expr: core_ir.Expr, out: set[int]) -> None:
+    if isinstance(expr, core_ir.Var):
+        out.add(expr.unique_id)
+        return
+    if isinstance(expr, core_ir.MakeTuple):
+        for el in expr.elements:
+            _collect_expr_var_uids(el, out)
+        return
+    if isinstance(expr, core_ir.Cast):
+        _collect_expr_var_uids(expr.expr, out)
+        return
+    for attr in ("left", "right"):
+        child = getattr(expr, attr, None)
+        if isinstance(child, core_ir.Expr):
+            _collect_expr_var_uids(child, out)
+
+
+def _nz_offset_scalar_uids(
+    body: core_ir.Stmt,
+    new_params: Sequence[tuple[core_ir.Var, core_ir.ParamDirection]],
+    old_params: Sequence[core_ir.Var],
+) -> set[int]:
+    """Return scalar parameter `unique_id`s transitively used in NZ load/store offsets in `body`."""
+    nz_tensor_uids = {
+        old_p.unique_id
+        for (new_p, _), old_p in zip(new_params, old_params, strict=True)
+        if isinstance(new_p.type, core_ir.TensorType)
+        and _tensor_type_layout(new_p.type) == core_ir.TensorLayout.NZ
+    }
+    if not nz_tensor_uids:
+        return set()
+    scalar_defs: dict[int, core_ir.Expr] = {}
+    loop_bounds: dict[int, tuple[core_ir.Expr, core_ir.Expr]] = {}
+    direct_uids: set[int] = set()
+
+    def _walk_expr(expr: core_ir.Expr) -> None:
+        if not isinstance(expr, core_ir.Call):
+            return
+        for arg in expr.args:
+            _walk_expr(arg)
+        if (
+            expr.op.name == _TILE_LOAD_OP
+            and len(expr.args) >= 2
+            and isinstance(expr.args[0], core_ir.Var)
+            and expr.args[0].unique_id in nz_tensor_uids
+        ):
+            _collect_expr_var_uids(expr.args[1], direct_uids)
+            if len(expr.args) >= 4:
+                _collect_expr_var_uids(expr.args[3], direct_uids)
+        elif (
+            expr.op.name == _TILE_STORE_OP
+            and len(expr.args) >= 3
+            and isinstance(expr.args[2], core_ir.Var)
+            and expr.args[2].unique_id in nz_tensor_uids
+        ):
+            _collect_expr_var_uids(expr.args[1], direct_uids)
+
+    def _walk_stmt(stmt: core_ir.Stmt) -> None:
+        if isinstance(stmt, core_ir.AssignStmt):
+            if isinstance(stmt.var.type, core_ir.ScalarType):
+                scalar_defs[stmt.var.unique_id] = stmt.value
+            elif (
+                isinstance(stmt.var.type, core_ir.TensorType)
+                and isinstance(stmt.value, core_ir.Var)
+                and stmt.value.unique_id in nz_tensor_uids
+            ):
+                nz_tensor_uids.add(stmt.var.unique_id)
+            _walk_expr(stmt.value)
+        elif isinstance(stmt, core_ir.ForStmt):
+            loop_bounds[stmt.loop_var.unique_id] = (stmt.start, stmt.step)
+        elif isinstance(stmt, core_ir.EvalStmt):
+            _walk_expr(stmt.expr)
+        elif isinstance(stmt, core_ir.ReturnStmt):
+            for val in stmt.value:
+                _walk_expr(val)
+        for child in _iter_child_stmts(stmt):
+            _walk_stmt(child)
+
+    _walk_stmt(body)
+    expanded = set(direct_uids)
+    worklist = list(direct_uids)
+    while worklist:
+        uid = worklist.pop()
+        if uid in scalar_defs:
+            sub: set[int] = set()
+            _collect_expr_var_uids(scalar_defs[uid], sub)
+            for s_uid in sub - expanded:
+                expanded.add(s_uid)
+                worklist.append(s_uid)
+        if uid in loop_bounds:
+            start_e, step_e = loop_bounds[uid]
+            sub_l: set[int] = set()
+            _collect_expr_var_uids(start_e, sub_l)
+            _collect_expr_var_uids(step_e, sub_l)
+            for s_uid in sub_l - expanded:
+                expanded.add(s_uid)
+                worklist.append(s_uid)
+    return expanded
+
+
 class _LayoutAssignmentWriter(core_ir.IRMutator):
     """Write a `LayoutAssignment` (both GM `TensorLayout` and on-chip `TileLayoutDesc`) back to IR."""
 
@@ -2487,6 +2615,8 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         self._tensor_layouts = assignment.tensor_layouts
         self._tile_layouts = assignment.tile_layouts
         self._scoped_tensor_layouts: dict[tuple[str, str], core_ir.TensorLayout] = {}
+        self._tile_prefix_override: dict[str, str] = {}
+        self._specialized_callees: dict[tuple[str, tuple[core_ir.TensorLayout | None, ...]], str] = {}
         self._param_steps: dict[tuple[str, int], int] = {}
         self._var_remap: dict[int, core_ir.Var] = {}
         self._func_return_types: dict[str, list[core_ir.Type]] = {}
@@ -2500,6 +2630,77 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
                 return scoped
         return self._tensor_layouts.get(clean_name, self._tensor_layouts.get(name_hint))
 
+    def _site_param_signature(
+        self,
+        callee: core_ir.Function,
+        site_args: Sequence[str | None],
+    ) -> tuple[core_ir.TensorLayout | None, ...]:
+        sig: list[core_ir.TensorLayout | None] = []
+        for p_idx, param in enumerate(callee.params):
+            if not isinstance(param.type, core_ir.TensorType):
+                sig.append(None)
+                continue
+            arg_name = site_args[p_idx] if p_idx < len(site_args) else None
+            default_lay = _tensor_type_layout(param.type)
+            sig.append(
+                self._tensor_layouts.get(arg_name, default_lay) if arg_name is not None else default_lay
+            )
+        return tuple(sig)
+
+    def _register_callee_specializations(
+        self,
+        func_by_name: dict[str, core_ir.Function],
+        visitor: _OrchCallMultiplierVisitor,
+    ) -> list[core_ir.Function]:
+        extra_incore: list[core_ir.Function] = []
+        for callee_name, sites in visitor.call_sites.items():
+            callee = func_by_name.get(callee_name)
+            if callee is None or not sites:
+                continue
+            if len(sites) == 1:
+                site_args, _ = sites[0]
+                for p_idx, param in enumerate(callee.params):
+                    arg_name = site_args[p_idx] if p_idx < len(site_args) else None
+                    lay = self._tensor_layouts.get(arg_name or "")
+                    if lay is not None:
+                        self._scoped_tensor_layouts[(callee_name, _clean_ssa_name(param.name_hint))] = lay
+                continue
+            for site_idx, (site_args, _) in enumerate(sites):
+                sig_t = self._site_param_signature(callee, site_args)
+                if site_idx == 0:
+                    spec_name = callee_name
+                    self._tile_prefix_override[spec_name] = f"{callee_name}_0"
+                    self._specialized_callees[(callee_name, sig_t)] = spec_name
+                elif (callee_name, sig_t) in self._specialized_callees:
+                    continue
+                else:
+                    spec_name = f"{callee_name}_site{site_idx}"
+                    self._tile_prefix_override[spec_name] = f"{callee_name}_{site_idx}"
+                    self._specialized_callees[(callee_name, sig_t)] = spec_name
+                    for p_idx in range(len(callee.params)):
+                        if (callee_name, p_idx) in self._param_steps:
+                            self._param_steps[(spec_name, p_idx)] = self._param_steps[(callee_name, p_idx)]
+                    extra_incore.append(
+                        core_ir.Function(
+                            spec_name,
+                            list(zip(callee.params, callee.param_directions, strict=True)),
+                            list(callee.return_types),
+                            callee.body,
+                            callee.span,
+                            type=callee.func_type,
+                            level=callee.level,
+                            role=callee.role,
+                            attrs=dict(callee.attrs) if callee.attrs else None,
+                            requires_runtime_binding=callee.requires_runtime_binding,
+                            ir_stage=callee.ir_stage,
+                        )
+                    )
+                for p_idx, param in enumerate(callee.params):
+                    lay = sig_t[p_idx]
+                    if lay is not None:
+                        self._scoped_tensor_layouts[(spec_name, _clean_ssa_name(param.name_hint))] = lay
+        return extra_incore
+
     def rewrite(self, program: core_ir.Program) -> core_ir.Program:
         funcs = list(program.functions.values())
         incore_funcs = [f for f in funcs if core_ir.is_incore_type(f.func_type)]
@@ -2507,6 +2708,7 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         top_orch = [f for f in other_funcs if str(f.func_type).endswith("Orchestration")]
         sub_orch = [f for f in other_funcs if not str(f.func_type).endswith("Orchestration")]
         func_by_name = {f.name: f for f in funcs}
+        extra_incore: list[core_ir.Function] = []
         if other_funcs:
             visitor = _OrchCallMultiplierVisitor(func_by_name)
             for fn in top_orch:
@@ -2515,36 +2717,33 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
             for fn in sub_orch:
                 visitor.walk(fn)
             self._param_steps = visitor.param_steps
-            for callee_name, sites in visitor.call_sites.items():
-                callee = func_by_name.get(callee_name)
-                if callee is None or not sites:
-                    continue
-                for p_idx, param in enumerate(callee.params):
-                    site_layouts: set[TensorLayout] = set()
-                    for site_args, _ in sites:
-                        if p_idx < len(site_args):
-                            arg_name = site_args[p_idx]
-                            if arg_name is not None:
-                                lay = self._tensor_layouts.get(arg_name)
-                                if lay is not None:
-                                    site_layouts.add(lay)
-                    if len(site_layouts) == 1:
-                        chosen_lay = next(iter(site_layouts))
-                        self._scoped_tensor_layouts[(callee_name, _clean_ssa_name(param.name_hint))] = (
-                            chosen_lay
-                        )
+            extra_incore = self._register_callee_specializations(func_by_name, visitor)
 
         rewritten_by_name: dict[str, core_ir.Function] = {}
-        for func in incore_funcs + sub_orch + top_orch:
+        for func in incore_funcs + extra_incore + sub_orch + top_orch:
             rewritten_by_name[func.name] = self.visit_function(func)
-        new_funcs = [rewritten_by_name[f.name] for f in funcs]
-        if all(nf.same_as(of) for nf, of in zip(new_funcs, funcs, strict=True)):
+        used_extra = [
+            rewritten_by_name[ef.name] for ef in extra_incore if ef.name in self._specialized_callees.values()
+        ]
+        new_funcs = (
+            [rewritten_by_name[f.name] for f in incore_funcs]
+            + used_extra
+            + [rewritten_by_name[f.name] for f in other_funcs]
+        )
+        if len(new_funcs) == len(funcs) and all(
+            nf.same_as(of) for nf, of in zip(new_funcs, funcs, strict=True)
+        ):
             return program
         return core_ir.Program(new_funcs, program.name, program.span)
 
     def _lookup_tile_desc(self, name_hint: str) -> TileLayoutDesc | None:
         clean_name = _clean_ssa_name(name_hint)
         if self._current_func_name:
+            ov = self._tile_prefix_override.get(self._current_func_name)
+            if ov is not None:
+                scoped_ov = self._tile_layouts.get(f"{ov}.{clean_name}")
+                if scoped_ov is not None:
+                    return scoped_ov
             scoped = self._tile_layouts.get(f"{self._current_func_name}.{clean_name}")
             if scoped is not None:
                 return scoped
@@ -2554,9 +2753,14 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         self,
         func_name: str,
         new_params: Sequence[tuple[core_ir.Var, core_ir.ParamDirection]],
+        old_params: Sequence[core_ir.Var],
+        body: core_ir.Stmt,
     ) -> list[core_ir.Stmt]:
+        nz_uids = _nz_offset_scalar_uids(body, new_params, old_params)
         prologue_stmts: list[core_ir.Stmt] = []
         for p_idx, (param, _) in enumerate(new_params):
+            if param.unique_id not in nz_uids:
+                continue
             step = self._param_steps.get((func_name, p_idx))
             if step is not None and step > 1 and step % 8 == 0 and isinstance(param.type, core_ir.ScalarType):
                 dt = param.type.dtype
@@ -2602,7 +2806,7 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
 
         prologue_stmts: list[core_ir.Stmt] = []
         if has_nz_param and core_ir.is_incore_type(func.func_type):
-            prologue_stmts = self._build_aligned_param_prologue(func.name, new_params)
+            prologue_stmts = self._build_aligned_param_prologue(func.name, new_params, func.params, func.body)
             if prologue_stmts:
                 changed = True
 
@@ -2651,6 +2855,16 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
             requires_runtime_binding=func.requires_runtime_binding,
             ir_stage=func.ir_stage,
         )
+
+    def _resolve_specialized_callee(
+        self,
+        callee_name: str,
+        new_args: Sequence[core_ir.Expr],
+    ) -> str:
+        sig = tuple(
+            _tensor_type_layout(a.type) if isinstance(a.type, core_ir.TensorType) else None for a in new_args
+        )
+        return self._specialized_callees.get((callee_name, sig), callee_name)
 
     def visit_var(self, op: core_ir.Var) -> core_ir.Expr:
         return self._var_remap.get(op.unique_id, op)
@@ -2717,20 +2931,24 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
     def visit_call(self, op: core_ir.Call) -> core_ir.Expr:
         new_args = [self.visit_expr(arg) for arg in op.args]
         args_changed = any(not a.same_as(b) for a, b in zip(new_args, op.args, strict=True))
-        if not args_changed:
-            return op
         if isinstance(op.op, core_ir.GlobalVar):
-            ret_types = self._func_return_types.get(op.op.name)
+            target_name = self._resolve_specialized_callee(op.op.name, new_args)
+            if not args_changed and target_name == op.op.name:
+                return op
+            target_gv = core_ir.GlobalVar(target_name) if target_name != op.op.name else op.op
+            ret_types = self._func_return_types.get(target_name)
             ret_type = ret_types[0] if ret_types and len(ret_types) == 1 else op.type
             return core_ir.Call(
-                op.op,
+                target_gv,
                 new_args,
                 dict(op.kwargs),
                 dict(op.attrs) if op.attrs else None,
                 ret_type,
                 op.span,
             )
-        if op.op.name in (_TILE_LOAD_OP, _TILE_STORE_OP):
+        if not args_changed:
+            return op
+        if op.op.name == _TILE_LOAD_OP:
             return core_ir.Call(
                 op.op,
                 new_args,
@@ -2749,15 +2967,24 @@ class _LayoutAssignmentWriter(core_ir.IRMutator):
         new_deps = [self.visit_expr(dep) for dep in op.deps]
         args_changed = any(not a.same_as(b) for a, b in zip(new_args, op.args, strict=True))
         deps_changed = any(not a.same_as(b) for a, b in zip(new_deps, op.deps, strict=True))
-        if not args_changed and not deps_changed:
+        target_name = (
+            self._resolve_specialized_callee(op.op.name, new_args)
+            if isinstance(op.op, core_ir.GlobalVar)
+            else ""
+        )
+        callee_changed = isinstance(op.op, core_ir.GlobalVar) and target_name != op.op.name
+        if not args_changed and not deps_changed and not callee_changed:
             return op
         ret_type = op.type
+        target_op = op.op
         if isinstance(op.op, core_ir.GlobalVar):
-            ret_types = self._func_return_types.get(op.op.name)
+            if callee_changed:
+                target_op = core_ir.GlobalVar(target_name)
+            ret_types = self._func_return_types.get(target_name)
             if ret_types is not None:
                 ret_type = core_ir.make_call_result_type(ret_types, is_submit=True)
         return core_ir.Submit(
-            op.op,
+            target_op,
             new_args,
             new_deps,
             dict(op.kwargs),
@@ -3156,9 +3383,8 @@ def _calibration_features(
                 else:
                     cols = dst_node.shape[-1] if dst_node.shape else 1
                     parent_cols = src_node.shape[-1] if src_node.shape else cols
-                    parent_row_bytes = parent_cols * _dtype_byte_width(dst_node.dtype)
-                    wide_strided = cols < parent_cols and parent_row_bytes > model.l2_cache_line_bytes
-                    ratio = 1.0 if wide_strided else max(1.0, contiguous_nd_ratio)
+                    strided = cols < parent_cols
+                    ratio = 1.0 if strided else max(1.0, contiguous_nd_ratio)
                     nd2nz_b += inv * scale * tile_bytes / ratio
                     transfer_cycles = tile_bytes / (model.mte2_nd2nz_bytes_per_cycle * ratio)
                 other_cycles += (
@@ -3182,13 +3408,23 @@ def _calibration_features(
     return [1.0, nd2nz_b, nz2nz_b, store_nd_b, store_nz_b, other_cycles]
 
 
-def _fit_within_case_differentials(
+def _fit_within_case_differentials(  # noqa: PLR0913
     rows_x: Sequence[Sequence[float]],
     rows_y: Sequence[float],
     op_cycles_list: Sequence[float],
     case_groups: dict[str, list[int]],
+    beta_mte2: float,
+    beta_fixpipe: float,
+    us_per_cycle: float,
 ) -> tuple[float, float, float, float, float, float, float, float]:
     """Fit case-demeaned ND->NZ differential slopes for MTE2 loads and FIXPIPE stores."""
+    adj_y = [
+        rows_y[i]
+        - beta_mte2 * (rows_x[i][1] + rows_x[i][2])
+        - beta_fixpipe * (rows_x[i][3] + rows_x[i][4])
+        - us_per_cycle * rows_x[i][5]
+        for i in range(len(rows_y))
+    ]
     d_rows_x: list[list[float]] = [[0.0, 0.0] for _ in rows_y]
     d_rows_y: list[float] = [0.0 for _ in rows_y]
     within_case_rhos: list[float] = []
@@ -3197,10 +3433,10 @@ def _fit_within_case_differentials(
             continue
         mean_nd = sum(rows_x[i][1] for i in idxs) / float(len(idxs))
         mean_snd = sum(rows_x[i][3] for i in idxs) / float(len(idxs))
-        mean_y = sum(rows_y[i] for i in idxs) / float(len(idxs))
+        mean_y = sum(adj_y[i] for i in idxs) / float(len(idxs))
         for i in idxs:
             d_rows_x[i] = [rows_x[i][1] - mean_nd, rows_x[i][3] - mean_snd]
-            d_rows_y[i] = rows_y[i] - mean_y
+            d_rows_y[i] = adj_y[i] - mean_y
         grp_ops = [op_cycles_list[i] for i in idxs]
         if max(grp_ops) > min(grp_ops):
             within_case_rhos.append(_spearman_rank_correlation(grp_ops, [rows_y[i] for i in idxs]))
@@ -3273,7 +3509,7 @@ def _anchor_pair_from_differential(  # noqa: PLR0913
     trigger = (
         (nd_name in fallback_params or nz_name in fallback_params)
         if require_both_cols
-        else (nz_name in fallback_params)
+        else (nd_name in fallback_params and nz_name not in fallback_params)
     )
     if not trigger or norm_delta <= 0.0:
         return fit_nd, fit_nz
@@ -3374,17 +3610,6 @@ def fit_cost_model_from_measurements(
         math.sqrt(max(0.0, float(xtx_scaled_inv[j, j]) * sigma2)) / scales_list[j] for j in range(n_cols)
     ]
 
-    (
-        delta_mte2_slope,
-        t_delta_mte2,
-        norm_mte2,
-        delta_fixpipe_slope,
-        t_delta_fixpipe,
-        norm_fixpipe,
-        within_r2,
-        within_op_rho,
-    ) = _fit_within_case_differentials(rows_x, rows_y, op_cycles_list, case_groups)
-
     raw_freq_ghz = (1.0 / (float(coef[5]) * 1000.0)) if float(coef[5]) > 1e-6 else 0.0
     if estimable[5] and 0.8 * nominal_freq_ghz <= raw_freq_ghz <= 1.2 * nominal_freq_ghz:
         us_per_cycle = float(coef[5])
@@ -3423,6 +3648,34 @@ def fit_cost_model_from_measurements(
     )
     fit_acc_to_nz = _slope_to_bpc(
         "fixpipe_acc_to_nz_bytes_per_cycle", 4, model.fixpipe_acc_to_nz_bytes_per_cycle
+    )
+
+    anchor_acc_nz = (
+        model.fixpipe_acc_to_nz_bytes_per_cycle
+        if (
+            "fixpipe_acc_to_nd_bytes_per_cycle" in fallback_params
+            or "fixpipe_acc_to_nz_bytes_per_cycle" in fallback_params
+        )
+        else fit_acc_to_nz
+    )
+    raw_op_slope = float(coef[5]) if estimable[5] and float(coef[5]) > 0.0 else 0.0
+    (
+        delta_mte2_slope,
+        t_delta_mte2,
+        norm_mte2,
+        delta_fixpipe_slope,
+        t_delta_fixpipe,
+        norm_fixpipe,
+        within_r2,
+        within_op_rho,
+    ) = _fit_within_case_differentials(
+        rows_x,
+        rows_y,
+        op_cycles_list,
+        case_groups,
+        us_per_cycle / fit_nz2nz,
+        us_per_cycle / anchor_acc_nz,
+        raw_op_slope,
     )
 
     if estimable[5] and len(case_groups) > 1:

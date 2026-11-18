@@ -1109,5 +1109,218 @@ class TestPassPipelineIntegrationAndCalibration:
         }
 
 
+def test_differential_anchoring_and_short_row_strided_classification():
+    from pypto.ir.auto_layout import ROW_MAJOR_FLAT, _calibration_features  # noqa: PLC0415
+
+    set_backend_type(BackendType.Ascend910)
+    nd = ir.TensorLayout.ND
+    nz = ir.TensorLayout.NZ
+    # Item 6: cols < parent_cols must classify as strided even when parent_row_bytes <= l2_cache_line_bytes.
+    base_model = LayoutCostModel(
+        backend_type=BackendType.Ascend910,
+        mte2_nd2nz_bytes_per_cycle=77.0,
+        mte2_nz2nz_bytes_per_cycle=102.0,
+    )
+    src = LayoutValueNode(
+        name="x",
+        memory_space=ir.MemorySpace.DDR,
+        shape=(16, 128),  # 128 * 2B = 256B <= 512B L2 cache line
+        dtype=DataType.FP16,
+        current_layout=nd,
+        admissible_layouts=(nd, nz),
+        producer_op_id=None,
+    )
+    dst = LayoutValueNode(
+        name="tx",
+        memory_space=ir.MemorySpace.Mat,
+        shape=(16, 64),  # cols < parent_cols
+        dtype=DataType.FP16,
+        current_layout=ROW_MAJOR_FLAT,
+        admissible_layouts=(ROW_MAJOR_FLAT,),
+        producer_op_id="load_0",
+    )
+    op = LayoutOperationNode(
+        op_id="load_0",
+        op_name="tile.load",
+        inputs=("x",),
+        output="tx",
+        configs=(
+            OperatorConfig(
+                op_id="load_0",
+                op_name="tile.load",
+                input_layouts=(nd,),
+                output_layout=ROW_MAJOR_FLAT,
+                op_cost_cycles=1.0,
+            ),
+        ),
+        invocations=100,
+    )
+    inst = LayoutProblemInstance(
+        values={"x": src, "tx": dst},
+        operations=(op,),
+        cost_model=base_model,
+    )
+    bd = evaluate_assignment(
+        inst,
+        LayoutAssignment(value_layouts={"x": nd, "tx": ROW_MAJOR_FLAT}, op_configs={"load_0": op.configs[0]}),
+    )
+    meas_item = CalibrationMeasurement(
+        variant_id="short_row_strided",
+        measured_us=1.0,
+        instance=inst,
+        breakdown=bd,
+    )
+    feats_strided = _calibration_features(base_model, meas_item, 100.0, 2.0)
+    assert feats_strided[1] == pytest.approx(float(dst.byte_size))
+
+    # Item 5: synthetic differential anchoring with r > 1 contiguous loads recovers exact bandwidths.
+    base_model_cal = LayoutCostModel(
+        expected_uses=100,
+        backend_type=BackendType.Ascend910,
+        mte2_nd2nz_bytes_per_cycle=50.0,
+        mte2_nd2nz_contiguous_bytes_per_cycle=100.0,
+    )
+    base_transfer = replace(
+        base_model_cal,
+        mte2_nd2nz_row_penalty_cycles=0.0,
+        mte2_nd2nz_sub512b_penalty_cycles=0.0,
+        fixpipe_drain_fixed_cycles=0.0,
+        fixpipe_odd_n1_penalty_cycles=0.0,
+    )
+    true_transfer = replace(
+        base_transfer,
+        mte2_nd2nz_bytes_per_cycle=77.0,
+        mte2_nd2nz_contiguous_bytes_per_cycle=154.0,
+        mte2_nz2nz_bytes_per_cycle=102.0,
+    )
+    nominal_us_per_cyc = 1.0 / (1.8 * 1000.0)
+    meas: list[CalibrationMeasurement] = []
+    for s_idx, (m_dim, k_dim, n_dim, kt, nt) in enumerate(
+        [
+            (64, 2048, 64, 256, None),
+            (64, 8192, 64, 256, None),
+            (64, 256, 2048, 256, 64),
+            (128, 1024, 1024, 128, 128),
+        ]
+    ):
+        case = auto_layout_bench.build_single_matmul_case(
+            m_dim, k_dim, n_dim, k_tile=kt, n_tile=nt, expected_uses=100, seed=s_idx
+        )
+        c_inst = extract_layout_instance(run_pre_layout_passes(case.program), cost_model=base_model_cal)
+        for v_idx, c_bd in enumerate(enumerate_assignments(c_inst, deduplicate=True)):
+            run_scale = float(c_inst.cost_model.expected_uses)
+            transfer_cyc = other_cyc = 0.0
+            for c_op in c_inst.operations:
+                cfg = c_bd.assignment.op_configs[c_op.op_id]
+                inv = float(c_op.invocations) / run_scale
+                if c_op.op_name == "tile.load":
+                    c_src = c_inst.values[c_op.inputs[0]]
+                    c_dst = c_inst.values[c_op.output]
+                    if c_dst.memory_space == ir.MemorySpace.Mat:
+                        sc = base_model_cal.effective_mte2_load_multiplier(c_src, c_dst, inv)
+                        l_args = (c_src, c_dst, cfg.input_layouts[0], cfg.output_layout)
+                        transfer_cyc += inv * sc * true_transfer.estimate_load_cost(*l_args)
+                        other_cyc += (
+                            inv
+                            * sc
+                            * (
+                                base_model_cal.estimate_load_cost(*l_args)
+                                - base_transfer.estimate_load_cost(*l_args)
+                            )
+                        )
+                        continue
+                elif c_op.op_name == "tile.store":
+                    s_args = (c_inst.values[c_op.inputs[0]], c_inst.values[c_op.output], cfg.output_layout)
+                    other_cyc += inv * (
+                        base_model_cal.estimate_store_cost(*s_args)
+                        - base_transfer.estimate_store_cost(*s_args)
+                    )
+                    continue
+                other_cyc += inv * cfg.op_cost_cycles
+            meas.append(
+                CalibrationMeasurement(
+                    variant_id=f"c_{s_idx}/v_{v_idx}",
+                    measured_us=10.0 + nominal_us_per_cyc * (transfer_cyc + other_cyc),
+                    instance=c_inst,
+                    breakdown=c_bd,
+                )
+            )
+    rep = fit_cost_model_from_measurements(meas, base_model_cal)
+    assert rep.fitted_model.mte2_nd2nz_bytes_per_cycle == pytest.approx(77.0, rel=1e-2)
+    assert rep.fitted_model.mte2_nz2nz_bytes_per_cycle == pytest.approx(102.0, rel=1e-2)
+
+
+def test_bench_metrics_and_variant_matching_fixes():
+    from unittest import mock  # noqa: PLC0415
+
+    from pypto.ir.auto_layout_bench import _evaluate_solvers_for_case, _match_variant_record  # noqa: PLC0415
+    from pypto.ir.auto_layout_production_bench import _extract_bench_metrics  # noqa: PLC0415
+    from pypto.ir.auto_layout_solver import (  # noqa: PLC0415
+        LayoutSolverResult,
+        LayoutSolverStats,
+    )
+
+    nd = ir.TensorLayout.ND
+
+    class _FakeStats:
+        def per_round(self, metric: str) -> list[float]:
+            return {
+                "device": [10.0, 12.0, 14.0],
+                "effective": [11.0, 13.0, 15.0],
+                "host": [20.0, 22.0, 24.0],
+            }[metric]
+
+    assert _extract_bench_metrics(_FakeStats()) == (12.0, 13.0, 22.0)
+
+    # Item 8: value_layouts disambiguates identical gm_layouts; writeback_issues blocks match.
+    recs = [
+        {
+            "variant_id": "v_nd_tile",
+            "gm_layouts": {"x": "ND"},
+            "value_layouts": {"x": "ND", "t": "RM"},
+            "device_us_median": 50.0,
+        },
+        {
+            "variant_id": "v_nz_tile",
+            "gm_layouts": {"x": "ND"},
+            "value_layouts": {"x": "ND", "t": "NZ"},
+            "device_us_median": 25.0,
+        },
+    ]
+    matched = _match_variant_record(recs, {"x": "ND"}, {"x": "ND", "t": "NZ"})
+    assert matched is not None
+    assert matched["variant_id"] == "v_nz_tile"
+
+    x_node = LayoutValueNode(
+        name="x",
+        memory_space=ir.MemorySpace.DDR,
+        shape=(16, 16),
+        dtype=DataType.FP16,
+        current_layout=nd,
+        admissible_layouts=(nd,),
+        producer_op_id=None,
+    )
+    inst = LayoutProblemInstance(values={"x": x_node}, operations=(), cost_model=LayoutCostModel())
+    bad_res = LayoutSolverResult(
+        breakdown=evaluate_assignment(inst, LayoutAssignment(value_layouts={"x": nd})),
+        stats=LayoutSolverStats(1, 0, 0, 1.0, "optimal", 0, 0),
+        conversions=(),
+        writeback_issues=("incompatible helper signature",),
+    )
+
+    with (
+        mock.patch("pypto.ir.auto_layout_bench.solve_greedy", return_value=bad_res),
+        mock.patch("pypto.ir.auto_layout_bench.solve_treewidth_dp", return_value=bad_res),
+        mock.patch("pypto.ir.auto_layout_bench.solve_auto_layout", return_value=bad_res),
+    ):
+        summary = _evaluate_solvers_for_case(
+            inst,
+            [{"variant_id": "v_nd", "gm_layouts": {"x": "ND"}, "device_us_median": 10.0}],
+        )
+    assert summary["auto_layout"]["variant_id"] is None
+    assert summary["auto_layout"]["device_us_median"] is None
+    assert summary["auto_layout"]["writeback_issues"] == ["incompatible helper signature"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -869,7 +869,10 @@ def solve_treewidth_dp(
     cfg = config or LayoutSolverConfig()
     progress = _Progress(cfg)
     tw_stats, elim_order, bags, parents = _compute_active_decomposition(problem)
-    return _run_treewidth_dp_on_decomposition(problem, cfg, progress, tw_stats, elim_order, bags, parents)
+    try:
+        return _run_treewidth_dp_on_decomposition(problem, cfg, progress, tw_stats, elim_order, bags, parents)
+    except _EvaluationLimit as exc:
+        raise ValueError(f"Treewidth DP exceeded max_evaluations={cfg.max_evaluations}") from exc
 
 
 def solve_auto_layout(
@@ -886,8 +889,14 @@ def solve_auto_layout(
     if (
         tw_stats.active_primal_treewidth <= cfg.max_treewidth
         and tw_stats.max_bag_domain_product <= cfg.max_bag_states
+        and tw_stats.total_dp_states <= cfg.max_evaluations
     ):
-        return _run_treewidth_dp_on_decomposition(problem, cfg, progress, tw_stats, elim_order, bags, parents)
+        try:
+            return _run_treewidth_dp_on_decomposition(
+                problem, cfg, progress, tw_stats, elim_order, bags, parents
+            )
+        except _EvaluationLimit:
+            pass
     choices = (
         problem.initial_choices(initial) if initial is not None else _topological_seed(problem, progress)
     )
