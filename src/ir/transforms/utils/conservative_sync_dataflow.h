@@ -101,6 +101,11 @@ struct ConservativeSyncChildEntry {
   std::vector<std::pair<PipeType, PipeType>> required_services;
   CompletionSummary completion = CompletionSummary::Identity();
   bool first_visit = false;
+  SeqStmtsPtr window_seq;
+  size_t window_begin = 0;
+  size_t window_end = 0;
+  std::optional<InlineExactSubBlock> inline_subblock;
+  bool IsSubblockSlice() const { return static_cast<bool>(window_seq); }
 };
 
 struct ConservativeSyncCost {
@@ -187,5 +192,7 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
 // Explicit policy construction. Acknowledgment-induced order is represented
 // here in logical tokens before LowerSync; no physical resource is assigned.
 FunctionPtr InsertConservativePrefixes(const ConservativeSyncAnalysis& analysis);
+CompletionSummary SummarizeStraightLineLogicalCompletion(const StmtPtr& body, FunctionType func_type,
+                                                         const std::string& target);
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_CONSERVATIVE_SYNC_DATAFLOW_H_

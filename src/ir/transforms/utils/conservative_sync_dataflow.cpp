@@ -17,6 +17,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <queue>
 #include <set>
@@ -35,9 +36,12 @@
 #include "pypto/ir/memref.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/sync.h"
+#include "pypto/ir/transforms/pass_context.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/type.h"
-#include "src/ir/transforms/utils/native_sync_placement.h"
+#include "src/ir/transforms/utils/sync_footprint_resolver.h"
+#include "src/ir/transforms/utils/sync_loop_trip_proof.h"
 #include "src/ir/transforms/utils/sync_scalar_readiness.h"
 
 namespace pypto::ir::sync {
@@ -55,7 +59,7 @@ MemorySpace Space(const ExprPtr& operand) {
 }
 
 // Each catalog entry is a conservative connected component of overlapping
-// enclosures. Unknown effects are wildcards, not disjoint unknown roots.
+// enclosures / fine 2D or strided descriptors. Unknown effects are wildcards.
 struct RawEffect {
   MemorySpace space;
   PipeType pipe;
@@ -63,90 +67,373 @@ struct RawEffect {
   std::optional<backend::BufferSyncByteWindow> enclosure;
   ExprPtr original_root;
   bool candidate_full_overwrite = false;
-  std::optional<backend::BufferSyncByteWindow> exact_full_window;
+  std::optional<StridedByteFootprint> vec_lattice;
+  std::optional<MatrixBoxFootprint> matrix_box;
+  IterationFiber fiber;
 };
 
 class StorageClasses {
  public:
-  void Build(const std::vector<std::vector<RawEffect>>& sites) {
-    std::map<MemorySpace, std::vector<backend::BufferSyncByteWindow>> intervals;
-    for (const auto& effects : sites)
-      for (const auto& effect : effects)
-        if (effect.enclosure) intervals[effect.space].push_back(*effect.enclosure);
-    for (auto& [space, windows] : intervals) {
-      std::sort(windows.begin(), windows.end(), [](const auto& left, const auto& right) {
-        return std::tie(left.begin, left.end) < std::tie(right.begin, right.end);
-      });
-      for (const auto& window : windows) {
-        auto& components = local_[space];
-        if (!components.empty() && window.begin < components.back().first.end) {
-          auto& component = components.back();
-          component.first.end = std::max(component.first.end, window.end);
-          domains[component.second - 1].enclosure = component.first;
-        } else {
-          const auto id = domains.size() + 1;
-          components.emplace_back(window, id);
-          domains.push_back({id, space, window, nullptr});
+  static constexpr size_t kMaxFineClusterDescriptors = 32;
+
+  void Build(const std::vector<std::vector<RawEffect>>& sites, const std::vector<SyncCanonicalRoot>& roots) {
+    effect_domains_.assign(sites.size(), {});
+    for (size_t s = 0; s < sites.size(); ++s) {
+      effect_domains_[s].assign(sites[s].size(), 0);
+    }
+
+    struct IndexedEffect {
+      backend::BufferSyncByteWindow hull;
+      size_t site_idx;
+      size_t effect_idx;
+    };
+    std::map<MemorySpace, std::vector<IndexedEffect>> by_space;
+    for (size_t s = 0; s < sites.size(); ++s) {
+      for (size_t e = 0; e < sites[s].size(); ++e) {
+        if (sites[s][e].enclosure) {
+          by_space[sites[s][e].space].push_back({*sites[s][e].enclosure, s, e});
         }
       }
     }
+
+    for (auto& [space, entries] : by_space) {
+      // Stage 1: O(E log E) 1D byte-hull sweep.
+      std::sort(entries.begin(), entries.end(), [](const IndexedEffect& a, const IndexedEffect& b) {
+        return std::tie(a.hull.begin, a.hull.end, a.site_idx, a.effect_idx) <
+               std::tie(b.hull.begin, b.hull.end, b.site_idx, b.effect_idx);
+      });
+
+      struct Cluster {
+        backend::BufferSyncByteWindow hull;
+        std::vector<std::pair<size_t, size_t>> members;
+      };
+      std::vector<Cluster> clusters;
+      for (const auto& entry : entries) {
+        if (!clusters.empty() && entry.hull.begin < clusters.back().hull.end) {
+          clusters.back().hull.end = std::max(clusters.back().hull.end, entry.hull.end);
+          clusters.back().members.emplace_back(entry.site_idx, entry.effect_idx);
+        } else {
+          clusters.push_back({entry.hull, {{entry.site_idx, entry.effect_idx}}});
+        }
+      }
+
+      // Stage 2: Intra-cluster fine partitioning (2D MatrixBox & GCD StridedByteFootprint).
+      for (const auto& cluster : clusters) {
+        auto emit_single = [&](const backend::BufferSyncByteWindow& hull, bool uniform_geom,
+                               const std::vector<std::pair<size_t, size_t>>& members) {
+          const size_t id = domains.size() + 1;
+          domains.push_back({id, space, hull, nullptr});
+          domain_uniform_geom.push_back(uniform_geom);
+          for (const auto& [si, ei] : members) effect_domains_[si][ei] = id;
+        };
+
+        if (cluster.members.size() == 1) {
+          emit_single(cluster.hull, true, cluster.members);
+          continue;
+        }
+
+        if (space == MemorySpace::Vec) {
+          bool all_have = true;
+          std::vector<StridedByteFootprint> uniq;
+          std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, size_t> geom_to_id;
+          std::vector<size_t> member_gid;
+          member_gid.reserve(cluster.members.size());
+          for (const auto& [si, ei] : cluster.members) {
+            const auto& lat = sites[si][ei].vec_lattice;
+            if (!lat) {
+              all_have = false;
+              break;
+            }
+            const auto key = std::make_tuple(lat->base, lat->pitch, lat->rows, lat->width);
+            auto [it, ins] = geom_to_id.emplace(key, uniq.size());
+            if (ins) {
+              if (uniq.size() >= kMaxFineClusterDescriptors) {
+                all_have = false;
+                break;
+              }
+              uniq.push_back(*lat);
+            }
+            member_gid.push_back(it->second);
+          }
+          if (!all_have || uniq.size() == 1) {
+            emit_single(cluster.hull, all_have && uniq.size() == 1, cluster.members);
+            continue;
+          }
+          std::vector<size_t> parent(uniq.size());
+          std::iota(parent.begin(), parent.end(), 0);
+          auto find_root = [&](size_t x) {
+            while (parent[x] != x) {
+              parent[x] = parent[parent[x]];
+              x = parent[x];
+            }
+            return x;
+          };
+          for (size_t i = 0; i < uniq.size(); ++i) {
+            for (size_t j = i + 1; j < uniq.size(); ++j) {
+              const size_t ri = find_root(i), rj = find_root(j);
+              if (ri != rj && StridedByteFootprint::MayOverlap(uniq[i], uniq[j])) {
+                parent[rj] = ri;
+              }
+            }
+          }
+          std::map<size_t, std::vector<std::pair<size_t, size_t>>> comp_members;
+          std::map<size_t, size_t> comp_uniq_count;
+          std::map<size_t, backend::BufferSyncByteWindow> comp_hull;
+          for (size_t i = 0; i < uniq.size(); ++i) {
+            ++comp_uniq_count[find_root(i)];
+          }
+          for (size_t idx = 0; idx < cluster.members.size(); ++idx) {
+            const size_t root = find_root(member_gid[idx]);
+            const auto [si, ei] = cluster.members[idx];
+            comp_members[root].push_back({si, ei});
+            const auto& enc = *sites[si][ei].enclosure;
+            auto it = comp_hull.find(root);
+            if (it == comp_hull.end()) {
+              comp_hull.emplace(root, enc);
+            } else {
+              it->second.begin = std::min(it->second.begin, enc.begin);
+              it->second.end = std::max(it->second.end, enc.end);
+            }
+          }
+          // Deterministic order by component hull (begin, end).
+          std::vector<size_t> comp_order;
+          comp_order.reserve(comp_members.size());
+          for (const auto& [root, _] : comp_members) comp_order.push_back(root);
+          std::sort(comp_order.begin(), comp_order.end(), [&](size_t a, size_t b) {
+            const auto& ha = comp_hull.at(a);
+            const auto& hb = comp_hull.at(b);
+            return std::tie(ha.begin, ha.end) < std::tie(hb.begin, hb.end);
+          });
+          for (const size_t root : comp_order) {
+            emit_single(comp_hull.at(root), comp_uniq_count.at(root) == 1, comp_members.at(root));
+          }
+        } else {
+          // Mat / Left / Right / Acc: 2D MatrixBoxFootprint partitioning.
+          bool all_have = true;
+          std::vector<MatrixBoxFootprint> uniq;
+          std::map<std::tuple<size_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>, size_t>
+              box_to_id;
+          std::vector<size_t> member_gid;
+          member_gid.reserve(cluster.members.size());
+          for (const auto& [si, ei] : cluster.members) {
+            const auto& box = sites[si][ei].matrix_box;
+            if (!box) {
+              all_have = false;
+              break;
+            }
+            const auto key = std::make_tuple(box->root_id, box->slot_lo, box->slot_hi, box->row_begin,
+                                             box->row_end, box->col_begin, box->col_end);
+            auto [it, ins] = box_to_id.emplace(key, uniq.size());
+            if (ins) {
+              if (uniq.size() >= kMaxFineClusterDescriptors) {
+                all_have = false;
+                break;
+              }
+              uniq.push_back(*box);
+            }
+            member_gid.push_back(it->second);
+          }
+          if (!all_have || uniq.size() == 1) {
+            emit_single(cluster.hull, all_have && uniq.size() == 1, cluster.members);
+            continue;
+          }
+          std::vector<size_t> parent(uniq.size());
+          std::iota(parent.begin(), parent.end(), 0);
+          auto find_root = [&](size_t x) {
+            while (parent[x] != x) {
+              parent[x] = parent[parent[x]];
+              x = parent[x];
+            }
+            return x;
+          };
+          for (size_t i = 0; i < uniq.size(); ++i) {
+            for (size_t j = i + 1; j < uniq.size(); ++j) {
+              const size_t ri = find_root(i), rj = find_root(j);
+              if (ri != rj && MatrixBoxFootprint::MayOverlap(uniq[i], uniq[j], roots)) {
+                parent[rj] = ri;
+              }
+            }
+          }
+          std::map<size_t, std::vector<std::pair<size_t, size_t>>> comp_members;
+          std::map<size_t, size_t> comp_uniq_count;
+          std::map<size_t, backend::BufferSyncByteWindow> comp_hull;
+          for (size_t i = 0; i < uniq.size(); ++i) {
+            ++comp_uniq_count[find_root(i)];
+          }
+          for (size_t idx = 0; idx < cluster.members.size(); ++idx) {
+            const size_t root = find_root(member_gid[idx]);
+            const auto [si, ei] = cluster.members[idx];
+            comp_members[root].push_back({si, ei});
+            const auto& enc = *sites[si][ei].enclosure;
+            auto it = comp_hull.find(root);
+            if (it == comp_hull.end()) {
+              comp_hull.emplace(root, enc);
+            } else {
+              it->second.begin = std::min(it->second.begin, enc.begin);
+              it->second.end = std::max(it->second.end, enc.end);
+            }
+          }
+          std::vector<size_t> comp_order;
+          comp_order.reserve(comp_members.size());
+          for (const auto& [root, _] : comp_members) comp_order.push_back(root);
+          std::sort(comp_order.begin(), comp_order.end(), [&](size_t a, size_t b) {
+            const auto& ha = comp_hull.at(a);
+            const auto& hb = comp_hull.at(b);
+            return std::tie(ha.begin, ha.end) < std::tie(hb.begin, hb.end);
+          });
+          for (const size_t root : comp_order) {
+            emit_single(comp_hull.at(root), comp_uniq_count.at(root) == 1, comp_members.at(root));
+          }
+        }
+      }
+    }
+
     // Original lexical effect order gives deterministic IDs, independent of
     // pointer ordering and hash iteration. Roots are retained by the catalog.
-    for (const auto& effects : sites)
-      for (const auto& effect : effects)
-        if (effect.original_root && !roots_.count(effect.original_root.get())) {
-          const auto id = domains.size() + 1;
-          roots_.emplace(effect.original_root.get(), id);
-          domains.push_back({id, effect.space, {}, effect.original_root});
+    for (size_t s = 0; s < sites.size(); ++s) {
+      for (size_t e = 0; e < sites[s].size(); ++e) {
+        const auto& effect = sites[s][e];
+        if (effect.original_root) {
+          auto it = roots_.find(effect.original_root.get());
+          if (it == roots_.end()) {
+            const auto id = domains.size() + 1;
+            it = roots_.emplace(effect.original_root.get(), id).first;
+            domains.push_back({id, effect.space, {}, effect.original_root});
+            domain_uniform_geom.push_back(false);
+          }
+          effect_domains_[s][e] = it->second;
         }
+      }
+    }
   }
-  size_t Domain(const RawEffect& effect) const {
-    if (effect.original_root) return roots_.at(effect.original_root.get());
-    if (!effect.enclosure) return 0;
-    const auto& components = local_.at(effect.space);
-    auto found =
-        std::upper_bound(components.begin(), components.end(), effect.enclosure->begin,
-                         [](int64_t begin, const auto& component) { return begin < component.first.begin; });
-    INTERNAL_CHECK(found != components.begin()) << "Internal error: missing conservative storage component";
-    --found;
-    INTERNAL_CHECK(effect.enclosure->end <= found->first.end)
-        << "Internal error: conservative storage component does not enclose an effect";
-    return found->second;
+
+  size_t Domain(size_t site_idx, size_t effect_idx) const { return effect_domains_[site_idx][effect_idx]; }
+  bool HasUniformGeometry(size_t domain_id) const {
+    return domain_id > 0 && domain_id <= domain_uniform_geom.size() && domain_uniform_geom[domain_id - 1];
   }
+
   std::vector<ConservativeStorageDomain> domains;
+  std::vector<bool> domain_uniform_geom;
 
  private:
-  std::map<MemorySpace, std::vector<std::pair<backend::BufferSyncByteWindow, size_t>>> local_;
+  std::vector<std::vector<size_t>> effect_domains_;
   std::unordered_map<const Expr*, size_t> roots_;
 };
 
-bool IsFullOverwriteOperand(const CallPtr& call, BufferAccess mode, MemorySpace space, const ExprPtr& operand) {
-  if (space == MemorySpace::DDR) return false;
-  const std::string& name = call->op_->name_;
-  if (name == "buffer.load") {
-    if (mode != BufferAccess::Write) return false;
-    const auto buf = As<BufferType>(operand->GetType());
-    return buf && buf->shape_.size() >= 2;
+constexpr size_t kAllPipeLaneCount = kPhysicalPipeCount + 1;  // MTE1..FIX + ALL.
+constexpr int64_t kMaxAffineFiberSpan = 8;
+constexpr int64_t kMaxModularFiberModulus = 16;
+
+struct FiberKey {
+  IterationFiber::Kind kind = IterationFiber::Kind::Wildcard;
+  const ForStmt* frame = nullptr;
+  int64_t modulus = 0;
+  int64_t offset = 0;
+  int64_t extent = 0;
+  int64_t coeff = 0;
+  uint8_t slice_axis = 0;
+
+  static FiberKey Wildcard() { return {}; }
+  static FiberKey From(const IterationFiber& f) {
+    if (f.kind == IterationFiber::Kind::Wildcard || !f.frame) return {};
+    return {f.kind, f.frame, f.modulus, f.offset, f.extent, f.coeff, f.slice_axis};
   }
-  if (name == "buffer.copy" || name == "buffer.extract" || name == "buffer.matmul") {
-    return mode == BufferAccess::Write;
+
+  bool operator==(const FiberKey& o) const {
+    return kind == o.kind && frame == o.frame && modulus == o.modulus && offset == o.offset &&
+           extent == o.extent && coeff == o.coeff && slice_axis == o.slice_axis;
   }
-  if (name == "buffer.ci_workspace") {
-    return mode == BufferAccess::Write && !call->args_.empty() && operand == call->args_.back();
+  bool operator<(const FiberKey& o) const {
+    return std::tie(kind, frame, modulus, offset, extent, coeff, slice_axis) <
+           std::tie(o.kind, o.frame, o.modulus, o.offset, o.extent, o.coeff, o.slice_axis);
   }
-  if (name == "buffer.matmul_acc") {
-    return mode == BufferAccess::ReadWrite;
+};
+
+struct SiteEffectFiber {
+  MemorySpace space = MemorySpace::DDR;
+  PipeType pipe = PipeType::S;
+  bool write = false;
+  size_t domain = 0;
+  FiberKey fiber;
+};
+
+using AffineDomainFrameKey = std::tuple<MemorySpace, size_t, const ForStmt*>;
+using AffineDomainBoundsMap = std::map<AffineDomainFrameKey, std::pair<int64_t, int64_t>>;
+
+bool FibersConflict(const FiberKey& a, const FiberKey& b) {
+  // Wildcard conflicts with ALL fibers including CompletedPast(L).
+  if (a.kind == IterationFiber::Kind::Wildcard || b.kind == IterationFiber::Kind::Wildcard) {
+    return true;
   }
-  if (backend::FindBufferElementwiseRecipe(name)) {
-    return mode == BufferAccess::Write && !call->args_.empty() && operand == call->args_.back();
+  if (a.frame != b.frame) return true;
+  if (a.kind == IterationFiber::Kind::CompletedPast || b.kind == IterationFiber::Kind::CompletedPast) {
+    return false;
   }
-  if (backend::FindBufferConversionRecipe(name)) {
-    return mode == BufferAccess::Write;
+  if (a.kind == IterationFiber::Kind::ModularSlot && b.kind == IterationFiber::Kind::ModularSlot) {
+    return a.modulus != b.modulus || a.offset == b.offset;
+  }
+  if (a.kind == IterationFiber::Kind::AffineSlice && b.kind == IterationFiber::Kind::AffineSlice) {
+    if (a.slice_axis != b.slice_axis || a.coeff != b.coeff) return true;
+    return std::max(a.offset, b.offset) < std::min(a.offset + a.extent, b.offset + b.extent);
+  }
+  return true;
+}
+
+bool MustCoverFiber(const FiberKey& kill_fiber, const FiberKey& target_fiber) {
+  if (kill_fiber.kind == IterationFiber::Kind::Wildcard) return true;
+  if (target_fiber.kind == IterationFiber::Kind::Wildcard) return false;
+  if (kill_fiber.frame != target_fiber.frame) return false;
+  if (kill_fiber.kind == IterationFiber::Kind::ModularSlot &&
+      target_fiber.kind == IterationFiber::Kind::ModularSlot) {
+    return kill_fiber.modulus == target_fiber.modulus && kill_fiber.offset == target_fiber.offset;
+  }
+  if (kill_fiber.kind == IterationFiber::Kind::AffineSlice &&
+      target_fiber.kind == IterationFiber::Kind::AffineSlice) {
+    return kill_fiber.slice_axis == target_fiber.slice_axis && kill_fiber.coeff == target_fiber.coeff &&
+           kill_fiber.offset <= target_fiber.offset &&
+           (target_fiber.offset + target_fiber.extent) <= (kill_fiber.offset + kill_fiber.extent);
   }
   return false;
 }
 
-constexpr size_t kAllPipeLaneCount = kPhysicalPipeCount + 1;  // MTE1..FIX + ALL.
+FiberKey TransformFiberOnBackedge(MemorySpace space, size_t domain, const FiberKey& f, const ForStmt* loop,
+                                  const AffineDomainBoundsMap& bounds) {
+  if (f.kind == IterationFiber::Kind::Wildcard || f.frame != loop) return f;
+  if (f.kind == IterationFiber::Kind::CompletedPast) return f;
+  if (f.kind == IterationFiber::Kind::ModularSlot && f.modulus > 0) {
+    FiberKey next = f;
+    next.offset = ((f.offset - f.coeff) % f.modulus + f.modulus) % f.modulus;
+    return next;
+  }
+  if (f.kind == IterationFiber::Kind::AffineSlice && f.coeff != 0) {
+    const auto bit = bounds.find({space, domain, loop});
+    if (bit == bounds.end()) return FiberKey::Wildcard();
+    const __int128 next_off = __int128(f.offset) - f.coeff;
+    if (f.coeff > 0) {
+      if (next_off + f.extent <= bit->second.first) {
+        return {IterationFiber::Kind::CompletedPast, loop, 0, 0, 0, 0, 0};
+      }
+    } else {
+      if (next_off >= bit->second.second) {
+        return {IterationFiber::Kind::CompletedPast, loop, 0, 0, 0, 0, 0};
+      }
+    }
+    if (next_off < std::numeric_limits<int64_t>::min() || next_off > std::numeric_limits<int64_t>::max()) {
+      return FiberKey::Wildcard();
+    }
+    FiberKey next = f;
+    next.offset = static_cast<int64_t>(next_off);
+    return next;
+  }
+  return FiberKey::Wildcard();
+}
+
+FiberKey TransformFiberOnExit(const FiberKey& f, const ForStmt* loop) {
+  if (f.kind != IterationFiber::Kind::Wildcard && f.frame == loop) {
+    return FiberKey::Wildcard();
+  }
+  return f;
+}
 
 PipeMask LaneToMask(PipeType pipe) {
   const auto index = static_cast<size_t>(pipe);
@@ -167,17 +454,17 @@ size_t PopCount(PipeMask mask) {
 }
 
 // Pass 1 monotone state: tracks live (not cleanly overwritten) read/write pipes per
-// (MemorySpace, domain). Domain 0 represents unknown/wildcard storage within `space`.
+// (MemorySpace, domain, FiberKey). Domain 0 represents unknown/wildcard storage within `space`.
 class LiveStorageState {
  public:
   struct DomainLanes {
     PipeMask reads = 0;
     PipeMask writes = 0;
-    bool operator==(const DomainLanes& other) const {
-      return reads == other.reads && writes == other.writes;
-    }
+    bool operator==(const DomainLanes& other) const { return reads == other.reads && writes == other.writes; }
     bool operator!=(const DomainLanes& other) const { return !(*this == other); }
   };
+
+  using Key = std::tuple<MemorySpace, size_t, FiberKey>;
 
   bool MergeFrom(const LiveStorageState& other) {
     bool changed = false;
@@ -191,25 +478,38 @@ class LiveStorageState {
     return changed;
   }
 
-  size_t KillDomain(MemorySpace space, size_t domain) {
+  size_t KillDomain(MemorySpace space, size_t domain, const FiberKey& kill_fiber = FiberKey::Wildcard()) {
     if (domain == 0) return 0;  // Wildcard domain 0 cannot be safely killed.
-    const auto found = entries_.find({space, domain});
-    if (found == entries_.end()) return 0;
-    const size_t killed = PopCount(found->second.reads) + PopCount(found->second.writes);
-    entries_.erase(found);
+    size_t killed = 0;
+    for (auto it = entries_.lower_bound({space, domain, FiberKey{}});
+         it != entries_.end() && std::get<0>(it->first) == space && std::get<1>(it->first) == domain;) {
+      if (MustCoverFiber(kill_fiber, std::get<2>(it->first))) {
+        killed += PopCount(it->second.reads) + PopCount(it->second.writes);
+        it = entries_.erase(it);
+      } else {
+        ++it;
+      }
+    }
     return killed;
   }
 
-  size_t CountDomain(MemorySpace space, size_t domain) const {
-    const auto found = entries_.find({space, domain});
-    if (found == entries_.end()) return 0;
-    return PopCount(found->second.reads) + PopCount(found->second.writes);
+  size_t CountDomain(MemorySpace space, size_t domain,
+                     const FiberKey& kill_fiber = FiberKey::Wildcard()) const {
+    if (domain == 0) return 0;
+    size_t count = 0;
+    for (auto it = entries_.lower_bound({space, domain, FiberKey{}});
+         it != entries_.end() && std::get<0>(it->first) == space && std::get<1>(it->first) == domain; ++it) {
+      if (MustCoverFiber(kill_fiber, std::get<2>(it->first))) {
+        count += PopCount(it->second.reads) + PopCount(it->second.writes);
+      }
+    }
+    return count;
   }
 
   void AddEffects(const ConservativeAccessSet& added) {
     for (const auto& fact : added) {
       const auto& [space, pipe, write, domain] = fact;
-      auto& dst = entries_[{space, domain}];
+      auto& dst = entries_[{space, domain, FiberKey::Wildcard()}];
       const PipeMask bit = LaneToMask(pipe);
       if (write) {
         dst.writes |= bit;
@@ -219,22 +519,69 @@ class LiveStorageState {
     }
   }
 
-  std::set<PipeType> QueryConflicts(const ConservativeAccessFact& consumer, ConservativeSyncCost& cost) const {
-    ++cost.conflict_queries;
+  void AddEffects(const std::vector<SiteEffectFiber>& added) {
+    for (const auto& eff : added) {
+      auto& dst = entries_[{eff.space, eff.domain, eff.fiber}];
+      const PipeMask bit = LaneToMask(eff.pipe);
+      if (eff.write) {
+        dst.writes |= bit;
+      } else {
+        dst.reads |= bit;
+      }
+    }
+  }
+
+  void ApplyLoopBackedge(const ForStmt* loop, const AffineDomainBoundsMap& bounds) {
+    std::map<Key, DomainLanes> next;
+    for (const auto& [key, lanes] : entries_) {
+      const auto& [space, domain, fiber] = key;
+      const FiberKey nf = TransformFiberOnBackedge(space, domain, fiber, loop, bounds);
+      auto& dst = next[{space, domain, nf}];
+      dst.reads |= lanes.reads;
+      dst.writes |= lanes.writes;
+    }
+    entries_ = std::move(next);
+  }
+
+  void ApplyLoopExit(const ForStmt* loop) {
+    std::map<Key, DomainLanes> next;
+    for (const auto& [key, lanes] : entries_) {
+      const auto& [space, domain, fiber] = key;
+      const FiberKey nf = TransformFiberOnExit(fiber, loop);
+      auto& dst = next[{space, domain, nf}];
+      dst.reads |= lanes.reads;
+      dst.writes |= lanes.writes;
+    }
+    entries_ = std::move(next);
+  }
+
+  std::set<PipeType> QueryConflicts(const ConservativeAccessFact& consumer,
+                                    ConservativeSyncCost& cost) const {
     const auto& [space, destination, write, domain] = consumer;
-    (void)destination;
+    return QueryConflicts(SiteEffectFiber{space, destination, write, domain, FiberKey::Wildcard()}, cost);
+  }
+
+  std::set<PipeType> QueryConflicts(const SiteEffectFiber& consumer, ConservativeSyncCost& cost) const {
+    ++cost.conflict_queries;
     std::set<PipeType> result;
     const auto collect = [&](const DomainLanes& lanes) {
       AppendPipeMaskToSet(lanes.writes, result);
-      if (write) AppendPipeMaskToSet(lanes.reads, result);
+      if (consumer.write) AppendPipeMaskToSet(lanes.reads, result);
     };
-    if (domain == 0) {
-      auto it = entries_.lower_bound({space, 0});
-      for (; it != entries_.end() && it->first.first == space; ++it) collect(it->second);
+    if (consumer.domain == 0) {
+      for (auto it = entries_.lower_bound({consumer.space, 0, FiberKey{}});
+           it != entries_.end() && std::get<0>(it->first) == consumer.space; ++it) {
+        collect(it->second);
+      }
     } else {
-      for (const size_t candidate : {size_t{0}, domain}) {
-        if (const auto found = entries_.find({space, candidate}); found != entries_.end()) {
-          collect(found->second);
+      for (const size_t candidate : {size_t{0}, consumer.domain}) {
+        for (auto it = entries_.lower_bound({consumer.space, candidate, FiberKey{}});
+             it != entries_.end() && std::get<0>(it->first) == consumer.space &&
+             std::get<1>(it->first) == candidate;
+             ++it) {
+          if (candidate == 0 || FibersConflict(std::get<2>(it->first), consumer.fiber)) {
+            collect(it->second);
+          }
         }
       }
     }
@@ -244,7 +591,8 @@ class LiveStorageState {
   ConservativeAccessSet ToAccessSet() const {
     ConservativeAccessSet result;
     for (const auto& [key, lanes] : entries_) {
-      const auto& [space, domain] = key;
+      const auto& [space, domain, fiber] = key;
+      (void)fiber;
       for (size_t index = 0; index < kAllPipeLaneCount; ++index) {
         const PipeMask bit = PipeMask{1} << index;
         const auto pipe = static_cast<PipeType>(index);
@@ -267,11 +615,11 @@ class LiveStorageState {
   bool operator!=(const LiveStorageState& other) const { return entries_ != other.entries_; }
 
  private:
-  std::map<std::pair<MemorySpace, size_t>, DomainLanes> entries_;
+  std::map<Key, DomainLanes> entries_;
 };
 
 // Pass 2 sparse delivery-debt lattice (Draft Section 6.4.2-6.4.3).
-// Tracks pending completion masks per (space, domain, write, origin_pipe). A set bit `d`
+// Tracks pending completion masks per (space, domain, write, origin_pipe, fiber). A set bit `d`
 // indicates that the event on `origin_pipe` is not yet guaranteed ordered before pipe `d`.
 // Absent entries carry zero pending debts.
 struct DebtKey {
@@ -279,12 +627,15 @@ struct DebtKey {
   size_t domain;
   bool write;
   PipeType src;
+  FiberKey fiber;
 
   bool operator<(const DebtKey& other) const {
-    return std::tie(space, domain, write, src) < std::tie(other.space, other.domain, other.write, other.src);
+    return std::tie(space, domain, write, src, fiber) <
+           std::tie(other.space, other.domain, other.write, other.src, other.fiber);
   }
   bool operator==(const DebtKey& other) const {
-    return space == other.space && domain == other.domain && write == other.write && src == other.src;
+    return space == other.space && domain == other.domain && write == other.write && src == other.src &&
+           fiber == other.fiber;
   }
 };
 
@@ -357,36 +708,55 @@ class DebtState {
     }
   }
 
-  void KillDomain(MemorySpace space, size_t domain) {
+  void KillDomain(MemorySpace space, size_t domain, const FiberKey& kill_fiber = FiberKey::Wildcard()) {
     if (domain == 0) return;
-    for (auto it = pending_.lower_bound({space, domain, false, PipeType::MTE1});
+    for (auto it = pending_.lower_bound({space, domain, false, PipeType::MTE1, FiberKey{}});
          it != pending_.end() && it->first.space == space && it->first.domain == domain;) {
-      it = pending_.erase(it);
+      if (MustCoverFiber(kill_fiber, it->first.fiber)) {
+        it = pending_.erase(it);
+      } else {
+        ++it;
+      }
     }
   }
 
   void AddEffects(const ConservativeAccessSet& added, const CompletionSummary* summary = nullptr) {
     for (const auto& fact : added) {
       const auto& [space, pipe, write, domain] = fact;
-      if (pipe == PipeType::ALL) continue;
-      const PipeMask pipe_bit = PipeToMask(pipe);
-      PipeMask initial = kAllPhysicalPipesMask;
-      if (summary != nullptr) {
-        const size_t idx = static_cast<size_t>(pipe);
-        if (idx < kPhysicalPipeCount) {
-          // Keep self-pipe bit unless intra-pipe ordering is guaranteed; clear strict safe destinations.
-          initial &= ~(summary->post_write_safe[idx] & ~pipe_bit);
-        }
-      }
-      if (initial != 0) {
-        pending_[{space, domain, write, pipe}] |= initial;
-      }
+      AddOneEffect(space, pipe, write, domain, FiberKey::Wildcard(), summary);
     }
+  }
+
+  void AddEffects(const std::vector<SiteEffectFiber>& added, const CompletionSummary* summary = nullptr) {
+    for (const auto& eff : added) {
+      AddOneEffect(eff.space, eff.pipe, eff.write, eff.domain, eff.fiber, summary);
+    }
+  }
+
+  void ApplyLoopBackedge(const ForStmt* loop, const AffineDomainBoundsMap& bounds) {
+    std::map<DebtKey, PipeMask> next;
+    for (const auto& [key, mask] : pending_) {
+      DebtKey nk = key;
+      nk.fiber = TransformFiberOnBackedge(key.space, key.domain, key.fiber, loop, bounds);
+      next[nk] |= mask;
+    }
+    pending_ = std::move(next);
+  }
+
+  void ApplyLoopExit(const ForStmt* loop) {
+    std::map<DebtKey, PipeMask> next;
+    for (const auto& [key, mask] : pending_) {
+      DebtKey nk = key;
+      nk.fiber = TransformFiberOnExit(key.fiber, loop);
+      next[nk] |= mask;
+    }
+    pending_ = std::move(next);
   }
 
   // Returns true iff every pending debt from `source` that conflicts with `site_effects`
   // is already guaranteed complete at `probe`.
-  bool CoversConflicts(PipeType source, PipeType probe, const ConservativeAccessSet& site_effects) const {
+  bool CoversConflicts(PipeType source, PipeType probe,
+                       const std::vector<SiteEffectFiber>& site_effects) const {
     const PipeMask probe_mask = PipeToMask(probe);
     if (probe_mask == 0) return false;
     for (const auto& [key, mask] : pending_) {
@@ -398,7 +768,7 @@ class DebtState {
   }
 
   std::vector<PipeType> Select(const std::vector<PipeType>& required, PipeType destination,
-                               const ConservativeAccessSet& site_effects) const {
+                               const std::vector<SiteEffectFiber>& site_effects) const {
     const size_t count = required.size();
     std::vector<bool> base(count);
     std::vector<std::vector<bool>> coverage(count, std::vector<bool>(count));
@@ -420,13 +790,31 @@ class DebtState {
   bool operator!=(const DebtState& other) const { return pending_ != other.pending_; }
 
  private:
-  static bool ConflictsAny(const DebtKey& key, const ConservativeAccessSet& site_effects) {
-    for (const auto& fact : site_effects) {
-      const auto& [c_space, c_pipe, c_write, c_domain] = fact;
-      (void)c_pipe;
-      if (c_space != key.space) continue;
-      if (!key.write && !c_write) continue;
-      if (key.domain == 0 || c_domain == 0 || key.domain == c_domain) return true;
+  void AddOneEffect(MemorySpace space, PipeType pipe, bool write, size_t domain, const FiberKey& fiber,
+                    const CompletionSummary* summary) {
+    if (pipe == PipeType::ALL) return;
+    const PipeMask pipe_bit = PipeToMask(pipe);
+    PipeMask initial = kAllPhysicalPipesMask;
+    if (summary != nullptr) {
+      const size_t idx = static_cast<size_t>(pipe);
+      if (idx < kPhysicalPipeCount) {
+        // Keep self-pipe bit unless intra-pipe ordering is guaranteed; clear strict safe destinations.
+        initial &= ~(summary->post_write_safe[idx] & ~pipe_bit);
+      }
+    }
+    if (initial != 0) {
+      pending_[{space, domain, write, pipe, fiber}] |= initial;
+    }
+  }
+
+  static bool ConflictsAny(const DebtKey& key, const std::vector<SiteEffectFiber>& site_effects) {
+    for (const auto& eff : site_effects) {
+      if (eff.space != key.space) continue;
+      if (!key.write && !eff.write) continue;
+      if (key.domain == 0 || eff.domain == 0 ||
+          (key.domain == eff.domain && FibersConflict(key.fiber, eff.fiber))) {
+        return true;
+      }
     }
     return false;
   }
@@ -435,11 +823,12 @@ class DebtState {
 };
 
 struct CfgVertex {
-  enum class Kind { Nop, Site, Child, BranchMerge };
+  enum class Kind { Nop, Site, Child, BranchMerge, LoopBackedge, LoopExit };
   Kind kind = Kind::Nop;
   size_t index = 0;
   std::vector<size_t> preds;
   std::vector<size_t> succs;
+  const ForStmt* loop = nullptr;
 };
 
 struct End {
@@ -453,10 +842,12 @@ class Builder {
   Builder(const FunctionPtr& function, std::string target,
           const std::vector<std::shared_ptr<const NativeSyncChild>>& retained,
           const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful,
-          bool retain_incoming_diagnostics, bool enable_refresh_kill)
+          bool retain_incoming_diagnostics, bool enable_refresh_kill, const SyncParameterBounds& parameters,
+          const std::optional<std::pair<int64_t, int64_t>>& blocks)
       : function_(function),
         target_(std::move(target)),
-        placement_(function),
+        trip_prover_(function, parameters, blocks),
+        resolver_(function, &trip_prover_, /*run_scalar_layout_check=*/true, target_),
         retain_incoming_diagnostics_(retain_incoming_diagnostics),
         enable_refresh_kill_(enable_refresh_kill) {
     const auto* context = PassContext::Current();
@@ -484,20 +875,67 @@ class Builder {
     for (const auto& child : eventful) {
       CHECK(child) << "Conservative synchronization: missing eventful child certificate";
       child->ValidateFor(function, target_);
-      CHECK(child_index_.emplace(child->Scope().get(), children.size()).second)
-          << "Conservative synchronization: duplicate retained child scope";
-      children.push_back({child->Scope(), {}, {}, {}, child, {}, CompletionSummary::Identity()});
+      const size_t child_idx = children.size();
+      if (child->IsSubblock()) {
+        window_slices_by_seq_[child->WindowSeq().get()].push_back(
+            {child->WindowBegin(), child->WindowEnd(), child_idx});
+        children.push_back({child->Scope(),
+                            {},
+                            {},
+                            {},
+                            child,
+                            {},
+                            CompletionSummary::Identity(),
+                            false,
+                            child->WindowSeq(),
+                            child->WindowBegin(),
+                            child->WindowEnd(),
+                            std::nullopt});
+      } else {
+        CHECK(child_index_.emplace(child->Scope().get(), child_idx).second)
+            << "Conservative synchronization: duplicate retained child scope";
+        children.push_back({child->Scope(), {}, {}, {}, child, {}, CompletionSummary::Identity()});
+      }
     }
   }
 
-  CompletionSummary ComputeEventfulCompletionSummary(const ConservativeSyncChildEntry& entry) const {
+  void RegisterInlineSubblocks(const std::vector<InlineExactSubBlock>& inline_subblocks) {
+    for (const auto& block : inline_subblocks) {
+      const size_t child_idx = children.size();
+      window_slices_by_seq_[block.window_seq.get()].push_back(
+          {block.window_begin, block.window_end, child_idx});
+      children.push_back({nullptr,
+                          {},
+                          {},
+                          {},
+                          nullptr,
+                          {},
+                          block.completion,
+                          false,
+                          block.window_seq,
+                          block.window_begin,
+                          block.window_end,
+                          block});
+    }
+    for (auto& [seq, slices] : window_slices_by_seq_) {
+      std::sort(slices.begin(), slices.end(),
+                [](const SliceWindow& a, const SliceWindow& b) { return a.begin < b.begin; });
+      for (size_t i = 1; i < slices.size(); ++i) {
+        CHECK(slices[i - 1].end <= slices[i].begin)
+            << "Conservative synchronization: overlapping sub-block slices";
+      }
+    }
+  }
+
+  static CompletionSummary ComputeRecipeCompletionSummary(const StmtPtr& recipe, FunctionType func_type,
+                                                          const std::string& target,
+                                                          const PipeMask base_active,
+                                                          const ForStmt* child_scope,
+                                                          const SyncControlRangeProver* trip_prover) {
     CompletionSummary base = CompletionSummary::Identity();
     base.has_bypass_path = true;
-    for (const auto& fact : entry.effects) {
-      const PipeType pipe = std::get<1>(fact);
-      if (pipe != PipeType::ALL) base.active |= PipeToMask(pipe);
-    }
-    if (!entry.eventful || !entry.eventful->LogicalRecipe()) return base;
+    base.active = base_active;
+    if (!recipe) return base;
 
     std::vector<CompletionVertex> vertices;
     std::vector<std::pair<size_t, size_t>> edges;
@@ -526,9 +964,9 @@ class Builder {
 
     auto emit_payload = [&](const CallPtr& call, size_t cur) -> size_t {
       if (!call || GetLogicalSyncKind(call->op_) != LogicalSyncKind::None ||
-          backend::QualifyBufferSyncNonPayload(call, target_))
+          backend::QualifyBufferSyncNonPayload(call, target))
         return cur;
-      const auto op = backend::QualifyBufferSyncOperation(call, function_->func_type_, target_);
+      const auto op = backend::QualifyBufferSyncOperation(call, func_type, target);
       const PipeMask mask = PipeToMask(op.Implementation().Pipe());
       if (mask == 0) return cur;
       written_pipes |= mask;
@@ -538,6 +976,15 @@ class Builder {
       const size_t v = new_vertex(std::move(op_v));
       edges.emplace_back(cur, v);
       return v;
+    };
+
+    auto is_const_unit_trip = [](const ForStmt* loop) -> bool {
+      if (!loop || loop->kind_ != ForKind::Sequential) return false;
+      const auto start = As<ConstInt>(loop->start_);
+      const auto stop = As<ConstInt>(loop->stop_);
+      const auto step = As<ConstInt>(loop->step_);
+      return start && stop && step && step->value_ > 0 && stop->value_ > start->value_ &&
+             (__int128(stop->value_) - start->value_) <= step->value_;
     };
 
     std::function<size_t(const StmtPtr&, size_t)> build = [&](const StmtPtr& stmt, size_t cur) -> size_t {
@@ -573,6 +1020,19 @@ class Builder {
         return merge;
       }
       if (const auto loop = As<ForStmt>(stmt)) {
+        const bool is_child_root = loop->HasAttr(kClosedSyncChildAttr);
+        const bool unit_const = is_const_unit_trip(loop.get());
+        const bool positive_trip =
+            unit_const ||
+            (trip_prover && ((is_child_root && child_scope && trip_prover->IsPositiveTrip(child_scope)) ||
+                             trip_prover->IsPositiveTripCompatible(loop.get())));
+        const bool exact_one_trip =
+            is_child_root &&
+            (unit_const || (trip_prover && child_scope && trip_prover->IsPositiveTrip(child_scope) &&
+                            trip_prover->IsAtMostOneTrip(child_scope)));
+        if (exact_one_trip) {
+          return build(loop->body_, cur);
+        }
         const auto saved_tokens = local_tokens;
         const PipeMask outer_written = written_pipes;
         written_pipes = 0;
@@ -585,7 +1045,7 @@ class Builder {
         local_tokens = saved_tokens;
         for (auto& [tok, tok_mask] : local_tokens) tok_mask &= ~loop_written;
         written_pipes = outer_written | loop_written;
-        return hdr;
+        return positive_trip ? body_exit : hdr;
       }
       if (const auto loop = As<WhileStmt>(stmt)) {
         const auto saved_tokens = local_tokens;
@@ -664,7 +1124,7 @@ class Builder {
       return cur;
     };
 
-    const size_t tail = build(entry.eventful->LogicalRecipe(), entry_v);
+    const size_t tail = build(recipe, entry_v);
     const size_t exit_v = new_vertex(CompletionVertex{});
     edges.emplace_back(tail, exit_v);
     auto summary = SolveCompletionTransfer(vertices, edges, entry_v, exit_v).summary;
@@ -678,12 +1138,35 @@ class Builder {
     return summary;
   }
 
+  CompletionSummary ComputeEventfulCompletionSummary(const ConservativeSyncChildEntry& entry) const {
+    PipeMask base_active = 0;
+    for (const auto& fact : entry.effects) {
+      const PipeType pipe = std::get<1>(fact);
+      if (pipe != PipeType::ALL) base_active |= PipeToMask(pipe);
+    }
+    const StmtPtr recipe = entry.inline_subblock
+                               ? entry.inline_subblock->spliced_seq
+                               : (entry.eventful ? entry.eventful->LogicalRecipe() : StmtPtr{});
+    return ComputeRecipeCompletionSummary(recipe, function_->func_type_, target_, base_active,
+                                          entry.scope.get(), &trip_prover_);
+  }
+
   void Build() {
     Read(function_->body_);
     RefineStorage();
-    for (auto& child : children) {
-      CHECK(seen_children_.count(child.scope.get()) != 0) << "Retained child is outside the original semantic input";
-      CollectChildEffects(child.scope, child.effects);
+    for (size_t idx = 0; idx < children.size(); ++idx) {
+      auto& child = children[idx];
+      if (child.IsSubblockSlice()) {
+        CHECK(seen_slice_children_.count(idx) != 0)
+            << "Retained sub-block child is outside the original semantic input";
+        for (size_t k = child.window_begin; k < child.window_end; ++k) {
+          CollectChildEffects(child.window_seq->stmts_[k], child.effects);
+        }
+      } else {
+        CHECK(seen_children_.count(child.scope.get()) != 0)
+            << "Retained child is outside the original semantic input";
+        CollectChildEffects(child.scope, child.effects);
+      }
       child.completion = ComputeEventfulCompletionSummary(child);
     }
   }
@@ -761,7 +1244,27 @@ class Builder {
     }
     if (const auto seq = As<SeqStmts>(statement)) {
       size_t cur = entry;
-      for (const auto& child : seq->stmts_) cur = BuildSubCfg(child, cur, cfg);
+      const auto wit = window_slices_by_seq_.find(seq.get());
+      if (wit == window_slices_by_seq_.end() || wit->second.empty()) {
+        for (const auto& child : seq->stmts_) cur = BuildSubCfg(child, cur, cfg);
+        return cur;
+      }
+      const auto& slices = wit->second;
+      size_t slice_idx = 0;
+      size_t i = 0;
+      while (i < seq->stmts_.size()) {
+        if (slice_idx < slices.size() && i == slices[slice_idx].begin) {
+          const size_t node = cfg.size();
+          cfg.push_back({CfgVertex::Kind::Child, slices[slice_idx].child_idx, {}, {}});
+          AddCfgEdge(cfg, cur, node);
+          cur = node;
+          i = slices[slice_idx].end;
+          ++slice_idx;
+        } else {
+          cur = BuildSubCfg(seq->stmts_[i], cur, cfg);
+          ++i;
+        }
+      }
       return cur;
     }
     if (const auto branch = As<IfStmt>(statement)) {
@@ -774,26 +1277,48 @@ class Builder {
       return merge;
     }
     if (const auto loop = As<ForStmt>(statement)) {
+      const bool positive = trip_prover_.IsPositiveTrip(loop.get());
+      const bool at_most_one = trip_prover_.IsAtMostOneTrip(loop.get());
+      const bool has_fibers = loops_with_fibers_.count(loop.get()) != 0;
+      auto wrap_exit = [&](size_t exit_node) -> size_t {
+        if (!has_fibers) return exit_node;
+        const size_t exit_v = cfg.size();
+        cfg.push_back({CfgVertex::Kind::LoopExit, 0, {}, {}, loop.get()});
+        AddCfgEdge(cfg, exit_node, exit_v);
+        return exit_v;
+      };
+      if (!As<ConstInt>(loop->start_) && at_most_one) {
+        if (positive) {
+          return wrap_exit(BuildSubCfg(loop->body_, entry, cfg));
+        }
+        const size_t body_exit = BuildSubCfg(loop->body_, entry, cfg);
+        const size_t merge = cfg.size();
+        cfg.push_back({CfgVertex::Kind::BranchMerge, 0, {}, {}});
+        AddCfgEdge(cfg, entry, merge);
+        AddCfgEdge(cfg, body_exit, merge);
+        return wrap_exit(merge);
+      }
       if (IsSpmdAtMostOneTripFor(loop, ssa_defs_)) {
         const size_t body_exit = BuildSubCfg(loop->body_, entry, cfg);
         const size_t merge = cfg.size();
         cfg.push_back({CfgVertex::Kind::BranchMerge, 0, {}, {}});
         AddCfgEdge(cfg, entry, merge);
         AddCfgEdge(cfg, body_exit, merge);
-        return merge;
+        return wrap_exit(merge);
       }
       const size_t header = cfg.size();
       cfg.push_back({CfgVertex::Kind::Nop, 0, {}, {}});
       AddCfgEdge(cfg, entry, header);
       const size_t body_exit = BuildSubCfg(loop->body_, header, cfg);
-      AddCfgEdge(cfg, body_exit, header);
-      const auto start = As<ConstInt>(loop->start_);
-      const auto stop = As<ConstInt>(loop->stop_);
-      const auto step = As<ConstInt>(loop->step_);
-      if (start && stop && step && step->value_ > 0 && stop->value_ > start->value_) {
-        return body_exit;
+      if (has_fibers) {
+        const size_t backedge = cfg.size();
+        cfg.push_back({CfgVertex::Kind::LoopBackedge, 0, {}, {}, loop.get()});
+        AddCfgEdge(cfg, body_exit, backedge);
+        AddCfgEdge(cfg, backedge, header);
+      } else {
+        AddCfgEdge(cfg, body_exit, header);
       }
-      return header;
+      return wrap_exit(positive ? body_exit : header);
     }
     if (const auto loop = As<WhileStmt>(statement)) {
       const size_t header = cfg.size();
@@ -835,43 +1360,97 @@ class Builder {
 
   LiveStorageState TransferLiveStorage(const CfgVertex& vertex, LiveStorageState state) const {
     if (vertex.kind == CfgVertex::Kind::Site) {
-      const auto& site = sites[vertex.index];
       if (enable_refresh_kill_) {
-        for (const auto& [space, domain] : site.refreshed_domains) state.KillDomain(space, domain);
+        for (const auto& [space, domain, kill_fiber] : site_refresh_fibers_[vertex.index]) {
+          state.KillDomain(space, domain, kill_fiber);
+        }
       }
-      state.AddEffects(site.effects);
+      state.AddEffects(site_effect_fibers_[vertex.index]);
     } else if (vertex.kind == CfgVertex::Kind::Child) {
       state.AddEffects(children[vertex.index].effects);
+    } else if (vertex.kind == CfgVertex::Kind::LoopBackedge && vertex.loop) {
+      state.ApplyLoopBackedge(vertex.loop, affine_domain_bounds_);
+    } else if (vertex.kind == CfgVertex::Kind::LoopExit && vertex.loop) {
+      state.ApplyLoopExit(vertex.loop);
     }
     return state;
+  }
+
+  std::vector<uint64_t> ComputeReachingChildDirs(const std::vector<CfgVertex>& cfg) const {
+    const size_t n = cfg.size();
+    std::vector<uint64_t> reaching_child_dirs(n, 0);
+    std::queue<size_t> q;
+    for (size_t w = 0; w < n; ++w) {
+      if (cfg[w].kind != CfgVertex::Kind::Child) continue;
+      const auto& w_entry = children[cfg[w].index];
+      // InlineExactSubBlock (`eventful == nullptr`) uses parent IDs, never a private child palette.
+      if (!w_entry.eventful) continue;
+      uint64_t mask = 0;
+      for (const auto& dir : w_entry.eventful->RearmDirections()) {
+        mask |= SyncDirectionBit(dir.second, dir.first);
+      }
+      if (mask == 0) continue;
+      for (const size_t nxt : cfg[w].succs) {
+        const uint64_t before = reaching_child_dirs[nxt];
+        reaching_child_dirs[nxt] |= mask;
+        if (reaching_child_dirs[nxt] != before) q.push(nxt);
+      }
+    }
+    while (!q.empty()) {
+      const size_t x = q.front();
+      q.pop();
+      const uint64_t mask = reaching_child_dirs[x];
+      for (const size_t nxt : cfg[x].succs) {
+        const uint64_t before = reaching_child_dirs[nxt];
+        reaching_child_dirs[nxt] |= mask;
+        if (reaching_child_dirs[nxt] != before) q.push(nxt);
+      }
+    }
+    return reaching_child_dirs;
+  }
+
+  static bool CfgNodeReachesSelf(const std::vector<CfgVertex>& cfg, size_t target) {
+    std::vector<bool> visited(cfg.size(), false);
+    std::queue<size_t> q;
+    for (const size_t nxt : cfg[target].succs) {
+      if (nxt == target) return true;
+      if (!visited[nxt]) {
+        visited[nxt] = true;
+        q.push(nxt);
+      }
+    }
+    while (!q.empty()) {
+      const size_t u = q.front();
+      q.pop();
+      for (const size_t nxt : cfg[u].succs) {
+        if (nxt == target) return true;
+        if (!visited[nxt]) {
+          visited[nxt] = true;
+          q.push(nxt);
+        }
+      }
+    }
+    return false;
+  }
+
+  static uint64_t CollectRearmServices(const ConservativeSyncChildEntry& entry, uint64_t reaching_mask,
+                                       std::set<std::pair<PipeType, PipeType>>& services) {
+    if (!entry.eventful) return 0;
+    uint64_t conflict = 0;
+    for (const auto& dir : entry.eventful->RearmDirections()) {
+      const uint64_t bit = SyncDirectionBit(dir.second, dir.first);
+      if ((reaching_mask & bit) != 0) {
+        services.insert(dir);
+        conflict |= bit;
+      }
+    }
+    return conflict;
   }
 
   ConservativeAccessSet SolveAcyclic(const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo,
                                      size_t cfg_exit) {
     const size_t n = cfg.size();
-    std::vector<bool> has_reaching_child(n, false);
-    {
-      std::queue<size_t> q;
-      for (size_t w = 0; w < n; ++w) {
-        if (cfg[w].kind != CfgVertex::Kind::Child) continue;
-        for (const size_t nxt : cfg[w].succs) {
-          if (!has_reaching_child[nxt]) {
-            has_reaching_child[nxt] = true;
-            q.push(nxt);
-          }
-        }
-      }
-      while (!q.empty()) {
-        const size_t x = q.front();
-        q.pop();
-        for (const size_t nxt : cfg[x].succs) {
-          if (!has_reaching_child[nxt]) {
-            has_reaching_child[nxt] = true;
-            q.push(nxt);
-          }
-        }
-      }
-    }
+    const std::vector<uint64_t> reaching_child_dirs = ComputeReachingChildDirs(cfg);
 
     // Pass 1: Fused live-storage transfer and conflict extraction with immediate
     // predecessor state release so straight-line sequences hold O(1) active maps.
@@ -916,10 +1495,8 @@ class Builder {
             services.emplace(source, std::get<1>(effect));
           }
         }
-        entry.first_visit = !has_reaching_child[u];
-        if (has_reaching_child[u] && entry.eventful) {
-          for (const auto& dir : entry.eventful->RearmDirections()) services.insert(dir);
-        }
+        const uint64_t rearm_conflicts = CollectRearmServices(entry, reaching_child_dirs[u], services);
+        entry.first_visit = (rearm_conflicts == 0);
         entry.services.assign(services.begin(), services.end());
         entry.required_services = entry.services;
         cost.baseline_services += services.size();
@@ -946,13 +1523,13 @@ class Builder {
           cost.incoming_diagnostic_facts += site.incoming.size();
         }
         if (enable_refresh_kill_) {
-          for (const auto& [space, domain] : site.refreshed_domains) {
-            cost.killed_facts += in_u.CountDomain(space, domain);
+          for (const auto& [space, domain, kill_fiber] : site_refresh_fibers_[v.index]) {
+            cost.killed_facts += in_u.CountDomain(space, domain, kill_fiber);
           }
         }
         std::set<PipeType> sources;
-        for (const auto& effect : site.effects) {
-          const auto conflicting = in_u.QueryConflicts(effect, cost);
+        for (const auto& eff : site_effect_fibers_[v.index]) {
+          const auto conflicting = in_u.QueryConflicts(eff, cost);
           sources.insert(conflicting.begin(), conflicting.end());
         }
         site.required_source_pipes.assign(sources.begin(), sources.end());
@@ -996,13 +1573,14 @@ class Builder {
       } else if (v.kind == CfgVertex::Kind::Site) {
         auto& site = sites[v.index];
         const auto destination = site.operation.Implementation().Pipe();
-        site.source_pipes = cur_in.Select(site.required_source_pipes, destination, site.effects);
+        const auto& effs = site_effect_fibers_[v.index];
+        site.source_pipes = cur_in.Select(site.required_source_pipes, destination, effs);
         PipeMask sources_mask = 0;
         for (const auto source : site.source_pipes) sources_mask |= PipeToMask(source);
         cur_in.DeliverSources(sources_mask, destination);
         std::vector<PipeType> missing;
         for (const auto req : site.required_source_pipes) {
-          if (!cur_in.CoversConflicts(req, destination, site.effects)) missing.push_back(req);
+          if (!cur_in.CoversConflicts(req, destination, effs)) missing.push_back(req);
         }
         if (!missing.empty()) {
           std::set<PipeType> unioned(site.source_pipes.begin(), site.source_pipes.end());
@@ -1024,7 +1602,7 @@ class Builder {
         INTERNAL_CHECK(next == site.source_pipes.size())
             << "Internal error: conservative service selection added or reordered a service";
         for (const auto source : site.required_source_pipes) {
-          INTERNAL_CHECK(cur_in.CoversConflicts(source, destination, site.effects))
+          INTERNAL_CHECK(cur_in.CoversConflicts(source, destination, effs))
               << "Internal error: conservative service selection omits a payload prerequisite";
         }
         const size_t omitted = site.required_source_pipes.size() - site.source_pipes.size();
@@ -1032,12 +1610,14 @@ class Builder {
         cost.suppressed_services += omitted;
         cost.services += site.source_pipes.size();
         if (enable_refresh_kill_) {
-          for (const auto& [space, domain] : site.refreshed_domains) cur_in.KillDomain(space, domain);
+          for (const auto& [space, domain, kill_fiber] : site_refresh_fibers_[v.index]) {
+            cur_in.KillDomain(space, domain, kill_fiber);
+          }
         }
-        cur_in.AddEffects(site.effects);
+        cur_in.AddEffects(effs);
         debt_out[u] = std::move(cur_in);
       } else {
-        debt_out[u] = std::move(cur_in);
+        debt_out[u] = TransferDebt(v, std::move(cur_in), /*use_selected=*/true);
       }
       if (rem_succs[u] == 0) debt_out[u] = DebtState{};
     }
@@ -1047,8 +1627,8 @@ class Builder {
   }
 
   void SolveLiveStorage(const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo,
-                        const std::vector<size_t>& rpo_pos, size_t entry, std::vector<LiveStorageState>& live_in,
-                        std::vector<LiveStorageState>& live_out) {
+                        const std::vector<size_t>& rpo_pos, size_t entry,
+                        std::vector<LiveStorageState>& live_in, std::vector<LiveStorageState>& live_out) {
     const size_t n = cfg.size();
     live_in.assign(n, LiveStorageState{});
     live_out.assign(n, LiveStorageState{});
@@ -1101,29 +1681,7 @@ class Builder {
   void ExtractSourcePipeServices(const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo,
                                  const std::vector<LiveStorageState>& live_in,
                                  const std::vector<LiveStorageState>& live_out) {
-    std::vector<bool> has_reaching_child(cfg.size(), false);
-    {
-      std::queue<size_t> q;
-      for (size_t w = 0; w < cfg.size(); ++w) {
-        if (cfg[w].kind != CfgVertex::Kind::Child) continue;
-        for (const size_t nxt : cfg[w].succs) {
-          if (!has_reaching_child[nxt]) {
-            has_reaching_child[nxt] = true;
-            q.push(nxt);
-          }
-        }
-      }
-      while (!q.empty()) {
-        const size_t x = q.front();
-        q.pop();
-        for (const size_t nxt : cfg[x].succs) {
-          if (!has_reaching_child[nxt]) {
-            has_reaching_child[nxt] = true;
-            q.push(nxt);
-          }
-        }
-      }
-    }
+    const std::vector<uint64_t> reaching_child_dirs = ComputeReachingChildDirs(cfg);
     ConservativeAccessSet tracked_facts;
     for (const size_t u : rpo) {
       const auto& v = cfg[u];
@@ -1149,10 +1707,8 @@ class Builder {
             services.emplace(source, std::get<1>(effect));
           }
         }
-        entry.first_visit = !has_reaching_child[u];
-        if (has_reaching_child[u] && entry.eventful) {
-          for (const auto& dir : entry.eventful->RearmDirections()) services.insert(dir);
-        }
+        const uint64_t rearm_conflicts = CollectRearmServices(entry, reaching_child_dirs[u], services);
+        entry.first_visit = (rearm_conflicts == 0) && !CfgNodeReachesSelf(cfg, u);
         entry.services.assign(services.begin(), services.end());
         entry.required_services = entry.services;
         cost.baseline_services += services.size();
@@ -1181,13 +1737,13 @@ class Builder {
           cost.incoming_diagnostic_facts += site.incoming.size();
         }
         if (enable_refresh_kill_) {
-          for (const auto& [space, domain] : site.refreshed_domains) {
-            cost.killed_facts += live_in[u].CountDomain(space, domain);
+          for (const auto& [space, domain, kill_fiber] : site_refresh_fibers_[v.index]) {
+            cost.killed_facts += live_in[u].CountDomain(space, domain, kill_fiber);
           }
         }
         std::set<PipeType> sources;
-        for (const auto& effect : site.effects) {
-          const auto conflicting = live_in[u].QueryConflicts(effect, cost);
+        for (const auto& eff : site_effect_fibers_[v.index]) {
+          const auto conflicting = live_in[u].QueryConflicts(eff, cost);
           sources.insert(conflicting.begin(), conflicting.end());
         }
         site.required_source_pipes.assign(sources.begin(), sources.end());
@@ -1210,16 +1766,23 @@ class Builder {
       for (const auto source : pipes) sources_mask |= PipeToMask(source);
       state.DeliverSources(sources_mask, destination);
       if (enable_refresh_kill_) {
-        for (const auto& [space, domain] : site.refreshed_domains) state.KillDomain(space, domain);
+        for (const auto& [space, domain, kill_fiber] : site_refresh_fibers_[vertex.index]) {
+          state.KillDomain(space, domain, kill_fiber);
+        }
       }
-      state.AddEffects(site.effects);
+      state.AddEffects(site_effect_fibers_[vertex.index]);
+    } else if (vertex.kind == CfgVertex::Kind::LoopBackedge && vertex.loop) {
+      state.ApplyLoopBackedge(vertex.loop, affine_domain_bounds_);
+    } else if (vertex.kind == CfgVertex::Kind::LoopExit && vertex.loop) {
+      state.ApplyLoopExit(vertex.loop);
     }
     return state;
   }
 
-  void RunDebtWorklist(bool use_selected, const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo_pos,
-                       std::vector<size_t> initial_dirty, std::vector<DebtState>& debt_in,
-                       std::vector<DebtState>& debt_out, std::vector<bool>& visited) const {
+  void RunDebtWorklist(bool use_selected, const std::vector<CfgVertex>& cfg,
+                       const std::vector<size_t>& rpo_pos, std::vector<size_t> initial_dirty,
+                       std::vector<DebtState>& debt_in, std::vector<DebtState>& debt_out,
+                       std::vector<bool>& visited) const {
     const size_t n = cfg.size();
     std::priority_queue<std::pair<size_t, size_t>, std::vector<std::pair<size_t, size_t>>,
                         std::greater<std::pair<size_t, size_t>>>
@@ -1257,9 +1820,10 @@ class Builder {
     }
   }
 
-  void SolveDebtFixedPoint(bool use_selected, const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo,
-                           const std::vector<size_t>& rpo_pos, std::vector<DebtState>& debt_in,
-                           std::vector<DebtState>& debt_out, std::vector<bool>& visited) const {
+  void SolveDebtFixedPoint(bool use_selected, const std::vector<CfgVertex>& cfg,
+                           const std::vector<size_t>& rpo, const std::vector<size_t>& rpo_pos,
+                           std::vector<DebtState>& debt_in, std::vector<DebtState>& debt_out,
+                           std::vector<bool>& visited) const {
     const size_t n = cfg.size();
     debt_in.assign(n, DebtState{});
     debt_out.assign(n, DebtState{});
@@ -1301,7 +1865,8 @@ class Builder {
       if (cfg[u].kind == CfgVertex::Kind::Site) {
         auto& site = sites[cfg[u].index];
         const auto destination = site.operation.Implementation().Pipe();
-        site.source_pipes = cur_in.Select(site.required_source_pipes, destination, site.effects);
+        site.source_pipes =
+            cur_in.Select(site.required_source_pipes, destination, site_effect_fibers_[cfg[u].index]);
       }
       rpo_out[u] = TransferDebt(cfg[u], std::move(cur_in), /*use_selected=*/true);
       rpo_done[u] = true;
@@ -1324,7 +1889,8 @@ class Builder {
         after_services.DeliverSources(sources_mask, destination);
         std::vector<PipeType> missing;
         for (const auto req : site.required_source_pipes) {
-          if (!after_services.CoversConflicts(req, destination, site.effects)) missing.push_back(req);
+          if (!after_services.CoversConflicts(req, destination, site_effect_fibers_[cfg[u].index]))
+            missing.push_back(req);
         }
         if (!missing.empty()) {
           std::set<PipeType> unioned(site.source_pipes.begin(), site.source_pipes.end());
@@ -1363,7 +1929,7 @@ class Builder {
           INTERNAL_CHECK(next == selected.source_pipes.size())
               << "Internal error: conservative service selection added or reordered a service";
           for (const auto source : selected.required_source_pipes) {
-            INTERNAL_CHECK(known.CoversConflicts(source, destination, selected.effects))
+            INTERNAL_CHECK(known.CoversConflicts(source, destination, site_effect_fibers_[cfg[u].index]))
                 << "Internal error: conservative service selection omits a payload prerequisite";
           }
           const size_t omitted = selected.required_source_pipes.size() - selected.source_pipes.size();
@@ -1386,63 +1952,155 @@ class Builder {
       const auto pipe = operation.Implementation().Pipe();
       const auto append = [&](MemorySpace space, BufferAccess mode,
                               std::optional<backend::BufferSyncByteWindow> enclosure, ExprPtr root,
-                              bool candidate_full_overwrite,
-                              std::optional<backend::BufferSyncByteWindow> exact_full_window) {
-        if (mode == BufferAccess::Read || mode == BufferAccess::ReadWrite)
-          raw[site].push_back({space, pipe, false, enclosure, root, false, std::nullopt});
-        if (mode == BufferAccess::Write || mode == BufferAccess::ReadWrite)
-          raw[site].push_back(
-              {space, pipe, true, enclosure, root, candidate_full_overwrite, exact_full_window});
+                              bool candidate_full_overwrite, std::optional<StridedByteFootprint> vec_lattice,
+                              std::optional<MatrixBoxFootprint> matrix_box, IterationFiber fiber) {
+        if (mode == BufferAccess::Read || mode == BufferAccess::ReadWrite) {
+          raw[site].push_back({space, pipe, false, enclosure, root, false, vec_lattice, matrix_box, fiber});
+        }
+        if (mode == BufferAccess::Write || mode == BufferAccess::ReadWrite) {
+          raw[site].push_back({space, pipe, true, enclosure, root, candidate_full_overwrite,
+                               std::move(vec_lattice), std::move(matrix_box), std::move(fiber)});
+        }
       };
       for (size_t index = 0; index < operation.ArgumentEffects().size(); ++index) {
         const auto mode = operation.ArgumentEffects()[index].data;
         if (mode == BufferAccess::None) continue;
         const auto& operand = call->args_[index];
         const auto space = Space(operand);
-        std::optional<backend::BufferSyncByteWindow> enclosure;
-        std::optional<backend::BufferSyncByteWindow> exact_full_window;
-        ExprPtr root;
-        bool candidate_full_overwrite = false;
-        if (space == MemorySpace::DDR) {
-          if (disjoint_gm_) {
-            if (const auto found = gm_roots_.find(operand.get()); found != gm_roots_.end())
-              root = found->second;
-          }
-        } else {
-          ++cost.enclosure_lookups;
-          enclosure = placement_.Window(operand);
-          if (enable_refresh_kill_ && IsFullOverwriteOperand(call, mode, space, operand)) {
-            exact_full_window = placement_.ExactFullWindow(operand);
-            candidate_full_overwrite = exact_full_window.has_value();
+        if (space != MemorySpace::DDR) ++cost.enclosure_lookups;
+        auto resolved = resolver_.ResolveOperand(sites[site].cut.get(), call, index, mode, space,
+                                                 enable_refresh_kill_, disjoint_gm_);
+        if (space == MemorySpace::DDR && disjoint_gm_ && !resolved.gm_root) {
+          if (const auto found = gm_roots_.find(operand.get()); found != gm_roots_.end()) {
+            resolved.gm_root = found->second;
           }
         }
-        append(space, mode, enclosure, std::move(root), candidate_full_overwrite, exact_full_window);
+        append(space, mode, resolved.byte_hull, std::move(resolved.gm_root),
+               resolved.candidate_full_overwrite, std::move(resolved.vec_lattice),
+               std::move(resolved.matrix_box), std::move(resolved.fiber));
       }
       for (const auto& effect : operation.Implementation().ImplicitEffects()) {
         std::optional<backend::BufferSyncByteWindow> enclosure;
-        if (effect.space != MemorySpace::DDR && effect.begin >= 0 && effect.end > effect.begin)
+        std::optional<StridedByteFootprint> vec_lattice;
+        if (effect.space != MemorySpace::DDR && effect.begin >= 0 && effect.end > effect.begin) {
           enclosure = backend::BufferSyncByteWindow{effect.begin, effect.end};
-        append(effect.space, effect.data, enclosure, nullptr, false, std::nullopt);
+          if (effect.space == MemorySpace::Vec) {
+            vec_lattice = StridedByteFootprint{effect.begin, effect.end - effect.begin, 1,
+                                               effect.end - effect.begin, false};
+          }
+        }
+        append(effect.space, effect.data, enclosure, nullptr, false, std::move(vec_lattice), std::nullopt,
+               IterationFiber::Wildcard());
       }
     }
     StorageClasses classes;
-    classes.Build(raw);
+    classes.Build(raw, resolver_.Roots());
+
+    // Normalize IterationFibers per (space, domain, loop) enforcing #86 Section 1.1 preconditions.
+    struct FiberGroup {
+      bool valid = true;
+      IterationFiber::Kind kind = IterationFiber::Kind::Wildcard;
+      int64_t modulus = 0;
+      int64_t coeff = 0;
+      uint8_t slice_axis = 0;
+      ExprPtr symbolic_base;
+      bool has_sym = false;
+      int64_t min_b = std::numeric_limits<int64_t>::max();
+      int64_t max_e = std::numeric_limits<int64_t>::min();
+    };
+    std::map<AffineDomainFrameKey, FiberGroup> groups;
+    for (size_t site = 0; site < sites.size(); ++site) {
+      for (size_t ei = 0; ei < raw[site].size(); ++ei) {
+        const auto& effect = raw[site][ei];
+        const size_t domain = classes.Domain(site, ei);
+        if (domain == 0 || effect.fiber.kind == IterationFiber::Kind::Wildcard || !effect.fiber.frame) {
+          continue;
+        }
+        auto& g = groups[{effect.space, domain, effect.fiber.frame}];
+        if (!g.valid) continue;
+        if (g.kind == IterationFiber::Kind::Wildcard) {
+          g.kind = effect.fiber.kind;
+          g.modulus = effect.fiber.modulus;
+          g.coeff = effect.fiber.coeff;
+          g.slice_axis = effect.fiber.slice_axis;
+          g.symbolic_base = effect.fiber.symbolic_base;
+          g.has_sym = static_cast<bool>(effect.fiber.symbolic_base);
+          if (g.kind == IterationFiber::Kind::ModularSlot) {
+            if (g.modulus <= 0 || g.modulus > kMaxModularFiberModulus || g.coeff == 0) g.valid = false;
+          } else if (g.kind == IterationFiber::Kind::AffineSlice) {
+            if (g.coeff == 0 || effect.fiber.extent <= 0) g.valid = false;
+          } else {
+            g.valid = false;
+          }
+        } else {
+          if (g.kind != effect.fiber.kind || g.coeff != effect.fiber.coeff ||
+              g.modulus != effect.fiber.modulus ||
+              (g.kind == IterationFiber::Kind::AffineSlice && g.slice_axis != effect.fiber.slice_axis)) {
+            g.valid = false;
+          } else if (g.kind == IterationFiber::Kind::AffineSlice) {
+            const bool cur_has_sym = static_cast<bool>(effect.fiber.symbolic_base);
+            if (cur_has_sym != g.has_sym) {
+              g.valid = false;
+            } else if (g.has_sym) {
+              try {
+                if (!structural_equal(g.symbolic_base, effect.fiber.symbolic_base, false)) {
+                  g.valid = false;
+                }
+              } catch (const StructuralComparisonUnsupported&) {
+                g.valid = false;
+              }
+            }
+          }
+        }
+        if (g.valid && g.kind == IterationFiber::Kind::AffineSlice) {
+          g.min_b = std::min(g.min_b, effect.fiber.offset);
+          g.max_e = std::max(g.max_e, effect.fiber.offset + effect.fiber.extent);
+        }
+      }
+    }
+    affine_domain_bounds_.clear();
+    loops_with_fibers_.clear();
+    for (auto& [key, g] : groups) {
+      if (!g.valid) continue;
+      if (g.kind == IterationFiber::Kind::AffineSlice) {
+        const __int128 abs_c = g.coeff > 0 ? g.coeff : -__int128(g.coeff);
+        const __int128 span_elems = __int128(g.max_e) - 1 - g.min_b;
+        const __int128 s_trips = span_elems < 0 ? 1 : (span_elems / abs_c + 1);
+        if (s_trips > kMaxAffineFiberSpan) {
+          g.valid = false;
+          continue;
+        }
+        affine_domain_bounds_[key] = {g.min_b, g.max_e};
+      }
+      loops_with_fibers_.insert(std::get<2>(key));
+    }
+
+    site_effect_fibers_.assign(sites.size(), {});
+    site_refresh_fibers_.assign(sites.size(), {});
     for (size_t site = 0; site < sites.size(); ++site) {
       auto& effects = sites[site].effects;
       effects.clear();
       std::set<std::pair<MemorySpace, size_t>> refreshed;
-      for (const auto& effect : raw[site]) {
-        const size_t domain = classes.Domain(effect);
+      std::set<std::tuple<MemorySpace, size_t, FiberKey>> refreshed_fibers;
+      for (size_t ei = 0; ei < raw[site].size(); ++ei) {
+        const auto& effect = raw[site][ei];
+        const size_t domain = classes.Domain(site, ei);
         effects.emplace(effect.space, effect.pipe, effect.write, domain);
-        if (effect.candidate_full_overwrite && effect.exact_full_window && domain > 0) {
-          const auto& dom = classes.domains[domain - 1];
-          if (dom.enclosure && dom.enclosure->begin == effect.exact_full_window->begin &&
-              dom.enclosure->end == effect.exact_full_window->end) {
-            refreshed.emplace(effect.space, domain);
+        FiberKey fkey = FiberKey::Wildcard();
+        if (domain > 0 && effect.fiber.kind != IterationFiber::Kind::Wildcard && effect.fiber.frame) {
+          const auto git = groups.find({effect.space, domain, effect.fiber.frame});
+          if (git != groups.end() && git->second.valid) {
+            fkey = FiberKey::From(effect.fiber);
           }
+        }
+        site_effect_fibers_[site].push_back({effect.space, effect.pipe, effect.write, domain, fkey});
+        if (effect.candidate_full_overwrite && domain > 0 && classes.HasUniformGeometry(domain)) {
+          refreshed.emplace(effect.space, domain);
+          refreshed_fibers.emplace(effect.space, domain, fkey);
         }
       }
       sites[site].refreshed_domains.assign(refreshed.begin(), refreshed.end());
+      site_refresh_fibers_[site].assign(refreshed_fibers.begin(), refreshed_fibers.end());
     }
     domains = std::move(classes.domains);
     cost.storage_domains = domains.size();
@@ -1498,7 +2156,7 @@ class Builder {
       return;
     }
     auto operation = backend::QualifyBufferSyncOperation(call, function_->func_type_, target_);
-    placement_.Require(operation);
+    resolver_.RequireWorkspaceSeparation(operation);
     const bool ready_result = operation.Implementation().ProducesReadyScalar();
     CHECK_SPAN((!result && operation.Result().behavior == BufferResultBehavior::None) ||
                    (result && ready_result && operation.Result().behavior == BufferResultBehavior::Value),
@@ -1540,10 +2198,32 @@ class Builder {
     ++cost.statements;
     if (const auto seq = As<SeqStmts>(statement)) {
       End end;
-      for (const auto& child : seq->stmts_) {
-        CHECK_SPAN(!end.Terminal(), child->span_)
+      const auto wit = window_slices_by_seq_.find(seq.get());
+      if (wit == window_slices_by_seq_.end() || wit->second.empty()) {
+        for (const auto& child : seq->stmts_) {
+          CHECK_SPAN(!end.Terminal(), child->span_)
+              << "Conservative synchronization: statements after a terminal cut are unavailable";
+          end = Read(child);
+        }
+        return end;
+      }
+      const auto& slices = wit->second;
+      size_t slice_idx = 0;
+      for (size_t i = 0; i < seq->stmts_.size(); ++i) {
+        CHECK_SPAN(!end.Terminal(), seq->stmts_[i]->span_)
             << "Conservative synchronization: statements after a terminal cut are unavailable";
-        end = Read(child);
+        const bool entering_slice = slice_idx < slices.size() && i == slices[slice_idx].begin;
+        if (entering_slice) {
+          CHECK(native_child_depth_ == 0)
+              << "Conservative synchronization: retained child scopes must not overlap";
+          seen_slice_children_.insert(slices[slice_idx].child_idx);
+          ++native_child_depth_;
+        }
+        end = Read(seq->stmts_[i]);
+        if (slice_idx < slices.size() && i + 1 == slices[slice_idx].end) {
+          --native_child_depth_;
+          ++slice_idx;
+        }
       }
       return end;
     }
@@ -1641,7 +2321,8 @@ class Builder {
 
   FunctionPtr function_;
   std::string target_;
-  NativeSyncPlacement placement_;
+  SyncControlRangeProver trip_prover_;
+  SyncFootprintResolver resolver_;
   bool retain_incoming_diagnostics_;
   bool enable_refresh_kill_;
   std::unordered_map<const Expr*, ExprPtr> gm_roots_;
@@ -1654,9 +2335,25 @@ class Builder {
   std::unordered_map<const Stmt*, size_t> child_index_;
   std::unordered_set<const Stmt*> seen_children_;
   std::vector<std::array<PipeMask, kPhysicalPipeCount>> child_service_matrices_;
+  struct SliceWindow {
+    size_t begin = 0;
+    size_t end = 0;
+    size_t child_idx = 0;
+  };
+  std::unordered_map<const SeqStmts*, std::vector<SliceWindow>> window_slices_by_seq_;
+  std::unordered_set<size_t> seen_slice_children_;
   std::unordered_map<const Stmt*, size_t> site_index_;
+  std::vector<std::vector<SiteEffectFiber>> site_effect_fibers_;
+  std::vector<std::vector<std::tuple<MemorySpace, size_t, FiberKey>>> site_refresh_fibers_;
+  AffineDomainBoundsMap affine_domain_bounds_;
+  std::unordered_set<const ForStmt*> loops_with_fibers_;
 };
 }  // namespace
+
+CompletionSummary SummarizeStraightLineLogicalCompletion(const StmtPtr& body, FunctionType func_type,
+                                                         const std::string& target) {
+  return Builder::ComputeRecipeCompletionSummary(body, func_type, target, 0, nullptr, nullptr);
+}
 
 ConservativeSyncAnalysis AnalyzeConservativeSync(
     const FunctionPtr& function, const std::string& target,
@@ -1679,7 +2376,11 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
     for (const auto& attempt : selection.attempts)
       if (attempt.child) selected.push_back(attempt.child);
   }
-  Builder builder(function, target, children, selected, retain_incoming_diagnostics, enable_refresh_kill);
+  Builder builder(function, target, children, selected, retain_incoming_diagnostics, enable_refresh_kill,
+                  parameters, blocks);
+  if (automatic_children && !selection.inline_subblocks.empty()) {
+    builder.RegisterInlineSubblocks(selection.inline_subblocks);
+  }
   builder.Build();
   auto exit = builder.Solve();
   builder.cost.retained_facts = exit.size();

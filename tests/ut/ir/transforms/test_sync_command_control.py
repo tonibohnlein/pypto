@@ -243,7 +243,9 @@ def test_residue_selection_stays_compact_and_matches_original_accesses(count):
         assert state.trace[-1] == ("system.bar_all", internal_state.payload_count)
         assert state.trace[:-1] == internal_state.trace
         assert optimized.trace == internal_state.trace
-        assert optimized.counts["conditions"] == 31
+        # RadixBoxGuard exact single-iteration boundary narrowing eliminates
+        # the 6 redundant residue checks inside the singleton boundary phase.
+        assert optimized.counts["conditions"] == 25
 
 
 @pytest.mark.parametrize("band,bound", [(0, 111), (1, 115), (2, 147), (3, 149)])

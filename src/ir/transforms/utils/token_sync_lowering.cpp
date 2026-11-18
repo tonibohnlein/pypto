@@ -40,9 +40,9 @@
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/closed_prefix_sync.h"
-#include "src/ir/transforms/utils/native_sync_placement.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/retained_sync_child.h"
+#include "src/ir/transforms/utils/sync_footprint_resolver.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
 
 namespace pypto::ir::sync {
@@ -570,8 +570,8 @@ class ForwardSyncOptimizer : public IRMutator {
     mask |= pipe_bit;
     if (root.get() != info->first.get()) {
       const auto old_call = As<Call>(op->expr_);
-      auto new_call = OpRegistry::GetInstance().Create(old_call->op_->name_, {root}, old_call->kwargs_,
-                                                       old_call->span_);
+      auto new_call =
+          OpRegistry::GetInstance().Create(old_call->op_->name_, {root}, old_call->kwargs_, old_call->span_);
       return std::make_shared<EvalStmt>(std::move(new_call), op->span_, op->leading_comments_);
     }
     return op;
@@ -646,8 +646,8 @@ class ForwardSyncOptimizer : public IRMutator {
     alias_of_ = saved_aliases;
     scope_depth_ = outer_scope;
     return std::make_shared<ForStmt>(op->loop_var_, op->start_, op->stop_, op->step_, op->iter_args_, body,
-                                     op->return_vars_, op->span_, op->kind_, op->attrs_, op->leading_comments_,
-                                     op->hardware_loop_policy_);
+                                     op->return_vars_, op->span_, op->kind_, op->attrs_,
+                                     op->leading_comments_, op->hardware_loop_policy_);
   }
 
   StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
@@ -916,17 +916,17 @@ FunctionPtr StripAllLogicalSync(const FunctionPtr& function) {
                                  [](const auto& attr) {
                                    return attr.first == kClosedSyncChildAttr ||
                                           attr.first == kClosedSyncChildExternalPolicyAttr ||
-                                          attr.first == "pypto.closed_sync_child_first_visit";
+                                          attr.first == kClosedSyncChildFirstVisitAttr ||
+                                          attr.first == kClosedSyncChildSubblockAttr;
                                  }),
                   attrs.end());
       if (iter_args.size() == op->iter_args_.size() && return_vars.size() == op->return_vars_.size() &&
           body == op->body_ && attrs.size() == op->attrs_.size()) {
         return op;
       }
-      return std::make_shared<ForStmt>(op->loop_var_, op->start_, op->stop_, op->step_,
-                                       std::move(iter_args), std::move(body), std::move(return_vars),
-                                       op->span_, op->kind_, std::move(attrs), op->leading_comments_,
-                                       op->hardware_loop_policy_);
+      return std::make_shared<ForStmt>(op->loop_var_, op->start_, op->stop_, op->step_, std::move(iter_args),
+                                       std::move(body), std::move(return_vars), op->span_, op->kind_,
+                                       std::move(attrs), op->leading_comments_, op->hardware_loop_policy_);
     }
     StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
       std::vector<IterArgPtr> iter_args;
@@ -970,9 +970,8 @@ FunctionPtr StripAllLogicalSync(const FunctionPtr& function) {
               attrs.end());
   return std::make_shared<Function>(function->name_, function->params_, function->param_directions_,
                                     function->return_types_, std::move(body), function->span_,
-                                    function->func_type_, function->level_, function->role_,
-                                    std::move(attrs), function->requires_runtime_binding_,
-                                    function->ir_stage_);
+                                    function->func_type_, function->level_, function->role_, std::move(attrs),
+                                    function->requires_runtime_binding_, function->ir_stage_);
 }
 
 LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::string& target,
@@ -995,8 +994,8 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
   }
   FindLogical(true).VisitFunction(function);
   if (HasOnlyClosedPrefixSyntax(function)) {
-    if (auto closed = TryLowerClosedPrefixSync(function, target, eligible_ids, extra_reservations,
-                                               parameters, blocks)) {
+    if (auto closed = TryLowerClosedPrefixSync(function, target, eligible_ids, extra_reservations, parameters,
+                                               blocks)) {
       if (dry_run_only) return {closed->function, closed->set_sites, closed->wait_sites, {}};
       CheckPhysicalSyncResult(closed->function);
       FinishSyncScheduleReceipt(closed->function, *closed, policy);
