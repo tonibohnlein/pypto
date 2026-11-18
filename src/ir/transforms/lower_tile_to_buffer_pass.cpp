@@ -39,6 +39,7 @@
 #include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/backend/common/gather_compare_scratch.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/cast_saturation.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -1370,8 +1371,9 @@ class TileToBufferMutator : public IRMutator {
       auto kwargs = call->kwargs_;
       if (conversion->kind == backend::BufferConversionKind::Cast) {
         // Destination dtype is already in its descriptor. Resolve saturation
-        // here so PTOAS defaults cannot change a logical float conversion.
-        kwargs = {{"mode", call->GetKwarg<int>("mode", 0)}, {"saturation_mode", 0}};
+        // here so PTOAS defaults cannot change a logical conversion.
+        kwargs = {{"mode", call->GetKwarg<int>("mode", 0)},
+                  {"saturation_mode", GetEmittedSaturationMode(call)}};
       }
       out.push_back(Operation(conversion->buffer_op, args, call->span_, kwargs));
       return std::make_shared<SeqStmts>(std::move(out), call->span_);
