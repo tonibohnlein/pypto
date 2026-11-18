@@ -135,6 +135,21 @@ def test_int32_to_fp32_cast_preserves_rounding_modes_and_rejects_other_modes():
             _call("cast", args, {"mode": bad_mode, "saturation_mode": 0})
 
 
+def test_int32_to_fp16_and_fp_to_int32_cast_contracts():
+    fp16_args = [_buffer("source", dtype=DataType.INT32), _buffer("dst", dtype=DataType.FP16)]
+    for mode in (0, 1):
+        call = _call("cast", fp16_args, {"mode": mode, "saturation_mode": 0})
+        assert call.kwargs["mode"] == mode
+    for bad_mode in (2, 3, 4, 5):
+        with pytest.raises(ValueError, match="unsupported conversion attributes"):
+            _call("cast", fp16_args, {"mode": bad_mode, "saturation_mode": 0})
+    int32_args = [_buffer("source", dtype=DataType.FP32), _buffer("dst", dtype=DataType.INT32)]
+    call = _call("cast", int32_args, {"mode": 0, "saturation_mode": 1})
+    assert call.kwargs["saturation_mode"] == 1
+    with pytest.raises(ValueError, match="unsupported conversion attributes"):
+        _call("cast", int32_args, {"mode": 0, "saturation_mode": 0})
+
+
 @pytest.mark.parametrize("bad", ["shape", "valid", "saturation", "mode"])
 def test_bfloat_cast_preserves_restrictions(bad):
     args = [_buffer("source"), _buffer("dst", dtype=DataType.BF16)]

@@ -24,6 +24,7 @@
 #include "pypto/core/any_cast.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/cast_saturation.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/transforms/structural_comparison.h"
@@ -139,8 +140,10 @@ const char* OperandError(const BufferConversionRecipe& recipe, const std::vector
                         (src->dtype_ == DataType::FP32 && dst->dtype_ == DataType::BF16);
     const bool fp_to_int32 =
         (src->dtype_ == DataType::FP32 || src->dtype_ == DataType::FP16) && dst->dtype_ == DataType::INT32;
-    const bool int32_to_fp =
-        src->dtype_ == DataType::INT32 && (dst->dtype_ == DataType::FP32 || dst->dtype_ == DataType::FP16);
+    const bool int32_to_fp32 = src->dtype_ == DataType::INT32 && dst->dtype_ == DataType::FP32;
+    const bool int32_to_fp16 = src->dtype_ == DataType::INT32 && dst->dtype_ == DataType::FP16;
+    const bool int32_to_fp = int32_to_fp32 || int32_to_fp16;
+    const int expected_saturation = static_cast<int>(ir::EmittedSaturationModeFor(dst->dtype_));
     // Preserve the existing half/single rounding contract (ceil stays unopened on float<->float).
     // A2/A3 direct FP32<->INT32 and FP16<->INT32 require no integer-narrowing scratch.
     for (const auto& [key, value] : kwargs) {
@@ -150,7 +153,13 @@ const char* OperandError(const BufferConversionRecipe& recipe, const std::vector
           return "has unsupported conversion attributes for this dtype pair";
         if (bfloat && mode != 0 && mode != 1 && mode != 2)
           return "has unsupported conversion attributes for this dtype pair";
-        if (int32_to_fp && mode != 0 && mode != 1 && mode != 2)
+        if (int32_to_fp32 && mode != 0 && mode != 1 && mode != 2)
+          return "has unsupported conversion attributes for this dtype pair";
+        if (int32_to_fp16 && mode != 0 && mode != 1)
+          return "has unsupported conversion attributes for this dtype pair";
+      } else if (key == "saturation_mode") {
+        const int saturation = AnyCast<int>(value, "Buffer cast saturation_mode");
+        if (saturation != expected_saturation)
           return "has unsupported conversion attributes for this dtype pair";
       }
     }
@@ -206,9 +215,10 @@ bool Attributes(const BufferConversionRecipe& recipe,
       return false;
     }
   }
-  // OperandError further qualifies rounding mode by dtype. Other rounding/saturation
-  // modes and scratch-backed integer narrowing keep their existing Tile path.
-  if (recipe.kind == K::Cast) return mode >= 0 && mode <= 5 && saturation == 0;
+  // OperandError further qualifies rounding and saturation mode by dtype. Other
+  // rounding/saturation modes and scratch-backed integer narrowing keep their
+  // existing Tile path.
+  if (recipe.kind == K::Cast) return mode >= 0 && mode <= 5 && ir::IsValidSaturationMode(saturation);
   if (recipe.kind == K::Compare || recipe.kind == K::CompareScalar) return comparison >= 0 && comparison < 6;
   return true;
 }

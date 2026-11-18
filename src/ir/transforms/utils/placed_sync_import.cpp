@@ -1758,6 +1758,34 @@ class Importer {
       const auto& s = result.storage[sid];
       const auto& t = result.storage[tid];
       if (extract && s.space == MemorySpace::Vec && t.space == MemorySpace::Vec) {
+        auto row = Coordinate(call->args_[1], segment);
+        auto column = Coordinate(call->args_[2], segment);
+        CHECK(row.parameters.empty() && column.parameters.empty() && !row.block && !column.block)
+            << "Parameterized local extraction needs a separate membership and alignment certificate";
+        const auto& src_view = vec_views.at(call->args_[0].get());
+        const auto& dst_view = vec_views.at(call->args_[target].get());
+        const auto bound_in_source = [&](const AffineCoordinate& coord, int64_t window, int64_t extent) {
+          if (coord.first < 0 || window <= 0) return false;
+          __int128 max_offset = coord.first;
+          const auto add_step = [&](int64_t step, int64_t count) {
+            const auto last = std::max<int64_t>(0, count - 1);
+            if (step < 0) return coord.first + __int128(last) * step >= 0;
+            max_offset += __int128(last) * step;
+            return true;
+          };
+          if (coord.second && !add_step(coord.second, segment.count)) return false;
+          for (const auto& [frame, coeff] : coord.frames) {
+            if (!coeff) continue;
+            int64_t count = 1;
+            for (const auto& nested : segment.nested_frames)
+              if (nested.loop.get() == frame) count = nested.count;
+            if (!add_step(coeff, count)) return false;
+          }
+          return max_offset + window <= extent;
+        };
+        CHECK(bound_in_source(row, dst_view.type->shape_[0], src_view.type->shape_[0]) &&
+              bound_in_source(column, dst_view.type->shape_[1], src_view.type->shape_[1]))
+            << "Synchronization access exceeds its proved allocation";
         // Vec->Vec extraction may span non-contiguous physical rows; model the
         // full Vec domain conservatively across both Exact and prefix analysis.
         whole(0, false);
@@ -1795,12 +1823,33 @@ class Importer {
         whole(target, true);
       }
     } else if (IsOp(call, "buffer.insert")) {
-      const auto& s = result.storage[Storage(call->args_[0])];
-      const auto& t = result.storage[Storage(call->args_[3])];
+      const auto sid = Storage(call->args_[0]), tid = Storage(call->args_[3]);
+      const auto& s = result.storage[sid];
+      const auto& t = result.storage[tid];
       CHECK(s.space == MemorySpace::Acc && t.space == MemorySpace::Mat)
           << "Only Acc to Mat FIXPIPE insertion is qualified";
+      auto row = Coordinate(call->args_[1], segment);
+      auto column = Coordinate(call->args_[2], segment);
+      CHECK(row.parameters.empty() && column.parameters.empty() && !row.block && !column.block)
+          << "Parameterized local insertion needs a separate membership and alignment certificate";
+      const auto aligned_frames = [](const auto& frames, int64_t alignment) {
+        return std::all_of(frames.begin(), frames.end(),
+                           [&](const auto& entry) { return entry.second % alignment == 0; });
+      };
+      const auto box =
+          t.layout->slayout_ != TileLayout::none_box ? t.layout->fractal_ / (16 * t.layout->dtype_.GetByte()) : 16;
+      CHECK(row.first % 16 == 0 && row.second % 16 == 0 && s.rows % 16 == 0 && column.first % 16 == 0 &&
+            column.second % 16 == 0 && s.columns % 16 == 0 && column.first % box == 0 && column.second % box == 0 &&
+            s.columns % box == 0 && aligned_frames(row.frames, 16) && aligned_frames(column.frames, 16) &&
+            aligned_frames(column.frames, box))
+          << "Unaligned boxed insertion requires a separate footprint contract";
+      auto target_access = Access(tid, true, row, column, s.rows, s.columns, segment);
+      ApplySlot(target_access, call->args_[3], segment);
       whole(0, false);
-      whole(3, true);
+      if (recover_accesses) {
+        site.accesses.push_back(std::move(target_access));
+      }
+      modes[3].second = true;
     } else if (IsOp(call, "buffer.matmul") || IsOp(call, "buffer.matmul_acc")) {
       whole(0, false);
       whole(1, false);

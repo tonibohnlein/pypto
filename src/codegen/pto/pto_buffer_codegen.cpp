@@ -37,6 +37,7 @@
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/arith/analyzer.h"
+#include "pypto/ir/cast_saturation.h"
 #include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
@@ -956,8 +957,11 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
     using K = backend::BufferConversionKind;
     if (conversion->kind == K::Cast) {
       const auto mode = call->GetKwarg<int>("mode", 0);
+      const auto dst_type = ir::As<ir::BufferType>(call->args_.back()->GetType());
+      const int default_sat = dst_type ? static_cast<int>(ir::EmittedSaturationModeFor(dst_type->dtype_)) : 0;
+      const int sat = call->GetKwarg<int>("saturation_mode", default_sat);
       attributes = "{rmode = #pto<round_mode " + backend::pto_ops_detail::round_modes.at(mode) +
-                   ">, satmode = #pto<saturation_mode OFF>}";
+                   ">, satmode = #pto<saturation_mode " + ir::SaturationModeToPTOString(sat) + ">}";
     } else if (conversion->kind == K::Compare || conversion->kind == K::CompareScalar) {
       attributes = "{cmpMode = #pto<cmp " +
                    backend::pto_ops_detail::cmp_modes.at(call->GetKwarg<int>("cmp_type")) + ">}";
