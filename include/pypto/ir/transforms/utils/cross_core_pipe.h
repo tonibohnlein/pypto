@@ -13,13 +13,16 @@
 #define PYPTO_IR_TRANSFORMS_UTILS_CROSS_CORE_PIPE_H_
 
 #include <any>
+#include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "pypto/ir/expr.h"
+#include "pypto/ir/function.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
@@ -101,6 +104,23 @@ CallPtr CreateInitializePipe(core_affinity::CoreSide side, int dir_mask, int slo
 
 void CollectCrossCorePipeMetadata(const std::vector<StmtPtr>& stmts, CrossCorePipeMetadata& metadata);
 CrossCorePipeMetadata CollectDominatingPipeSetupMetadata(const std::vector<StmtPtr>& stmts);
+
+struct ConsumerPipeCapacity {
+  size_t required;
+  size_t slots;
+};
+
+struct ConsumerFifoEvidence {
+  bool has_transport = false;
+  std::map<int, ConsumerPipeCapacity> capacities;
+  std::string unavailable;
+  std::optional<Span> overwritten_input;
+};
+
+/// Inspect A2/A3 lexical consumer FIFO markers and their declared local
+/// capacities. The proof neither certifies asynchronous completion nor grants
+/// ownership. An overwritten input is a concrete straight-line native read.
+ConsumerFifoEvidence AnalyzeConsumerFifo(const FunctionPtr& function);
 
 // `slot_num_override` (from pl.cross_core_slot(slot_num=N)) overrides the ring depth used to size
 // the transport ring and emitted initialize_pipe `slot_num` attribute. nullopt selects

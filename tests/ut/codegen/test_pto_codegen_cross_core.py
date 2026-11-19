@@ -26,12 +26,15 @@ Multiple explicit pipes:
   2. Vector → Cube (V2C): Vector pushes another tile on pipe id 1
 """
 
+import json
 import re
+from pathlib import Path
 
 import pypto.language as pl
 import pytest
 from pypto import backend, codegen, ir, passes
 from pypto.backend import BackendType
+from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.backend.pto_backend import _build_group_mapping
 from pypto.runtime import RunConfig
 
@@ -45,6 +48,125 @@ def _extract_func_section(mlir_code: str, func_name: str) -> str:
     if next_start == -1:
         return mlir_code[start:]
     return mlir_code[start:next_start]
+
+
+def _paired_consumer(local_depth: int, *, read_after_wrap: bool = True) -> ir.Program:
+    first_read = "combined = pl.add(first, first)"
+    early = "" if read_after_wrap else first_read
+    late = "combined = pl.add(first, second)" if read_after_wrap else "combined = pl.add(combined, second)"
+    return pl.parse_program(f"""
+@pl.program
+class PairedConsumer:
+    @pl.function(type=pl.FunctionType.AIC)
+    def cube(self, x: pl.Tensor[[32, 16], pl.FP16]):
+        peer = pl.import_peer_buffer(name="peer_c2v", peer_func="vector")
+        pl.aic_initialize_pipe(peer, pl.const(0, pl.INT32), dir_mask=1, slot_size=1024,
+                               slot_num=2, local_slot_num={local_depth})
+        values = pl.load(x, [0, 0], [16, 16])
+        other = pl.load(x, [16, 0], [16, 16])
+        first = pl.matmul(values, values)
+        second = pl.matmul(other, other)
+        pl.tpush_to_aiv(first, split=0)
+        pl.tpush_to_aiv(second, split=0)
+
+    @pl.function(type=pl.FunctionType.AIV)
+    def vector(self, out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
+        fifo = pl.reserve_buffer(name="peer_c2v", size={1024 * local_depth}, base=4096)
+        pl.aiv_initialize_pipe(fifo, pl.const(0, pl.INT32), dir_mask=1, slot_size=1024,
+                               slot_num=2, local_slot_num={local_depth})
+        first: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+        {early}
+        second: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+        {late}
+        pl.tfree_to_aic(first)
+        pl.tfree_to_aic(second)
+        return pl.store(combined, [0, 0], out)
+
+    @pl.function(type=pl.FunctionType.Group)
+    def paired(self, x: pl.Tensor[[32, 16], pl.FP16],
+               out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
+        self.cube(x)
+        return self.vector(out)
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(self, x: pl.Tensor[[32, 16], pl.FP16],
+             out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
+        return self.paired(x, out)
+""")
+
+
+@pytest.mark.usefixtures("ascend_backend")
+def test_explicit_peer_rejects_native_read_after_slot_wrap(tmp_path: Path):
+    cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
+    with pytest.raises(ValueError, match="Native peer pop overwrites a consumer slot"):
+        ir.compile(_paired_consumer(1), **cfg.compile_kwargs())
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.usefixtures("ascend_backend")
+@pytest.mark.parametrize("depth,read_after_wrap", [(2, True), (1, False)])
+def test_explicit_peer_preserves_protocol_on_qualified_or_unproved_fifo(
+    tmp_path: Path, depth: int, read_after_wrap: bool
+):
+    if find_ptoas_binary() is None:
+        pytest.skip("PTOAS is not available")
+    cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
+    with passes.PassContext(
+        [], enable_buffer_ir=True, enable_pypto_autosync=True, autosync_policy="conservative_prefix"
+    ):
+        ir.compile(_paired_consumer(depth, read_after_wrap=read_after_wrap), **cfg.compile_kwargs())
+    kernels = list((tmp_path / "kernels").rglob("*.cpp"))
+    assert len(kernels) == 2
+    body = (tmp_path / "kernels" / "aiv" / "vector.cpp").read_text()
+    # Each output includes both peer definitions. The AIV definition retains
+    # two pop/free epochs in both the active and zero-valid handshake lanes.
+    assert body.count("TPUSH<") == 2
+    assert body.count("TPOP<") == 4
+    assert body.count("TFREE<") == 4
+    if not read_after_wrap:
+        active = re.findall(r"^\s+(TPOP|TFREE|TADD)(?:<|\()", body, re.MULTILINE)
+        assert active[:6] == ["TPOP", "TADD", "TPOP", "TADD", "TFREE", "TFREE"]
+    report = json.loads((tmp_path / "report" / "autosync.json").read_text())
+    routes = {kernel["function"]: kernel for kernel in report["kernels"]}
+    assert f"peak marker depth 2, declared local capacity {depth}" in routes["vector"]["reason"]
+    assert all(route["selected_route"] == "ptoas" for route in routes.values())
+
+
+@pytest.mark.usefixtures("ascend_backend")
+def test_peer_fifo_counts_independent_ids_and_refuses_early_exit():
+    def original(early_exit: bool) -> ir.Program:
+        exit_early = "if index == 0:\n                continue" if early_exit else ""
+        return pl.parse_program(f"""
+@pl.program
+class IndependentFifos:
+    @pl.function(type=pl.FunctionType.AIV)
+    def vector(self):
+        a = pl.reserve_buffer(name="a", size=1024, base=4096)
+        b = pl.reserve_buffer(name="b", size=1024, base=8192)
+        pl.aiv_initialize_pipe(a, pl.const(0, pl.INT32), dir_mask=1, slot_size=1024, slot_num=1, id=0)
+        pl.aiv_initialize_pipe(b, pl.const(0, pl.INT32), dir_mask=1, slot_size=1024, slot_num=1, id=1)
+        for index in pl.range(4096):
+            first: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0, id=0)
+            second: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0, id=1)
+            {exit_early}
+            pl.tfree_to_aic(second, id=1)
+            pl.tfree_to_aic(first, id=0)
+""")
+
+    for early_exit in (False, True):
+        source = original(early_exit)
+        with passes.PassContext([], enable_pypto_autosync=True, autosync_policy="conservative_prefix"):
+            result = passes.realize_sync()(source)
+        before, after = source.get_function("vector"), result.get_function("vector")
+        assert before is not None and after is not None
+        assert not after.attrs["pypto_autosync"]
+        why = after.attrs["autosync_fallback_reason"]
+        if early_exit:
+            assert "early-exit control does not prove local FIFO order" in why
+        else:
+            for pipe_id in (0, 1):
+                assert f"pipe id {pipe_id} has peak marker depth 1, declared local capacity 1" in why
+        ir.assert_structural_equal(before.body, after.body)
 
 
 # ============================================================================

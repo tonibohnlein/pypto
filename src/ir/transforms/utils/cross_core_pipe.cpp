@@ -15,14 +15,19 @@
 #include <any>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "pypto/backend/common/backend_handler.h"
+#include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
@@ -30,9 +35,12 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/core_side_ops.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
@@ -44,63 +52,216 @@ namespace {
 
 const auto& FlattenBody = transform_utils::FlattenToStmts;
 
-struct ConsumerFifo {
-  std::vector<const Var*> pops;
-  size_t next_free = 0;
+struct ConsumerFifoResult {
+  std::map<int, size_t> peak_depth;
+  size_t first_transport;
+  bool unsupported_control = false;
 };
 
-// Inspect the finalized FIFO schedule, not merely the number of live values:
-// the emitted tfree has no tile operand and releases the oldest slot. Nested
-// scopes must preserve their incoming FIFO ownership; otherwise reject the
-// unsupported schedule rather than silently releasing an enclosing tile.
-// Checkpoint/rewind avoids copying live queues at each nesting level: O(N).
-int RequiredConsumerDepth(const std::vector<StmtPtr>& stmts, core_affinity::CoreSide side,
-                          ConsumerFifo& fifo) {
-  int peak = static_cast<int>(fifo.pops.size() - fifo.next_free);
-  auto visit_body = [&](const StmtPtr& body) {
-    const size_t entry_tail = fifo.pops.size();
-    const size_t entry_head = fifo.next_free;
-    const int body_peak = RequiredConsumerDepth(FlattenBody(body), side, fifo);
-    const bool unchanged = fifo.next_free == entry_head && fifo.pops.size() == entry_tail;
-    const bool empty_on_both_sides = entry_head == entry_tail && fifo.next_free == fifo.pops.size();
-    CHECK_SPAN(unchanged || empty_on_both_sides, body->span_)
-        << "Automatic cross-core pipe does not support FIFO ownership escaping a control-flow body; "
-           "place/consume and release each gathered tile within its scope.";
-    fifo.pops.resize(entry_tail);
-    fifo.next_free = entry_head;
-    peak = std::max(peak, body_peak);
+bool IsPeerTransport(const CallPtr& call) {
+  return op_predicates::IsTPush(call) || op_predicates::IsTPop(call) || op_predicates::IsTFree(call);
+}
+
+// Each nested body closes its own borrows without popping an inherited queue
+// entry. Thus it restores the incoming state even for skipped or repeated visits.
+// Independent pipe IDs have independent slots and can release in either order.
+class ConsumerFifo {
+ public:
+  ConsumerFifo(core_affinity::CoreSide side, bool established_pipe_ids)
+      : pop_(core_side_ops::TPopOp(side)),
+        free_(core_side_ops::TFreeOp(side)),
+        established_pipe_ids_(established_pipe_ids) {}
+
+  ConsumerFifoResult Run(const std::vector<StmtPtr>& stmts) {
+    result_.first_transport = stmts.size();
+    for (root_index_ = 0; root_index_ < stmts.size(); ++root_index_) Read(stmts[root_index_], 0, false);
+    CHECK(active_.empty()) << "Cross-core FIFO requires a logical tfree for every tpop";
+    return std::move(result_);
+  }
+
+ private:
+  struct Borrow {
+    int id;
+    size_t scope;
   };
-  for (const auto& stmt : stmts) {
-    auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt);
-    auto eval = std::dynamic_pointer_cast<const EvalStmt>(stmt);
-    auto call = assign ? std::dynamic_pointer_cast<const Call>(assign->value_)
-                       : (eval ? std::dynamic_pointer_cast<const Call>(eval->expr_) : nullptr);
-    if (call && call->op_) {
-      if (call->op_->name_ == core_side_ops::TPopOp(side)) {
-        INTERNAL_CHECK_SPAN(assign, stmt->span_) << "Internal error: tpop must bind a tile";
-        fifo.pops.push_back(assign->var_.get());
-        peak = std::max(peak, static_cast<int>(fifo.pops.size() - fifo.next_free));
-      } else if (call->op_->name_ == core_side_ops::TFreeOp(side)) {
-        auto tile = call->args_.empty() ? nullptr : AsVarLike(call->args_[0]);
-        CHECK_SPAN(tile && fifo.next_free < fifo.pops.size() && fifo.pops[fifo.next_free] == tile.get(),
-                   stmt->span_)
-            << "Automatic cross-core pipe requires FIFO release order; a retained earlier tile "
+
+  void Scope(const StmtPtr& body, size_t scope, bool parallel) {
+    const auto entry = active_.size();
+    Read(body, scope + 1, parallel);
+    CHECK_SPAN(active_.size() == entry, body->span_)
+        << "Cross-core FIFO cannot prove ownership escaping a control-flow body; "
+           "place/consume and release each gathered tile within its scope.";
+  }
+
+  void Read(const StmtPtr& stmt, size_t scope, bool parallel) {
+    if (const auto call = transform_utils::GetCallFromStmt(stmt)) {
+      if (IsPeerTransport(call)) {
+        result_.first_transport = std::min(result_.first_transport, root_index_);
+        result_.unsupported_control |= parallel;
+      }
+      if (op_predicates::IsTPop(call)) {
+        const auto assign = As<AssignStmt>(stmt);
+        CHECK_SPAN(assign && IsOp(call, pop_), stmt->span_)
+            << "Cross-core FIFO requires a tpop result on its consumer core";
+        const int id = established_pipe_ids_ ? call->GetKwarg<int>("id", 0) : 0;
+        CHECK_SPAN(active_.emplace(assign->var_.get(), Borrow{id, scope}).second, stmt->span_)
+            << "Cross-core FIFO has a repeated outstanding tpop result";
+        auto& queue = queues_[id];
+        queue.push_back(assign->var_.get());
+        auto& peak = result_.peak_depth[id];
+        peak = std::max(peak, queue.size());
+      } else if (op_predicates::IsTFree(call)) {
+        const auto tile = call->args_.empty() ? nullptr : AsVarLike(call->args_[0]);
+        const auto borrow = active_.find(tile.get());
+        CHECK_SPAN(IsOp(call, free_) && borrow != active_.end() && borrow->second.scope == scope, stmt->span_)
+            << "Cross-core FIFO cannot match tfree with an outstanding tpop in the same scope";
+        const int id = borrow->second.id;
+        auto& queue = queues_.at(id);
+        CHECK_SPAN(
+            (!established_pipe_ids_ || call->GetKwarg<int>("id", id) == id) && queue.front() == tile.get(),
+            stmt->span_)
+            << "Cross-core pipe requires FIFO release order within each pipe; a retained earlier tile "
                "must be consumed before a later gathered tile is released.";
-        ++fifo.next_free;
+        queue.pop_front();
+        active_.erase(borrow);
       }
     }
-    if (auto loop = std::dynamic_pointer_cast<const ForStmt>(stmt)) {
-      visit_body(loop->body_);
-    } else if (auto loop = std::dynamic_pointer_cast<const WhileStmt>(stmt)) {
-      visit_body(loop->body_);
-    } else if (auto branch = std::dynamic_pointer_cast<const IfStmt>(stmt)) {
-      visit_body(branch->then_body_);
-      if (branch->else_body_) {
-        visit_body(*branch->else_body_);
-      }
+    if (const auto seq = As<SeqStmts>(stmt)) {
+      for (const auto& child : seq->stmts_) Read(child, scope, parallel);
+    } else if (const auto loop = As<ForStmt>(stmt)) {
+      Scope(loop->body_, scope,
+            parallel || loop->kind_ == ForKind::Parallel || loop->kind_ == ForKind::Pipeline);
+    } else if (const auto loop = As<WhileStmt>(stmt)) {
+      Scope(loop->body_, scope, parallel);
+    } else if (const auto branch = As<IfStmt>(stmt)) {
+      Scope(branch->then_body_, scope, parallel);
+      if (branch->else_body_) Scope(*branch->else_body_, scope, parallel);
+    } else if (const auto region = As<ScopeStmt>(stmt)) {
+      Scope(region->body_, scope, true);
+    } else if (const auto region = As<SimtScopeStmt>(stmt)) {
+      Scope(region->body_, scope, true);
+    } else if (As<BreakStmt>(stmt) || As<ContinueStmt>(stmt) || As<InlineStmt>(stmt) ||
+               As<SimtLaunchStmt>(stmt) || (As<ReturnStmt>(stmt) && !active_.empty())) {
+      result_.unsupported_control = true;
     }
   }
-  return peak;
+
+  std::string pop_;
+  std::string free_;
+  bool established_pipe_ids_;
+  std::unordered_map<const Var*, Borrow> active_;
+  std::unordered_map<int, std::deque<const Var*>> queues_;
+  ConsumerFifoResult result_;
+  size_t root_index_ = 0;
+};
+
+size_t AutomaticConsumerDepth(const std::vector<StmtPtr>& stmts, core_affinity::CoreSide side) {
+  // Automatic setup constructs just one pipe. Size the original aggregate
+  // queue without interpreting handwritten operation IDs as independent pools.
+  const auto fifo = ConsumerFifo(side, false).Run(stmts);
+  return fifo.peak_depth.empty() ? 0 : fifo.peak_depth.at(0);
+}
+
+class PeerCutVerifier : public IRVisitor {
+ public:
+  explicit PeerCutVerifier(const std::unordered_set<const Call*>& initializers)
+      : initializers_(initializers) {}
+
+  void VisitStmt(const StmtPtr& stmt) override {
+    const auto call = transform_utils::GetCallFromStmt(stmt);
+    expected_ = call.get();
+    IRVisitor::VisitStmt(stmt);
+  }
+
+  void VisitExpr(const ExprPtr& expr) override {
+    const auto call = As<Call>(expr);
+    const bool at_cut = expected_ == expr.get();
+    if (at_cut) expected_ = nullptr;
+    CHECK(!call || !As<GlobalVar>(call->op_)) << "Outlined calls do not establish local peer FIFO order";
+    if (IsPeerTransport(call) || op_predicates::IsInitializePipe(call)) {
+      CHECK_SPAN(at_cut && seen_cuts_.insert(call.get()).second, call->span_)
+          << "Peer FIFO requires an original peer operation at a unique statement cut";
+      CHECK_SPAN(!op_predicates::IsInitializePipe(call) || initializers_.count(call.get()), call->span_)
+          << "Peer FIFO requires initializers that dominate all transport cuts";
+    }
+    if (seen_values_.insert(expr.get()).second) IRVisitor::VisitExpr(expr);
+  }
+
+ protected:
+  void VisitVarLike_(const VarPtr&) override {}
+
+ private:
+  const std::unordered_set<const Call*>& initializers_;
+  const Call* expected_ = nullptr;
+  std::unordered_set<const Call*> seen_cuts_;
+  std::unordered_set<const Expr*> seen_values_;
+};
+
+std::optional<std::pair<int64_t, int64_t>> FullVecShape(const TypePtr& value) {
+  const auto type = As<TileType>(value);
+  if (!type || type->memory_space_ != MemorySpace::Vec || type->dtype_ != DataType::FP32 ||
+      type->shape_.size() != 2)
+    return std::nullopt;
+  const auto view = tile_view_semantics::GetEffectiveTileView(*type);
+  if (view.blayout != TileLayout::row_major || view.slayout != TileLayout::none_box ||
+      view.pad != PadValue::null || view.compact != CompactMode::null || view.valid_shape.size() != 2)
+    return std::nullopt;
+  const auto rows = TryGetNonNegativeConstInt(type->shape_[0]);
+  const auto cols = TryGetNonNegativeConstInt(type->shape_[1]);
+  if ((view.start_offset && TryGetNonNegativeConstInt(view.start_offset) != 0) || !rows || !cols ||
+      *rows == 0 || *cols == 0 || *cols % 8 != 0 || rows != TryGetNonNegativeConstInt(view.valid_shape[0]) ||
+      cols != TryGetNonNegativeConstInt(view.valid_shape[1]))
+    return std::nullopt;
+  if (!view.stride.empty() && (view.stride.size() != 2 || TryGetNonNegativeConstInt(view.stride[0]) != cols ||
+                               TryGetNonNegativeConstInt(view.stride[1]) != 1))
+    return std::nullopt;
+  return std::pair{*rows, *cols};
+}
+
+std::optional<Span> FindOverwrittenConsumer(const std::vector<StmtPtr>& stmts, size_t begin, int id,
+                                            size_t slots, int slot_size) {
+  const auto& registry = OpRegistry::GetInstance();
+  std::deque<VarPtr> active;
+  VarPtr overwritten;
+  for (size_t i = begin; i < stmts.size(); ++i) {
+    const auto& stmt = stmts[i];
+    const auto call = transform_utils::GetCallFromStmt(stmt);
+    // The concrete refusal only uses a flat unconditional prefix. Effects of
+    // arbitrary branch/carry/exit paths remain outside this witness.
+    if (!As<AssignStmt>(stmt) && !As<EvalStmt>(stmt)) break;
+    if (op_predicates::IsTPop(call) && call->GetKwarg<int>("id", 0) == id) {
+      const auto tile = As<AssignStmt>(stmt)->var_;
+      const auto shape = FullVecShape(tile->GetType());
+      overwritten.reset();
+      if (active.size() >= slots && shape && call->GetKwarg<int>("split", 0) == 0 &&
+          shape->first <= (slot_size / 4) / shape->second) {
+        const auto& earlier = active[active.size() - slots];
+        if (earlier && shape == FullVecShape(earlier->GetType())) overwritten = earlier;
+      }
+      active.push_back(call->GetKwarg<int>("split", 0) == 0 ? tile : nullptr);
+      continue;
+    }
+    if (op_predicates::IsTFree(call)) {
+      if (!active.empty() && !call->args_.empty() && call->args_[0].get() == active.front().get())
+        active.pop_front();
+    } else if (overwritten && call && !As<GlobalVar>(call->op_) && registry.IsRegistered(call->op_->name_)) {
+      const auto& op = registry.GetEntry(call->op_->name_);
+      const auto shape = FullVecShape(call->GetType());
+      bool active_read = false, matches_shape = shape == FullVecShape(overwritten->GetType());
+      if (matches_shape &&
+          op.GetExecutionMemoryAccessEvidence() == ExecutionMemoryAccessEvidence::Functional) {
+        for (size_t arg = 0; arg < call->args_.size(); ++arg) {
+          const auto& value = call->args_[arg];
+          if (As<TileType>(value->GetType())) matches_shape &= shape == FullVecShape(value->GetType());
+          active_read |=
+              value.get() == overwritten.get() && ArgEffectReads(op.GetArgEffect(arg, call->kwargs_));
+        }
+        if (matches_shape && active_read) return stmt->span_;
+      }
+    }
+    overwritten.reset();
+  }
+  return std::nullopt;
 }
 
 }  // namespace
@@ -331,6 +492,69 @@ CrossCorePipeMetadata CollectDominatingPipeSetupMetadata(const std::vector<StmtP
   return metadata;
 }
 
+ConsumerFifoEvidence AnalyzeConsumerFifo(const FunctionPtr& function) {
+  if (function->func_type_ != FunctionType::AIC && function->func_type_ != FunctionType::AIV) return {};
+  const auto side =
+      function->func_type_ == FunctionType::AIC ? core_affinity::CoreSide::AIC : core_affinity::CoreSide::AIV;
+  const int incoming =
+      side == core_affinity::CoreSide::AIC ? core_affinity::kDirMaskV2C : core_affinity::kDirMaskC2V;
+  const size_t operand = side == core_affinity::CoreSide::AIC ? 1 : 0;
+  const auto stmts = FlattenBody(function->body_);
+  ConsumerFifoEvidence evidence;
+  try {
+    const auto fifo = ConsumerFifo(side, true).Run(stmts);
+    if (fifo.first_transport == stmts.size()) return {};
+    evidence.has_transport = true;
+    CHECK(!fifo.unsupported_control)
+        << "Concurrent, outlined or early-exit control does not prove local FIFO order";
+    const auto initialize = core_side_ops::InitializePipeOp(side);
+    std::unordered_map<const Var*, CallPtr> reserves;
+    std::map<int, CallPtr> initializers;
+    std::unordered_set<const Call*> prologue_initializers;
+    for (size_t i = 0; i < fifo.first_transport; ++i) {
+      const auto& stmt = stmts[i];
+      const auto call = transform_utils::GetCallFromStmt(stmt);
+      if (!call) continue;
+      if (IsOp(call, "system.reserve_buffer")) {
+        if (const auto assign = As<AssignStmt>(stmt)) reserves.emplace(assign->var_.get(), call);
+      } else if (IsOp(call, initialize)) {
+        prologue_initializers.insert(call.get());
+        if (call->GetKwarg<int>("dir_mask", 0) & incoming) {
+          CHECK(initializers.emplace(call->GetKwarg<int>("id", 0), call).second)
+              << "More than one dominating consumer initializer uses the same peer pipe id";
+        }
+      }
+    }
+    PeerCutVerifier(prologue_initializers).VisitStmt(function->body_);
+    for (const auto& [id, required] : fifo.peak_depth) {
+      const auto it = initializers.find(id);
+      CHECK(it != initializers.end()) << "No dominating consumer initializer for peer pipe id " << id;
+      const auto& setup = it->second;
+      const auto mask = setup->GetKwarg<int>("dir_mask", 0);
+      const auto slots = setup->GetKwarg<int>("slot_num", GetPtoasImplicitSlotNum(mask));
+      const auto local = setup->GetKwarg<int>("local_slot_num", slots);
+      const auto slot_size = setup->GetKwarg<int>("slot_size", 0);
+      CHECK((mask & ~(core_affinity::kDirMaskV2C | core_affinity::kDirMaskC2V)) == 0 && local > 0 &&
+            slots >= local && slot_size > 0 && setup->args_.size() == 2)
+          << "Invalid consumer slot geometry for peer pipe id " << id;
+      const auto reserve = reserves.find(AsVarLike(setup->args_[operand]).get());
+      CHECK(reserve != reserves.end() &&
+            reserve->second->GetKwarg<int>("size", 0) >= int64_t{local} * slot_size)
+          << "No reserve declaration covers the consumer slot window for peer pipe id " << id;
+      const auto depth = static_cast<size_t>(local);
+      evidence.capacities.emplace(id, ConsumerPipeCapacity{required, depth});
+      if (side == core_affinity::CoreSide::AIV && prologue_initializers.size() == 1 && required > depth) {
+        if (const auto overwritten =
+                FindOverwrittenConsumer(stmts, fifo.first_transport, id, depth, slot_size))
+          evidence.overwritten_input.emplace(*overwritten);
+      }
+    }
+  } catch (const pypto::ValueError& error) {
+    return {true, {}, error.what(), std::nullopt};
+  }
+  return evidence;
+}
+
 AutomaticPipeSetup BuildAutomaticPipeSetup(const std::string& func_name, const std::string& aic_name,
                                            const std::string& aiv_name, const std::vector<StmtPtr>& aic_stmts,
                                            const std::vector<StmtPtr>& aiv_stmts,
@@ -371,17 +595,14 @@ AutomaticPipeSetup BuildAutomaticPipeSetup(const std::string& func_name, const s
         << effective_slot_num << ")";
   }
   const int local_depth = local_slot_num_override.value_or(effective_slot_num);
-  ConsumerFifo aic_fifo;
-  ConsumerFifo aiv_fifo;
-  const int required_slot_num =
-      std::max(RequiredConsumerDepth(aic_stmts, core_affinity::CoreSide::AIC, aic_fifo),
-               RequiredConsumerDepth(aiv_stmts, core_affinity::CoreSide::AIV, aiv_fifo));
-  CHECK_SPAN(effective_slot_num >= required_slot_num, span)
+  const size_t required_slot_num = std::max(AutomaticConsumerDepth(aic_stmts, core_affinity::CoreSide::AIC),
+                                            AutomaticConsumerDepth(aiv_stmts, core_affinity::CoreSide::AIV));
+  CHECK_SPAN(static_cast<size_t>(effective_slot_num) >= required_slot_num, span)
       << "Automatic cross-core pipe slot_num=" << effective_slot_num << " is insufficient for "
       << required_slot_num
       << " simultaneously retained popped tiles; set cross_core_slot(slot_num=" << required_slot_num
       << ") or place/consume each gathered tile before gathering the next.";
-  CHECK_SPAN(local_depth >= required_slot_num, span)
+  CHECK_SPAN(static_cast<size_t>(local_depth) >= required_slot_num, span)
       << "Automatic cross-core pipe local_slot_num=" << local_depth << " is insufficient for "
       << required_slot_num
       << " simultaneously retained popped tiles; increase local_slot_num or place/consume "

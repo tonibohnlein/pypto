@@ -38,6 +38,7 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
 #include "pypto/ir/transforms/utils/loop_state_repair.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
@@ -782,6 +783,14 @@ Pass SplitVectorKernel() {
       // cross-core handshakes on lane 1 of a non-split AIV function. Untouched by
       // the convergence refactor.
       if (RequiresNoSplitDualAivSync(func)) {
+        // Check the original active lane before it is cloned into the
+        // zero-valid handshake-only lane. The existing transport is otherwise
+        // preserved, including when the local overlap proof is unavailable.
+        const auto fifo = cross_core_pipe::AnalyzeConsumerFifo(func);
+        if (fifo.overwritten_input) {
+          CHECK_SPAN(false, *fifo.overwritten_input)
+              << "Native peer pop overwrites a consumer slot before a later read of the earlier tile";
+        }
         new_functions.push_back(ProcessNoSplitDualAivFunction(func));
         changed = true;
       } else {
