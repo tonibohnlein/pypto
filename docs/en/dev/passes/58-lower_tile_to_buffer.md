@@ -46,7 +46,7 @@ partition form before storage planning rather than failing during final lowering
 | Atomic-add Acc writeback to packed ND GM | FP32 source and destination, A2/A3 |
 | add, mul | FP16, FP32, INT32 |
 | sub, div, maximum, minimum, abs, exp, sqrt, neg, relu, log, recip | FP32 |
-| rsqrt (default precision, no workspace) | FP32 |
+| rsqrt (default precision or high precision with explicit workspace) | FP32 |
 | adds, subs, muls, divs, maximums, minimums, lrelu, full | FP32 |
 | row_max, row_sum, row_min, row_prod | FP32, positive static valid |
 | row_expand_add/sub/mul/div/max/min | FP32, positive static valid, contiguous column carrier |
@@ -83,16 +83,16 @@ task-level visibility and inter-worker ordering where required. Host-model
 validation and generated C++ do not establish deterministic floating-point
 reduction across workers or native/device qualification.
 
-`rsqrt` uses the existing dense unary recipe with a disjoint destination. Both
-omitted `high_precision` and explicit `False` select the two-operand default
-implementation; `True`, an extra workspace, or an unknown attribute do not.
-Fixed recipes require their complete logical operand arity, including metadata
-operands such as `full`'s shape, so optional operands cannot be silently discarded.
-The selected A2/A3 implementation is pinned to
-[PTO-ISA `TUnaryOp.hpp`](https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TUnaryOp.hpp):
-the default `TRSQRT_IMPL` calls the shared `TUNARY_IMPL<RsqrtOp>` and `vrsqrt`,
-with no implicit scratch or numbered-event claims. The separate high-precision
-workspace overload is not covered by this recipe. Runtime-valid descriptors use
+With `high_precision` omitted or false, `rsqrt` uses the dense unary recipe
+with a disjoint destination. With `high_precision=True` and an explicit
+workspace, the FP32 recipe emits the three-operand `TRSQRT`. On A2/A3 the
+implementation writes one 32-byte block at the scratch address and reads it
+back for division. The scratch tile can have a partial valid rectangle because
+the instruction takes its data pointer and uses the destination's valid extents
+to control the computation. The scratch storage must cover the block and be
+disjoint from both data operands. [A2/A3 implementation](https://github.com/hw-native-sys/pto-isa/blob/83b1b2b5/include/pto/npu/a2a3/TUnaryOp.hpp#L300).
+
+Runtime-valid descriptors use
 the existing per-use metadata restoration and positive-extent guard; an empty
 valid region does not execute the native unary operation. Host tests cover
 positive numerical inputs, empty/partial/full valid regions, storage aliases,
@@ -323,6 +323,12 @@ from the table above. Standalone setters retain Tile IR because conversion needs
 an explicit logical result. Valid expressions must match structurally across
 arithmetic operands and result; two `-1` descriptor dimensions alone do not prove
 matching runtime values.
+
+A logical vector of capacity `[C]` uses a physical Vec tile of shape `[1,C]`,
+including when reshape produces the vector. A rank-one GM transfer of `n`
+elements uses the one-dimensional partition `[n]`. Its local tile has active
+extents `[1,n]`. For a runtime length, both native valid fields are mutable,
+and lowering establishes those two values before the transfer.
 
 Each data consumer restores its allocation-backed operands' logical valid
 extents. An old SSA value therefore keeps its original valid rectangle after a

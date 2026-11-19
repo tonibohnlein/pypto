@@ -25,6 +25,7 @@
 
 #include "pypto/backend/common/buffer_axis_recipes.h"
 #include "pypto/backend/common/buffer_conversion_recipes.h"
+#include "pypto/backend/common/buffer_scalar_recipes.h"
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/ir/arith/analyzer.h"
 #include "pypto/ir/function.h"
@@ -40,8 +41,8 @@ namespace pypto::ir {
 // A dynamic descriptor's -1 fields state availability, never equality of the
 // actual native metadata. This input-owned, use-site checker retains expressions
 // supplied by dominating allocation/setter commands and proves relations under
-// the original guard. It is intentionally scoped to ordinary alloc metadata:
-// slot/borrowed handles need a native-metadata ownership export first.
+// the original guard. Mutable facts require ordinary alloc ownership.
+// Rank-one transfers can also use immutable allocation or subview extents.
 //
 // One walk and indexed per-handle state; control boundaries advance an epoch
 // rather than scanning every handle. Unknown joins/backedges lose evidence,
@@ -97,7 +98,21 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
             state.extents[axis] = Constant(type->valid_shape_[axis], statement->span_);
           }
         }
+        // PTOAS cannot update a descriptor with a fixed valid row, so its
+        // dynamic column still names the allocation operand after a join.
+        if (type->shape_.size() == 2 && type->shape_[0] == 1 && type->valid_shape_[0] == 1 &&
+            type->valid_shape_[1] == -1 && state.extents[1]) {
+          immutable_rank_one_extents_[statement->var_.get()] = state.extents;
+        }
         states_[statement->var_.get()] = std::move(state);
+      }
+    } else if (call && type && type->shape_.size() == 2 && type->shape_[0] == 1 &&
+               type->valid_shape_[1] == -1 && IsOp(call, "buffer.subview") && call->args_.size() == 3) {
+      // A view's valid tuple belongs to the view itself, even if the parent
+      // allocation's active extents are changed later.
+      const auto valid = As<MakeTuple>(call->args_[2]);
+      if (valid && valid->elements_.size() == 2 && valid->elements_[0] && valid->elements_[1]) {
+        immutable_rank_one_extents_[statement->var_.get()] = {valid->elements_[0], valid->elements_[1]};
       }
     } else if (const auto scalar = As<ScalarType>(statement->var_->GetType());
                scalar && scalar->dtype_ == DataType::BOOL && !call) {
@@ -235,19 +250,39 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     }
     return result;
   }
+  std::optional<std::array<ExprPtr, 2>> RankOneTransferExtents(const ExprPtr& expression) const {
+    const auto var = AsVarLike(expression);
+    const auto immutable = immutable_rank_one_extents_.find(var.get());
+    if (immutable != immutable_rank_one_extents_.end()) return immutable->second;
+    return Extents(expression);
+  }
   void Refuse(const CallPtr& call, const std::string& message) {
     if (!issue_) issue_ = Issue{call, message};
   }
   void CheckCall(const CallPtr& call) {
-    if (collect_guards_ && (IsOp(call, "buffer.load") || IsOp(call, "buffer.store")) &&
-        call->args_.size() == 4) {
+    const bool load = IsOp(call, "buffer.load");
+    if ((load || IsOp(call, "buffer.store")) && call->args_.size() == 4) {
       const auto extents = As<MakeTuple>(call->args_[2]);
-      if (extents && std::any_of(extents->elements_.begin(), extents->elements_.end(),
-                                 [](const ExprPtr& extent) { return !As<ConstInt>(extent); })) {
+      if (collect_guards_ && extents &&
+          std::any_of(extents->elements_.begin(), extents->elements_.end(),
+                      [](const ExprPtr& extent) { return !As<ConstInt>(extent); })) {
         auto [entry, inserted] = transfer_guards_.emplace(call.get(), true);
         if (entry->second) {
           entry->second = std::all_of(extents->elements_.begin(), extents->elements_.end(),
                                       [this](const ExprPtr& extent) { return Positive(extent); });
+        }
+      }
+      const auto& local = call->args_[load ? 3 : 0];
+      const auto type = As<BufferType>(local->GetType());
+      if (type && type->valid_shape_.size() == 2 && type->valid_shape_[1] == -1 && extents &&
+          extents->elements_.size() == 1 && backend::SupportsBufferVector1DTransfer(call->args_, load)) {
+        const auto active = RankOneTransferExtents(local);
+        if (!active || !Equal((*active)[0], Constant(1, call->span_)) ||
+            !(structural_equal((*active)[1], extents->elements_[0]) ||
+              Equal((*active)[1], extents->elements_[0]))) {
+          Refuse(call,
+                 "Runtime rank-one transfer requires restored valid shape [1, extent] "
+                 "matching the GM partition");
         }
       }
     }
@@ -298,6 +333,7 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
 
     if (IsOp(call, "buffer.set_validshape") && call->args_.size() == 2) {
       const auto handle = AsVarLike(call->args_[0]);
+      immutable_rank_one_extents_.erase(handle.get());
       const auto values = As<MakeTuple>(call->args_[1]);
       if (handle && owners_.count(handle.get()) && values && values->elements_.size() == 2) {
         states_[handle.get()] = {epoch_, {values->elements_[0], values->elements_[1]}};
@@ -386,6 +422,7 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
   arith::AnalyzerPtr analyzer_;
   std::unordered_set<const Var*> owners_;
   std::unordered_map<const Var*, State> states_;
+  std::unordered_map<const Var*, std::array<ExprPtr, 2>> immutable_rank_one_extents_;
   std::optional<Issue> issue_;
   bool collect_guards_;
   // The same immutable statement/call can be reused. Every occurrence must

@@ -37,6 +37,7 @@
 #include "pypto/codegen/pto/pto_type_utils.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/arith/analyzer.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memory_space.h"
@@ -827,6 +828,52 @@ static std::string MakePrintCodegenPTO(const std::string& pto_op_name, const Cal
   return "";
 }
 
+// The three-operand A2/A3 implementation initializes the first 32 bytes
+// of scratch before reading the source, and reuses them throughout division.
+static bool RsqrtWorkspaceMayOverlap(const ir::TileTypePtr& scratch, const ir::TileTypePtr& payload,
+                                     bool addressed, const ir::Span& span) {
+  const auto workspace = scratch->memref_.value_or(nullptr);
+  const auto data = payload->memref_.value_or(nullptr);
+  // Borrowed pipe buffers have no general-pool MemRef. Their native handles
+  // are checked separately from planned allocation ranges.
+  if (!workspace || !data) return false;
+  if (!addressed && workspace->base_ != data->base_) return false;
+  const auto scratch_address = As<ir::ConstInt>(workspace->byte_offset_);
+  const auto data_address = As<ir::ConstInt>(data->byte_offset_);
+  __int128 distance;
+  if (scratch_address && data_address) {
+    distance = static_cast<__int128>(data_address->value_) - scratch_address->value_;
+  } else {
+    // Recover a fixed distance between offsets that use shared runtime
+    // coordinates. In placed mode even distinct roots share one byte domain.
+    ir::arith::Analyzer analyzer;
+    const auto difference =
+        std::make_shared<ir::Sub>(data->byte_offset_, workspace->byte_offset_, DataType::INT64, span);
+    const auto constant = As<ir::ConstInt>(analyzer.Simplify(difference));
+    if (!constant) return true;
+    distance = constant->value_;
+  }
+  constexpr int64_t kScratchBytes = 32;
+  return distance < kScratchBytes && distance > -static_cast<__int128>(data->size_);
+}
+
+static void CheckA2A3RsqrtWorkspace(const CallPtr& op, codegen::PTOCodegen& codegen) {
+  const auto& source = op->args_[0];
+  const auto& scratch = op->args_[1];
+  const auto source_type = As<ir::TileType>(source->GetType());
+  const auto scratch_type = As<ir::TileType>(scratch->GetType());
+  const auto destination_type = codegen.GetCurrentResultTileType();
+  INTERNAL_CHECK_SPAN(source_type && scratch_type && destination_type, op->span_)
+      << "Internal error: tile.rsqrt requires Tile operands and destination";
+  const auto scratch_handle = codegen.GetExprAsCode(scratch);
+  CHECK_SPAN(scratch_handle != codegen.GetExprAsCode(source) &&
+                 scratch_handle != codegen.GetCurrentResultTarget() &&
+                 !RsqrtWorkspaceMayOverlap(scratch_type, source_type, codegen.EmitTileAddr(), op->span_) &&
+                 !RsqrtWorkspaceMayOverlap(scratch_type, destination_type, codegen.EmitTileAddr(), op->span_),
+             op->span_)
+      << "tile.rsqrt on A2/A3 requires scratch disjoint from source and destination";
+}
+
 static std::string MakePreluCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
   CheckArity(op, "pto.tprelu", 3);
@@ -1245,6 +1292,9 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
           INTERNAL_CHECK_SPAN(arity == 1 || arity == 2, op->span_)
               << "tile.rsqrt requires 1 or 2 arguments, but got " << arity;
           auto& pto_codegen = AsPto(codegen);
+          if (arity == 2 && pto_codegen.GetBackendHandler()->GetPtoTargetArch() == "a2a3") {
+            CheckA2A3RsqrtWorkspace(op, pto_codegen);
+          }
           std::string code = "pto.trsqrt " + GenerateInsOutsClause(op, pto_codegen);
           if (op->GetKwarg<bool>("high_precision", false)) {
             code += " {precisionType = #pto<rsqrt_precision high_precision>}";

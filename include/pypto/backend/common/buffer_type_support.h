@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "pypto/core/dtype.h"
@@ -133,6 +134,27 @@ inline bool IsAlignedDenseVecBuffer(const ir::BufferTypePtr& type) {
   return IsAlignedDenseVecBufferGeometry(type) && type->valid_shape_[0] > 0 && type->valid_shape_[1] > 0;
 }
 
+/// Native dense tiles represent a logical vector as one row. Apply the same
+/// axis mapping to physical capacities, valid extents and their SSA operands.
+template <typename Extent>
+std::vector<Extent> NormalizeBufferTileExtents(std::vector<Extent> extents, const Extent& one) {
+  if (extents.size() == 1) extents.insert(extents.begin(), one);
+  return extents;
+}
+
+/// Both native valid fields must be dynamic for a metadata update, including
+/// the implicit row of a vector. Zero valid extents also require runtime
+/// metadata; the descriptor itself cannot represent the empty-lane sentinel.
+inline std::vector<int64_t> MutableBufferValidShape(const std::vector<ir::ExprPtr>& logical_valid) {
+  std::vector<int64_t> valid;
+  for (const auto& extent : logical_valid) {
+    const auto constant = ir::As<ir::ConstInt>(extent);
+    if (!constant || constant->value_ == 0) return {-1, -1};
+    valid.push_back(constant->value_);
+  }
+  return NormalizeBufferTileExtents(std::move(valid), int64_t{1});
+}
+
 /// Physical descriptor projection shared by native operation recipes. The
 /// returned full-shape valid fields describe capacity only, never the actual
 /// active domain; a caller must separately certify original valid metadata.
@@ -144,12 +166,12 @@ inline ir::BufferTypePtr PhysicalLogicalVecDescriptor(const ir::TypePtr& type) {
   const auto offset = ir::As<ir::ConstInt>(view.start_offset);
   if (view.start_offset && (!offset || offset->value_ != 0)) return nullptr;
   std::vector<int64_t> shape;
-  if (tile->shape_.size() == 1) shape.push_back(1);
   for (const auto& expression : tile->shape_) {
     const auto dimension = ir::As<ir::ConstInt>(expression);
     if (!dimension || dimension->value_ <= 0) return nullptr;
     shape.push_back(dimension->value_);
   }
+  shape = NormalizeBufferTileExtents(std::move(shape), int64_t{1});
   if (!view.stride.empty()) {
     if (tile->shape_.size() == 1) {
       const auto stride = view.stride.size() == 1 ? ir::As<ir::ConstInt>(view.stride[0]) : nullptr;
@@ -176,13 +198,9 @@ inline ir::BufferTypePtr StaticLogicalBufferDescriptor(const ir::TypePtr& type) 
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
   const auto& extents = view.valid_shape.empty() ? tile->shape_ : view.valid_shape;
   if (extents.size() != tile->shape_.size()) return nullptr;
-  std::vector<int64_t> valid;
-  if (extents.size() == 1) valid.push_back(1);
-  for (size_t i = 0; i < extents.size(); ++i) {
-    const auto extent = ir::As<ir::ConstInt>(extents[i]);
-    const int64_t limit = physical->shape_[extents.size() == 1 ? 1 : i];
-    if (!extent || extent->value_ <= 0 || extent->value_ > limit) return nullptr;
-    valid.push_back(extent->value_);
+  const auto valid = MutableBufferValidShape(extents);
+  for (size_t i = 0; i < valid.size(); ++i) {
+    if (valid[i] <= 0 || valid[i] > physical->shape_[i]) return nullptr;
   }
   return std::make_shared<ir::BufferType>(physical->shape_, tile->dtype_, ir::MemorySpace::Vec, valid,
                                           view.blayout);

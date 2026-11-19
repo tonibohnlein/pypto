@@ -7,15 +7,19 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Default FP32 reciprocal square root uses the existing unary Buffer contract."""
+"""FP32 reciprocal square root preserves its precision and scratch contracts."""
 
 import pypto.language as pl
 import pytest
 import torch
 from pypto import ir, passes, testing
+from pypto.backend._ptoas_locate import find_ptoas_binary
+from pypto.backend.pto_backend import _run_ptoas
 from pypto.debug import torch_codegen
+from pypto.pypto_core import codegen
 from pypto.pypto_core import ir as core_ir
 
+from .buffer_test_utils import statements
 from .sync_closed_command_oracle import check_closed_commands
 from .sync_matmul_oracle import validate
 from .test_physical_sync_realization import check
@@ -66,19 +70,111 @@ class DefaultRsqrt:
 
 
 @pytest.mark.parametrize("planner", _PLANNERS)
-def test_explicit_workspace_rsqrt_is_not_silently_reduced_to_default(planner):
-    program = pl.parse_program("""
+@pytest.mark.parametrize("scratch_form", ["create", "partial_load", "bounded_window"])
+def test_explicit_workspace_rsqrt_reaches_ptoas(planner, scratch_form, tmp_path):
+    scratch_definition = {
+        "create": "scratch = pl.tile.create([16, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)",
+        "partial_load": "scratch = pl.load(workspace, [0, 0], [16, 32], valid_shape=[1, 32])",
+        "bounded_window": (
+            "backing = pl.load(workspace, [0, 0], [32, 32])\n"
+            "        scratch = pl.tile.slice(backing, [16, 32], [4, 0], valid_shape=[1, 32])"
+        ),
+    }[scratch_form]
+    program = pl.parse_program(f"""
 @pl.program
 class Workspace:
     @pl.function(type=pl.FunctionType.InCore)
     def kernel(self, x: pl.Tensor[[16, 32], pl.FP32],
+               workspace: pl.Tensor[[32, 32], pl.FP32],
                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]]) -> pl.Tensor[[16, 32], pl.FP32]:
         value = pl.load(x, [0, 0], [16, 32])
-        scratch = pl.tile.create([16, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        {scratch_definition}
         result = pl.tile.rsqrt(value, scratch, high_precision=True)
         return pl.store(result, [0, 0], out)
 """)
-    assert _kernel(_lower(program, planner)).ir_stage == ir.FunctionIRStage.Functional
+    lowered = _lower(program, planner)
+    assert _kernel(lowered).ir_stage == ir.FunctionIRStage.Buffer
+    calls = [
+        stmt.expr
+        for stmt in statements(lowered)
+        if isinstance(stmt, ir.EvalStmt) and isinstance(stmt.expr, ir.Call)
+    ]
+    (rsqrt,) = (call for call in calls if call.op.name == ir.get_op("buffer.rsqrt_workspace").name)
+    assert len(rsqrt.args) == 3
+    assert dict(rsqrt.kwargs) == {"high_precision": True}
+    scratch = rsqrt.args[1]
+    scratch_type = scratch.type
+    assert isinstance(scratch_type, ir.BufferType)
+    assert list(scratch_type.shape) == [16, 32]
+    assert list(scratch_type.valid_shape) == ([16, 32] if scratch_form == "create" else [1, 32])
+    if scratch_form == "partial_load":
+        # The same allocation remains the load destination and the scratch
+        # operand. Its nominal valid rectangle stays one row.
+        loads = [call for call in calls if call.op.name == ir.get_op("buffer.load").name]
+        assert scratch.same_as(loads[1].args[-1])
+    effects = testing.describe_buffer_sync_operation(rsqrt, ir.FunctionType.AIV)
+    assert [item["data"] for item in effects["arguments"]] == ["read", "write", "write"]
+
+    pto = codegen.PTOCodegen().generate(
+        lowered, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS, emit_source_loc=False
+    )
+    (instruction,) = (line for line in pto.splitlines() if "pto.trsqrt " in line)
+    assert instruction.split(" : ", 1)[0].count("%") == 2
+    assert "precisionType = #pto<rsqrt_precision high_precision>" in instruction
+    _assert_native_workspace_rsqrt(pto, tmp_path, planner)
+
+
+def _assert_native_workspace_rsqrt(pto, tmp_path, planner):
+    if find_ptoas_binary() is not None:
+        source = tmp_path / "rsqrt.pto"
+        output = tmp_path / "rsqrt.cpp"
+        source.write_text(pto)
+        level = "level2" if planner == passes.MemoryPlanner.PTOAS else "level3"
+        _run_ptoas(str(source), str(output), ["--pto-arch=a2", f"--pto-level={level}"])
+        assert "TRSQRT<pto::RsqrtAlgorithm::HIGH_PRECISION>" in output.read_text()
+
+
+@pytest.mark.parametrize("planner", _PLANNERS)
+@pytest.mark.parametrize(
+    ("scratch_form", "enable_buffer_ir"),
+    [("narrow_window", True), ("disjoint_windows", True), ("source_alias", True), ("source_alias", False)],
+)
+def test_workspace_rsqrt_functional_storage_checks(planner, scratch_form, enable_buffer_ir, tmp_path):
+    source = (
+        "pl.tile.slice(backing, [16, 32], [0, 0], valid_shape=[16, 32])"
+        if scratch_form == "disjoint_windows"
+        else "pl.load(x, [0, 0], [16, 32])"
+    )
+    scratch_definition = {
+        "narrow_window": "pl.tile.slice(backing, [16, 32], [0, 0], valid_shape=[1, 32])",
+        "disjoint_windows": "pl.tile.slice(backing, [16, 32], [16, 0], valid_shape=[1, 32])",
+        "source_alias": "pl.tile.set_validshape(value, 1, 32)",
+    }[scratch_form]
+    program = pl.parse_program(f"""
+@pl.program
+class Workspace:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, x: pl.Tensor[[16, 32], pl.FP32],
+               workspace: pl.Tensor[[32, 64], pl.FP32],
+               out: pl.Out[pl.Tensor[[16, 32], pl.FP32]]) -> pl.Tensor[[16, 32], pl.FP32]:
+        backing = pl.load(workspace, [0, 0], [32, 64])
+        value = {source}
+        scratch = {scratch_definition}
+        result = pl.tile.rsqrt(value, scratch, high_precision=True)
+        return pl.store(result, [0, 0], out)
+""")
+    lowered = _lower(program, planner, enable_buffer_ir)
+    assert _kernel(lowered).ir_stage == ir.FunctionIRStage.Functional
+    if scratch_form == "source_alias":
+        with pytest.raises(ValueError, match="scratch disjoint from source and destination"):
+            codegen.PTOCodegen().generate(
+                lowered, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS, emit_source_loc=False
+            )
+    else:
+        pto = codegen.PTOCodegen().generate(
+            lowered, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS, emit_source_loc=False
+        )
+        _assert_native_workspace_rsqrt(pto, tmp_path, planner)
 
 
 @pytest.mark.parametrize("planner", _PLANNERS)

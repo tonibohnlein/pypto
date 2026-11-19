@@ -20,6 +20,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "memory_reuse/internal.h"
@@ -161,12 +162,11 @@ class BufferKernelSupport : public IRVisitor {
         admission.Require(
             backend::IsDenseVecBufferTile(tile, view) && cols % (256 / tile->dtype_.GetBit()) == 0,
             BufferAdmissionProperty::TypeLayout);
-        admission.Require(
-            view.stride.empty() ||
-                (one_d ? (view.stride.size() == 1 && ConstantEquals(view.stride[0], 1))
-                       : (view.stride.size() == 2 && ConstantEquals(view.stride[0], cols) &&
-                          ConstantEquals(view.stride[1], 1))),
-            BufferAdmissionProperty::TypeLayout);
+        admission.Require(view.stride.empty() ||
+                              (one_d ? (view.stride.size() == 1 && ConstantEquals(view.stride[0], 1))
+                                     : (view.stride.size() == 2 && ConstantEquals(view.stride[0], cols) &&
+                                        ConstantEquals(view.stride[1], 1))),
+                          BufferAdmissionProperty::TypeLayout);
       }
       admission.Require(!view.start_offset || ConstantEquals(view.start_offset, 0),
                         BufferAdmissionProperty::TypeLayout);
@@ -208,19 +208,19 @@ class BufferKernelSupport : public IRVisitor {
         admission.Require(view.valid_shape.empty() || SameShape(view.valid_shape, tensor->shape_),
                           BufferAdmissionProperty::TypeLayout);
         if (tensor->shape_.size() == 1) {
-          admission.Require(view.stride.empty() || (view.stride.size() == 1 && ConstantEquals(view.stride[0], 1)),
-                            BufferAdmissionProperty::TypeLayout);
+          admission.Require(
+              view.stride.empty() || (view.stride.size() == 1 && ConstantEquals(view.stride[0], 1)),
+              BufferAdmissionProperty::TypeLayout);
         } else {
           const auto rows = As<ConstInt>(tensor->shape_[0]);
           const auto cols = As<ConstInt>(tensor->shape_[1]);
           const auto row_stride = view.stride.size() == 2 ? As<ConstInt>(view.stride[0]) : nullptr;
           const bool single_row = rows && rows->value_ == 1;
-          admission.Require(
-              view.stride.empty() ||
-                  (view.stride.size() == 2 && ConstantEquals(view.stride[1], 1) &&
-                   (structural_equal(view.stride[0], tensor->shape_[1]) ||
-                    (single_row && cols && row_stride && row_stride->value_ >= cols->value_))),
-              BufferAdmissionProperty::TypeLayout);
+          admission.Require(view.stride.empty() ||
+                                (view.stride.size() == 2 && ConstantEquals(view.stride[1], 1) &&
+                                 (structural_equal(view.stride[0], tensor->shape_[1]) ||
+                                  (single_row && cols && row_stride && row_stride->value_ >= cols->value_))),
+                            BufferAdmissionProperty::TypeLayout);
         }
       }
     } else if (!As<ScalarType>(type) && !As<PtrType>(type) && !As<VoidType>(type) && !As<TupleType>(type)) {
@@ -542,9 +542,9 @@ class BufferKernelSupport : public IRVisitor {
                               backend::SupportsLogicalVector1DBufferTransfer(call),
                           BufferAdmissionProperty::TransferTypes);
       const int cache = GetIntKwarg(call->kwargs_, "cache", static_cast<int>(CachePolicy::kDefault));
-      admission.Require(cache == static_cast<int>(CachePolicy::kDefault) ||
-                            cache == static_cast<int>(CachePolicy::kBypass),
-                        BufferAdmissionProperty::OperationRecipe);
+      admission.Require(
+          cache == static_cast<int>(CachePolicy::kDefault) || cache == static_cast<int>(CachePolicy::kBypass),
+          BufferAdmissionProperty::OperationRecipe);
     } else if (IsOp(call, "tile.store")) {
       has_store = true;
       // The Buffer store recipe uses the three-operand form; accept an explicit
@@ -677,6 +677,9 @@ class BufferKernelSupport : public IRVisitor {
       admission.Require(
           recipe && recipe->default_enabled && backend::SupportsLogicalBufferElementwise(*recipe, call),
           BufferAdmissionProperty::OperationRecipe);
+      if (admission.supported() && IsOp(call, "tile.rsqrt") && call->args_.size() == 2) {
+        admission.Require(QualifyRsqrtWorkspace(call), BufferAdmissionProperty::OperationRecipe);
+      }
       if (IsOp(call, "tile.full")) has_fill = true;
     }
     IRVisitor::VisitExpr_(call);
@@ -684,6 +687,22 @@ class BufferKernelSupport : public IRVisitor {
 
  private:
   static constexpr int64_t kWindowAlignmentBytes = 32;
+
+  bool QualifyRsqrtWorkspace(const CallPtr& call) const {
+    const auto& scratch = call->args_[1];
+    const auto scratch_view = views_.Get(scratch);
+    // Slice admission already checks bounds and byte alignment. Keep only
+    // fixed-origin dense views so the scratch enclosure has proved geometry.
+    if (!scratch_view.root || !scratch_view.offsets || !views_.HasDenseRowPitch(scratch)) return false;
+    const auto source_view = views_.Get(call->args_[0]);
+    if (!source_view.root) return false;
+    const auto memory = GetTypeMemRef(scratch_view.root->GetType()).value_or(nullptr);
+    const auto source_memory = GetTypeMemRef(source_view.root->GetType()).value_or(nullptr);
+    // Selection precedes address placement. The Buffer verifier later checks
+    // physical separation of all three operands, even across different roots.
+    return memory && memory->base_ && source_memory && source_memory->base_ &&
+           memory->base_ != source_memory->base_;
+  }
 
   // Cache scalar SSA facts and expression nodes once. Unknown values have no
   // guaranteed factor beyond one; arithmetic preserves only proven multiples.
@@ -741,19 +760,19 @@ class BufferKernelSupport : public IRVisitor {
         !SameShape(ValidShape(target), target->shape_) || !SameShape(ValidShape(source), source->shape_) ||
         !SameShape(ValidShape(destination), destination->shape_) ||
         GetOptionalDoubleKwarg(call->kwargs_, "pre_quant").has_value() ||
-        GetKwargOr<bool>(call->kwargs_, "pre_relu", false) ||
-        GetIntKwarg(call->kwargs_, "cache", 0) != 0) {
+        GetKwargOr<bool>(call->kwargs_, "pre_relu", false) || GetIntKwarg(call->kwargs_, "cache", 0) != 0) {
       admission.Require(false, BufferAdmissionProperty::MatrixRecipe);
       return;
     }
     for (size_t i = 0; i < 2; ++i) {
       const auto offset = As<ConstInt>(offsets->elements_[i]);
       const auto scalar = As<ScalarType>(offsets->elements_[i]->GetType());
-      const auto limit = As<ConstInt>(destination->shape_[i])->value_ - As<ConstInt>(source->shape_[i])->value_;
-      admission.Require(limit >= 0 && scalar &&
-                            (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt()) &&
-                            (!offset || (offset->value_ >= 0 && offset->value_ <= limit && offset->value_ % 16 == 0)),
-                        BufferAdmissionProperty::MatrixRecipe);
+      const auto limit =
+          As<ConstInt>(destination->shape_[i])->value_ - As<ConstInt>(source->shape_[i])->value_;
+      admission.Require(
+          limit >= 0 && scalar && (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt()) &&
+              (!offset || (offset->value_ >= 0 && offset->value_ <= limit && offset->value_ % 16 == 0)),
+          BufferAdmissionProperty::MatrixRecipe);
     }
   }
 
@@ -866,11 +885,9 @@ class BufferKernelSupport : public IRVisitor {
 
   static std::optional<uint64_t> TileBytes(const TileTypePtr& tile) {
     if (!tile || !StaticShape(tile->shape_)) return std::nullopt;
-    const std::vector<int64_t> shape =
-        tile->shape_.size() == 1
-            ? std::vector<int64_t>{1, As<ConstInt>(tile->shape_[0])->value_}
-            : std::vector<int64_t>{As<ConstInt>(tile->shape_[0])->value_,
-                                   As<ConstInt>(tile->shape_[1])->value_};
+    std::vector<int64_t> extents;
+    for (const auto& extent : tile->shape_) extents.push_back(As<ConstInt>(extent)->value_);
+    const auto shape = backend::NormalizeBufferTileExtents(std::move(extents), int64_t{1});
     return backend::PhysicalBufferBytes(std::make_shared<BufferType>(shape, tile->dtype_, MemorySpace::Vec));
   }
 
@@ -932,15 +949,15 @@ class BufferKernelSupport : public IRVisitor {
             break;
           }
         }
-        admission.Require(call->args_.size() == 4 && valid_kwargs && source->shape_.size() == 2 &&
-                              destination->shape_.size() == 2 && StaticShape(source->shape_) &&
-                              StaticShape(destination->shape_) && source->dtype_ == destination->dtype_ &&
-                              !views_.IsWindow(call->args_[0]) &&
-                              backend::IsDenseVecBufferTile(
-                                  source, tile_view_semantics::GetEffectiveTileView(*source)) &&
-                              backend::IsDenseVecBufferTile(
-                                  destination, tile_view_semantics::GetEffectiveTileView(*destination)),
-                          BufferAdmissionProperty::OperationRecipe);
+        admission.Require(
+            call->args_.size() == 4 && valid_kwargs && source->shape_.size() == 2 &&
+                destination->shape_.size() == 2 && StaticShape(source->shape_) &&
+                StaticShape(destination->shape_) && source->dtype_ == destination->dtype_ &&
+                !views_.IsWindow(call->args_[0]) &&
+                backend::IsDenseVecBufferTile(source, tile_view_semantics::GetEffectiveTileView(*source)) &&
+                backend::IsDenseVecBufferTile(destination,
+                                              tile_view_semantics::GetEffectiveTileView(*destination)),
+            BufferAdmissionProperty::OperationRecipe);
         if (!admission.supported()) return;
         const int64_t elem_bytes = source->dtype_.GetBit() / 8;
         const auto col_residue = WindowOffsetResidue(call->args_[2], elem_bytes);

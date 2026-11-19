@@ -281,7 +281,8 @@ class BufferIRVisitor : public IRVisitor {
                                         view_handles_.count(AsVarLike(op->args_[1]).get()))) {
           CheckWindowPair(op, op->args_[0], op->args_[1], true);
         }
-        if (IsOp(op, "buffer.extract") || IsOp(op, "buffer.insert")) CheckWindowPair(op, op->args_[0], op->args_[3], false);
+        if (IsOp(op, "buffer.extract") || IsOp(op, "buffer.insert"))
+          CheckWindowPair(op, op->args_[0], op->args_[3], false);
         if (IsOp(op, "buffer.set_validshape") && view_handles_.count(AsVarLike(op->args_[0]).get())) {
           Error("buffer.set_validshape cannot mutate static view metadata", op->span_);
         }
@@ -530,6 +531,7 @@ class BufferIRVisitor : public IRVisitor {
       if (recipe.inputs[i].kind == backend::BufferElementwiseOperandKind::Buffer) {
         CheckWindowPair(call, call->args_[i], call->args_.back(), exact_allowed);
       } else if (recipe.inputs[i].kind == backend::BufferElementwiseOperandKind::Workspace) {
+        CheckElementwiseWorkspaceWindow(call, call->args_[i]);
         CheckWindowPair(call, call->args_[i], call->args_.back(), false);
         for (size_t j = 0; j < recipe.inputs.size(); ++j) {
           if (j != i && recipe.inputs[j].kind != backend::BufferElementwiseOperandKind::ElementScalar) {
@@ -537,6 +539,27 @@ class BufferIRVisitor : public IRVisitor {
           }
         }
       }
+    }
+  }
+
+  void CheckElementwiseWorkspaceWindow(const CallPtr& call, const ExprPtr& operand) {
+    const auto var = AsVarLike(operand);
+    const auto window = windows_.find(var.get());
+    const auto type = As<BufferType>(operand->GetType());
+    const auto pitch = static_cast<uint64_t>(type->shape_[1]) * type->dtype_.GetByte();
+    // A strided or runtime-offset subview can hide its true geometry. Slot
+    // selectors already have a proved aligned stride from their physical tile.
+    if (window == windows_.end() || window->second.row_pitch != pitch ||
+        (!window->second.known_offset && view_handles_.count(var.get()))) {
+      Error(call->op_->name_ + " workspace requires proven dense allocation geometry", call->span_);
+      return;
+    }
+    const auto root = allocations_.find(window->second.root);
+    constexpr uint64_t alignment = 32;
+    if (root == allocations_.end() || window->second.offset % alignment != 0 ||
+        (!root->second.symbolic &&
+         (!root->second.address || root->second.address->value_ % alignment != 0))) {
+      Error(call->op_->name_ + " workspace requires a proven 32-byte aligned base", call->span_);
     }
   }
 
