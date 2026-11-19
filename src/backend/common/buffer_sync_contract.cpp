@@ -46,6 +46,7 @@ const char* BufferNativeOperation(const ir::CallPtr& call) {
   if (IsOp(call, "buffer.transpose")) return GetPtoNativeOpSpec("tile.transpose").native_op;
   if (IsOp(call, "buffer.matmul")) return "pto.tmatmul";
   if (IsOp(call, "buffer.matmul_acc")) return "pto.tmatmul.acc";
+  if (IsOp(call, "buffer.ci") || IsOp(call, "buffer.ci_workspace")) return "pto.tci";
   if (auto r = FindBufferElementwiseRecipe(call->op_->name_)) return r->native_op;
   if (auto r = FindBufferIndexedRecipe(call->op_->name_)) return r->native_op;
   if (auto r = FindBufferAxisRecipe(call->op_->name_)) return r->native_op;
@@ -96,14 +97,18 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
     const bool load = IsOp(call, "buffer.load");
     if (const auto tensor = As<ir::TensorType>(call->args_[load ? 0 : 3]->GetType());
         tensor && tensor->shape_.size() == 1) {
-      CHECK(core == FunctionType::AIV && target == "a2a3" && SupportsBufferScalarTransfer(call->args_, load))
-          << "Rank-one scalar DMA requires the qualified A2/A3 AIV INT32 point-transfer contract";
-      // TLOAD reads one GM element and may write a local alignment tail;
-      // TSTORE writes exactly one GM element. Its selected ND unit view gives
-      // nBurst=1,lenBurst=4 in TStoreUb2gmNd2nd, then the A2/A3 b32 intrinsic.
-      // Both retain the normative selected native DMA contract. Conservative
-      // import covers the full carrier; no exact physical selector is granted.
-      result.audited_signal_free_variant_ = true;
+      const bool scalar_point = SupportsBufferScalarTransfer(call->args_, load);
+      const bool vector_1d = SupportsBufferVector1DTransfer(call->args_, load);
+      CHECK(core == FunctionType::AIV && target == "a2a3" && (scalar_point || vector_1d))
+          << "Rank-one Buffer DMA requires qualified A2/A3 AIV scalar point or vector 1D transfer contract";
+      if (scalar_point) {
+        // TLOAD reads one GM element and may write a local alignment tail;
+        // TSTORE writes exactly one GM element. Its selected ND unit view gives
+        // nBurst=1,lenBurst=4 in TStoreUb2gmNd2nd, then the A2/A3 b32 intrinsic.
+        // Both retain the normative selected native DMA contract. Conservative
+        // import covers the full carrier; no exact physical selector is granted.
+        result.audited_signal_free_variant_ = true;
+      }
     }
     const auto local = As<BufferType>(call->args_[load ? 3 : 0]->GetType());
     CHECK(local && (local->memory_space_ == MemorySpace::Vec ||
@@ -169,6 +174,15 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
           << "Synchronization conversion import requires a qualified AIV cast";
     result.pipe_ = PipeType::V;
   }
+  if (IsOp(call, "buffer.ci_workspace")) {
+    CHECK(target == "a2a3" && core == FunctionType::AIV)
+        << "Buffer sequence generation requires A2/A3 AIV explicit workspace form";
+    // pto-isa a2a3/TCI.hpp: the explicit-workspace TCI variant executes pure
+    // vector instructions on explicit tmp without EVENT_ID/TMP_UB_OFFSET.
+    result.audited_signal_free_variant_ = true;
+  } else if (IsOp(call, "buffer.ci")) {
+    CHECK(false) << "Synchronization import requires explicit workspace buffer.ci_workspace";
+  }
   if (IsOp(call, "buffer.cast")) {
     const auto source = As<BufferType>(call->args_[0]->GetType());
     const auto target_type = As<BufferType>(call->args_[1]->GetType());
@@ -182,12 +196,12 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
       CHECK(target == "a2a3") << "Direct BF16/FP32 conversion requires a qualified native implementation";
     }
   }
-  if (IsOp(call, "buffer.rsqrt")) {
-    CHECK(target == "a2a3") << "Default rsqrt requires a qualified native implementation";
+  if (IsOp(call, "buffer.rsqrt") || IsOp(call, "buffer.rsqrt_workspace")) {
+    CHECK(target == "a2a3") << "Rsqrt requires a qualified native implementation";
     // pto-isa 5487a6b0 TUnaryOp.hpp: the admitted two-operand default
-    // TRSQRT_IMPL invokes TUNARY_IMPL<RsqrtOp> / vrsqrt. No temporary or
-    // numbered-event operation is present. The explicit-workspace overload
-    // is a different recipe and is rejected by shared call validation.
+    // TRSQRT_IMPL invokes TUNARY_IMPL<RsqrtOp> / vrsqrt, and the explicit
+    // high-precision TRSQRT_IMPL uses vector_dup/vsqrt/vmul/vdiv on explicit tmp.
+    // Neither uses hidden temporary or numbered-event operations.
     result.audited_signal_free_variant_ = true;
   }
   if (const auto row = FindBufferAxisRecipe(call->op_->name_); row && row->reduction && row->axis == 1) {

@@ -213,6 +213,19 @@ class BufferIRVisitor : public IRVisitor {
             Error("Scalar Buffer operations require dense physical row pitch", op->span_);
           }
         }
+        if (IsOp(op, "buffer.ci") || IsOp(op, "buffer.ci_workspace")) {
+          for (size_t i = 1; i < op->args_.size(); ++i) {
+            const auto window = windows_.find(AsVarLike(op->args_[i]).get());
+            const auto type = As<BufferType>(op->args_[i]->GetType());
+            const auto pitch = static_cast<uint64_t>(type->shape_[1]) * (type->dtype_.GetBit() / 8);
+            if (window == windows_.end() || window->second.row_pitch != pitch) {
+              Error("Sequence Buffer operations require dense physical row pitch", op->span_);
+            }
+          }
+          if (IsOp(op, "buffer.ci_workspace")) {
+            CheckWindowPair(op, op->args_[1], op->args_[2], false);
+          }
+        }
         if (const auto* indexed = backend::FindBufferIndexedRecipe(name)) {
           // Flattened indexing requires dense physical rows. A subview may
           // inherit a wider parent pitch despite its own dense descriptor.
@@ -516,6 +529,13 @@ class BufferIRVisitor : public IRVisitor {
     for (size_t i = 0; i < recipe.inputs.size(); ++i) {
       if (recipe.inputs[i].kind == backend::BufferElementwiseOperandKind::Buffer) {
         CheckWindowPair(call, call->args_[i], call->args_.back(), exact_allowed);
+      } else if (recipe.inputs[i].kind == backend::BufferElementwiseOperandKind::Workspace) {
+        CheckWindowPair(call, call->args_[i], call->args_.back(), false);
+        for (size_t j = 0; j < recipe.inputs.size(); ++j) {
+          if (j != i && recipe.inputs[j].kind != backend::BufferElementwiseOperandKind::ElementScalar) {
+            CheckWindowPair(call, call->args_[j], call->args_[i], false);
+          }
+        }
       }
     }
   }

@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/buffer_indexed_recipes.h"
 #include "pypto/backend/common/buffer_scalar_recipes.h"
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
@@ -171,9 +172,10 @@ TypePtr DeduceBufferTransfer(const std::vector<ExprPtr>& args, bool load) {
   auto buffer = As<BufferType>(args[load ? 3 : 0]->GetType());
   CHECK(tensor && buffer) << name << " requires an ordinary GM TensorType and a BufferType";
   if (tensor->shape_.size() == 1) {
-    CHECK(backend::SupportsBufferScalarTransfer(args, load))
-        << "Rank-one Buffer transfers require a qualified INT32 point load/store with a private 32-byte Vec "
-           "carrier";
+    CHECK(backend::SupportsBufferScalarTransfer(args, load) ||
+          backend::SupportsBufferVector1DTransfer(args, load))
+        << "Rank-one Buffer transfers require either a qualified INT32 scalar point transfer or an aligned "
+           "rank-1 vector transfer into a [1, C] Vec buffer";
     return GetVoidType();
   }
   CHECK(tensor->shape_.size() == 2 && buffer->shape_.size() == 2)
@@ -423,6 +425,45 @@ REGISTER_OP("buffer.write")
   }
   return true;
 }();
+
+REGISTER_OP("buffer.ci")
+    .set_description("Generate a contiguous integer sequence into an explicit destination buffer")
+    .set_op_category("BufferOp")
+    .set_ir_stage(OpIRStage::Buffer)
+    .set_internal_only()
+    .add_argument("start", "Starting INT32 scalar")
+    .add_argument("dst", "Destination single-row INT32 buffer")
+    .set_attr<bool>("descending")
+    .set_output_arity(0)
+    .set_buffer_non_memory_arg(0)
+    .set_buffer_arg_effect(1, BufferAccess::Write, BufferAccess::Read)
+    .set_buffer_result_behavior(BufferResultBehavior::None)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      backend::ValidateBufferCiOperands(false, args, kwargs);
+      return GetVoidType();
+    });
+
+REGISTER_OP("buffer.ci_workspace")
+    .set_description("Generate a contiguous integer sequence into an explicit buffer using explicit scratch")
+    .set_op_category("BufferOp")
+    .set_ir_stage(OpIRStage::Buffer)
+    .set_internal_only()
+    .add_argument("start", "Starting INT32 scalar")
+    .add_argument("tmp", "Scratch Vec workspace buffer")
+    .add_argument("dst", "Destination single-row INT32 buffer")
+    .set_attr<bool>("descending")
+    .set_output_arity(0)
+    .set_buffer_non_memory_arg(0)
+    .set_buffer_arg_effect(1, BufferAccess::Write, BufferAccess::Read)
+    .set_workspace_arg(1)
+    .set_buffer_arg_effect(2, BufferAccess::Write, BufferAccess::Read)
+    .set_buffer_result_behavior(BufferResultBehavior::None)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      backend::ValidateBufferCiOperands(true, args, kwargs);
+      return GetVoidType();
+    });
 
 }  // namespace ir
 }  // namespace pypto

@@ -107,20 +107,30 @@ def test_bfloat_cast_preserves_mode_and_effects(source, destination, mode):
     ir.assert_structural_equal(call, ir.deserialize(ir.serialize(call)), enable_auto_mapping=True)
 
 
-@pytest.mark.parametrize("dtype", [DataType.FP16, DataType.INT16, DataType.INT32])
-def test_bfloat_extension_does_not_admit_other_round_casts(dtype):
-    with pytest.raises(ValueError, match="unsupported conversion attributes"):
-        _call("cast", [_buffer("source"), _buffer("dst", dtype=dtype)], {"mode": 2})
+@pytest.mark.parametrize("dtype", [DataType.FP16, DataType.INT32])
+@pytest.mark.parametrize("mode", [1, 2])
+def test_fp32_to_fp16_and_int32_round_casts_preserve_mode(dtype, mode):
+    call = _call("cast", [_buffer("source"), _buffer("dst", dtype=dtype)], {"mode": mode})
+    assert call.kwargs["mode"] == mode
 
 
-def test_int32_to_fp32_cast_preserves_none_mode_and_rejects_other_modes():
+def test_bfloat_extension_does_not_admit_int16_or_invalid_round_casts():
+    with pytest.raises(ValueError, match="requires FP16/FP32, BF16/FP32, or FP/INT32 conversion"):
+        _call("cast", [_buffer("source"), _buffer("dst", dtype=DataType.INT16)], {"mode": 2})
+    for dtype in (DataType.FP16, DataType.BF16):
+        with pytest.raises(ValueError, match="unsupported conversion attributes"):
+            _call("cast", [_buffer("source"), _buffer("dst", dtype=dtype)], {"mode": 3})
+
+
+def test_int32_to_fp32_cast_preserves_rounding_modes_and_rejects_other_modes():
     args = [_buffer("source", dtype=DataType.INT32), _buffer("dst", dtype=DataType.FP32)]
-    call = _call("cast", args, {"mode": 0, "saturation_mode": 0})
-    assert call.kwargs["mode"] == 0
-    assert ir.get_op_buffer_arg_effect(call.op.name, 0).data == ir.BufferAccess.Read
-    assert ir.get_op_buffer_arg_effect(call.op.name, 1).data == ir.BufferAccess.Write
-    ir.assert_structural_equal(call, ir.deserialize(ir.serialize(call)), enable_auto_mapping=True)
-    for bad_mode in (1, 2):
+    for mode in (0, 1, 2):
+        call = _call("cast", args, {"mode": mode, "saturation_mode": 0})
+        assert call.kwargs["mode"] == mode
+        assert ir.get_op_buffer_arg_effect(call.op.name, 0).data == ir.BufferAccess.Read
+        assert ir.get_op_buffer_arg_effect(call.op.name, 1).data == ir.BufferAccess.Write
+        ir.assert_structural_equal(call, ir.deserialize(ir.serialize(call)), enable_auto_mapping=True)
+    for bad_mode in (3, 4, 5):
         with pytest.raises(ValueError, match="unsupported conversion attributes"):
             _call("cast", args, {"mode": bad_mode, "saturation_mode": 0})
 

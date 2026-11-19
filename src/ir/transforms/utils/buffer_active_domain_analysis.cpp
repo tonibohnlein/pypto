@@ -72,20 +72,22 @@ Domain Meet(const Domain& a, const Domain& b) {
 
 Domain Declared(const TypePtr& type) {
   const auto tile = As<TileType>(type);
-  if (!tile || tile->GetMemorySpace() != MemorySpace::Vec || tile->shape_.size() != 2) return {};
+  if (!tile || tile->GetMemorySpace() != MemorySpace::Vec ||
+      (tile->shape_.size() != 1 && tile->shape_.size() != 2))
+    return {};
   const auto& view = tile_view_semantics::GetEffectiveTileView(*tile);
   const auto& valid = view.valid_shape.empty() ? tile->shape_ : view.valid_shape;
-  if (valid.size() != 2) return {};
+  if (valid.size() != tile->shape_.size()) return {};
   Domain result{DomainKind::Full, nullptr, 0};
-  for (int axis = 0; axis < 2; ++axis) {
-    const auto capacity = As<ConstInt>(tile->shape_[axis]);
+  for (size_t i = 0; i < tile->shape_.size(); ++i) {
+    const auto capacity = As<ConstInt>(tile->shape_[i]);
     if (!capacity || capacity->value_ <= 0) return {};
-    if (structural_equal(valid[axis], tile->shape_[axis])) continue;
+    if (structural_equal(valid[i], tile->shape_[i])) continue;
     // A named bound gives constant-time lexical/invariance checks. More general
     // expressions retain the original IR until they have a shared proof owner.
-    if (result.kind == DomainKind::Prefix || (!AsVarLike(valid[axis]) && !As<ConstInt>(valid[axis])))
+    if (result.kind == DomainKind::Prefix || (!AsVarLike(valid[i]) && !As<ConstInt>(valid[i])))
       return {};
-    result = {DomainKind::Prefix, valid[axis], axis};
+    result = {DomainKind::Prefix, valid[i], tile->shape_.size() == 1 ? 1 : static_cast<int>(i)};
   }
   return result;
 }
@@ -97,7 +99,7 @@ bool Contains(const Domain& defined, const Domain& required) {
 }
 
 bool IsElementwise(const CallPtr& call) {
-  return backend::FindLogicalBufferElementwiseRecipe(call->op_->name_) != nullptr;
+  return backend::FindLogicalBufferElementwiseRecipe(call) != nullptr;
 }
 bool IsCast(const CallPtr& call) {
   const auto recipe = backend::FindLogicalBufferConversionRecipe(call->op_->name_);
@@ -113,7 +115,7 @@ bool IsRowAxisOp(const CallPtr& call) {
 bool KnownData(const CallPtr& call) {
   return IsElementwise(call) || IsCast(call) || IsVectorReshape(call) || IsOp(call, "tile.full") ||
          IsOp(call, "tile.create") || IsOp(call, "tile.load") || IsOp(call, "tile.store") ||
-         IsOp(call, "tile.set_validshape") || IsRowAxisOp(call);
+         IsOp(call, "tile.set_validshape") || IsOp(call, "tile.ci") || IsRowAxisOp(call);
 }
 
 Domain AxisMap(Domain domain, const TypePtr& target) {
@@ -360,10 +362,21 @@ class DomainIndex : public IRVisitor {
     }
   }
   Domain Forward(const CallPtr& call) const {
-    if (IsOp(call, "tile.full") || IsOp(call, "tile.load")) return Declared(call->GetType());
+    if (IsOp(call, "tile.full") || IsOp(call, "tile.load") || IsOp(call, "tile.ci")) {
+      return Declared(call->GetType());
+    }
     if (IsOp(call, "tile.set_validshape")) return Meet(Get(call->args_[0]), Declared(call->GetType()));
     if (IsVectorReshape(call)) return ReshapeDomain(Get(call->args_[0]), call, call->GetType());
-    if (IsElementwise(call) || IsCast(call)) {
+    if (const auto* recipe = backend::FindLogicalBufferElementwiseRecipe(call)) {
+      Domain result{DomainKind::Full, nullptr, 0};
+      for (const auto& input : recipe->inputs) {
+        if (input.kind == backend::BufferElementwiseOperandKind::Buffer) {
+          result = Meet(result, Get(call->args_[input.logical_index]));
+        }
+      }
+      return Meet(result, Declared(call->GetType()));
+    }
+    if (IsCast(call)) {
       Domain result{DomainKind::Full, nullptr, 0};
       for (const auto& arg : call->args_)
         if (As<TileType>(arg->GetType())) result = Meet(result, Get(arg));

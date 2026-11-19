@@ -833,6 +833,25 @@ def _fillpad(tensor, pad_mode="zero"):
     padded[valid_slices] = tensor[valid_slices]
     return padded
 
+def _cast_tensor(tensor, dtype, mode=0):
+    if tensor.is_floating_point() and not dtype.is_floating_point:
+        if mode == 1:
+            return torch.round(tensor).to(dtype)
+        if mode == 2:
+            return (torch.sign(tensor) * torch.floor(torch.abs(tensor) + 0.5)).to(dtype)
+        if mode == 3:
+            return torch.floor(tensor).to(dtype)
+        if mode == 4:
+            return torch.ceil(tensor).to(dtype)
+    return tensor.to(dtype)
+
+def _tile_ci(start, shape, descending=False, dtype=torch.int32):
+    shape_t = tuple(int(s) for s in shape)
+    cols = shape_t[-1]
+    step = -1 if descending else 1
+    seq = int(start) + torch.arange(cols, dtype=torch.int64) * step
+    return seq.to(dtype).reshape(shape_t)
+
 def _write_and_return(container, index, value):
     container[index] = value
     return container
@@ -980,7 +999,8 @@ def _torch_buffer_dtype(dtype: DataType) -> str:
 def _handle_cast(a: list[str], kw: dict[str, Any]) -> str:
     dt = kw.get("target_type")
     dtype_str = _torch_dtype(dt) if isinstance(dt, DataType) else "torch.float32"
-    return f"{a[0]}.to({dtype_str})"
+    mode = int(kw.get("mode", 0))
+    return f"_cast_tensor({a[0]}, {dtype_str}, {mode})"
 
 
 def _kw_dtype(kw: dict[str, Any]) -> str:
@@ -1407,6 +1427,9 @@ def _register_ops() -> None:  # noqa: PLR0915
     m["tile.extract"] = _handle_tile_extract
     m["tile.read"] = lambda a, _kw: f"{a[0]}[{a[1]}]"
     m["tile.write"] = lambda a, _kw: f"_write_and_return({a[0]}, {a[1]}, {a[2]})"
+    m["tile.ci"] = lambda a, kw: (
+        f"_tile_ci({a[0]}, {a[1]}, {bool(kw.get('descending', False))!r}, {_kw_dtype(kw)})"
+    )
     m["tile.get_block_idx"] = lambda _a, _kw: "0"
 
     # Tile-only ops not covered by the shared tensor/tile loop above.
@@ -1488,13 +1511,26 @@ def _register_ops() -> None:  # noqa: PLR0915
             f"_buffer_active({a[-1]}).copy_("
             f"{fn([f'_buffer_active({a[0]})', f'torch.as_tensor({a[1]}, dtype={a[0]}.dtype)'], kw)})"
         )
+    m["buffer.rsqrt_workspace"] = lambda a, _kw: (
+        f"_buffer_active({a[2]}).copy_(torch.rsqrt(_buffer_active({a[0]})))"
+    )
+    m["buffer.ci"] = lambda a, kw: (
+        f"_buffer_write({a[1]}, "
+        f"_tile_ci({a[0]}, {a[1]}.shape, {bool(kw.get('descending', False))!r}, {a[1]}.dtype))"
+    )
+    m["buffer.ci_workspace"] = lambda a, kw: (
+        f"_buffer_write({a[2]}, "
+        f"_tile_ci({a[0]}, {a[2]}.shape, {bool(kw.get('descending', False))!r}, {a[2]}.dtype))"
+    )
     m["buffer.full"] = lambda a, _kw: f"_buffer_active({a[1]}).fill_({a[0]})"
     m["buffer.gather_compare"] = lambda a, kw: (
         f"_buffer_gather_compare({a[0]}, {a[1]}, {a[4]}, {a[5]}, {kw['cmp_mode']}, {kw.get('offset', 0)})"
     )
     m["buffer.gather"] = lambda a, _kw: f"_buffer_gather({a[0]}, {a[1]}, {a[3]})"
     m["buffer.scatter"] = lambda a, _kw: f"_buffer_scatter({a[0]}, {a[1]}, {a[2]})"
-    m["buffer.cast"] = lambda a, _kw: f"_buffer_write({a[1]}, _buffer_active({a[0]}).to({a[1]}.dtype))"
+    m["buffer.cast"] = lambda a, kw: (
+        f"_buffer_write({a[1]}, _cast_tensor(_buffer_active({a[0]}), {a[1]}.dtype, {int(kw.get('mode', 0))}))"
+    )
     m["buffer.cmp"] = lambda a, kw: (
         "_buffer_pack_predicate("
         f"{_handle_cmp([f'_buffer_active({a[0]})', f'_buffer_active({a[1]})'], kw)}, {a[2]})"

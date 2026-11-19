@@ -63,7 +63,7 @@ class BufferViewAnalysis : public IRVisitor {
 
   bool HasDenseRowPitch(const ExprPtr& value) const {
     const auto tile = As<TileType>(value->GetType());
-    if (!tile || tile->shape_.size() != 2) return false;
+    if (!tile || (tile->shape_.size() != 1 && tile->shape_.size() != 2)) return false;
     const auto view = Get(value);
     // Native relabels count the inherited physical pitch even for one row.
     return view.row_bytes && view.row_bytes == PhysicalRowBytes(tile);
@@ -103,8 +103,9 @@ class BufferViewAnalysis : public IRVisitor {
         const auto dst = As<TileType>(assign->var_->GetType());
         const auto src = As<TileType>(call->args_[0]->GetType());
         const auto src_rows = src && src->shape_.size() == 2 ? As<ConstInt>(src->shape_[0]) : nullptr;
-        if (IsOp(call, "tile.reshape") && HasDenseRowPitch(call->args_[0]) && src_rows &&
-            src_rows->value_ == 1 && dst && dst->shape_.size() == 2 &&
+        if (IsOp(call, "tile.reshape") && HasDenseRowPitch(call->args_[0]) &&
+            ((src && src->shape_.size() == 1) || (src_rows && src_rows->value_ == 1)) && dst &&
+            dst->shape_.size() == 2 &&
             tile_view_semantics::GetEffectiveTileView(*dst).blayout == TileLayout::col_major) {
           view.contiguous_column_relabel = true;
         }
@@ -117,8 +118,8 @@ class BufferViewAnalysis : public IRVisitor {
 
  private:
   static std::optional<int64_t> PhysicalRowBytes(const TileTypePtr& tile) {
-    if (!tile || tile->shape_.size() != 2) return std::nullopt;
-    const auto cols = As<ConstInt>(tile->shape_[1]);
+    if (!tile || (tile->shape_.size() != 1 && tile->shape_.size() != 2)) return std::nullopt;
+    const auto cols = As<ConstInt>(tile->shape_.back());
     const auto bytes = tile->dtype_.GetBit() / 8;
     if (!cols || cols->value_ <= 0 || bytes <= 0 ||
         cols->value_ > std::numeric_limits<int64_t>::max() / bytes) {

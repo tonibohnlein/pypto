@@ -133,24 +133,30 @@ const char* OperandError(const BufferConversionRecipe& recipe, const std::vector
   const auto& dst = types.back();
   if (recipe.kind == K::Cast) {
     const auto& src = types[0];
-    const bool pair = (src->dtype_ == DataType::FP16 && dst->dtype_ == DataType::FP32) ||
-                      (src->dtype_ == DataType::FP32 && dst->dtype_ == DataType::FP16);
+    const bool float_half = (src->dtype_ == DataType::FP16 && dst->dtype_ == DataType::FP32) ||
+                            (src->dtype_ == DataType::FP32 && dst->dtype_ == DataType::FP16);
     const bool bfloat = (src->dtype_ == DataType::BF16 && dst->dtype_ == DataType::FP32) ||
                         (src->dtype_ == DataType::FP32 && dst->dtype_ == DataType::BF16);
-    const bool int32_to_fp32 = src->dtype_ == DataType::INT32 && dst->dtype_ == DataType::FP32;
-    // Preserve the existing half/single rounding contract. A2/A3's direct
-    // float/bfloat conversion additionally supports ROUND (mode 2); widening
-    // bfloat and exact INT32->FP32 (mode 0) need no integer-narrowing scratch.
+    const bool fp_to_int32 =
+        (src->dtype_ == DataType::FP32 || src->dtype_ == DataType::FP16) && dst->dtype_ == DataType::INT32;
+    const bool int32_to_fp =
+        src->dtype_ == DataType::INT32 && (dst->dtype_ == DataType::FP32 || dst->dtype_ == DataType::FP16);
+    // Preserve the existing half/single rounding contract (ceil stays unopened on float<->float).
+    // A2/A3 direct FP32<->INT32 and FP16<->INT32 require no integer-narrowing scratch.
     for (const auto& [key, value] : kwargs) {
       if (key == "mode") {
         const int mode = AnyCast<int>(value, "Buffer cast mode");
-        if ((mode == 2 && !bfloat) || (int32_to_fp32 && mode != 0))
+        if (float_half && mode != 0 && mode != 1 && mode != 2)
+          return "has unsupported conversion attributes for this dtype pair";
+        if (bfloat && mode != 0 && mode != 1 && mode != 2)
+          return "has unsupported conversion attributes for this dtype pair";
+        if (int32_to_fp && mode != 0 && mode != 1 && mode != 2)
           return "has unsupported conversion attributes for this dtype pair";
       }
     }
-    return (pair || bfloat || int32_to_fp32) && (Geometry(src, dst) || runtime_cast)
+    return (float_half || bfloat || fp_to_int32 || int32_to_fp) && (Geometry(src, dst) || runtime_cast)
                ? nullptr
-               : "requires FP16/FP32, BF16/FP32, or INT32->FP32 conversion with matching physical and valid shapes";
+               : "requires FP16/FP32, BF16/FP32, or FP/INT32 conversion with matching physical and valid shapes";
   }
   if (recipe.kind == K::Compare || recipe.kind == K::CompareScalar) {
     const auto& src = types[0];
@@ -200,9 +206,9 @@ bool Attributes(const BufferConversionRecipe& recipe,
       return false;
     }
   }
-  // OperandError further qualifies mode 2 by dtype. Other rounding/saturation
+  // OperandError further qualifies rounding mode by dtype. Other rounding/saturation
   // modes and scratch-backed integer narrowing keep their existing Tile path.
-  if (recipe.kind == K::Cast) return (mode == 0 || mode == 1 || mode == 2) && saturation == 0;
+  if (recipe.kind == K::Cast) return mode >= 0 && mode <= 5 && saturation == 0;
   if (recipe.kind == K::Compare || recipe.kind == K::CompareScalar) return comparison >= 0 && comparison < 6;
   return true;
 }

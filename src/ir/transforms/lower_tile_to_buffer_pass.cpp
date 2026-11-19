@@ -111,15 +111,23 @@ BufferTypePtr DenseDescriptor(const TileTypePtr& tile, const Span& span) {
   const auto view_offset = As<ConstInt>(view.start_offset);
   CHECK_SPAN(!view.start_offset || (view_offset && view_offset->value_ == 0), span)
       << "LowerTileToBuffer: nonzero tile view offsets require an explicit Buffer view recipe";
-  const auto shape = StaticExtents(tile->shape_, span);
+  auto raw_shape = StaticExtents(tile->shape_, span);
   if (!view.stride.empty()) {
     const auto strides = StaticExtents(view.stride, span);
-    const std::vector<int64_t> expected =
-        column ? std::vector<int64_t>{1, shape[0]} : std::vector<int64_t>{shape[1], 1};
-    CHECK_SPAN(strides == expected, span)
-        << "LowerTileToBuffer: strided tiles require an explicit Buffer view recipe";
+    if (tile->shape_.size() == 1) {
+      CHECK_SPAN(strides == std::vector<int64_t>{1}, span)
+          << "LowerTileToBuffer: strided tiles require an explicit Buffer view recipe";
+    } else {
+      const std::vector<int64_t> expected =
+          column ? std::vector<int64_t>{1, raw_shape[0]} : std::vector<int64_t>{raw_shape[1], 1};
+      CHECK_SPAN(strides == expected, span)
+          << "LowerTileToBuffer: strided tiles require an explicit Buffer view recipe";
+    }
   }
-  const auto valid = DescriptorValid(view.valid_shape.empty() ? tile->shape_ : view.valid_shape, shape);
+  const std::vector<int64_t> shape =
+      raw_shape.size() == 1 ? std::vector<int64_t>{1, raw_shape[0]} : std::move(raw_shape);
+  auto valid = DescriptorValid(view.valid_shape.empty() ? tile->shape_ : view.valid_shape, shape);
+  if (tile->shape_.size() == 1 && valid.size() == 1) valid = {1, valid[0]};
   const auto& logical_valid = view.valid_shape.empty() ? tile->shape_ : view.valid_shape;
   const auto fixed_column = logical_valid.size() == 2 ? As<ConstInt>(logical_valid[1]) : nullptr;
   CHECK_SPAN(!column || (fixed_column && fixed_column->value_ == 1), span)
@@ -135,8 +143,11 @@ BufferTypePtr WindowDescriptor(const TileTypePtr& tile, const Span& span) {
   const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
   const bool column = backend::IsColumnVectorBufferTile(tile, view);
   if (!column) CheckDenseVecTile(tile, view, span);
-  const auto shape = StaticExtents(tile->shape_, span);
+  auto raw_shape = StaticExtents(tile->shape_, span);
+  const std::vector<int64_t> shape =
+      raw_shape.size() == 1 ? std::vector<int64_t>{1, raw_shape[0]} : std::move(raw_shape);
   std::vector<int64_t> valid;
+  if (tile->shape_.size() == 1) valid.push_back(1);
   for (const auto& extent : view.valid_shape.empty() ? tile->shape_ : view.valid_shape) {
     auto constant = As<ConstInt>(extent);
     valid.push_back(constant && constant->value_ != 0 ? constant->value_ : -1);
@@ -1053,6 +1064,9 @@ class TileToBufferMutator : public IRMutator {
     INTERNAL_CHECK_SPAN(type, tile->span_) << "Internal error: valid extents require a Tile operand";
     const auto view = tile_view_semantics::GetEffectiveTileView(*type);
     std::vector<ExprPtr> extents;
+    if (type->shape_.size() == 1) {
+      extents.push_back(std::make_shared<ConstInt>(1, DataType::INDEX, tile->span_));
+    }
     for (const auto& extent : view.valid_shape.empty() ? type->shape_ : view.valid_shape) {
       if (auto constant = As<ConstInt>(extent)) {
         extents.push_back(std::make_shared<ConstInt>(constant->value_, DataType::INDEX, tile->span_));
@@ -1122,7 +1136,7 @@ class TileToBufferMutator : public IRMutator {
     const bool guarded_axis_op = axis_recipe && backend::SupportsLogicalBufferAxis(*axis_recipe, call);
     const bool data_operation =
         guarded_axis_op || store || IsOp(call, "tile.load") || IsOp(call, "tile.move") ||
-        backend::FindLogicalBufferElementwiseRecipe(call->op_->name_) || static_cast_recipe;
+        backend::FindLogicalBufferElementwiseRecipe(call) || static_cast_recipe;
     if (!data_operation || (!store && !result)) {
       return WithValidState(call, result, LowerCall(call, result));
     }
@@ -1261,6 +1275,16 @@ class TileToBufferMutator : public IRMutator {
         out.push_back(Operation("buffer.write", {source, indices, VisitExpr(call->args_[2])}, call->span_));
       }
       return SeqStmts::Flatten(out, call->span_);
+    }
+    if (IsOp(call, "tile.ci")) {
+      CHECK_SPAN(result && backend::SupportsLogicalBufferCi(call), call->span_)
+          << "LowerTileToBuffer: unsupported tile.ci operands";
+      const bool has_ws = call->args_.size() == 3;
+      std::vector<ExprPtr> args{VisitExpr(call->args_[0])};
+      if (has_ws) args.push_back(Handle(call->args_[2]));
+      args.push_back(Handle(result));
+      return Operation(has_ws ? "buffer.ci_workspace" : "buffer.ci", args, call->span_,
+                       {{"descending", call->GetKwarg<bool>("descending", false)}});
     }
     if (const auto* indexed = backend::FindLogicalBufferIndexedRecipe(call->op_->name_)) {
       CHECK_SPAN(result && backend::SupportsLogicalBufferIndexed(*indexed, call), call->span_)
@@ -1546,9 +1570,16 @@ class TileToBufferMutator : public IRMutator {
                  call->span_)
           << "LowerTileToBuffer: tile.load cache requires DEFAULT or BYPASS policy";
       const bool scalar_point = backend::SupportsLogicalBufferScalarTransfer(call);
+      const bool vector_1d = backend::SupportsLogicalVector1DBufferTransfer(call);
+      ExprPtr valid = Valid(result);
+      if (scalar_point) {
+        valid = VisitExpr(call->args_[3]);
+      } else if (vector_1d) {
+        valid = std::make_shared<MakeTuple>(
+            std::vector<ExprPtr>{Valid(result)->elements_[1]}, call->span_);
+      }
       return Operation("buffer.load",
-                       {VisitExpr(call->args_[0]), VisitExpr(call->args_[1]),
-                        scalar_point ? VisitExpr(call->args_[3]) : Valid(result), Handle(result)},
+                       {VisitExpr(call->args_[0]), VisitExpr(call->args_[1]), valid, Handle(result)},
                        call->span_,
                        cache == static_cast<int>(CachePolicy::kDefault)
                            ? std::vector<std::pair<std::string, std::any>>{}
@@ -1581,6 +1612,8 @@ class TileToBufferMutator : public IRMutator {
         // carrier descriptor remains rank two with physical capacity [1,8].
         valid = std::make_shared<MakeTuple>(
             std::vector<ExprPtr>{std::make_shared<ConstInt>(1, DataType::INDEX, call->span_)}, call->span_);
+      } else if (backend::SupportsLogicalVector1DBufferTransfer(call)) {
+        valid = std::make_shared<MakeTuple>(std::vector<ExprPtr>{valid->elements_[1]}, call->span_);
       }
       return Operation("buffer.store", {Handle(call->args_[0]), VisitExpr(call->args_[1]), valid, output},
                        call->span_,
@@ -1589,7 +1622,7 @@ class TileToBufferMutator : public IRMutator {
     }
     if (const auto* recipe = As<GlobalVar>(call->op_)
                                  ? nullptr
-                                 : backend::FindLogicalBufferElementwiseRecipe(call->op_->name_)) {
+                                 : backend::FindLogicalBufferElementwiseRecipe(call)) {
       INTERNAL_CHECK_SPAN(result, call->span_) << "Internal error: Tile elementwise recipe has no result";
       const auto& entry = OpRegistry::GetInstance().GetEntry(call->op_->name_);
       ValidateKwargs(call->kwargs_, entry.GetOp()->GetAttrs(), call->op_->name_);
@@ -1617,6 +1650,8 @@ class TileToBufferMutator : public IRMutator {
         const auto& source = call->args_[input.logical_index];
         if (input.kind == backend::BufferElementwiseOperandKind::Buffer) {
           args.push_back(needs_windows ? WindowHandle(source, out) : Handle(source));
+        } else if (input.kind == backend::BufferElementwiseOperandKind::Workspace) {
+          args.push_back(Handle(source));
         } else {
           // Scalar representation belongs to the lowering contract. The emitter
           // consumes the resulting type and never repairs element operands.

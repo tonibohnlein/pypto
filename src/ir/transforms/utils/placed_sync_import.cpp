@@ -28,6 +28,7 @@
 #include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
+#include "pypto/backend/common/buffer_scalar_recipes.h"
 #include "pypto/backend/common/buffer_sync_contract.h"
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
@@ -1646,8 +1647,33 @@ class Importer {
       const bool gm_read = gm_mode == BufferAccess::Read || gm_mode == BufferAccess::ReadWrite;
       const bool gm_write = gm_mode == BufferAccess::Write || gm_mode == BufferAccess::ReadWrite;
       auto offsets = As<MakeTuple>(call->args_[1]), shape = As<MakeTuple>(call->args_[2]);
-      CHECK(offsets && shape && offsets->elements_.size() == 2 && shape->elements_.size() == 2)
-          << "Synchronization DMA requires a rank-two rectangle";
+      const auto gm_tensor = As<TensorType>(call->args_[gm_arg]->GetType());
+      const bool rank1_gm =
+          gm_tensor && gm_tensor->shape_.size() == 1 && offsets && shape &&
+          offsets->elements_.size() == 1 && shape->elements_.size() == 1 && !recover_accesses;
+      const bool scalar_point = backend::SupportsBufferScalarTransfer(call->args_, load);
+      CHECK(rank1_gm || (offsets && shape && offsets->elements_.size() == 2 && shape->elements_.size() == 2))
+          << "Synchronization DMA requires a rank-two rectangle or conservative rank-one transfer";
+      if (rank1_gm) {
+        if (!scalar_point) RequireIndex(offsets->elements_[0]);
+        if (readonly_external) {
+          CHECK(load && gm_read && !gm_write) << "Read-only external projection requires a read-only DMA";
+          ReadyScalar(offsets->elements_[0], segment);
+        } else {
+          const auto off_root = coordinates.Build(offsets->elements_[0], segment, parameters, result);
+          coordinates.CheckScope(off_root, segment);
+        }
+        modes[gm_arg] = {gm_read, gm_write};
+        const auto local = As<BufferType>(call->args_[load ? 3 : 0]->GetType());
+        const bool valid_shape_match =
+            local && local->shape_[0] == 1 &&
+            (scalar_point ? (local->shape_[1] == 8 && Constant(shape->elements_[0]) == 1)
+                          : (local->valid_shape_[1] == -1 ||
+                             local->shape_[1] == Constant(shape->elements_[0])));
+        CHECK(valid_shape_match) << "Partial DMA local footprint is not qualified";
+        CHECK(local->memory_space_ == MemorySpace::Vec) << "Rank-one DMA requires Vec storage";
+        whole(load ? 3 : 0, load);
+      } else {
       // Coordinate readiness and checked arithmetic remain native admission
       // evidence even when no dependence footprint is requested.
       RequireIndex(offsets->elements_[0]);
@@ -1724,6 +1750,7 @@ class Importer {
             (load ? local->memory_space_ == MemorySpace::Mat : local->memory_space_ == MemorySpace::Acc))
           << "Only GM/Mat, Acc/GM and GM/Vec DMA contracts are qualified";
       whole(load ? 3 : 0, load);
+      }
     } else if (IsOp(call, "buffer.copy") || IsOp(call, "buffer.extract")) {
       const bool extract = IsOp(call, "buffer.extract");
       const auto target = extract ? 3 : 1;
@@ -1809,6 +1836,11 @@ class Importer {
       }
       whole(0, false);
       whole(1, true);
+    } else if (IsOp(call, "buffer.ci_workspace")) {
+      CHECK(result.owner->func_type_ == FunctionType::AIV) << "Sequence synchronization requires an AIV leaf";
+      ReadyScalar(call->args_[0], segment);
+      enclosure(1, true);
+      whole(2, true);
     } else if (auto recipe = backend::FindBufferIndexedRecipe(call->op_->name_)) {
       CHECK(result.owner->func_type_ == FunctionType::AIV) << "Indexed synchronization requires an AIV leaf";
       // The shared contract uses in-range physical element offsets into a
@@ -1848,6 +1880,8 @@ class Importer {
       for (size_t arg = 0; arg < recipe->inputs.size(); ++arg) {
         if (recipe->inputs[arg].kind == backend::BufferElementwiseOperandKind::Buffer) {
           whole(arg, false);
+        } else if (recipe->inputs[arg].kind == backend::BufferElementwiseOperandKind::Workspace) {
+          enclosure(arg, true);
         } else {
           CHECK(As<ConstFloat>(call->args_[arg]) || As<ConstInt>(call->args_[arg]))
               << "Synchronization scalar operand readiness is unavailable";
@@ -2728,14 +2762,16 @@ static CompactSyncInput ImportQualifiedSync(
     if (As<ScalarType>(param->GetType())) continue;
     if (importer.readonly_external) {
       const auto type = As<TensorType>(param->GetType());
-      CHECK(type && type->shape_.size() == 2 && type->dtype_.GetBit() % 8 == 0 && !type->tensor_view_)
-          << "Projected external roots require the existing unviewed rank-two ND descriptor contract";
-      CHECK(Constant(type->shape_[1]) > 0) << "Projected external ND pitch must remain a positive constant";
-      if (As<ConstInt>(type->shape_[0])) {
-        CHECK(Constant(type->shape_[0]) > 0) << "Projected external extent must remain positive";
-      } else {
-        RequireIndex(type->shape_[0]);
-        importer.ReadyScalar(type->shape_[0], SyncSegment{});
+      CHECK(type && (type->shape_.size() == 1 || type->shape_.size() == 2) &&
+            type->dtype_.GetBit() % 8 == 0 && !type->tensor_view_)
+          << "Projected external roots require the existing unviewed rank-one/two ND descriptor contract";
+      for (const auto& dim : type->shape_) {
+        if (As<ConstInt>(dim)) {
+          CHECK(Constant(dim) > 0) << "Projected external extent must remain positive";
+        } else {
+          RequireIndex(dim);
+          importer.ReadyScalar(dim, SyncSegment{});
+        }
       }
       importer.objects[param.get()] = importer.result.storage.size();
       SyncStorage unavailable{param->name_hint_, MemorySpace::DDR, 0, 0, 0, 0, nullptr};

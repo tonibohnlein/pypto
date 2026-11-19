@@ -47,18 +47,21 @@ inline bool SupportsBufferStoreMode(int atomic, std::optional<ir::MemorySpace> s
          source_dtype == DataType::FP32 && destination_dtype == DataType::FP32;
 }
 
+/// Dynamic or static extent accepted on GM Tensor descriptors in Buffer IR.
+inline bool IsBufferTensorExtent(const ir::ExprPtr& expr) {
+  if (const auto constant = ir::As<ir::ConstInt>(expr)) return constant->value_ > 0;
+  return expr && ir::GetScalarDtype(expr) == DataType::INDEX;
+}
+
 /// GM descriptor geometry admitted by Buffer selection and direct emission.
-/// A leading INDEX symbol is supplied by the existing tensor-shape ABI. The
-/// constant minor extent fixes the packed row stride; no allocation/access
+/// INDEX dimensions follow the existing tensor-shape ABI; no allocation/access
 /// bound or synchronization certificate is inferred from this capability.
 inline bool IsBufferTensorShape(const std::vector<ir::ExprPtr>& shape) {
-  if (shape.size() != 2) return false;
-  const auto columns = ir::As<ir::ConstInt>(shape[1]);
-  if (!columns || columns->value_ <= 0) return false;
-  if (auto rows = ir::As<ir::ConstInt>(shape[0])) return rows->value_ > 0;
-  const auto rows = ir::As<ir::Var>(shape[0]);
-  const auto scalar = rows ? ir::As<ir::ScalarType>(rows->GetType()) : nullptr;
-  return scalar && scalar->dtype_ == DataType::INDEX;
+  if (shape.size() != 1 && shape.size() != 2) return false;
+  for (const auto& dim : shape) {
+    if (!IsBufferTensorExtent(dim)) return false;
+  }
+  return true;
 }
 
 // A2/A3 default Acc NZ->ND TSTORE valid-size encoding, independent of the
@@ -81,7 +84,7 @@ inline bool IsBufferAccRowTrimDescriptor(const ir::BufferTypePtr& buffer) {
 
 /// Logical descriptor shape shared by default selection and final lowering.
 inline bool IsDenseVecBufferTile(const ir::TileTypePtr& tile, const ir::TileView& view) {
-  return tile->shape_.size() == 2 &&
+  return (tile->shape_.size() == 1 || tile->shape_.size() == 2) &&
          (IsDenseBufferTransferDtype(tile->dtype_) || tile->dtype_ == DataType::UINT8 ||
           tile->dtype_ == DataType::UINT32) &&
          tile->GetMemorySpace() == ir::MemorySpace::Vec && view.blayout == ir::TileLayout::row_major &&
@@ -135,25 +138,31 @@ inline bool IsAlignedDenseVecBuffer(const ir::BufferTypePtr& type) {
 /// active domain; a caller must separately certify original valid metadata.
 inline ir::BufferTypePtr PhysicalLogicalVecDescriptor(const ir::TypePtr& type) {
   const auto tile = ir::As<ir::TileType>(type);
-  if (!tile || tile->shape_.size() != 2) return nullptr;
+  if (!tile || (tile->shape_.size() != 1 && tile->shape_.size() != 2)) return nullptr;
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
   if (!IsDenseVecBufferTile(tile, view) && !IsColumnVectorBufferTile(tile, view)) return nullptr;
   const auto offset = ir::As<ir::ConstInt>(view.start_offset);
   if (view.start_offset && (!offset || offset->value_ != 0)) return nullptr;
   std::vector<int64_t> shape;
+  if (tile->shape_.size() == 1) shape.push_back(1);
   for (const auto& expression : tile->shape_) {
     const auto dimension = ir::As<ir::ConstInt>(expression);
     if (!dimension || dimension->value_ <= 0) return nullptr;
     shape.push_back(dimension->value_);
   }
   if (!view.stride.empty()) {
-    const std::vector<int64_t> expected = view.blayout == ir::TileLayout::col_major
-                                              ? std::vector<int64_t>{1, shape[0]}
-                                              : std::vector<int64_t>{shape[1], 1};
-    if (view.stride.size() != 2) return nullptr;
-    for (size_t i = 0; i < 2; ++i) {
-      const auto stride = ir::As<ir::ConstInt>(view.stride[i]);
-      if (!stride || stride->value_ != expected[i]) return nullptr;
+    if (tile->shape_.size() == 1) {
+      const auto stride = view.stride.size() == 1 ? ir::As<ir::ConstInt>(view.stride[0]) : nullptr;
+      if (!stride || stride->value_ != 1) return nullptr;
+    } else {
+      const std::vector<int64_t> expected = view.blayout == ir::TileLayout::col_major
+                                                ? std::vector<int64_t>{1, shape[0]}
+                                                : std::vector<int64_t>{shape[1], 1};
+      if (view.stride.size() != 2) return nullptr;
+      for (size_t i = 0; i < 2; ++i) {
+        const auto stride = ir::As<ir::ConstInt>(view.stride[i]);
+        if (!stride || stride->value_ != expected[i]) return nullptr;
+      }
     }
   }
   return std::make_shared<ir::BufferType>(shape, tile->dtype_, ir::MemorySpace::Vec, shape, view.blayout);
@@ -166,11 +175,13 @@ inline ir::BufferTypePtr StaticLogicalBufferDescriptor(const ir::TypePtr& type) 
   if (!physical || !tile) return nullptr;
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
   const auto& extents = view.valid_shape.empty() ? tile->shape_ : view.valid_shape;
-  if (extents.size() != 2) return nullptr;
+  if (extents.size() != tile->shape_.size()) return nullptr;
   std::vector<int64_t> valid;
-  for (size_t i = 0; i < 2; ++i) {
+  if (extents.size() == 1) valid.push_back(1);
+  for (size_t i = 0; i < extents.size(); ++i) {
     const auto extent = ir::As<ir::ConstInt>(extents[i]);
-    if (!extent || extent->value_ <= 0 || extent->value_ > physical->shape_[i]) return nullptr;
+    const int64_t limit = physical->shape_[extents.size() == 1 ? 1 : i];
+    if (!extent || extent->value_ <= 0 || extent->value_ > limit) return nullptr;
     valid.push_back(extent->value_);
   }
   return std::make_shared<ir::BufferType>(physical->shape_, tile->dtype_, ir::MemorySpace::Vec, valid,

@@ -117,30 +117,36 @@ std::string BufferTypeString(const ir::BufferTypePtr& type, const ir::Span& span
 
 void CheckBufferTensorParameter(const ir::TensorTypePtr& tensor, const ir::Span& span) {
   if (backend::IsBufferScalarGMSource(tensor)) return;
-  CHECK_SPAN(tensor->shape_.size() == 2 && (backend::IsDenseBufferTransferDtype(tensor->dtype_) ||
-                                            backend::IsCubeOperandDtype(tensor->dtype_)),
+  CHECK_SPAN((tensor->shape_.size() == 1 || tensor->shape_.size() == 2) &&
+                 (backend::IsDenseBufferTransferDtype(tensor->dtype_) ||
+                  backend::IsCubeOperandDtype(tensor->dtype_)),
              span)
-      << "Direct Buffer IR GM parameters currently require rank-2 FP16/BF16/FP32/INT32/INT8 tensors";
-  auto cols = As<ir::ConstInt>(tensor->shape_[1]);
+      << "Direct Buffer IR GM parameters currently require rank-1/rank-2 FP16/BF16/FP32/INT32/INT8 tensors";
   CHECK_SPAN(backend::IsBufferTensorShape(tensor->shape_), span)
-      << "Direct Buffer IR GM parameters require positive static columns and positive static rows or an "
-         "INDEX row symbol";
+      << "Direct Buffer IR GM parameters require positive static or INDEX tensor extents";
   if (tensor->tensor_view_) {
     const auto& view = *tensor->tensor_view_;
     CHECK_SPAN(view.layout == ir::TensorLayout::ND && view.pad == ir::PadValue::null, span)
         << "Direct Buffer IR GM parameters currently require unpadded ND layout";
     if (!view.stride.empty()) {
-      CHECK_SPAN(view.stride.size() == 2, span)
-          << "Direct Buffer IR GM parameters require rank-2 packed strides";
-      auto rows = As<ir::ConstInt>(tensor->shape_[0]);
-      auto row_stride = As<ir::ConstInt>(view.stride[0]);
-      auto col_stride = As<ir::ConstInt>(view.stride[1]);
-      const bool single_row = rows && rows->value_ == 1;
-      CHECK_SPAN(row_stride && col_stride && col_stride->value_ == 1 &&
-                     (row_stride->value_ == cols->value_ ||
-                      (single_row && row_stride->value_ >= cols->value_)),
-                 span)
-          << "Direct Buffer IR GM parameters currently require packed row-major strides";
+      if (tensor->shape_.size() == 1) {
+        auto s0 = As<ir::ConstInt>(view.stride[0]);
+        CHECK_SPAN(view.stride.size() == 1 && s0 && s0->value_ == 1, span)
+            << "Direct Buffer IR rank-1 GM parameters require unit stride";
+      } else {
+        CHECK_SPAN(view.stride.size() == 2, span)
+            << "Direct Buffer IR GM parameters require rank-2 packed strides";
+        auto cols = As<ir::ConstInt>(tensor->shape_[1]);
+        auto rows = As<ir::ConstInt>(tensor->shape_[0]);
+        auto row_stride = As<ir::ConstInt>(view.stride[0]);
+        auto col_stride = As<ir::ConstInt>(view.stride[1]);
+        const bool single_row = rows && rows->value_ == 1;
+        CHECK_SPAN(col_stride && col_stride->value_ == 1 &&
+                       (ir::structural_equal(view.stride[0], tensor->shape_[1]) ||
+                        (single_row && cols && row_stride && row_stride->value_ >= cols->value_)),
+                   span)
+            << "Direct Buffer IR GM parameters currently require packed row-major strides";
+      }
     }
   }
 }
@@ -420,9 +426,10 @@ class BufferEmissionPreflight : public ir::IRVisitor {
     uses_spmd_blocks |= ir::IsOp(call, "buffer.get_block_idx") || ir::IsOp(call, "buffer.get_block_num");
     uses_spmd_subblock |= ir::IsOp(call, "buffer.get_subblock_idx");
     if (backend::FindBufferConversionRecipe(call->op_->name_) ||
-        backend::FindBufferIndexedRecipe(call->op_->name_)) {
+        backend::FindBufferIndexedRecipe(call->op_->name_) || ir::IsOp(call, "buffer.ci") ||
+        ir::IsOp(call, "buffer.ci_workspace")) {
       CHECK_SPAN(conversion_supported_, call->span_)
-          << "Direct Buffer cast/compare/select and indexed operations currently supports A2/A3 only";
+          << "Direct Buffer cast/compare/select, sequence and indexed operations currently supports A2/A3 only";
     }
     if (const auto* axis = backend::FindBufferAxisRecipe(call->op_->name_); axis) {
       bool runtime_valid = false;
@@ -447,7 +454,8 @@ class BufferEmissionPreflight : public ir::IRVisitor {
                    ir::IsOp(call, "buffer.get_block_idx") || ir::IsOp(call, "buffer.get_block_num") ||
                    ir::IsOp(call, "buffer.get_subblock_idx") || ir::IsOp(call, "buffer.matmul") ||
                    ir::IsOp(call, "buffer.matmul_acc") || ir::IsOp(call, "buffer.extract") ||
-                   ir::IsOp(call, "buffer.insert") || ir::IsOp(call, "buffer.transpose"),
+                   ir::IsOp(call, "buffer.insert") || ir::IsOp(call, "buffer.transpose") ||
+                   ir::IsOp(call, "buffer.ci") || ir::IsOp(call, "buffer.ci_workspace"),
                call->span_)
         << "Operation '" << call->op_->name_ << "' is not supported by direct Buffer IR codegen";
     if (ir::IsOp(call, "buffer.alloc_multi") && call->args_.size() == 2) {
@@ -479,11 +487,12 @@ class BufferEmissionPreflight : public ir::IRVisitor {
       const auto tensor_type = As<ir::TensorType>(call->args_[load ? 0 : 3]->GetType());
       const auto tensor_columns = tensor_type ? As<ir::ConstInt>(tensor_type->shape_.back()) : nullptr;
       const bool scalar_point = backend::SupportsBufferScalarTransfer(call->args_, load);
+      const bool vector_1d = backend::SupportsBufferVector1DTransfer(call->args_, load);
       CHECK_SPAN(!scalar_point || (conversion_supported_ && function_->func_type_ == ir::FunctionType::AIV),
                  call->span_)
           << "Rank-one scalar point transfers require A2/A3 AIV execution";
       CHECK_SPAN(
-          scalar_point ||
+          scalar_point || vector_1d ||
               (!backend::IsColumnVectorBufferGeometry(buffer) &&
                (!tensor_columns || tensor_columns->value_ != 1)) ||
               (conversion_supported_ && backend::SupportsPackedColumnBufferTransfer(tensor_type, buffer)),
@@ -915,6 +924,18 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
     Emit(load ? operation + " ins(" + tensor_operand + ") outs(" + buffer_operand + ")" + attributes
               : operation + " ins(" + buffer_operand + ") outs(" + tensor_operand + ")" + attributes);
     backend::pto_ops_detail::EndNonEmptyRegion(guarded, *this);
+  } else if (ir::IsOp(call, "buffer.ci") || ir::IsOp(call, "buffer.ci_workspace")) {
+    const std::string start = GetExprAsCode(call->args_[0]);
+    const std::string start_type = GetExprTypeAnnotation(call->args_[0]);
+    const std::string descending = call->GetKwarg<bool>("descending", false) ? "true" : "false";
+    if (ir::IsOp(call, "buffer.ci_workspace")) {
+      Emit("pto.tci ins(" + start + ", " + GetExprAsCode(call->args_[1]) + " : " + start_type + ", " +
+           GetExprTypeAnnotation(call->args_[1]) + ") outs(" + GetExprAsCode(call->args_[2]) + " : " +
+           GetExprTypeAnnotation(call->args_[2]) + ") {descending = " + descending + "}");
+    } else {
+      Emit("pto.tci ins(" + start + " : " + start_type + ") outs(" + GetExprAsCode(call->args_[1]) + " : " +
+           GetExprTypeAnnotation(call->args_[1]) + ") {descending = " + descending + "}");
+    }
   } else if (const auto* indexed = backend::FindBufferIndexedRecipe(call->op_->name_)) {
     if (indexed->compare) {
       // The complete scratch backing is an explicit effect operand. Native
