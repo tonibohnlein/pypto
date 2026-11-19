@@ -135,7 +135,6 @@ def test_compile_pto_module_enables_per_unit_pass_dump(tmp_path, monkeypatch) ->
         "--enable-insert-sync",
         "--pto-level=level3",
         "--mlir-print-ir-after-all",
-        "--mlir-print-ir-module-scope",
         f"--mlir-print-ir-tree-dir={dump_dir}",
         "--pto-arch",
         "a3",
