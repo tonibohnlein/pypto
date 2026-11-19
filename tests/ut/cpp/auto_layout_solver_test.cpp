@@ -433,6 +433,135 @@ void TestBudgetAndTreewidthLimits() {
   Require(tw_threw, "SolveTreewidthDP must throw ValueError when active_treewidth > max_treewidth");
 }
 
+void TestTreewidthAbove64AndPerComponentDPFallback() {
+  // 1) Above 64 operations: ComputeTreewidth and SolveAutoLayout(instance).treewidth_stats must agree.
+  const auto ND = al::LayoutSpec::ND();
+  const auto NZ = al::LayoutSpec::NZ();
+  al::LayoutProblemInstance big;
+  big.AddValue(MakeValue("v0"));
+  for (int i = 0; i < 70; ++i) {
+    const std::string out_name = "v" + std::to_string(i + 1);
+    const std::string op_name = "Op" + std::to_string(i);
+    big.AddValue(MakeValue(out_name, op_name));
+    big.operations.push_back(MakeOp(op_name, {"v" + std::to_string(i)}, out_name,
+                                    {{{ND}, ND, (i % 2 == 0) ? 1.0 : 2.0}, {{NZ}, NZ, 1.5}}));
+  }
+  const auto expected_tw = al::ComputeTreewidth(big);
+  const auto auto_big = al::SolveAutoLayout(big);
+  Require(auto_big.treewidth_stats.has_value(), "treewidth_stats must be populated");
+  Require(auto_big.treewidth_stats->primal_treewidth == expected_tw.primal_treewidth,
+          "SolveAutoLayout primal_treewidth must match ComputeTreewidth above 64 ops");
+  Require(auto_big.treewidth_stats->active_primal_treewidth == expected_tw.active_primal_treewidth,
+          "SolveAutoLayout active_primal_treewidth must match ComputeTreewidth above 64 ops");
+
+  // 2) Per-component DP + FM fallback:
+  // Component A has a 3-node chain (active_tw = 1 <= max_treewidth = 1),
+  // Component B has a K4 clique (active_tw = 3 > max_treewidth = 1) with a barrier.
+  al::LayoutProblemInstance mixed;
+  mixed.forbid_unmaterializable_gm_conversions = true;
+  mixed.cost_model.gm_pack_fixed_cycles = 10.0;
+  mixed.cost_model.gm_pack_bytes_per_cycle = 1e18;
+  // Component A (chain x0 -> t0 -> y0)
+  mixed.AddValue(MakeValue("x0"));
+  mixed.AddValue(MakeValue("t0", "A0"));
+  mixed.AddValue(MakeValue("y0", "A1"));
+  mixed.operations.push_back(MakeOp("A0", {"x0"}, "t0", {{{ND}, ND, 5.0}, {{NZ}, NZ, 1.0}}));
+  mixed.operations.push_back(MakeOp("A1", {"t0"}, "y0", {{{ND}, ND, 1.0}, {{NZ}, NZ, 1.0}}));
+  // Component B (4 consumers of shared x1 -> active_tw = 3, TopologicalSeed gets trapped in NZ)
+  mixed.AddValue(MakeValue("x1"));
+  mixed.AddValue(MakeValue("b0", "B0"));
+  mixed.AddValue(MakeValue("b1", "B1"));
+  mixed.AddValue(MakeValue("b2", "B2"));
+  mixed.AddValue(MakeValue("b3", "B3"));
+  mixed.operations.push_back(MakeOp("B0", {"x1"}, "b0", {{{NZ}, ND, 0.0}, {{ND}, ND, 11.0}}));
+  mixed.operations.push_back(MakeOp("B1", {"x1"}, "b1", {{{NZ}, ND, 0.0}, {{ND}, ND, 0.5}}));
+  mixed.operations.push_back(MakeOp("B2", {"x1"}, "b2", {{{NZ}, ND, 0.0}, {{ND}, ND, 0.5}}));
+  mixed.operations.push_back(MakeOp("B3", {"x1"}, "b3", {{{NZ}, ND, 5.0}, {{ND}, ND, 0.0}}));
+  al::LayoutSolverConfig cfg_tw1;
+  cfg_tw1.max_treewidth = 1;
+  const auto res_greedy = al::SolveGreedy(mixed, std::nullopt, cfg_tw1);
+  RequireNear(res_greedy.TotalCostCycles(), 21.0, 1e-9,
+              "Plain greedy gets trapped at A(6.0) + B_NZ(15.0) = 21.0");
+  const auto res_mixed = al::SolveAutoLayout(mixed, std::nullopt, cfg_tw1);
+  RequireNear(res_mixed.TotalCostCycles(), 18.0, 1e-9,
+              "Per-component DP + FM must optimize Component A (6.0) and Component B (12.0)");
+  Require(res_mixed.stats.termination_reason == "local_optimum",
+          "Mixed exact/fallback solve must report local_optimum after FM converges");
+}
+
+void TestIfJoinAndClassFCrossLoopForbidden() {
+  const auto RM = al::LayoutSpec::RowMajorFlat();
+  const auto CM = al::LayoutSpec::ColMajorFlat();
+
+  // 1) control.if_join forces both branches to match the join layout, inserting a
+  // realizable Vec branch-yield conversion only when direct matching costs more.
+  al::LayoutProblemInstance join_inst;
+  join_inst.AddValue(MakeValue("t_then", "P_then", MemorySpace::Vec, false, false, {RM, CM}));
+  join_inst.AddValue(MakeValue("t_else", "P_else", MemorySpace::Vec, false, false, {RM, CM}));
+  join_inst.AddValue(MakeValue("t_join", "J_if", MemorySpace::Vec, false, false, {RM, CM}));
+  join_inst.AddValue(MakeValue("y_out", "Cons", MemorySpace::Vec, false, false, {RM}));
+
+  al::OperationNode p_then = MakeOp("P_then", {}, "t_then", {{{}, RM, 100.0}, {{}, CM, 1.0}}, 1, "tile.load");
+  al::OperationNode p_else = MakeOp("P_else", {}, "t_else", {{{}, RM, 1.0}, {{}, CM, 100.0}}, 1, "tile.load");
+  al::OperationNode j_if = MakeOp("J_if", {"t_then", "t_else"}, "t_join",
+                                  {{{RM, RM}, RM, 0.0}, {{CM, CM}, CM, 0.0}}, 1, "control.if_join");
+  al::OperationNode cons = MakeOp("Cons", {"t_join"}, "y_out", {{{RM}, RM, 0.0}}, 1, "tile.store");
+  join_inst.operations = {p_then, p_else, j_if, cons};
+
+  const auto join_dp = al::SolveTreewidthDP(join_inst);
+  Require(join_dp.writeback_issues.empty(), "Valid if_join must have no conversion issues");
+  Require(join_dp.breakdown.assignment.op_configs.at("P_then").output_layout == CM,
+          "then branch must keep CM and insert a branch-yield Vec conversion to RM");
+  Require(join_dp.breakdown.assignment.op_configs.at("P_else").output_layout == RM,
+          "else branch must match join RM");
+  Require(join_dp.breakdown.assignment.op_configs.at("J_if").output_layout == RM,
+          "control.if_join output must match consumer RM");
+  Require(join_dp.conversions.size() == 1, "Expected exactly one branch-yield conversion for t_then");
+
+  // When a branch conversion into control.if_join is not cheaper than matching directly,
+  // the branch switches directly to the join layout with zero conversions.
+  al::LayoutProblemInstance direct_join_inst = join_inst;
+  direct_join_inst.operations[0] =
+      MakeOp("P_then", {}, "t_then", {{{}, RM, 1.5}, {{}, CM, 1.0}}, 1, "tile.load");
+  const auto direct_dp = al::SolveTreewidthDP(direct_join_inst);
+  Require(direct_dp.writeback_issues.empty(), "Direct-match if_join must have no conversion issues");
+  Require(direct_dp.breakdown.assignment.op_configs.at("P_then").output_layout == RM,
+          "Cheaper direct-match branch must switch to RM without conversion");
+  Require(direct_dp.conversions.empty(), "Direct-match if_join must emit zero conversions");
+
+  // 2) Class F: on-chip value produced with invocations=1 and consumed with invocations=4
+  // prefers conversion-free match without throwing.
+  al::LayoutProblemInstance loop_mismatch;
+  loop_mismatch.AddValue(MakeValue("v", "Prod", MemorySpace::Vec, false, false, {RM, CM}));
+  loop_mismatch.AddValue(MakeValue("w", "Cons", MemorySpace::Vec, false, false, {RM}));
+  loop_mismatch.operations = {
+      MakeOp("Prod", {}, "v", {{{}, RM, 2.0}, {{}, CM, 1.0}}, 1),
+      MakeOp("Cons", {"v"}, "w", {{{RM}, RM, 0.0}}, 4),
+  };
+  const auto lm_res = al::SolveAutoLayout(loop_mismatch);
+  Require(lm_res.writeback_issues.empty(), "Class F conversion-free config must succeed without issues");
+  Require(lm_res.breakdown.assignment.op_configs.at("Prod").output_layout == RM,
+          "Class F producer must match consumer layout");
+
+  // 3) Class F gain-cache/evaluator agreement under budget=1 when one consumer has incompatible
+  // invocations=1 and another has compatible invocations=2.
+  al::LayoutProblemInstance budget1_inst;
+  budget1_inst.AddValue(MakeValue("v", "prod", MemorySpace::Vec, false, false, {RM, CM}));
+  budget1_inst.AddValue(MakeValue("w1", "c1", MemorySpace::Vec, false, false, {RM, CM}));
+  budget1_inst.AddValue(MakeValue("w2", "c2", MemorySpace::Vec, false, false, {RM, CM}));
+  budget1_inst.operations = {
+      MakeOp("prod", {}, "v", {{{}, RM, 1.0}, {{}, CM, 1000.0}}, 2),
+      MakeOp("c1", {"v"}, "w1", {{{CM}, CM, 1.0}, {{RM}, RM, 500.0}}, 2),
+      MakeOp("c2", {"v"}, "w2", {{{RM}, RM, 1.0}, {{CM}, CM, 1.0}}, 1),
+  };
+  al::LayoutSolverConfig cfg_b1;
+  cfg_b1.max_treewidth = 0;
+  cfg_b1.max_evaluations = 1;
+  const auto b1_res = al::SolveAutoLayout(budget1_inst, std::nullopt, cfg_b1);
+  Require(std::isfinite(b1_res.TotalCostCycles()),
+          "Class F evaluator and gain cache must agree even at max_evaluations=1");
+}
+
 }  // namespace
 
 int main() {
@@ -442,6 +571,8 @@ int main() {
     TestSharedConversionBarrierAndOracle();
     TestIncrementalStateAndAsymmetricCosts();
     TestBudgetAndTreewidthLimits();
+    TestTreewidthAbove64AndPerComponentDPFallback();
+    TestIfJoinAndClassFCrossLoopForbidden();
     std::cout << "All pypto_auto_layout_solver_test checks passed!\n";
     return 0;
   } catch (const std::exception& e) {

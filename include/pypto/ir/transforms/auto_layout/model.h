@@ -230,6 +230,9 @@ struct LayoutProblemInstance {
   LayoutCostModel cost_model;
   /// Optional per-value `(src, dst) -> cost` overrides populated by Python subclasses of `LayoutCostModel`.
   CustomConversionCostMap custom_conversion_costs;
+  /// When true (set by `ExtractLayoutInstance`), penalize unmaterializable GM internal conversions and
+  /// multi-representation GM inputs so the solver avoids unrewritable assignments.
+  bool forbid_unmaterializable_gm_conversions = false;
 
   void AddValue(ValueNode node);
   [[nodiscard]] const ValueNode* FindValue(const std::string& name) const;

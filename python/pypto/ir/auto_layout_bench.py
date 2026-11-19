@@ -49,7 +49,9 @@ from pypto.ir.auto_layout import (
     LayoutVariantArtifact,
     compile_layout_variants,
     fit_cost_model_from_measurements,
+    pack_dn,
     pack_nz,
+    unpack_dn,
     unpack_nz,
 )
 from pypto.ir.auto_layout_solver import (
@@ -480,8 +482,11 @@ def prepare_variant_tensors(
 
     call_inputs: list[torch.Tensor] = []
     for p_name, tensor in zip(input_param_names, case.inputs, strict=True):
-        if variant.gm_input_layouts.get(p_name) == "NZ":
+        in_lay = variant.gm_input_layouts.get(p_name)
+        if in_lay == "NZ":
             call_inputs.append(pack_nz(tensor))
+        elif in_lay == "DN":
+            call_inputs.append(pack_dn(tensor))
         else:
             call_inputs.append(tensor.contiguous())
 
@@ -953,11 +958,13 @@ def run_calibration_suite(  # noqa: PLR0913
                     device_id=device_id,
                 )
                 compiled(*all_args, config=run_cfg)
-                actual = (
-                    unpack_nz(out_buf)
-                    if next(iter(variant.gm_output_layouts.values()), "ND") == "NZ"
-                    else out_buf
-                )
+                out_lay = next(iter(variant.gm_output_layouts.values()), "ND")
+                if out_lay == "NZ":
+                    actual = unpack_nz(out_buf)
+                elif out_lay == "DN":
+                    actual = unpack_dn(out_buf)
+                else:
+                    actual = out_buf
                 max_err = float((actual - case.expected_output).abs().max().item())
                 ok = bool(torch.allclose(actual, case.expected_output, rtol=1e-2, atol=1e-2))
                 rec["accuracy_ok"] = ok

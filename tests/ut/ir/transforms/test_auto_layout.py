@@ -29,6 +29,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pypto.language as pl
 import pytest
@@ -1652,8 +1653,10 @@ def test_device_sweep_l3_host_tuple_sync_and_rank5_reshape_fixes():
         ),
     )
     r5_fns = {fn.name: fn for fn in rewritten_rank5.functions.values()}
-    assert _tensor_type_layout(r5_fns["proj_a_mm"].params[0].type) == nz
-    assert _tensor_type_layout(r5_fns["prefetch_o_proj_w"].params[0].type) == nd
+    proj_a_t = r5_fns["proj_a_mm"].params[0].type
+    prefetch_t = r5_fns["prefetch_o_proj_w"].params[0].type
+    assert isinstance(proj_a_t, ir.TensorType) and _tensor_type_layout(proj_a_t) == nz
+    assert isinstance(prefetch_t, ir.TensorType) and _tensor_type_layout(prefetch_t) == nd
 
     # 3) L3 HOST orchestrator functions keep logical ND parameter layouts when AutoLayout writes back NZ.
     w_host = ir.Var("wq_a", ir.TensorType([2, 64, 64], DataType.FP16, None, nd_view), span)
@@ -1737,7 +1740,9 @@ def test_device_sweep_l3_host_tuple_sync_and_rank5_reshape_fixes():
     pass1_prog = block_pipe.run(prog_two_pass)
     p1_fns = {fn.name: fn for fn in pass1_prog.functions.values()}
     assert "nz_tensor_views_blocked" in p1_fns["proj_a_mm"].attrs
-    assert [int(d.value) for d in p1_fns["proj_a_mm"].params[0].type.shape] == [1, 8, 16, 16, 16]
+    p1_t0 = p1_fns["proj_a_mm"].params[0].type
+    assert isinstance(p1_t0, ir.TensorType)
+    assert [int(d.value) for d in p1_t0.shape if isinstance(d, ir.ConstInt)] == [1, 8, 16, 16, 16]
 
     rewritten_two_pass = apply_layout_assignment(
         pass1_prog,
@@ -1752,8 +1757,11 @@ def test_device_sweep_l3_host_tuple_sync_and_rank5_reshape_fixes():
     )
     pass2_prog = block_pipe.run(rewritten_two_pass)
     p2_fns = {fn.name: fn for fn in pass2_prog.functions.values()}
-    assert [int(d.value) for d in p2_fns["proj_a_mm"].params[0].type.shape] == [1, 8, 16, 16, 16]
-    assert [int(d.value) for d in p2_fns["other_mm"].params[0].type.shape] == [1, 4, 4, 16, 16]
+    p2_t0 = p2_fns["proj_a_mm"].params[0].type
+    p2_other_t0 = p2_fns["other_mm"].params[0].type
+    assert isinstance(p2_t0, ir.TensorType) and isinstance(p2_other_t0, ir.TensorType)
+    assert [int(d.value) for d in p2_t0.shape if isinstance(d, ir.ConstInt)] == [1, 8, 16, 16, 16]
+    assert [int(d.value) for d in p2_other_t0.shape if isinstance(d, ir.ConstInt)] == [1, 4, 4, 16, 16]
 
     # 5) Vec tile.store uses MTE3 bandwidth (no Fixpipe odd_n1 penalty), and reductions price by max
     #    input/output elements.
@@ -2358,8 +2366,9 @@ def test_direction_c_fractal_nz_vec_pointwise_between_cube_matmuls_and_pto():
         # Multi-output return_types sync: vec_nz_multi returns (mid2=NZ, mid3=ND).
         ret_types = c_fns["vec_nz_multi"].return_types
         assert len(ret_types) == 2
+        assert isinstance(ret_types[0], ir.TensorType) and ret_types[0].tensor_view is not None
         assert ret_types[0].tensor_view.layout == ir.TensorLayout.NZ
-        assert c_fns["vec_nz_multi"].return_types[1].tensor_view is None
+        assert isinstance(ret_types[1], ir.TensorType) and ret_types[1].tensor_view is None
         ir.assert_structural_equal(_run_resolve_layouts_pass(c_rewritten), c_rewritten)
         run_post_layout_passes(c_rewritten)
 
@@ -2464,7 +2473,7 @@ def test_direction_c_fractal_nz_vec_pointwise_between_cube_matmuls_and_pto():
             run_post_layout_passes(k2_rw)
 
 
-def test_nested_if_while_yield_scoping_and_return_var_symmetry():
+def test_nested_if_while_yield_scoping_and_return_var_symmetry():  # noqa: PLR0915
     set_backend_type(BackendType.Ascend910)
     span = ir.Span.unknown()
     nd = ir.TensorLayout.ND
@@ -2573,34 +2582,26 @@ def test_nested_if_while_yield_scoping_and_return_var_symmetry():
         ir.create_op_call("tile.load", [w, offs, win, win], {"target_memory": ir.MemorySpace.Mat}, span),
         span,
     )
+    t_l0a_kwargs: dict[str, Any] = {
+        "target_memory": ir.MemorySpace.Left,
+        "blayout": ir.TileLayout.col_major,
+        "slayout": ir.TileLayout.row_major,
+    }
     t_l0a = ir.Var("t_l0a", left_type, span)
     t_l0a_stmt = ir.AssignStmt(
         t_l0a,
-        ir.create_op_call(
-            "tile.move",
-            [t_mat_a],
-            {
-                "target_memory": ir.MemorySpace.Left,
-                "blayout": ir.TileLayout.col_major,
-                "slayout": ir.TileLayout.row_major,
-            },
-            span,
-        ),
+        ir.create_op_call("tile.move", [t_mat_a], t_l0a_kwargs, span),
         span,
     )
+    t_l0b_kwargs: dict[str, Any] = {
+        "target_memory": ir.MemorySpace.Right,
+        "blayout": ir.TileLayout.row_major,
+        "slayout": ir.TileLayout.col_major,
+    }
     t_l0b = ir.Var("t_l0b", right_type, span)
     t_l0b_stmt = ir.AssignStmt(
         t_l0b,
-        ir.create_op_call(
-            "tile.move",
-            [t_mat_b],
-            {
-                "target_memory": ir.MemorySpace.Right,
-                "blayout": ir.TileLayout.row_major,
-                "slayout": ir.TileLayout.col_major,
-            },
-            span,
-        ),
+        ir.create_op_call("tile.move", [t_mat_b], t_l0b_kwargs, span),
         span,
     )
     t_acc = ir.Var("t_acc", acc_type, span)
@@ -2727,33 +2728,57 @@ def test_nested_if_while_yield_scoping_and_return_var_symmetry():
     )
     rewritten = apply_layout_assignment(prog, assignment)
     rw_fn = next(fn for gv, fn in rewritten.functions.items() if gv.name == "nested_cf_kernel")
+    assert isinstance(rw_fn.params[0].type, ir.TensorType) and rw_fn.params[0].type.tensor_view is not None
     assert rw_fn.params[0].type.tensor_view.layout == nz
+    assert isinstance(rw_fn.params[1].type, ir.TensorType) and rw_fn.params[1].type.tensor_view is not None
     assert rw_fn.params[1].type.tensor_view.layout == nz
+    assert isinstance(rw_fn.params[4].type, ir.TensorType) and rw_fn.params[4].type.tensor_view is not None
     assert rw_fn.params[4].type.tensor_view.layout == nz
 
+    assert isinstance(rw_fn.body, ir.SeqStmts)
     rw_stmts = rw_fn.body.stmts
     rw_for = next(s for s in rw_stmts if isinstance(s, ir.ForStmt))
+    assert (
+        isinstance(rw_for.iter_args[0].type, ir.TensorType)
+        and rw_for.iter_args[0].type.tensor_view is not None
+    )
     assert rw_for.iter_args[0].type.tensor_view.layout == nz
+    assert (
+        isinstance(rw_for.iter_args[1].type, ir.TileType) and rw_for.iter_args[1].type.tile_view is not None
+    )
     assert rw_for.iter_args[1].type.tile_view.blayout == ir.TileLayout.col_major
     assert rw_for.return_vars[0].type == rw_for.iter_args[0].type
     assert rw_for.return_vars[1].type == rw_for.iter_args[1].type
 
+    assert isinstance(rw_for.body, ir.SeqStmts)
     rw_for_stmts = rw_for.body.stmts
     rw_while = next(s for s in rw_for_stmts if isinstance(s, ir.WhileStmt))
+    assert (
+        isinstance(rw_while.iter_args[0].type, ir.TensorType)
+        and rw_while.iter_args[0].type.tensor_view is not None
+    )
     assert rw_while.iter_args[0].type.tensor_view.layout == nz
+    assert (
+        isinstance(rw_while.iter_args[1].type, ir.TileType)
+        and rw_while.iter_args[1].type.tile_view is not None
+    )
     assert rw_while.iter_args[1].type.tile_view.blayout == ir.TileLayout.col_major
     assert rw_while.return_vars[0].type == rw_while.iter_args[0].type
     assert rw_while.return_vars[1].type == rw_while.iter_args[1].type
 
     rw_if = next(s for s in rw_for_stmts if isinstance(s, ir.IfStmt))
+    assert (
+        isinstance(rw_if.return_vars[0].type, ir.TensorType)
+        and rw_if.return_vars[0].type.tensor_view is not None
+    )
     assert rw_if.return_vars[0].type.tensor_view.layout == nz
     # Inner IfStmt branches must yield ROW_MAJOR_FLAT (`t_then` / `t_else`), not COL_MAJOR_FLAT.
+    assert isinstance(rw_if.then_body, ir.SeqStmts)
     then_yield = rw_if.then_body.stmts[-1]
     assert isinstance(then_yield, ir.YieldStmt)
-    assert (
-        then_yield.value[1].type.tile_view is None
-        or then_yield.value[1].type.tile_view.blayout == ir.TileLayout.row_major
-    )
+    then_yield_t = then_yield.value[1].type
+    assert isinstance(then_yield_t, ir.TileType)
+    assert then_yield_t.tile_view is None or then_yield_t.tile_view.blayout == ir.TileLayout.row_major
     assert rw_if.return_vars[1].type == then_yield.value[1].type
 
     verify_props = passes.IRPropertySet()
@@ -2765,6 +2790,542 @@ def test_nested_if_while_yield_scoping_and_return_var_symmetry():
         rewritten,
         "test_nested_if_while_yield_scoping_and_return_var_symmetry",
     )
+
+
+def test_if_join_distinct_producers_while_cond_and_distributed_tensor_preservation():
+    """Verify IfStmt branch joins, WhileStmt condition iter_arg remap, and DistributedTensorType safety."""
+    from pypto.ir.auto_layout_solver import solve_auto_layout  # noqa: PLC0415
+
+    set_backend_type(BackendType.Ascend910)
+
+    # 1) Conditional IfStmt join with two distinct reusable load producers forces consistent branch layouts.
+    @pl.jit
+    def if_join_kernel(
+        x: pl.Tensor[[16, 16], pl.FP16],
+        y: pl.Tensor[[16, 16], pl.FP16],
+        flag: pl.Scalar[pl.INT32],
+        out: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
+    ) -> pl.Tensor[[16, 16], pl.FP16]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="if_join_vec"):
+            if flag > 0:
+                t = pl.load(x, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
+            else:
+                t = pl.load(y, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
+            out = pl.store(t, [0, 0], out)
+        return out
+
+    stub = torch.zeros((16, 16), dtype=torch.float16)
+    prog_if = if_join_kernel.specialize(stub, stub, 1, stub)
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
+        pre_if = run_pre_layout_passes(prog_if)
+        inst_if = extract_layout_instance(
+            pre_if,
+            cost_model=LayoutCostModel(backend_type=BackendType.Ascend910, expected_uses=100),
+            reusable_tensors={"x", "y"},
+        )
+        assert any(op.op_name == "control.if_join" for op in inst_if.operations)
+        res_if = solve_auto_layout(inst_if)
+        assert res_if.writeback_issues == ()
+        rw_if_prog = apply_layout_assignment(pre_if, res_if.writeback_assignment())
+        verify_props = passes.IRPropertySet()
+        verify_props.insert(passes.IRProperty.SSAForm)
+        verify_props.insert(passes.IRProperty.AssignTypeSymmetry)
+        passes.verify_properties(verify_props, rw_if_prog, "if_join_distinct_producers")
+
+    # 2) WhileStmt condition referencing an IterArg whose type changes during writeback stays in SSA form.
+    span = ir.Span.unknown()
+    gm_type = ir.TensorType([16, 16], DataType.FP16, None)
+    mat_type = ir.TileType(
+        [16, 16],
+        DataType.FP16,
+        None,
+        ir.TileView(blayout=ir.TileLayout.col_major, slayout=ir.TileLayout.row_major, fractal=512),
+        ir.MemorySpace.Mat,
+    )
+    in_buf = ir.Var("in_buf", gm_type, span)
+    out_buf = ir.Var("out_buf", gm_type, span)
+    ia = ir.IterArg("loop_gm", gm_type, in_buf, span)
+    # Condition references `ia` inside a Call (`tile.load`) so WhileStmt must substitute `ia` into condition_.
+    cond_load = ir.create_op_call(
+        "tile.load",
+        [
+            ia,
+            ir.MakeTuple([ir.ConstInt(0, DataType.INDEX, span), ir.ConstInt(0, DataType.INDEX, span)], span),
+            ir.MakeTuple(
+                [ir.ConstInt(16, DataType.INDEX, span), ir.ConstInt(16, DataType.INDEX, span)], span
+            ),
+            ir.MakeTuple(
+                [ir.ConstInt(16, DataType.INDEX, span), ir.ConstInt(16, DataType.INDEX, span)], span
+            ),
+        ],
+        {"target_memory": ir.MemorySpace.Mat},
+        span,
+    )
+    cond_expr = ir.ConstBool(False, span)
+    # Force an explicit Var reference to `ia` inside the WhileStmt condition expression.
+    zero_off = ir.ConstInt(0, DataType.INDEX, span)
+    cond_var_ref = ir.Ne(
+        ir.TupleGetItemExpr(
+            ir.MakeTuple([ir.ConstInt(0, DataType.INDEX, span), ia], span),
+            0,
+            span,
+        ),
+        zero_off,
+        DataType.BOOL,
+        span,
+    )
+    body_t = ir.Var("body_t", mat_type, span)
+    body_load = ir.AssignStmt(body_t, cond_load, span)
+    stored_v = ir.Var("stored_v", gm_type, span)
+    body_store = ir.AssignStmt(
+        stored_v,
+        ir.create_op_call(
+            "tile.store",
+            [
+                body_t,
+                ir.MakeTuple([zero_off, zero_off], span),
+                out_buf,
+                ir.MakeTuple(
+                    [ir.ConstInt(16, DataType.INDEX, span), ir.ConstInt(16, DataType.INDEX, span)], span
+                ),
+            ],
+            {},
+            span,
+        ),
+        span,
+    )
+    rv = ir.Var("loop_rv", gm_type, span)
+    ws = ir.WhileStmt(
+        ir.And(cond_expr, cond_var_ref, DataType.BOOL, span),
+        [ia],
+        ir.SeqStmts([body_load, body_store, ir.YieldStmt([ia], span)], span),
+        [rv],
+        span,
+    )
+    fn_w = ir.Function(
+        "while_cond_fn",
+        [in_buf, out_buf],
+        [gm_type],
+        ir.SeqStmts([ws, ir.ReturnStmt([out_buf], span)], span),
+        span,
+        type=ir.FunctionType.AIC,
+        level=ir.Level.AIC,
+    )
+    prog_w = ir.Program([fn_w], "prog_w", span)
+    rw_w = apply_layout_assignment(
+        prog_w,
+        LayoutAssignment(value_layouts={"in_buf": ir.TensorLayout.NZ}, op_configs={}),
+    )
+    rw_w_fn = next(iter(rw_w.functions.values()))
+    assert isinstance(rw_w_fn.body, ir.SeqStmts)
+    rw_ws = next(s for s in rw_w_fn.body.stmts if isinstance(s, ir.WhileStmt))
+    assert rw_ws.iter_args[0].name_hint == "loop_gm"
+    # Verify WhileStmt condition references the new IterArg pointer, not the stale original `ia`.
+    assert str(ia.type) != str(rw_ws.iter_args[0].type)
+    assert rw_ws.iter_args[0] is not ia
+    assert isinstance(rw_ws.condition, ir.And)
+    assert isinstance(rw_ws.condition.right, ir.Ne)
+    assert isinstance(rw_ws.condition.right.left, ir.TupleGetItemExpr)
+    assert isinstance(rw_ws.condition.right.left.tuple, ir.MakeTuple)
+    assert rw_ws.condition.right.left.tuple.elements[1] is rw_ws.iter_args[0]
+    assert rw_ws.condition.right.left.tuple.elements[1] is not ia
+
+    # 3) DistributedTensorType parameters keep subtype & pinned layout across extraction and writeback.
+    dist_t = ir.DistributedTensorType([16, 16], DataType.FP16, None)
+    d_in = ir.Var("d_in", dist_t, span)
+    d_out = ir.Var("d_out", gm_type, span)
+    d_tile = ir.Var("d_tile", mat_type, span)
+    d_load = ir.AssignStmt(
+        d_tile,
+        ir.create_op_call(
+            "tile.load",
+            [
+                d_in,
+                ir.MakeTuple([zero_off, zero_off], span),
+                ir.MakeTuple(
+                    [ir.ConstInt(16, DataType.INDEX, span), ir.ConstInt(16, DataType.INDEX, span)], span
+                ),
+                ir.MakeTuple(
+                    [ir.ConstInt(16, DataType.INDEX, span), ir.ConstInt(16, DataType.INDEX, span)], span
+                ),
+            ],
+            {"target_memory": ir.MemorySpace.Mat},
+            span,
+        ),
+        span,
+    )
+    d_ret = ir.Var("d_ret", gm_type, span)
+    d_store = ir.AssignStmt(
+        d_ret,
+        ir.create_op_call(
+            "tile.store",
+            [
+                d_tile,
+                ir.MakeTuple([zero_off, zero_off], span),
+                d_out,
+                ir.MakeTuple(
+                    [ir.ConstInt(16, DataType.INDEX, span), ir.ConstInt(16, DataType.INDEX, span)], span
+                ),
+            ],
+            {},
+            span,
+        ),
+        span,
+    )
+    fn_dist = ir.Function(
+        "dist_kernel",
+        [d_in, d_out],
+        [gm_type],
+        ir.SeqStmts([d_load, d_store, ir.ReturnStmt([d_ret], span)], span),
+        span,
+        type=ir.FunctionType.AIC,
+        level=ir.Level.AIC,
+    )
+    prog_dist = ir.Program([fn_dist], "prog_dist", span)
+    inst_dist = extract_layout_instance(
+        prog_dist, cost_model=LayoutCostModel(backend_type=BackendType.Ascend910)
+    )
+    assert "d_in" in inst_dist.values
+    assert inst_dist.values["d_in"].admissible_layouts == (ir.TensorLayout.ND,)
+    rw_dist = apply_layout_assignment(
+        prog_dist, LayoutAssignment(value_layouts={"d_in": ir.TensorLayout.ND}, op_configs={})
+    )
+    rw_dist_fn = next(iter(rw_dist.functions.values()))
+    assert isinstance(rw_dist_fn.params[0].type, ir.DistributedTensorType)
+
+
+def test_calibration_prediction_includes_internal_onchip_conversions():
+    """Verify calibration predictor and features count internal conversions, excluding GM packing."""
+    from pypto.ir.auto_layout import (  # noqa: PLC0415
+        COL_MAJOR_FLAT,
+        ROW_BCAST_FLAT,
+        ROW_MAJOR_FLAT,
+        CalibrationMeasurement,
+        _calibration_features,
+        _calibration_prediction_cycles,
+    )
+
+    cm = LayoutCostModel(expected_uses=2)
+    gm_in = LayoutValueNode(
+        name="x",
+        shape=(32, 32),
+        dtype=DataType.FP32,
+        memory_space=ir.MemorySpace.DDR,
+        current_layout=ir.TensorLayout.ND,
+        admissible_layouts=(ir.TensorLayout.ND, ir.TensorLayout.NZ),
+        is_reusable_weight=True,
+    )
+    vec_val = LayoutValueNode(
+        name="rsum",
+        shape=(32, 1),
+        dtype=DataType.FP32,
+        memory_space=ir.MemorySpace.Vec,
+        current_layout=COL_MAJOR_FLAT,
+        admissible_layouts=(COL_MAJOR_FLAT, ROW_BCAST_FLAT),
+        producer_op_id="op_prod",
+    )
+    vec_out = LayoutValueNode(
+        name="y",
+        shape=(32, 32),
+        dtype=DataType.FP32,
+        memory_space=ir.MemorySpace.Vec,
+        current_layout=ROW_MAJOR_FLAT,
+        admissible_layouts=(ROW_MAJOR_FLAT,),
+        producer_op_id="op_cons",
+    )
+    op_prod = LayoutOperationNode(
+        op_id="op_prod",
+        op_name="tile.row_sum",
+        inputs=("x",),
+        output="rsum",
+        invocations=2,
+        configs=(OperatorConfig("op_prod", "tile.row_sum", (ir.TensorLayout.NZ,), COL_MAJOR_FLAT, 10.0),),
+    )
+    op_cons = LayoutOperationNode(
+        op_id="op_cons",
+        op_name="tile.row_expand_add",
+        inputs=("rsum",),
+        output="y",
+        invocations=2,
+        configs=(OperatorConfig("op_cons", "tile.row_expand_add", (ROW_BCAST_FLAT,), ROW_MAJOR_FLAT, 5.0),),
+    )
+    inst = LayoutProblemInstance(
+        values={"x": gm_in, "rsum": vec_val, "y": vec_out},
+        operations=[op_prod, op_cons],
+        cost_model=cm,
+    )
+    bd = evaluate_assignment(
+        inst, LayoutAssignment(value_layouts={"x": ir.TensorLayout.NZ, "rsum": COL_MAJOR_FLAT})
+    )
+    meas = CalibrationMeasurement(variant_id="v", measured_us=1.0, instance=inst, breakdown=bd)
+    expected_op = (32.0 / cm.vec_elements_per_cycle) + (1024.0 / cm.vec_elements_per_cycle)
+    expected_internal_conv = cm.estimate_conversion_cost(vec_val, COL_MAJOR_FLAT, ROW_BCAST_FLAT)
+    pred = _calibration_prediction_cycles(cm, meas)
+    feats = _calibration_features(cm, meas, expected_uses=2.0, contiguous_nd_ratio=1.0)
+    assert pred == pytest.approx(expected_op + expected_internal_conv)
+    assert feats[5] == pytest.approx(expected_op + expected_internal_conv)
+
+
+def test_callee_specialization_remaps_attrs_and_symbolic_types():
+    """Callee specialization substitutes scalar params inside attrs, param types, and return_type."""
+    from pypto.pypto_core import passes  # noqa: PLC0415
+
+    set_backend_type(BackendType.Ascend910)
+    span = ir.Span.unknown()
+    c64 = ir.ConstInt(64, DataType.INDEX, span)
+    nd_view = ir.TensorView([], ir.TensorLayout.ND)
+    nz_view = ir.TensorView([], ir.TensorLayout.NZ)
+
+    callee_k = ir.Var("k_callee", ir.ScalarType(DataType.INDEX), span)
+    callee_sym_ty = ir.TensorType([callee_k, c64], DataType.FP16, None, nd_view)
+    callee_x = ir.Var("x_callee", callee_sym_ty, span)
+    callee_fn = ir.Function(
+        "sym_callee",
+        [callee_k, callee_x],
+        [callee_sym_ty],
+        ir.SeqStmts([ir.ReturnStmt([callee_x], span)], span),
+        span,
+        type=ir.FunctionType.InCore,
+        level=ir.Level.CHIP_DIE,
+        attrs={"sym_k": callee_k},
+    )
+
+    orch_k = ir.Var("k_orch", ir.ScalarType(DataType.INDEX), span)
+    orch_ty_nd = ir.TensorType([orch_k, c64], DataType.FP16, None, nd_view)
+    orch_x_nd = ir.Var("x_nd__ssa_v0", orch_ty_nd, span)
+    orch_x_nz = ir.Var("x_nz__ssa_v0", orch_ty_nd, span)
+    orch_out0 = ir.Var("out0", orch_ty_nd, span)
+    orch_out1 = ir.Var("out1", orch_ty_nd, span)
+    callee_gv = ir.GlobalVar("sym_callee")
+    orch_body = ir.SeqStmts(
+        [
+            ir.AssignStmt(
+                orch_out0,
+                ir.Call(callee_gv, [orch_k, orch_x_nd], {}, None, orch_ty_nd, span),
+                span,
+            ),
+            ir.AssignStmt(
+                orch_out1,
+                ir.Call(callee_gv, [orch_k, orch_x_nz], {}, None, orch_ty_nd, span),
+                span,
+            ),
+            ir.ReturnStmt([orch_out0], span),
+        ],
+        span,
+    )
+    orch_fn = ir.Function(
+        "entry",
+        [orch_k, orch_x_nd, orch_x_nz],
+        [orch_ty_nd],
+        orch_body,
+        span,
+        type=ir.FunctionType.Orchestration,
+        level=ir.Level.CHIP,
+    )
+    prog = ir.Program([orch_fn, callee_fn], "sym_spec_prog", span)
+    inst = extract_layout_instance(prog)
+    assignment = LayoutAssignment(
+        value_layouts={
+            "x_nd": ir.TensorLayout.ND,
+            "x_nz": ir.TensorLayout.NZ,
+            "x_callee": ir.TensorLayout.ND,
+        }
+    )
+    rewritten = apply_layout_assignment(prog, assignment)
+    spec_fns = [f for f in rewritten.functions.values() if f.name not in ("entry", "sym_callee")]
+    assert len(spec_fns) == 1
+    spec_fn = spec_fns[0]
+    new_k = spec_fn.params[0]
+    assert not new_k.same_as(callee_k)
+    assert isinstance(spec_fn.attrs["sym_k"], ir.Expr) and spec_fn.attrs["sym_k"].same_as(new_k)
+    spec_p1_ty = spec_fn.params[1].type
+    assert isinstance(spec_p1_ty, ir.TensorType)
+    assert spec_p1_ty.tensor_view is not None and spec_p1_ty.tensor_view.layout == nz_view.layout
+    assert spec_p1_ty.shape[0].same_as(new_k)
+    assert len(spec_fn.return_types) == 1
+    assert isinstance(spec_fn.return_types[0], ir.TensorType)
+    assert spec_fn.return_types[0].shape[0].same_as(new_k)
+    ssa_props = passes.IRPropertySet()
+    ssa_props.insert(passes.IRProperty.SSAForm)
+    passes.verify_properties(ssa_props, rewritten, "callee_spec_ssa")
+    assert inst is not None
+
+
+def test_if_join_col_major_and_transpose_nd_preservation():
+    """Verify IfStmt branch-yield conversions via control.if_join and tensor.transpose ND pinning."""
+    from pypto.ir.auto_layout_solver import solve_auto_layout  # noqa: PLC0415
+    from pypto.pypto_core import passes  # noqa: PLC0415
+
+    set_backend_type(BackendType.Ascend910)
+
+    # 1) tensor.transpose on an external ND input in Orchestration does not alias source/dest or emit NZ/DN.
+    @pl.program
+    class _TransposeOrchProg:
+        @pl.function(type=pl.FunctionType.InCore)
+        def vec_copy(
+            self,
+            inp: pl.Tensor[[64, 64], pl.FP16],
+            out: pl.Out[pl.Tensor[[64, 64], pl.FP16]],
+        ) -> pl.Tensor[[64, 64], pl.FP16]:
+            t = pl.load(inp, [0, 0], [64, 64], target_memory=pl.Mem.Vec)
+            t2 = pl.tile.muls(t, 2.0)
+            out = pl.store(t2, [0, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def entry(
+            self,
+            x: pl.Tensor[[64, 64], pl.FP16],
+            out0: pl.Out[pl.Tensor[[64, 64], pl.FP16]],
+            out1: pl.Out[pl.Tensor[[64, 64], pl.FP16]],
+        ) -> tuple[pl.Tensor[[64, 64], pl.FP16], pl.Tensor[[64, 64], pl.FP16]]:
+            xt = pl.transpose(x, 0, 1)
+            out0 = self.vec_copy(x, out0)
+            out1 = self.vec_copy(xt, out1)
+            return out0, out1
+
+    pre_tr = run_pre_layout_passes(_TransposeOrchProg)
+    inst_tr = extract_layout_instance(pre_tr, cost_model=LayoutCostModel(backend_type=BackendType.Ascend910))
+    assert inst_tr.values["x"].admissible_layouts == (ir.TensorLayout.ND,)
+    assert inst_tr.values["xt"].admissible_layouts == (ir.TensorLayout.ND,)
+    res_tr = solve_auto_layout(inst_tr)
+    assert res_tr.writeback_issues == ()
+
+    # 2) IfStmt returning a [32, 1] tile: COL_MAJOR_FLAT reduction in `then`, load+add in `else`,
+    # joined via control.if_join and stored to ND GM without op_queue desync or writeback issues.
+    @pl.jit
+    def if_join_col_major_kernel(
+        flag: pl.Scalar[pl.BOOL],
+        x: pl.Tensor[[32, 32], pl.FP16],
+        y: pl.Tensor[[32, 1], pl.FP16],
+        z: pl.Tensor[[32, 1], pl.FP16],
+        out: pl.Out[pl.Tensor[[32, 1], pl.FP16]],
+    ) -> pl.Tensor[[32, 1], pl.FP16]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="if_join_vec"):
+            tx = pl.load(x, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            ty = pl.load(y, [0, 0], [32, 1], target_memory=pl.Mem.Vec)
+            tz = pl.load(z, [0, 0], [32, 1], target_memory=pl.Mem.Vec)
+            if flag:
+                tmp = pl.tile.create([32, 32], dtype=pl.FP16, target_memory=pl.Mem.Vec)
+                branch = pl.tile.row_max(tx, tmp)
+            else:
+                branch = pl.tile.add(ty, tz)
+            out = pl.store(branch, [0, 0], out)
+        return out
+
+    stub32 = torch.zeros((32, 32), dtype=torch.float16)
+    stub32x1 = torch.zeros((32, 1), dtype=torch.float16)
+    prog_if = if_join_col_major_kernel.specialize(True, stub32, stub32x1, stub32x1, stub32x1)
+    with passes.PassContext(
+        [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+    ):
+        pre_if = run_pre_layout_passes(prog_if)
+        inst_if = extract_layout_instance(
+            pre_if, cost_model=LayoutCostModel(backend_type=BackendType.Ascend910)
+        )
+        assert any(op.op_name == "control.if_join" for op in inst_if.operations)
+        res_if = solve_auto_layout(inst_if)
+        assert res_if.writeback_issues == ()
+        rw_if = apply_layout_assignment(pre_if, res_if.writeback_assignment())
+        ir.assert_structural_equal(_run_resolve_layouts_pass(rw_if), rw_if)
+        run_post_layout_passes(rw_if)
+
+
+def test_tile_reshape_512_and_row_expand_with_reshape_consumer():
+    """Verify fractal=512 tile.reshape extraction and ROW_BCAST_FLAT exclusion on tile.reshape."""
+    from pypto.ir.auto_layout_solver import solve_auto_layout  # noqa: PLC0415
+    from pypto.pypto_core import passes  # noqa: PLC0415
+
+    set_backend_type(BackendType.Ascend910)
+
+    # 1) Direct fractal=512 tile.reshape must preserve its layout in admissible_layouts without SOLVER-FAIL.
+    span = ir.Span.unknown()
+    tv512 = ir.TileView(blayout=ir.TileLayout.row_major, slayout=ir.TileLayout.none_box, fractal=512)
+    ty512 = ir.TileType([1, 16, 32], DataType.FP16, None, tv512, ir.MemorySpace.Vec)
+    t_in = ir.Var("t_512_in", ty512, span)
+    t_out = ir.Var("t_512_out", ty512, span)
+    reshape_call = ir.create_op_call(
+        "tile.reshape",
+        [
+            t_in,
+            ir.MakeTuple([ir.ConstInt(d, DataType.INDEX, span) for d in (1, 16, 32)], span),
+        ],
+        {},
+        span,
+    )
+    fn_512 = ir.Function(
+        "reshape_512_fn",
+        [t_in],
+        [ty512],
+        ir.SeqStmts([ir.AssignStmt(t_out, reshape_call, span), ir.ReturnStmt([t_out], span)], span),
+        span,
+        type=ir.FunctionType.AIV,
+        level=ir.Level.AIV,
+    )
+    from pypto.ir.auto_layout import TileLayoutDesc  # noqa: PLC0415
+
+    inst_512 = extract_layout_instance(ir.Program([fn_512], "prog_512", span))
+    desc512 = TileLayoutDesc(blayout=ir.TileLayout.row_major, slayout=ir.TileLayout.none_box, fractal=512)
+    assert desc512 in inst_512.values["t_512_in"].admissible_layouts
+    assert desc512 in inst_512.values["t_512_out"].admissible_layouts
+    res_512 = solve_auto_layout(inst_512)
+    assert res_512.writeback_issues == ()
+
+    # 2) [32, 1] tile feeding both multiple row_expand_adds AND tile.reshape excludes ROW_BCAST_FLAT
+    # from tile.reshape so element counts always agree.
+    @pl.jit
+    def row_expand_plus_reshape(
+        x: pl.Tensor[[32, 32], pl.FP32],
+        q0: pl.Tensor[[32, 32], pl.FP32],
+        q1: pl.Tensor[[32, 32], pl.FP32],
+        q2: pl.Tensor[[32, 32], pl.FP32],
+        out0: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+        out1: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+        out2: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+        out_r: pl.Out[pl.Tensor[[1, 32], pl.FP32]],
+    ) -> tuple[
+        pl.Tensor[[32, 32], pl.FP32],
+        pl.Tensor[[32, 32], pl.FP32],
+        pl.Tensor[[32, 32], pl.FP32],
+        pl.Tensor[[1, 32], pl.FP32],
+    ]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="vec_re_reshape"):
+            tx = pl.load(x, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            tq0 = pl.load(q0, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            tq1 = pl.load(q1, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            tq2 = pl.load(q2, [0, 0], [32, 32], target_memory=pl.Mem.Vec)
+            tmp = pl.tile.create([32, 32], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+            rsum = pl.tile.row_sum(tx, tmp)
+            y0 = pl.tile.row_expand_add(tq0, rsum)
+            y1 = pl.tile.row_expand_add(tq1, rsum)
+            y2 = pl.tile.row_expand_add(tq2, rsum)
+            r_row = pl.tile.reshape(rsum, [1, 32])
+            out0 = pl.store(y0, [0, 0], out0)
+            out1 = pl.store(y1, [0, 0], out1)
+            out2 = pl.store(y2, [0, 0], out2)
+            out_r = pl.store(r_row, [0, 0], out_r)
+        return out0, out1, out2, out_r
+
+    stub = torch.zeros((32, 32), dtype=torch.float32)
+    stub1x32 = torch.zeros((1, 32), dtype=torch.float32)
+    prog_re = row_expand_plus_reshape.specialize(stub, stub, stub, stub, stub, stub, stub, stub1x32)
+    with passes.PassContext(
+        [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+    ):
+        pre_re = run_pre_layout_passes(prog_re)
+        inst_re = extract_layout_instance(
+            pre_re, cost_model=LayoutCostModel(backend_type=BackendType.Ascend910)
+        )
+        reshape_ops = [op for op in inst_re.operations if op.op_name == "tile.reshape"]
+        assert len(reshape_ops) == 1
+        assert all(ROW_BCAST_FLAT not in cfg.input_layouts for cfg in reshape_ops[0].configs)
+        res_re = solve_auto_layout(inst_re)
+        assert res_re.writeback_issues == ()
+        rw_re = apply_layout_assignment(pre_re, res_re.writeback_assignment())
+        ir.assert_structural_equal(_run_resolve_layouts_pass(rw_re), rw_re)
+        run_post_layout_passes(rw_re)
 
 
 if __name__ == "__main__":

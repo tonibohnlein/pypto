@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -356,7 +357,7 @@ bool IsWholeTensorFlatten(const CallPtr& call) {
   if (!IsOp(call, "tensor.reshape") || call->args_.size() < 2) {
     return false;
   }
-  auto src_type = As<TensorType>(call->args_[0]->GetType());
+  auto src_type = AsTensorTypeLike(call->args_[0]->GetType());
   if (!src_type) {
     return false;
   }
@@ -380,6 +381,9 @@ bool IsWholeTensorFlatten(const CallPtr& call) {
 }
 
 std::optional<std::vector<int64_t>> IsNzCompatibleTensorType(const TypePtr& type) {
+  if (IsA<DistributedTensorType>(type)) {
+    return std::nullopt;
+  }
   auto tensor_type = As<TensorType>(type);
   if (!tensor_type) {
     return std::nullopt;
@@ -747,7 +751,7 @@ std::unordered_set<std::string> CollectFuncExpandsGmNames(
   std::unordered_set<std::string> names;
   for (size_t idx = 0; idx < func->params_.size(); ++idx) {
     const auto& param = func->params_[idx];
-    if (As<TensorType>(param->GetType())) {
+    if (AsTensorTypeLike(param->GetType())) {
       const auto& ov = idx < param_overrides.size() ? param_overrides[idx] : std::nullopt;
       if (ov.has_value() && !ov->empty()) {
         names.insert(*ov);
@@ -758,7 +762,7 @@ std::unordered_set<std::string> CollectFuncExpandsGmNames(
   }
   auto walk = [&](auto& self, const StmtPtr& stmt) -> void {
     if (auto as = As<AssignStmt>(stmt)) {
-      if (As<TensorType>(as->var_->GetType())) {
+      if (AsTensorTypeLike(as->var_->GetType())) {
         if (auto call = As<Call>(as->value_); call && IsOp(call, "tensor.create")) {
           names.insert(CleanName(as->var_->name_hint_));
         }
@@ -772,11 +776,16 @@ std::unordered_set<std::string> CollectFuncExpandsGmNames(
   return names;
 }
 
-std::unordered_set<std::string> CollectFuncNzIneligible(
+struct FuncGmIneligible {
+  std::unordered_set<std::string> nz;
+  std::unordered_set<std::string> dn;
+};
+
+FuncGmIneligible CollectFuncGmIneligible(
     const FunctionPtr& func, const LayoutCostModel& model,
     const std::vector<std::optional<std::string>>& param_overrides,
     const std::map<std::pair<std::string, size_t>, int64_t>& param_steps) {
-  std::unordered_set<std::string> ineligible;
+  FuncGmIneligible out;
   VarUnionFind uf;
   std::unordered_map<const Var*, std::string> root_names;
   NzFactContext fact_ctx;
@@ -786,10 +795,19 @@ std::unordered_set<std::string> CollectFuncNzIneligible(
     const auto& param = func->params_[idx];
     const auto& ov = idx < param_overrides.size() ? param_overrides[idx] : std::nullopt;
     const std::string name = (ov.has_value() && !ov->empty()) ? *ov : CleanName(param->name_hint_);
-    if (As<TensorType>(param->GetType())) {
+    if (auto tt = AsTensorTypeLike(param->GetType())) {
       root_names[uf.Find(param.get())] = name;
-      if (already_blocked || !IsNzCompatibleTensorType(param->GetType()).has_value()) {
-        ineligible.insert(name);
+      if (IsA<DistributedTensorType>(param->GetType())) {
+        out.nz.insert(name);
+        out.dn.insert(name);
+      } else {
+        if (already_blocked || !IsNzCompatibleTensorType(param->GetType()).has_value()) {
+          out.nz.insert(name);
+        }
+        auto st_shape = StaticShape(tt->shape_);
+        if (!st_shape.has_value() || st_shape->size() != 2) {
+          out.dn.insert(name);
+        }
       }
     } else if (As<ScalarType>(param->GetType())) {
       auto it = param_steps.find({func->name_, idx});
@@ -824,7 +842,7 @@ std::unordered_set<std::string> CollectFuncNzIneligible(
             call && (IsOp(call, "tile.get_block_idx") || IsOp(call, "tile.get_block_num"))) {
           fact_ctx.non_neg_vars.insert(as->var_.get());
         }
-      } else if (As<TensorType>(as->var_->GetType())) {
+      } else if (AsTensorTypeLike(as->var_->GetType())) {
         if (auto rhs_var = AsVarLike(as->value_)) {
           union_vars(as->var_.get(), rhs_var.get());
         } else if (auto call = As<Call>(as->value_)) {
@@ -832,16 +850,52 @@ std::unordered_set<std::string> CollectFuncNzIneligible(
             const std::string b_name = CleanName(as->var_->name_hint_);
             root_names[uf.Find(as->var_.get())] = b_name;
             if (IsOp(call, "tensor.reshape") || !IsNzCompatibleTensorType(as->var_->GetType()).has_value()) {
-              ineligible.insert(b_name);
+              out.nz.insert(b_name);
+            }
+            if (IsOp(call, "tensor.reshape")) {
+              out.dn.insert(b_name);
             }
           } else if (auto alias_idx = ResultAliasedArgIndex(call);
                      alias_idx.has_value() && *alias_idx < call->args_.size()) {
-            if (auto src_v = AsVarLike(call->args_[*alias_idx]); src_v && As<TensorType>(src_v->GetType())) {
-              union_vars(as->var_.get(), src_v.get());
+            if (auto src_v = AsVarLike(call->args_[*alias_idx]);
+                src_v && AsTensorTypeLike(src_v->GetType())) {
+              auto lhs_tt = AsTensorTypeLike(as->var_->GetType());
+              auto src_tt = AsTensorTypeLike(src_v->GetType());
+              if (!IsOp(call, "tensor.transpose") && lhs_tt && src_tt &&
+                  detail::TensorTypeLayout(lhs_tt) == detail::TensorTypeLayout(src_tt)) {
+                union_vars(as->var_.get(), src_v.get());
+              } else {
+                const std::string out_clean = CleanName(as->var_->name_hint_);
+                const std::string src_clean = CleanName(src_v->name_hint_);
+                out.nz.insert(out_clean);
+                out.dn.insert(out_clean);
+                out.nz.insert(src_clean);
+                out.dn.insert(src_clean);
+              }
             }
           } else if ((IsOp(call, "tensor.slice") || IsOp(call, "tensor.view")) && !call->args_.empty()) {
-            if (auto src_v = AsVarLike(call->args_[0]); src_v && As<TensorType>(src_v->GetType())) {
-              union_vars(as->var_.get(), src_v.get());
+            if (auto src_v = AsVarLike(call->args_[0]); src_v && AsTensorTypeLike(src_v->GetType())) {
+              auto lhs_tt = AsTensorTypeLike(as->var_->GetType());
+              auto src_tt = AsTensorTypeLike(src_v->GetType());
+              if (lhs_tt && src_tt && detail::TensorTypeLayout(lhs_tt) == detail::TensorTypeLayout(src_tt)) {
+                union_vars(as->var_.get(), src_v.get());
+              } else {
+                const std::string out_clean = CleanName(as->var_->name_hint_);
+                const std::string src_clean = CleanName(src_v->name_hint_);
+                out.nz.insert(out_clean);
+                out.dn.insert(out_clean);
+                out.nz.insert(src_clean);
+                out.dn.insert(src_clean);
+              }
+            }
+          } else if (IsOp(call, "tensor.transpose") && !call->args_.empty()) {
+            const std::string out_clean = CleanName(as->var_->name_hint_);
+            out.nz.insert(out_clean);
+            out.dn.insert(out_clean);
+            if (auto src_v = AsVarLike(call->args_[0]); src_v && AsTensorTypeLike(src_v->GetType())) {
+              const std::string src_clean = CleanName(src_v->name_hint_);
+              out.nz.insert(src_clean);
+              out.dn.insert(src_clean);
             }
           }
         }
@@ -851,7 +905,7 @@ std::unordered_set<std::string> CollectFuncNzIneligible(
       std::vector<const Var*> targets;
       targets.reserve(fs->iter_args_.size());
       for (const auto& ia : fs->iter_args_) {
-        if (auto init_v = AsVarLike(ia->initValue_); init_v && As<TensorType>(init_v->GetType())) {
+        if (auto init_v = AsVarLike(ia->initValue_); init_v && AsTensorTypeLike(init_v->GetType())) {
           union_vars(ia.get(), init_v.get());
         }
         targets.push_back(ia.get());
@@ -860,7 +914,7 @@ std::unordered_set<std::string> CollectFuncNzIneligible(
       self(self, fs->body_);
       yield_frames.pop_back();
       for (size_t i = 0; i < fs->return_vars_.size() && i < fs->iter_args_.size(); ++i) {
-        if (As<TensorType>(fs->return_vars_[i]->GetType())) {
+        if (AsTensorTypeLike(fs->return_vars_[i]->GetType())) {
           union_vars(fs->return_vars_[i].get(), fs->iter_args_[i].get());
         }
       }
@@ -869,7 +923,7 @@ std::unordered_set<std::string> CollectFuncNzIneligible(
       std::vector<const Var*> targets;
       targets.reserve(ws->iter_args_.size());
       for (const auto& ia : ws->iter_args_) {
-        if (auto init_v = AsVarLike(ia->initValue_); init_v && As<TensorType>(init_v->GetType())) {
+        if (auto init_v = AsVarLike(ia->initValue_); init_v && AsTensorTypeLike(init_v->GetType())) {
           union_vars(ia.get(), init_v.get());
         }
         targets.push_back(ia.get());
@@ -878,7 +932,7 @@ std::unordered_set<std::string> CollectFuncNzIneligible(
       self(self, ws->body_);
       yield_frames.pop_back();
       for (size_t i = 0; i < ws->return_vars_.size() && i < ws->iter_args_.size(); ++i) {
-        if (As<TensorType>(ws->return_vars_[i]->GetType())) {
+        if (AsTensorTypeLike(ws->return_vars_[i]->GetType())) {
           union_vars(ws->return_vars_[i].get(), ws->iter_args_[i].get());
         }
       }
@@ -887,7 +941,7 @@ std::unordered_set<std::string> CollectFuncNzIneligible(
       auto& frame = yield_frames.back();
       if (!frame.loop_targets.empty()) {
         for (size_t i = 0; i < ys->value_.size() && i < frame.loop_targets.size(); ++i) {
-          if (auto yv = AsVarLike(ys->value_[i]); yv && As<TensorType>(yv->GetType())) {
+          if (auto yv = AsVarLike(ys->value_[i]); yv && AsTensorTypeLike(yv->GetType())) {
             union_vars(yv.get(), frame.loop_targets[i]);
           }
         }
@@ -913,7 +967,7 @@ std::unordered_set<std::string> CollectFuncNzIneligible(
             auto tv = AsVarLike(then_y[0][i]);
             auto ev = AsVarLike(else_y[0][i]);
             if (tv && ev && uf.Find(tv.get()) == uf.Find(ev.get()) &&
-                As<TensorType>(ifs->return_vars_[i]->GetType())) {
+                AsTensorTypeLike(ifs->return_vars_[i]->GetType())) {
               union_vars(ifs->return_vars_[i].get(), tv.get());
             }
           }
@@ -946,25 +1000,35 @@ std::unordered_set<std::string> CollectFuncNzIneligible(
     }
     for (size_t i = 0; i < call->args_.size(); ++i) {
       auto arg_v = AsVarLike(call->args_[i]);
-      if (!arg_v || !As<TensorType>(arg_v->GetType())) {
+      if (!arg_v || !AsTensorTypeLike(arg_v->GetType())) {
         continue;
       }
       const std::string t_name = lookup_name(arg_v.get());
-      bool ok = false;
+      bool ok_nz = false;
+      bool ok_dn = false;
       if (IsOp(call, "tensor.create")) {
-        ok = IsNzCompatibleTensorType(call->GetType()).has_value();
+        ok_nz = IsNzCompatibleTensorType(call->GetType()).has_value();
+        ok_dn = true;
       } else if (IsOp(call, "tensor.reshape") && i == 0) {
-        ok = IsWholeTensorFlatten(call);
+        ok_nz = IsWholeTensorFlatten(call);
       } else if (IsOp(call, "tensor.slice") && i == 0) {
-        ok = IsNzCompatibleTensorSliceCall(call, arg_v->GetType());
+        ok_nz = IsNzCompatibleTensorSliceCall(call, arg_v->GetType());
       } else if (IsOp(call, "tile.load") && i == 0) {
-        ok = IsNzCompatibleTileLoadCall(call, arg_v->GetType(), facts);
+        ok_nz = IsNzCompatibleTileLoadCall(call, arg_v->GetType(), facts);
+        const MemorySpace target_mem = GetMemorySpaceKwarg(call->kwargs_, "target_memory", MemorySpace::Vec);
+        ok_dn = (target_mem == MemorySpace::Vec);
       } else if (IsOp(call, "tile.store") && i == 2) {
-        ok = IsNzCompatibleTileStoreCall(call, arg_v->GetType(), facts, model);
+        ok_nz = IsNzCompatibleTileStoreCall(call, arg_v->GetType(), facts, model);
+        auto src_tile = !call->args_.empty() ? As<TileType>(call->args_[0]->GetType()) : nullptr;
+        ok_dn = src_tile && src_tile->GetMemorySpace().value_or(MemorySpace::Vec) == MemorySpace::Vec;
       }
-      if (!ok) {
-        ineligible.insert(t_name);
-        ineligible.insert(CleanName(arg_v->name_hint_));
+      if (!ok_nz) {
+        out.nz.insert(t_name);
+        out.nz.insert(CleanName(arg_v->name_hint_));
+      }
+      if (!ok_dn) {
+        out.dn.insert(t_name);
+        out.dn.insert(CleanName(arg_v->name_hint_));
       }
     }
   };
@@ -984,7 +1048,7 @@ std::unordered_set<std::string> CollectFuncNzIneligible(
     }
   };
   check_stmt(check_stmt, func->body_);
-  return ineligible;
+  return out;
 }
 
 class OrchAnalyzer {
@@ -993,6 +1057,10 @@ class OrchAnalyzer {
       : func_by_name_(func_by_name) {}
 
   void Walk(const FunctionPtr& func) {
+    const bool prev_host = in_host_func_;
+    in_host_func_ = func->level_.has_value() && LevelToLinquLevel(*func->level_) >= 3;
+    host_param_vars_.clear();
+    host_whole_matrix_vars_.clear();
     const auto caller_it = analysis_.call_arg_names.find(func->name_);
     for (size_t idx = 0; idx < func->params_.size(); ++idx) {
       const auto& param = func->params_[idx];
@@ -1002,6 +1070,10 @@ class OrchAnalyzer {
       const std::string name =
           (caller_opt.has_value() && !caller_opt->empty()) ? *caller_opt : CleanName(param->name_hint_);
       SetVarName(param.get(), name);
+      if (in_host_func_ && AsTensorTypeLike(param->GetType())) {
+        host_param_vars_.insert(param.get());
+        host_whole_matrix_vars_.insert(param.get());
+      }
       auto step_it = analysis_.param_steps.find({func->name_, idx});
       if (step_it != analysis_.param_steps.end() && step_it->second > 1) {
         var_steps_[param.get()] = step_it->second;
@@ -1012,6 +1084,7 @@ class OrchAnalyzer {
     mult_ = (cnt_it != analysis_.call_counts.end()) ? cnt_it->second : 1;
     WalkStmt(func->body_);
     mult_ = prev_mult;
+    in_host_func_ = prev_host;
   }
 
   OrchCallAnalysis Result() && { return std::move(analysis_); }
@@ -1120,6 +1193,24 @@ class OrchAnalyzer {
       }
     }
 
+    if (in_host_func_ && callee && (!callee->level_.has_value() || LevelToLinquLevel(*callee->level_) < 3)) {
+      const bool is_device_dispatch = [&]() {
+        if (auto c = As<Call>(expr)) return c->HasAttr(kAttrDevice);
+        if (auto s = As<Submit>(expr)) return s->HasAttr(kAttrDevice);
+        return false;
+      }();
+      for (size_t i = 0; i < args.size() && i < resolved.size(); ++i) {
+        const auto& name_opt = resolved[i];
+        if (!name_opt.has_value()) continue;
+        analysis_.dn_ineligible_names.insert(*name_opt);
+        auto arg_v = AsVarLike(args[i]);
+        const bool whole_host = arg_v && host_whole_matrix_vars_.count(arg_v.get()) != 0;
+        if (!is_device_dispatch || !whole_host) {
+          analysis_.nz_ineligible_names.insert(*name_opt);
+        }
+      }
+    }
+
     auto& sites = analysis_.call_sites[name];
     auto& idx_map = site_index_[name];
     auto [site_it, inserted] = idx_map.emplace(resolved, sites.size());
@@ -1131,10 +1222,62 @@ class OrchAnalyzer {
 
     if (assign_var && callee) {
       std::vector<std::optional<std::string>> out_names;
-      for (size_t i = 0; i < resolved.size() && i < callee->param_directions_.size(); ++i) {
-        const auto dir = callee->param_directions_[i];
-        if (dir == ParamDirection::Out || dir == ParamDirection::InOut) {
-          out_names.push_back(resolved[i]);
+      std::unordered_map<const Var*, size_t> param_idx_map;
+      for (size_t i = 0; i < callee->params_.size(); ++i) {
+        param_idx_map[callee->params_[i].get()] = i;
+      }
+      auto trace_aliases = [&](auto& self, const StmtPtr& stmt) -> void {
+        if (!stmt) return;
+        if (auto as = As<AssignStmt>(stmt)) {
+          if (auto rv = AsVarLike(as->value_)) {
+            if (auto it = param_idx_map.find(rv.get()); it != param_idx_map.end()) {
+              param_idx_map[as->var_.get()] = it->second;
+            }
+          } else if (auto c = As<Call>(as->value_)) {
+            if (auto alias_idx = ResultAliasedArgIndex(c);
+                alias_idx.has_value() && *alias_idx < c->args_.size()) {
+              if (auto av = AsVarLike(c->args_[*alias_idx])) {
+                if (auto it = param_idx_map.find(av.get()); it != param_idx_map.end()) {
+                  param_idx_map[as->var_.get()] = it->second;
+                }
+              }
+            }
+          }
+        }
+        for (const auto& ch : IterChildStmts(stmt)) {
+          self(self, ch);
+        }
+      };
+      trace_aliases(trace_aliases, callee->body_);
+      std::vector<ReturnStmtPtr> ret_stmts;
+      auto find_rets = [&](auto& self, const StmtPtr& stmt) -> void {
+        if (!stmt) return;
+        if (auto rs = As<ReturnStmt>(stmt)) {
+          ret_stmts.push_back(rs);
+          return;
+        }
+        for (const auto& ch : IterChildStmts(stmt)) {
+          self(self, ch);
+        }
+      };
+      find_rets(find_rets, callee->body_);
+      if (!ret_stmts.empty()) {
+        const auto& rs = ret_stmts.back();
+        for (const auto& val : rs->value_) {
+          std::optional<std::string> mapped;
+          if (auto rv = AsVarLike(val)) {
+            if (auto it = param_idx_map.find(rv.get());
+                it != param_idx_map.end() && it->second < resolved.size()) {
+              mapped = resolved[it->second];
+            }
+          }
+          out_names.push_back(std::move(mapped));
+        }
+      } else {
+        for (size_t i = 0; i < resolved.size() && i < callee->param_directions_.size(); ++i) {
+          if (callee->param_directions_[i] == ParamDirection::Out) {
+            out_names.push_back(resolved[i]);
+          }
         }
       }
       tuple_aliases_[assign_var.get()] = out_names;
@@ -1159,30 +1302,51 @@ class OrchAnalyzer {
     }
     for (size_t i = 0; i < call->args_.size(); ++i) {
       auto arg_v = AsVarLike(call->args_[i]);
-      if (!arg_v || !As<TensorType>(arg_v->GetType())) {
+      if (!arg_v || !AsTensorTypeLike(arg_v->GetType())) {
         continue;
       }
       const std::string src_alias = GetVarName(arg_v.get());
-      if (i == 0 && assign_var && As<TensorType>(assign_var->GetType()) && !IsOp(call, "tensor.reshape")) {
+      const bool layout_changing = [&]() {
+        if (IsOp(call, "tensor.transpose")) {
+          return true;
+        }
+        auto lhs_tt = assign_var ? AsTensorTypeLike(assign_var->GetType()) : nullptr;
+        auto src_tt = AsTensorTypeLike(arg_v->GetType());
+        return lhs_tt && src_tt && detail::TensorTypeLayout(lhs_tt) != detail::TensorTypeLayout(src_tt);
+      }();
+      if (i == 0 && assign_var && AsTensorTypeLike(assign_var->GetType()) && !IsOp(call, "tensor.reshape") &&
+          !layout_changing) {
         UnionVars(assign_var.get(), arg_v.get());
       }
       const bool ok_nz =
           (IsOp(call, "tensor.reshape") && i == 0 && IsWholeTensorFlatten(call)) ||
           (IsOp(call, "tensor.slice") && i == 0 && IsNzCompatibleTensorSliceCall(call, arg_v->GetType()));
+      if (in_host_func_ && assign_var && IsOp(call, "tensor.slice") && i == 0 &&
+          host_whole_matrix_vars_.count(arg_v.get()) != 0 &&
+          IsNzCompatibleTensorSliceCall(call, arg_v->GetType())) {
+        host_whole_matrix_vars_.insert(assign_var.get());
+      }
       if (IsOp(call, "tensor.reshape") && assign_var) {
         analysis_.reshaped_names.insert(CleanName(assign_var->name_hint_));
       }
       if (!ok_nz) {
         analysis_.nz_ineligible_names.insert(src_alias);
+        analysis_.dn_ineligible_names.insert(src_alias);
         if (!IsOp(call, "tensor.slice")) {
           analysis_.reshaped_names.insert(src_alias);
         }
         if (assign_var) {
           const std::string out_clean = CleanName(assign_var->name_hint_);
           analysis_.nz_ineligible_names.insert(out_clean);
+          analysis_.dn_ineligible_names.insert(out_clean);
           if (!IsOp(call, "tensor.slice")) {
             analysis_.reshaped_names.insert(out_clean);
           }
+        }
+      } else {
+        analysis_.dn_ineligible_names.insert(src_alias);
+        if (assign_var) {
+          analysis_.dn_ineligible_names.insert(CleanName(assign_var->name_hint_));
         }
       }
     }
@@ -1336,6 +1500,9 @@ class OrchAnalyzer {
   };
   std::vector<OrchYieldFrame> yield_frames_;
   std::unordered_map<std::string, std::map<std::vector<std::optional<std::string>>, size_t>> site_index_;
+  bool in_host_func_ = false;
+  std::unordered_set<const Var*> host_param_vars_;
+  std::unordered_set<const Var*> host_whole_matrix_vars_;
 };
 
 std::vector<LayoutSpec> AdmissibleTileLayouts(const TileTypePtr& tile_type) {
@@ -1359,6 +1526,7 @@ class PostInferInstanceExtractor {
                              const std::optional<std::unordered_set<std::string>>& external_out_names,
                              const std::unordered_set<std::string>& reshaped_names,
                              const std::unordered_set<std::string>& nz_ineligible_names,
+                             const std::unordered_set<std::string>& dn_ineligible_names,
                              const std::unordered_set<std::string>& internal_buffers,
                              LayoutProblemInstance& instance,
                              std::unordered_set<std::string>& consumed_values, size_t& op_counter,
@@ -1371,6 +1539,7 @@ class PostInferInstanceExtractor {
         external_out_names_(external_out_names),
         reshaped_names_(reshaped_names),
         nz_ineligible_names_(nz_ineligible_names),
+        dn_ineligible_names_(dn_ineligible_names),
         internal_buffers_(internal_buffers),
         instance_(instance),
         consumed_values_(consumed_values),
@@ -1384,10 +1553,11 @@ class PostInferInstanceExtractor {
     for (size_t idx = 0; idx < func->params_.size(); ++idx) {
       const auto& param = func->params_[idx];
       const auto direction = func->param_directions_[idx];
-      auto tt = As<TensorType>(param->GetType());
+      auto tt = AsTensorTypeLike(param->GetType());
       if (!tt) {
         continue;
       }
+      const bool is_distributed = IsA<DistributedTensorType>(param->GetType());
       auto [shape, is_static] = TensorShapeWithDynamicFallback(tt->shape_);
       if (shape.empty()) {
         continue;
@@ -1400,14 +1570,15 @@ class PostInferInstanceExtractor {
                                   ? (external_out_names_->count(name) != 0)
                                   : (direction == ParamDirection::Out || direction == ParamDirection::InOut);
       const bool is_reusable = (reusable_.count(name) != 0) || (reusable_.count(param->name_hint_) != 0);
-      const bool allow_relayout = model_.allow_external_input_relayout || is_reusable || is_ext_out ||
-                                  (internal_buffers_.count(name) != 0);
-      const bool allow_nz = is_static && cur_layout == LayoutSpec::ND() && reshaped_names_.count(name) == 0 &&
-                            nz_ineligible_names_.count(name) == 0 && IsNzCompatibleShape(shape, tt->dtype_) &&
-                            allow_relayout;
-      const bool allow_dn = is_static && shape.size() == 2 &&
+      const bool allow_relayout = !is_distributed && (model_.allow_external_input_relayout || is_reusable ||
+                                                      is_ext_out || (internal_buffers_.count(name) != 0));
+      const bool allow_nz = !is_distributed && is_static && cur_layout == LayoutSpec::ND() &&
+                            reshaped_names_.count(name) == 0 && nz_ineligible_names_.count(name) == 0 &&
+                            IsNzCompatibleShape(shape, tt->dtype_) && allow_relayout;
+      const bool allow_dn = !is_distributed && is_static && shape.size() == 2 &&
                             (cur_layout == LayoutSpec::ND() || cur_layout == LayoutSpec::DN()) &&
-                            reshaped_names_.count(name) == 0 && allow_relayout;
+                            reshaped_names_.count(name) == 0 && dn_ineligible_names_.count(name) == 0 &&
+                            allow_relayout;
       std::vector<LayoutSpec> adm_list{cur_layout};
       if (allow_dn && cur_layout != LayoutSpec::DN()) {
         adm_list.push_back(LayoutSpec::DN());
@@ -1493,11 +1664,17 @@ class PostInferInstanceExtractor {
           vec_tmp_vars_.insert(v.get());
         } else {
           vec_non_tmp_vars_.insert(v.get());
+          if (IsOp(call, "tile.reshape")) {
+            vec_non_row_expand_consumer_vars_.insert(v.get());
+          }
         }
       }
     }
     if (lhs && As<TileType>(lhs->GetType()) && !IsOp(call, "tile.create")) {
       vec_non_tmp_vars_.insert(lhs.get());
+    }
+    if (lhs && As<TileType>(lhs->GetType()) && IsOp(call, "tile.create")) {
+      vec_non_row_expand_consumer_vars_.insert(lhs.get());
     }
     if (lhs && RowReductionOps().count(op_name) != 0) {
       vec_row_reduction_vars_.insert(lhs.get());
@@ -1521,11 +1698,13 @@ class PostInferInstanceExtractor {
     vec_non_tmp_vars_.clear();
     vec_cmp_vars_.clear();
     vec_row_expand_add_vars_.clear();
+    vec_non_row_expand_consumer_vars_.clear();
     vec_row_reduction_vars_.clear();
     vec_nz_eligible_vars_.clear();
     nz_fact_ctx_ = NzFactContext{};
 
     std::unordered_map<const Var*, std::string> tensor_vars = var_to_name_;
+    std::vector<std::pair<const Var*, const Var*>> assign_aliases;
     VarUnionFind uf;
     std::unordered_set<const Var*> disqualified;
     std::vector<const Var*> disqualified_order;
@@ -1545,6 +1724,7 @@ class PostInferInstanceExtractor {
         }
       } else if (As<TileType>(param->GetType())) {
         mark_disqualified(param.get());
+        vec_non_row_expand_consumer_vars_.insert(param.get());
       }
     }
 
@@ -1556,7 +1736,7 @@ class PostInferInstanceExtractor {
               call && (IsOp(call, "tile.get_block_idx") || IsOp(call, "tile.get_block_num"))) {
             nz_fact_ctx_.non_neg_vars.insert(as->var_.get());
           }
-        } else if (As<TensorType>(as->var_->GetType())) {
+        } else if (AsTensorTypeLike(as->var_->GetType())) {
           if (auto rv = AsVarLike(as->value_); rv && tensor_vars.count(rv.get()) != 0) {
             tensor_vars[as->var_.get()] = tensor_vars[rv.get()];
           } else if (auto call = As<Call>(as->value_);
@@ -1569,50 +1749,57 @@ class PostInferInstanceExtractor {
       } else if (auto fs = As<ForStmt>(stmt)) {
         nz_fact_ctx_.loop_ranges[fs->loop_var_.get()] = {fs->start_, fs->step_};
         for (const auto& ia : fs->iter_args_) {
-          if (As<TensorType>(ia->GetType())) {
+          if (AsTensorTypeLike(ia->GetType())) {
             if (auto iv = AsVarLike(ia->initValue_); iv && tensor_vars.count(iv.get()) != 0) {
               tensor_vars[ia.get()] = tensor_vars[iv.get()];
             }
           } else if (As<TileType>(ia->GetType())) {
             mark_disqualified(ia.get());
+            vec_non_row_expand_consumer_vars_.insert(ia.get());
             if (auto iv = AsVarLike(ia->initValue_)) {
               mark_disqualified(iv.get());
+              vec_non_row_expand_consumer_vars_.insert(iv.get());
             }
           }
         }
         for (size_t i = 0; i < fs->return_vars_.size() && i < fs->iter_args_.size(); ++i) {
-          if (As<TensorType>(fs->iter_args_[i]->GetType()) &&
+          if (AsTensorTypeLike(fs->iter_args_[i]->GetType()) &&
               tensor_vars.count(fs->iter_args_[i].get()) != 0) {
             tensor_vars[fs->return_vars_[i].get()] = tensor_vars[fs->iter_args_[i].get()];
           } else if (As<TileType>(fs->return_vars_[i]->GetType())) {
             mark_disqualified(fs->return_vars_[i].get());
+            vec_non_row_expand_consumer_vars_.insert(fs->return_vars_[i].get());
           }
         }
       } else if (auto ws = As<WhileStmt>(stmt)) {
         for (const auto& ia : ws->iter_args_) {
-          if (As<TensorType>(ia->GetType())) {
+          if (AsTensorTypeLike(ia->GetType())) {
             if (auto iv = AsVarLike(ia->initValue_); iv && tensor_vars.count(iv.get()) != 0) {
               tensor_vars[ia.get()] = tensor_vars[iv.get()];
             }
           } else if (As<TileType>(ia->GetType())) {
             mark_disqualified(ia.get());
+            vec_non_row_expand_consumer_vars_.insert(ia.get());
             if (auto iv = AsVarLike(ia->initValue_)) {
               mark_disqualified(iv.get());
+              vec_non_row_expand_consumer_vars_.insert(iv.get());
             }
           }
         }
         for (size_t i = 0; i < ws->return_vars_.size() && i < ws->iter_args_.size(); ++i) {
-          if (As<TensorType>(ws->iter_args_[i]->GetType()) &&
+          if (AsTensorTypeLike(ws->iter_args_[i]->GetType()) &&
               tensor_vars.count(ws->iter_args_[i].get()) != 0) {
             tensor_vars[ws->return_vars_[i].get()] = tensor_vars[ws->iter_args_[i].get()];
           } else if (As<TileType>(ws->return_vars_[i]->GetType())) {
             mark_disqualified(ws->return_vars_[i].get());
+            vec_non_row_expand_consumer_vars_.insert(ws->return_vars_[i].get());
           }
         }
       } else if (auto ifs = As<IfStmt>(stmt)) {
         for (const auto& rv : ifs->return_vars_) {
           if (As<TileType>(rv->GetType())) {
             mark_disqualified(rv.get());
+            vec_non_row_expand_consumer_vars_.insert(rv.get());
           }
         }
       }
@@ -1737,6 +1924,7 @@ class PostInferInstanceExtractor {
           visit_call(call, as->var_);
         } else if (auto rv = AsVarLike(as->value_); rv && As<TileType>(as->var_->GetType())) {
           union_nz(as->var_.get(), rv.get());
+          assign_aliases.emplace_back(as->var_.get(), rv.get());
         }
       } else if (auto es = As<EvalStmt>(stmt)) {
         if (auto call = As<Call>(es->expr_)) {
@@ -1746,12 +1934,15 @@ class PostInferInstanceExtractor {
         for (const auto& val : rs->value_) {
           if (auto call = As<Call>(val)) {
             visit_call(call, nullptr);
+          } else if (auto tv = AsVarLike(val); tv && As<TileType>(tv->GetType())) {
+            vec_non_row_expand_consumer_vars_.insert(tv.get());
           }
         }
       } else if (auto ys = As<YieldStmt>(stmt)) {
         for (const auto& val : ys->value_) {
           if (auto tv = AsVarLike(val); tv && As<TileType>(tv->GetType())) {
             mark_disqualified(tv.get());
+            vec_non_row_expand_consumer_vars_.insert(tv.get());
           }
         }
       }
@@ -1760,6 +1951,23 @@ class PostInferInstanceExtractor {
       }
     };
     scan_calls(scan_calls, func->body_);
+
+    // Propagate non-row-expand consumer usage across Var aliases so aliased row vectors
+    // consumed outside `tile.row_expand_add` never receive `ROW_BCAST_FLAT`.
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (const auto& [dst_v, src_v] : assign_aliases) {
+        const bool d_in = vec_non_row_expand_consumer_vars_.count(dst_v) != 0;
+        const bool s_in = vec_non_row_expand_consumer_vars_.count(src_v) != 0;
+        if (d_in && !s_in) {
+          vec_non_row_expand_consumer_vars_.insert(src_v);
+          changed = true;
+        } else if (s_in && !d_in) {
+          vec_non_row_expand_consumer_vars_.insert(dst_v);
+          changed = true;
+        }
+      }
+    }
 
     for (const Var* v : vec_tmp_vars_) {
       if (vec_non_tmp_vars_.count(v) != 0) {
@@ -1806,7 +2014,8 @@ class PostInferInstanceExtractor {
       const bool valid_ok = !tile_type->tile_view_.has_value() ||
                             tile_type->tile_view_->valid_shape.empty() ||
                             StaticShape(tile_type->tile_view_->valid_shape) == shape;
-      if (vec_row_expand_add_vars_.count(var.get()) != 0 && m_dim > 1 && bpe > 0 &&
+      if (vec_row_expand_add_vars_.count(var.get()) != 0 &&
+          vec_non_row_expand_consumer_vars_.count(var.get()) == 0 && m_dim > 1 && bpe > 0 &&
           ((m_dim * bpe) % 32) == 0 && dtype_bcast_ok && valid_ok) {
         candidates.push_back(LayoutSpec::RowBcastFlat());
       }
@@ -1864,6 +2073,9 @@ class PostInferInstanceExtractor {
       }
     } else {
       admissible = AdmissibleTileLayouts(tile_type);
+    }
+    if (std::find(admissible.begin(), admissible.end(), cur_layout) == admissible.end()) {
+      admissible.insert(admissible.begin(), cur_layout);
     }
     ValueNode node;
     node.name = name;
@@ -1946,20 +2158,35 @@ class PostInferInstanceExtractor {
     op_node.inputs = {src_name};
     op_node.output = dst_node->name;
     op_node.invocations = model_.expected_uses * loop_multiplier_;
-    op_node.configs = {
-        OperatorConfig{op_id,
-                       rhs->op_->name_,
-                       {LayoutSpec::FractalNZ()},
-                       LayoutSpec::FractalZN(),
-                       0.0,
-                       "Zero-copy metadata view (NZ -> ZN)"},
-        OperatorConfig{op_id,
-                       rhs->op_->name_,
-                       {LayoutSpec::FractalZN()},
-                       LayoutSpec::FractalNZ(),
-                       0.0,
-                       "Zero-copy metadata view (ZN -> NZ)"},
+    auto has_adm = [](const ValueNode* node, const LayoutSpec& lay) {
+      return std::find(node->admissible_layouts.begin(), node->admissible_layouts.end(), lay) !=
+             node->admissible_layouts.end();
     };
+    const std::pair<LayoutSpec, LayoutSpec> pairs[] = {
+        {LayoutSpec::FractalNZ(), LayoutSpec::FractalZN()},
+        {LayoutSpec::FractalZN(), LayoutSpec::FractalNZ()},
+    };
+    for (const auto& [s_lay, d_lay] : pairs) {
+      if (has_adm(src_node, s_lay) && has_adm(dst_node, d_lay)) {
+        op_node.configs.push_back(OperatorConfig{
+            op_id,
+            rhs->op_->name_,
+            {s_lay},
+            d_lay,
+            0.0,
+            "Zero-copy metadata view (" + s_lay.ShortName() + " -> " + d_lay.ShortName() + ")"});
+      }
+    }
+    if (op_node.configs.empty()) {
+      op_node.configs.push_back(OperatorConfig{op_id,
+                                               rhs->op_->name_,
+                                               {src_node->current_layout},
+                                               dst_node->current_layout,
+                                               0.0,
+                                               "Zero-copy metadata view (" +
+                                                   src_node->current_layout.ShortName() + " -> " +
+                                                   dst_node->current_layout.ShortName() + ")"});
+    }
     instance_.operations.push_back(std::move(op_node));
   }
 
@@ -2025,6 +2252,13 @@ class PostInferInstanceExtractor {
     if (!lhs_node || !rhs_node || !dst_node) return;
 
     const double cost = model_.EstimateMatmulCost(*lhs_node, *rhs_node, *dst_node);
+    const bool lhs_is_fractal = lhs_node->current_layout == LayoutSpec::FractalNZ() ||
+                                lhs_node->current_layout == LayoutSpec::FractalZN();
+    const bool rhs_is_fractal = rhs_node->current_layout == LayoutSpec::FractalNZ() ||
+                                rhs_node->current_layout == LayoutSpec::FractalZN();
+    const LayoutSpec req_lhs = lhs_is_fractal ? LayoutSpec::FractalNZ() : lhs_node->current_layout;
+    const LayoutSpec req_rhs = rhs_is_fractal ? LayoutSpec::FractalZN() : rhs_node->current_layout;
+    const LayoutSpec req_dst = dst_node->current_layout;
     OperationNode op_node;
     op_node.op_id = op_id;
     op_node.op_name = rhs->op_->name_;
@@ -2033,10 +2267,11 @@ class PostInferInstanceExtractor {
     op_node.invocations = model_.expected_uses * loop_multiplier_;
     op_node.configs = {OperatorConfig{op_id,
                                       rhs->op_->name_,
-                                      {LayoutSpec::FractalNZ(), LayoutSpec::FractalZN()},
-                                      LayoutSpec::FractalAccNZ(),
+                                      {req_lhs, req_rhs},
+                                      req_dst,
                                       cost,
-                                      "L0 Cube MAD (Left[NZ] x Right[ZN] -> Acc[NZ1024])"}};
+                                      "L0 Cube MAD (Left[" + req_lhs.ShortName() + "] x Right[" +
+                                          req_rhs.ShortName() + "] -> Acc[" + req_dst.ShortName() + "])"}};
     instance_.operations.push_back(std::move(op_node));
   }
 
@@ -2285,18 +2520,32 @@ class PostInferInstanceExtractor {
     std::vector<OperatorConfig> configs;
     if (op_name == "tile.full") {
       const double cost = static_cast<double>(dst_node->NumElements()) / model_.vec_elements_per_cycle;
-      configs.push_back(
-          OperatorConfig{op_id, op_name, {}, LayoutSpec::RowMajorFlat(), cost, "tile.full (row_major)"});
-      if (std::find(dst_node->admissible_layouts.begin(), dst_node->admissible_layouts.end(),
-                    LayoutSpec::FractalNZ()) != dst_node->admissible_layouts.end()) {
+      auto has_adm = [&](const LayoutSpec& lay) {
+        return std::find(dst_node->admissible_layouts.begin(), dst_node->admissible_layouts.end(), lay) !=
+               dst_node->admissible_layouts.end();
+      };
+      if (has_adm(LayoutSpec::RowMajorFlat())) {
+        configs.push_back(
+            OperatorConfig{op_id, op_name, {}, LayoutSpec::RowMajorFlat(), cost, "tile.full (row_major)"});
+      }
+      if (has_adm(LayoutSpec::FractalNZ())) {
         configs.push_back(
             OperatorConfig{op_id, op_name, {}, LayoutSpec::FractalNZ(), cost, "tile.full (FRACTAL_NZ)"});
       }
+      if (configs.empty()) {
+        configs.push_back(OperatorConfig{op_id,
+                                         op_name,
+                                         {},
+                                         dst_node->current_layout,
+                                         cost,
+                                         "tile.full (" + dst_node->current_layout.ShortName() + ")"});
+      }
     } else if (op_name == "tile.reshape" && tile_inputs.size() == 1) {
       const ValueNode* in_node = std::get<2>(tile_inputs[0]);
-      if (in_node->shape.size() == 2 && dst_node->shape.size() == 2 &&
-          (in_node->shape[0] == 1 || in_node->shape[1] == 1) &&
-          (dst_node->shape[0] == 1 || dst_node->shape[1] == 1)) {
+      auto is_1d_vec = [](const std::vector<int64_t>& shape) {
+        return shape.size() == 1 || (shape.size() == 2 && (shape[0] == 1 || shape[1] == 1));
+      };
+      if (is_1d_vec(in_node->shape) && is_1d_vec(dst_node->shape)) {
         std::vector<LayoutSpec> in_choices, out_choices;
         for (const auto& lay : in_node->admissible_layouts) {
           if (lay != LayoutSpec::RowBcastFlat() && lay != LayoutSpec::FractalNZ()) in_choices.push_back(lay);
@@ -2318,12 +2567,30 @@ class PostInferInstanceExtractor {
           }
         }
       } else {
-        configs.push_back(OperatorConfig{op_id,
-                                         op_name,
-                                         {LayoutSpec::RowMajorFlat()},
-                                         LayoutSpec::RowMajorFlat(),
-                                         0.0,
-                                         "tile.reshape 2D (row_major)"});
+        std::vector<LayoutSpec> common;
+        for (const auto& lay : in_node->admissible_layouts) {
+          if (lay == LayoutSpec::RowBcastFlat()) {
+            continue;
+          }
+          if (std::find(dst_node->admissible_layouts.begin(), dst_node->admissible_layouts.end(), lay) !=
+              dst_node->admissible_layouts.end()) {
+            common.push_back(lay);
+          }
+        }
+        if (!common.empty()) {
+          for (const auto& lay : common) {
+            configs.push_back(
+                OperatorConfig{op_id, op_name, {lay}, lay, 0.0, "tile.reshape (" + lay.ShortName() + ")"});
+          }
+        } else {
+          configs.push_back(OperatorConfig{op_id,
+                                           op_name,
+                                           {in_node->current_layout},
+                                           dst_node->current_layout,
+                                           0.0,
+                                           "tile.reshape (" + in_node->current_layout.ShortName() + " -> " +
+                                               dst_node->current_layout.ShortName() + ")"});
+        }
       }
     } else if (RowReductionOps().count(op_name) != 0) {
       const double cost =
@@ -2435,12 +2702,15 @@ class PostInferInstanceExtractor {
 
     for (size_t idx = 0; idx < op->return_vars_.size(); ++idx) {
       std::optional<std::string> mapped;
-      if (idx < yielded_vars.size() && yielded_vars[idx] != nullptr) {
-        auto it = var_to_name_.find(yielded_vars[idx]);
+      // Loops may return an iter_arg that carries the loop's persistent state/type while a
+      // nested yield aliases a local tile; prefer iter_args_[idx] so return_vars_ stays bound
+      // to the loop-carried value across the loop boundary (Class C fix).
+      if (idx < op->iter_args_.size()) {
+        auto it = var_to_name_.find(op->iter_args_[idx].get());
         if (it != var_to_name_.end()) mapped = it->second;
       }
-      if (!mapped.has_value() && idx < op->iter_args_.size()) {
-        auto it = var_to_name_.find(op->iter_args_[idx].get());
+      if (!mapped.has_value() && idx < yielded_vars.size() && yielded_vars[idx] != nullptr) {
+        auto it = var_to_name_.find(yielded_vars[idx]);
         if (it != var_to_name_.end()) mapped = it->second;
       }
       if (mapped.has_value()) {
@@ -2465,12 +2735,12 @@ class PostInferInstanceExtractor {
 
     for (size_t idx = 0; idx < op->return_vars_.size(); ++idx) {
       std::optional<std::string> mapped;
-      if (idx < yielded_vars.size() && yielded_vars[idx] != nullptr) {
-        auto it = var_to_name_.find(yielded_vars[idx]);
+      if (idx < op->iter_args_.size()) {
+        auto it = var_to_name_.find(op->iter_args_[idx].get());
         if (it != var_to_name_.end()) mapped = it->second;
       }
-      if (!mapped.has_value() && idx < op->iter_args_.size()) {
-        auto it = var_to_name_.find(op->iter_args_[idx].get());
+      if (!mapped.has_value() && idx < yielded_vars.size() && yielded_vars[idx] != nullptr) {
+        auto it = var_to_name_.find(yielded_vars[idx]);
         if (it != var_to_name_.end()) mapped = it->second;
       }
       if (mapped.has_value()) {
@@ -2516,20 +2786,126 @@ class PostInferInstanceExtractor {
       yield_stack_.pop_back();
 
       std::vector<const Var*> else_y;
-      if (ifs->else_body_.has_value() && *ifs->else_body_) {
+      const bool has_else = ifs->else_body_.has_value() && *ifs->else_body_;
+      if (has_else) {
         yield_stack_.emplace_back();
         WalkStmt(*ifs->else_body_);
         else_y = std::move(yield_stack_.back());
         yield_stack_.pop_back();
       }
-      if (!ifs->return_vars_.empty() && !then_y.empty() && !else_y.empty()) {
-        for (size_t i = 0; i < ifs->return_vars_.size(); ++i) {
-          if (i < then_y.size() && i < else_y.size() && then_y[i] != nullptr && else_y[i] != nullptr) {
-            auto it_t = var_to_name_.find(then_y[i]);
-            auto it_e = var_to_name_.find(else_y[i]);
-            if (it_t != var_to_name_.end() && it_e != var_to_name_.end() && it_t->second == it_e->second) {
-              var_to_name_[ifs->return_vars_[i].get()] = it_t->second;
+      for (size_t i = 0; i < ifs->return_vars_.size(); ++i) {
+        const auto& rv = ifs->return_vars_[i];
+        const Var* tv = i < then_y.size() ? then_y[i] : nullptr;
+        const Var* ev = i < else_y.size() ? else_y[i] : nullptr;
+        auto it_t = (tv != nullptr) ? var_to_name_.find(tv) : var_to_name_.end();
+        auto it_e = (ev != nullptr) ? var_to_name_.find(ev) : var_to_name_.end();
+        const bool has_t = it_t != var_to_name_.end();
+        const bool has_e = it_e != var_to_name_.end();
+        if (has_t && has_e && it_t->second == it_e->second) {
+          var_to_name_[rv.get()] = it_t->second;
+          continue;
+        }
+        if (has_t && has_e) {
+          const std::string then_name = it_t->second;
+          const std::string else_name = it_e->second;
+          const ValueNode* then_node_ptr = instance_.FindValue(then_name);
+          const ValueNode* else_node_ptr = instance_.FindValue(else_name);
+          if (then_node_ptr == nullptr || else_node_ptr == nullptr) {
+            continue;
+          }
+          const ValueNode then_node = *then_node_ptr;
+          const ValueNode else_node = *else_node_ptr;
+          const std::string op_id = MakeOpId(rv->name_hint_, "if_join");
+          const ValueNode* r_node_ptr = nullptr;
+          if (As<TileType>(rv->GetType())) {
+            r_node_ptr = RegisterTileVar(rv, op_id, {then_name, else_name});
+          } else if (auto tt = AsTensorTypeLike(rv->GetType())) {
+            auto [shape, is_static] = TensorShapeWithDynamicFallback(tt->shape_);
+            (void)is_static;
+            if (!shape.empty()) {
+              std::string r_name = tile_prefix_ + CleanName(rv->name_hint_);
+              if (r_name.empty()) r_name = "if_join_val";
+              if (instance_.FindValue(r_name) != nullptr) {
+                r_name = r_name + "_" + std::to_string(op_counter_);
+              }
+              var_to_name_[rv.get()] = r_name;
+              consumed_values_.insert(then_name);
+              consumed_values_.insert(else_name);
+              const LayoutSpec cur_lay = tt->tensor_view_.has_value()
+                                             ? LayoutSpec::Tensor(tt->tensor_view_->layout)
+                                             : LayoutSpec::ND();
+              ValueNode r_node;
+              r_node.name = r_name;
+              r_node.shape = std::move(shape);
+              r_node.dtype = tt->dtype_;
+              r_node.memory_space = MemorySpace::DDR;
+              r_node.current_layout = cur_lay;
+              r_node.admissible_layouts = IsA<DistributedTensorType>(rv->GetType())
+                                              ? std::vector<LayoutSpec>{cur_lay}
+                                              : then_node.admissible_layouts;
+              r_node.producer_op_id = op_id;
+              instance_.AddValue(std::move(r_node));
+              r_node_ptr = instance_.FindValue(r_name);
             }
+          }
+          if (r_node_ptr == nullptr) {
+            continue;
+          }
+          ValueNode r_node = *r_node_ptr;
+          std::vector<LayoutSpec> common;
+          for (const auto& lay : then_node.admissible_layouts) {
+            if (lay == LayoutSpec::RowBcastFlat()) continue;
+            const bool in_else =
+                std::find(else_node.admissible_layouts.begin(), else_node.admissible_layouts.end(), lay) !=
+                else_node.admissible_layouts.end();
+            const bool in_r = std::find(r_node.admissible_layouts.begin(), r_node.admissible_layouts.end(),
+                                        lay) != r_node.admissible_layouts.end();
+            if (in_else && in_r) {
+              common.push_back(lay);
+            }
+          }
+          std::vector<OperatorConfig> join_configs;
+          if (!common.empty()) {
+            r_node.admissible_layouts = common;
+            instance_.AddValue(r_node);
+            for (const auto& lay : common) {
+              join_configs.push_back(OperatorConfig{op_id,
+                                                    "control.if_join",
+                                                    {lay, lay},
+                                                    lay,
+                                                    0.0,
+                                                    "Conditional if_join (" + lay.ShortName() + ")"});
+            }
+          } else {
+            ValueNode pinned_t = then_node;
+            pinned_t.admissible_layouts = {then_node.current_layout};
+            instance_.AddValue(std::move(pinned_t));
+            ValueNode pinned_e = else_node;
+            pinned_e.admissible_layouts = {else_node.current_layout};
+            instance_.AddValue(std::move(pinned_e));
+            r_node.admissible_layouts = {r_node.current_layout};
+            instance_.AddValue(r_node);
+            join_configs.push_back(OperatorConfig{op_id,
+                                                  "control.if_join",
+                                                  {then_node.current_layout, else_node.current_layout},
+                                                  r_node.current_layout,
+                                                  0.0,
+                                                  "Conditional if_join (pinned baseline)"});
+          }
+          instance_.operations.push_back(OperationNode{op_id,
+                                                       "control.if_join",
+                                                       {then_name, else_name},
+                                                       r_node.name,
+                                                       model_.expected_uses * loop_multiplier_,
+                                                       std::move(join_configs)});
+        } else if (has_t && !has_else) {
+          var_to_name_[rv.get()] = it_t->second;
+        } else if (has_t != has_e) {
+          const std::string& tracked_name = has_t ? it_t->second : it_e->second;
+          if (const ValueNode* tracked = instance_.FindValue(tracked_name)) {
+            ValueNode pinned = *tracked;
+            pinned.admissible_layouts = {tracked->current_layout};
+            instance_.AddValue(std::move(pinned));
           }
         }
       }
@@ -2546,6 +2922,7 @@ class PostInferInstanceExtractor {
   const std::optional<std::unordered_set<std::string>>& external_out_names_;
   const std::unordered_set<std::string>& reshaped_names_;
   const std::unordered_set<std::string>& nz_ineligible_names_;
+  const std::unordered_set<std::string>& dn_ineligible_names_;
   const std::unordered_set<std::string>& internal_buffers_;
   LayoutProblemInstance& instance_;
   std::unordered_set<std::string>& consumed_values_;
@@ -2562,6 +2939,7 @@ class PostInferInstanceExtractor {
   std::unordered_set<const Var*> vec_non_tmp_vars_;
   std::unordered_set<const Var*> vec_cmp_vars_;
   std::unordered_set<const Var*> vec_row_expand_add_vars_;
+  std::unordered_set<const Var*> vec_non_row_expand_consumer_vars_;
   std::unordered_set<const Var*> vec_row_reduction_vars_;
   std::unordered_set<const Var*> vec_nz_eligible_vars_;
   NzFactContext nz_fact_ctx_;
@@ -2589,6 +2967,7 @@ bool IsGmLayoutSupportedByOps(const std::string& val_name, const LayoutSpec& lay
 
 void PruneUnsupportedGmAndFractalLayouts(LayoutProblemInstance& instance,
                                          const std::unordered_set<std::string>& nz_ineligible_names,
+                                         const std::unordered_set<std::string>& dn_ineligible_names,
                                          const std::unordered_set<std::string>& reshaped_names) {
   std::unordered_map<std::string, std::vector<size_t>> val_to_op_indices;
   val_to_op_indices.reserve(instance.values.size());
@@ -2630,8 +3009,8 @@ void PruneUnsupportedGmAndFractalLayouts(LayoutProblemInstance& instance,
             keep = nz_ineligible_names.count(val_name) == 0 && reshaped_names.count(val_name) == 0 &&
                    IsGmLayoutSupportedByOps(val_name, lay, participating);
           } else if (lay == LayoutSpec::DN()) {
-            keep = reshaped_names.count(val_name) == 0 && !participating.empty() &&
-                   IsGmLayoutSupportedByOps(val_name, lay, participating);
+            keep = dn_ineligible_names.count(val_name) == 0 && reshaped_names.count(val_name) == 0 &&
+                   !participating.empty() && IsGmLayoutSupportedByOps(val_name, lay, participating);
           }
         }
         if (keep) {
@@ -2725,6 +3104,68 @@ void PruneUnsupportedGmAndFractalLayouts(LayoutProblemInstance& instance,
   }
 }
 
+void SanitizeInstanceInvariants(LayoutProblemInstance& instance) {
+  for (const auto& val_name : instance.value_order) {
+    auto& val = instance.values.at(val_name);
+    std::vector<LayoutSpec> dedup;
+    dedup.reserve(val.admissible_layouts.size() + 1);
+    for (const auto& lay : val.admissible_layouts) {
+      if (std::find(dedup.begin(), dedup.end(), lay) == dedup.end()) {
+        dedup.push_back(lay);
+      }
+    }
+    if (std::find(dedup.begin(), dedup.end(), val.current_layout) == dedup.end()) {
+      dedup.insert(dedup.begin(), val.current_layout);
+    }
+    val.admissible_layouts = std::move(dedup);
+  }
+
+  for (auto& op : instance.operations) {
+    const ValueNode* out_node = instance.FindValue(op.output);
+    if (out_node == nullptr) {
+      continue;
+    }
+    std::vector<OperatorConfig> valid_cfgs;
+    valid_cfgs.reserve(op.configs.size());
+    double min_cost = std::numeric_limits<double>::infinity();
+    for (const auto& cfg : op.configs) {
+      min_cost = std::min(min_cost, cfg.op_cost_cycles);
+      if (cfg.input_layouts.size() != op.inputs.size()) {
+        continue;
+      }
+      if (std::find(out_node->admissible_layouts.begin(), out_node->admissible_layouts.end(),
+                    cfg.output_layout) == out_node->admissible_layouts.end()) {
+        continue;
+      }
+      bool all_in = true;
+      for (size_t i = 0; i < op.inputs.size(); ++i) {
+        const ValueNode* in_node = instance.FindValue(op.inputs[i]);
+        if (in_node == nullptr ||
+            std::find(in_node->admissible_layouts.begin(), in_node->admissible_layouts.end(),
+                      cfg.input_layouts[i]) == in_node->admissible_layouts.end()) {
+          all_in = false;
+          break;
+        }
+      }
+      if (all_in) {
+        valid_cfgs.push_back(cfg);
+      }
+    }
+    if (valid_cfgs.empty()) {
+      std::vector<LayoutSpec> baseline_ins;
+      baseline_ins.reserve(op.inputs.size());
+      for (const auto& inp_name : op.inputs) {
+        const ValueNode* in_node = instance.FindValue(inp_name);
+        baseline_ins.push_back(in_node != nullptr ? in_node->current_layout : LayoutSpec::RowMajorFlat());
+      }
+      valid_cfgs.push_back(OperatorConfig{op.op_id, op.op_name, std::move(baseline_ins),
+                                          out_node->current_layout, std::isfinite(min_cost) ? min_cost : 0.0,
+                                          "Sanitized baseline (" + op.op_name + ")"});
+    }
+    op.configs = std::move(valid_cfgs);
+  }
+}
+
 }  // namespace
 
 LayoutSpec EffectiveTileLayout(const TileTypePtr& tile_type) {
@@ -2799,6 +3240,7 @@ LayoutProblemInstance ExtractLayoutInstance(const ProgramPtr& program, const Lay
 
   LayoutProblemInstance instance;
   instance.cost_model = resolved_model;
+  instance.forbid_unmaterializable_gm_conversions = true;
 
   std::vector<FunctionPtr> incore_funcs;
   std::vector<FunctionPtr> non_incore_funcs;
@@ -2845,8 +3287,9 @@ LayoutProblemInstance ExtractLayoutInstance(const ProgramPtr& program, const Lay
     auto sites_it = orch.call_sites.find(func->name_);
     if (sites_it != orch.call_sites.end() && !sites_it->second.empty()) {
       for (const auto& site : sites_it->second) {
-        auto inelig = CollectFuncNzIneligible(func, resolved_model, site.arg_names, orch.param_steps);
-        orch.nz_ineligible_names.insert(inelig.begin(), inelig.end());
+        auto inelig = CollectFuncGmIneligible(func, resolved_model, site.arg_names, orch.param_steps);
+        orch.nz_ineligible_names.insert(inelig.nz.begin(), inelig.nz.end());
+        orch.dn_ineligible_names.insert(inelig.dn.begin(), inelig.dn.end());
         auto exp_gm = CollectFuncExpandsGmNames(func, site.arg_names);
         orch.nz_ineligible_names.insert(exp_gm.begin(), exp_gm.end());
         orch.reshaped_names.insert(exp_gm.begin(), exp_gm.end());
@@ -2855,8 +3298,9 @@ LayoutProblemInstance ExtractLayoutInstance(const ProgramPtr& program, const Lay
       auto arg_it = orch.call_arg_names.find(func->name_);
       std::vector<std::optional<std::string>> overrides =
           arg_it != orch.call_arg_names.end() ? arg_it->second : std::vector<std::optional<std::string>>{};
-      auto inelig = CollectFuncNzIneligible(func, resolved_model, overrides, orch.param_steps);
-      orch.nz_ineligible_names.insert(inelig.begin(), inelig.end());
+      auto inelig = CollectFuncGmIneligible(func, resolved_model, overrides, orch.param_steps);
+      orch.nz_ineligible_names.insert(inelig.nz.begin(), inelig.nz.end());
+      orch.dn_ineligible_names.insert(inelig.dn.begin(), inelig.dn.end());
       auto exp_gm = CollectFuncExpandsGmNames(func, overrides);
       orch.nz_ineligible_names.insert(exp_gm.begin(), exp_gm.end());
       orch.reshaped_names.insert(exp_gm.begin(), exp_gm.end());
@@ -2873,10 +3317,10 @@ LayoutProblemInstance ExtractLayoutInstance(const ProgramPtr& program, const Lay
       for (size_t site_idx = 0; site_idx < sites_it->second.size(); ++site_idx) {
         const auto& site = sites_it->second[site_idx];
         const std::string prefix = func->name_ + "_" + std::to_string(site_idx) + ".";
-        PostInferInstanceExtractor ext(resolved_model, be, reusable_tensors, ext_out_names,
-                                       orch.reshaped_names, orch.nz_ineligible_names, orch.internal_buffers,
-                                       instance, consumed_values, op_counter, prefix, site.multiplicity,
-                                       site.arg_names, orch.param_steps);
+        PostInferInstanceExtractor ext(
+            resolved_model, be, reusable_tensors, ext_out_names, orch.reshaped_names,
+            orch.nz_ineligible_names, orch.dn_ineligible_names, orch.internal_buffers, instance,
+            consumed_values, op_counter, prefix, site.multiplicity, site.arg_names, orch.param_steps);
         ext.Extract(func);
       }
       continue;
@@ -2889,12 +3333,15 @@ LayoutProblemInstance ExtractLayoutInstance(const ProgramPtr& program, const Lay
     std::vector<std::optional<std::string>> overrides =
         arg_it != orch.call_arg_names.end() ? arg_it->second : std::vector<std::optional<std::string>>{};
     PostInferInstanceExtractor ext(resolved_model, be, reusable_tensors, ext_out_names, orch.reshaped_names,
-                                   orch.nz_ineligible_names, orch.internal_buffers, instance, consumed_values,
-                                   op_counter, prefix, call_mult, std::move(overrides), orch.param_steps);
+                                   orch.nz_ineligible_names, orch.dn_ineligible_names, orch.internal_buffers,
+                                   instance, consumed_values, op_counter, prefix, call_mult,
+                                   std::move(overrides), orch.param_steps);
     ext.Extract(func);
   }
 
-  PruneUnsupportedGmAndFractalLayouts(instance, orch.nz_ineligible_names, orch.reshaped_names);
+  PruneUnsupportedGmAndFractalLayouts(instance, orch.nz_ineligible_names, orch.dn_ineligible_names,
+                                      orch.reshaped_names);
+  SanitizeInstanceInvariants(instance);
   return instance;
 }
 

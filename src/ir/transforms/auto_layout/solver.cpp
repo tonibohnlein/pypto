@@ -276,12 +276,15 @@ std::vector<OpId> TopologicalSeed(const IndexedProblem& problem, const LayoutSol
   std::vector<uint64_t> requested(num_vals, 0);
   for (ValueId v = 0; v < num_vals; ++v) {
     produced[v] = problem.Values()[v].default_source_idx;
+    requested[v] = problem.Values()[v].boundary_demand_mask;
   }
 
   for (OpId op_idx : problem.TopoOrder()) {
     const auto& op = problem.Ops()[op_idx];
     uint16_t best_choice = 0;
     double best_cost = std::numeric_limits<double>::infinity();
+    const auto& out_info = problem.Values()[op.output_value];
+    const size_t out_num_layouts = out_info.layouts.size();
     for (uint16_t q = 0; q < static_cast<uint16_t>(op.costs.size()); ++q) {
       if (evaluated_moves + 1 > config.max_evaluations) {
         termination_reason = "evaluation_budget";
@@ -290,11 +293,26 @@ std::vector<OpId> TopologicalSeed(const IndexedProblem& problem, const LayoutSol
       }
       ++evaluated_moves;
       double cost = op.costs[q];
+      const uint16_t out_lay = op.output_layout_indices[q];
+      uint64_t out_mask = requested[op.output_value];
+      while (out_mask != 0) {
+        const int dst_idx = __builtin_ctzll(out_mask);
+        if (static_cast<uint16_t>(dst_idx) != out_lay) {
+          cost +=
+              out_info
+                  .conv_costs[static_cast<size_t>(out_lay) * out_num_layouts + static_cast<size_t>(dst_idx)];
+        }
+        out_mask &= out_mask - 1;
+      }
       for (const auto& use : op.config_uses[q]) {
         const ValueId v = use.value_id;
         const auto& v_info = problem.Values()[v];
         const size_t num_layouts = v_info.layouts.size();
-        const uint16_t src_idx = produced[v];
+        const uint16_t src_idx = (v == op.output_value) ? out_lay : produced[v];
+        if (v_info.forbid_multi_rep && __builtin_popcountll(requested[v]) <= 1 &&
+            __builtin_popcountll(requested[v] | use.demand_mask) > 1) {
+          cost += problem.Instance().cost_model.vec_unsupported_conversion_cycles;
+        }
         uint64_t new_bits = use.demand_mask & ~requested[v];
         while (new_bits != 0) {
           const int dst_idx = __builtin_ctzll(new_bits);
@@ -366,15 +384,20 @@ std::pair<std::vector<LayoutConversion>, std::vector<std::string>> BuildConversi
       conversions.push_back(
           LayoutConversion{v_info.name, src_spec, dst_spec, conv_cost, consumer_op_ids, boundary});
       if (!boundary) {
-        const bool producer_ok =
-            !v_info.producer_op.has_value() || StartsWithTile(problem.Ops()[*v_info.producer_op].op_name);
+        const std::string& prod_op_name =
+            v_info.producer_op.has_value() ? problem.Ops()[*v_info.producer_op].op_name : std::string();
+        const bool producer_ok = !v_info.producer_op.has_value() || StartsWithTile(prod_op_name) ||
+                                 prod_op_name == "control.if_join";
         const bool consumers_ok =
-            std::all_of(consumer_indices.begin(), consumer_indices.end(),
-                        [&](OpId idx) { return StartsWithTile(problem.Ops()[idx].op_name); });
+            std::all_of(consumer_indices.begin(), consumer_indices.end(), [&](OpId idx) {
+              const std::string& cname = problem.Ops()[idx].op_name;
+              return StartsWithTile(cname) || cname == "control.if_join";
+            });
+        const bool compat_invs = (v_info.incompatible_target_mask & (uint64_t{1} << dst_idx)) == 0;
         const bool realizable_vec =
             node->memory_space == MemorySpace::Vec &&
             instance.cost_model.SupportsVecTileConversion(*node, src_spec, dst_spec) && producer_ok &&
-            consumers_ok;
+            consumers_ok && compat_invs;
         if (!realizable_vec) {
           issues.push_back("Value '" + v_info.name + "' needs an internal conversion " +
                            src_spec.ShortName() + " -> " + dst_spec.ShortName());
@@ -579,62 +602,7 @@ ActiveDecomposition ComputeActiveDecomposition(const IndexedProblem& problem) {
     out.components.push_back(std::move(comp));
   }
 
-  if (num_ops <= 64) {
-    out.tw_stats = ComputeProblemTreewidthInternal(problem);
-    return out;
-  }
-
-  int64_t active_tw = 0;
-  int64_t max_bag_size = 0;
-  int64_t max_prod = num_ops > 0 ? 1 : 0;
-  int64_t total_states = 0;
-  bool any_bag = false;
-  for (const auto& dec : out.component_decomps) {
-    active_tw = std::max(active_tw, dec.treewidth);
-    for (const auto& bag : dec.bags) {
-      if (!any_bag) {
-        max_prod = 0;
-        any_bag = true;
-      }
-      max_bag_size = std::max(max_bag_size, static_cast<int64_t>(bag.size()));
-      int64_t prod = 1;
-      for (OpId u : bag) {
-        const int64_t dom = static_cast<int64_t>(problem.Ops()[u].costs.size());
-        if (prod > std::numeric_limits<int64_t>::max() / std::max<int64_t>(1, dom)) {
-          prod = std::numeric_limits<int64_t>::max();
-          break;
-        }
-        prod *= dom;
-      }
-      max_prod = std::max(max_prod, prod);
-      if (total_states > std::numeric_limits<int64_t>::max() - prod) {
-        total_states = std::numeric_limits<int64_t>::max();
-      } else {
-        total_states += prod;
-      }
-      out.tw_stats.bags.emplace_back();
-      for (OpId u : bag) {
-        out.tw_stats.bags.back().push_back(problem.Ops()[u].op_id);
-      }
-    }
-    for (OpId u : dec.elim_order) {
-      out.tw_stats.elimination_order.push_back(problem.Ops()[u].op_id);
-    }
-  }
-  if (!any_bag) {
-    total_states = num_ops > 0 ? 1 : 0;
-  }
-
-  out.tw_stats.num_values = static_cast<int64_t>(problem.NumValues());
-  out.tw_stats.num_operations = static_cast<int64_t>(num_ops);
-  out.tw_stats.num_movable_operations = static_cast<int64_t>(movable.size());
-  out.tw_stats.dataflow_treewidth = active_tw;
-  out.tw_stats.primal_treewidth = active_tw;
-  out.tw_stats.active_primal_treewidth = active_tw;
-  out.tw_stats.max_bag_size = max_bag_size;
-  out.tw_stats.max_active_bag_size = max_bag_size;
-  out.tw_stats.max_bag_domain_product = max_prod;
-  out.tw_stats.total_dp_states = total_states;
+  out.tw_stats = ComputeProblemTreewidthInternal(problem);
   return out;
 }
 
@@ -659,265 +627,302 @@ struct ChildMessageDesc {
   std::vector<size_t> sep_strides;  ///< Aligned with parent bag's separator positions.
 };
 
-bool RunTreewidthDPOnComponents(const IndexedProblem& problem, const ActiveDecomposition& decomp,
-                                const LayoutSolverConfig& config, int64_t& evaluated_moves,
-                                std::vector<uint16_t>& out_choices) {
+struct DPContext {
+  std::vector<bool> is_movable;
+  std::vector<uint64_t> base_demand;
+  std::vector<uint16_t> base_source;
+  std::vector<int> comp_of_op;
+  std::vector<size_t> step_of_op;
+  std::vector<std::vector<std::pair<ValueId, size_t>>> comp_factors;
+};
+
+DPContext BuildDPContext(const IndexedProblem& problem, const ActiveDecomposition& decomp) {
   const size_t num_ops = problem.NumOps();
   const size_t num_vals = problem.NumValues();
-  out_choices.assign(num_ops, 0);
-
-  std::vector<bool> is_movable(num_ops, false);
+  const size_t num_comps = decomp.component_decomps.size();
+  DPContext ctx;
+  ctx.is_movable.assign(num_ops, false);
   for (OpId u = 0; u < num_ops; ++u) {
     if (problem.Ops()[u].costs.size() > 1) {
-      is_movable[u] = true;
+      ctx.is_movable[u] = true;
     }
   }
 
-  // Precompute base demand masks and fixed source layouts per value from boundary + fixed ops.
-  std::vector<uint64_t> base_demand(num_vals, 0);
-  std::vector<uint16_t> base_source(num_vals, 0);
+  ctx.base_demand.assign(num_vals, 0);
+  ctx.base_source.assign(num_vals, 0);
   for (ValueId v = 0; v < num_vals; ++v) {
-    base_demand[v] = problem.Values()[v].boundary_demand_mask;
-    base_source[v] = problem.Values()[v].default_source_idx;
+    ctx.base_demand[v] = problem.Values()[v].boundary_demand_mask;
+    ctx.base_source[v] = problem.Values()[v].default_source_idx;
   }
   for (OpId u = 0; u < num_ops; ++u) {
-    if (is_movable[u]) {
+    if (ctx.is_movable[u]) {
       continue;
     }
     const auto& op = problem.Ops()[u];
-    base_source[op.output_value] = op.output_layout_indices[0];
+    ctx.base_source[op.output_value] = op.output_layout_indices[0];
     for (const auto& use : op.config_uses[0]) {
-      base_demand[use.value_id] |= use.demand_mask;
+      ctx.base_demand[use.value_id] |= use.demand_mask;
     }
   }
 
-  // Map each movable op to its component and step within that component.
-  std::vector<int> comp_of_op(num_ops, -1);
-  std::vector<size_t> step_of_op(num_ops, 0);
-  for (size_t c = 0; c < decomp.component_decomps.size(); ++c) {
+  ctx.comp_of_op.assign(num_ops, -1);
+  ctx.step_of_op.assign(num_ops, 0);
+  for (size_t c = 0; c < num_comps; ++c) {
     const auto& dec = decomp.component_decomps[c];
     for (size_t s = 0; s < dec.elim_order.size(); ++s) {
-      comp_of_op[dec.elim_order[s]] = static_cast<int>(c);
-      step_of_op[dec.elim_order[s]] = s;
+      ctx.comp_of_op[dec.elim_order[s]] = static_cast<int>(c);
+      ctx.step_of_op[dec.elim_order[s]] = s;
     }
   }
 
-  for (size_t comp_idx = 0; comp_idx < decomp.component_decomps.size(); ++comp_idx) {
-    const auto& dec = decomp.component_decomps[comp_idx];
-    const size_t num_bags = dec.bags.size();
-    if (num_bags == 0) {
-      continue;
+  // O(V + E) linear-time factor placement across all connected components.
+  ctx.comp_factors.resize(num_comps);
+  std::vector<size_t> comp_min_step(num_comps, std::numeric_limits<size_t>::max());
+  std::vector<size_t> touched_comps;
+  for (ValueId v = 0; v < num_vals; ++v) {
+    touched_comps.clear();
+    for (OpId p : problem.Values()[v].participants) {
+      const int c = ctx.comp_of_op[p];
+      if (c >= 0) {
+        const size_t cu = static_cast<size_t>(c);
+        if (comp_min_step[cu] == std::numeric_limits<size_t>::max()) {
+          touched_comps.push_back(cu);
+        }
+        comp_min_step[cu] = std::min(comp_min_step[cu], ctx.step_of_op[p]);
+      }
+    }
+    for (size_t cu : touched_comps) {
+      ctx.comp_factors[cu].emplace_back(v, comp_min_step[cu]);
+      comp_min_step[cu] = std::numeric_limits<size_t>::max();
+    }
+  }
+  return ctx;
+}
+
+bool RunTreewidthDPOnSingleComponent(const IndexedProblem& problem, const ActiveDecomposition& decomp,
+                                     const DPContext& ctx, size_t comp_idx, const LayoutSolverConfig& config,
+                                     int64_t& evaluated_moves, std::vector<uint16_t>& out_choices) {
+  const auto& dec = decomp.component_decomps[comp_idx];
+  const size_t num_bags = dec.bags.size();
+  if (num_bags == 0) {
+    return true;
+  }
+
+  std::vector<std::vector<ValueId>> factors_at_bag(num_bags);
+  for (const auto& [v, first_step] : ctx.comp_factors[comp_idx]) {
+    factors_at_bag[first_step].push_back(v);
+  }
+
+  std::vector<std::vector<size_t>> children_of(num_bags);
+  for (size_t s = 0; s < num_bags; ++s) {
+    if (dec.parents[s].has_value()) {
+      children_of[*dec.parents[s]].push_back(s);
+    }
+  }
+
+  // Precompute mixed-radix separator sizes and strides for each bag.
+  std::vector<size_t> sep_sizes(num_bags, 1);
+  std::vector<std::vector<size_t>> sep_strides(num_bags);
+  for (size_t s = 0; s < num_bags; ++s) {
+    const size_t sep_len = dec.bags[s].size() - 1;
+    sep_strides[s].assign(sep_len, 1);
+    size_t stride = 1;
+    for (int j = static_cast<int>(sep_len) - 1; j >= 0; --j) {
+      sep_strides[s][static_cast<size_t>(j)] = stride;
+      const OpId u = dec.bags[s][static_cast<size_t>(j) + 1];
+      stride *= problem.Ops()[u].costs.size();
+    }
+    sep_sizes[s] = stride;
+  }
+
+  std::vector<std::vector<double>> messages(num_bags);
+  std::vector<std::vector<uint16_t>> backpointers(num_bags);
+
+  std::unordered_map<OpId, size_t> bag_pos;
+  std::vector<uint16_t> sep_q;
+  std::vector<uint16_t> bag_q;
+
+  for (size_t s = 0; s < num_bags; ++s) {
+    const auto& bag = dec.bags[s];
+    const OpId elim_u = bag[0];
+    const size_t sep_len = bag.size() - 1;
+    const size_t sep_size = sep_sizes[s];
+    const size_t elim_dom = problem.Ops()[elim_u].costs.size();
+
+    bag_pos.clear();
+    for (size_t idx = 0; idx < bag.size(); ++idx) {
+      bag_pos[bag[idx]] = idx;
     }
 
-    // Assign each value with movable participants in this component to its earliest elimination bag.
-    std::vector<std::vector<ValueId>> factors_at_bag(num_bags);
-    for (ValueId v = 0; v < num_vals; ++v) {
-      size_t first_step = num_bags;
-      bool belongs = false;
-      for (OpId p : problem.Values()[v].participants) {
-        if (comp_of_op[p] == static_cast<int>(comp_idx)) {
-          belongs = true;
-          first_step = std::min(first_step, step_of_op[p]);
+    std::vector<ChildMessageDesc> child_descs;
+    child_descs.reserve(children_of[s].size());
+    for (size_t c : children_of[s]) {
+      ChildMessageDesc cd;
+      cd.child_step = c;
+      cd.sep_strides.assign(sep_len, 0);
+      const auto& c_bag = dec.bags[c];
+      for (size_t cj = 1; cj < c_bag.size(); ++cj) {
+        const OpId cw = c_bag[cj];
+        const size_t p_pos = bag_pos[cw];
+        const size_t c_stride = sep_strides[c][cj - 1];
+        if (p_pos == 0) {
+          cd.elim_stride = c_stride;
+        } else {
+          cd.sep_strides[p_pos - 1] = c_stride;
         }
       }
-      if (belongs) {
-        factors_at_bag[first_step].push_back(v);
-      }
+      child_descs.push_back(std::move(cd));
     }
 
-    std::vector<std::vector<size_t>> children_of(num_bags);
-    for (size_t s = 0; s < num_bags; ++s) {
-      if (dec.parents[s].has_value()) {
-        children_of[*dec.parents[s]].push_back(s);
+    std::vector<BagFactorDesc> factor_descs;
+    factor_descs.reserve(factors_at_bag[s].size());
+    for (ValueId v : factors_at_bag[s]) {
+      const auto& v_info = problem.Values()[v];
+      BagFactorDesc fd;
+      fd.value_id = v;
+      fd.base_demand_mask = ctx.base_demand[v];
+      fd.fixed_source_idx = ctx.base_source[v];
+      if (v_info.producer_op.has_value() && ctx.is_movable[*v_info.producer_op]) {
+        fd.prod_bag_pos = static_cast<int>(bag_pos[*v_info.producer_op]);
       }
-    }
-
-    // Precompute mixed-radix separator sizes and strides for each bag.
-    std::vector<size_t> sep_sizes(num_bags, 1);
-    std::vector<std::vector<size_t>> sep_strides(num_bags);
-    for (size_t s = 0; s < num_bags; ++s) {
-      const size_t sep_len = dec.bags[s].size() - 1;
-      sep_strides[s].assign(sep_len, 1);
-      size_t stride = 1;
-      for (int j = static_cast<int>(sep_len) - 1; j >= 0; --j) {
-        sep_strides[s][static_cast<size_t>(j)] = stride;
-        const OpId u = dec.bags[s][static_cast<size_t>(j) + 1];
-        stride *= problem.Ops()[u].costs.size();
-      }
-      sep_sizes[s] = stride;
-    }
-
-    std::vector<std::vector<double>> messages(num_bags);
-    std::vector<std::vector<uint16_t>> backpointers(num_bags);
-
-    std::unordered_map<OpId, size_t> bag_pos;
-    std::vector<uint16_t> sep_q;
-    std::vector<uint16_t> bag_q;
-
-    for (size_t s = 0; s < num_bags; ++s) {
-      const auto& bag = dec.bags[s];
-      const OpId elim_u = bag[0];
-      const size_t sep_len = bag.size() - 1;
-      const size_t sep_size = sep_sizes[s];
-      const size_t elim_dom = problem.Ops()[elim_u].costs.size();
-
-      bag_pos.clear();
-      for (size_t idx = 0; idx < bag.size(); ++idx) {
-        bag_pos[bag[idx]] = idx;
-      }
-
-      std::vector<ChildMessageDesc> child_descs;
-      child_descs.reserve(children_of[s].size());
-      for (size_t c : children_of[s]) {
-        ChildMessageDesc cd;
-        cd.child_step = c;
-        cd.sep_strides.assign(sep_len, 0);
-        const auto& c_bag = dec.bags[c];
-        for (size_t cj = 1; cj < c_bag.size(); ++cj) {
-          const OpId cw = c_bag[cj];
-          const size_t p_pos = bag_pos[cw];
-          const size_t c_stride = sep_strides[c][cj - 1];
-          if (p_pos == 0) {
-            cd.elim_stride = c_stride;
-          } else {
-            cd.sep_strides[p_pos - 1] = c_stride;
-          }
+      for (OpId p : v_info.participants) {
+        if (!ctx.is_movable[p]) {
+          continue;
         }
-        child_descs.push_back(std::move(cd));
-      }
-
-      std::vector<BagFactorDesc> factor_descs;
-      factor_descs.reserve(factors_at_bag[s].size());
-      for (ValueId v : factors_at_bag[s]) {
-        const auto& v_info = problem.Values()[v];
-        BagFactorDesc fd;
-        fd.value_id = v;
-        fd.base_demand_mask = base_demand[v];
-        fd.fixed_source_idx = base_source[v];
-        if (v_info.producer_op.has_value() && is_movable[*v_info.producer_op]) {
-          fd.prod_bag_pos = static_cast<int>(bag_pos[*v_info.producer_op]);
-        }
-        for (OpId p : v_info.participants) {
-          if (!is_movable[p]) {
-            continue;
-          }
-          BagFactorDesc::ConsumerEntry ce;
-          ce.bag_pos = bag_pos[p];
-          ce.op_id = p;
-          const size_t p_dom = problem.Ops()[p].costs.size();
-          ce.demand_by_choice.assign(p_dom, 0);
-          bool has_any_demand = false;
-          for (uint16_t q = 0; q < static_cast<uint16_t>(p_dom); ++q) {
-            for (const auto& use : problem.Ops()[p].config_uses[q]) {
-              if (use.value_id == v) {
-                ce.demand_by_choice[q] = use.demand_mask;
-                if (use.demand_mask != 0) {
-                  has_any_demand = true;
-                }
-                break;
+        BagFactorDesc::ConsumerEntry ce;
+        ce.bag_pos = bag_pos[p];
+        ce.op_id = p;
+        const size_t p_dom = problem.Ops()[p].costs.size();
+        ce.demand_by_choice.assign(p_dom, 0);
+        bool has_any_demand = false;
+        for (uint16_t q = 0; q < static_cast<uint16_t>(p_dom); ++q) {
+          for (const auto& use : problem.Ops()[p].config_uses[q]) {
+            if (use.value_id == v) {
+              ce.demand_by_choice[q] = use.demand_mask;
+              if (use.demand_mask != 0) {
+                has_any_demand = true;
               }
+              break;
             }
-          }
-          if (has_any_demand) {
-            fd.consumers.push_back(std::move(ce));
           }
         }
-        factor_descs.push_back(std::move(fd));
-      }
-
-      messages[s].assign(sep_size, std::numeric_limits<double>::infinity());
-      backpointers[s].assign(sep_size, 0);
-      sep_q.assign(sep_len, 0);
-      bag_q.assign(bag.size(), 0);
-
-      const auto& elim_costs = problem.Ops()[elim_u].costs;
-      for (size_t sep_idx = 0; sep_idx < sep_size; ++sep_idx) {
-        for (size_t j = 0; j < sep_len; ++j) {
-          bag_q[j + 1] = sep_q[j];
-        }
-        double best_val = std::numeric_limits<double>::infinity();
-        uint16_t best_q = 0;
-        for (uint16_t q_elim = 0; q_elim < static_cast<uint16_t>(elim_dom); ++q_elim) {
-          if (evaluated_moves + 1 > config.max_evaluations) {
-            return false;
-          }
-          ++evaluated_moves;
-          bag_q[0] = q_elim;
-          double val = elim_costs[q_elim];
-
-          for (const auto& fd : factor_descs) {
-            const auto& v_info = problem.Values()[fd.value_id];
-            const size_t num_layouts = v_info.layouts.size();
-            uint16_t src_idx = fd.fixed_source_idx;
-            if (fd.prod_bag_pos >= 0) {
-              const OpId prod_op = bag[static_cast<size_t>(fd.prod_bag_pos)];
-              const uint16_t prod_q = bag_q[static_cast<size_t>(fd.prod_bag_pos)];
-              src_idx = problem.Ops()[prod_op].output_layout_indices[prod_q];
-            }
-            uint64_t mask = fd.base_demand_mask;
-            for (const auto& ce : fd.consumers) {
-              mask |= ce.demand_by_choice[bag_q[ce.bag_pos]];
-            }
-            const double* row = v_info.conv_costs.data() + static_cast<size_t>(src_idx) * num_layouts;
-            while (mask != 0) {
-              const int dst = __builtin_ctzll(mask);
-              val += row[dst];
-              mask &= mask - 1;
-            }
-          }
-
-          for (const auto& cd : child_descs) {
-            size_t c_idx = static_cast<size_t>(q_elim) * cd.elim_stride;
-            for (size_t j = 0; j < sep_len; ++j) {
-              c_idx += static_cast<size_t>(sep_q[j]) * cd.sep_strides[j];
-            }
-            val += messages[cd.child_step][c_idx];
-          }
-
-          if (val < best_val - config.tolerance) {
-            best_val = val;
-            best_q = q_elim;
-          }
-        }
-        messages[s][sep_idx] = best_val;
-        backpointers[s][sep_idx] = best_q;
-
-        // Advance mixed-radix odometer for sep_q.
-        for (int j = static_cast<int>(sep_len) - 1; j >= 0; --j) {
-          const size_t jj = static_cast<size_t>(j);
-          const OpId sep_op = bag[jj + 1];
-          const uint16_t dom = static_cast<uint16_t>(problem.Ops()[sep_op].costs.size());
-          if (++sep_q[jj] < dom) {
-            break;
-          }
-          sep_q[jj] = 0;
+        if (has_any_demand) {
+          fd.consumers.push_back(std::move(ce));
         }
       }
+      factor_descs.push_back(std::move(fd));
     }
 
-    // Backtrack optimal choices in reverse elimination order.
-    for (int s = static_cast<int>(num_bags) - 1; s >= 0; --s) {
-      const size_t ss = static_cast<size_t>(s);
-      const auto& bag = dec.bags[ss];
-      const OpId elim_u = bag[0];
-      size_t sep_idx = 0;
-      for (size_t j = 1; j < bag.size(); ++j) {
-        sep_idx += static_cast<size_t>(out_choices[bag[j]]) * sep_strides[ss][j - 1];
+    messages[s].assign(sep_size, std::numeric_limits<double>::infinity());
+    backpointers[s].assign(sep_size, 0);
+    sep_q.assign(sep_len, 0);
+    bag_q.assign(bag.size(), 0);
+
+    const auto& elim_costs = problem.Ops()[elim_u].costs;
+    for (size_t sep_idx = 0; sep_idx < sep_size; ++sep_idx) {
+      for (size_t j = 0; j < sep_len; ++j) {
+        bag_q[j + 1] = sep_q[j];
       }
-      out_choices[elim_u] = backpointers[ss][sep_idx];
+      double best_val = std::numeric_limits<double>::infinity();
+      uint16_t best_q = 0;
+      for (uint16_t q_elim = 0; q_elim < static_cast<uint16_t>(elim_dom); ++q_elim) {
+        if (evaluated_moves + 1 > config.max_evaluations) {
+          return false;
+        }
+        ++evaluated_moves;
+        bag_q[0] = q_elim;
+        double val = elim_costs[q_elim];
+
+        for (const auto& fd : factor_descs) {
+          const auto& v_info = problem.Values()[fd.value_id];
+          const size_t num_layouts = v_info.layouts.size();
+          uint16_t src_idx = fd.fixed_source_idx;
+          if (fd.prod_bag_pos >= 0) {
+            const OpId prod_op = bag[static_cast<size_t>(fd.prod_bag_pos)];
+            const uint16_t prod_q = bag_q[static_cast<size_t>(fd.prod_bag_pos)];
+            src_idx = problem.Ops()[prod_op].output_layout_indices[prod_q];
+          }
+          uint64_t mask = fd.base_demand_mask;
+          for (const auto& ce : fd.consumers) {
+            mask |= ce.demand_by_choice[bag_q[ce.bag_pos]];
+          }
+          if (v_info.forbid_multi_rep && __builtin_popcountll(mask) > 1) {
+            val += problem.Instance().cost_model.vec_unsupported_conversion_cycles;
+          }
+          const double* row = v_info.conv_costs.data() + static_cast<size_t>(src_idx) * num_layouts;
+          while (mask != 0) {
+            const int dst = __builtin_ctzll(mask);
+            val += row[dst];
+            mask &= mask - 1;
+          }
+        }
+
+        for (const auto& cd : child_descs) {
+          size_t c_idx = static_cast<size_t>(q_elim) * cd.elim_stride;
+          for (size_t j = 0; j < sep_len; ++j) {
+            c_idx += static_cast<size_t>(sep_q[j]) * cd.sep_strides[j];
+          }
+          val += messages[cd.child_step][c_idx];
+        }
+
+        if (val < best_val - config.tolerance) {
+          best_val = val;
+          best_q = q_elim;
+        }
+      }
+      messages[s][sep_idx] = best_val;
+      backpointers[s][sep_idx] = best_q;
+
+      // Advance mixed-radix odometer for sep_q.
+      for (int j = static_cast<int>(sep_len) - 1; j >= 0; --j) {
+        const size_t jj = static_cast<size_t>(j);
+        const OpId sep_op = bag[jj + 1];
+        const uint16_t dom = static_cast<uint16_t>(problem.Ops()[sep_op].costs.size());
+        if (++sep_q[jj] < dom) {
+          break;
+        }
+        sep_q[jj] = 0;
+      }
     }
+  }
+
+  // Backtrack optimal choices in reverse elimination order.
+  for (int s = static_cast<int>(num_bags) - 1; s >= 0; --s) {
+    const size_t ss = static_cast<size_t>(s);
+    const auto& bag = dec.bags[ss];
+    const OpId elim_u = bag[0];
+    size_t sep_idx = 0;
+    for (size_t j = 1; j < bag.size(); ++j) {
+      sep_idx += static_cast<size_t>(out_choices[bag[j]]) * sep_strides[ss][j - 1];
+    }
+    out_choices[elim_u] = backpointers[ss][sep_idx];
   }
 
   return true;
 }
 
-void GreedyRefine(IncrementalState& state, const LayoutSolverConfig& config, int64_t& evaluated_moves,
-                  int64_t& moves_applied, int64_t& greedy_sweeps, std::string& termination_reason) {
+bool RunTreewidthDPOnComponents(const IndexedProblem& problem, const ActiveDecomposition& decomp,
+                                const LayoutSolverConfig& config, int64_t& evaluated_moves,
+                                std::vector<uint16_t>& out_choices) {
+  out_choices.assign(problem.NumOps(), 0);
+  const DPContext ctx = BuildDPContext(problem, decomp);
+  for (size_t comp_idx = 0; comp_idx < decomp.component_decomps.size(); ++comp_idx) {
+    if (!RunTreewidthDPOnSingleComponent(problem, decomp, ctx, comp_idx, config, evaluated_moves,
+                                         out_choices)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void GreedyRefineOps(IncrementalState& state, const std::vector<OpId>& ops, const LayoutSolverConfig& config,
+                     int64_t& evaluated_moves, int64_t& moves_applied, int64_t& greedy_sweeps,
+                     std::string& termination_reason) {
   const auto& problem = state.Problem();
   for (int64_t sweep = 0; sweep < config.max_greedy_sweeps; ++sweep) {
     ++greedy_sweeps;
     bool improved = false;
-    for (OpId op_idx : problem.TopoOrder()) {
+    for (OpId op_idx : ops) {
       const size_t num_cfg = problem.Ops()[op_idx].costs.size();
       double best_gain = 0.0;
       uint16_t best_choice = 0;
@@ -948,6 +953,99 @@ void GreedyRefine(IncrementalState& state, const LayoutSolverConfig& config, int
       termination_reason = "local_optimum";
       return;
     }
+  }
+  termination_reason = "greedy_sweep_budget";
+}
+
+void GreedyRefine(IncrementalState& state, const LayoutSolverConfig& config, int64_t& evaluated_moves,
+                  int64_t& moves_applied, int64_t& greedy_sweeps, std::string& termination_reason) {
+  GreedyRefineOps(state, state.Problem().TopoOrder(), config, evaluated_moves, moves_applied, greedy_sweeps,
+                  termination_reason);
+}
+
+void FMRefineComponent(IncrementalState& state, const std::vector<OpId>& comp_ops,
+                       const LayoutSolverConfig& config, int64_t& evaluated_moves, int64_t& moves_applied,
+                       int64_t& greedy_sweeps, std::string& termination_reason) {
+  if (comp_ops.size() <= 1) {
+    return;
+  }
+  const auto& problem = state.Problem();
+  const size_t n = comp_ops.size();
+  std::vector<bool> locked(n, false);
+  struct AppliedMove {
+    OpId op_idx;
+    uint16_t old_choice;
+  };
+  std::vector<AppliedMove> history;
+  history.reserve(n);
+
+  for (int64_t pass = 0; pass < config.max_greedy_sweeps; ++pass) {
+    ++greedy_sweeps;
+    std::fill(locked.begin(), locked.end(), false);
+    history.clear();
+    double best_prefix_cost = state.Cost();
+    size_t best_prefix_len = 0;
+    bool budget_hit = false;
+
+    for (size_t step = 0; step < n; ++step) {
+      size_t best_local = n;
+      uint16_t best_q = 0;
+      double best_gain = -std::numeric_limits<double>::infinity();
+      for (size_t i = 0; i < n; ++i) {
+        if (locked[i]) {
+          continue;
+        }
+        const OpId op_idx = comp_ops[i];
+        const size_t num_cfg = problem.Ops()[op_idx].costs.size();
+        const uint16_t cur_q = state.Choices()[op_idx];
+        for (uint16_t q = 0; q < static_cast<uint16_t>(num_cfg); ++q) {
+          if (q == cur_q) {
+            continue;
+          }
+          if (evaluated_moves + 1 > config.max_evaluations) {
+            budget_hit = true;
+            break;
+          }
+          ++evaluated_moves;
+          const double g = state.Gain(op_idx, q);
+          if (best_local == n || g > best_gain + config.tolerance) {
+            best_gain = g;
+            best_local = i;
+            best_q = q;
+          }
+        }
+        if (budget_hit) {
+          break;
+        }
+      }
+      if (budget_hit || best_local == n) {
+        break;
+      }
+      const OpId chosen_op = comp_ops[best_local];
+      const uint16_t old_q = state.Choices()[chosen_op];
+      state.Apply(chosen_op, best_q);
+      locked[best_local] = true;
+      history.push_back(AppliedMove{chosen_op, old_q});
+      const double cur_cost = state.Cost();
+      if (cur_cost < best_prefix_cost - config.tolerance) {
+        best_prefix_cost = cur_cost;
+        best_prefix_len = history.size();
+      }
+    }
+
+    for (size_t idx = history.size(); idx > best_prefix_len; --idx) {
+      const auto& mv = history[idx - 1];
+      state.Apply(mv.op_idx, mv.old_choice);
+    }
+    if (budget_hit) {
+      termination_reason = "evaluation_budget";
+      return;
+    }
+    if (best_prefix_len == 0) {
+      termination_reason = "local_optimum";
+      return;
+    }
+    moves_applied += static_cast<int64_t>(best_prefix_len);
   }
   termination_reason = "greedy_sweep_budget";
 }
@@ -1233,15 +1331,22 @@ IndexedProblem::IndexedProblem(const LayoutProblemInstance& instance) : instance
     }
 
     std::set<int64_t> conv_invs_set;
+    std::set<int64_t> compat_conv_invs_set;
     std::vector<uint16_t> target_indices;
+    uint64_t incompatible_target_mask = 0;
     auto add_target = [&](uint16_t idx) {
       if (std::find(target_indices.begin(), target_indices.end(), idx) == target_indices.end()) {
         target_indices.push_back(idx);
       }
     };
 
+    const bool is_onchip_produced = node.memory_space != MemorySpace::DDR && v_info.producer_op.has_value();
+    const int64_t prod_inv = is_onchip_produced ? ops_[*v_info.producer_op].invocations : 0;
+
     for (OpId p : v_info.participants) {
       const OpInfo& op_info = ops_[p];
+      const bool inv_compat = !is_onchip_produced || (op_info.invocations >= prod_inv && prod_inv > 0 &&
+                                                      (op_info.invocations % prod_inv) == 0);
       for (const auto& uses_vec : op_info.config_uses) {
         for (const auto& use : uses_vec) {
           if (use.value_id != v) {
@@ -1250,15 +1355,23 @@ IndexedProblem::IndexedProblem(const LayoutProblemInstance& instance) : instance
           bool any_diff = false;
           for (const auto& [lay_idx, _] : use.layout_counts) {
             add_target(lay_idx);
+            bool diff_for_lay = false;
             for (uint16_t src_idx : source_indices) {
               if (src_idx != lay_idx) {
+                diff_for_lay = true;
                 any_diff = true;
                 break;
               }
             }
+            if (diff_for_lay && !inv_compat) {
+              incompatible_target_mask |= (uint64_t{1} << lay_idx);
+            }
           }
           if (any_diff) {
             conv_invs_set.insert(op_info.invocations);
+            if (inv_compat) {
+              compat_conv_invs_set.insert(op_info.invocations);
+            }
           }
         }
       }
@@ -1274,17 +1387,74 @@ IndexedProblem::IndexedProblem(const LayoutProblemInstance& instance) : instance
       for (uint16_t src_idx : source_indices) {
         if (src_idx != b_idx) {
           conv_invs_set.insert(instance_.cost_model.expected_uses);
+          const bool b_compat =
+              !is_onchip_produced || (instance_.cost_model.expected_uses >= prod_inv && prod_inv > 0 &&
+                                      (instance_.cost_model.expected_uses % prod_inv) == 0);
+          if (b_compat) {
+            compat_conv_invs_set.insert(instance_.cost_model.expected_uses);
+          } else {
+            incompatible_target_mask |= (uint64_t{1} << b_idx);
+          }
           break;
         }
       }
     }
 
-    const std::vector<int64_t> conv_invs(conv_invs_set.begin(), conv_invs_set.end());
+    v_info.forbid_multi_rep = instance_.forbid_unmaterializable_gm_conversions &&
+                              !node.producer_op_id.has_value() && node.memory_space == MemorySpace::DDR;
+
+    bool has_conversion_free_layout = false;
+    if (incompatible_target_mask != 0) {
+      for (uint16_t s_idx : source_indices) {
+        if (node.is_external_output && !instance_.cost_model.allow_external_output_relayout &&
+            s_idx != v_info.default_source_idx) {
+          continue;
+        }
+        bool ok_all_consumers = true;
+        for (OpId p : v_info.participants) {
+          const OpInfo& op_info = ops_[p];
+          bool op_consumes_v = false;
+          bool op_has_compat_cfg = false;
+          for (const auto& uses_vec : op_info.config_uses) {
+            for (const auto& use : uses_vec) {
+              if (use.value_id == v) {
+                op_consumes_v = true;
+                if (use.demand_mask == (uint64_t{1} << s_idx)) {
+                  op_has_compat_cfg = true;
+                }
+              }
+            }
+          }
+          if (op_consumes_v && !op_has_compat_cfg) {
+            ok_all_consumers = false;
+            break;
+          }
+        }
+        if (ok_all_consumers) {
+          has_conversion_free_layout = true;
+          break;
+        }
+      }
+    }
+
+    v_info.incompatible_target_mask = incompatible_target_mask;
+    v_info.has_conversion_free_layout = has_conversion_free_layout;
+
+    const std::vector<int64_t> conv_invs =
+        (incompatible_target_mask != 0 && has_conversion_free_layout)
+            ? std::vector<int64_t>(compat_conv_invs_set.begin(), compat_conv_invs_set.end())
+            : std::vector<int64_t>(conv_invs_set.begin(), conv_invs_set.end());
     const double mult = ConversionMultiplier(instance_, node, op_ptr_by_id, conv_invs);
     v_info.conv_costs.assign(num_layouts * num_layouts, 0.0);
     for (uint16_t src_idx : source_indices) {
       for (uint16_t dst_idx : target_indices) {
         if (src_idx == dst_idx) {
+          continue;
+        }
+        const uint64_t dst_bit = uint64_t{1} << dst_idx;
+        if ((incompatible_target_mask & dst_bit) != 0) {
+          v_info.conv_costs[static_cast<size_t>(src_idx) * num_layouts + dst_idx] =
+              instance_.cost_model.vec_unsupported_conversion_cycles;
           continue;
         }
         const double c = RequireFiniteNonNegative(
@@ -1395,6 +1565,9 @@ IncrementalState::IncrementalState(const IndexedProblem& problem, std::vector<ui
       source_costs_[v][s] = c;
     }
     cost_ += source_costs_[v][sources_[v]];
+    if (v_info.forbid_multi_rep && __builtin_popcountll(demand_masks_[v]) > 1) {
+      cost_ += problem_.Instance().cost_model.vec_unsupported_conversion_cycles;
+    }
   }
 }
 
@@ -1453,11 +1626,18 @@ double IncrementalState::Gain(OpId op_idx, uint16_t new_choice) const {
       }
     }
 
+    const double multi_rep_penalty = problem_.Instance().cost_model.vec_unsupported_conversion_cycles;
+    const double mr_delta = v_info.forbid_multi_rep
+                                ? (static_cast<double>(__builtin_popcountll(new_mask) > 1) -
+                                   static_cast<double>(__builtin_popcountll(demand_masks_[v]) > 1)) *
+                                      multi_rep_penalty
+                                : 0.0;
+
     if (new_mask == demand_masks_[v]) {
-      return source_costs_[v][new_src] - source_costs_[v][old_src];
+      return source_costs_[v][new_src] - source_costs_[v][old_src] + mr_delta;
     }
 
-    double factor = source_costs_[v][new_src];
+    double factor = source_costs_[v][new_src] + mr_delta;
     uint64_t diff_on = new_mask & ~demand_masks_[v];
     uint64_t diff_off = demand_masks_[v] & ~new_mask;
     const double* row = v_info.conv_costs.data() + static_cast<size_t>(new_src) * num_layouts;
@@ -1552,6 +1732,24 @@ void IncrementalState::Apply(OpId op_idx, uint16_t new_choice) {
   sources_[op.output_value] = op.output_layout_indices[new_choice];
   choices_[op_idx] = new_choice;
   cost_ -= g;
+  if (std::abs(g) > 1e9) {
+    // Recompute exact total cost after entering/leaving a large penalty state so IEEE-754
+    // cancellation cannot leave residual drift in `cost_`.
+    double exact = 0.0;
+    const size_t num_ops = problem_.NumOps();
+    for (OpId u = 0; u < num_ops; ++u) {
+      exact += problem_.Ops()[u].costs[choices_[u]];
+    }
+    const size_t num_vals = problem_.NumValues();
+    const double multi_rep_penalty = problem_.Instance().cost_model.vec_unsupported_conversion_cycles;
+    for (ValueId v = 0; v < num_vals; ++v) {
+      exact += source_costs_[v][sources_[v]];
+      if (problem_.Values()[v].forbid_multi_rep && __builtin_popcountll(demand_masks_[v]) > 1) {
+        exact += multi_rep_penalty;
+      }
+    }
+    cost_ = exact;
+  }
 }
 
 LayoutAssignment IncrementalState::ToAssignment() const {
@@ -1650,19 +1848,56 @@ LayoutSolverResult SolveAutoLayout(const LayoutProblemInstance& instance,
     return BuildResult(empty_state, 0, 0, 0, 0.0, "optimal", decomp.tw_stats);
   }
 
-  if (decomp.tw_stats.active_primal_treewidth <= config.max_treewidth &&
-      decomp.tw_stats.max_bag_domain_product <= config.max_bag_states &&
-      decomp.tw_stats.total_dp_states <= config.max_evaluations) {
-    std::vector<uint16_t> dp_choices;
-    int64_t dp_evals = evaluated_moves;
-    if (RunTreewidthDPOnComponents(problem, decomp, config, dp_evals, dp_choices)) {
-      IncrementalState state(problem, std::move(dp_choices));
-      return BuildResult(state, dp_evals, 0, 0, state.Cost(), "optimal", decomp.tw_stats);
+  const size_t num_comps = decomp.component_decomps.size();
+  std::vector<size_t> dp_comps;
+  std::vector<size_t> fallback_comps;
+  for (size_t c = 0; c < num_comps; ++c) {
+    const auto& dec = decomp.component_decomps[c];
+    int64_t comp_max_prod = 1;
+    int64_t comp_total_states = 0;
+    for (const auto& bag : dec.bags) {
+      int64_t prod = 1;
+      for (OpId u : bag) {
+        const int64_t dom = static_cast<int64_t>(problem.Ops()[u].costs.size());
+        if (prod > std::numeric_limits<int64_t>::max() / std::max<int64_t>(1, dom)) {
+          prod = std::numeric_limits<int64_t>::max();
+          break;
+        }
+        prod *= dom;
+      }
+      comp_max_prod = std::max(comp_max_prod, prod);
+      if (comp_total_states > std::numeric_limits<int64_t>::max() - prod) {
+        comp_total_states = std::numeric_limits<int64_t>::max();
+      } else {
+        comp_total_states += prod;
+      }
     }
-    // Preserve exact Python fallback behavior: if DP hits evaluation limit, retry greedy from 0 evals.
-    evaluated_moves = dp_evals;
+    if (dec.treewidth <= config.max_treewidth && comp_max_prod <= config.max_bag_states &&
+        comp_total_states <= config.max_evaluations) {
+      dp_comps.push_back(c);
+    } else {
+      fallback_comps.push_back(c);
+    }
   }
 
+  const DPContext dp_ctx = BuildDPContext(problem, decomp);
+  std::vector<uint16_t> dp_choices(problem.NumOps(), 0);
+  int64_t dp_evals = 0;
+  std::vector<size_t> solved_dp_comps;
+  for (size_t c : dp_comps) {
+    if (RunTreewidthDPOnSingleComponent(problem, decomp, dp_ctx, c, config, dp_evals, dp_choices)) {
+      solved_dp_comps.push_back(c);
+    } else {
+      fallback_comps.push_back(c);
+    }
+  }
+
+  if (fallback_comps.empty()) {
+    IncrementalState state(problem, std::move(dp_choices));
+    return BuildResult(state, dp_evals, 0, 0, state.Cost(), "optimal", decomp.tw_stats);
+  }
+
+  evaluated_moves = dp_evals;
   int64_t moves_applied = 0;
   int64_t greedy_sweeps = 0;
   std::string termination_reason = "local_optimum";
@@ -1673,10 +1908,40 @@ LayoutSolverResult SolveAutoLayout(const LayoutProblemInstance& instance,
     auto seed = TopologicalSeed(problem, config, evaluated_moves, termination_reason);
     choices.assign(seed.begin(), seed.end());
   }
+  // Preserve exact DP solutions on every component that fit the DP budget.
+  for (size_t c : solved_dp_comps) {
+    for (OpId u : decomp.components[c]) {
+      choices[u] = dp_choices[u];
+    }
+  }
+
+  std::vector<bool> in_fallback(problem.NumOps(), false);
+  for (size_t c : fallback_comps) {
+    for (OpId u : decomp.components[c]) {
+      in_fallback[u] = true;
+    }
+  }
+  std::vector<OpId> fallback_ops;
+  for (OpId u : problem.TopoOrder()) {
+    if (in_fallback[u]) {
+      fallback_ops.push_back(u);
+    }
+  }
+
   IncrementalState state(problem, std::move(choices));
   const double initial_cost = state.Cost();
-  if (termination_reason != "evaluation_budget") {
-    GreedyRefine(state, config, evaluated_moves, moves_applied, greedy_sweeps, termination_reason);
+  if (termination_reason != "evaluation_budget" && !fallback_ops.empty()) {
+    GreedyRefineOps(state, fallback_ops, config, evaluated_moves, moves_applied, greedy_sweeps,
+                    termination_reason);
+    if (!initial.has_value() && termination_reason != "evaluation_budget") {
+      for (size_t c : fallback_comps) {
+        if (termination_reason == "evaluation_budget") {
+          break;
+        }
+        FMRefineComponent(state, decomp.components[c], config, evaluated_moves, moves_applied, greedy_sweeps,
+                          termination_reason);
+      }
+    }
   }
   return BuildResult(state, evaluated_moves, moves_applied, greedy_sweeps, initial_cost, termination_reason,
                      decomp.tw_stats);

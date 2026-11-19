@@ -647,6 +647,7 @@ class LayoutProblemInstance:
     values: dict[str, LayoutValueNode] = field(default_factory=_empty_values)
     operations: list[LayoutOperationNode] = field(default_factory=_empty_operations)
     cost_model: LayoutCostModel = field(default_factory=LayoutCostModel)
+    forbid_unmaterializable_gm_conversions: bool = False
 
 
 _TILE_LOAD_OP = core_ir.get_op("tile.load").name
@@ -817,6 +818,7 @@ def _from_cpp_cost_model(model: _cpp_al.LayoutCostModel) -> LayoutCostModel:
 def _to_cpp_instance(instance: LayoutProblemInstance) -> _cpp_al.LayoutProblemInstance:
     out = _cpp_al.LayoutProblemInstance()
     out.cost_model = _to_cpp_cost_model(instance.cost_model)
+    out.forbid_unmaterializable_gm_conversions = bool(instance.forbid_unmaterializable_gm_conversions)
     for node in instance.values.values():
         out.add_value(_to_cpp_value_node(node))
     out.operations = [_to_cpp_operation_node(op) for op in instance.operations]
@@ -840,16 +842,22 @@ def _from_cpp_instance(
     cpp_inst: _cpp_al.LayoutProblemInstance,
     cost_model: LayoutCostModel | None = None,
 ) -> LayoutProblemInstance:
+    cpp_values = cpp_inst.values
     values: dict[str, LayoutValueNode] = {}
     for name in cpp_inst.value_order:
-        if name in cpp_inst.values:
-            values[name] = _from_cpp_value_node(cpp_inst.values[name])
-    for name, node in cpp_inst.values.items():
+        if name in cpp_values:
+            values[name] = _from_cpp_value_node(cpp_values[name])
+    for name, node in cpp_values.items():
         if name not in values:
             values[name] = _from_cpp_value_node(node)
     operations = [_from_cpp_operation_node(op) for op in cpp_inst.operations]
     model = cost_model if cost_model is not None else _from_cpp_cost_model(cpp_inst.cost_model)
-    return LayoutProblemInstance(values=values, operations=operations, cost_model=model)
+    return LayoutProblemInstance(
+        values=values,
+        operations=operations,
+        cost_model=model,
+        forbid_unmaterializable_gm_conversions=bool(cpp_inst.forbid_unmaterializable_gm_conversions),
+    )
 
 
 def _to_cpp_assignment(assignment: LayoutAssignment) -> _cpp_al.LayoutAssignment:
@@ -1366,8 +1374,46 @@ def _calibration_load_scale(
     return 1.0
 
 
+def _calibration_internal_conversion_cycles(
+    model: LayoutCostModel,
+    measurement: CalibrationMeasurement,
+) -> float:
+    """Return single-launch internal on-chip conversion cycles (excluding boundary GM packing)."""
+    instance = measurement.instance
+    assignment = measurement.breakdown.assignment
+    expected_uses = float(max(1, instance.cost_model.expected_uses))
+    ops_by_id = {op.op_id: op for op in instance.operations}
+
+    requested: dict[str, list[LayoutChoice]] = {}
+    for op in instance.operations:
+        cfg = assignment.op_configs.get(op.op_id)
+        if cfg is None:
+            continue
+        for inp_name, req_lay in zip(op.inputs, cfg.input_layouts):
+            lays = requested.setdefault(inp_name, [])
+            if req_lay not in lays:
+                lays.append(req_lay)
+
+    total = 0.0
+    for val_name, req_lays in requested.items():
+        val_node = instance.values.get(val_name)
+        if val_node is None:
+            continue
+        if val_node.memory_space == core_ir.MemorySpace.DDR and val_node.producer_op_id is None:
+            continue
+        src_lay = assignment.value_layouts.get(val_name, val_node.current_layout)
+        if val_node.producer_op_id is not None and val_node.producer_op_id in ops_by_id:
+            inv = float(ops_by_id[val_node.producer_op_id].invocations) / expected_uses
+        else:
+            inv = 1.0
+        for dst_lay in req_lays:
+            if dst_lay != src_lay:
+                total += inv * model.estimate_conversion_cost(val_node, src_lay, dst_lay)
+    return total
+
+
 def _calibration_prediction_cycles(model: LayoutCostModel, measurement: CalibrationMeasurement) -> float:
-    """Return single-launch operator cycles; boundary packing is outside timing."""
+    """Return single-launch operator and internal conversion cycles; boundary packing is outside timing."""
     expected_uses = float(measurement.instance.cost_model.expected_uses)
     total = 0.0
     for op in measurement.instance.operations:
@@ -1377,6 +1423,7 @@ def _calibration_prediction_cycles(model: LayoutCostModel, measurement: Calibrat
         inv = float(op.invocations) / expected_uses
         scale = _calibration_load_scale(model, measurement.instance, op, inv)
         total += inv * scale * _calibration_op_cost(model, measurement.instance, op, config)
+    total += _calibration_internal_conversion_cycles(model, measurement)
     return total
 
 
@@ -1388,7 +1435,8 @@ def _calibration_features(
 ) -> list[float]:
     """Build four transfer-byte features and one retained-cycle feature."""
     instance = measurement.instance
-    nd2nz_b = nz2nz_b = store_nd_b = store_nz_b = other_cycles = 0.0
+    nd2nz_b = nz2nz_b = store_nd_b = store_nz_b = 0.0
+    other_cycles = _calibration_internal_conversion_cycles(model, measurement)
     for op in instance.operations:
         cfg = measurement.breakdown.assignment.op_configs.get(op.op_id)
         if cfg is None:

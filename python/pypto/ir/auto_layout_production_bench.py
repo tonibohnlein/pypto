@@ -44,6 +44,7 @@ from pypto.ir.auto_layout import (
     evaluate_assignment,
     extract_layout_instance,
     make_auto_layout_pass,
+    pack_dn,
     pack_nz,
     run_pre_layout_passes,
     unpack_nz,
@@ -57,7 +58,9 @@ from pypto.ir.auto_layout_solver import (
     solve_treewidth_dp,
 )
 from pypto.ir.compile import compile as compile_program
+from pypto.pypto_core import Error as PyPTOError
 from pypto.pypto_core import ir as core_ir
+from pypto.pypto_core import passes as core_passes
 
 TensorLayout = core_ir.TensorLayout
 
@@ -379,28 +382,44 @@ def load_pypto_lib_production_suite(
 
 
 def _prepare_nd_baseline_program(jit_fn: Any) -> tuple[core_ir.Program, set[str]]:
-    """Specialize `jit_fn` with all 2D `pl.NZ` annotations stripped to `pl.ND`.
+    """Specialize `jit_fn` stripping `pl.NZ` annotations to `pl.ND` where typecheck permits.
+
+    Tries 2D+3D stripping first, falls back to 2D-only if internal slice/type annotations
+    reject 3D stripping, and finally falls back to unstripped metadata (`orig_nz = set()`).
 
     Returns:
-        `(raw_nd_program, originally_nz_2d_tensor_names)`
+        `(raw_nd_program, originally_nz_tensor_names)`
     """
     spec, _ = jit_fn._resolve_specialization((), {}, allow_signature_mode=True)
-    orig_nz_2d: set[str] = set()
-    nd_meta = {}
-    for name, meta in spec.tensor_meta.items():
-        if meta.layout == TensorLayout.NZ and len(meta.shape) == 2:
-            orig_nz_2d.add(name)
-            nd_meta[name] = replace(meta, layout=TensorLayout.ND)
-        else:
-            nd_meta[name] = meta
-    prog, _ = jit_fn._compile_to_program_with_rename_map(
-        nd_meta,
-        spec.scalar_dtypes,
-        spec.constexpr_values,
-        spec.per_func_dyn,
-        pl,
-    )
-    return prog, orig_nz_2d
+    tc_props = core_passes.IRPropertySet()
+    tc_props.insert(core_passes.IRProperty.TypeChecked)
+
+    def _compile_stripped(target_ranks: tuple[int, ...]) -> tuple[core_ir.Program, set[str]]:
+        orig_nz: set[str] = set()
+        nd_meta = {}
+        for name, meta in spec.tensor_meta.items():
+            if meta.layout == TensorLayout.NZ and len(meta.shape) in target_ranks:
+                orig_nz.add(name)
+                nd_meta[name] = replace(meta, layout=TensorLayout.ND)
+            else:
+                nd_meta[name] = meta
+        prog, _ = jit_fn._compile_to_program_with_rename_map(
+            nd_meta,
+            spec.scalar_dtypes,
+            spec.constexpr_values,
+            spec.per_func_dyn,
+            pl,
+        )
+        if target_ranks:
+            core_passes.verify_properties(tc_props, prog, "nd_baseline_typecheck")
+        return prog, orig_nz
+
+    for ranks in ((2, 3), (2,)):
+        try:
+            return _compile_stripped(ranks)
+        except (PyPTOError, TypeError, ValueError, RuntimeError):
+            continue
+    return _compile_stripped(())
 
 
 def _materialize_canonical_tensors_and_golden(
@@ -421,9 +440,14 @@ def _materialize_canonical_tensors_and_golden(
         core_ir.ParamDirection.Out: "out",
         core_ir.ParamDirection.InOut: "inout",
     }
-    for spec_item, direction in zip(case.specs, entry.param_directions, strict=True):
+    param_dir_by_name = {p.name_hint: d for p, d in zip(entry.params, entry.param_directions)}
+    for idx, spec_item in enumerate(case.specs):
         if isinstance(spec_item, TensorSpec):
-            spec_item.direction = dir_map.get(direction, "in")
+            direction = param_dir_by_name.get(spec_item.name)
+            if direction is None and idx < len(entry.param_directions):
+                direction = entry.param_directions[idx]
+            if direction is not None:
+                spec_item.direction = dir_map.get(direction, "in")
 
     logical_nd: dict[str, torch.Tensor] = {}
     golden_scratch: dict[str, Any] = {}
@@ -453,11 +477,13 @@ def _build_variant_specs(
     base_specs: Sequence[Any],
     logical_nd: dict[str, torch.Tensor],
     nz_tensor_names: set[str],
+    dn_tensor_names: set[str] | None = None,
 ) -> list[Any]:
-    """Create `TensorSpec`s whose `init_value` returns `pack_nz(t)` for any tensor in `nz_tensor_names`."""
+    """Create `TensorSpec`s packing inputs via `pack_nz` / `pack_dn` for promoted tensors."""
     golden_spec_mod = importlib.import_module("golden.spec")
     ScalarSpec = golden_spec_mod.ScalarSpec
     TensorSpec = golden_spec_mod.TensorSpec
+    dn_set = dn_tensor_names or set()
 
     variant_specs: list[Any] = []
     for s in base_specs:
@@ -472,6 +498,14 @@ def _build_variant_specs(
                 list(s.shape),
                 s.dtype,
                 init_value=lambda t=packed_t: t.clone(),
+            )
+        elif s.is_input and s.name in dn_set:
+            packed_dn_t = pack_dn(base_t).contiguous()
+            ts = TensorSpec(
+                s.name,
+                list(s.shape),
+                s.dtype,
+                init_value=lambda t=packed_dn_t: t.clone(),
             )
         else:
             ts = TensorSpec(
@@ -515,6 +549,7 @@ def _execute_and_time_variant(  # noqa: PLR0913
     nz_names: set[str],
     golden_fn: Callable[[dict[str, Any]], None],
     *,
+    dn_names: set[str] | None = None,
     cli_backend: str,
     is_sim: bool,
     device_id: int,
@@ -526,7 +561,7 @@ def _execute_and_time_variant(  # noqa: PLR0913
     """Execute, validate against `golden_fn`, and benchmark one compiled variant."""
     golden_run = importlib.import_module("golden").run
 
-    v_specs = _build_variant_specs(case.specs, logical_nd, nz_names)
+    v_specs = _build_variant_specs(case.specs, logical_nd, nz_names, dn_names)
     old_bench = os.environ.get("PYPTO_BENCH")
     old_rounds = os.environ.get("PYPTO_BENCH_ROUNDS")
     old_warmup = os.environ.get("PYPTO_BENCH_WARMUP")
@@ -566,7 +601,7 @@ def _execute_and_time_variant(  # noqa: PLR0913
         old_bench_sw = os.environ.get("PYPTO_BENCH")
         try:
             os.environ["PYPTO_BENCH"] = "0"
-            sw_specs = _build_variant_specs(case.specs, logical_nd, nz_names)
+            sw_specs = _build_variant_specs(case.specs, logical_nd, nz_names, dn_names)
             golden_run(
                 fn=case.jit_fn,
                 specs=sw_specs,
@@ -639,6 +674,12 @@ def run_production_benchmark_suite(  # noqa: PLR0913
             cost_model=cost_model,
             reusable_tensors=set(case.reusable_tensors),
         )
+        already_nz_in_raw_prog: set[str] = {
+            k for k, v in instance.values.items() if v.current_layout == core_ir.TensorLayout.NZ
+        }
+        already_dn_in_raw_prog: set[str] = {
+            k for k, v in instance.values.items() if v.current_layout == core_ir.TensorLayout.DN
+        }
         base_bd = evaluate_assignment(instance, LayoutAssignment(value_layouts={}))
 
         t0 = time.perf_counter()
@@ -690,6 +731,13 @@ def run_production_benchmark_suite(  # noqa: PLR0913
             v_dir.mkdir(parents=True, exist_ok=True)
             nz_names: set[str] = (
                 {k for k, v in assignment.tensor_layouts.items() if v == core_ir.TensorLayout.NZ}
+                - already_nz_in_raw_prog
+                if assignment is not None
+                else set()
+            )
+            dn_names: set[str] = (
+                {k for k, v in assignment.tensor_layouts.items() if v == core_ir.TensorLayout.DN}
+                - already_dn_in_raw_prog
                 if assignment is not None
                 else set()
             )
@@ -732,6 +780,7 @@ def run_production_benchmark_suite(  # noqa: PLR0913
                     logical_nd,
                     nz_names,
                     _precomputed_golden,
+                    dn_names=dn_names,
                     cli_backend=cli_backend,
                     is_sim=is_sim,
                     device_id=device_id,

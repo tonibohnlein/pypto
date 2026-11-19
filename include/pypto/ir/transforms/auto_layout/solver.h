@@ -103,6 +103,9 @@ class IndexedProblem {
     std::vector<int> boundary_counts;
     /// Flat `[src_idx * num_layouts + dst_idx]` precomputed conversion costs.
     std::vector<double> conv_costs;
+    uint64_t incompatible_target_mask = 0;
+    bool has_conversion_free_layout = false;
+    bool forbid_multi_rep = false;
 
     [[nodiscard]] int FindLayoutIndex(const LayoutSpec& spec) const;
   };

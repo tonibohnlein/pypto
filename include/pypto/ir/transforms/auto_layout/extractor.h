@@ -72,6 +72,7 @@ struct OrchCallAnalysis {
   std::map<std::pair<std::string, size_t>, int64_t> param_steps;
   std::unordered_set<std::string> reshaped_names;
   std::unordered_set<std::string> nz_ineligible_names;
+  std::unordered_set<std::string> dn_ineligible_names;
   std::unordered_set<std::string> internal_buffers;
 };
 

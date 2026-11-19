@@ -182,6 +182,8 @@ void BindAutoLayout(nb::module_& m) {
       .def_rw("operations", &al::LayoutProblemInstance::operations)
       .def_rw("cost_model", &al::LayoutProblemInstance::cost_model)
       .def_rw("custom_conversion_costs", &al::LayoutProblemInstance::custom_conversion_costs)
+      .def_rw("forbid_unmaterializable_gm_conversions",
+              &al::LayoutProblemInstance::forbid_unmaterializable_gm_conversions)
       .def("add_value", &al::LayoutProblemInstance::AddValue, nb::arg("node"))
       .def("find_value", &al::LayoutProblemInstance::FindValue, nb::arg("name"),
            nb::rv_policy::reference_internal)
@@ -320,6 +322,7 @@ void BindAutoLayout(nb::module_& m) {
       .def_ro("param_steps", &al::OrchCallAnalysis::param_steps)
       .def_ro("reshaped_names", &al::OrchCallAnalysis::reshaped_names)
       .def_ro("nz_ineligible_names", &al::OrchCallAnalysis::nz_ineligible_names)
+      .def_ro("dn_ineligible_names", &al::OrchCallAnalysis::dn_ineligible_names)
       .def_ro("internal_buffers", &al::OrchCallAnalysis::internal_buffers);
 
   mod.def("c0_elements", &al::C0Elements, nb::arg("dtype"));
