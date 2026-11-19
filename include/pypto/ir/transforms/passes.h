@@ -805,6 +805,7 @@ struct AutoLayoutOptions {
   std::string solver = "auto";
   int64_t max_treewidth = 8;
   std::string name = "AutoLayout";
+  bool fail_on_writeback_issues = false;
 };
 
 /**
