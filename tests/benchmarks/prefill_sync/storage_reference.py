@@ -51,7 +51,8 @@ def source_trace(path: Path, args: list[int], width: int, worker: int):
     header = inputs[1]
     nptr = header.count("!pto.ptr")
     env = {"__pypto_spmd_block_idx": worker, "__pypto_spmd_block_num": width}
-    env.update({f"arg{i}": (f"arg{i}" if i < nptr else args[i - nptr]) for i in range(nptr + len(args))})
+    env.update({f"arg{i}": value for i, value in enumerate(args, start=nptr)})
+    pointers = {f"arg{i}" for i in range(nptr)}
     rects, allocations, ops = {}, {}, []
 
     def full(tile):
@@ -62,9 +63,11 @@ def source_trace(path: Path, args: list[int], width: int, worker: int):
         if not sep:
             var, rhs = None, line
         if rhs.startswith("arith."):
+            assert var is not None
             env[var[1:]] = scalar_value(rhs, env)
         elif rhs.startswith("pto.alloc_tile"):
             info = re.search(r"loc=(\w+), dtype=(\w+), rows=(\d+), cols=(\d+), v_row=(\d+), v_col=(\d+)", rhs)
+            assert var is not None and info is not None
             space, dtype, m, n, vm, vn = info.groups()
             assert (m, n) == (vm, vn)
             address = env[names(rhs)[0]]
@@ -83,10 +86,12 @@ def source_trace(path: Path, args: list[int], width: int, worker: int):
             allocations[ident] = (space, address, size)
             rects[ident] = (ident, 0, 0, int(m), int(n))
         elif rhs.startswith("pto.make_tensor_view"):
+            assert var is not None
             base, m, n, s0, s1 = names(rhs)
-            assert env[s0] == env[n] and env[s1] == 1
-            rects[var[1:]] = (env[base], 0, 0, env[m], env[n])
+            assert base in pointers and env[s0] == env[n] and env[s1] == 1
+            rects[var[1:]] = (base, 0, 0, env[m], env[n])
         elif rhs.startswith("pto.partition_view"):
+            assert var is not None
             view, i, j, m, n = names(rhs)
             base, r, c, h, w = rects[view]
             x, y, rows, cols = [env[k] for k in (i, j, m, n)]

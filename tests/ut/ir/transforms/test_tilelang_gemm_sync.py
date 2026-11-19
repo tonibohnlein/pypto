@@ -298,10 +298,13 @@ def _make_lookahead_tile_body(
     c_param, a_param, b_param = params
     acc, a_l1_pool, b_l1_pool, a_l0_pool, b_l0_pool = pools
     row_var, col_var = coords
-    a_mat_t = a_l1_pool.type.element_type
-    b_mat_t = b_l1_pool.type.element_type
-    left_t = a_l0_pool.type.element_type
-    right_t = b_l0_pool.type.element_type
+
+    def pool_element(pool: ir.Var) -> ir.BufferType:
+        typ = pool.type
+        assert isinstance(typ, ir.MultiBufferType)
+        return typ.element_type
+
+    a_mat_t, b_mat_t, left_t, right_t = map(pool_element, (a_l1_pool, b_l1_pool, a_l0_pool, b_l0_pool))
 
     def ci(val: int) -> ir.ConstInt:
         return ir.ConstInt(val, idx, span)

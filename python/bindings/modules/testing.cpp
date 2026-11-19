@@ -726,8 +726,8 @@ bool IsNoDuplicateOpForTesting(const std::string& op_name) {
 // ============================================================================
 
 // Diagnostics count final emitted sites separately from per-case construction.
-// Original payload guards are included in if_sites, but excluded from the
-// added guard_sites field below by subtracting the unchanged owner's census.
+// if_sites includes original payload guards. The invocation result also
+// compares this count with the original owner to report its added guards.
 class PhysicalControlCensus : public ir::IRVisitor {
  public:
   size_t sets = 0, waits = 0, barriers = 0, branches = 0;
@@ -743,6 +743,16 @@ class PhysicalControlCensus : public ir::IRVisitor {
     ir::IRVisitor::VisitStmt_(statement);
   }
 };
+
+size_t DescribeEmittedPhysicalControl(nb::dict& out, const ir::FunctionPtr& function) {
+  PhysicalControlCensus emitted;
+  emitted.VisitFunction(function);
+  out["set_sites"] = emitted.sets;
+  out["wait_sites"] = emitted.waits;
+  out["barrier_sites"] = emitted.barriers;
+  out["if_sites"] = emitted.branches;
+  return emitted.branches;
+}
 
 nb::dict DescribeSchedulePolicy(const ir::sync::SyncSchedulePolicy& policy) {
   nb::dict out;
@@ -1132,8 +1142,7 @@ void BindTesting(nb::module_& m) {
         INTERNAL_CHECK(assignment) << "Missing completed assignment";
         const auto copy = result;
         nb::dict out;
-        out["shared_family_storage"] =
-            &result.assignment->Families() == &copy.assignment->Families();
+        out["shared_family_storage"] = &result.assignment->Families() == &copy.assignment->Families();
         out["families"] = result.assignment->Families().size();
         if (change == "preassigned_ids") {
           auto families = order->Families();  // Deliberately invalid diagnostic input.
@@ -1186,6 +1195,13 @@ void BindTesting(nb::module_& m) {
             const auto result = sync_testing::RealizeDemandPlan(analysis, target, eligible_ids, policy);
             auto out = DescribePhysicalSync(result);
             out["schedule_policy"] = DescribeSchedulePolicy(policy);
+            nb::dict case_sites;
+            case_sites["set_sites"] = result.set_sites;
+            case_sites["wait_sites"] = result.wait_sites;
+            case_sites["barrier_sites"] = result.barrier_sites;
+            case_sites["guard_sites"] = result.guard_sites;
+            out["case_sites"] = case_sites;
+            DescribeEmittedPhysicalControl(out, result.function);
             return out;
           },
           nb::arg("target"), nb::arg("eligible_ids") = nb::none(), nb::kw_only(),
@@ -1461,23 +1477,19 @@ void BindTesting(nb::module_& m) {
             case_sites["barrier_sites"] = barriers;
             case_sites["guard_sites"] = guards;
             out["case_sites"] = case_sites;
-            PhysicalControlCensus emitted, original;
-            emitted.VisitFunction(result.function);
+            const size_t emitted_branches = DescribeEmittedPhysicalControl(out, result.function);
+            PhysicalControlCensus original;
             original.VisitFunction(analysis.owner);
-            INTERNAL_CHECK(emitted.branches >= original.branches)
+            INTERNAL_CHECK(emitted_branches >= original.branches)
                 << "Internal error: invocation payload guards changed";
-            out["set_sites"] = emitted.sets;
-            out["wait_sites"] = emitted.waits;
-            out["barrier_sites"] = emitted.barriers;
-            out["guard_sites"] = emitted.branches - original.branches;
-            out["if_sites"] = emitted.branches;
+            out["guard_sites"] = emitted_branches - original.branches;
             return out;
           },
           nb::arg("target"), nb::arg("eligible_ids") = nb::none(), nb::kw_only(),
           nb::arg("schedule_policy") = ir::sync::SyncSchedulePolicy{},
           "Test supplied-demand case adapter; does not exercise actual-token interpretation")
-      .def("select_case", &sync_testing::SelectInvocationCase, nb::arg("block_index"),
-           nb::arg("parameters"), "Retained case for a fully bound admitted invocation, or None")
+      .def("select_case", &sync_testing::SelectInvocationCase, nb::arg("block_index"), nb::arg("parameters"),
+           "Retained case for a fully bound admitted invocation, or None")
       .def(
           "describe",
           [](const ir::sync::SyncInvocationAnalysis& result) {
@@ -1566,8 +1578,9 @@ void BindTesting(nb::module_& m) {
       [](const ir::FunctionPtr& function, const std::string& target,
          const std::vector<std::shared_ptr<const ir::sync::NativeSyncChild>>& children,
          bool retain_incoming_diagnostics, bool automatic_children, bool enable_refresh_kill) {
-        const auto analysis = ir::sync::AnalyzeConservativeSync(
-            function, target, children, {}, retain_incoming_diagnostics, automatic_children, enable_refresh_kill);
+        const auto analysis =
+            ir::sync::AnalyzeConservativeSync(function, target, children, {}, retain_incoming_diagnostics,
+                                              automatic_children, enable_refresh_kill);
         auto facts = [](const ir::sync::ConservativeAccessSet& accesses) {
           nb::list result;
           for (const auto& [space, pipe, write, domain] : accesses) {
@@ -1706,7 +1719,8 @@ void BindTesting(nb::module_& m) {
         result["incoming_diagnostics_available"] = analysis.HasIncomingDiagnostics();
         result["disjoint_gm"] = analysis.SuppliedDisjointGM();
         result["gm_alias_contract"] = analysis.SuppliedDisjointGM() ? "supplied_disjoint_roots" : "may_alias";
-        result["precision"] = analysis.HasRefreshKill() ? "storage_domain_refresh_kill" : "storage_domain_no_kill";
+        result["precision"] =
+            analysis.HasRefreshKill() ? "storage_domain_refresh_kill" : "storage_domain_no_kill";
         result["exact_storage_selectors"] = false;
         result["executable_protocol"] = false;
         return result;

@@ -116,7 +116,7 @@ def barrier_program(*, manual_before_fill=False):
     allocation = ir.AssignStmt(buffer, op("buffer.alloc", [ir.MakeTuple([], S), ci(0)], ty), S)
     full = ir.EvalStmt(op("buffer.full", [ir.ConstFloat(1.0, ir.DataType.FP32, S), buffer]), S)
     absolute = ir.EvalStmt(op("buffer.abs", [buffer, buffer]), S)
-    body = [allocation]
+    body: list[ir.Stmt] = [allocation]
     if manual_before_fill:
         # Wait for work on an independent buffer before starting the fill.
         # The storage hazard on the original buffer occurs later, before abs.
