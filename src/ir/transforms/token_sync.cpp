@@ -28,6 +28,7 @@
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
+#include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/simplify.h"
 #include "pypto/ir/verifier/sync.h"
@@ -502,6 +503,21 @@ Pass RealizeSync(bool require_whole_module) {
         const auto location = function->GetAttr<std::string>(kAttrBufferAdmissionLocation);
         if (!location.empty()) {
           reason += " (" + location + ")";
+        }
+      }
+      if (ctx->GetBackendHandler()->GetPtoTargetArch() == "a2a3") {
+        const auto peer = cross_core_pipe::AnalyzeConsumerFifo(function);
+        if (peer.has_transport) {
+          if (!peer.unavailable.empty()) {
+            reason += "; native peer FIFO proof unavailable: " + peer.unavailable;
+          } else {
+            for (const auto& [id, capacity] : peer.capacities) {
+              reason += "; native peer FIFO pipe id " + std::to_string(id) + " has peak marker depth " +
+                        std::to_string(capacity.required) + ", declared local capacity " +
+                        std::to_string(capacity.slots);
+            }
+          }
+          reason += "; peer Buffer bindings, local DMA readiness and slot reuse remain unqualified";
         }
       }
       return sync::SyncOutcome(function, false, reason);

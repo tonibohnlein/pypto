@@ -345,3 +345,22 @@ Other preserved failures are the aggregate120s watchdog and stale API/metadata
 expectations. The final smaller integration batches retain that120s watchdog.
 No failed run is relabeled as an all-green full-suite result. Final hook and
 receipt review status is recorded in the machine-readable checkpoint.
+
+## A2/A3 consumer slot checks
+
+Automatic setup and AutoSync fallback now share a FIFO walk over the original
+pop and free markers. Automatic setup sizes its single generated queue.
+Fallback counts outstanding entries separately for each declared pipe ID.
+A supported loop or branch restores its incoming queues, so the analysis
+does not enumerate visits. The fallback reports this marker depth against the
+declaration reached through the consumer initializer's reserve operand and
+keeps the original Buffer admission reason. Marker depth does not establish
+alias-use lifetime, local DMA completion, or peer progress.
+
+Before no-split AIV dispatch is duplicated, the compiler rejects a concrete
+slot overwrite in the original active lane. The proof requires a single
+dominating consumer setup, an unconditional sequence of fully valid dense FP32
+Vec pops, and a direct registered tile data read of an older outstanding value
+after its slot wraps. Unknown shapes, early exits and alias reads remain
+outside this rejection. PTOAS retains grouped synchronization ownership and the
+original native peer epochs, including the zero-valid handshake lane.
