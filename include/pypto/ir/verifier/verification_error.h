@@ -64,7 +64,8 @@ enum class ErrorType : int {
   TILE_VIEW_MISMATCH = 111,                    // Effective TileView metadata mismatch
   BUFFER_DESCRIPTOR_MISMATCH = 112,            // Buffer descriptor or multi-buffer slot count mismatch
   TENSOR_LAYOUT_MISMATCH = 113,                // Call argument layout differs from the callee parameter's
-  ASYNC_HANDLE_MISMATCH = 114                  // A communication event or session has the wrong producer
+  ASYNC_HANDLE_MISMATCH = 114,                  // A communication event or session has the wrong producer
+  SYNC_TOKEN_SOURCE_MISMATCH = 115             // Completion token source pipeline differs
 };
 
 /**

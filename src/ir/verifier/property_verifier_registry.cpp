@@ -63,6 +63,7 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   Register(IRProperty::OutParamNotShadowed, CreateOutParamNotShadowedPropertyVerifier);
   Register(IRProperty::ArrayNotEscaped, CreateArrayNotEscapedPropertyVerifier);
   Register(IRProperty::RegScopeValid, CreateRegScopePropertyVerifier);
+  Register(IRProperty::LogicalSyncValid, CreateLogicalSyncPropertyVerifier);
   Register(IRProperty::HardwareLoopContractValid, CreateHardwareLoopContractPropertyVerifier);
   Register(IRProperty::NoNestedInCore, CreateNoNestedIncorePropertyVerifier);
   Register(IRProperty::InOutUseValid, CreateInOutUseValidPropertyVerifier);

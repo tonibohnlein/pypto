@@ -181,7 +181,8 @@ void BindPass(nb::module_& m) {
              "Writable SIMT Tiles have dedicated initialized output storage")
       .value("SimtSpecialized", IRProperty::SimtSpecialized, "SIMT helper resources match their launches")
       .value("AsyncHandleProvenance", IRProperty::AsyncHandleProvenance,
-             "Distributed async events and sessions trace to matching SSA definitions");
+             "Distributed async events and sessions trace to matching SSA definitions")
+      .value("LogicalSyncValid", IRProperty::LogicalSyncValid, "Logical completion ownership and schemas");
 
   // Bind IRPropertySet
   auto ir_property_set = nb::class_<IRPropertySet>(passes, "IRPropertySet", "A set of IR properties");
@@ -519,7 +520,9 @@ void BindPass(nb::module_& m) {
       .value("TENSOR_LAYOUT_MISMATCH", typecheck::ErrorType::TENSOR_LAYOUT_MISMATCH,
              "Call argument layout differs from the callee parameter's")
       .value("ASYNC_HANDLE_MISMATCH", typecheck::ErrorType::ASYNC_HANDLE_MISMATCH,
-             "A communication event or session has the wrong producer");
+             "A communication event or session has the wrong producer")
+      .value("SYNC_TOKEN_SOURCE_MISMATCH", typecheck::ErrorType::SYNC_TOKEN_SOURCE_MISMATCH,
+             "Completion token source pipeline differs");
 
   // Bind NestedCallErrorType enum
   nb::enum_<nested_call::ErrorType>(passes, "NestedCallErrorType", "Nested call verification error types")

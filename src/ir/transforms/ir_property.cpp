@@ -137,6 +137,8 @@ std::string IRPropertyToString(IRProperty prop) {
       return "SimtSpecialized";
     case IRProperty::AsyncHandleProvenance:
       return "AsyncHandleProvenance";
+    case IRProperty::LogicalSyncValid:
+      return "LogicalSyncValid";
     default:
       return "Unknown";
   }
@@ -184,6 +186,7 @@ const IRPropertySet& GetVerifiedProperties() {
                                    IRProperty::SimtOutputsMaterialized,
                                    IRProperty::SimtSpecialized,
                                    IRProperty::RegScopeValid,
+                                   IRProperty::LogicalSyncValid,
                                    IRProperty::HardwareLoopContractValid,
                                    IRProperty::InlineFunctionsEliminated,
                                    IRProperty::MixedKernelExpanded,
@@ -235,6 +238,7 @@ const IRPropertySet& GetStructuralProperties() {
   static const IRPropertySet props{IRProperty::TypeChecked,
                                    IRProperty::SimtValid,
                                    IRProperty::RegScopeValid,
+                                   IRProperty::LogicalSyncValid,
                                    IRProperty::HardwareLoopContractValid,
                                    IRProperty::BreakContinueValid,
                                    IRProperty::NoRedundantBlocks,
@@ -256,6 +260,7 @@ const IRPropertySet& GetDefaultVerifyProperties() {
                                    IRProperty::TypeChecked,
                                    IRProperty::SimtValid,
                                    IRProperty::RegScopeValid,
+                                   IRProperty::LogicalSyncValid,
                                    IRProperty::HardwareLoopContractValid,
                                    IRProperty::NoNestedCalls,
                                    IRProperty::BreakContinueValid,

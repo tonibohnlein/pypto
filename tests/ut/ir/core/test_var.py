@@ -32,6 +32,18 @@ class TestVar:
         assert isinstance(var, ir.Expr)
         assert isinstance(var, ir.IRNode)
 
+    def test_same_name_variables_keep_distinct_dictionary_bindings(self):
+        """Expression equality builds IR; dictionary keys retain wrapper identity."""
+        span = ir.Span.unknown()
+        dtype = ir.ScalarType(DataType.INDEX)
+        outer, inner = ir.Var("i", dtype, span), ir.Var("i", dtype, span)
+        outer_scope = {outer: 3}
+        inner_scope = {**outer_scope, inner: 7}
+        assert len(inner_scope) == 2
+        assert inner_scope[outer] == 3
+        assert inner_scope[inner] == 7
+        assert outer_scope[outer] == 3
+
     def test_var_immutability(self):
         """Test that Var attributes are immutable."""
         span = ir.Span("test.py", 1, 1, 1, 5)

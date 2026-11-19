@@ -52,6 +52,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/simt.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/sync.h"
 #include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/type.h"
 #include "src/ir/transforms/python_printer.h"
@@ -636,8 +637,8 @@ void IRPythonPrinter::PrintCall(const CallPtr& op) {
   const bool direct_tpush = IsOp(op, "tile.tpush_to_aiv_direct");
   if (direct_tpush) op_name = "tile.tpush_to_aiv";
   // Keep the existing barrier IR while presenting its parameterized public
-  // API. The native ops have no operands or kwargs; retain the legacy call
-  // spelling for noncanonical calls rather than silently dropping metadata.
+  // API. The native ops have no operands; retain the legacy call spelling
+  // for noncanonical calls rather than silently dropping metadata.
   // `core_type` is part of the public barrier spelling, so it does NOT make the
   // call noncanonical; any other kwarg does, and falls through to generic Call
   // printing rather than being silently dropped.
@@ -656,8 +657,6 @@ void IRPythonPrinter::PrintCall(const CallPtr& op) {
       barrier_pipe = "M";
     } else if (IsOp(op, "system.bar_v")) {
       barrier_pipe = "V";
-    } else if (IsOp(op, "system.bar_s")) {
-      barrier_pipe = "S";
     } else if (IsOp(op, "system.bar_fix")) {
       barrier_pipe = "FIX";
     } else if (IsOp(op, "system.bar_all")) {
@@ -931,6 +930,9 @@ void IRPythonPrinter::PrintCall(const CallPtr& op) {
   // argument 'dim'" before the wrapper body ever runs. Print `index` as a
   // keyword too whenever `dim` is present so the call reparses.
   const bool gather_kw_index = IsOp(op, "tensor.gather") && op->HasKwarg("dim") && op->args_.size() == 2;
+  // Range bounds are SSA operands in IR and keyword-only in the public DSL.
+  const bool sync_kw_bounds =
+      GetLogicalSyncKind(op->op_) == LogicalSyncKind::MemoryOverlaps && op->args_.size() == 6;
 
   const bool window_view = IsOp(op, "tensor.view") && (op->args_.size() == 4 || op->args_.size() == 5);
 
@@ -949,6 +951,7 @@ void IRPythonPrinter::PrintCall(const CallPtr& op) {
     if (a2av_kw_core_num && i + 1 == op->args_.size()) continue;
     if (mgather && i >= 2) continue;
     if (gather_kw_index && i == 1) continue;
+    if (sync_kw_bounds && i >= 2) continue;
     if (i > 0) stream_ << ", ";
 
     if (window_view && i >= 2) {
@@ -980,6 +983,13 @@ void IRPythonPrinter::PrintCall(const CallPtr& op) {
     stream_ << (need_comma ? ", " : "") << "aiv_subblockid=";
     VisitExpr(op->args_.back());
     need_comma = true;
+  }
+  if (sync_kw_bounds) {
+    static constexpr const char* names[] = {"first_begin", "first_end", "second_begin", "second_end"};
+    for (size_t i = 0; i < 4; ++i) {
+      stream_ << ", " << names[i] << "=";
+      VisitExpr(op->args_[i + 2]);
+    }
   }
   if (gather_row_kw_valid) {
     stream_ << ", valid_shape=";
@@ -1073,8 +1083,11 @@ void IRPythonPrinter::PrintCall(const CallPtr& op) {
     if (value.type() == typeid(int)) {
       int int_val = AnyCast<int>(value, "printing kwarg: " + key);
       // Print pipe kwargs as PipeType enum names for readability
+      const auto sync_kind = GetLogicalSyncKind(op->op_);
       if (key == "set_pipe" || key == "wait_pipe" ||
-          (key == "pipe" && (IsOp(op, "system.sync_set") || IsOp(op, "system.sync_wait") ||
+          (key == "dst_pipe" && sync_kind == LogicalSyncKind::Wait) ||
+          (key == "pipe" && (sync_kind == LogicalSyncKind::Record || sync_kind == LogicalSyncKind::Completed ||
+                             IsOp(op, "system.sync_set") || IsOp(op, "system.sync_wait") ||
                              IsOp(op, "system.set_intra_block") || IsOp(op, "system.wait_intra_block")))) {
         stream_ << prefix_ << ".PipeType." << PipeTypeToString(static_cast<PipeType>(int_val));
       } else if (key == "mode") {

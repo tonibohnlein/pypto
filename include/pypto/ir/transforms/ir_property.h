@@ -162,6 +162,7 @@ enum class IRProperty : uint64_t {
   SimtOutputsMaterialized,    ///< Writable SIMT Tiles use initialized, dedicated output storage
   SimtSpecialized,            ///< Reachable helpers carry resources matching their launch dimensions
   AsyncHandleProvenance,      ///< Distributed events and sessions trace to matching SSA definitions
+  LogicalSyncValid,           ///< Logical completion schemas, ownership and lexical SSA are valid
   kCount                      ///< Sentinel (must be last)
 };
 
@@ -307,9 +308,9 @@ const IRPropertySet& GetVerifiedProperties();
  * Never declared in per-pass PassProperties. VerificationInstrument checks
  * them before and after every pass; at pipeline start PassPipeline checks only
  * the intersection with GetVerifiedProperties(). Returns {TypeChecked, SimtValid, RegScopeValid,
- * HardwareLoopContractValid, BreakContinueValid, NoRedundantBlocks, UseAfterDef, OutParamNotShadowed,
- * NoNestedInCore, InOutUseValid, PipelineLoopValid, ArrayNotEscaped, ManualDepsOnSubmitOnly,
- * AtomicAddDtypeValid, NoScalarKernelReturn, AssignTypeSymmetry}.
+ * LogicalSyncValid, HardwareLoopContractValid, BreakContinueValid, NoRedundantBlocks, UseAfterDef,
+ * OutParamNotShadowed, NoNestedInCore, InOutUseValid, PipelineLoopValid, ArrayNotEscaped,
+ * ManualDepsOnSubmitOnly, AtomicAddDtypeValid, NoScalarKernelReturn, AssignTypeSymmetry}.
  */
 const IRPropertySet& GetStructuralProperties();
 
