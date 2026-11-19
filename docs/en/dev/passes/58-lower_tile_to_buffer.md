@@ -892,6 +892,25 @@ C++ generation. These checks qualify the declared contiguous storage model;
 they do not establish native device correctness or add unsupported broadcast
 operation recipes.
 
+### Native integer fields on A2/A3
+
+Binary column broadcasts select their native loop from the destination tile descriptor.
+In normal mode, one vector instruction repeats across the active rows. Its repeat count
+fits in 8 bits, and moving between rows requires each matrix row stride to fit in
+255 blocks of 32 bytes. A destination with multiple physical rows and a partial or
+runtime valid-column template uses count mode, which advances the row pointers explicitly.
+For example, a full-valid static FP32 `[2,2048]` Buffer destination needs a stride of
+256 blocks. Buffer selection can keep this kernel in Functional IR, where the emitted
+destination has runtime validity and uses count mode.
+
+Both Functional and Buffer code generation check the row and column starts passed to
+`TEXTRACT`. Each must fit in an unsigned 16-bit field. For a dynamic start, the full
+window's in-bounds contract can establish the limit. For example, a 32-column window
+in a 65,552-column source can start at most at 65,520. A 16-column window in the same
+source can start at 65,536 and requires additional evidence about its start.
+Vec-to-Vec extracts also pass the destination’s active row and column counts through
+unsigned 16-bit fields. The same width limit applies to those counts.
+
 ### Runtime rows in column broadcast
 
 The FP32 `col_expand_mul` recipe additionally accepts runtime active rows while

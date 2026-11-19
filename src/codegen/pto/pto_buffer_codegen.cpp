@@ -434,6 +434,9 @@ class BufferEmissionPreflight : public ir::IRVisitor {
                                                         "indexed operations currently supports A2/A3 only";
     }
     if (const auto* axis = backend::FindBufferAxisRecipe(call->op_->name_); axis) {
+      if (conversion_supported_) {
+        backend::ValidateA2A3BufferAxisEncoding(*axis, call);
+      }
       bool runtime_valid = false;
       for (const auto& arg : call->args_) {
         if (const auto type = As<ir::BufferType>(arg->GetType())) {
@@ -982,6 +985,31 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
          BufferInsOutsClause(inputs, call->args_[2]) +
          FormatMatmulTf32Attr(call, GetBackendHandler()->GetPtoTargetArch()));
   } else if (ir::IsOp(call, "buffer.extract") || ir::IsOp(call, "buffer.insert")) {
+    if (ir::IsOp(call, "buffer.extract") && GetBackendHandler()->GetPtoTargetArch() == "a2a3") {
+      INTERNAL_CHECK_SPAN(call->args_.size() == 4 && call->args_[0] && call->args_[3], call->span_)
+          << "Internal error: buffer.extract requires a source buffer, offsets and a destination buffer";
+      const auto source = As<ir::BufferType>(call->args_[0]->GetType());
+      const auto destination = As<ir::BufferType>(call->args_[3]->GetType());
+      INTERNAL_CHECK_SPAN(source && source->shape_.size() == 2 && destination &&
+                              destination->shape_.size() == 2 && destination->valid_shape_.size() == 2,
+                          call->span_)
+          << "Internal error: buffer.extract requires rank-two source and destination buffers";
+      backend::pto_ops_detail::CheckA2A3ExtractCoordinate(call->args_[1], "row", source->shape_[0],
+                                                          destination->shape_[0]);
+      backend::pto_ops_detail::CheckA2A3ExtractCoordinate(call->args_[2], "column", source->shape_[1],
+                                                          destination->shape_[1]);
+      if (source->memory_space_ == ir::MemorySpace::Vec &&
+          destination->memory_space_ == ir::MemorySpace::Vec) {
+        for (size_t dim = 0; dim < 2; ++dim) {
+          const int64_t valid = destination->valid_shape_[dim];
+          // A dynamic Buffer descriptor can be updated. Its own physical
+          // capacity supplies the bound independently of source metadata.
+          backend::pto_ops_detail::CheckA2A3VecExtractValidExtent(
+              valid >= 0 ? std::optional<int64_t>{valid} : std::nullopt, destination->shape_[dim],
+              dim == 0 ? "row" : "column", call->span_);
+        }
+      }
+    }
     const std::string row = EmitBufferIntegerOperand(call->args_[1], DataType::INDEX);
     const std::string col = EmitBufferIntegerOperand(call->args_[2], DataType::INDEX);
     Emit(std::string(backend::BufferNativeOperation(call)) + " ins(" + GetExprAsCode(call->args_[0]) + ", " +

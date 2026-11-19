@@ -13,9 +13,11 @@
 #define PYPTO_BACKEND_COMMON_BUFFER_AXIS_RECIPES_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
+#include "pypto/core/dtype.h"
 #include "pypto/ir/expr.h"
 
 namespace pypto::backend {
@@ -39,6 +41,13 @@ const BufferAxisRecipe* FindLogicalBufferAxisRecipe(const std::string& name);
 const BufferAxisRecipe* FindBufferAxisRecipe(const std::string& name);
 bool SupportsLogicalBufferAxis(const BufferAxisRecipe& recipe, const ir::CallPtr& call);
 void ValidateBufferAxisOperands(const BufferAxisRecipe& recipe, const std::vector<ir::ExprPtr>& args);
+
+/// A2/A3 binary column broadcasts share a native implementation. A negative
+/// native_valid_cols denotes the mutable valid-column template parameter.
+const char* A2A3ColumnBroadcastEncodingError(DataType dtype, int64_t rows, int64_t cols,
+                                             int64_t valid_row_bound, int64_t native_valid_cols,
+                                             int64_t max_row_stride);
+void ValidateA2A3BufferAxisEncoding(const BufferAxisRecipe& recipe, const ir::CallPtr& call);
 
 }  // namespace pypto::backend
 

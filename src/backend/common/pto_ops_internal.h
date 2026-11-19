@@ -23,6 +23,7 @@
  */
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -111,6 +112,18 @@ std::string GenerateInsOutsClause(const ir::CallPtr& op, codegen::PTOCodegen& co
 bool HasStaticValidShape(const std::shared_ptr<const ir::TileType>& tile_type);
 void RequireStaticValidShapeForPtoas(const std::shared_ptr<const ir::TileType>& tile_type,
                                      std::string_view op_name, std::string_view role, const ir::Span& span);
+/// Check the A2/A3 native TEXTRACT coordinate width. A nonzero source/window
+/// pair supplies the existing hard in-bounds precondition for dynamic offsets.
+void CheckA2A3ExtractCoordinate(const ir::ExprPtr& offset, std::string_view axis, int64_t source_extent = 0,
+                                int64_t window_extent = 0);
+/// Native A2/A3 Vec-to-Vec extraction also narrows active destination extents.
+void CheckA2A3VecExtractValidExtent(std::optional<int64_t> extent, int64_t dynamic_upper_bound,
+                                    std::string_view axis, const ir::Span& span);
+/// Read a shape field from the canonical native descriptor. Dynamic fields return -1.
+int64_t NativeTileExtent(std::string_view type, std::string_view field, const ir::Span& span);
+void CheckA2A3VecExtractValidShape(std::string_view native_type, const ir::Span& span);
+void CheckA2A3VecExtractValidShape(const ir::TileTypePtr& destination, const ir::Span& span,
+                                   const ir::TileTypePtr& source = nullptr);
 std::string GetTileViewTypeAnnotation(const ir::ExprPtr& expr, codegen::PTOCodegen& codegen);
 /// Explicit validity for a mutable reshape alias. Both fields name emitted
 /// index SSA operands in physical tile coordinates (including FP4 packing).

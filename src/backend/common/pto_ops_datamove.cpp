@@ -20,6 +20,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -1738,16 +1739,47 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
         << "tile.extract requires 4 arguments (src, index_row, index_col, shape), but got "
         << op->args_.size();
 
+    std::string result_target = codegen.GetCurrentResultTarget();
+    std::string result_type = codegen.GetCurrentResultTileBufTypeStringFromTileType();
+    const auto existing_type = codegen.GetSSATileBufType(result_target);
+    const bool needs_new_buffer = !result_type.empty() && existing_type != result_type;
+
+    if (codegen.GetBackendHandler()->GetPtoTargetArch() == "a2a3") {
+      const auto source_tile = op->args_[0] ? As<ir::TileType>(op->args_[0]->GetType()) : nullptr;
+      const auto shape = As<ir::MakeTuple>(op->args_[3]);
+      INTERNAL_CHECK_SPAN(
+          source_tile && source_tile->shape_.size() == 2 && shape && shape->elements_.size() == 2, op->span_)
+          << "Internal error: tile.extract requires a rank-two source tile and window shape";
+      const auto check_coordinate = [&](size_t dim, std::string_view axis) {
+        const auto source_extent = As<ir::ConstInt>(source_tile->shape_[dim]);
+        const auto window_extent = As<ir::ConstInt>(shape->elements_[dim]);
+        pto_ops_detail::CheckA2A3ExtractCoordinate(op->args_[dim + 1], axis,
+                                                   source_extent ? source_extent->value_ : 0,
+                                                   window_extent ? window_extent->value_ : 0);
+      };
+      check_coordinate(0, "row");
+      check_coordinate(1, "column");
+      const auto destination = codegen.GetCurrentResultTileType();
+      if (source_tile->GetMemorySpace() == ir::MemorySpace::Vec && destination &&
+          destination->GetMemorySpace() == ir::MemorySpace::Vec) {
+        // Unaddressed destinations may share an already initialized handle.
+        // The fresh fallback also omits explicit valid operands. Only rely on
+        // logical validity for ordinary addressed per-variable allocations.
+        if (!codegen.EmitTileAddr() || needs_new_buffer) {
+          pto_ops_detail::CheckA2A3VecExtractValidShape(needs_new_buffer ? result_type : existing_type,
+                                                        op->span_);
+        } else {
+          pto_ops_detail::CheckA2A3VecExtractValidShape(destination, op->span_, source_tile);
+        }
+      }
+    }
+
     std::string src = codegen.GetExprAsCode(op->args_[0]);
     std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
     const auto offsets = GetSizeCodes({op->args_[1], op->args_[2]}, codegen);
     // args_[3] is the shape tuple: type-deduction only, no PTO operand.
 
-    std::string result_target = codegen.GetCurrentResultTarget();
-    std::string result_type = codegen.GetCurrentResultTileBufTypeStringFromTileType();
-
-    auto existing_type = codegen.GetSSATileBufType(result_target);
-    if (!result_type.empty() && existing_type != result_type) {
+    if (needs_new_buffer) {
       result_target = codegen.AllocNewTileBuf(result_type, "extract_buf");
       codegen.SetCurrentResultBuf(result_target);
     }

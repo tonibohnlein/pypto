@@ -15,29 +15,35 @@
  */
 
 #include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_handler.h"
 #include "pypto/backend/common/pto_native_ops.h"
 #include "pypto/codegen/codegen_base.h"
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/codegen/pto/pto_type_utils.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/arith/const_fold.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 #include "src/backend/common/pto_ops_internal.h"
 
 namespace pypto {
@@ -528,6 +534,119 @@ void EmitInsOuts(codegen::PTOCodegen& codegen, std::string_view pto_op_name,
                    ins, {{codegen.GetCurrentResultTarget(), codegen.GetCurrentResultTileBufTypeString()}}));
 }
 
+static bool HasIntrinsicA2A3ExtractCoordinateRange(const ir::ExprPtr& offset) {
+  const auto dtype = ir::GetScalarDtype(offset);
+  constexpr size_t kCoordinateBits = std::numeric_limits<uint16_t>::digits;
+  if (dtype.IsUnsignedInt() && dtype.GetBit() <= kCoordinateBits) {
+    return true;
+  }
+  if (const auto cast = As<ir::Cast>(offset)) {
+    const auto operand_dtype = ir::GetScalarDtype(cast->operand_);
+    // Widening from an unsigned type preserves the nonnegative range.
+    return operand_dtype.IsUnsignedInt() && operand_dtype.GetBit() <= kCoordinateBits &&
+           (dtype == DataType::INDEX || (dtype.IsInt() && dtype.GetBit() > operand_dtype.GetBit()));
+  }
+  if (const auto mod = As<ir::FloorMod>(offset); mod && (dtype == DataType::INDEX || dtype.IsSignedInt())) {
+    const auto divisor = As<ir::ConstInt>(mod->right_);
+    // The signed FloorMod emitter corrects negative remainders into [0, divisor).
+    return divisor && divisor->value_ > 0 && divisor->value_ - 1 <= std::numeric_limits<uint16_t>::max() &&
+           ir::arith::detail::ConstIntFitsDtype(divisor->value_, divisor->dtype()) &&
+           ir::arith::detail::ConstIntFitsDtype(divisor->value_, dtype);
+  }
+  return false;
+}
+
+void CheckA2A3ExtractCoordinate(const ir::ExprPtr& offset, std::string_view axis, int64_t source_extent,
+                                int64_t window_extent) {
+  // PTOAS casts coordinates to uint16_t, and the A2/A3 TEXTRACT ABI takes
+  // uint16_t coordinates even when the tile and scalar IR use wider types.
+  constexpr int64_t kMaxCoordinate = std::numeric_limits<uint16_t>::max();
+  INTERNAL_CHECK(offset) << "Internal error: TEXTRACT requires non-null offsets";
+  const auto literal = As<ir::ConstInt>(offset);
+  const auto constant =
+      literal ? std::optional<int64_t>{literal->value_} : ir::arith::TryEvaluateIntConstant(offset);
+  if (constant) {
+    CHECK_SPAN(*constant >= 0 && *constant <= kMaxCoordinate, offset->span_)
+        << "A2/A3 TEXTRACT " << axis << " offset " << *constant << " is outside [0, " << kMaxCoordinate
+        << "]; extract from a smaller source window";
+    return;
+  }
+
+  // The whole requested window must fit in its source, including the invalid
+  // portion of a partial window. Consequently a valid dynamic coordinate is
+  // at most source_extent - window_extent, even if its scalar type is wide.
+  const bool in_bounds_window =
+      window_extent > 0 && source_extent >= window_extent && source_extent - window_extent <= kMaxCoordinate;
+  CHECK_SPAN(in_bounds_window || HasIntrinsicA2A3ExtractCoordinateRange(offset), offset->span_)
+      << "A2/A3 TEXTRACT " << axis << " offset must be provably within [0, " << kMaxCoordinate
+      << "]; use a bounded offset or extract from a smaller source window";
+}
+
+void CheckA2A3VecExtractValidExtent(std::optional<int64_t> extent, int64_t dynamic_upper_bound,
+                                    std::string_view axis, const ir::Span& span) {
+  // Both ND and NZ native dispatch narrow GetValidRow() and GetValidCol().
+  constexpr int64_t kMaxExtent = std::numeric_limits<uint16_t>::max();
+  if (extent) {
+    CHECK_SPAN(*extent >= 0 && *extent <= kMaxExtent, span)
+        << "A2/A3 TEXTRACT destination valid " << axis << " extent " << *extent << " is outside [0, "
+        << kMaxExtent << "]; extract a smaller window";
+  } else {
+    CHECK_SPAN(dynamic_upper_bound >= 0 && dynamic_upper_bound <= kMaxExtent, span)
+        << "A2/A3 TEXTRACT destination valid " << axis << " extent must be provably within [0, " << kMaxExtent
+        << "]; extract a smaller window";
+  }
+}
+
+int64_t NativeTileExtent(std::string_view type, std::string_view field, const ir::Span& span) {
+  const auto field_pos = type.find(field);
+  INTERNAL_CHECK_SPAN(field_pos != std::string_view::npos, span)
+      << "Internal error: missing " << field << " in emitted tile descriptor " << type;
+  type.remove_prefix(field_pos + field.size());
+  const auto value = type.substr(0, type.find(','));
+  if (value == "?") {
+    return -1;
+  }
+  int64_t extent = 0;
+  const auto end = value.data() + value.size();
+  const auto parsed = std::from_chars(value.data(), end, extent);
+  INTERNAL_CHECK_SPAN(parsed.ec == std::errc() && parsed.ptr == end, span)
+      << "Internal error: invalid " << field << " in emitted tile descriptor";
+  return extent;
+}
+
+void CheckA2A3VecExtractValidShape(std::string_view native_type, const ir::Span& span) {
+  const auto check = [&](std::string_view axis, std::string_view active_field,
+                         std::string_view capacity_field) {
+    const auto active = NativeTileExtent(native_type, active_field, span);
+    const auto capacity = NativeTileExtent(native_type, capacity_field, span);
+    CheckA2A3VecExtractValidExtent(active >= 0 ? std::optional<int64_t>{active} : std::nullopt, capacity,
+                                   axis, span);
+  };
+  check("row", ", v_row=", ", rows=");
+  check("column", ", v_col=", ", cols=");
+}
+
+void CheckA2A3VecExtractValidShape(const ir::TileTypePtr& destination, const ir::Span& span,
+                                   const ir::TileTypePtr& source) {
+  const auto& shape = destination->shape_;
+  const auto valid = ir::GetValidShape(destination);
+  const auto source_valid = source ? ir::GetValidShape(source) : std::vector<ir::ExprPtr>{};
+  INTERNAL_CHECK_SPAN((shape.size() == 1 || shape.size() == 2) && shape.size() == valid.size(), span)
+      << "Internal error: Vec TEXTRACT destination validity must match its rank-one or rank-two shape";
+  for (size_t dim = 0; dim < shape.size(); ++dim) {
+    const auto extent = ir::arith::TryEvaluateIntConstant(valid[dim]);
+    constexpr int64_t kUnknownBound = std::numeric_limits<int64_t>::max();
+    auto upper_bound = ir::arith::TryEvaluateIntConstant(shape[dim]).value_or(kUnknownBound);
+    // Functional tile.extract infers the result validity by intersecting the
+    // requested window with the source's valid region.
+    if (source_valid.size() == shape.size()) {
+      upper_bound =
+          std::min(upper_bound, ir::arith::TryEvaluateIntConstant(source_valid[dim]).value_or(kUnknownBound));
+    }
+    CheckA2A3VecExtractValidExtent(extent, upper_bound, dim + 1 == shape.size() ? "column" : "row", span);
+  }
+}
+
 std::string MaterializeSubviewOperandIfNeeded(const ir::ExprPtr& expr, codegen::PTOCodegen& codegen,
                                               const std::string& name_hint) {
   auto var = ir::As<ir::Var>(expr);
@@ -581,6 +700,21 @@ std::string MaterializeSubviewOperandIfNeeded(const ir::ExprPtr& expr, codegen::
       << " columns) would repack strided -> dense on top of its own live source and corrupt it. "
          "CanonicalizeTileSlice must rewrite this slice into a tile.extract with a fresh buffer";
 
+  if (codegen.GetBackendHandler()->GetPtoTargetArch() == "a2a3") {
+    CheckA2A3ExtractCoordinate(mat->row_offset, "row");
+    CheckA2A3ExtractCoordinate(mat->col_offset, "column");
+    const auto destination = As<ir::TileType>(var->GetType());
+    if (mat->source_memory_space == ir::MemorySpace::Vec && destination &&
+        destination->GetMemorySpace() == ir::MemorySpace::Vec) {
+      // In PTOAS-planned mode the target may reuse a handle initialized by
+      // another tile. The slice's logical validity does not describe that handle.
+      if (codegen.EmitTileAddr()) {
+        CheckA2A3VecExtractValidShape(destination, expr->span_);
+      } else {
+        CheckA2A3VecExtractValidShape(mat->materialize_target_type, expr->span_);
+      }
+    }
+  }
   auto result_type = mat->materialize_target_type;
   std::ostringstream extract;
   extract << "pto.textract ins(" << mat->source_ssa << ", " << mat->row_off_ssa << ", " << mat->col_off_ssa;

@@ -11,13 +11,18 @@
 
 #include "pypto/backend/common/buffer_axis_recipes.h"
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 
+#include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_config.h"
+#include "pypto/backend/common/backend_handler.h"
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/pto_native_ops.h"
 #include "pypto/core/any_cast.h"
@@ -89,7 +94,53 @@ const BufferAxisRecipe* FindBufferAxisRecipe(const std::string& name) {
   return found == index.end() ? nullptr : found->second;
 }
 
+const char* A2A3ColumnBroadcastEncodingError(DataType dtype, int64_t rows, int64_t cols,
+                                             int64_t valid_row_bound, int64_t native_valid_cols,
+                                             int64_t max_row_stride) {
+  // PTO-ISA TColExpandBinOp.hpp selects count mode for a partial or mutable
+  // column extent, except on single-row tiles. Count mode loops over rows with
+  // unsigned element offsets and sends the valid columns to the count mask.
+  if (rows != 1 && native_valid_cols != cols) {
+    const auto row_span = std::max(cols, max_row_stride);
+    if (row_span <= 0 || valid_row_bound > std::numeric_limits<uint32_t>::max() / row_span) {
+      return "requires A2/A3 native count-mode element offsets to fit uint32; split the tile";
+    }
+    return nullptr;
+  }
+  constexpr int64_t kMaxRepeatField = std::numeric_limits<uint8_t>::max();
+  if (valid_row_bound > kMaxRepeatField) {
+    return "requires the A2/A3 native repeat count to fit uint8; split the tile into at most 255 valid rows";
+  }
+  // The broadcast operand uses zero repeat stride. A single repeat never
+  // advances a row, so it can use a wider tile.
+  if (valid_row_bound > 1) {
+    constexpr int64_t kBlockBits = 32 * 8;
+    const auto element_bits = static_cast<int64_t>(dtype.GetBit());
+    if (element_bits <= 0 || element_bits > kBlockBits ||
+        max_row_stride / (kBlockBits / element_bits) > kMaxRepeatField) {
+      return "requires the A2/A3 native repeat stride to fit uint8; split the tile into narrower columns";
+    }
+  }
+  return nullptr;
+}
+
 namespace {
+
+bool IsConfiguredForA2A3() {
+  return BackendConfig::IsConfigured() &&
+         BackendConfig::GetBackend()->GetHandler()->GetPtoTargetArch() == "a2a3";
+}
+
+const char* BufferColumnBroadcastEncodingError(const BufferAxisRecipe& recipe,
+                                               const ir::BufferTypePtr& destination) {
+  if (recipe.axis != 0 || recipe.reduction || !destination || destination->shape_.size() != 2) {
+    return nullptr;
+  }
+  const auto& shape = destination->shape_;
+  const auto& valid = destination->valid_shape_;
+  return A2A3ColumnBroadcastEncodingError(destination->dtype_, shape[0], shape[1],
+                                          valid[0] < 0 ? shape[0] : valid[0], valid[1], shape[1]);
+}
 
 bool HasRuntimeMetadata(const std::vector<ir::BufferTypePtr>& types) {
   for (const auto& type : types)
@@ -158,14 +209,10 @@ const char* OperandError(const BufferAxisRecipe& recipe, const std::vector<ir::B
   }
   if (recipe.axis == 0) {
     const auto& row = types[1];
-    const bool dynamic_broadcast =
-        std::string_view(recipe.buffer_op) == "buffer.col_expand_mul" &&
-        (source->valid_shape_ == std::vector<int64_t>{-1, -1} ||
-         types[2]->valid_shape_ == std::vector<int64_t>{-1, -1});
+    const bool dynamic_broadcast = std::string_view(recipe.buffer_op) == "buffer.col_expand_mul" &&
+                                   (source->valid_shape_ == std::vector<int64_t>{-1, -1} ||
+                                    types[2]->valid_shape_ == std::vector<int64_t>{-1, -1});
     if (dynamic_broadcast) {
-      if (source->shape_[0] > 255 || source->shape_[1] / 8 > 255) {
-        return "requires native repeat count and row stride to fit uint8";
-      }
       if (row->shape_[0] != 1 || row->valid_shape_[0] != 1 || row->shape_[1] != source->shape_[1] ||
           row->valid_shape_[1] != source->shape_[1]) {
         return "requires a single full-valid row preserving physical columns";
@@ -174,7 +221,8 @@ const char* OperandError(const BufferAxisRecipe& recipe, const std::vector<ir::B
         return "requires the broadcast destination to preserve source physical shape";
       }
       for (const auto& matrix : {source, types[2]}) {
-        if (matrix->valid_shape_ != std::vector<int64_t>{-1, -1} && matrix->valid_shape_[1] != matrix->shape_[1]) {
+        if (matrix->valid_shape_ != std::vector<int64_t>{-1, -1} &&
+            matrix->valid_shape_[1] != matrix->shape_[1]) {
           return "requires full-valid columns in the broadcast matrices";
         }
       }
@@ -298,11 +346,23 @@ bool SupportsLogicalBufferAxis(const BufferAxisRecipe& recipe, const ir::CallPtr
     types = {PhysicalLogicalVecDescriptor(call->args_[0]->GetType()),
              StaticLogicalBufferDescriptor(call->args_[1]->GetType()),
              PhysicalLogicalVecDescriptor(call->GetType())};
-    if (types[0] && types[2] && (types[0]->shape_[0] > 255 || types[0]->shape_[1] / 8 > 255)) return false;
+    // These projections describe capacity. Both matrices have the same
+    // symbolic valid rows, so lowering gives them mutable native validity.
+    if (OperandError(recipe, types) != nullptr) {
+      return false;
+    }
+    const auto& dst = types[2];
+    return A2A3ColumnBroadcastEncodingError(dst->dtype_, dst->shape_[0], dst->shape_[1], dst->shape_[0],
+                                            /*native_valid_cols=*/-1, dst->shape_[1]) == nullptr;
   } else {
     for (const auto& arg : call->args_) types.push_back(StaticLogicalBufferDescriptor(arg->GetType()));
     types.push_back(StaticLogicalBufferDescriptor(call->GetType()));
-    if (OperandError(recipe, types) == nullptr) return true;
+    if (OperandError(recipe, types) == nullptr) {
+      // Whole-function Buffer admission is A2/A3-only. Ordinary Functional
+      // allocations use mutable native validity and may safely run in count mode.
+      return recipe.axis != 0 || recipe.reduction || !IsConfiguredForA2A3() ||
+             BufferColumnBroadcastEncodingError(recipe, types.back()) == nullptr;
+    }
     if (recipe.axis != 1 || !MatchingLogicalRowValid(recipe, call)) return false;
     types = {PhysicalLogicalVecDescriptor(call->args_[0]->GetType()),
              recipe.reduction ? StaticLogicalBufferDescriptor(call->args_[1]->GetType())
@@ -324,6 +384,20 @@ void ValidateBufferAxisOperands(const BufferAxisRecipe& recipe, const std::vecto
   }
   const auto* error = OperandError(recipe, types);
   CHECK(!error) << recipe.buffer_op << " " << error;
+  if (recipe.axis == 0 && !recipe.reduction && IsConfiguredForA2A3()) {
+    const auto* encoding_error = BufferColumnBroadcastEncodingError(recipe, types.back());
+    CHECK(!encoding_error) << recipe.buffer_op << " " << encoding_error;
+  }
+}
+
+void ValidateA2A3BufferAxisEncoding(const BufferAxisRecipe& recipe, const ir::CallPtr& call) {
+  if (recipe.axis == 0 && !recipe.reduction) {
+    INTERNAL_CHECK_SPAN(call->args_.size() == 3, call->span_)
+        << "Internal error: expected source, broadcast row and destination for " << recipe.buffer_op;
+    const auto destination = ir::As<ir::BufferType>(call->args_.back()->GetType());
+    const auto* error = BufferColumnBroadcastEncodingError(recipe, destination);
+    CHECK_SPAN(!error, call->span_) << recipe.buffer_op << " " << error;
+  }
 }
 
 }  // namespace pypto::backend

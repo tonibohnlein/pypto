@@ -29,6 +29,7 @@
 
 #include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_handler.h"
+#include "pypto/backend/common/buffer_axis_recipes.h"
 #include "pypto/backend/common/cube_operand_types.h"
 #include "pypto/backend/common/pto_native_ops.h"
 #include "pypto/codegen/codegen_base.h"
@@ -71,6 +72,7 @@ using pto_ops_detail::GetTileViewTypeAnnotation;
 using pto_ops_detail::HasStaticValidShape;
 using pto_ops_detail::MaterializeSubviewOperandIfNeeded;
 using pto_ops_detail::MutableTileViewShape;
+using pto_ops_detail::NativeTileExtent;
 using pto_ops_detail::RequireStaticValidShapeForPtoas;
 
 /// Operators whose PTOAS lowering walks every operand and the result as one flat
@@ -229,6 +231,31 @@ static bool RequiresRowMajorLayout(std::string_view op_name) {
 static void CheckMatmulOperandArch(const CallPtr& op, size_t lhs_index, size_t rhs_index,
                                    codegen::PTOCodegen& codegen);
 
+static int64_t NativeTileRowStride(std::string_view type, const ir::Span& span) {
+  // PTO-ISA's Tile::RowStride is Cols for row-major and 1 for col-major.
+  if (type.find(", blayout=col_major,") != std::string_view::npos) {
+    return 1;
+  }
+  return NativeTileExtent(type, ", cols=", span);
+}
+
+static void CheckA2A3ColumnBroadcastEncoding(const CallPtr& op, std::string_view destination,
+                                             std::string_view lhs, std::string_view rhs) {
+  const auto& span = op->span_;
+  const auto type = As<ir::TileType>(op->GetType());
+  INTERNAL_CHECK_SPAN(type, span) << "Internal error: " << op->op_->name_ << " requires a TileType result";
+  const auto rows = NativeTileExtent(destination, ", rows=", span);
+  const auto cols = NativeTileExtent(destination, ", cols=", span);
+  const auto valid_rows = NativeTileExtent(destination, ", v_row=", span);
+  const auto valid_cols = NativeTileExtent(destination, ", v_col=", span);
+  // Native dispatch selects the matrix operand using its live valid shape.
+  // Bound both input strides in case either is selected.
+  const auto max_stride = std::max({cols, NativeTileRowStride(lhs, span), NativeTileRowStride(rhs, span)});
+  const auto* error = A2A3ColumnBroadcastEncodingError(
+      type->dtype_, rows, cols, valid_rows < 0 ? rows : valid_rows, valid_cols, max_stride);
+  CHECK_SPAN(!error, span) << op->op_->name_ << " " << error;
+}
+
 static std::string MakeNaryCodegenPTO(const std::string& pto_op_name, size_t arity, const CallPtr& op,
                                       codegen::CodegenBase& codegen_base,
                                       std::optional<size_t> i32_operand_idx = std::nullopt) {
@@ -264,34 +291,25 @@ static std::string MakeNaryCodegenPTO(const std::string& pto_op_name, size_t ari
       pto_op_name == "pto.tcolexpandexpdif") {
     // Derive a debug hint from the op name (e.g. "pto.tcolexpandmul" -> "colexpandmul").
     const std::string mat_tag = pto_op_name.substr(std::string("pto.t").size());
-    auto lhs_operand = MaterializeSubviewOperandIfNeeded(op->args_[0], codegen, mat_tag + "_mat");
-    auto rhs_operand = MaterializeSubviewOperandIfNeeded(op->args_[1], codegen, mat_tag + "_vec");
-    std::string lhs_orig = codegen.GetExprAsCode(op->args_[0]);
-    std::string rhs_orig = codegen.GetExprAsCode(op->args_[1]);
-    if (lhs_operand != lhs_orig || rhs_operand != rhs_orig) {
-      // Resolve type annotations: use the materialized target type when
-      // the operand was a subview, otherwise use the original annotation.
-      std::string lhs_type = codegen.GetExprTypeAnnotation(op->args_[0]);
-      auto* lhs_mat = codegen.GetSubviewMaterialization(lhs_orig);
-      if (lhs_mat) lhs_type = lhs_mat->materialize_target_type;
-
-      std::string rhs_type = codegen.GetExprTypeAnnotation(op->args_[1]);
-      auto* rhs_mat = codegen.GetSubviewMaterialization(rhs_orig);
-      if (rhs_mat) rhs_type = rhs_mat->materialize_target_type;
-
-      std::ostringstream oss;
-      oss << pto_op_name << " ins(" << lhs_operand << ", " << rhs_operand;
-      if (!lhs_type.empty() && !rhs_type.empty()) {
-        oss << " : " << lhs_type << ", " << rhs_type;
+    const auto materialize = [&](const ExprPtr& arg, const std::string& hint) {
+      const auto original = codegen.GetExprAsCode(arg);
+      const auto operand = MaterializeSubviewOperandIfNeeded(arg, codegen, hint);
+      if (operand != original) {
+        const auto* info = codegen.GetSubviewMaterialization(original);
+        INTERNAL_CHECK_SPAN(info, arg->span_)
+            << "Internal error: missing column broadcast subview materialization";
+        return std::make_pair(operand, info->materialize_target_type);
       }
-      std::string result_target = codegen.GetCurrentResultTarget();
-      std::string result_type = codegen.GetCurrentResultTileBufTypeString();
-      oss << ") outs(" << result_target;
-      if (!result_type.empty()) oss << " : " << result_type;
-      oss << ")";
-      codegen.Emit(oss.str());
-      return "";
+      return std::make_pair(operand, codegen.GetExprTypeAnnotation(arg));
+    };
+    const auto lhs = materialize(op->args_[0], mat_tag + "_mat");
+    const auto rhs = materialize(op->args_[1], mat_tag + "_vec");
+    if (codegen.GetBackendHandler()->GetPtoTargetArch() == "a2a3") {
+      CheckA2A3ColumnBroadcastEncoding(op, codegen.GetCurrentResultTileBufTypeString(), lhs.second,
+                                       rhs.second);
     }
+    EmitInsOuts(codegen, pto_op_name, {lhs, rhs});
+    return "";
   }
   if (ir::IsOp(op, "tile.matmul") || ir::IsOp(op, "tile.matmul_bias")) {
     CheckMatmulOperandArch(op, /*lhs_index=*/0, /*rhs_index=*/1, codegen);
