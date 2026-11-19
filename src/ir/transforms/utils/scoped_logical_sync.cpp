@@ -97,8 +97,8 @@ class ScopedRealizer : public IRMutator {
     result.name_scan_nodes = names_.Nodes();
   }
   void Append(const CompactSyncResult& analysis, const ExprPtr& guard = nullptr) {
-    CHECK(analysis.input.region_tree) << "Scoped logical transport requires an original region tree";
-    for (const auto& segment : analysis.input.segments)
+    CHECK(analysis.State().input.region_tree) << "Scoped logical transport requires an original region tree";
+    for (const auto& segment : analysis.State().input.segments)
       for (const auto& frame : segment.nested_frames)
         if (frame.count) active_loops_.insert(frame.loop.get());
     const auto families = analysis.ExportScopedDemands();
@@ -106,7 +106,7 @@ class ScopedRealizer : public IRMutator {
     for (const auto& family : families->families) {
       CHECK(analysis.ReferenceBefore(family.source, family.target))
           << "Scoped token source must precede its consumer in the original invocation";
-      Add(analysis.input, family, guard);
+      Add(analysis.State().input, family, guard);
     }
   }
   LogicalSyncRealization result;
@@ -353,10 +353,10 @@ class ScopedRealizer : public IRMutator {
 };
 }  // namespace
 LogicalSyncRealization RealizeScopedLogicalSync(const CompactSyncResult& analysis) {
-  CHECK(analysis.input.region_tree) << "Scoped logical transport requires an original region tree";
-  ScopedRealizer realizer(analysis.input.owner);
+  CHECK(analysis.State().input.region_tree) << "Scoped logical transport requires an original region tree";
+  ScopedRealizer realizer(analysis.State().input.owner);
   realizer.Append(analysis);
-  realizer.result.function = realizer.VisitFunction(analysis.input.owner);
+  realizer.result.function = realizer.VisitFunction(analysis.State().input.owner);
   CheckLogicalSync(realizer.result.function);
   return realizer.result;
 }
@@ -366,9 +366,9 @@ LogicalSyncRealization RealizeLogicalInvocation(const SyncInvocationAnalysis& an
   const auto block = DominatingSyncBlock(analysis.owner);
   auto next = analysis.block_bounds.first;
   for (const auto& item : analysis.cases) {
-    CHECK(item.mathematics && item.mathematics->input.owner == analysis.owner &&
-          item.mathematics->input.parameter_bounds == analysis.parameter_bounds &&
-          item.mathematics->input.block_bounds == std::make_pair(item.block_first, item.block_last) &&
+    CHECK(item.mathematics && item.mathematics->State().input.owner == analysis.owner &&
+          item.mathematics->State().input.parameter_bounds == analysis.parameter_bounds &&
+          item.mathematics->State().input.block_bounds == std::make_pair(item.block_first, item.block_last) &&
           item.block_first == next && item.block_last >= next &&
           item.block_last < std::numeric_limits<int64_t>::max())
         << "Incomplete logical invocation cases";

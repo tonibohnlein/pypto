@@ -89,10 +89,10 @@ void InvertNumericalRows(NumericalNode& node) {
     }
   }
 }
-void CountNumericalInterface(const NumericalNode& node, CompactSyncResult& result) {
+void CountNumericalInterface(const NumericalNode& node, CompactSyncBuilder& result) {
   for (const auto& chain : node.chains) {
-    result.interface_ports += chain.size();
-    result.interface_entries += 2 * kNumericalChains * chain.size();
+    result.Diagnostics().interface_ports += chain.size();
+    result.Diagnostics().interface_entries += 2 * kNumericalChains * chain.size();
   }
 }
 namespace {
@@ -139,7 +139,7 @@ struct TwoMinimum {
 };
 std::vector<NumericalCrossing> ReduceCrossings(const NumericalNode& a, const NumericalNode& b,
                                                const std::vector<NumericalCrossing>& all,
-                                               CompactSyncResult& work) {
+                                               CompactSyncBuilder& work) {
   std::vector<bool> redundant(all.size());
   for (size_t c = 0; c < kNumericalChains; ++c) {
     if (a.chains[c].empty()) continue;
@@ -158,7 +158,7 @@ std::vector<NumericalCrossing> ReduceCrossings(const NumericalNode& a, const Num
         // Inclusive activation: ties enter before queries at this rank.
         for (size_t i : points[rank]) best.Insert(all[i].target.second, i);
         for (size_t i : queries[rank]) {
-          ++work.crossing_tests;
+          ++work.Diagnostics().crossing_tests;
           const auto& target = all[i].target;
           if (best.OtherAtMost(i, b.reverse[target.first][target.second][d])) redundant[i] = true;
         }
@@ -264,7 +264,7 @@ void BuildNumericalMergeOrder(const std::shared_ptr<NumericalNode>& node,
 }
 std::shared_ptr<const NumericalNode> MergeNumericalNodes(std::shared_ptr<const NumericalNode> a,
                                                          std::shared_ptr<const NumericalNode> b,
-                                                         CompactSyncResult& result) {
+                                                         CompactSyncBuilder& result) {
   if (!a->length) return b;
   if (!b->length) return a;
   auto node = std::make_shared<NumericalNode>();
@@ -274,7 +274,7 @@ std::shared_ptr<const NumericalNode> MergeNumericalNodes(std::shared_ptr<const N
   CHECK(a->storage.size() == b->storage.size()) << "Numerical children have incompatible storage frames";
   std::map<std::pair<NumericalEvent, NumericalEvent>, bool> edges;
   auto add = [&](NumericalOrdinal source, bool sc, NumericalOrdinal target, bool tc, bool native) {
-    ++result.bridge_candidates;
+    ++result.Diagnostics().bridge_candidates;
     edges[{{source, sc}, {target, tc}}] |= native;
   };
   for (size_t cell = 0; cell < a->storage.size(); ++cell) {
@@ -291,9 +291,9 @@ std::shared_ptr<const NumericalNode> MergeNumericalNodes(std::shared_ptr<const N
         // Empty children preserve these facts; initialization clears the
         // target qualification even if its source site is otherwise protected.
         bool protected_pair = false;
-        if (result.input.region_tree && a->last_m_qualified &&
+        if (result.State().input.region_tree && a->last_m_qualified &&
             a->last_m_qualified == b->first_m_continuation &&
-            *a->last_m_qualified == result.storage_classes.at(cell).storage &&
+            *a->last_m_qualified == result.State().storage_classes.at(cell).storage &&
             left.last_writer == a->last[matrix] && right.first_writer == b->first[matrix]) {
           protected_pair = std::none_of(left.last_readers.begin(), left.last_readers.end(),
                                         [](const auto& value) { return value.has_value(); }) &&
@@ -328,13 +328,13 @@ std::shared_ptr<const NumericalNode> MergeNumericalNodes(std::shared_ptr<const N
   for (const auto& [edge, native] : edges)
     all.push_back({a->positions.at(edge.first), b->positions.at(edge.second), native});
   // Parent ports are selected child ports, never synthetic completion events.
-  const auto ports = NumericalPorts(*node, result.port_normalization_visits);
+  const auto ports = NumericalPorts(*node, result.Diagnostics().port_normalization_visits);
   // Demand proposal/reduction remains owned by this storage-analysis caller.
   // The supplied reduced crossings preserve the full order and the existing
   // compact query index; token clients instead supply their actual-use edges.
   BuildNumericalMergeOrder(node, ports, ReduceCrossings(*a, *b, all, result));
   CountNumericalInterface(*node, result);
-  ++result.merge_nodes;
+  ++result.Diagnostics().merge_nodes;
   return node;
 }
 }  // namespace pypto::ir::sync

@@ -614,7 +614,7 @@ def test_runtime_for_step_fails_before_emission(dtype, expression):
     step = ir.Add(step_param, _int(1, dtype), dtype, SPAN) if expression else step_param
     _, allocation = _alloc("storage")
     loop = ir.ForStmt(_scalar("i"), _int(0), _int(16), step, [], allocation, [], SPAN)
-    with pytest.raises(ValueError, match="requires a provably positive constant for-loop step"):
+    with pytest.raises(ValueError, match="requires a provably positive for-loop step"):
         _emit(_program([loop], [step_param]))
 
 
@@ -622,7 +622,7 @@ def test_runtime_for_step_fails_before_emission(dtype, expression):
 def test_nonpositive_for_step_fails_before_emission(step):
     _, allocation = _alloc("storage")
     loop = ir.ForStmt(_scalar("i"), _int(0), _int(16), step, [], allocation, [], SPAN)
-    with pytest.raises(ValueError, match="requires a provably positive constant for-loop step"):
+    with pytest.raises(ValueError, match="requires a provably positive for-loop step"):
         _emit(_program([loop]))
 
 

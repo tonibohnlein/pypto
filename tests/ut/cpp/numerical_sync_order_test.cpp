@@ -12,16 +12,122 @@
 #include <cassert>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <random>
 #include <set>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "pypto/core/error.h"
 #include "src/ir/transforms/utils/numerical_sync_merge.h"
+#include "src/ir/transforms/utils/physical_sync_allocation.h"
 
 namespace {
+using pypto::ir::sync::CompactSyncBuilder;
+using pypto::ir::sync::CompactSyncResult;
+using pypto::ir::sync::CompactSyncView;
+static_assert(!std::is_default_constructible_v<CompactSyncResult>);
+static_assert(!std::is_copy_constructible_v<CompactSyncView>);
+static_assert(!std::is_copy_assignable_v<CompactSyncView>);
+static_assert(!std::is_move_assignable_v<CompactSyncView>);
+static_assert(std::is_copy_constructible_v<CompactSyncResult>);
+static_assert(std::is_const_v<std::remove_reference_t<decltype(std::declval<CompactSyncResult&>().State())>>);
+
+void CheckPublishedLifetime() {
+  // Returning a copy destroys both the builder and the first published owner.
+  // The copy must retain the exact moved inventory, not borrowed member refs.
+  auto retained = [] {
+    CompactSyncBuilder builder;
+    builder.State().input.hardware_target = "a2a3";
+    builder.State().crossing_demands.push_back({{0, 2, 1}, {1, 0, 0}});
+    const auto* inventory = builder.State().crossing_demands.data();
+    auto published = std::move(builder).Publish();
+    auto copy = published;
+    assert(copy.State().crossing_demands.data() == inventory);
+    assert(&copy.State() == &published.State());
+    assert(&copy.Diagnostics() == &published.Diagnostics());
+    return copy;
+  }();
+  assert(retained.State().input.hardware_target == "a2a3");
+  assert(std::get<1>(retained.State().crossing_demands.front().first) == 2);
+  CompactSyncBuilder another;
+  another.State().input.hardware_target = "different construction";
+  auto distinct = std::move(another).Publish();
+  assert(&distinct.State() != &retained.State());
+  assert(retained.State().input.hardware_target == "a2a3");
+}
+void CheckFamilyEndpointCoordinates() {
+  using pypto::ir::sync::DecodeSyncFamilyEndpoint;
+  using pypto::ir::sync::Occurrence;
+  using pypto::ir::sync::PhysicalSyncFamily;
+  using pypto::ir::sync::SyncEmptyAxes;
+  using pypto::ir::sync::SyncEndpointKind;
+  constexpr auto source = SyncEndpointKind::Source;
+  constexpr auto target = SyncEndpointKind::Target;
+  constexpr auto flat = SyncEmptyAxes::ContiguousVisits;
+  constexpr auto scoped = SyncEmptyAxes::Singleton;
+  PhysicalSyncFamily family{3, 7, 5, 11, 10, 20, 1, {}};
+  assert(DecodeSyncFamilyEndpoint(family, 0, source, flat) == Occurrence(3, 10, 7));
+  assert(DecodeSyncFamilyEndpoint(family, 0, target, scoped) == Occurrence(5, 20, 11));
+  family.count = 3;
+  assert(DecodeSyncFamilyEndpoint(family, 2, source, flat) == Occurrence(3, 12, 7));
+  // Empty Cartesian axes mean singleton even at ordinal zero. The flat
+  // convention must never silently make a missing scoped map executable.
+  assert(!DecodeSyncFamilyEndpoint(family, 0, source, scoped));
+  assert(!DecodeSyncFamilyEndpoint(family, -1, source, flat));
+  assert(!DecodeSyncFamilyEndpoint(family, 3, source, flat));
+  family.count = 0;
+  assert(!DecodeSyncFamilyEndpoint(family, 0, source, flat));
+  family.count = -1;
+  assert(!DecodeSyncFamilyEndpoint(family, 0, source, flat));
+
+  // Independent nested enumeration: nonunit and unequal endpoint strides leave
+  // holes and model reset-local coordinates. Frame legality is checked by the
+  // production callers, not by this arithmetic-only decoder.
+  for (int64_t outer = 1; outer <= 4; ++outer) {
+    for (int64_t inner = 1; inner <= 5; ++inner) {
+      family.count = outer * inner;
+      family.axes = {{nullptr, outer, 12, 20}, {nullptr, inner, 2, 3}};
+      int64_t ordinal = 0;
+      for (int64_t i = 0; i < outer; ++i) {
+        for (int64_t j = 0; j < inner; ++j, ++ordinal) {
+          assert(DecodeSyncFamilyEndpoint(family, ordinal, source, scoped) ==
+                 Occurrence(3, 10 + 12 * i + 2 * j, 7));
+          assert(DecodeSyncFamilyEndpoint(family, ordinal, target, scoped) ==
+                 Occurrence(5, 20 + 20 * i + 3 * j, 11));
+          assert(DecodeSyncFamilyEndpoint(family, ordinal, source, flat) ==
+                 DecodeSyncFamilyEndpoint(family, ordinal, source, scoped));
+        }
+      }
+    }
+  }
+  family.count = 2;
+  family.axes = {{nullptr, 2, 0, 3}};
+  assert(DecodeSyncFamilyEndpoint(family, 1, source, scoped) == Occurrence(3, 10, 7));
+  assert(DecodeSyncFamilyEndpoint(family, 1, target, scoped) == Occurrence(5, 23, 11));
+  family.axes.front().count = 3;
+  assert(!DecodeSyncFamilyEndpoint(family, 0, source, scoped));
+  family.axes.front().count = 0;
+  assert(!DecodeSyncFamilyEndpoint(family, 0, source, scoped));
+  family.axes.front().count = -1;
+  assert(!DecodeSyncFamilyEndpoint(family, 0, source, scoped));
+  family.axes.front().count = 2;
+  family.axes.front().source_stride = -1;
+  assert(!DecodeSyncFamilyEndpoint(family, 0, source, scoped));
+  family.axes.front().source_stride = 1;
+  family.source_first = -1;
+  assert(!DecodeSyncFamilyEndpoint(family, 0, source, scoped));
+  family.source_first = std::numeric_limits<int64_t>::max();
+  assert(!DecodeSyncFamilyEndpoint(family, 1, source, scoped));
+  family.axes.clear();
+  assert(!DecodeSyncFamilyEndpoint(family, 1, source, flat));
+  family.source_first = 10;
+  family.count = std::numeric_limits<int64_t>::max();
+  family.axes = {{nullptr, family.count, 1, 1}, {nullptr, family.count, 1, 1}, {nullptr, family.count, 1, 1}};
+  assert(!DecodeSyncFamilyEndpoint(family, 0, source, scoped));
+}
 using pypto::ir::sync::BuildNumericalMergeOrder;
 using pypto::ir::sync::IndexNumericalPositions;
 using pypto::ir::sync::InvertNumericalRows;
@@ -156,6 +262,8 @@ struct Fixture {
 }  // namespace
 
 int main() {
+  CheckPublishedLifetime();
+  CheckFamilyEndpointCoordinates();
   size_t comparisons = 0;
   for (uint32_t seed = 0; seed < 2000; ++seed) {
     Fixture fixture(seed);

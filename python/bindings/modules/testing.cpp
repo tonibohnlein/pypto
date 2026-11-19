@@ -59,6 +59,7 @@
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/sync.h"
 #include "python/bindings/modules/testing_sync_support.h"
+#include "src/ir/transforms/utils/compact_sync_builder.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/physical_sync_commands.h"
 #include "src/ir/transforms/utils/scoped_sync_palette.h"
@@ -71,20 +72,20 @@ namespace nb = nanobind;
 namespace pypto {
 namespace python {
 
-nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
+nb::dict DescribeCompactSync(const ir::sync::CompactSyncView& result) {
   nb::dict out;
-  out["interval_access_visits"] = result.input.interval_access_visits;
-  out["collective_domains"] = result.collective_domains;
-  out["collective_witnesses"] = result.collective_witnesses;
-  out["collective_access_visits"] = result.collective_access_visits;
-  out["qualified_intervals"] = result.input.qualified_intervals;
+  out["interval_access_visits"] = result.State().input.interval_access_visits;
+  out["collective_domains"] = result.Diagnostics().collective_domains;
+  out["collective_witnesses"] = result.Diagnostics().collective_witnesses;
+  out["collective_access_visits"] = result.Diagnostics().collective_access_visits;
+  out["qualified_intervals"] = result.State().input.qualified_intervals;
   out["guarantee"] = "minimum demands for declared footprints and core native chains";
   out["realization"] = "not requested";
-  out["analysis_available"] = result.segments.size() == result.input.segments.size();
-  out["parameter_bounds"] = result.input.parameter_bounds;
-  out["coordinate_nodes"] = result.input.coordinate_nodes;
-  out["coordinate_flatten_visits"] = result.input.coordinate_flatten_visits;
-  out["coordinate_coefficient_entries"] = result.input.coordinate_coefficient_entries;
+  out["analysis_available"] = result.State().segments.size() == result.State().input.segments.size();
+  out["parameter_bounds"] = result.State().input.parameter_bounds;
+  out["coordinate_nodes"] = result.State().input.coordinate_nodes;
+  out["coordinate_flatten_visits"] = result.State().input.coordinate_flatten_visits;
+  out["coordinate_coefficient_entries"] = result.State().input.coordinate_coefficient_entries;
   nb::list storage, regions, coordinate_programs;
   std::map<const ir::sync::SyncCoordinateProgram*, size_t> coordinate_program_ids;
   auto external_geometry = [&](const ir::sync::SyncAccess& access) -> nb::object {
@@ -163,7 +164,7 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
     }
     return value;
   };
-  for (const auto& s : result.input.storage) {
+  for (const auto& s : result.State().input.storage) {
     nb::dict item;
     item["name"] = s.name;
     item["space"] = s.space;
@@ -179,12 +180,12 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
     item["column_parameters"] = s.column_parameters;
     item["row_block"] = s.row_block;
     item["column_block"] = s.column_block;
-    item["block_origin"] = result.input.block_bounds ? result.input.block_bounds->first : 0;
+    item["block_origin"] = result.State().input.block_bounds ? result.State().input.block_bounds->first : 0;
     storage.append(item);
   }
-  for (size_t r = 0; r < result.input.segments.size(); ++r) {
-    const auto& source = result.input.segments[r];
-    const auto* analysis = r < result.segments.size() ? &result.segments[r] : nullptr;
+  for (size_t r = 0; r < result.State().input.segments.size(); ++r) {
+    const auto& source = result.State().input.segments[r];
+    const auto* analysis = r < result.State().segments.size() ? &result.State().segments[r] : nullptr;
     nb::dict region;
     nb::list sites, families, generators;
     region["count"] = source.count;
@@ -267,40 +268,41 @@ nb::dict DescribeCompactSync(const ir::sync::CompactSyncResult& result) {
   out["storage"] = storage;
   out["regions"] = regions;
   out["crossing_demands"] =
-      result.HasHierarchy() ? nb::object(nb::none()) : nb::cast(result.crossing_demands);
+      result.HasHierarchy() ? nb::object(nb::none()) : nb::cast(result.State().crossing_demands);
   out["crossing_generators"] =
-      result.HasHierarchy() ? nb::object(nb::none()) : nb::cast(result.crossing_generators);
-  out["analyzed_occurrences"] = result.analyzed_occurrences;
-  out["phase_variants"] = result.phase_variants;
-  out["finite_microbody_occurrences"] = result.finite_microbody_occurrences;
-  out["hardware_target"] = result.input.hardware_target;
-  out["cells"] = result.cells;
-  out["boundary_graph_edges"] = result.graph_edges;
-  out["class_tests"] = result.class_tests;
-  out["class_lookup_tests"] = result.class_lookup_tests;
-  out["port_pair_tests"] = result.port_pair_tests;
-  out["crossing_path_searches"] = result.crossing_path_searches;
-  out["import_seconds"] = result.import_seconds;
-  out["partition_seconds"] = result.partition_seconds;
-  out["reduction_seconds"] = result.reduction_seconds;
-  out["composition_seconds"] = result.composition_seconds;
+      result.HasHierarchy() ? nb::object(nb::none()) : nb::cast(result.State().crossing_generators);
+  out["analyzed_occurrences"] = result.Diagnostics().analyzed_occurrences;
+  out["phase_variants"] = result.Diagnostics().phase_variants;
+  out["finite_microbody_occurrences"] = result.Diagnostics().finite_microbody_occurrences;
+  out["hardware_target"] = result.State().input.hardware_target;
+  out["cells"] = result.Diagnostics().cells;
+  out["boundary_graph_edges"] = result.Diagnostics().graph_edges;
+  out["class_tests"] = result.Diagnostics().class_tests;
+  out["class_lookup_tests"] = result.Diagnostics().class_lookup_tests;
+  out["port_pair_tests"] = result.Diagnostics().port_pair_tests;
+  out["crossing_path_searches"] = result.Diagnostics().crossing_path_searches;
+  out["import_seconds"] = result.Diagnostics().import_seconds;
+  out["partition_seconds"] = result.Diagnostics().partition_seconds;
+  out["reduction_seconds"] = result.Diagnostics().reduction_seconds;
+  out["composition_seconds"] = result.Diagnostics().composition_seconds;
   out["hierarchical"] = result.HasHierarchy();
-  out["source_region_nodes"] = result.source_region_nodes;
-  out["source_coordinate_entries"] = result.source_coordinate_entries;
-  out["scoped_export_builds"] = result.scoped_export_builds;
-  out["point_selector_access_visits"] = result.point_selector_access_visits;
-  out["interface_cells"] = result.interface_cells;
-  out["omitted_bridge_domains"] = result.omitted_bridge_domains;
-  out["interface_slot_visits"] = result.interface_slot_visits;
-  out["interface_ports"] = result.interface_ports;
-  out["interface_entries"] = result.interface_entries;
-  out["interface_queries"] = result.interface_queries;
-  out["merge_nodes"] = result.merge_nodes;
-  out["crossing_tests"] = result.crossing_tests;
-  out["hierarchy_query_steps"] = result.hierarchy_query_steps;
-  out["interface_access_visits"] = result.interface_access_visits;
-  out["bridge_candidates"] = result.bridge_candidates;
-  out["port_normalization_visits"] = result.port_normalization_visits;
+  out["source_region_nodes"] = result.Diagnostics().source_region_nodes;
+  out["source_coordinate_entries"] = result.Diagnostics().source_coordinate_entries;
+  out["scoped_export_builds"] = result.Diagnostics().scoped_export_builds;
+  out["scoped_export_attempts"] = result.Diagnostics().scoped_export_attempts;
+  out["point_selector_access_visits"] = result.Diagnostics().point_selector_access_visits;
+  out["interface_cells"] = result.Diagnostics().interface_cells;
+  out["omitted_bridge_domains"] = result.Diagnostics().omitted_bridge_domains;
+  out["interface_slot_visits"] = result.Diagnostics().interface_slot_visits;
+  out["interface_ports"] = result.Diagnostics().interface_ports;
+  out["interface_entries"] = result.Diagnostics().interface_entries;
+  out["interface_queries"] = result.Diagnostics().interface_queries;
+  out["merge_nodes"] = result.Diagnostics().merge_nodes;
+  out["crossing_tests"] = result.Diagnostics().crossing_tests;
+  out["hierarchy_query_steps"] = result.Diagnostics().hierarchy_query_steps;
+  out["interface_access_visits"] = result.Diagnostics().interface_access_visits;
+  out["bridge_candidates"] = result.Diagnostics().bridge_candidates;
+  out["port_normalization_visits"] = result.Diagnostics().port_normalization_visits;
   return out;
 }
 nb::object CompactBoundary(const ir::sync::CompactSyncResult& result, size_t storage, int64_t row,
@@ -1067,8 +1069,10 @@ void BindTesting(nb::module_& m) {
       "Test immutable assignment storage and rejection of foreign or changed synchronous contexts");
 
   nb::class_<ir::sync::CompactSyncResult>(testing, "CompactSyncAnalysis")
-      .def("export_crossing_demands", &ir::sync::CompactSyncResult::ExportCrossingDemands,
-           "Export retained crossings for a flat regional use; unavailable is distinct from empty")
+      .def(
+          "export_crossing_demands",
+          [](const ir::sync::CompactSyncResult& result) { return result.ExportCrossingDemands(); },
+          "Export retained crossings for a flat regional use; unavailable is distinct from empty")
       .def(
           "realize",
           [](const ir::sync::CompactSyncResult& analysis) {
@@ -1098,9 +1102,15 @@ void BindTesting(nb::module_& m) {
           nb::arg("target"), nb::arg("eligible_ids") = nb::none(), nb::kw_only(),
           nb::arg("schedule_policy") = ir::sync::SyncSchedulePolicy{},
           "Test retained-demand insertion through the production token lowering pipeline")
-      .def("describe", &DescribeCompactSync, "Inspect retained analysis without additional construction")
-      .def("expand_retained_demands", &ir::sync::CompactSyncResult::ExpandRetainedDemands,
-           nb::arg("max_payloads"), "Bounded audit expansion of retained records; never reruns analysis")
+      .def(
+          "describe", [](const ir::sync::CompactSyncResult& result) { return DescribeCompactSync(result); },
+          "Inspect retained analysis without additional construction")
+      .def(
+          "expand_retained_demands",
+          [](const ir::sync::CompactSyncResult& result, size_t maximum) {
+            return result.ExpandRetainedDemands(maximum);
+          },
+          nb::arg("max_payloads"), "Bounded audit expansion of retained records; never reruns analysis")
       .def(
           "export_scoped_demands",
           [](const ir::sync::CompactSyncResult& result) -> nb::object {
@@ -1125,9 +1135,12 @@ void BindTesting(nb::module_& m) {
             return out;
           },
           "Export cached compact demand families in original source frames; not a physical certificate")
-      .def("precedes", &ir::sync::CompactSyncResult::Precedes, nb::arg("source"),
-           nb::arg("source_completion"), nb::arg("target"), nb::arg("target_completion"),
-           "Query original segment/visit/site events")
+      .def(
+          "precedes",
+          [](const ir::sync::CompactSyncResult& result, const ir::sync::Occurrence& a, bool sc,
+             const ir::sync::Occurrence& b, bool tc) { return result.Precedes(a, sc, b, tc); },
+          nb::arg("source"), nb::arg("source_completion"), nb::arg("target"), nb::arg("target_completion"),
+          "Query original segment/visit/site events")
       .def("boundary", &CompactBoundary, nb::arg("storage"), nb::arg("row"), nb::arg("column"),
            nb::arg("parameters") = std::map<size_t, int64_t>{}, nb::arg("block_index") = nb::none(),
            "Exact modeled point selector, or None for unavailable domain")
@@ -1404,8 +1417,9 @@ void BindTesting(nb::module_& m) {
       [](const ir::FunctionPtr& function, bool disjoint_gm, const std::string& target,
          const ir::sync::SyncParameterBounds& bounds,
          const std::optional<std::pair<int64_t, int64_t>>& block_bounds) {
-        ir::sync::CompactSyncResult imported;
-        imported.input = ir::sync::ImportPlacedSync(function, disjoint_gm, target, bounds, block_bounds);
+        ir::sync::CompactSyncBuilder imported;
+        imported.State().input =
+            ir::sync::ImportPlacedSync(function, disjoint_gm, target, bounds, block_bounds);
         auto description = DescribeCompactSync(imported);
         description["guarantee"] = "qualified access description; demand analysis not requested";
         description["analysis_available"] = false;
@@ -1423,7 +1437,7 @@ void BindTesting(nb::module_& m) {
         auto input = ir::sync::ImportPlacedSync(function, disjoint_gm, target, bounds, block_bounds);
         double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         auto result = ir::sync::AnalyzeCompactSync(std::move(input), composition_order);
-        result.import_seconds = seconds;
+        result.Diagnostics().import_seconds = seconds;
         return result;
       },
       nb::arg("function"), nb::arg("disjoint_gm"), nb::arg("target") = "a2a3",

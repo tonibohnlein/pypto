@@ -107,7 +107,7 @@ def test_nested_repetition_covers_boundaries_and_physical_reuse(outer, inner, re
     physical = retained.realize_physical("a2a3", list(range(6)))
     run_physical(function, physical["function"], range(6), parameters=parameters)
     after = retained.describe()
-    for counter in ("scoped_export_builds", "hierarchy_query_steps"):
+    for counter in ("scoped_export_builds", "scoped_export_attempts", "hierarchy_query_steps"):
         assert after.pop(counter) >= before.pop(counter)
     assert after == before
     regions = [r for r in before["regions"] if r["nested_frames"]]
@@ -192,6 +192,8 @@ def test_nested_mathematics_does_not_hide_unavailable_dma_barrier():
     after = retained.describe()
     assert after.pop("scoped_export_builds") == 1
     assert before.pop("scoped_export_builds") == 0
+    assert after.pop("scoped_export_attempts") == 1
+    assert before.pop("scoped_export_attempts") == 0
     assert after == before
 
 
@@ -878,6 +880,8 @@ def test_scoped_families_equal_actual_covers_and_keep_original_frames(fixture, i
     after = retained.describe()
     assert after.pop("scoped_export_builds") == 1
     assert before.pop("scoped_export_builds") == 0
+    assert after.pop("scoped_export_attempts") == 1
+    assert before.pop("scoped_export_attempts") == 0
     assert before == after, "An endpoint export must not reconstruct retained mathematics"
 
 
@@ -987,6 +991,25 @@ def test_symbolic_singleton_start_is_not_constant_zero_initialization():
     # frame's normalized ordinal0 is not proof that original k_loop IV is0.
     with pytest.raises(ValueError, match="Symbolic first-visit initialization"):
         testing.analyze_placed_sync(changed, True, block_bounds=(0, 1))
+
+
+def test_published_scoped_export_isolated_from_subsequent_analysis():
+    # A new source/frame domain must receive a new owner, while the old cached
+    # capability stays valid after its source Python handles are released.
+    first_source = resident_pipeline_tree(2, 2, 2)
+    first = testing.analyze_placed_sync(first_source, True)
+    first_export = first.export_scoped_demands()
+    first_pairs = first.expand_retained_demands(1000)
+    del first_source
+    second_source = resident_pipeline_tree(2, 3, 3)
+    second = testing.analyze_placed_sync(second_source, True)
+    assert second.describe()["scoped_export_attempts"] == 0
+    validate(second_source, second)
+    assert second.export_scoped_demands() is not None
+    assert first.export_scoped_demands() == first_export
+    assert first.expand_retained_demands(1000) == first_pairs
+    assert first.describe()["scoped_export_attempts"] == 1
+    assert second.describe()["scoped_export_attempts"] == 1
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "pypto/backend/common/backend_handler.h"
+#include "pypto/backend/common/buffer_sync_contract.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/transforms/base/mutator.h"
@@ -70,7 +71,7 @@ bool IsOwnedLeaf(const FunctionPtr& function) {
 // Internal child lowering never calls this wrapper: a child may return pending
 // payloads. This changes the invocation boundary, not the internal demand set.
 FunctionPtr CompleteOwnedInvocation(const FunctionPtr& function, const std::string& target) {
-  CHECK(target == "a2a3") << "Invocation completion requires the A2/A3 ALL-pipe contract";
+  const auto& execution = backend::RequireLocalSyncExecutionContract(target);
   // Current leaf import admits a canonical terminal return. Reject fallthrough
   // rather than publish an ownership marker with an uncovered exit.
   auto body = As<SeqStmts>(function->body_);
@@ -78,21 +79,22 @@ FunctionPtr CompleteOwnedInvocation(const FunctionPtr& function, const std::stri
       << "Invocation completion requires a canonical terminal return";
   class CompleteReturns : public IRMutator {
     std::string core_;
+    const char* completion_;
 
    public:
-    explicit CompleteReturns(FunctionType type) : core_(type == FunctionType::AIC ? "aic" : "aiv") {}
+    explicit CompleteReturns(FunctionType type, const char* completion)
+        : core_(type == FunctionType::AIC ? "aic" : "aiv"), completion_(completion) {}
     StmtPtr VisitStmt_(const ReturnStmtPtr& op) override {
       // Return operands are already computed Buffer/Tensor handles or scalars.
       // Do not move an effectful return expression past the completion cut.
       for (const auto& value : op->value_)
         CHECK(As<Var>(value) || As<ConstInt>(value) || As<ConstFloat>(value) || As<ConstBool>(value))
             << "Invocation completion requires evaluated return operands";
-      auto completion =
-          OpRegistry::GetInstance().Create("system.bar_all", {}, {{"core_type", core_}}, op->span_);
+      auto completion = OpRegistry::GetInstance().Create(completion_, {}, {{"core_type", core_}}, op->span_);
       return std::make_shared<SeqStmts>(
           std::vector<StmtPtr>{std::make_shared<EvalStmt>(completion, op->span_), op}, op->span_);
     }
-  } complete(function->func_type_);
+  } complete(function->func_type_, execution.terminal_completion_op);
   return sync::SyncOutcome(complete.VisitFunction(function), true, "");
 }
 FunctionPtr InsertLogicalSync(const FunctionPtr& function, const std::string& target,

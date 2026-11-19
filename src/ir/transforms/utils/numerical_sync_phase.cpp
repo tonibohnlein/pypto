@@ -45,11 +45,11 @@ int64_t PhaseInteger(Ordinal value) {
 // Enumerating its finite inner stages is charged explicitly. No source IR is
 // cloned and no payload is unrolled in the executable program.
 void SnapshotPhase(const SyncRegion& source, PhaseBindings& bindings, NumericalFiniteProvider& provider,
-                   const CompactSyncResult& result, const NumericalSyncHierarchy& hierarchy,
+                   const CompactSyncView& result, const NumericalSyncHierarchy& hierarchy,
                    bool body_only = false, const ForStmt* periodic_frame = nullptr) {
   if (source.leaf) {
     const auto r = *source.leaf;
-    const auto& segment = result.input.segments[r];
+    const auto& segment = result.State().input.segments[r];
     const auto count = PhaseScope(segment);
     for (int64_t i = 0; i < count; ++i) {
       if (segment.original_loop) bindings[segment.original_loop.get()] = i;
@@ -99,7 +99,7 @@ void SnapshotPhase(const SyncRegion& source, PhaseBindings& bindings, NumericalF
             slot = found->second;
           }
           access.slot_first = Mod(Ordinal(access.slot_first) + Ordinal(slot) * access.slot_step,
-                                  result.input.storage[access.storage].slot_count);
+                                  result.State().input.storage[access.storage].slot_count);
           access.slot_step = 0;
           access.slot_coordinate_frame.reset();
           accesses.push_back(std::move(access));
@@ -116,13 +116,13 @@ void SnapshotPhase(const SyncRegion& source, PhaseBindings& bindings, NumericalF
     SnapshotPhase(child, bindings, provider, result, hierarchy, false, periodic_frame);
 }
 using PhasePeriods = std::map<const ForStmt*, int64_t>;
-PhasePeriods IndexPhasePeriods(const CompactSyncResult& result) {
+PhasePeriods IndexPhasePeriods(const CompactSyncView& result) {
   PhasePeriods periods;
-  for (const auto& segment : result.input.segments)
+  for (const auto& segment : result.State().input.segments)
     for (const auto& site : segment.sites)
       for (const auto& access : site.accesses) {
         if (!access.slot_coordinate_frame || !access.slot_step) continue;
-        const auto slots = result.input.storage[access.storage].slot_count;
+        const auto slots = result.State().input.storage[access.storage].slot_count;
         const auto orbit = slots / std::gcd(slots, access.slot_step);
         auto [position, inserted] = periods.emplace(access.slot_coordinate_frame.get(), orbit);
         if (!inserted)
@@ -132,19 +132,19 @@ PhasePeriods IndexPhasePeriods(const CompactSyncResult& result) {
   return periods;
 }
 size_t RetainPhase(const SyncRegion& source, PhaseBindings bindings, bool body_only,
-                   CompactSyncResult& result, NumericalSyncHierarchy& hierarchy) {
-  const size_t id = result.input.segments.size() + hierarchy.finite_providers.size();
+                   CompactSyncBuilder& result, NumericalSyncHierarchy& hierarchy) {
+  const size_t id = result.State().input.segments.size() + hierarchy.finite_providers.size();
   auto& provider = hierarchy.finite_providers[id];
   SnapshotPhase(source, bindings, provider, result, hierarchy, body_only,
                 body_only && source.repetition ? source.repetition->loop.get() : nullptr);
-  result.finite_microbody_occurrences += provider.sites.size();
-  ++result.phase_variants;
+  result.Diagnostics().finite_microbody_occurrences += provider.sites.size();
+  ++result.Diagnostics().phase_variants;
   return id;
 }
-void PlanPhases(const SyncRegion& source, CompactSyncResult& result, NumericalSyncHierarchy& hierarchy,
+void PlanPhases(const SyncRegion& source, CompactSyncBuilder& result, NumericalSyncHierarchy& hierarchy,
                 const PhasePeriods& periods) {
   if (source.leaf) {
-    CHECK(PhaseScope(result.input.segments[*source.leaf]) <= 1)
+    CHECK(PhaseScope(result.State().input.segments[*source.leaf]) <= 1)
         << "A separate repeated child needs its retained interface outside the finite phase microbody";
     hierarchy.finite_source_providers[*source.leaf] = RetainPhase(source, {}, false, result, hierarchy);
     return;
@@ -188,7 +188,7 @@ void PlanPhases(const SyncRegion& source, CompactSyncResult& result, NumericalSy
       << "An outer startup scope needs its own qualified phase or invariant child interface";
   for (const auto& child : source.children) PlanPhases(child, result, hierarchy, periods);
 }
-void PhaseCells(CompactSyncResult& result, NumericalSyncHierarchy& hierarchy) {
+void PhaseCells(CompactSyncBuilder& result, NumericalSyncHierarchy& hierarchy) {
   struct Cuts {
     std::set<int64_t> rows, columns, slots;
   };
@@ -196,7 +196,7 @@ void PhaseCells(CompactSyncResult& result, NumericalSyncHierarchy& hierarchy) {
   for (const auto& [id, provider] : hierarchy.finite_providers)
     for (const auto& site : provider.sites)
       for (const auto& access : site.accesses) {
-        ++result.interface_access_visits;
+        ++result.Diagnostics().interface_access_visits;
         auto& cuts = inventory[access.storage];
         cuts.rows.insert(access.row);
         cuts.rows.insert(PhaseInteger(Ordinal(access.row) + access.rows));
@@ -211,13 +211,13 @@ void PhaseCells(CompactSyncResult& result, NumericalSyncHierarchy& hierarchy) {
       for (size_t r = 1; r < rows.size(); ++r)
         for (size_t c = 1; c < columns.size(); ++c) {
           hierarchy.cells.push_back({storage, slot, rows[r - 1], columns[c - 1]});
-          result.storage_classes.push_back(
+          result.State().storage_classes.push_back(
               {storage, rows[r - 1], columns[c - 1], rows[r] - rows[r - 1], columns[c] - columns[c - 1]});
         }
   }
-  result.cells = result.interface_cells = hierarchy.cells.size();
+  result.Diagnostics().cells = result.Diagnostics().interface_cells = hierarchy.cells.size();
 }
-NodePtr BuildFinitePhase(size_t id, CompactSyncResult& result, NumericalSyncHierarchy& hierarchy) {
+NodePtr BuildFinitePhase(size_t id, CompactSyncBuilder& result, NumericalSyncHierarchy& hierarchy) {
   auto& provider = hierarchy.finite_providers.at(id);
   FiniteSyncInput model;
   model.exact_accesses = true;
@@ -227,7 +227,7 @@ NodePtr BuildFinitePhase(size_t id, CompactSyncResult& result, NumericalSyncHier
     for (const auto& access : site.accesses) {
       model.exact_accesses &= access.exact_footprint;
       for (size_t c = 0; c < hierarchy.cells.size(); ++c) {
-        ++result.class_tests;
+        ++result.Diagnostics().class_tests;
         const auto& cell = hierarchy.cells[c];
         if (cell.storage == access.storage && cell.slot == access.slot_first && cell.row >= access.row &&
             cell.row < access.row + access.rows && cell.column >= access.column &&
@@ -240,7 +240,7 @@ NodePtr BuildFinitePhase(size_t id, CompactSyncResult& result, NumericalSyncHier
   // The existing native predicate sees actual finite reference order, not
   // concatenated source-leaf inventories from a nested loop.
   CompactSyncInput native;
-  native.storage = result.input.storage;
+  native.storage = result.State().input.storage;
   native.segments.emplace_back();
   native.segments.front().sites = provider.sites;
   AccumulatorProtection protection(native);
@@ -248,7 +248,7 @@ NodePtr BuildFinitePhase(size_t id, CompactSyncResult& result, NumericalSyncHier
     return protection.Protects({0, 0, a}, {0, 0, b}, hierarchy.cells[c].storage);
   };
   provider.order = AnalyzeFiniteSync(model);
-  result.analyzed_occurrences += provider.sites.size();
+  result.Diagnostics().analyzed_occurrences += provider.sites.size();
   auto node = std::make_shared<Node>();
   node->leaf = id;
   node->length = provider.sites.size();
@@ -276,7 +276,7 @@ NodePtr BuildFinitePhase(size_t id, CompactSyncResult& result, NumericalSyncHier
     if (!first.initializes_accumulator) node->first_m_continuation = first.protected_accumulator;
     node->last_m_qualified = provider.sites[static_cast<size_t>(*node->last[matrix])].protected_accumulator;
   }
-  for (const auto& event : NumericalPorts(*node, result.port_normalization_visits)) {
+  for (const auto& event : NumericalPorts(*node, result.Diagnostics().port_normalization_visits)) {
     const auto chain =
         2 * static_cast<size_t>(provider.sites[static_cast<size_t>(event.first)].pipe) + event.second;
     node->chains[chain].push_back(event.first);
@@ -288,7 +288,7 @@ NodePtr BuildFinitePhase(size_t id, CompactSyncResult& result, NumericalSyncHier
       size_t target = 0;
       for (size_t source = 0; source < node->chains[c].size(); ++source) {
         while (target < node->chains[d].size()) {
-          ++result.interface_queries;
+          ++result.Diagnostics().interface_queries;
           if (node->chains[c][source] == node->chains[d][target] && c % 2 == d % 2) break;
           if (provider.order.Precedes(static_cast<size_t>(node->chains[c][source]), c % 2,
                                       static_cast<size_t>(node->chains[d][target]), d % 2))
@@ -304,15 +304,15 @@ NodePtr BuildFinitePhase(size_t id, CompactSyncResult& result, NumericalSyncHier
   return node;
 }
 }  // namespace
-void PlanNumericalPhases(const SyncRegion& source, CompactSyncResult& result,
+void PlanNumericalPhases(const SyncRegion& source, CompactSyncBuilder& result,
                          NumericalSyncHierarchy& hierarchy) {
   PlanPhases(source, result, hierarchy, IndexPhasePeriods(result));
 }
-void BuildNumericalPhaseCells(CompactSyncResult& result, NumericalSyncHierarchy& hierarchy) {
+void BuildNumericalPhaseCells(CompactSyncBuilder& result, NumericalSyncHierarchy& hierarchy) {
   PhaseCells(result, hierarchy);
 }
 std::map<size_t, std::shared_ptr<const NumericalNode>> BuildNumericalPhaseProviders(
-    CompactSyncResult& result, NumericalSyncHierarchy& hierarchy) {
+    CompactSyncBuilder& result, NumericalSyncHierarchy& hierarchy) {
   std::map<size_t, std::shared_ptr<const NumericalNode>> providers;
   for (const auto& [id, provider] : hierarchy.finite_providers)
     providers.emplace(id, BuildFinitePhase(id, result, hierarchy));

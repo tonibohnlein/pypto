@@ -1,8 +1,9 @@
 # Regional synchronization architecture and implementation gates
 
 Status: all five implementation gates accepted within the scope below. The
-final broad host gate is 525 passes and one unchanged pre-analysis admission
-failure; a separate emission-scaling regression passes. This is not an all-green
+original broad host gate was 525 passes and one unchanged pre-analysis admission
+failure. The bounded architecture follow-ups below now pass 651 selected tests
+with the same one admission failure; their individual gates are recorded below. This is not an all-green
 repository or native/device qualification.
 
 ## Objective and RFC alignment
@@ -135,8 +136,10 @@ Malformed compiler output is an internal error and must not delegate.
 Executable qualification requires an explicit checked target/runtime boundary
 guarantee or an established boundary protocol. Otherwise it remains unsupported
 or wholly delegated. Device success and notification closure do not prove
-payload completion at return. This milestone introduces no new drain policy;
-existing experimental receipts remain separately qualified. No scarce-ID repair
+payload completion at return. The original milestone introduced no drain policy. Follow-up `12e99a75c`
+now adds an explicit A2/A3 terminal ALL-pipe drain before public ownership;
+unsupported exit forms refuse. Internal child lowering still permits pending
+payloads. Earlier drain-asymmetric device receipts remain separately qualified. No scarce-ID repair
 may change the logical completion fact.
 
 ## Ordered implementation and review gates
@@ -505,3 +508,152 @@ additional type-narrowing checks. The five-file annotation gate records 234
 passes plus two corrected fixture checks: increasing the prefix stride from two
 to four preserves its admitted zero/one executions while reaching the intended
 nonuniform-guard refusal. All 25 original GEMM C++ outputs remain byte-identical.
+
+## Bounded architecture follow-ups (2026-11-14)
+
+Baseline: `12e99a75c`. These three gates strengthen existing ownership and
+interfaces; they do not add coverage, change demand algorithms, optimize token
+programs, alter allocation, or change payload schedules. The earlier five gates
+and their receipts remain historical evidence. Each new gate must receive
+independent architecture/correctness acceptance before the next is implemented.
+
+### Gate A — immutable published analysis
+
+At the baseline, `CompactSyncResult` exposed mutable input, reduced segments and crossings
+beside a lazy scoped-demand cache. Replace caller discipline with a mutable,
+internal construction state and a read-only published owner. Move retained data
+at publication; do not copy relation/segment inventories to freeze them. Separate
+query-work counters from proof-bearing state. Internal construction may query
+its current result, but must not publish cached exports before finalization.
+
+For example, changing a construction's original frame or crossing inventory
+must never leave a previously exported demand cache attached to that changed
+state. Published owners may share immutable evidence; consumers cannot edit it.
+
+Migrate invariant, rotating and numerical builders in
+`compact_sync_analysis.cpp`, `rotating_sync_analysis.cpp` and
+`numerical_sync_{hierarchy,phase,merge}.cpp`; update existing consumers/bindings.
+Delete public mutable construction access. Preserve selectors' unavailable vs
+covered-empty answers, and retain independent mathematical and actual-token
+owners. Test publication/copy lifetime, repeated exports, changed-input isolation
+and existing covers/queries/selectors. Inspect construction and retained sizes.
+
+### Gate B — selected native implementation contracts
+
+At the baseline, `physical_sync_allocation.cpp::NativeClaims` reconstructed native macro
+selection. Move the admitted selection/claim contract to the existing backend
+recipe/catalog boundary; have import and allocation consume it. Native ordering
+and invocation completion must use that same qualified target/variant scope.
+Retain operation-specific footprint recovery in the importer: selecting TLOAD
+alone does not prove a rectangle or its alias policy.
+
+For example, a Mat-to-Left TEXTRACT must not inherit the excluded Vec overload's
+resource claims; an unsupported variant must refuse rather than appear
+resource-free. A2/A3 scalar native order, the qualified Cube accumulator rule,
+and public terminal completion remain explicit premises. Do not create a second
+operation registry or claim executable support for A5/compound operations.
+
+Migrate the existing importer and native resource consumer; use shared recipes
+already used by code generation. Keep broad emission-name selection separate
+from narrow synchronization qualification. An unknown hardware target may still
+receive conservative mathematical analysis without the Cube exemption, but
+physical realization must refuse. Resolve both initialization and continuation
+variants and retain per-core/mode/lifetime resource qualification. Delete
+allocator-local macro selection.
+Acceptance includes variants, missing claims, reserved IDs, scalar and Cube
+exemptions, target refusal and terminal drains. Generated plans and resource
+assignments must remain unchanged for existing admitted fixtures.
+
+### Gate C — shared consumer contracts
+
+The identified duplicate is family ordinal decoding in
+`physical_sync_allocation.cpp::Endpoint` and
+`scoped_token_order.cpp::FamilyOccurrence`. Consolidate checked translation in
+the existing physical endpoint service. Preserve two explicit conventions:
+empty axes mean contiguous flat records for the flat allocator, but a singleton
+for scoped-token families. Validate record bounds, axis extents, arithmetic and
+original region/site identities without changing the admitted language. Share
+mechanics, not the meanings of required order and expressed token order.
+Do not force finite and periodic kernels into one mathematical representation.
+
+For example, a missing original-coordinate binding must remain unavailable in
+both query and endpoint consumers; neither may synthesize coordinate zero.
+Covered-but-untouched storage remains an exact empty answer. Choose actual
+production duplicates and list removed adapters in the gate receipt; do not
+introduce a general interface without migrated production clients.
+
+Acceptance requires actual-token order preservation, independent matching/reuse,
+all event-query combinations, selector absence/refusal negatives, and unchanged
+compact representation growth. Existing small-GEMM Buffer admission is a
+separate known failure. OptimizeSync rewrites and new target coverage are deferred.
+
+### Execution and evidence
+
+For each gate: implement, serial build, focused independent regressions, inspect
+removals and complexity, reviewer accepts or requests correction. Record exact
+source/tool identities and results in the final receipt. The aggregate machine
+limit is two intensive workers; this campaign uses serial builds/tests. No
+native/device qualification or new performance claim follows from these refactors.
+
+### Accepted implementation checkpoints
+
+Gate A is accepted. `CompactSyncBuilder` owns mutable construction state;
+`CompactSyncView` shares read-only query code and has no scoped-export cache.
+`CompactSyncResult` publishes shared immutable state and owns the successful or
+unavailable export memo. Base assignment is inaccessible, preventing replacement
+of premises beneath a published cache. Diagnostics remain mutable counters,
+never proof premises. Publication moves/shares inventories without copying them;
+it adds constant-sized ownership allocations and makes no speedup claim.
+The gate passed 354 Python tests and the existing C++ numerical-order target
+(including publication/copy lifetime and 2,000 independent graph cases). One
+previously known small-GEMM Buffer-admission failure was explicitly deselected.
+
+Gate B is accepted. `backend/common/buffer_sync_contract` owns native operation
+identity, current single-pipe variant selection, bound core/target resource
+claims, Cube size eligibility and the supported scalar/terminal contract.
+`PTOCodegen` shares broad operation-name selection without adopting autosync's
+narrow admission policy. The importer retains physical geometry, precision,
+readiness and same-accumulator/slot/interference proofs. Allocation no longer
+selects macros or filters overload-specific claims itself. Both initialization
+and continuation arms are qualified. Unsupported target mathematics remain
+available without native protection; physical ownership remains refused.
+
+The native gate passed 219 focused tests and 458 Buffer-emission/Vec tests.
+Two old positive-step diagnostic regexes were corrected to match the baseline's
+existing range-proof behavior; their nine negative cases still require refusal.
+Six pinned emitted PTO plans (matmul, accumulating matmul, split-K, Vec, repeated
+Vec and staged pipeline) remain byte-identical to `12e99a75c`.
+
+Gate C is accepted. `DecodeSyncFamilyEndpoint` in the existing physical-allocation
+interface is the sole shared ordinal arithmetic implementation for direct
+allocation and scoped-token order checking. Callers explicitly select flat
+contiguous or scoped singleton empty-axis conventions. It validates positive
+axis extents, ordinal bounds, complete Cartesian volume, nonnegative strides
+and checked visit arithmetic; unavailable maps do not become occurrence zero.
+Original frame/guard/cut proofs remain with their existing owners. The old
+`Endpoint` and `FamilyOccurrence` arithmetic bodies are deleted; thin wrappers
+choose conventions and preserve contextual refusal messages. Work remains
+O(axis depth), without unfolding trip counts.
+
+The final serial integration gate is **651 passed, one unchanged failure**:
+`test_scoped_token_order::test_shenggan_original_tiles_single_invocation_cpp`
+still reaches Functional IR instead of placed Buffer IR before analysis. Two
+existing deprecation warnings remain. The existing C++ target passes publication
+lifetime, 150 independently enumerated endpoint tuples plus invalid/overflow
+maps, and 2,000 numerical graph cases. All six pinned emitted plans remain
+byte-identical to the baseline after Gate C. The established static-site and
+trip-count scaling bounds pass unchanged.
+
+Configured checks passed on the tracked tree plus precisely these changes.
+The pinned hook dependencies use Python 3.11 (their torch version is unavailable
+for the compiler's Python 3.14); unrelated untracked research files were excluded
+from the check snapshot, not modified or deleted. A visitor-parameter naming
+correction required by the type checker passed its two-test recheck.
+
+See [the machine-readable receipt](39-regional-sync-architecture-followups.json)
+for source/tool hashes, exact commands, per-gate results and artifact hashes.
+This work does not add thread-safe concurrent diagnostic/cache mutation, new
+kernel admission, OptimizeSync rewrites or native/device qualification. Required
+order, actual-token order, consuming notification reuse and invocation completion
+remain distinct contracts. Allocation algorithms, pool sizes, hardware exemptions,
+logical protocols and payload schedules are unchanged.

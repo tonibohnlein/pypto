@@ -267,16 +267,11 @@ struct SyncStorageAccessIndex {
 };
 class NumericalSyncHierarchy;
 class SyncBoundaryGraph;
-class CompactSyncResult {
- public:
-  CompactSyncInput input;
-  std::vector<CompactSegmentResult> segments;
-  std::vector<SyncStorageClass> storage_classes;
-  std::vector<SyncStorageAccessIndex> storage_access_index;
-  std::vector<Crossing> crossing_generators, crossing_demands;
+// Construction diagnostics are not premises of any order or export proof.
+// Query counters may change after publication without invalidating evidence.
+struct CompactSyncDiagnostics {
   size_t analyzed_occurrences = 0, cells = 0, graph_edges = 0;
   size_t class_tests = 0, class_lookup_tests = 0, port_pair_tests = 0, crossing_path_searches = 0;
-  std::shared_ptr<const NumericalSyncHierarchy> hierarchy;
   size_t collective_domains = 0, collective_witnesses = 0, collective_access_visits = 0;
   size_t interface_cells = 0, interface_slot_visits = 0, interface_ports = 0, interface_entries = 0;
   size_t interface_queries = 0, merge_nodes = 0, crossing_tests = 0;
@@ -284,24 +279,40 @@ class CompactSyncResult {
   size_t omitted_bridge_domains = 0;
   size_t source_region_nodes = 0, source_coordinate_entries = 0;
   size_t phase_variants = 0, finite_microbody_occurrences = 0;
-  mutable size_t scoped_export_builds = 0;
-  mutable size_t point_selector_access_visits = 0;
-  mutable size_t hierarchy_query_steps = 0;
-  bool HasHierarchy() const { return static_cast<bool>(hierarchy); }
+  size_t scoped_export_builds = 0;
+  size_t point_selector_access_visits = 0;
+  size_t hierarchy_query_steps = 0;
+  size_t scoped_export_attempts = 0;
+  double import_seconds = 0;
+  double partition_seconds = 0, reduction_seconds = 0, composition_seconds = 0;
+};
+// Proof-bearing data. Only internal builders obtain mutable access. Published
+// results expose it through a const view; nested retained graph handles are const.
+struct CompactSyncState {
+  CompactSyncInput input;
+  std::vector<CompactSegmentResult> segments;
+  std::vector<SyncStorageClass> storage_classes;
+  std::vector<SyncStorageAccessIndex> storage_access_index;
+  std::vector<Crossing> crossing_generators, crossing_demands;
+  std::shared_ptr<const NumericalSyncHierarchy> hierarchy;
+  std::shared_ptr<const SyncBoundaryGraph> boundary_order;
+};
+class CompactSyncBuilder;
+// Read-only queries are also usable while an internal builder is constructing
+// its hierarchy. This view has no cached export: only publication may memoize it.
+class CompactSyncView {
+ public:
+  const CompactSyncState& State() const { return *state_; }
+  CompactSyncDiagnostics& Diagnostics() const { return *diagnostics_; }
+  bool HasHierarchy() const { return static_cast<bool>(State().hierarchy); }
   std::vector<Crossing> ExpandRetainedDemands(size_t max_payloads) const;
   // Finite crossing records only; shared repeated scopes need a separate endpoint map.
   // Unavailable is distinct from an available empty crossing inventory.
   std::optional<std::vector<Crossing>> ExportCrossingDemands() const;
-  // Complete compact demand export over original source scopes. Null means
-  // unavailable; a non-null empty inventory proves no modeled demands. This
-  // is not a physical reuse certificate or permission to flatten scope axes.
-  std::shared_ptr<const ScopedSyncDemands> ExportScopedDemands() const;
   bool ReferenceBefore(const Occurrence& a, const Occurrence& b) const;
   // Exact point answer within one retained leaf scope; coordinates are local
   // to that scope, not the repeated use of its source definition.
   PointBoundary LeafBoundary(size_t region, size_t storage, int64_t row, int64_t column) const;
-  double import_seconds = 0;
-  double partition_seconds = 0, reduction_seconds = 0, composition_seconds = 0;
   bool Precedes(const Occurrence& a, bool sc, const Occurrence& b, bool tc) const;
   // Out-of-domain -> nullopt. Covered but untouched point -> empty boundary.
   std::optional<PointBoundary> Boundary(size_t storage, int64_t row, int64_t column) const;
@@ -314,12 +325,43 @@ class CompactSyncResult {
                                             const std::map<size_t, int64_t>& parameters = {},
                                             std::optional<int64_t> block_index = std::nullopt) const;
 
+ protected:
+  // A view cannot be sliced or assigned through a published result's base:
+  // that would detach its premises from the publication-only export cache.
+  CompactSyncView(const CompactSyncView&) = default;
+  CompactSyncView(CompactSyncView&&) = default;
+  CompactSyncView& operator=(const CompactSyncView&) = default;
+  CompactSyncView& operator=(CompactSyncView&&) = default;
+  explicit CompactSyncView(std::shared_ptr<const CompactSyncState> state,
+                           std::shared_ptr<CompactSyncDiagnostics> diagnostics)
+      : state_(std::move(state)), diagnostics_(std::move(diagnostics)) {}
+  std::shared_ptr<const CompactSyncState> state_;
+  std::shared_ptr<CompactSyncDiagnostics> diagnostics_;
+
  private:
-  mutable std::shared_ptr<const ScopedSyncDemands> scoped_demands_;
-  friend CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& composition_order);
   std::optional<PointBoundary> RelativeBoundary(size_t storage, int64_t row, int64_t column,
                                                 std::optional<size_t> leaf = std::nullopt) const;
-  std::shared_ptr<SyncBoundaryGraph> boundary_order_;
+};
+// A published result and its cache share one immutable premise inventory.
+// Copies share both; changing caller input requires a newly analyzed owner.
+class CompactSyncResult final : public CompactSyncView {
+ public:
+  // Complete compact demand export over original source scopes. Null means
+  // unavailable; a non-null empty inventory proves no modeled demands. This
+  // is not a physical reuse certificate or permission to flatten scope axes.
+  std::shared_ptr<const ScopedSyncDemands> ExportScopedDemands() const;
+
+ private:
+  friend class CompactSyncBuilder;
+  struct ScopedExportCache {
+    bool attempted = false;
+    std::shared_ptr<const ScopedSyncDemands> value;
+  };
+  CompactSyncResult(std::shared_ptr<const CompactSyncState> state,
+                    std::shared_ptr<CompactSyncDiagnostics> diagnostics)
+      : CompactSyncView(std::move(state), std::move(diagnostics)),
+        scoped_export_(std::make_shared<ScopedExportCache>()) {}
+  std::shared_ptr<ScopedExportCache> scoped_export_;
 };
 // Common retained owner with representation-specific qualified construction.
 // The legacy no-slot route uses bounded two-body reduction and a research

@@ -51,10 +51,10 @@ int64_t Mod(Ordinal value, int64_t modulus) {
   const auto residue = value % modulus;
   return static_cast<int64_t>(residue < 0 ? residue + modulus : residue);
 }
-NumericalBoundary LeafBoundary(const CompactSyncResult& result, size_t leaf, const NumericalCell& cell) {
-  if (result.hierarchy) {
-    const auto provider = result.hierarchy->finite_providers.find(leaf);
-    if (provider != result.hierarchy->finite_providers.end()) {
+NumericalBoundary LeafBoundary(const CompactSyncView& result, size_t leaf, const NumericalCell& cell) {
+  if (result.State().hierarchy) {
+    const auto provider = result.State().hierarchy->finite_providers.find(leaf);
+    if (provider != result.State().hierarchy->finite_providers.end()) {
       NumericalBoundary out;
       // Point membership is evaluated against the retained exact rectangles,
       // independently of the crossing partition's representative points.
@@ -80,11 +80,11 @@ NumericalBoundary LeafBoundary(const CompactSyncResult& result, size_t leaf, con
       return out;
     }
   }
-  const auto selected = result.segments[leaf].rotating
-                            ? RotatingBoundary(result.input, result.segments[leaf], cell.storage, cell.slot,
-                                               cell.row, cell.column, leaf)
+  const auto selected = result.State().segments[leaf].rotating
+                            ? RotatingBoundary(result.State().input, result.State().segments[leaf],
+                                               cell.storage, cell.slot, cell.row, cell.column, leaf)
                             : result.LeafBoundary(leaf, cell.storage, cell.row, cell.column);
-  const size_t sites = result.input.segments[leaf].sites.size();
+  const size_t sites = result.State().input.segments[leaf].sites.size();
   auto ordinal = [&](const std::optional<Occurrence>& occurrence) -> std::optional<Ordinal> {
     if (!occurrence) return std::nullopt;
     return Length(std::get<1>(*occurrence), sites) + std::get<2>(*occurrence);
@@ -102,7 +102,7 @@ NumericalBoundary LeafBoundary(const CompactSyncResult& result, size_t leaf, con
 // crossing witnesses. Every writing phase must fill [0, rows*row_bytes) once;
 // intervening finite readers cover every row. Other domains are untouched.
 std::optional<CollectiveSyncDomain> CollectiveDomain(const CompactSyncInput& input, size_t storage,
-                                                     CompactSyncResult& work) {
+                                                     CompactSyncBuilder& work) {
   const auto& domain = input.storage[storage];
   if (!domain.byte_coordinates || domain.slot_count != 1) return std::nullopt;
   CollectiveSyncDomain proof;
@@ -128,7 +128,7 @@ std::optional<CollectiveSyncDomain> CollectiveDomain(const CompactSyncInput& inp
     size_t writes = 0;
     for (const auto& site : segment.sites)
       for (const auto& access : site.accesses) {
-        ++work.collective_access_visits;
+        ++work.Diagnostics().collective_access_visits;
         if (access.storage == storage) {
           effects.emplace_back(&site, &access);
           writes += access.write;
@@ -203,29 +203,29 @@ std::optional<CollectiveSyncDomain> CollectiveDomain(const CompactSyncInput& inp
   proof.witness_columns.assign(witnesses.begin(), witnesses.end());
   return proof;
 }
-std::vector<NumericalCell> InterfaceCells(CompactSyncResult& result, NumericalSyncHierarchy& hierarchy) {
-  const auto& input = result.input;
+std::vector<NumericalCell> InterfaceCells(CompactSyncBuilder& result, NumericalSyncHierarchy& hierarchy) {
+  const auto& input = result.State().input;
   std::vector<bool> written(input.storage.size());
   using Effect = std::pair<const SyncSegment*, const SyncAccess*>;
   std::map<size_t, std::vector<Effect>> effects;
   for (const auto& segment : input.segments)
     for (const auto& site : segment.sites)
       for (const auto& access : site.accesses) {
-        ++result.interface_access_visits;
+        ++result.Diagnostics().interface_access_visits;
         if (access.write) written.at(access.storage) = true;
         effects[access.storage].emplace_back(&segment, &access);
       }
   for (const auto& [storage, domain_effects] : effects) {
     if (!written[storage]) continue;
     if (auto proof = CollectiveDomain(input, storage, result)) {
-      ++result.collective_domains;
-      result.collective_witnesses += proof->witness_columns.size();
+      ++result.Diagnostics().collective_domains;
+      result.Diagnostics().collective_witnesses += proof->witness_columns.size();
       hierarchy.collective_domains.emplace(storage, std::move(*proof));
     }
   }
   std::map<size_t, size_t> private_owner;
-  for (size_t region = 0; region < result.segments.size(); ++region)
-    for (const auto& [storage, certificate] : result.segments[region].visit_owned) {
+  for (size_t region = 0; region < result.State().segments.size(); ++region)
+    for (const auto& [storage, certificate] : result.State().segments[region].visit_owned) {
       if (hierarchy.collective_domains.count(storage)) continue;
       const auto [owner, inserted] = private_owner.emplace(storage, region);
       CHECK(inserted || owner->second == region)
@@ -248,13 +248,13 @@ std::vector<NumericalCell> InterfaceCells(CompactSyncResult& result, NumericalSy
       CHECK(region.nested_frames.empty() || own_frame)
           << "Visit-owned storage cannot be omitted across repeated or reset invocations";
       for (const auto& [segment, access] : domain_effects) {
-        ++result.interface_access_visits;
+        ++result.Diagnostics().interface_access_visits;
         CHECK(segment == &region)
             << "Visit-owned storage has an outside read or write; crossing selector export unavailable";
         CHECK((!access->row_step && !access->column_step) || access->coordinate_frame == region.original_loop)
             << "Visit-owned translation belongs to another occurrence frame";
       }
-      ++result.omitted_bridge_domains;
+      ++result.Diagnostics().omitted_bridge_domains;
       continue;
     }
     // The shared alias-qualified physical inventory proves that no region
@@ -262,7 +262,7 @@ std::vector<NumericalCell> InterfaceCells(CompactSyncResult& result, NumericalSy
     if (!written[storage]) continue;
     std::set<int64_t> rows, columns, slots;
     for (const auto& [segment, pointer] : domain_effects) {
-      ++result.interface_access_visits;
+      ++result.Diagnostics().interface_access_visits;
       const auto& access = *pointer;
       if (!segment->count) continue;
       const auto count = Scope(*segment);
@@ -277,7 +277,7 @@ std::vector<NumericalCell> InterfaceCells(CompactSyncResult& result, NumericalSy
       // Explicit complete-interface output work. Enumerate visited physical
       // slots only; never the trip count beyond one orbit or a joint period.
       for (int64_t visit = 0; visit < std::min(count, period); ++visit) {
-        ++result.interface_slot_visits;
+        ++result.Diagnostics().interface_slot_visits;
         slots.insert(Mod(Ordinal(access.slot_first) + Ordinal(visit) * access.slot_step, banks));
       }
     }
@@ -286,35 +286,36 @@ std::vector<NumericalCell> InterfaceCells(CompactSyncResult& result, NumericalSy
       for (size_t i = 1; i < r.size(); ++i)
         for (size_t j = 1; j < c.size(); ++j) cells.push_back({storage, slot, r[i - 1], c[j - 1]});
   }
-  result.interface_cells = cells.size();
+  result.Diagnostics().interface_cells = cells.size();
   return cells;
 }
-bool LeafQuery(const CompactSyncResult& result, size_t leaf, Ordinal a, bool sc, Ordinal b, bool tc) {
+bool LeafQuery(const CompactSyncView& result, size_t leaf, Ordinal a, bool sc, Ordinal b, bool tc) {
   if (a == b && sc == tc) return true;
-  if (result.hierarchy) {
-    const auto provider = result.hierarchy->finite_providers.find(leaf);
-    if (provider != result.hierarchy->finite_providers.end())
+  if (result.State().hierarchy) {
+    const auto provider = result.State().hierarchy->finite_providers.find(leaf);
+    if (provider != result.State().hierarchy->finite_providers.end())
       return provider->second.order.Precedes(static_cast<size_t>(a), sc, static_cast<size_t>(b), tc);
   }
-  const auto sites = result.input.segments[leaf].sites.size();
+  const auto sites = result.State().input.segments[leaf].sites.size();
   INTERNAL_CHECK(sites) << "Nonempty numerical leaf has no sites";
-  return result.segments[leaf].Precedes(static_cast<int64_t>(a / sites), static_cast<size_t>(a % sites), sc,
-                                        static_cast<int64_t>(b / sites), static_cast<size_t>(b % sites), tc);
+  return result.State().segments[leaf].Precedes(
+      static_cast<int64_t>(a / sites), static_cast<size_t>(a % sites), sc, static_cast<int64_t>(b / sites),
+      static_cast<size_t>(b % sites), tc);
 }
-NodePtr BuildLeaf(CompactSyncResult& result, const std::vector<NumericalCell>& cells, size_t leaf) {
+NodePtr BuildLeaf(CompactSyncBuilder& result, const std::vector<NumericalCell>& cells, size_t leaf) {
   auto node = std::make_shared<Node>();
   node->leaf = leaf;
-  const auto& input = result.input.segments[leaf];
-  const auto count = result.segments[leaf].internal_scope_count;
+  const auto& input = result.State().input.segments[leaf];
+  const auto count = result.State().segments[leaf].internal_scope_count;
   node->length = Length(count, input.sites.size());
   for (size_t c = 0; c < cells.size(); ++c) {
-    if (result.segments[leaf].rotating) {
+    if (result.State().segments[leaf].rotating) {
       node->storage.push_back(LeafBoundary(result, leaf, cells[c]));
     } else {
       // Composition consumes exact conflict-class boundaries. A moving read
       // can intersect a whole-write class without touching its representative
       // point; point selectors below must NOT replace this class summary.
-      const auto boundary = result.segments[leaf].body.Boundary(c);
+      const auto boundary = result.State().segments[leaf].body.Boundary(c);
       INTERNAL_CHECK(boundary) << "Invariant leaf omitted a supplied class";
       NumericalBoundary out;
       auto at = [&](const std::optional<size_t>& site, bool last) -> std::optional<Ordinal> {
@@ -347,7 +348,7 @@ NodePtr BuildLeaf(CompactSyncResult& result, const std::vector<NumericalCell>& c
     if (!first.initializes_accumulator) node->first_m_continuation = first.protected_accumulator;
     node->last_m_qualified = input.sites[last_site].protected_accumulator;
   }
-  for (const auto& event : NumericalPorts(*node, result.port_normalization_visits)) {
+  for (const auto& event : NumericalPorts(*node, result.Diagnostics().port_normalization_visits)) {
     const auto site = static_cast<size_t>(event.first % input.sites.size());
     const size_t chain = 2 * static_cast<size_t>(input.sites[site].pipe) + event.second;
     node->chains[chain].push_back(event.first);
@@ -359,7 +360,7 @@ NodePtr BuildLeaf(CompactSyncResult& result, const std::vector<NumericalCell>& c
       size_t target = 0;
       for (size_t source = 0; source < node->chains[c].size(); ++source) {
         while (target < node->chains[d].size()) {
-          ++result.interface_queries;
+          ++result.Diagnostics().interface_queries;
           if (LeafQuery(result, leaf, node->chains[c][source], c % 2, node->chains[d][target], d % 2)) break;
           ++target;
         }
@@ -371,7 +372,7 @@ NodePtr BuildLeaf(CompactSyncResult& result, const std::vector<NumericalCell>& c
   CountNumericalInterface(*node, result);
   return node;
 }
-NodePtr Repeat(NodePtr body, int64_t count, CompactSyncResult& result, NodePtr* seam = nullptr) {
+NodePtr Repeat(NodePtr body, int64_t count, CompactSyncBuilder& result, NodePtr* seam = nullptr) {
   NodePtr output = std::make_shared<Node>();
   if (!count || !body->length) return output;
   while (count) {
@@ -385,7 +386,7 @@ NodePtr Repeat(NodePtr body, int64_t count, CompactSyncResult& result, NodePtr* 
   return output;
 }
 NodePtr Compose(const std::vector<NodePtr>& nodes, size_t begin, size_t end, const std::string& order,
-                CompactSyncResult& result) {
+                CompactSyncBuilder& result) {
   if (begin == end) return std::make_shared<Node>();
   if (end - begin == 1) return nodes[begin];
   if (order == "left") {
@@ -402,17 +403,17 @@ NodePtr Compose(const std::vector<NodePtr>& nodes, size_t begin, size_t end, con
   return MergeNumericalNodes(Compose(nodes, begin, middle, order, result),
                              Compose(nodes, middle, end, order, result), result);
 }
-NumericalSourceLayout BuildSourceLayout(const SyncRegion& source, CompactSyncResult& result,
+NumericalSourceLayout BuildSourceLayout(const SyncRegion& source, CompactSyncBuilder& result,
                                         std::set<size_t>& leaves) {
-  ++result.source_region_nodes;
+  ++result.Diagnostics().source_region_nodes;
   NumericalSourceLayout out;
   if (source.leaf) {
-    CHECK(source.children.empty() && !source.repetition && *source.leaf < result.segments.size())
+    CHECK(source.children.empty() && !source.repetition && *source.leaf < result.State().segments.size())
         << "Invalid source region leaf";
     CHECK(leaves.insert(*source.leaf).second) << "Source leaf has more than one original occurrence path";
     out.leaf = source.leaf;
-    out.length = out.body_length = Length(result.segments[*source.leaf].internal_scope_count,
-                                          result.input.segments[*source.leaf].sites.size());
+    out.length = out.body_length = Length(result.State().segments[*source.leaf].internal_scope_count,
+                                          result.State().input.segments[*source.leaf].sites.size());
   } else {
     if (source.repetition) {
       CHECK(source.repetition->count >= 0) << "Negative source repetition count";
@@ -431,17 +432,18 @@ NumericalSourceLayout BuildSourceLayout(const SyncRegion& source, CompactSyncRes
   return out;
 }
 void IndexSourcePaths(const NumericalSourceLayout& source, NumericalOccurrencePath& path,
-                      NumericalSyncHierarchy& hierarchy, CompactSyncResult& result) {
+                      NumericalSyncHierarchy& hierarchy, CompactSyncBuilder& result) {
   if (source.leaf) {
     const auto leaf = *source.leaf;
-    path.frames.emplace_back(result.segments[leaf].internal_scope_count,
-                             result.input.segments[leaf].sites.size());
+    path.frames.emplace_back(result.State().segments[leaf].internal_scope_count,
+                             result.State().input.segments[leaf].sites.size());
     Ordinal visits = 1;
     for (const auto& [count, stride] : path.frames) {
       CHECK(!__builtin_mul_overflow(visits, Ordinal(count), &visits)) << "Source visit count overflow";
     }
-    CHECK(visits == result.input.segments[leaf].count) << "Source path disagrees with leaf visit inventory";
-    result.source_coordinate_entries += path.frames.size();
+    CHECK(visits == result.State().input.segments[leaf].count)
+        << "Source path disagrees with leaf visit inventory";
+    result.Diagnostics().source_coordinate_entries += path.frames.size();
     hierarchy.source_paths.at(leaf) = path;
     path.frames.pop_back();
     return;
@@ -457,7 +459,7 @@ void IndexSourcePaths(const NumericalSourceLayout& source, NumericalOccurrencePa
 }
 NodePtr BuildSourceNode(const SyncRegion& source, NumericalSourceLayout& layout,
                         const std::vector<NodePtr>& leaves, const std::string& order,
-                        CompactSyncResult& result) {
+                        CompactSyncBuilder& result) {
   if (source.leaf) {
     layout.body = layout.summary = leaves.at(*source.leaf);
     return layout.summary;
@@ -469,13 +471,13 @@ NodePtr BuildSourceNode(const SyncRegion& source, NumericalSourceLayout& layout,
   layout.body = body;
   if (source.startup && source.repetition && source.repetition->count > 1 && body->length) {
     const auto [leaf, site] = *source.startup;
-    const auto& initializer = result.input.segments[leaf].sites[site];
+    const auto& initializer = result.State().input.segments[leaf].sites[site];
     // First-touch qualification proves that the first RMW read has no internal
     // predecessor, so the rows/covers are identical. Only incoming footprint
     // protection differs. Keep the startup node immutable, including when the
     // enclosing invocation repeats or a summary is shared by binary doubling.
     // An empty initializer leaf cannot establish a continuation entry.
-    if (result.segments[leaf].internal_scope_count) {
+    if (result.State().segments[leaf].internal_scope_count) {
       auto continuation = std::make_shared<Node>(*body);
       continuation->first_m_continuation = initializer.protected_accumulator;
       auto tail = Repeat(continuation, source.repetition->count - 1, result, &layout.seam);
@@ -492,8 +494,8 @@ NodePtr BuildSourceNode(const SyncRegion& source, NumericalSourceLayout& layout,
   layout.summary = source.repetition ? Repeat(body, source.repetition->count, result, &layout.seam) : body;
   return layout.summary;
 }
-Occurrence DecodeSource(const CompactSyncResult& result, Ordinal ordinal) {
-  const auto* node = &*result.hierarchy->source_layout;
+Occurrence DecodeSource(const CompactSyncView& result, Ordinal ordinal) {
+  const auto* node = &*result.State().hierarchy->source_layout;
   CHECK(ordinal >= 0 && ordinal < node->length) << "Invalid original source occurrence ordinal";
   Ordinal visit = 0;
   while (!node->leaf) {
@@ -508,31 +510,31 @@ Occurrence DecodeSource(const CompactSyncResult& result, Ordinal ordinal) {
     node = &node->children[index];
   }
   const auto leaf = *node->leaf;
-  const auto sites = result.input.segments[leaf].sites.size();
-  visit = visit * result.segments[leaf].internal_scope_count + ordinal / sites;
-  CHECK(visit < result.input.segments[leaf].count) << "Decoded source visit outside original frame";
+  const auto sites = result.State().input.segments[leaf].sites.size();
+  visit = visit * result.State().segments[leaf].internal_scope_count + ordinal / sites;
+  CHECK(visit < result.State().input.segments[leaf].count) << "Decoded source visit outside original frame";
   return {leaf, static_cast<int64_t>(visit), static_cast<size_t>(ordinal % sites)};
 }
-Occurrence Decode(const CompactSyncResult& result, Ordinal ordinal) {
-  if (result.hierarchy->source_layout) return DecodeSource(result, ordinal);
-  const auto& offsets = result.hierarchy->segment_offsets;
+Occurrence Decode(const CompactSyncView& result, Ordinal ordinal) {
+  if (result.State().hierarchy->source_layout) return DecodeSource(result, ordinal);
+  const auto& offsets = result.State().hierarchy->segment_offsets;
   const auto upper = std::upper_bound(offsets.begin(), offsets.end(), ordinal);
   CHECK(upper != offsets.begin() && upper != offsets.end()) << "Invalid numerical occurrence ordinal";
   const size_t region = static_cast<size_t>(upper - offsets.begin() - 1);
-  const auto& segment = result.input.segments[region];
+  const auto& segment = result.State().input.segments[region];
   const auto relative = ordinal - offsets[region];
   INTERNAL_CHECK(!segment.sites.empty()) << "Nonempty numerical region has no sites";
   return {region, static_cast<int64_t>(relative / segment.sites.size()),
           static_cast<size_t>(relative % segment.sites.size())};
 }
-Ordinal Encode(const CompactSyncResult& result, const Occurrence& occurrence) {
+Ordinal Encode(const CompactSyncView& result, const Occurrence& occurrence) {
   const auto [region, visit, site] = occurrence;
-  CHECK(region < result.input.segments.size()) << "Invalid numerical region";
-  const auto& segment = result.input.segments[region];
+  CHECK(region < result.State().input.segments.size()) << "Invalid numerical region";
+  const auto& segment = result.State().input.segments[region];
   CHECK(visit >= 0 && visit < segment.count && site < segment.sites.size())
       << "Invalid numerical synchronization occurrence";
-  if (result.hierarchy->source_layout) {
-    const auto& path = result.hierarchy->source_paths[region];
+  if (result.State().hierarchy->source_layout) {
+    const auto& path = result.State().hierarchy->source_paths[region];
     auto ordinal = NumericalAdd(path.first, site);
     auto remaining = visit;
     for (auto frame = path.frames.rbegin(); frame != path.frames.rend(); ++frame) {
@@ -543,7 +545,8 @@ Ordinal Encode(const CompactSyncResult& result, const Occurrence& occurrence) {
     CHECK(!remaining) << "Occurrence exceeds original coordinate arity";
     return ordinal;
   }
-  return NumericalAdd(result.hierarchy->segment_offsets[region], Length(visit, segment.sites.size()) + site);
+  return NumericalAdd(result.State().hierarchy->segment_offsets[region],
+                      Length(visit, segment.sites.size()) + site);
 }
 
 int64_t PhaseInteger(Ordinal value) {
@@ -552,7 +555,7 @@ int64_t PhaseInteger(Ordinal value) {
 }
 NodePtr BuildPhaseSource(const SyncRegion& source, NumericalSourceLayout& layout,
                          const std::map<size_t, NodePtr>& providers, const std::string& order,
-                         CompactSyncResult& result, NumericalSyncHierarchy& hierarchy) {
+                         CompactSyncBuilder& result, NumericalSyncHierarchy& hierarchy) {
   if (source.leaf) {
     layout.body = layout.summary = providers.at(hierarchy.finite_source_providers.at(*source.leaf));
     return layout.summary;
@@ -585,35 +588,35 @@ NodePtr BuildPhaseSource(const SyncRegion& source, NumericalSourceLayout& layout
       source.repetition ? Repeat(layout.body, source.repetition->count, result, &layout.seam) : layout.body;
   return layout.summary;
 }
-CompactSyncResult AnalyzePhasedSource(CompactSyncInput input, const std::string& order) {
+CompactSyncBuilder AnalyzePhasedSource(CompactSyncInput input, const std::string& order) {
   const auto begin = std::chrono::steady_clock::now();
-  CompactSyncResult result;
-  result.input = std::move(input);
+  CompactSyncBuilder result;
+  result.State().input = std::move(input);
   IndexSyncStorageAccesses(result);
   auto hierarchy = std::make_shared<NumericalSyncHierarchy>();
-  result.hierarchy = hierarchy;
-  for (size_t storage = 0; storage < result.input.storage.size(); ++storage) {
-    if (result.input.storage[storage].space != MemorySpace::DDR) continue;
-    const auto& directory = result.storage_access_index[storage];
+  result.State().hierarchy = hierarchy;
+  for (size_t storage = 0; storage < result.State().input.storage.size(); ++storage) {
+    if (result.State().input.storage[storage].space != MemorySpace::DDR) continue;
+    const auto& directory = result.State().storage_access_index[storage];
     if (!directory.written) {
       hierarchy->phase_readonly_domains.insert(storage);
-      ++result.omitted_bridge_domains;
+      ++result.Diagnostics().omitted_bridge_domains;
     } else {
       bool external = false;
       for (const auto& [r, s, a] : directory.accesses)
-        external |= static_cast<bool>(result.input.segments[r].sites[s].accesses[a].external);
+        external |= static_cast<bool>(result.State().input.segments[r].sites[s].accesses[a].external);
       if (external) {
         CHECK(directory.accesses.size() == 1)
             << "External output ownership requires one complete write family and no other accesses";
         const auto [r, s, a] = directory.accesses.front();
-        const auto& segment = result.input.segments[r];
+        const auto& segment = result.State().input.segments[r];
         const auto& access = segment.sites[s].accesses[a];
         CHECK(access.write && access.exact_footprint && !access.after_first && access.external &&
               (access.external->row_major_tiles || segment.count <= 1))
             << "External output has no exact injective tile ownership certificate";
         if (segment.count <= 1) {
           hierarchy->phase_owned_outputs.insert(storage);
-          ++result.omitted_bridge_domains;
+          ++result.Diagnostics().omitted_bridge_domains;
           continue;
         }
         const auto& tiles = *access.external->row_major_tiles;
@@ -630,10 +633,10 @@ CompactSyncResult AnalyzePhasedSource(CompactSyncInput input, const std::string&
         CHECK(found && access.rows == tiles.row_scale && access.columns == tiles.column_scale)
             << "External output ownership has incompatible frame or tile extents";
         hierarchy->phase_owned_outputs.insert(storage);
-        ++result.omitted_bridge_domains;
+        ++result.Diagnostics().omitted_bridge_domains;
       } else {
         for (const auto& [r, s, a] : directory.accesses) {
-          const auto& access = result.input.segments[r].sites[s].accesses[a];
+          const auto& access = result.State().input.segments[r].sites[s].accesses[a];
           CHECK(!access.row_step && !access.column_step)
               << "Phased moving GM writes need a scoped external ownership certificate";
         }
@@ -641,45 +644,45 @@ CompactSyncResult AnalyzePhasedSource(CompactSyncInput input, const std::string&
     }
   }
   hierarchy->segment_offsets.push_back(0);
-  for (const auto& source : result.input.segments) {
+  for (const auto& source : result.State().input.segments) {
     CompactSegmentResult descriptor;
     descriptor.count = source.count;
     descriptor.internal_scope_count = Scope(source);
     for (const auto& site : source.sites) descriptor.pipes.push_back(site.pipe);
-    result.segments.push_back(std::move(descriptor));
+    result.State().segments.push_back(std::move(descriptor));
     hierarchy->segment_offsets.push_back(
         NumericalAdd(hierarchy->segment_offsets.back(), Length(source.count, source.sites.size())));
   }
   std::set<size_t> leaves;
-  hierarchy->source_layout = BuildSourceLayout(*result.input.region_tree, result, leaves);
-  hierarchy->source_paths.resize(result.input.segments.size());
+  hierarchy->source_layout = BuildSourceLayout(*result.State().input.region_tree, result, leaves);
+  hierarchy->source_paths.resize(result.State().input.segments.size());
   NumericalOccurrencePath path;
   IndexSourcePaths(*hierarchy->source_layout, path, *hierarchy, result);
-  PlanNumericalPhases(*result.input.region_tree, result, *hierarchy);
+  PlanNumericalPhases(*result.State().input.region_tree, result, *hierarchy);
   BuildNumericalPhaseCells(result, *hierarchy);
   const auto partitioned = std::chrono::steady_clock::now();
-  result.partition_seconds = std::chrono::duration<double>(partitioned - begin).count();
+  result.Diagnostics().partition_seconds = std::chrono::duration<double>(partitioned - begin).count();
   const auto providers = BuildNumericalPhaseProviders(result, *hierarchy);
   const auto reduced = std::chrono::steady_clock::now();
-  result.reduction_seconds = std::chrono::duration<double>(reduced - partitioned).count();
-  hierarchy->root = BuildPhaseSource(*result.input.region_tree, *hierarchy->source_layout, providers, order,
-                                     result, *hierarchy);
-  result.composition_seconds =
+  result.Diagnostics().reduction_seconds = std::chrono::duration<double>(reduced - partitioned).count();
+  hierarchy->root = BuildPhaseSource(*result.State().input.region_tree, *hierarchy->source_layout, providers,
+                                     order, result, *hierarchy);
+  result.Diagnostics().composition_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - reduced).count();
   return result;
 }
-void ExpandNodeDemands(const CompactSyncResult& result, const NodePtr& node, Ordinal offset,
+void ExpandNodeDemands(const CompactSyncView& result, const NodePtr& node, Ordinal offset,
                        std::vector<Crossing>& out) {
   if (!node->length) return;
   if (!node->left) {
-    if (const auto provider = result.hierarchy->finite_providers.find(node->leaf);
-        provider != result.hierarchy->finite_providers.end()) {
+    if (const auto provider = result.State().hierarchy->finite_providers.find(node->leaf);
+        provider != result.State().hierarchy->finite_providers.end()) {
       for (const auto& [a, b] : provider->second.order.demands)
         out.emplace_back(Decode(result, NumericalAdd(offset, a)), Decode(result, NumericalAdd(offset, b)));
       return;
     }
-    const auto& segment = result.segments[node->leaf];
-    const auto sites = result.input.segments[node->leaf].sites.size();
+    const auto& segment = result.State().segments[node->leaf];
+    const auto sites = result.State().input.segments[node->leaf].sites.size();
     for (const auto& demand : segment.demands)
       for (int64_t i = 0; i < segment.internal_scope_count - demand.distance; ++i) {
         const auto a = NumericalAdd(offset, Length(i, sites) + demand.source);
@@ -700,7 +703,7 @@ void ExpandNodeDemands(const CompactSyncResult& result, const NodePtr& node, Ord
   }
 }
 // Export only retained merge records: leaf demand families remain compact.
-void ExportNodeCrossings(const CompactSyncResult& result, const NodePtr& node, Ordinal offset,
+void ExportNodeCrossings(const CompactSyncView& result, const NodePtr& node, Ordinal offset,
                          std::vector<Crossing>& out) {
   if (!node->length || !node->left) return;
   ExportNodeCrossings(result, node->left, offset, out);
@@ -723,7 +726,7 @@ class ScopedExporter {
     int64_t count;
     int64_t step = 1;
   };
-  const CompactSyncResult& result_;
+  const CompactSyncView& result_;
   std::shared_ptr<ScopedSyncDemands> output_ = std::make_shared<ScopedSyncDemands>();
   std::vector<std::map<const ForStmt*, int64_t>> strides_;
   std::vector<Axis> axes_;
@@ -747,8 +750,9 @@ class ScopedExporter {
       source_span += Ordinal(axis->count - 1) * axis->source_stride;
       target_span += Ordinal(axis->count - 1) * axis->target_stride;
     }
-    INTERNAL_CHECK(Ordinal(std::get<1>(family.source)) + source_span < result_.input.segments[sr].count &&
-                   Ordinal(std::get<1>(family.target)) + target_span < result_.input.segments[tr].count)
+    INTERNAL_CHECK(
+        Ordinal(std::get<1>(family.source)) + source_span < result_.State().input.segments[sr].count &&
+        Ordinal(std::get<1>(family.target)) + target_span < result_.State().input.segments[tr].count)
         << "Internal error: scoped endpoint exceeds original invocation domain";
     output_->families.push_back(std::move(family));
   }
@@ -771,8 +775,8 @@ class ScopedExporter {
   void Finite(const NodePtr& node, Ordinal offset) {
     if (!node || !node->length) return;
     if (!node->left) {
-      const auto provider = result_.hierarchy->finite_providers.find(node->leaf);
-      INTERNAL_CHECK(provider != result_.hierarchy->finite_providers.end())
+      const auto provider = result_.State().hierarchy->finite_providers.find(node->leaf);
+      INTERNAL_CHECK(provider != result_.State().hierarchy->finite_providers.end())
           << "Missing finite phase provider";
       for (const auto& [a, b] : provider->second.order.demands)
         Record(NumericalAdd(offset, a), NumericalAdd(offset, b));
@@ -786,8 +790,8 @@ class ScopedExporter {
     ++output_->visited_source_nodes;
     if (!source.length) return;
     if (source.frame) {
-      const auto found = result_.hierarchy->phase_schedules.find(source.frame.get());
-      if (found != result_.hierarchy->phase_schedules.end()) {
+      const auto found = result_.State().hierarchy->phase_schedules.find(source.frame.get());
+      if (found != result_.State().hierarchy->phase_schedules.end()) {
         const auto& phase = found->second;
         Finite(phase.prefix, offset);
         const auto cycles = NumericalAdd(offset, phase.prefix->length);
@@ -808,12 +812,12 @@ class ScopedExporter {
     }
     if (source.leaf) {
       const auto leaf = *source.leaf;
-      if (result_.hierarchy->finite_source_providers.count(leaf)) {
+      if (result_.State().hierarchy->finite_source_providers.count(leaf)) {
         Finite(source.summary, offset);
         return;
       }
-      const auto& segment = result_.input.segments[leaf];
-      const auto& analysis = result_.segments[leaf];
+      const auto& segment = result_.State().input.segments[leaf];
+      const auto& analysis = result_.State().segments[leaf];
       for (const auto& demand : analysis.demands) {
         const auto count = analysis.internal_scope_count - demand.distance;
         if (count <= 0) continue;
@@ -843,8 +847,8 @@ class ScopedExporter {
   }
 
  public:
-  explicit ScopedExporter(const CompactSyncResult& result) : result_(result) {
-    for (const auto& segment : result.input.segments) {
+  explicit ScopedExporter(const CompactSyncView& result) : result_(result) {
+    for (const auto& segment : result.State().input.segments) {
       strides_.emplace_back();
       Ordinal stride = 1;
       for (auto frame = segment.nested_frames.rbegin(); frame != segment.nested_frames.rend(); ++frame) {
@@ -856,11 +860,11 @@ class ScopedExporter {
     }
   }
   std::shared_ptr<const ScopedSyncDemands> Run() {
-    Visit(*result_.hierarchy->source_layout, 0);
+    Visit(*result_.State().hierarchy->source_layout, 0);
     return output_;
   }
 };
-NumericalBoundary Point(const CompactSyncResult& result, const NodePtr& node, const NumericalCell& cell,
+NumericalBoundary Point(const CompactSyncView& result, const NodePtr& node, const NumericalCell& cell,
                         std::unordered_map<const Node*, NumericalBoundary>& cache) {
   const auto found = cache.find(node.get());
   if (found != cache.end()) return found->second;
@@ -877,7 +881,7 @@ NumericalBoundary Point(const CompactSyncResult& result, const NodePtr& node, co
 }
 }  // namespace
 
-CompactSyncResult AnalyzeNumericalSync(CompactSyncInput input, const std::string& order) {
+CompactSyncBuilder AnalyzeNumericalSync(CompactSyncInput input, const std::string& order) {
   const bool structured = input.region_tree.has_value();
   if (structured)
     for (const auto& segment : input.segments)
@@ -903,7 +907,7 @@ CompactSyncResult AnalyzeNumericalSync(CompactSyncInput input, const std::string
   // every effect and refuses an unbound ancestor slot frame. Moving DDR domains
   // use its visit-owned proof; route selection supplies neither certificate.
   const bool invariant_leaves = structured && !moving_write && !slot_access;
-  CompactSyncResult result;
+  CompactSyncBuilder result;
   if (invariant_leaves) {
     // The initial structured adapter accepts invariant conflict classes only.
     // Slot geometry still needs its own scoped interface proof.
@@ -911,91 +915,93 @@ CompactSyncResult AnalyzeNumericalSync(CompactSyncInput input, const std::string
       CHECK(storage.slot_count == 1) << "Structured rotating source export is not yet qualified";
     result = AnalyzeInvariantSyncLeaves(std::move(input));
   } else {
-    result.input = std::move(input);
+    result.State().input = std::move(input);
     IndexSyncStorageAccesses(result);
-    for (size_t r = 0; r < result.input.segments.size(); ++r) {
-      const auto& original = result.input.segments[r];
-      result.segments.push_back(AnalyzeRotatingSegment(result.input, r, Scope(original), result));
+    for (size_t r = 0; r < result.State().input.segments.size(); ++r) {
+      const auto& original = result.State().input.segments[r];
+      result.State().segments.push_back(
+          AnalyzeRotatingSegment(result.State().input, r, Scope(original), result));
       // SourceLayout owns structured repetition; do not duplicate visits in
       // leaf mathematics or mistake a finite reader for its enclosing loop.
-      result.segments.back().repetitions = structured ? 1 : Repetitions(original);
+      result.State().segments.back().repetitions = structured ? 1 : Repetitions(original);
     }
   }
   auto hierarchy = std::make_shared<NumericalSyncHierarchy>();
   hierarchy->segment_offsets.push_back(0);
-  for (const auto& original : result.input.segments)
+  for (const auto& original : result.State().input.segments)
     hierarchy->segment_offsets.push_back(
         NumericalAdd(hierarchy->segment_offsets.back(), Length(original.count, original.sites.size())));
   const auto start = std::chrono::steady_clock::now();
   if (invariant_leaves) {
-    for (const auto& cell : result.storage_classes)
+    for (const auto& cell : result.State().storage_classes)
       hierarchy->cells.push_back({cell.storage, 0, cell.row, cell.column});
-    result.interface_cells = hierarchy->cells.size();
+    result.Diagnostics().interface_cells = hierarchy->cells.size();
   } else {
     hierarchy->cells = InterfaceCells(result, *hierarchy);
   }
   std::vector<NodePtr> nodes;
-  for (size_t r = 0; r < result.segments.size(); ++r) {
+  for (size_t r = 0; r < result.State().segments.size(); ++r) {
     auto leaf = BuildLeaf(result, hierarchy->cells, r);
-    nodes.push_back(Repeat(leaf, result.segments[r].repetitions, result));
+    nodes.push_back(Repeat(leaf, result.State().segments[r].repetitions, result));
   }
   if (structured) {
     std::set<size_t> leaves;
-    hierarchy->source_layout = BuildSourceLayout(*result.input.region_tree, result, leaves);
-    CHECK(leaves.size() == result.segments.size()) << "Source tree omitted retained leaves";
-    hierarchy->source_paths.resize(result.segments.size());
+    hierarchy->source_layout = BuildSourceLayout(*result.State().input.region_tree, result, leaves);
+    CHECK(leaves.size() == result.State().segments.size()) << "Source tree omitted retained leaves";
+    hierarchy->source_paths.resize(result.State().segments.size());
     NumericalOccurrencePath path;
     IndexSourcePaths(*hierarchy->source_layout, path, *hierarchy, result);
     hierarchy->root =
-        BuildSourceNode(*result.input.region_tree, *hierarchy->source_layout, nodes, order, result);
+        BuildSourceNode(*result.State().input.region_tree, *hierarchy->source_layout, nodes, order, result);
   } else {
     hierarchy->root = Compose(nodes, 0, nodes.size(), order, result);
   }
   INTERNAL_CHECK(hierarchy->root->length == hierarchy->segment_offsets.back())
       << "Numerical repetition lost original occurrence coordinates";
-  result.hierarchy = hierarchy;
+  result.State().hierarchy = hierarchy;
   // Crossings remain owned by the hierarchy. A missing flat export is not an
   // empty answer; clients can audit bounded expansion without reanalysis.
-  result.composition_seconds =
+  result.Diagnostics().composition_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   return result;
 }
-bool NumericalReferenceBefore(const CompactSyncResult& result, const Occurrence& a, const Occurrence& b) {
+bool NumericalReferenceBefore(const CompactSyncView& result, const Occurrence& a, const Occurrence& b) {
   return Encode(result, a) < Encode(result, b);
 }
-bool NumericalPrecedes(const CompactSyncResult& result, const Occurrence& a, bool sc, const Occurrence& b,
+bool NumericalPrecedes(const CompactSyncView& result, const Occurrence& a, bool sc, const Occurrence& b,
                        bool tc) {
   const auto source = Encode(result, a), target = Encode(result, b);
   if (source > target || (source == target && sc == tc)) return false;
   const NumericalOrderQuery query{[&](size_t leaf, Ordinal a, bool ac, Ordinal b, bool bc) {
                                     return LeafQuery(result, leaf, a, ac, b, bc);
                                   },
-                                  result.hierarchy_query_steps};
-  return QueryNumericalOrder(query, result.hierarchy->root, source, sc, target, tc);
+                                  result.Diagnostics().hierarchy_query_steps};
+  return QueryNumericalOrder(query, result.State().hierarchy->root, source, sc, target, tc);
 }
-std::optional<PointBoundary> QueryExternalNumericalBoundary(const CompactSyncResult& result, size_t storage,
+std::optional<PointBoundary> QueryExternalNumericalBoundary(const CompactSyncView& result, size_t storage,
                                                             int64_t slot, int64_t row, int64_t column,
                                                             const std::map<size_t, int64_t>& parameters,
                                                             std::optional<int64_t> block_index) {
-  const auto& domain = result.input.storage.at(storage);
+  const auto& domain = result.State().input.storage.at(storage);
   if (slot != 0 || row < 0 || column < 0 || row >= domain.rows || column >= domain.columns)
     return std::nullopt;
   // Readonly establishes no conflicts, not an arbitrary exact membership
   // selector. Never pass a nonlinear descriptor to the affine fallback.
-  if (!result.hierarchy->phase_owned_outputs.count(storage)) return std::nullopt;
+  if (!result.State().hierarchy->phase_owned_outputs.count(storage)) return std::nullopt;
   for (const auto& [parameter, value] : parameters) {
-    const auto bound = result.input.parameter_bounds.find(parameter);
-    if (bound == result.input.parameter_bounds.end() || value < bound->second.first ||
+    const auto bound = result.State().input.parameter_bounds.find(parameter);
+    if (bound == result.State().input.parameter_bounds.end() || value < bound->second.first ||
         value > bound->second.second)
       return std::nullopt;
   }
-  if (block_index && (!result.input.block_bounds || *block_index < result.input.block_bounds->first ||
-                      *block_index > result.input.block_bounds->second))
+  if (block_index &&
+      (!result.State().input.block_bounds || *block_index < result.State().input.block_bounds->first ||
+       *block_index > result.State().input.block_bounds->second))
     return std::nullopt;
-  const auto& directory = result.storage_access_index.at(storage);
+  const auto& directory = result.State().storage_access_index.at(storage);
   INTERNAL_CHECK(directory.accesses.size() == 1) << "Owned output lost its complete access inventory";
   const auto [r, s, a] = directory.accesses.front();
-  const auto& segment = result.input.segments[r];
+  const auto& segment = result.State().input.segments[r];
   const auto& access = segment.sites[s].accesses[a];
   const auto& external = *access.external;
   if (!segment.count) return PointBoundary{};
@@ -1056,17 +1062,17 @@ std::optional<PointBoundary> QueryExternalNumericalBoundary(const CompactSyncRes
   out.first_writer = out.last_writer = Occurrence{r, ordinal, s};
   return out;
 }
-PointBoundary QueryNumericalBoundary(const CompactSyncResult& result, size_t storage, int64_t slot,
-                                     int64_t row, int64_t column) {
-  if (result.hierarchy->phase_readonly_domains.count(storage)) {
+PointBoundary QueryNumericalBoundary(const CompactSyncView& result, size_t storage, int64_t slot, int64_t row,
+                                     int64_t column) {
+  if (result.State().hierarchy->phase_readonly_domains.count(storage)) {
     PointBoundary out;
     // Read-only domains were omitted from conflict construction, not from
     // access knowledge. Query the original framed affine accesses; phase
     // snapshots cannot represent their changing external coordinates.
     CHECK(slot == 0) << "External selector has an invalid physical slot";
-    for (const auto& [r, s, a] : result.storage_access_index.at(storage).accesses) {
-      ++result.point_selector_access_visits;
-      const auto& segment = result.input.segments[r];
+    for (const auto& [r, s, a] : result.State().storage_access_index.at(storage).accesses) {
+      ++result.Diagnostics().point_selector_access_visits;
+      const auto& segment = result.State().input.segments[r];
       const auto& site = segment.sites[s];
       const auto& access = site.accesses[a];
       INTERNAL_CHECK(!access.write) << "Read-only phase domain contains a write";
@@ -1081,7 +1087,7 @@ PointBoundary QueryNumericalBoundary(const CompactSyncResult& result, size_t sto
     return out;
   }
   std::unordered_map<const Node*, NumericalBoundary> cache;
-  const auto selected = Point(result, result.hierarchy->root, {storage, slot, row, column}, cache);
+  const auto selected = Point(result, result.State().hierarchy->root, {storage, slot, row, column}, cache);
   auto decode = [&](const std::optional<Ordinal>& ordinal) -> std::optional<Occurrence> {
     return ordinal ? std::optional<Occurrence>(Decode(result, *ordinal)) : std::nullopt;
   };
@@ -1094,37 +1100,38 @@ PointBoundary QueryNumericalBoundary(const CompactSyncResult& result, size_t sto
   }
   return out;
 }
-std::optional<std::vector<Crossing>> ExportNumericalCrossings(const CompactSyncResult& result) {
-  if (result.input.region_tree) return std::nullopt;
+std::optional<std::vector<Crossing>> ExportNumericalCrossings(const CompactSyncView& result) {
+  if (result.State().input.region_tree) return std::nullopt;
   // Check the complete scope before exposing any records. A repeated DAG use
   // cannot be represented by the ordinary single-interval family coordinates.
-  for (size_t r = 0; r < result.segments.size(); ++r) {
-    const auto& segment = result.segments[r];
-    if (segment.repetitions != 1 || segment.count != result.input.segments[r].count) return std::nullopt;
+  for (size_t r = 0; r < result.State().segments.size(); ++r) {
+    const auto& segment = result.State().segments[r];
+    if (segment.repetitions != 1 || segment.count != result.State().input.segments[r].count)
+      return std::nullopt;
   }
-  if (!result.hierarchy) return result.crossing_demands;
+  if (!result.State().hierarchy) return result.State().crossing_demands;
   std::vector<Crossing> out;
-  ExportNodeCrossings(result, result.hierarchy->root, 0, out);
+  ExportNodeCrossings(result, result.State().hierarchy->root, 0, out);
   std::sort(out.begin(), out.end());
   out.erase(std::unique(out.begin(), out.end()), out.end());
   return out;
 }
-std::shared_ptr<const ScopedSyncDemands> ExportNumericalScopedDemands(const CompactSyncResult& result) {
-  if (!result.hierarchy || !result.hierarchy->source_layout) return nullptr;
+std::shared_ptr<const ScopedSyncDemands> ExportNumericalScopedDemands(const CompactSyncView& result) {
+  if (!result.State().hierarchy || !result.State().hierarchy->source_layout) return nullptr;
   return ScopedExporter(result).Run();
 }
-std::vector<Crossing> ExpandNumericalDemands(const CompactSyncResult& result, size_t maximum) {
+std::vector<Crossing> ExpandNumericalDemands(const CompactSyncView& result, size_t maximum) {
   Ordinal count = 0;
-  for (const auto& segment : result.input.segments)
+  for (const auto& segment : result.State().input.segments)
     count = NumericalAdd(count, Length(segment.count, segment.sites.size()));
   CHECK(count <= maximum) << "Retained-demand audit exceeds its requested payload bound";
   std::vector<Crossing> out;
-  if (result.hierarchy) {
-    ExpandNodeDemands(result, result.hierarchy->root, 0, out);
+  if (result.State().hierarchy) {
+    ExpandNodeDemands(result, result.State().hierarchy->root, 0, out);
   } else {
-    out = result.crossing_demands;
-    for (size_t r = 0; r < result.segments.size(); ++r) {
-      const auto& segment = result.segments[r];
+    out = result.State().crossing_demands;
+    for (size_t r = 0; r < result.State().segments.size(); ++r) {
+      const auto& segment = result.State().segments[r];
       for (const auto& demand : segment.demands)
         for (int64_t i = 0; i < segment.count - demand.distance; ++i)
           out.push_back({{r, i, demand.source}, {r, i + demand.distance, demand.target}});

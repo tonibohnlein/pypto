@@ -23,11 +23,7 @@
 #include <utility>
 #include <vector>
 
-#include "pypto/backend/common/backend.h"
-#include "pypto/backend/common/buffer_conversion_recipes.h"
-#include "pypto/backend/common/buffer_elementwise_recipes.h"
-#include "pypto/backend/common/buffer_indexed_recipes.h"
-#include "pypto/backend/common/buffer_row_recipes.h"
+#include "pypto/backend/common/buffer_sync_contract.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
@@ -41,92 +37,33 @@ namespace pypto::ir::sync {
 namespace {
 using Direction = SyncDirection;
 using Family = PhysicalSyncFamily;
-Occurrence Endpoint(const Family& f, int64_t ordinal, bool publish) {
-  auto visit = publish ? f.source_first : f.target_first;
-  if (f.axes.empty()) {
-    visit += ordinal;
-  } else {
-    for (auto axis = f.axes.rbegin(); axis != f.axes.rend(); ++axis) {
-      visit += (ordinal % axis->count) * (publish ? axis->source_stride : axis->target_stride);
-      ordinal /= axis->count;
-    }
-    INTERNAL_CHECK(!ordinal) << "Internal error: scoped physical record exceeds domain";
-  }
-  return {publish ? f.source_region : f.target_region, visit, publish ? f.source_site : f.target_site};
+Occurrence Endpoint(const Family& family, int64_t ordinal, SyncEndpointKind endpoint) {
+  const auto occurrence =
+      DecodeSyncFamilyEndpoint(family, ordinal, endpoint, SyncEmptyAxes::ContiguousVisits);
+  CHECK(occurrence) << "Direct family record has incompatible coordinates";
+  return *occurrence;
 }
-Occurrence Source(const Family& f, int64_t ordinal) { return Endpoint(f, ordinal, true); }
-Occurrence Target(const Family& f, int64_t ordinal) { return Endpoint(f, ordinal, false); }
+Occurrence Source(const Family& f, int64_t ordinal) { return Endpoint(f, ordinal, SyncEndpointKind::Source); }
+Occurrence Target(const Family& f, int64_t ordinal) { return Endpoint(f, ordinal, SyncEndpointKind::Target); }
 
-// This is a narrow binding of the existing native resource declarations, not
-// an inference that arbitrary missing catalog entries mean signal-free code.
-// Direct Buffer IR emits TLOAD(Mat/Vec), TSTORE(Acc/Vec), TMOV(Mat->Left/Right),
-// TEXTRACT(Mat->Left/Right), TMATMUL and TMATMUL_ACC for these admitted calls.
-// In manual a2a3 mode those variants have no hidden AIC flags. TEXTRACT's
-// catalogued V<->S claims belong to the excluded Vec overload. Still consume
-// any applicable fixed claims for the owning core conservatively, and refuse
-// unresolved owners. Vec arithmetic takes its macro from the shared recipe.
+// Resource binding uses the same selected implementation as access import.
+// Each distinct immutable call is resolved once, including continuation arms;
+// do not deduplicate by macro alone because overload/core claims can differ.
 std::map<Direction, std::set<int>> NativeClaims(const CompactSyncInput& a, const std::string& target) {
-  CHECK(target == "a2a3") << "Unsupported physical target: native variants are qualified only for a2a3";
-  auto backend = backend::GetBackendInstance(backend::BackendType::Ascend910);
+  CHECK(a.hardware_target == target) << "Synchronization hardware contract differs from lowering target";
+  backend::RequireLocalSyncExecutionContract(target);
   std::map<Direction, std::set<int>> claimed;
-  std::set<std::string> checked;
+  std::set<const Call*> checked;
   for (const auto& segment : a.segments) {
     if (!segment.count) continue;
     for (const auto& site : segment.sites) {
       for (const auto& call : {site.original, site.continuation}) {
-        if (!call) continue;
-        std::string macro;
-        if (IsOp(call, "buffer.load")) {
-          macro = "pto::TLOAD";
-        } else if (IsOp(call, "buffer.store")) {
-          macro = "pto::TSTORE";
-        } else if (IsOp(call, "buffer.copy")) {
-          macro = "pto::TMOV";
-        } else if (IsOp(call, "buffer.extract")) {
-          macro = "pto::TEXTRACT";
-        } else if (IsOp(call, "buffer.matmul")) {
-          macro = "pto::TMATMUL";
-        } else if (IsOp(call, "buffer.matmul_acc")) {
-          macro = "pto::TMATMUL_ACC";
-        } else {
-          // The same recipe selects the emitted PTO operation. Resource claims
-          // remain authoritative; unresolved ISA-helper ownership still refuses.
-          const char* native = nullptr;
-          if (auto recipe = backend::FindBufferElementwiseRecipe(call->op_->name_)) {
-            native = recipe->native_op;
-          } else if (auto recipe = backend::FindBufferIndexedRecipe(call->op_->name_)) {
-            native = recipe->native_op;
-          } else if (auto recipe = backend::FindBufferRowRecipe(call->op_->name_)) {
-            native = recipe->native_op;
-          } else if (auto recipe = backend::FindBufferConversionRecipe(call->op_->name_);
-                     recipe && recipe->kind == backend::BufferConversionKind::Cast) {
-            native = recipe->native_op;
-          }
-          CHECK(native) << "Unavailable native synchronization resource binding: " << call->op_->name_;
-          macro = std::string(native).substr(4);
-          std::transform(macro.begin(), macro.end(), macro.begin(),
-                         [](unsigned char c) { return std::toupper(c); });
-          macro = "pto::" + macro;
-        }
-        if (!checked.insert(macro).second) continue;
-        const auto declaration = backend->FindIsaMacroResources(macro);
-        if (!declaration) continue;  // Only the enumerated, audited native variants.
-        for (const auto& claim : declaration->claims) {
-          using pypto::sync::CoreScope;
-          using pypto::sync::IsaIdSource;
-          using pypto::sync::IsaResourceLifetime;
-          using pypto::sync::IsaSyncMode;
-          using pypto::sync::ResourceKind;
-          if (std::find(claim.modes.begin(), claim.modes.end(), IsaSyncMode::Manual) == claim.modes.end())
-            continue;
-          if (macro == "pto::TEXTRACT" && claim.pool.core == CoreScope::AIV) continue;
-          CHECK(claim.pool.kind == ResourceKind::PipelineEvent &&
-                claim.pool.core ==
-                    (a.owner->func_type_ == FunctionType::AIV ? CoreScope::AIV : CoreScope::AIC) &&
-                claim.source == IsaIdSource::Fixed && claim.lifetime == IsaResourceLifetime::Invocation)
-              << "Unavailable native flag owner/variant binding: " << macro;
+        if (!call || !checked.insert(call.get()).second) continue;
+        const auto implementation =
+            backend::SelectBufferSyncImplementation(call, a.owner->func_type_, target);
+        INTERNAL_CHECK(implementation.Pipe() == site.pipe) << "Native binding differs from imported pipe";
+        for (const auto& claim : implementation.Claims())
           for (auto id : claim.ids) claimed[{claim.pool.src, claim.pool.dst}].insert(static_cast<int>(id));
-        }
       }
     }
   }
@@ -434,6 +371,11 @@ class Allocator {
 
 }  // namespace
 SyncDirection SyncFamilyPipes(const CompactSyncInput& a, const Family& f) {
+  CHECK(f.source_region < a.segments.size() && f.target_region < a.segments.size())
+      << "Synchronization family region is unavailable";
+  CHECK(f.source_site < a.segments[f.source_region].sites.size() &&
+        f.target_site < a.segments[f.target_region].sites.size())
+      << "Synchronization family site is unavailable";
   return {a.segments[f.source_region].sites[f.source_site].pipe,
           a.segments[f.target_region].sites[f.target_site].pipe};
 }

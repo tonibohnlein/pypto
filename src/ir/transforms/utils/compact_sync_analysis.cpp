@@ -28,6 +28,7 @@
 #include "src/ir/transforms/utils/rotating_sync_analysis.h"
 #include "src/ir/transforms/utils/sync_boundary_graph.h"
 namespace pypto::ir::sync {
+
 namespace {
 using Atom = SyncStorageClass;
 bool Intersects(const SyncAccess& a, const Atom& c, int64_t i) {
@@ -316,15 +317,16 @@ bool CompactSegmentResult::Precedes(int64_t a, size_t source, bool sc, int64_t b
   return threshold && *threshold <= b - a;
 }
 
-void IndexSyncStorageAccesses(CompactSyncResult& result) {
-  INTERNAL_CHECK(result.storage_access_index.empty()) << "Original access index requires a fresh result";
-  result.storage_access_index.resize(result.input.storage.size());
-  for (size_t r = 0; r < result.input.segments.size(); ++r) {
-    const auto& segment = result.input.segments[r];
+void IndexSyncStorageAccesses(CompactSyncBuilder& result) {
+  INTERNAL_CHECK(result.State().storage_access_index.empty())
+      << "Original access index requires a fresh result";
+  result.State().storage_access_index.resize(result.State().input.storage.size());
+  for (size_t r = 0; r < result.State().input.segments.size(); ++r) {
+    const auto& segment = result.State().input.segments[r];
     for (size_t s = 0; s < segment.sites.size(); ++s)
       for (size_t a = 0; a < segment.sites[s].accesses.size(); ++a) {
         const auto& access = segment.sites[s].accesses[a];
-        auto& index = result.storage_access_index.at(access.storage);
+        auto& index = result.State().storage_access_index.at(access.storage);
         index.accesses.emplace_back(r, s, a);
         index.written |= access.write;
         index.external_geometry |= static_cast<bool>(access.external);
@@ -332,27 +334,28 @@ void IndexSyncStorageAccesses(CompactSyncResult& result) {
       }
   }
 }
-CompactSyncResult AnalyzeInvariantSyncLeaves(CompactSyncInput input) {
-  CompactSyncResult result;
-  result.input = std::move(input);
+CompactSyncBuilder AnalyzeInvariantSyncLeaves(CompactSyncInput input) {
+  CompactSyncBuilder result;
+  result.State().input = std::move(input);
   using Clock = std::chrono::steady_clock;
   auto begin = Clock::now();
   IndexSyncStorageAccesses(result);
-  auto atoms = Partition(result.input);
-  result.cells = atoms.size();
-  result.storage_classes = atoms;
-  const auto index = IndexClasses(result.input, atoms);
+  auto atoms = Partition(result.State().input);
+  result.Diagnostics().cells = atoms.size();
+  result.State().storage_classes = atoms;
+  const auto index = IndexClasses(result.State().input, atoms);
   auto partitioned = Clock::now();
-  result.partition_seconds = std::chrono::duration<double>(partitioned - begin).count();
-  AccumulatorProtection protection(result.input);
-  for (size_t r = 0; r < result.input.segments.size(); ++r)
-    result.segments.push_back(Reduce(result.input.segments[r], r, protection, atoms, index,
-                                     result.analyzed_occurrences, result.class_tests,
-                                     result.class_lookup_tests));
-  if (result.input.region_tree)
-    for (auto& segment : result.segments) segment.count = segment.internal_scope_count;
+  result.Diagnostics().partition_seconds = std::chrono::duration<double>(partitioned - begin).count();
+  AccumulatorProtection protection(result.State().input);
+  for (size_t r = 0; r < result.State().input.segments.size(); ++r)
+    result.State().segments.push_back(Reduce(result.State().input.segments[r], r, protection, atoms, index,
+                                             result.Diagnostics().analyzed_occurrences,
+                                             result.Diagnostics().class_tests,
+                                             result.Diagnostics().class_lookup_tests));
+  if (result.State().input.region_tree)
+    for (auto& segment : result.State().segments) segment.count = segment.internal_scope_count;
   auto reduced = Clock::now();
-  result.reduction_seconds = std::chrono::duration<double>(reduced - partitioned).count();
+  result.Diagnostics().reduction_seconds = std::chrono::duration<double>(reduced - partitioned).count();
   return result;
 }
 CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& composition_order) {
@@ -369,7 +372,7 @@ CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& 
           });
         });
       });
-  if (input.region_tree) return AnalyzeNumericalSync(std::move(input), composition_order);
+  if (input.region_tree) return AnalyzeNumericalSync(std::move(input), composition_order).Publish();
   for (const auto& segment : input.segments)
     for (const auto& site : segment.sites)
       for (const auto& access : site.accesses)
@@ -377,21 +380,21 @@ CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& 
   if (rotating)
     return input.segments.size() > 1 ||
                    (!input.segments.empty() && !input.segments.front().nested_frames.empty())
-               ? AnalyzeNumericalSync(std::move(input), composition_order)
-               : AnalyzeRotatingSync(std::move(input));
+               ? AnalyzeNumericalSync(std::move(input), composition_order).Publish()
+               : AnalyzeRotatingSync(std::move(input)).Publish();
   auto result = AnalyzeInvariantSyncLeaves(std::move(input));
-  const auto& atoms = result.storage_classes;
+  const auto& atoms = result.State().storage_classes;
   using Clock = std::chrono::steady_clock;
   const auto reduced = Clock::now();
   // A single region already owns all queries and boundaries. Keep the
   // concrete numerical fast path free of a redundant all-pairs port graph.
-  if (result.segments.size() == 1) return result;
-  AccumulatorProtection protection(result.input);
+  if (result.State().segments.size() == 1) return std::move(result).Publish();
+  AccumulatorProtection protection(result.State().input);
   std::vector<std::optional<Occurrence>> writers(atoms.size());
   std::vector<std::array<std::optional<Occurrence>, kPipeCount>> readers(atoms.size());
   std::set<Crossing> crossings;
-  for (size_t r = 0; r < result.segments.size(); ++r) {
-    const auto& s = result.segments[r];
+  for (size_t r = 0; r < result.State().segments.size(); ++r) {
+    const auto& s = result.State().segments[r];
     if (!s.count || s.pipes.empty()) continue;
     for (size_t c = 0; c < atoms.size(); ++c) {
       auto boundary = s.body.Boundary(c);
@@ -415,7 +418,7 @@ CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& 
         if (boundary->last_readers[p]) readers[c][p] = Occurrence{r, s.count - 1, *boundary->last_readers[p]};
     }
   }
-  result.crossing_generators.assign(crossings.begin(), crossings.end());
+  result.State().crossing_generators.assign(crossings.begin(), crossings.end());
   // Supply every generator endpoint before the immutable port index is built.
   // Reduction must query the required graph, not an already reduced subset.
   std::vector<Occurrence> ports;
@@ -423,65 +426,67 @@ CompactSyncResult AnalyzeCompactSync(CompactSyncInput input, const std::string& 
     ports.push_back(crossing.first);
     ports.push_back(crossing.second);
   }
-  result.boundary_order_ = std::make_shared<SyncBoundaryGraph>(result.segments, ports);
-  result.port_pair_tests = result.boundary_order_->pair_tests;
-  for (const auto& e : crossings) result.boundary_order_->Add({e.first, true}, {e.second, false});
+  auto boundary = std::make_shared<SyncBoundaryGraph>(result.State().segments, ports);
+  result.State().boundary_order = boundary;
+  result.Diagnostics().port_pair_tests = boundary->pair_tests;
+  for (const auto& e : crossings) boundary->Add({e.first, true}, {e.second, false});
   for (const auto& e : crossings) {
-    ++result.crossing_path_searches;
-    auto a = result.boundary_order_->Node({e.first, true}),
-         b = result.boundary_order_->Node({e.second, false});
-    if (!result.boundary_order_->Path(a, b, std::make_pair(a, b))) result.crossing_demands.push_back(e);
+    ++result.Diagnostics().crossing_path_searches;
+    auto a = boundary->Node({e.first, true}), b = boundary->Node({e.second, false});
+    if (!boundary->Path(a, b, std::make_pair(a, b))) result.State().crossing_demands.push_back(e);
   }
-  result.graph_edges = result.boundary_order_->Edges();
-  result.composition_seconds = std::chrono::duration<double>(Clock::now() - reduced).count();
-  return result;
+  result.Diagnostics().graph_edges = boundary->Edges();
+  result.Diagnostics().composition_seconds = std::chrono::duration<double>(Clock::now() - reduced).count();
+  return std::move(result).Publish();
 }
-bool CompactSyncResult::Precedes(const Occurrence& a, bool sc, const Occurrence& b, bool tc) const {
-  if (hierarchy) return NumericalPrecedes(*this, a, sc, b, tc);
+bool CompactSyncView::Precedes(const Occurrence& a, bool sc, const Occurrence& b, bool tc) const {
+  if (State().hierarchy) return NumericalPrecedes(*this, a, sc, b, tc);
   auto [ar, av, as] = a;
   auto [br, bv, bs] = b;
-  CHECK(ar < segments.size() && br < segments.size()) << "Invalid compact region";
+  CHECK(ar < State().segments.size() && br < State().segments.size()) << "Invalid compact region";
   // Validate coordinates even for a backwards query.
-  segments[ar].Precedes(av, as, sc, av, as, sc);
-  segments[br].Precedes(bv, bs, tc, bv, bs, tc);
-  if (ar == br) return segments[ar].Precedes(av, as, sc, bv, bs, tc);
+  State().segments[ar].Precedes(av, as, sc, av, as, sc);
+  State().segments[br].Precedes(bv, bs, tc, bv, bs, tc);
+  if (ar == br) return State().segments[ar].Precedes(av, as, sc, bv, bs, tc);
   if (ar > br) return false;
-  INTERNAL_CHECK(boundary_order_) << "Missing original boundary order";
-  return boundary_order_->Precedes(segments, a, sc, b, tc);
+  INTERNAL_CHECK(State().boundary_order) << "Missing original boundary order";
+  return State().boundary_order->Precedes(State().segments, a, sc, b, tc);
 }
-std::optional<PointBoundary> CompactSyncResult::Boundary(size_t storage, int64_t row, int64_t column) const {
+std::optional<PointBoundary> CompactSyncView::Boundary(size_t storage, int64_t row, int64_t column) const {
   return BoundaryAt(storage, row, column, {});
 }
-std::optional<PointBoundary> CompactSyncResult::BoundaryAt(size_t storage, int64_t row, int64_t column,
-                                                           const std::map<size_t, int64_t>& parameters,
-                                                           std::optional<int64_t> block_index) const {
-  if (storage >= input.storage.size() || input.storage[storage].slot_count != 1) return std::nullopt;
+std::optional<PointBoundary> CompactSyncView::BoundaryAt(size_t storage, int64_t row, int64_t column,
+                                                         const std::map<size_t, int64_t>& parameters,
+                                                         std::optional<int64_t> block_index) const {
+  if (storage >= State().input.storage.size() || State().input.storage[storage].slot_count != 1)
+    return std::nullopt;
   return BoundarySlot(storage, 0, row, column, parameters, block_index);
 }
-std::optional<PointBoundary> CompactSyncResult::BoundarySlot(size_t storage, int64_t slot, int64_t row,
-                                                             int64_t column,
-                                                             const std::map<size_t, int64_t>& parameters,
-                                                             std::optional<int64_t> block_index) const {
-  if (storage >= input.storage.size() || slot < 0 || slot >= input.storage[storage].slot_count)
+std::optional<PointBoundary> CompactSyncView::BoundarySlot(size_t storage, int64_t slot, int64_t row,
+                                                           int64_t column,
+                                                           const std::map<size_t, int64_t>& parameters,
+                                                           std::optional<int64_t> block_index) const {
+  if (storage >= State().input.storage.size() || slot < 0 ||
+      slot >= State().input.storage[storage].slot_count)
     return std::nullopt;
-  const auto& domain = input.storage[storage];
+  const auto& domain = State().input.storage[storage];
   if (domain.row_extent_parameter) {
     const auto parameter = *domain.row_extent_parameter;
     auto value = parameters.find(parameter);
-    const auto bounds = input.parameter_bounds.at(parameter);
+    const auto bounds = State().input.parameter_bounds.at(parameter);
     if (value == parameters.end() || value->second < bounds.first || value->second > bounds.second ||
         row >= value->second)
       return std::nullopt;
   }
   if (row < 0 || column < 0 || row >= domain.rows || column >= domain.columns) return std::nullopt;
-  if (hierarchy && storage_access_index.at(storage).external_geometry)
+  if (State().hierarchy && State().storage_access_index.at(storage).external_geometry)
     return QueryExternalNumericalBoundary(*this, storage, slot, row, column, parameters, block_index);
   auto shift = [&](const SyncTranslation& translation) -> std::optional<int64_t> {
     int64_t value = 0;
     for (auto [index, coefficient] : translation) {
-      auto bound = input.parameter_bounds.find(index);
+      auto bound = State().input.parameter_bounds.find(index);
       auto supplied = parameters.find(index);
-      if (bound == input.parameter_bounds.end() || supplied == parameters.end() ||
+      if (bound == State().input.parameter_bounds.end() || supplied == parameters.end() ||
           supplied->second < bound->second.first || supplied->second > bound->second.second)
         return std::nullopt;
       const auto sum = __int128(value) + __int128(coefficient) * supplied->second;
@@ -493,10 +498,10 @@ std::optional<PointBoundary> CompactSyncResult::BoundarySlot(size_t storage, int
   auto r = shift(domain.row_parameters), c = shift(domain.column_parameters);
   if (!r || !c) return std::nullopt;
   if (domain.row_block || domain.column_block) {
-    if (!block_index || !input.block_bounds || *block_index < input.block_bounds->first ||
-        *block_index > input.block_bounds->second)
+    if (!block_index || !State().input.block_bounds || *block_index < State().input.block_bounds->first ||
+        *block_index > State().input.block_bounds->second)
       return std::nullopt;
-    const auto coordinate = *block_index - input.block_bounds->first;
+    const auto coordinate = *block_index - State().input.block_bounds->first;
     const auto row_shift = __int128(*r) + __int128(domain.row_block) * coordinate;
     const auto column_shift = __int128(*c) + __int128(domain.column_block) * coordinate;
     if (row_shift > std::numeric_limits<int64_t>::max() || column_shift > std::numeric_limits<int64_t>::max())
@@ -507,14 +512,14 @@ std::optional<PointBoundary> CompactSyncResult::BoundarySlot(size_t storage, int
   // The original domain is covered, but this invocation accesses only its
   // translated footprint. A point before that footprint is proven absent.
   if (row < *r || column < *c) return PointBoundary{};
-  if (hierarchy && input.region_tree) {
-    const auto& index = storage_access_index.at(storage);
+  if (State().hierarchy && State().input.region_tree) {
+    const auto& index = State().storage_access_index.at(storage);
     if (index.enclosing_motion) {
       if (index.written) return std::nullopt;  // No invented absence for an unsupported selector.
       PointBoundary out;
       for (const auto& [leaf, site, access_index] : index.accesses) {
-        ++point_selector_access_visits;
-        const auto& segment = input.segments[leaf];
+        ++Diagnostics().point_selector_access_visits;
+        const auto& segment = State().input.segments[leaf];
         const auto& access = segment.sites[site].accesses[access_index];
         auto visits = PointVisits(access, segment, row - *r, column - *c);
         if (!visits) continue;
@@ -528,15 +533,15 @@ std::optional<PointBoundary> CompactSyncResult::BoundarySlot(size_t storage, int
       return out;
     }
   }
-  if (hierarchy) return QueryNumericalBoundary(*this, storage, slot, row - *r, column - *c);
-  if (segments.size() == 1 && segments.front().rotating)
-    return RotatingBoundary(input, segments.front(), storage, slot, row - *r, column - *c);
+  if (State().hierarchy) return QueryNumericalBoundary(*this, storage, slot, row - *r, column - *c);
+  if (State().segments.size() == 1 && State().segments.front().rotating)
+    return RotatingBoundary(State().input, State().segments.front(), storage, slot, row - *r, column - *c);
   return RelativeBoundary(storage, row - *r, column - *c);
 }
-std::optional<PointBoundary> CompactSyncResult::RelativeBoundary(size_t storage, int64_t row, int64_t column,
-                                                                 std::optional<size_t> leaf) const {
-  if (storage >= input.storage.size() || row < 0 || column < 0 || row >= input.storage[storage].rows ||
-      column >= input.storage[storage].columns)
+std::optional<PointBoundary> CompactSyncView::RelativeBoundary(size_t storage, int64_t row, int64_t column,
+                                                               std::optional<size_t> leaf) const {
+  if (storage >= State().input.storage.size() || row < 0 || column < 0 ||
+      row >= State().input.storage[storage].rows || column >= State().input.storage[storage].columns)
     return std::nullopt;
   PointBoundary out;
   struct Range {
@@ -546,15 +551,15 @@ std::optional<PointBoundary> CompactSyncResult::RelativeBoundary(size_t storage,
     PipeType pipe;
   };
   std::vector<Range> ranges;
-  for (size_t r = leaf.value_or(0); r < (leaf ? *leaf + 1 : input.segments.size()); ++r)
-    for (size_t s = 0; s < input.segments[r].sites.size(); ++s) {
-      const auto& site = input.segments[r].sites[s];
+  for (size_t r = leaf.value_or(0); r < (leaf ? *leaf + 1 : State().input.segments.size()); ++r)
+    for (size_t s = 0; s < State().input.segments[r].sites.size(); ++s) {
+      const auto& site = State().input.segments[r].sites[s];
       for (const auto& a : site.accesses)
         if (a.storage == storage) {
           if (a.external) return std::nullopt;
           auto visits = [&](const SyncAccess& access) {
-            return leaf ? Visits(access, segments[r].internal_scope_count, row, column)
-                        : PointVisits(access, input.segments[r], row, column);
+            return leaf ? Visits(access, State().segments[r].internal_scope_count, row, column)
+                        : PointVisits(access, State().input.segments[r], row, column);
           };
           auto v = visits(a);
           if (!v) continue;
@@ -584,33 +589,38 @@ std::optional<PointBoundary> CompactSyncResult::RelativeBoundary(size_t storage,
     }
   return out;
 }
-PointBoundary CompactSyncResult::LeafBoundary(size_t region, size_t storage, int64_t row,
-                                              int64_t column) const {
-  CHECK(region < segments.size()) << "Invalid compact leaf";
-  for (const auto& site : input.segments[region].sites)
+PointBoundary CompactSyncView::LeafBoundary(size_t region, size_t storage, int64_t row,
+                                            int64_t column) const {
+  CHECK(region < State().segments.size()) << "Invalid compact leaf";
+  for (const auto& site : State().input.segments[region].sites)
     for (const auto& access : site.accesses)
       CHECK(access.storage != storage ||
-            (!access.external &&
-             (!access.coordinate_frame || access.coordinate_frame == input.segments[region].original_loop)))
+            (!access.external && (!access.coordinate_frame ||
+                                  access.coordinate_frame == State().input.segments[region].original_loop)))
           << "Leaf point selector requires its enclosing occurrence binding";
   auto result = RelativeBoundary(storage, row, column, region);
   CHECK(result) << "Leaf storage point outside the supplied domain";
   return *result;
 }
-std::optional<std::vector<Crossing>> CompactSyncResult::ExportCrossingDemands() const {
+std::optional<std::vector<Crossing>> CompactSyncView::ExportCrossingDemands() const {
   return ExportNumericalCrossings(*this);
 }
 std::shared_ptr<const ScopedSyncDemands> CompactSyncResult::ExportScopedDemands() const {
-  if (!scoped_demands_) {
-    scoped_demands_ = ExportNumericalScopedDemands(*this);
-    if (scoped_demands_) ++scoped_export_builds;
+  if (!scoped_export_->attempted) {
+    // Cache unavailable as well as successful capabilities; neither changes the
+    // retained mathematics. Exceptions leave the request eligible for retry.
+    ++Diagnostics().scoped_export_attempts;
+    auto value = ExportNumericalScopedDemands(*this);
+    scoped_export_->value = std::move(value);
+    scoped_export_->attempted = true;
+    if (scoped_export_->value) ++Diagnostics().scoped_export_builds;
   }
-  return scoped_demands_;
+  return scoped_export_->value;
 }
-bool CompactSyncResult::ReferenceBefore(const Occurrence& a, const Occurrence& b) const {
-  return hierarchy ? NumericalReferenceBefore(*this, a, b) : a < b;
+bool CompactSyncView::ReferenceBefore(const Occurrence& a, const Occurrence& b) const {
+  return State().hierarchy ? NumericalReferenceBefore(*this, a, b) : a < b;
 }
-std::vector<Crossing> CompactSyncResult::ExpandRetainedDemands(size_t max_payloads) const {
+std::vector<Crossing> CompactSyncView::ExpandRetainedDemands(size_t max_payloads) const {
   return ExpandNumericalDemands(*this, max_payloads);
 }
 }  // namespace pypto::ir::sync
