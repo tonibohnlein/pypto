@@ -12,6 +12,7 @@
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -399,6 +400,7 @@ SyncNativeReservations SyncNativeClaims(const FunctionPtr& owner, const std::vec
   for (const auto& call : calls) {
     if (!checked.insert(call.get()).second) continue;
     const auto operation = backend::QualifyBufferSyncOperation(call, owner->func_type_, target);
+    resolver.RequireVecCopyPlacement(operation);
     resolver.RequireWorkspaceSeparation(operation);
     ReserveNativeClaims(operation.Implementation(), claimed);
   }

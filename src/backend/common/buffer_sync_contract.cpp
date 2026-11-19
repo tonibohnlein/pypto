@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -26,6 +28,7 @@
 #include "pypto/backend/common/buffer_indexed_recipes.h"
 #include "pypto/backend/common/buffer_scalar_recipes.h"
 #include "pypto/backend/common/buffer_type_support.h"
+#include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/backend/common/pto_native_ops.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/kind_traits.h"
@@ -134,14 +137,26 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
     const bool extract = IsOp(call, "buffer.extract");
     const auto source = As<BufferType>(call->args_[0]->GetType());
     const auto destination = As<BufferType>(call->args_[extract ? 3 : 1]->GetType());
-    if (extract && source && destination && source->memory_space_ == MemorySpace::Vec &&
+    if (source && destination && source->memory_space_ == MemorySpace::Vec &&
         destination->memory_space_ == MemorySpace::Vec) {
       result.pipe_ = PipeType::V;
+      if (!extract) {
+        const auto bytes = DenseBufferBytes(source);
+        constexpr uint64_t kBlockBytes = 32;
+        CHECK(target == "a2a3" && core == FunctionType::AIV && IsAlignedDenseVecBufferGeometry(source) &&
+              source->shape_ == source->valid_shape_ && bytes &&
+              *bytes / kBlockBytes <= std::numeric_limits<uint16_t>::max())
+            << "Vec copy needs full static dense A2/A3 AIV block-burst geometry";
+        // The registered Vec copy has identical descriptors. A2/A3 TMovToVec
+        // selects one copy_ubuf_to_ubuf burst on PIPE_V, with no implicit
+        // storage or numbered events; the importer proves actual placement.
+        result.audited_signal_free_variant_ = true;
+      }
     } else {
       CHECK(source && destination && source->memory_space_ == MemorySpace::Mat &&
             (destination->memory_space_ == MemorySpace::Left ||
              destination->memory_space_ == MemorySpace::Right))
-          << "Only Mat to operand-buffer movement or Vec extract is qualified";
+          << "Only Mat to operand-buffer or Vec to Vec movement is qualified";
       result.pipe_ = PipeType::MTE1;
       result.mat_to_operand_extract_ = extract;
     }
@@ -225,10 +240,9 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
     result.audited_signal_free_variant_ = true;
   }
   if (const auto axis = FindBufferAxisRecipe(call->op_->name_); axis && !axis->reduction && axis->axis == 1) {
-    CHECK(target == "a2a3" &&
-          (IsOp(call, "buffer.row_expand_add") || IsOp(call, "buffer.row_expand_sub") ||
-           IsOp(call, "buffer.row_expand_mul") || IsOp(call, "buffer.row_expand_div") ||
-           IsOp(call, "buffer.row_expand_max") || IsOp(call, "buffer.row_expand_min")))
+    CHECK(target == "a2a3" && (IsOp(call, "buffer.row_expand_add") || IsOp(call, "buffer.row_expand_sub") ||
+                               IsOp(call, "buffer.row_expand_mul") || IsOp(call, "buffer.row_expand_div") ||
+                               IsOp(call, "buffer.row_expand_max") || IsOp(call, "buffer.row_expand_min")))
         << "Row broadcast implicit effects require a qualified native implementation";
     // Registry validation selects FP32 Mode1 (a contiguous column carrier),
     // with no explicit temporary operand. Runtime-row CountMode has the same

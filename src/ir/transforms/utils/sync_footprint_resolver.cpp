@@ -13,9 +13,13 @@
 
 #include <algorithm>
 #include <limits>
+#include <memory>
 #include <numeric>
+#include <string>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_config.h"
@@ -276,6 +280,25 @@ std::optional<backend::BufferSyncByteWindow> SyncFootprintResolver::ExactFullWin
 void SyncFootprintResolver::RequireWorkspaceSeparation(const backend::BufferSyncOperation& operation) const {
   backend::RequireBufferSyncWorkspaceSeparation(operation,
                                                 [this](const ExprPtr& value) { return ByteHull(value); });
+}
+
+void SyncFootprintResolver::RequireVecCopyPlacement(const backend::BufferSyncOperation& operation) const {
+  const auto& call = operation.Operation();
+  if (!IsOp(call, "buffer.copy") || operation.Implementation().Pipe() != PipeType::V) return;
+  constexpr int64_t kBlockBytes = 32;
+  const auto full_window = [&](const ExprPtr& operand) {
+    const auto window = ExactFullWindow(operand);
+    const auto bytes = backend::DenseBufferBytes(As<BufferType>(operand->GetType()));
+    CHECK_SPAN(window && bytes && window->begin % kBlockBytes == 0 &&
+                   __int128(window->end) - window->begin == *bytes,
+               call->span_)
+        << "Vec copy needs an aligned, static contiguous placed byte window for each operand";
+    return *window;
+  };
+  const auto source = full_window(call->args_[0]);
+  const auto destination = full_window(call->args_[1]);
+  CHECK_SPAN(source.end <= destination.begin || destination.end <= source.begin, call->span_)
+      << "Vec copy requires physically disjoint source and destination windows";
 }
 
 void SyncFootprintResolver::PrescanDynamicValidTargets(const StmtPtr& stmt) {
@@ -608,7 +631,18 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
               backend::BufferSyncByteWindow{static_cast<int64_t>(begin), static_cast<int64_t>(end)};
           view.base_byte_offset = static_cast<int64_t>(begin);
           const bool const_offsets = (r_lo == r_hi && c_lo == c_hi);
-          view.static_full_valid = parent->static_full_valid && const_offsets && call->args_.size() == 2 &&
+          const auto valid = call->args_.size() == 3 ? As<MakeTuple>(call->args_[2]) : nullptr;
+          const auto valid_matches_shape = [&](size_t axis) {
+            if (!valid || valid->elements_.size() != 2) return false;
+            const auto extent = As<ConstInt>(valid->elements_[axis]);
+            return extent && extent->value_ == dst_type->shape_[axis];
+          };
+          const bool full_valid_operand =
+              call->args_.size() == 2 || (valid_matches_shape(0) && valid_matches_shape(1));
+          const bool proved_offsets = r_opt && c_opt && r_opt->is_const() && c_opt->is_const() &&
+                                      r_opt->lo >= 0 && r_opt->hi <= max_r && c_opt->lo >= 0 &&
+                                      c_opt->hi <= max_c;
+          view.static_full_valid = parent->static_full_valid && proved_offsets && full_valid_operand &&
                                    HasFullStaticValidShape(dst_type) && !IsDynamicValidTouched(var.get());
           if (const_offsets) {
             view.vec_lattice = StridedByteFootprint{static_cast<int64_t>(begin), pitch, dst_type->shape_[0],

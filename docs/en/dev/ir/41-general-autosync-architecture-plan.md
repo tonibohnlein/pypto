@@ -118,6 +118,15 @@ allocator reservation may supply the proof only within its enforced scope.
 This check must not require exact GM selectors or declare an uncertain GM
 location empty. Implicit effects remain in cross-call hazard analysis as well.
 
+On A2/A3 AIV, AutoSync can own Vec-to-Vec `buffer.copy` through the existing
+`TMOV` on `PIPE_V`. The selected variant requires identical dense row-major
+descriptors with full static valid extents and 32-byte-aligned rows that fit
+one native burst. Exact import, conservative construction, and physical
+qualification require two disjoint aligned byte windows. They use inherited
+view pitch, so a contiguous single-row subview can qualify even when its
+parent has a wider row stride. Unknown placement, gaps between rows, and
+overlapping copies retain downstream synchronization ownership.
+
 Acceptance: extend `independent_broadcasts(..., operand_alias=True)` through exact
 and conservative analysis, public InsertSync/LowerSync and enabled RealizeSync.
 Include aliases/views, workspace edges, read and write operands, legal disjoint
