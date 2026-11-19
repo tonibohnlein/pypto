@@ -1354,8 +1354,8 @@ class Builder {
       // InlineExactSubBlock (`eventful == nullptr`) uses parent IDs, never a private child palette.
       if (!w_entry.eventful) continue;
       uint64_t mask = 0;
-      for (const auto& dir : w_entry.eventful->RearmDirections()) {
-        mask |= SyncDirectionBit(dir.second, dir.first);
+      for (const auto& [producer, consumer] : w_entry.eventful->ResourceDirections()) {
+        mask |= SyncDirectionBit(producer, consumer);
       }
       if (mask == 0) continue;
       for (const size_t nxt : cfg[w].succs) {
@@ -1405,10 +1405,12 @@ class Builder {
                                        std::set<std::pair<PipeType, PipeType>>& services) {
     if (!entry.eventful) return 0;
     uint64_t conflict = 0;
-    for (const auto& dir : entry.eventful->RearmDirections()) {
-      const uint64_t bit = SyncDirectionBit(dir.second, dir.first);
+    for (const auto& [producer, consumer] : entry.eventful->ResourceDirections()) {
+      const uint64_t bit = SyncDirectionBit(producer, consumer);
       if ((reaching_mask & bit) != 0) {
-        services.insert(dir);
+        // The previous child's consuming wait must complete before this
+        // child can publish into the same directional palette.
+        services.emplace(consumer, producer);
         conflict |= bit;
       }
     }

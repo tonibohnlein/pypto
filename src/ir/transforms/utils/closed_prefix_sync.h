@@ -12,6 +12,7 @@
 #define SRC_IR_TRANSFORMS_UTILS_CLOSED_PREFIX_SYNC_H_
 
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,12 @@ namespace pypto::ir::sync {
 // bound recovery when the actual program uses only current-cut transactions.
 bool HasOnlyClosedPrefixSyntax(const FunctionPtr& function);
 bool HasClosedSyncChild(const FunctionPtr& function);
+// For an unmarked retained recipe under the conservative-prefix policy,
+// report generated event directions (including synthesized reverse ACKs)
+// before lane allocation. A structured token recipe can require another route.
+std::optional<std::set<SyncDirection>> PlanClosedPrefixEventDirections(
+    const FunctionPtr& function, const SyncParameterBounds& parameters,
+    const std::optional<std::pair<int64_t, int64_t>>& blocks);
 // Establish operation/native-resource eligibility even for an empty logical
 // program. This interprets no required-order edges and supplies no coverage
 // claim: explicit LowerSync still consumes the caller's actual token program.
@@ -35,8 +42,7 @@ bool QualifyLocalSyncInvocation(const FunctionPtr& function, const std::string& 
 std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     const FunctionPtr& function, const std::string& target,
     const std::optional<std::vector<int>>& eligible_ids,
-    const SyncNativeReservations& extra_reservations = {},
-    const SyncParameterBounds& parameters = {},
+    const SyncNativeReservations& extra_reservations = {}, const SyncParameterBounds& parameters = {},
     const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt);
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_CLOSED_PREFIX_SYNC_H_

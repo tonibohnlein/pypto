@@ -80,13 +80,17 @@ RelayMatrix ComposeRelay(const RelayMatrix& first, const RelayMatrix& second) {
   return out;
 }
 
-void ApplyRelayEdge(RelayMatrix& matrix, PipeType src, PipeType dst) {
-  const RelayMask sm = RelayPipeBit(src);
-  const RelayMask dm = RelayPipeBit(dst);
-  if (sm == 0 || dm == 0) return;
+void ApplyCapturedRelayEdge(RelayMatrix& matrix, const RelayMatrix& captured, RelayMask source,
+                            RelayMask destination) {
   for (size_t i = 0; i < kRelayPipeCount; ++i) {
-    if ((matrix[i] & sm) != 0) matrix[i] |= dm;
+    if ((captured[i] & source) != 0) {
+      matrix[i] |= destination;
+    }
   }
+}
+
+void ApplyRelayEdge(RelayMatrix& matrix, PipeType src, PipeType dst) {
+  ApplyCapturedRelayEdge(matrix, matrix, RelayPipeBit(src), RelayPipeBit(dst));
 }
 
 RelayMatrix ComputeChildLoopRelayMatrix(const StmtPtr& root, const SyncControlRangeProver& prover) {
@@ -155,13 +159,8 @@ RelayMatrix ComputeChildLoopRelayMatrix(const StmtPtr& root, const SyncControlRa
         const auto found = v ? tokens.find(v.get()) : tokens.end();
         const auto dst = TryGetSyncPipeKwarg(call, "dst_pipe");
         if (found != tokens.end() && dst) {
-          const RelayMask dm = RelayPipeBit(*dst);
-          if (dm != 0) {
-            for (const auto& src : found->second) {
-              for (size_t p = 0; p < kRelayPipeCount; ++p) {
-                if ((src.captured[p] & src.src_bit) != 0) cur[p] |= dm;
-              }
-            }
+          for (const auto& src : found->second) {
+            ApplyCapturedRelayEdge(cur, src.captured, src.src_bit, RelayPipeBit(*dst));
           }
         }
       }
@@ -219,16 +218,13 @@ struct OneWayTransaction {
 
 class Discover : public IRVisitor {
  public:
-  explicit Discover(FunctionPtr owner = nullptr, std::string target = "",
-                    const SyncControlRangeProver* prover = nullptr)
-      : owner_(std::move(owner)), target_(std::move(target)), prover_(prover) {}
+  explicit Discover(const SyncControlRangeProver* prover = nullptr) : prover_(prover) {}
   std::vector<LocalCompletion> local;
   std::vector<OneWayTransaction> one_way;
   std::vector<StmtPtr> erased_waits;
   std::vector<StmtPtr> erased_defs;
   std::vector<ForStmtPtr> children;
   std::map<const ForStmt*, RelayMatrix> entries;
-  std::unordered_map<const ForStmt*, uint64_t> child_prior_dirs;
   std::unordered_set<const ForStmt*> loop_nested_children;
   std::map<const Stmt*, uint32_t> loop_scope_ids;
   std::unordered_set<const ForStmt*> spmd_one_trip_loops;
@@ -281,56 +277,15 @@ class Discover : public IRVisitor {
     }
     has_if = true;
     control_stack_.push_back(branch.get());
-    const uint64_t before_if = prior_child_dirs_;
     VisitExpr(branch->condition_);
     VisitStmt(branch->then_body_);
-    const uint64_t after_then = prior_child_dirs_;
-    prior_child_dirs_ = before_if;
     if (branch->else_body_) VisitStmt(*branch->else_body_);
-    prior_child_dirs_ = after_then | prior_child_dirs_;
     control_stack_.pop_back();
   }
   void VisitStmt_(const ForStmtPtr& loop) override {
     if (loop->HasAttr(kClosedSyncChildAttr)) {
       CHECK(loop->GetAttr<int>(kClosedSyncChildAttr) == 1) << "Unsupported closed-child routing version";
-      uint64_t dirs = 0;
-      struct CollectDirs : public IRVisitor {
-        const std::string& target;
-        uint64_t mask = 0;
-        std::vector<CallPtr> calls;
-        std::unordered_set<const Expr*> seen;
-        explicit CollectDirs(const std::string& t) : target(t) {}
-        void VisitExpr(const ExprPtr& expr) override {
-          if (expr && seen.insert(expr.get()).second) IRVisitor::VisitExpr(expr);
-        }
-        void VisitExpr_(const CallPtr& call) override {
-          if (IsOp(call, "sync.wait") && !call->args_.empty()) {
-            if (const auto tok = As<SyncTokenType>(call->args_[0]->GetType())) {
-              const PipeType dst = Pipe(call, "dst_pipe");
-              if (tok->pipe_ != dst) mask |= SyncDirectionBit(tok->pipe_, dst);
-            }
-          } else if (GetLogicalSyncKind(call->op_) == LogicalSyncKind::None && !IsSyncNonPayloadCall(call) &&
-                     !target.empty() && !backend::QualifyBufferSyncNonPayload(call, target)) {
-            calls.push_back(call);
-          }
-          IRVisitor::VisitExpr_(call);
-        }
-      } collector(target_);
-      collector.VisitStmt(loop->body_);
-      dirs = collector.mask;
-      if (owner_ && !target_.empty() && !collector.calls.empty()) {
-        for (const auto& [dir, ids] : SyncNativeClaims(owner_, collector.calls, target_)) {
-          (void)ids;
-          if (dir.first != dir.second) dirs |= SyncDirectionBit(dir.first, dir.second);
-        }
-      }
-      if (prover_ && loop->HasAttr(kClosedSyncChildFirstVisitAttr)) {
-        CHECK(loop_stack_.empty() && (prior_child_dirs_ & dirs) == 0)
-            << "First-visit closed child cannot appear inside a multi-trip loop or after an earlier child";
-      }
-      child_prior_dirs[loop.get()] = prior_child_dirs_;
       if (!loop_stack_.empty()) loop_nested_children.insert(loop.get());
-      prior_child_dirs_ |= dirs;
       children.push_back(loop);
       return;  // Actual child tokens are independently parsed below.
     }
@@ -345,9 +300,7 @@ class Discover : public IRVisitor {
         (prover_ && !As<ConstInt>(loop->start_) && prover_->IsAtMostOneTrip(loop.get()))) {
       spmd_one_trip_loops.insert(loop.get());
       control_stack_.push_back(loop.get());
-      const uint64_t before = prior_child_dirs_;
       IRVisitor::VisitStmt_(loop);
-      prior_child_dirs_ |= before;
       control_stack_.pop_back();
       return;
     }
@@ -383,7 +336,14 @@ class Discover : public IRVisitor {
 
   void VisitStmt_(const SeqStmtsPtr& sequence) override {
     const auto& statements = sequence->stmts_;
+    // An entry rearm orders work issued before the contiguous handoff starts.
+    // A token recorded before an intervening payload or child cannot prove it.
     RelayMatrix preceding_relay = IdentityRelay();
+    size_t relay_start = 0;
+    const auto reset_relay = [&](size_t index) {
+      relay_start = index + 1;
+      preceding_relay = IdentityRelay();
+    };
     for (size_t index = 0; index < statements.size(); ++index) {
       if (const auto child = As<ForStmt>(statements[index]); child && child->HasAttr(kClosedSyncChildAttr)) {
         entries.emplace(child.get(), preceding_relay);
@@ -394,14 +354,14 @@ class Discover : public IRVisitor {
           if (IsOp(call, "sync.completed")) {
             completed_tokens_.insert(assign->var_.get());
             erased_defs.push_back(statements[index]);
-            preceding_relay = IdentityRelay();
+            reset_relay(index);
             continue;
           }
         } else if (const auto alias = As<Var>(assign->value_);
                    alias && completed_tokens_.count(alias.get())) {
           completed_tokens_.insert(assign->var_.get());
           erased_defs.push_back(statements[index]);
-          preceding_relay = IdentityRelay();
+          reset_relay(index);
           continue;
         }
       }
@@ -456,22 +416,27 @@ class Discover : public IRVisitor {
         if (it != pending_records_.end() && !it->second.used) {
           unsupported_syntax = true;
         }
-        pending_records_[var.get()] = {
-            Pipe(rec, "pipe"), statements[index], control_stack_, sequence.get(), index, false};
+        pending_records_[var.get()] = {Pipe(rec, "pipe"),
+                                       statements[index],
+                                       control_stack_,
+                                       sequence.get(),
+                                       index,
+                                       preceding_relay,
+                                       false};
         continue;
       }
       if (const auto w = SyncWait(statements[index])) {
         const auto token = As<Var>(w->args_.empty() ? ExprPtr{} : w->args_[0]);
         if (!token) {
           unsupported_syntax = true;
-          preceding_relay = IdentityRelay();
+          reset_relay(index);
           continue;
         }
         const auto rec_it = pending_records_.find(token.get());
         if (rec_it == pending_records_.end() || rec_it->second.used ||
             rec_it->second.control_stack != control_stack_) {
           unsupported_syntax = true;
-          preceding_relay = IdentityRelay();
+          reset_relay(index);
           continue;
         }
         rec_it->second.used = true;
@@ -490,12 +455,15 @@ class Discover : public IRVisitor {
                              loop_scope_stack_.back(), false, 0, 0, -1, -1, 0,
                              same_seq ? sequence.get() : nullptr, same_seq ? rec_it->second.index_in_seq : 0,
                              same_seq ? index : 0});
-          ApplyRelayEdge(preceding_relay, src, dst);
+          if (same_seq && rec_it->second.index_in_seq >= relay_start) {
+            ApplyCapturedRelayEdge(preceding_relay, rec_it->second.captured_relay, RelayPipeBit(src),
+                                   RelayPipeBit(dst));
+          }
         }
         continue;
       }
 
-      preceding_relay = IdentityRelay();
+      reset_relay(index);
       VisitStmt(statements[index]);
     }
   }
@@ -507,10 +475,9 @@ class Discover : public IRVisitor {
     std::vector<const Stmt*> control_stack;
     const SeqStmts* seq = nullptr;
     size_t index_in_seq = 0;
+    RelayMatrix captured_relay{};
     bool used = false;
   };
-  FunctionPtr owner_;
-  std::string target_;
   const SyncControlRangeProver* prover_ = nullptr;
   std::set<const Var*> completed_tokens_;
   std::unordered_map<const Var*, PendingRecord> pending_records_;
@@ -519,7 +486,6 @@ class Discover : public IRVisitor {
   std::vector<const Stmt*> control_stack_;
   std::vector<uint32_t> loop_scope_stack_{0};
   uint32_t next_loop_scope_id_ = 0;
-  uint64_t prior_child_dirs_ = 0;
 };
 
 class NativeOperations : public IRVisitor {
@@ -645,18 +611,11 @@ const char* LocalBarrier(PipeType pipe, FunctionType core) {
 
 class Assignment {
  public:
-  Assignment(const FunctionPtr& owner, Discover& discovered, const NativeOperations& native_ops,
-             const std::string& target, const std::optional<std::vector<int>>& eligible,
-             const SyncNativeReservations& extra_reservations, const SyncControlRangeProver& prover) {
-    const auto& native = backend::RequireLocalSyncExecutionContract(target);
-    CHECK(native.set_completes_source_prefix && native.wait_consumes_before_advance)
-        << "Closed prefix protocols require ordered consuming event commands";
-    reservations_ = SyncNativeClaims(owner, native_ops.all_native_payloads, target);
-    for (const auto& [direction, ids] : reservations_)
-      for (int id : ids) native_claimed_.emplace_back(direction.first, direction.second, id);
-    for (const auto& [direction, ids] : extra_reservations)
-      reservations_[direction].insert(ids.begin(), ids.end());
-
+  // The loop-closure decision determines which physical directions exist,
+  // independently of their lane assignment. Retained children use the same
+  // decision before the parent plans its entry protocols.
+  static void PlanOneWayClosure(const FunctionPtr& owner, Discover& discovered,
+                                const SyncControlRangeProver& prover) {
     // Index statement ordering/edges inside loops so we only fall back to the
     // 4-command protocol when a 1-way loop edge lacks an unconditional reverse cycle.
     // A wait at `wait_idx` only relays completion facts captured on `source` at `rec_idx`.
@@ -713,13 +672,8 @@ class Assignment {
             if (const auto wit = edges_at_wait.find(i); wit != edges_at_wait.end()) {
               for (const auto& edge : wit->second) {
                 if (edge.rec_idx < start_idx) continue;
-                const RelayMask sm = RelayPipeBit(edge.src);
-                const RelayMask dm = RelayPipeBit(edge.dst);
-                if (sm == 0 || dm == 0) continue;
-                const RelayMatrix& captured = pref[edge.rec_idx];
-                for (size_t p = 0; p < kRelayPipeCount; ++p) {
-                  if ((captured[p] & sm) != 0) next[p] |= dm;
-                }
+                ApplyCapturedRelayEdge(next, pref[edge.rec_idx], RelayPipeBit(edge.src),
+                                       RelayPipeBit(edge.dst));
               }
             }
             pref[i + 1] = next;
@@ -830,6 +784,21 @@ class Assignment {
       ow.loop_pre_reach = closed_all ? pre_reach_all : 0;
       ow.loop_post_reach = closed_all ? post_reach_all : 0;
     }
+  }
+
+  Assignment(const FunctionPtr& owner, Discover& discovered, const NativeOperations& native_ops,
+             const std::string& target, const std::optional<std::vector<int>>& eligible,
+             const SyncNativeReservations& extra_reservations, const SyncControlRangeProver& prover) {
+    const auto& native = backend::RequireLocalSyncExecutionContract(target);
+    CHECK(native.set_completes_source_prefix && native.wait_consumes_before_advance)
+        << "Closed prefix protocols require ordered consuming event commands";
+    reservations_ = SyncNativeClaims(owner, native_ops.all_native_payloads, target);
+    for (const auto& [direction, ids] : reservations_)
+      for (int id : ids) native_claimed_.emplace_back(direction.first, direction.second, id);
+    for (const auto& [direction, ids] : extra_reservations)
+      reservations_[direction].insert(ids.begin(), ids.end());
+
+    PlanOneWayClosure(owner, discovered, prover);
 
     // Allocate directional IDs for all 1-way transactions (both 2-cmd and 4-cmd fallback),
     // tracking in-flight lifetimes so concurrent operations never share a flag ID and
@@ -1553,6 +1522,89 @@ bool HasMatchingClosedPrefixUses(const FunctionPtr& function, const Discover& di
       discovered.local.size() + discovered.one_way.size() + discovered.erased_waits.size();
   return check.uses == expected_uses;
 }
+
+using ChildResourceDirections = std::map<const ForStmt*, std::set<SyncDirection>>;
+
+// Read claims from the independently lowered child to cover both closed-prefix
+// ACKs and structured event commands. Parent-reserved lanes are exclusions from
+// the child's palette, so derive native claims solely from the child's payloads.
+std::set<SyncDirection> CollectChildResourceDirections(const FunctionPtr& logical, const StmtPtr& physical,
+                                                       const std::string& target) {
+  class Publications : public IRVisitor {
+   public:
+    std::set<SyncDirection> directions;
+
+   protected:
+    void VisitStmt_(const EvalStmtPtr& statement) override {
+      if (const auto call = As<Call>(statement->expr_); call && IsOp(call, "system.set_flag")) {
+        directions.emplace(Pipe(call, "src_pipe"), Pipe(call, "dst_pipe"));
+      }
+    }
+    void VisitExpr(const ExprPtr&) override {}
+  } publications;
+  publications.VisitStmt(physical);
+  NativeOperations native(logical->func_type_, target);
+  native.VisitFunction(logical);
+  for (const auto& [dir, ids] : SyncNativeClaims(logical, native.all_native_payloads, target)) {
+    (void)ids;
+    if (dir.first != dir.second) {
+      publications.directions.insert(dir);
+    }
+  }
+  return publications.directions;
+}
+
+// Walk original control cuts with actual child directions. Both arms start
+// with the entering claims; only a following cut sees the union of the arms.
+class ChildEntryVerifier : public IRVisitor {
+ public:
+  ChildEntryVerifier(const Discover& discovered, const ChildResourceDirections& directions)
+      : discovered_(discovered), directions_(directions) {}
+
+ protected:
+  void VisitExpr(const ExprPtr&) override {}
+  void VisitStmt_(const IfStmtPtr& branch) override {
+    const uint64_t before = prior_directions_;
+    VisitStmt(branch->then_body_);
+    const uint64_t after_then = prior_directions_;
+    prior_directions_ = before;
+    if (branch->else_body_) {
+      VisitStmt(*branch->else_body_);
+    }
+    prior_directions_ |= after_then;
+  }
+  void VisitStmt_(const ForStmtPtr& loop) override {
+    const auto child = directions_.find(loop.get());
+    if (child == directions_.end()) {
+      IRVisitor::VisitStmt_(loop);
+      return;
+    }
+    const auto entry = discovered_.entries.find(loop.get());
+    CHECK(entry != discovered_.entries.end()) << "Closed child lacks an original entry protocol cut";
+    const bool loop_nested = discovered_.loop_nested_children.count(loop.get()) != 0;
+    const bool first_visit = loop->HasAttr(kClosedSyncChildFirstVisitAttr);
+    CHECK(!first_visit || !loop_nested)
+        << "First-visit closed child cannot appear inside a multi-trip loop or after an earlier child";
+    uint64_t mask = 0;
+    for (const auto& [producer, consumer] : child->second) {
+      const auto bit = SyncDirectionBit(producer, consumer);
+      const bool prior_claim = (prior_directions_ & bit) != 0;
+      CHECK(!first_visit || !prior_claim)
+          << "First-visit closed child cannot appear inside a multi-trip loop or after an earlier child";
+      if (!first_visit && (loop_nested || prior_directions_ == 0 || prior_claim)) {
+        CHECK((entry->second[static_cast<size_t>(consumer)] & RelayPipeBit(producer)) != 0)
+            << "Closed child entry lacks a participating-pipe acknowledgment; cross-visit rearm unproved";
+      }
+      mask |= bit;
+    }
+    prior_directions_ |= mask;
+  }
+
+ private:
+  const Discover& discovered_;
+  const ChildResourceDirections& directions_;
+  uint64_t prior_directions_ = 0;
+};
 }  // namespace
 
 bool HasOnlyClosedPrefixSyntax(const FunctionPtr& function) {
@@ -1564,6 +1616,26 @@ bool HasOnlyClosedPrefixSyntax(const FunctionPtr& function) {
     return true;
   if (discovered.has_closed_pair || !discovered.children.empty()) return true;
   return discovered.has_while || !discovered.has_payload || (discovered.has_if && !discovered.has_for);
+}
+
+std::optional<std::set<SyncDirection>> PlanClosedPrefixEventDirections(
+    const FunctionPtr& function, const SyncParameterBounds& parameters,
+    const std::optional<std::pair<int64_t, int64_t>>& blocks) {
+  const SyncControlRangeProver prover(function, parameters, blocks);
+  Discover discovered(&prover);
+  discovered.VisitFunction(function);
+  if (!HasMatchingClosedPrefixUses(function, discovered) || !discovered.children.empty()) {
+    return std::nullopt;
+  }
+  Assignment::PlanOneWayClosure(function, discovered, prover);
+  std::set<SyncDirection> directions;
+  for (const auto& transaction : discovered.one_way) {
+    directions.emplace(transaction.source, transaction.destination);
+    if (transaction.needs_return_ack) {
+      directions.emplace(transaction.destination, transaction.source);
+    }
+  }
+  return directions;
 }
 
 bool HasClosedSyncChild(const FunctionPtr& function) {
@@ -1592,7 +1664,7 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     const std::optional<std::vector<int>>& eligible_ids, const SyncNativeReservations& extra_reservations,
     const SyncParameterBounds& parameters, const std::optional<std::pair<int64_t, int64_t>>& blocks) {
   const SyncControlRangeProver prover(function, parameters, blocks);
-  Discover discovered(function, target, &prover);
+  Discover discovered(&prover);
   discovered.VisitFunction(function);
   if (!HasMatchingClosedPrefixUses(function, discovered)) return std::nullopt;
   CHECK(!function->requires_runtime_binding_ && !function->HasAttr(kAttrExternalSource) &&
@@ -1604,6 +1676,7 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
   const Assignment assignment(function, discovered, native, target, eligible_ids, extra_reservations, prover);
 
   std::map<const ForStmt*, StmtPtr> children;
+  ChildResourceDirections child_directions;
   size_t child_sets = 0, child_waits = 0, child_barriers = 0, child_lanes = 0;
   const auto bindings =
       discovered.children.empty()
@@ -1633,29 +1706,6 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     }
     auto context = bindings->Bind(child, external_policy);
     CheckLogicalSync(context.binding_owner);
-    NativeOperations child_native(function->func_type_, target);
-    child_native.VisitFunction(context.binding_owner);
-    std::set<SyncDirection> required_rearm;
-    for (const auto& [dir, ids] :
-         SyncNativeClaims(context.binding_owner, child_native.all_native_payloads, target)) {
-      (void)ids;
-      if (dir.first != dir.second) required_rearm.emplace(dir.second, dir.first);
-    }
-    for (const auto& [src, dst] : CollectSyncWaitDirections(context.binding_owner->body_)) {
-      required_rearm.emplace(dst, src);
-    }
-    const auto entry = discovered.entries.find(child.get());
-    CHECK(entry != discovered.entries.end()) << "Closed child lacks an original entry protocol cut";
-    if (!child->HasAttr(kClosedSyncChildFirstVisitAttr)) {
-      const bool loop_nested = discovered.loop_nested_children.count(child.get()) != 0;
-      const uint64_t prior_dirs = discovered.child_prior_dirs.at(child.get());
-      for (const auto& [source, destination] : required_rearm) {
-        if (loop_nested || prior_dirs == 0 || (prior_dirs & SyncDirectionBit(destination, source)) != 0) {
-          CHECK((entry->second[static_cast<size_t>(source)] & RelayPipeBit(destination)) != 0)
-              << "Closed child entry lacks a participating-pipe acknowledgment; cross-visit rearm unproved";
-        }
-      }
-    }
     const bool is_subblock = child->HasAttr(kClosedSyncChildSubblockAttr);
     auto unmarked = std::make_shared<ForStmt>(*child);
     unmarked->attrs_.erase(std::remove_if(unmarked->attrs_.begin(), unmarked->attrs_.end(),
@@ -1689,6 +1739,8 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     const auto original_body = As<SeqStmts>(actual->body_);
     const auto lowered_body = As<SeqStmts>(lowered.function->body_);
     INTERNAL_CHECK(original_body && lowered_body) << "Internal error: child binding body is not a sequence";
+    child_directions.emplace(child.get(),
+                             CollectChildResourceDirections(context.binding_owner, lowered_body, target));
     std::set<const Var*> descriptor_variables;
     for (const auto& statement : original_body->stmts_)
       if (const auto assignment_stmt = As<AssignStmt>(statement))
@@ -1735,6 +1787,9 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     }
   }
 
+  if (!child_directions.empty()) {
+    ChildEntryVerifier(discovered, child_directions).VisitFunction(function);
+  }
   Emit emit(assignment, function->func_type_, children);
   PhysicalSyncRealization result;
   result.function = emit.Rewrite(function);

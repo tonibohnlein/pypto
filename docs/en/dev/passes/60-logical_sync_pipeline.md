@@ -512,31 +512,23 @@ and payload coordinates remain in the retained recipe; surrounding branch guards
 and resets remain under their original wrapper. Failed batches publish no partial
 capability list, commands or resource claims.
 
-The parent retains the child's logical token recipe and all possibly pending
-child effects. It places actual closed acknowledgment services at the original
-entry for every ordered pair of participating pipes. This deliberately strengthens
-the selected parent order. For a child flag direction `p -> q`, the previous
-consumption on `q` precedes the entry publication `q -> p`; its acquisition on
-`p` precedes the next child publication. Thus reuse across nonempty, zero or
-skipped visits has a causal rearming path. Closed matching alone supplies no such
-path and does not establish payload completion at child exit.
+The parent tracks pending payload effects and directional event claims separately.
+Each retained child reports the event directions its protocol may use, including
+reverse acknowledgments introduced to close a loop and reservations made by
+native operations. Siblings with disjoint buffers can still share a directional
+event ID. When an earlier child can reach the current entry and both use
+`p -> q`, the parent establishes a handoff from `q` to `p`. This orders the
+earlier WAIT on `q` before the later SET on `p`. Mutually exclusive arms can
+use the same direction without an inter-arm handoff.
 
-`LowerSync` interprets the supplied program, including serialized tokens. A
-versioned loop attribute routes child parsing, but is not trusted evidence.
-Lowering reestablishes lexical bindings, token confinement and the entry services.
-Its participating-pipe footprint includes actual record sources and wait
-destinations as well as payload pipes, including command-only services. It then
-uses the existing actual-token parser, endpoint decoder and physical
-allocator. Parent roles and child IDs are disjoint: the parent reserves its
-existing directional roles first; child lowering receives the remaining common
-eligible palette. Insufficient evidence or capacity refuses transactionally;
-there is no new coloring or silently added completion. Native reservations and
-unsupported directions retain their existing checks. Child commands are not
-service-pruning candidates.
+`LowerSync` checks the supplied token program, including serialized programs.
+It reserves the parent's directional IDs first and lowers each child with the
+remaining IDs. At each child's original entry it checks that the handoff covers
+the directions actually published by the child and its native reservations.
+A record used as evidence captures only the pipe prefix at that record.
+Missing ordering evidence or event capacity causes qualification to fail.
 
-The first all-pairs entry construction is a sufficient contract and can refuse a
-child when a participating direction is unavailable even if fewer directions
-might suffice. Exact GM selectors remain unavailable where not provided. A request batch builds one original-owner statement/definition index using
+A request batch builds one original-owner statement/definition index using
 `ParentStmtAnalysis`; each region then visits only its own scope, ancestors and
 necessary dominating bindings. `child.describe()` reports the shared index nodes
 (counted once per batch), per-query scope nodes and captured definition count,
