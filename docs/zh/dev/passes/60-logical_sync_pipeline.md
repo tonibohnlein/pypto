@@ -18,6 +18,8 @@ with passes.PassContext([], autosync_disjoint_gm=True):
 现支持单区域旋转槽流的常量距离历史；有限数值跨区域导出使用 occurrence capture；满足条件的常量嵌套区域也支持逻辑插入，
 并可通过下述作用域数值证书限定物理降低。`OptimizeSync` 验证后原样返回。
 
+在默认的逐内核模式下，若令牌程序仅生成屏障，`LowerSync` 会在原等待位置保留这些屏障，并继续启用下游 PTOAS 同步。调用者可以通过同一流水线上的等待来约束独立操作的执行顺序。
+
 `LowerSync` 首先支持直线有限令牌程序：record、completed、join 和 wait。
 它解释实际令牌定义及使用，不重新分析存储来替换手写依赖。记录包含该管线
 此前导入的等待。令牌不消耗，多次使用必须分别建立匹配的物理交接。

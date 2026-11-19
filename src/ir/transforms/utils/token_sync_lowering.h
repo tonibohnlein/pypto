@@ -49,7 +49,6 @@ struct StrippedLogicalSync {
   std::map<const ForStmt*, ForStmtPtr> loops;
 };
 StrippedLogicalSync StripStructuredLogicalSync(const FunctionPtr& function, bool allow_nested);
-FunctionPtr StripAllLogicalSync(const FunctionPtr& function);
 bool HasLogicalSync(const FunctionPtr& function);
 // Executable summary only. Case-specific family coordinates are never flattened
 // into one misleading inventory; their immutable owners live through emission.
