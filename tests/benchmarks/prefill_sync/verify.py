@@ -37,7 +37,7 @@ from storage_reference import reference, source_trace
 HERE = Path(__file__).resolve().parent
 
 
-def check_flag_lifetimes(events, cube):
+def check_flag_lifetimes(events, cube, *, event_slots=6):
     """Check causal consumption before an event slot is republished, including across loop iterations."""
     latest_start, latest_completion, gate, commands = {}, {}, {}, {}
     published, consumed = {}, {}
@@ -75,7 +75,7 @@ def check_flag_lifetimes(events, cube):
                 gate[p] = commands[p] = barrier
         else:
             src, dst, slot = args
-            assert src != dst and 0 <= int(slot) < 6
+            assert src != dst and 0 <= int(slot) < event_slots
             key = tuple(args)
             if kind == "set":
                 assert key not in published
