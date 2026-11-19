@@ -1200,6 +1200,7 @@ class PTOCodegen : public CodegenBase {
   /// Per-function mutable state that is reset at the start of each GenerateFunction call.
   struct FunctionState {
     bool buffer_ir = false;
+    std::unordered_set<const ir::Stmt*> c2v_slot_reuse_fences;
     /// Lowered slot producers require shared alias identity even through split APIs.
     bool has_software_pipeline_slots = false;
     std::ostringstream constants_section;
@@ -1373,6 +1374,7 @@ class PTOCodegen : public CodegenBase {
 
     void Reset() {
       buffer_ir = false;
+      c2v_slot_reuse_fences.clear();
       has_software_pipeline_slots = false;
       constants_section.str("");
       constants_section.clear();

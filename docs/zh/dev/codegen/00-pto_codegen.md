@@ -326,6 +326,8 @@ PTOAS 支持本地分配、TPOP 派生及连续 Subview 派生的描述符
 | `system.syncall(core_type=C)` | `pto.syncall() mode = #pto.sync_all_mode<hard>, core_type = #pto.sync_core_type<C>` | 跨核全员屏障（hard/FFTS 形态） |
 | `system.syncall(mode="soft", core_type=C, gm_workspace=ws, used_cores=N)` | `pto.syncall(%gm_ptr[, %used] : !pto.ptr<i32>[, i32]) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<C>` | 当前 PTO-ISA 的 soft/GM 轮询屏障（部分占用即可；GM workspace 至少 64 字节；显式 `N=0` 时从设备启动寄存器推导并省略 `%used`） |
 
+在 A2/A3 上，AIV 的 C2V tile 接收通过 MTE2 写入循环复用的本地槽位。即使已经执行相应的 `tfree_to_aic`，下一次 pop 发出时，向量指令仍可能在读取该槽位。当不同的 pop 指令可能复用同一块本地存储时，代码生成器会在可能覆盖旧数据的 pop 前保守地插入 `pto.barrier <PIPE_ALL>`。该屏障也适用于由 PTOAS 负责同步的内核，无需占用硬件事件 ID。含显式本地事件等待的函数保留原有调度，由编写者保证槽位复用的顺序。PTOAS 继续插入从接收到读取所需的常规同步。
+
 A5 C2V 单向管道显式提供 `c2v_dtype` 时，代码生成还会输出 `nosplit = true` 和
 `acc_push_epilogue`。例如，`c2v_dtype=pl.BF16, pre_relu=True` 对应：
 

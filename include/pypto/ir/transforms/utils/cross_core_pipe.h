@@ -18,6 +18,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -121,6 +122,10 @@ struct ConsumerFifoEvidence {
 /// capacities. The proof neither certifies asynchronous completion nor grants
 /// ownership. An overwritten input is a concrete straight-line native read.
 ConsumerFifoEvidence AnalyzeConsumerFifo(const FunctionPtr& function);
+
+/// Find A2/A3 C2V tile receive sites that may overwrite the same local
+/// bytes as a different native TPOP. Run on the final native emission order.
+std::unordered_set<const Stmt*> FindC2VSlotReuseFences(const FunctionPtr& function);
 
 // `slot_num_override` (from pl.cross_core_slot(slot_num=N)) overrides the ring depth used to size
 // the transport ring and emitted initialize_pipe `slot_num` attribute. nullopt selects

@@ -29,6 +29,7 @@ Multiple explicit pipes:
 import json
 import re
 from pathlib import Path
+from textwrap import indent
 
 import pypto.language as pl
 import pytest
@@ -50,37 +51,74 @@ def _extract_func_section(mlir_code: str, func_name: str) -> str:
     return mlir_code[start:next_start]
 
 
-def _paired_consumer(local_depth: int, *, read_after_wrap: bool = True) -> ir.Program:
+def _paired_consumer(
+    local_depth: int,
+    *,
+    read_after_wrap: bool = True,
+    free_before_wrap: bool = False,
+    intervening_read: bool = False,
+    authored_waits: bool = False,
+) -> ir.Program:
     first_read = "combined = pl.add(first, first)"
+    first_free = "pl.tfree_to_aic(first)"
     early = "" if read_after_wrap else first_read
-    late = "combined = pl.add(first, second)" if read_after_wrap else "combined = pl.add(combined, second)"
+    prior = "first" if read_after_wrap else "combined"
+    intervening = "doubled = pl.add(second, second)" if intervening_read else ""
+    second_arg = "doubled" if intervening_read else "second"
+    free_early = first_free if free_before_wrap else ""
+    free_late = "" if free_before_wrap else first_free
+
+    def sync(src: str, dst: str, event: int) -> str:
+        args = f"pl.PipeType.{src}, pl.PipeType.{dst}, {event}"
+        return f"pl.system.set_flag({args})\npl.system.wait_flag({args})" if authored_waits else ""
+
+    return _paired_receive_program(
+        local_depth,
+        """
+values = pl.load(x, [0, 0], [16, 16])
+other = pl.load(x, [16, 0], [16, 16])
+first = pl.matmul(values, values)
+second = pl.matmul(other, other)
+pl.tpush_to_aiv(first, split=0)
+pl.tpush_to_aiv(second, split=0)
+""",
+        f"""
+first: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+{sync("MTE2", "V", 0)}
+{early}
+{free_early}
+{sync("V", "MTE2", 0)}
+second: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+{sync("MTE2", "V", 1)}
+{intervening}
+combined = pl.add({prior}, {second_arg})
+{free_late}
+pl.tfree_to_aic(second)
+{sync("V", "MTE3", 0)}
+return pl.store(combined, [0, 0], out)
+""",
+    )
+
+
+def _paired_receive_program(
+    local_depth: int, producer: str, consumer: str, *, slot_bytes: int = 1024
+) -> ir.Program:
     return pl.parse_program(f"""
 @pl.program
 class PairedConsumer:
     @pl.function(type=pl.FunctionType.AIC)
     def cube(self, x: pl.Tensor[[32, 16], pl.FP16]):
         peer = pl.import_peer_buffer(name="peer_c2v", peer_func="vector")
-        pl.aic_initialize_pipe(peer, pl.const(0, pl.INT32), dir_mask=1, slot_size=1024,
+        pl.aic_initialize_pipe(peer, pl.const(0, pl.INT32), dir_mask=1, slot_size={slot_bytes},
                                slot_num=2, local_slot_num={local_depth})
-        values = pl.load(x, [0, 0], [16, 16])
-        other = pl.load(x, [16, 0], [16, 16])
-        first = pl.matmul(values, values)
-        second = pl.matmul(other, other)
-        pl.tpush_to_aiv(first, split=0)
-        pl.tpush_to_aiv(second, split=0)
+{indent(producer.strip(), "        ")}
 
     @pl.function(type=pl.FunctionType.AIV)
     def vector(self, out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
-        fifo = pl.reserve_buffer(name="peer_c2v", size={1024 * local_depth}, base=4096)
-        pl.aiv_initialize_pipe(fifo, pl.const(0, pl.INT32), dir_mask=1, slot_size=1024,
+        fifo = pl.reserve_buffer(name="peer_c2v", size={slot_bytes * local_depth}, base=4096)
+        pl.aiv_initialize_pipe(fifo, pl.const(0, pl.INT32), dir_mask=1, slot_size={slot_bytes},
                                slot_num=2, local_slot_num={local_depth})
-        first: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
-        {early}
-        second: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
-        {late}
-        pl.tfree_to_aic(first)
-        pl.tfree_to_aic(second)
-        return pl.store(combined, [0, 0], out)
+{indent(consumer.strip(), "        ")}
 
     @pl.function(type=pl.FunctionType.Group)
     def paired(self, x: pl.Tensor[[32, 16], pl.FP16],
@@ -96,25 +134,36 @@ class PairedConsumer:
 
 
 @pytest.mark.usefixtures("ascend_backend")
-def test_explicit_peer_rejects_native_read_after_slot_wrap(tmp_path: Path):
+@pytest.mark.parametrize("free_before_wrap", [False, True], ids=["retained", "freed-with-gap"])
+def test_explicit_peer_rejects_native_read_after_slot_wrap(tmp_path: Path, free_before_wrap: bool):
     cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
     with pytest.raises(ValueError, match="Native peer pop overwrites a consumer slot"):
-        ir.compile(_paired_consumer(1), **cfg.compile_kwargs())
+        prog = _paired_consumer(1, free_before_wrap=free_before_wrap, intervening_read=free_before_wrap)
+        ir.compile(prog, **cfg.compile_kwargs())
 
 
 @pytest.mark.ptoas_compile
 @pytest.mark.usefixtures("ascend_backend")
-@pytest.mark.parametrize("depth,read_after_wrap", [(2, True), (1, False)])
-def test_explicit_peer_preserves_protocol_on_qualified_or_unproved_fifo(
-    tmp_path: Path, depth: int, read_after_wrap: bool
+@pytest.mark.parametrize("enable_autosync", [False, True], ids=["stock", "conservative-prefix"])
+@pytest.mark.parametrize(
+    "depth,read_after_wrap,free_before_wrap",
+    [(2, True, False), (2, False, False), (1, False, False), (1, False, True)],
+    ids=["two-slot-late", "two-slot-early", "one-slot-retained", "one-slot-freed"],
+)
+def test_explicit_peer_orders_physical_slot_reuse(
+    tmp_path: Path, depth: int, read_after_wrap: bool, free_before_wrap: bool, enable_autosync: bool
 ):
     if find_ptoas_binary() is None:
         pytest.skip("PTOAS is not available")
     cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
     with passes.PassContext(
-        [], enable_buffer_ir=True, enable_pypto_autosync=True, autosync_policy="conservative_prefix"
+        [],
+        enable_buffer_ir=True,
+        enable_pypto_autosync=enable_autosync,
+        autosync_policy="conservative_prefix",
     ):
-        ir.compile(_paired_consumer(depth, read_after_wrap=read_after_wrap), **cfg.compile_kwargs())
+        prog = _paired_consumer(depth, read_after_wrap=read_after_wrap, free_before_wrap=free_before_wrap)
+        ir.compile(prog, **cfg.compile_kwargs())
     kernels = list((tmp_path / "kernels").rglob("*.cpp"))
     assert len(kernels) == 2
     body = (tmp_path / "kernels" / "aiv" / "vector.cpp").read_text()
@@ -123,13 +172,125 @@ def test_explicit_peer_preserves_protocol_on_qualified_or_unproved_fifo(
     assert body.count("TPUSH<") == 2
     assert body.count("TPOP<") == 4
     assert body.count("TFREE<") == 4
-    if not read_after_wrap:
-        active = re.findall(r"^\s+(TPOP|TFREE|TADD)(?:<|\()", body, re.MULTILINE)
-        assert active[:6] == ["TPOP", "TADD", "TPOP", "TADD", "TFREE", "TFREE"]
-    report = json.loads((tmp_path / "report" / "autosync.json").read_text())
-    routes = {kernel["function"]: kernel for kernel in report["kernels"]}
-    assert f"peak marker depth 2, declared local capacity {depth}" in routes["vector"]["reason"]
-    assert all(route["selected_route"] == "ptoas" for route in routes.values())
+    native = (tmp_path / "ptoas" / "paired.cpp").read_text()
+    first_pop, second_pop, replay_first, _ = (match.start() for match in re.finditer(r"\bTPOP<", native))
+    between_pops = native[first_pop:second_pop]
+    barrier = "pipe_barrier(PIPE_ALL);"
+    if depth == 1:
+        # Hardware TFREE for a GM-backed tile pop does not wait for the vector
+        # read. The same physical slot needs this fence in both lexical forms.
+        assert between_pops.index("TADD(") < between_pops.index(barrier)
+    else:
+        assert barrier not in between_pops
+    assert barrier not in native[replay_first:]
+    # Read readiness still comes from PTOAS on both routes.
+    assert "wait_flag(PIPE_MTE2, PIPE_V," in native[second_pop:replay_first]
+    ownership = json.loads((tmp_path / "ptoas" / "paired.sync.json").read_text())
+    assert ownership["ptoas_insert_sync"]
+    assert not any(domain["owned"] for domain in ownership["domains"])
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.usefixtures("ascend_backend")
+def test_explicit_peer_preserves_authored_handoff(tmp_path: Path):
+    if find_ptoas_binary() is None:
+        pytest.skip("PTOAS is not available")
+    cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
+    prog = _paired_consumer(1, read_after_wrap=False, authored_waits=True)
+    ir.compile(prog, **cfg.compile_kwargs())
+    native = (tmp_path / "ptoas" / "paired.cpp").read_text()
+    first_pop, second_pop, *_ = (match.start() for match in re.finditer(r"\bTPOP<", native))
+    between_pops = native[first_pop:second_pop]
+    assert "pipe_barrier(PIPE_ALL);" not in between_pops
+    assert between_pops.index("TADD(") < between_pops.index("wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);")
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.usefixtures("ascend_backend")
+@pytest.mark.parametrize("depth", [1, 2])
+def test_explicit_peer_slot_stride_is_independent_of_tile_extent(tmp_path: Path, depth: int):
+    if find_ptoas_binary() is None:
+        pytest.skip("PTOAS is not available")
+    prog = _paired_receive_program(
+        depth,
+        """
+values = pl.load(x, [0, 0], [16, 16])
+wide = pl.load(x, [0, 0], [32, 16])
+first = pl.matmul(wide, values)
+second = pl.matmul(values, values)
+pl.tpush_to_aiv(first, split=0)
+pl.tpush_to_aiv(second, split=0)
+""",
+        """
+first: pl.Tile[[32, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+doubled = pl.add(first, first)
+prefix = pl.slice(doubled, [16, 16], [0, 0])
+out = pl.store(prefix, [0, 0], out)
+second: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+out = pl.store(second, [0, 0], out)
+pl.tfree_to_aic(first)
+pl.tfree_to_aic(second)
+return out
+""",
+        slot_bytes=2048,
+    )
+    cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
+    ir.compile(prog, **cfg.compile_kwargs())
+    native = (tmp_path / "ptoas" / "paired.cpp").read_text()
+    first_pop, second_pop, *_ = list(re.finditer(r"\bTPOP<.*", native))
+    assert "Vec, float, 32, 16," in first_pop[0]
+    assert "Vec, float, 16, 16," in second_pop[0]
+    # The shorter receive overwrites the prior payload's prefix in one slot.
+    # A second slot starts at the declared byte stride, even for unequal tiles.
+    between_pops = native[first_pop.end() : second_pop.start()]
+    assert ("pipe_barrier(PIPE_ALL);" in between_pops) == (depth == 1)
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.usefixtures("ascend_backend")
+@pytest.mark.parametrize(
+    "depth,two_sites", [(1, False), (1, True), (2, True)], ids=["same-site", "distinct-sites", "two-slot"]
+)
+def test_explicit_peer_loop_orders_slot_reuse(tmp_path: Path, depth: int, two_sites: bool):
+    if find_ptoas_binary() is None:
+        pytest.skip("PTOAS is not available")
+    work = """
+tile: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+doubled = pl.add(tile, tile)
+pl.tfree_to_aic(tile)
+out = pl.store(doubled, [0, 0], out)
+""".strip()
+    receive = [work]
+    if two_sites:
+        receive.append(work.replace("tile", "other").replace("doubled", "second_doubled"))
+    producer = [
+        "values = pl.load(x, [0, 0], [16, 16])",
+        "first = pl.matmul(values, values)",
+        "for _ in pl.range(4):",
+        indent("\n".join(["pl.tpush_to_aiv(first, split=0)"] * len(receive)), "    "),
+    ]
+    consumer = ["for _ in pl.range(4):", indent("\n".join(receive), "    "), "return out"]
+    cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
+    prog = _paired_receive_program(depth, "\n".join(producer), "\n".join(consumer))
+    ir.compile(prog, **cfg.compile_kwargs())
+
+    native = (tmp_path / "ptoas" / "paired.cpp").read_text()
+    loop_start = native.rfind("for (", 0, native.index("TPOP<"))
+    first_pop = native.index("TPOP<")
+    read = native.index("TADD(", first_pop)
+    if two_sites and depth == 1:
+        second_pop = native.index("TPOP<", first_pop + 1)
+        # Both different receive sites target the single slot, including on
+        # the next iteration's backedge.
+        assert "pipe_barrier(PIPE_ALL);" in native[loop_start:first_pop]
+        assert "pipe_barrier(PIPE_ALL);" in native[read:second_pop]
+    else:
+        assert "pipe_barrier(PIPE_ALL);" not in native[loop_start:]
+        before_pop = native[loop_start:first_pop]
+        wait = re.search(r"wait_flag\(PIPE_V, PIPE_MTE2, (EVENT_ID\d+)\);", before_pop)
+        assert wait is not None
+        release = native[read : native.index("TFREE<", read)]
+        assert f"set_flag(PIPE_V, PIPE_MTE2, {wait[1]});" in release
 
 
 @pytest.mark.usefixtures("ascend_backend")
