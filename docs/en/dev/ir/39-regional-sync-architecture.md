@@ -679,6 +679,23 @@ preserving original coordinates and empty visits. This matches the draft's
 numerical sequence/repetition construction. It is not a claim of exact treatment
 of arbitrary interleaving or data-dependent branches.
 
+With disjoint GM supplied, the `conservative_prefix` policy can retry an
+unavailable whole-invocation exact analysis by projecting qualified read-only
+input roots. The importer checks distinct original GM bases and direct effects
+of the selected DMA operations. The exact model still includes writable GM
+geometry and all local effects. The compiler preserves original DMA addresses
+and runtime descriptor extents. The existing invocation partitioner and
+directional allocator prove the combined order before the compiler publishes it.
+
+For Qwen gate/up, the dynamic layer offset and weight extents belong to
+read-only DMA operands. The common numerical owner exposes the last extract
+and first reload of each reused MAT slot, and the final gate store and first up
+multiply share the accumulator boundary. Independent children can still need
+entry acknowledgments. Replacing those acknowledgments requires a shared
+storage key, aligned activation predicates, and a proof that each lane's
+previous WAIT causally precedes its next SET. A direction at the child boundary
+does not identify those events.
+
 `sync_matmul_oracle.validate` independently interprets original Buffer addresses,
 constructs concrete conflicts, computes closure and covers, and compares the
 actual retained demand records after bounded expansion. It also checks all four

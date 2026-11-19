@@ -10,9 +10,11 @@
 """Unswizzled row-major external geometry, independent of kernel names or flags."""
 
 import pytest
-from pypto import ir, testing
+from pypto import ir, passes, testing
 
+from .sync_matmul_cases import staged_fixture
 from .sync_matmul_oracle import check_imported_accesses, interpret, validate
+from .sync_physical_oracle import run_physical
 from .test_nested_phase_sync import nested_matrix_fixture
 from .test_nested_sync_repetition import expand_scoped_families
 
@@ -153,3 +155,155 @@ def test_runtime_divisor_is_not_admitted_as_a_row_major_certificate():
 
     with pytest.raises(ValueError, match="positive constant divisor"):
         testing.describe_placed_sync_input(RuntimeDivisor().visit_function(original), True)
+
+
+def with_unbounded_dma_coordinate(
+    *,
+    writable_shape: bool = False,
+    writable_offset: bool = False,
+    shared_base: bool = False,
+    runtime_control: bool = False,
+    input_write: bool = False,
+) -> ir.Function:
+    source = staged_fixture(2, stages=1, m=64, n=64)
+    a, b, out = source.params
+    span = source.span
+    index = ir.DataType.INDEX
+    scalar = ir.ScalarType(index)
+    base = ir.Var("row_base", scalar, span)
+    extent = ir.Var("row_extent", scalar, span)
+    common = ir.MemRef("shared", 0, 0, span) if shared_base else None
+    assert isinstance(b.type, ir.TensorType) and isinstance(out.type, ir.TensorType)
+    weights = ir.Var(b.name_hint, ir.TensorType([extent, b.type.shape[1]], b.type.dtype, common), span)
+    output = ir.Var(
+        out.name_hint,
+        ir.TensorType(
+            [extent if writable_shape else out.type.shape[0], out.type.shape[1]], out.type.dtype, common
+        ),
+        span,
+    )
+    body = ir.substitute_stmt(source.body, [(b, weights), (out, output)])
+
+    class DynamicOffset(ir.IRMutator):
+        def visit_if_stmt(self, op: ir.IfStmt) -> ir.Stmt:
+            if not runtime_control:
+                return super().visit_if_stmt(op)
+            gate = ir.Eq(base, ir.ConstInt(0, index, span), ir.DataType.BOOL, span)
+            condition = ir.And(op.condition, gate, ir.DataType.BOOL, span)
+            return ir.IfStmt(condition, op.then_body, op.else_body, op.return_vars, span)
+
+        def visit_call(self, op: ir.Call) -> ir.Expr:
+            if (
+                op.op.name == ir.get_op("buffer.load").name
+                and op.args[0] is weights
+                or writable_offset
+                and op.op.name == ir.get_op("buffer.store").name
+            ):
+                offsets = op.args[1]
+                assert isinstance(offsets, ir.MakeTuple)
+                row, col = offsets.elements
+                new = ir.MakeTuple([ir.Add(base, row, index, span), col], span)
+                return ir.Call(op.op, [op.args[0], new, *op.args[2:]], op.type, span)
+            return super().visit_call(op)
+
+    body = DynamicOffset().visit_stmt(body)
+    direction = ir.ParamDirection.In if input_write else ir.ParamDirection.InOut
+    return ir.Function(
+        source.name,
+        [a, weights, (output, direction), base, extent],
+        [output.type],
+        body,
+        span,
+        source.func_type,
+        ir_stage=source.ir_stage,
+    )
+
+
+def realize_exact_projection(function: ir.Function, *, disjoint: bool, split_passes: bool) -> ir.Function:
+    program = ir.Program([function], "DisjointReadOnlyProjection", function.span)
+    with passes.PassContext(
+        [], enable_pypto_autosync=True, autosync_policy="conservative_prefix", autosync_disjoint_gm=disjoint
+    ):
+        if split_passes:
+            result = passes.lower_sync()(passes.optimize_sync()(passes.insert_sync()(program)))
+        else:
+            result = passes.realize_sync()(program)
+    return next(iter(result.functions.values()))
+
+
+@pytest.mark.parametrize("split_passes", [False, True])
+def test_disjoint_readonly_projection_keeps_original_unbounded_coordinates(split_passes):
+    original = with_unbounded_dma_coordinate()
+    before = ir.serialize(original)
+    with pytest.raises(ValueError, match="caller range"):
+        testing.analyze_placed_sync(original, True)
+    physical = realize_exact_projection(original, disjoint=True, split_passes=split_passes)
+    assert physical.attrs["pypto_autosync"]
+    assert "autosync_analysis_policy" not in physical.attrs
+    assert ir.serialize(original) == before
+    for expected, actual in zip(original.params, physical.params, strict=True):
+        ir.assert_structural_equal(expected.type, actual.type)
+    run_physical(original, physical, range(6), {3: 1, 4: 65})
+
+
+@pytest.mark.parametrize(
+    "disjoint,unsafe",
+    [
+        (False, {}),
+        (True, {"writable_shape": True}),
+        (True, {"writable_offset": True}),
+        (True, {"shared_base": True}),
+        (True, {"runtime_control": True}),
+        (True, {"input_write": True}),
+    ],
+)
+def test_disjoint_readonly_projection_requires_qualified_writable_and_distinct_roots(disjoint, unsafe):
+    original = with_unbounded_dma_coordinate(**unsafe)
+    physical = realize_exact_projection(original, disjoint=disjoint, split_passes=False)
+    assert (
+        not physical.attrs["pypto_autosync"]
+        or physical.attrs["autosync_analysis_policy"] == "conservative_prefix"
+    )
+
+
+def test_symbolic_innermost_frame_keeps_original_start_for_branch_proof():
+    source = staged_fixture(2, stages=1, m=64, n=64)
+    span = source.span
+    index = ir.DataType.INDEX
+
+    def ci(value):
+        return ir.ConstInt(value, index, span)
+
+    block = ir.Var("block", ir.ScalarType(index), span)
+    get_block = ir.AssignStmt(block, ir.Call(ir.get_op("buffer.get_block_idx"), [], block.type, span), span)
+    assert isinstance(source.body, ir.SeqStmts)
+    original_loop, _, returned = source.body.stmts[-3:]
+    assert isinstance(original_loop, ir.ForStmt) and isinstance(original_loop.body, ir.SeqStmts)
+    var = original_loop.loop_var
+    payload = original_loop.body.stmts[0]
+    assert isinstance(payload, ir.EvalStmt) and isinstance(payload.expr, ir.Call)
+    load = payload.expr
+    offsets = ir.MakeTuple([ci(0), ci(0)], span)
+    first = ir.EvalStmt(ir.Call(load.op, [load.args[0], offsets, *load.args[2:]], load.type, span), span)
+    second = ir.EvalStmt(ir.Call(load.op, [load.args[0], offsets, *load.args[2:]], load.type, span), span)
+    branch = ir.IfStmt(ir.Gt(var, ci(24), ir.DataType.BOOL, span), second, None, [], span)
+    loop = ir.ForStmt(
+        var, block, ci(68), ci(24), [], ir.SeqStmts([first, branch, ir.YieldStmt([], span)], span), [], span
+    )
+    changed = ir.Function(
+        source.name,
+        list(zip(source.params, source.param_directions, strict=True)),
+        source.return_types,
+        ir.SeqStmts([*source.body.stmts[:-3], get_block, loop, returned], span),
+        span,
+        source.func_type,
+        ir_stage=source.ir_stage,
+    )
+    # The first trip uses an IV between 20 and 23 and the second between 44
+    # and 47. A zero-based [0, 24] proof would incorrectly discard the branch.
+    with pytest.raises(ValueError, match="Only first-visit initialization"):
+        testing.analyze_sync_invocation(changed, True, "a2a3", {}, (20, 23))
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

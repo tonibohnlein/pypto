@@ -194,15 +194,16 @@ class NativeChildScopeRequests : public IRVisitor {
 FunctionPtr InsertLogicalSync(const FunctionPtr& function, const std::string& target,
                               const sync::SyncParameterBounds& parameters,
                               std::optional<std::pair<int64_t, int64_t>> blocks,
-                              std::optional<int64_t> launch_count) {
+                              std::optional<int64_t> launch_count,
+                              sync::SyncExternalPolicy external_policy = sync::SyncExternalPolicy::Geometry) {
   if (blocks) {
-    const auto invocation =
-        sync::AnalyzeSyncInvocation(function, true, target, parameters, *blocks, launch_count);
+    const auto invocation = sync::AnalyzeSyncInvocation(function, true, target, parameters, *blocks,
+                                                        launch_count, external_policy);
     return invocation.cases.size() == 1
                ? sync::RealizeCompactSync(*invocation.cases.front().mathematics).function
                : sync::RealizeLogicalInvocation(invocation).function;
   }
-  auto input = sync::ImportPlacedSync(function, true, target, parameters, blocks);
+  auto input = sync::ImportPlacedSync(function, true, target, parameters, blocks, nullptr, external_policy);
   return sync::RealizeCompactSync(sync::AnalyzeCompactSync(std::move(input))).function;
 }
 
@@ -228,16 +229,18 @@ FunctionPtr AnalyzeRegionSync(
       return InsertLogicalSync(BindLaunchCount(function, launch_count), target, parameters, blocks,
                                launch_count);
     }
-    try {
-      const auto logical = InsertLogicalSync(BindLaunchCount(function, launch_count), target, parameters,
-                                             blocks, launch_count);
-      // Mirror RealizeSync's late lowering fallback so 3-pass InsertSync -> OptimizeSync -> LowerSync
-      // switches to MixedCompose + Regional before committing an exact plan that cannot lower.
-      sync::LowerLogicalSync(sync::OptimizeLogicalSync(logical), target, std::nullopt, parameters, blocks, {},
-                             sync::SyncExternalPolicy::Geometry, launch_count, {}, /*dry_run_only=*/true);
-      return logical;
-    } catch (const pypto::ValueError&) {
-      // Fall through to MixedCompose + Regional fallback.
+    const auto owner = BindLaunchCount(function, launch_count);
+    for (const auto policy :
+         {sync::SyncExternalPolicy::Geometry, sync::SyncExternalPolicy::DisjointReadOnlyProjection}) {
+      try {
+        const auto logical = InsertLogicalSync(owner, target, parameters, blocks, launch_count, policy);
+        // Prove physical realizability before selecting the precise owner.
+        sync::LowerLogicalSync(sync::OptimizeLogicalSync(logical), target, std::nullopt, parameters, blocks,
+                               {}, policy, launch_count, {}, /*dry_run_only=*/true);
+        return logical;
+      } catch (const pypto::ValueError&) {
+        // Try the next qualified route before regional fallback.
+      }
     }
   }
   CHECK(allow_regional_fallback) << "Regional synchronization fallback is unavailable under exact policy";
@@ -433,10 +436,23 @@ Pass LowerSync(bool require_whole_module) {
           const bool payloads =
               require_whole_module &&
               sync::QualifyLocalSyncInvocation(function, context->GetBackendHandler()->GetPtoTargetArch());
-          auto result = sync::LowerLogicalSync(
-              function, context->GetBackendHandler()->GetPtoTargetArch(), std::nullopt, parameters, blocks,
-              {}, sync::SyncExternalPolicy::Geometry, FixedLaunchCount(evidence, global->name_));
           const auto target = context->GetBackendHandler()->GetPtoTargetArch();
+          const auto launch_count = FixedLaunchCount(evidence, global->name_);
+          const auto lower = [&](sync::SyncExternalPolicy policy) {
+            return sync::LowerLogicalSync(function, target, std::nullopt, parameters, blocks, {}, policy,
+                                          launch_count);
+          };
+          const auto result = [&] {
+            try {
+              return lower(sync::SyncExternalPolicy::Geometry);
+            } catch (const pypto::ValueError&) {
+              if (!disjoint_gm || context->GetAutoSyncPolicy() != "conservative_prefix" ||
+                  sync::HasClosedSyncChild(function)) {
+                throw;
+              }
+              return lower(sync::SyncExternalPolicy::DisjointReadOnlyProjection);
+            }
+          }();
           if (require_whole_module && !payloads && !HasPhysicalCommands(result)) {
             function = sync::SyncOutcome(result.function, true, "");
           } else if (!require_whole_module && (!result.set_sites || !result.wait_sites)) {
@@ -498,12 +514,14 @@ Pass RealizeSync(bool require_whole_module) {
     // resource refusal returns the original body, never partially emitted IR.
     // Internal errors are deliberately not caught. The strict retained-result
     // APIs still throw on these user-facing input/proof refusals.
-    auto realize_logical = [&](const FunctionPtr& logical) -> FunctionPtr {
+    auto realize_logical = [&](const FunctionPtr& logical,
+                               sync::SyncExternalPolicy policy =
+                                   sync::SyncExternalPolicy::Geometry) -> FunctionPtr {
       sync::CheckGeneratedLogicalSync(logical);
       const auto optimized = sync::OptimizeLogicalSync(logical);
       sync::CheckGeneratedLogicalSync(optimized);
       const auto physical = sync::LowerLogicalSync(optimized, target, std::nullopt, bounds, block_bounds, {},
-                                                   sync::SyncExternalPolicy::Geometry, block_count);
+                                                   policy, block_count);
       // PTOAS recognizes literal flags, not empty plans or barriers, as manual
       // ownership. Do not fabricate a dummy flag or mix partial ownership.
       if (!require_whole_module && (!physical.set_sites || !physical.wait_sites))
@@ -516,12 +534,18 @@ Pass RealizeSync(bool require_whole_module) {
     };
     try {
       if (disjoint_gm) {
+        const auto owner = BindLaunchCount(function, block_count);
         try {
-          const auto exact_logical = InsertLogicalSync(BindLaunchCount(function, block_count), target, bounds,
-                                                       block_bounds, block_count);
-          return realize_logical(exact_logical);
+          return realize_logical(InsertLogicalSync(owner, target, bounds, block_bounds, block_count));
         } catch (const pypto::ValueError&) {
           if (!prefix) throw;
+        }
+        constexpr auto projection = sync::SyncExternalPolicy::DisjointReadOnlyProjection;
+        try {
+          return realize_logical(
+              InsertLogicalSync(owner, target, bounds, block_bounds, block_count, projection), projection);
+        } catch (const pypto::ValueError&) {
+          // Fall through to the conservative regional policy.
         }
       }
       try {
