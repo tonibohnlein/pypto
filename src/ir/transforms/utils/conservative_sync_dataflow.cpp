@@ -131,10 +131,16 @@ bool IsFullOverwriteOperand(const CallPtr& call, BufferAccess mode, MemorySpace 
   if (name == "buffer.copy" || name == "buffer.extract" || name == "buffer.matmul") {
     return mode == BufferAccess::Write;
   }
+  if (name == "buffer.ci_workspace") {
+    return mode == BufferAccess::Write && !call->args_.empty() && operand == call->args_.back();
+  }
   if (name == "buffer.matmul_acc") {
     return mode == BufferAccess::ReadWrite;
   }
-  if (backend::FindBufferElementwiseRecipe(name) || backend::FindBufferConversionRecipe(name)) {
+  if (backend::FindBufferElementwiseRecipe(name)) {
+    return mode == BufferAccess::Write && !call->args_.empty() && operand == call->args_.back();
+  }
+  if (backend::FindBufferConversionRecipe(name)) {
     return mode == BufferAccess::Write;
   }
   return false;

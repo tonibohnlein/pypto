@@ -316,7 +316,10 @@ def test_gm_transfers_reject_reduction_columns(name):
             ir.TensorType([16, 32], DataType.FP32, None, ir.TensorView([64, 1], ir.TensorLayout.ND)),
             "packed row-major",
         ),
-        (ir.TensorType([_int(32), _scalar("columns")], DataType.FP32), "positive static columns"),
+        (
+            ir.TensorType([_int(32), _scalar("columns", DataType.INT32)], DataType.FP32),
+            "positive static or INDEX tensor extents",
+        ),
     ],
 )
 def test_unsupported_gm_parameter_recipes_fail_before_emission(tensor_type, message):
@@ -1030,8 +1033,11 @@ def test_unsupported_dynamic_gm_geometry_remains_unavailable(kind):
         [source],
         ir.FunctionIRStage.Buffer,
     )
-    with pytest.raises(ValueError, match="positive static columns"):
-        _emit(program)
+    if kind == "narrow_rows":
+        with pytest.raises(ValueError, match="positive static or INDEX tensor extents"):
+            _emit(program)
+    else:
+        assert "pto.tload" in _emit(program)
 
 
 def test_single_row_non_packed_tensor_view_emits_pto():

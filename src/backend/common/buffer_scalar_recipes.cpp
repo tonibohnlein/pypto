@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "pypto/backend/common/buffer_type_support.h"
+#include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memref.h"
 #include "pypto/ir/op_registry.h"
@@ -142,5 +143,73 @@ bool LogicalScalarWriteSharesStorage(const ir::CallPtr& call, const ir::TypePtr&
   // Full MemRef equality retains base identity, byte range, slots and their
   // original selection coordinates. Base equality alone is insufficient.
   return a && b && (a == b || ir::structural_equal(a, b));
+}
+
+bool SupportsBufferVector1DTransfer(const std::vector<ir::ExprPtr>& args, bool load) {
+  if (args.size() != 4 || SupportsBufferScalarTransfer(args, load)) return false;
+  for (const auto& arg : args)
+    if (!arg) return false;
+  const auto tensor = ir::As<ir::TensorType>(args[load ? 0 : 3]->GetType());
+  const auto buffer = ir::As<ir::BufferType>(args[load ? 3 : 0]->GetType());
+  const auto offsets = ir::As<ir::MakeTuple>(args[1]);
+  const auto valid = ir::As<ir::MakeTuple>(args[2]);
+  if (!tensor || tensor->shape_.size() != 1 || !IsBufferTensorShape(tensor->shape_) ||
+      !IsDenseBufferTransferDtype(tensor->dtype_) || !buffer || !IsAlignedDenseVecBufferGeometry(buffer) ||
+      buffer->shape_.size() != 2 || buffer->shape_[0] != 1 || buffer->shape_[1] <= 1 ||
+      buffer->dtype_ != tensor->dtype_ || !offsets || offsets->elements_.size() != 1 || !valid ||
+      valid->elements_.size() != 1) {
+    return false;
+  }
+  if (tensor->tensor_view_) {
+    const auto& view = *tensor->tensor_view_;
+    if (view.layout != ir::TensorLayout::ND || view.pad != ir::PadValue::null) return false;
+    if (!view.stride.empty()) {
+      const auto stride0 = view.stride.size() == 1 ? ir::As<ir::ConstInt>(view.stride[0]) : nullptr;
+      if (!stride0 || stride0->value_ != 1) return false;
+    }
+  }
+  const auto off_type = ir::As<ir::ScalarType>(offsets->elements_[0]->GetType());
+  const auto val_type = ir::As<ir::ScalarType>(valid->elements_[0]->GetType());
+  if (!off_type || !(off_type->dtype_ == DataType::INDEX || off_type->dtype_.IsSignedInt()) || !val_type ||
+      !(val_type->dtype_ == DataType::INDEX || val_type->dtype_.IsSignedInt())) {
+    return false;
+  }
+  const auto extent = ir::As<ir::ConstInt>(valid->elements_[0]);
+  if (extent && (extent->value_ <= 0 || extent->value_ > buffer->shape_[1])) return false;
+  if (buffer->valid_shape_[1] != -1 && (!extent || extent->value_ != buffer->valid_shape_[1])) return false;
+  return buffer->valid_shape_[0] == 1;
+}
+
+bool SupportsLogicalVector1DBufferTransfer(const ir::CallPtr& call) {
+  if (!call || SupportsLogicalBufferScalarTransfer(call)) return false;
+  const bool load = ir::IsOp(call, "tile.load");
+  if (!load && !ir::IsOp(call, "tile.store")) return false;
+  if (load ? call->args_.size() != 4 : (call->args_.size() != 3 && call->args_.size() != 4)) return false;
+  for (const auto& arg : call->args_)
+    if (!arg) return false;
+  const auto tile = ir::As<ir::TileType>(load ? call->GetType() : call->args_[0]->GetType());
+  const auto tensor = ir::As<ir::TensorType>(call->args_[load ? 0 : 2]->GetType());
+  if (!tile || tile->shape_.size() != 1 || !tensor || tensor->shape_.size() != 1) return false;
+  const auto physical = PhysicalLogicalVecDescriptor(tile);
+  if (!physical) return false;
+  const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
+  const auto& logical_valid = view.valid_shape.empty() ? tile->shape_ : view.valid_shape;
+  if (logical_valid.size() != 1) return false;
+  const auto valid_const = ir::As<ir::ConstInt>(logical_valid[0]);
+  const std::vector<int64_t> buf_valid{1, valid_const && valid_const->value_ > 0 ? valid_const->value_ : -1};
+  const auto buf_type =
+      std::make_shared<ir::BufferType>(physical->shape_, tile->dtype_, ir::MemorySpace::Vec, buf_valid);
+  const auto buf_var = std::make_shared<ir::Var>("vec1d", buf_type, call->span_);
+  const ir::ExprPtr valid_tuple =
+      load ? call->args_[3]
+           : std::make_shared<ir::MakeTuple>(std::vector<ir::ExprPtr>{logical_valid[0]}, call->span_);
+  if (load) {
+    const auto shape_tuple = ir::As<ir::MakeTuple>(call->args_[2]);
+    const auto cap =
+        shape_tuple && shape_tuple->elements_.size() == 1 ? ir::As<ir::ConstInt>(shape_tuple->elements_[0]) : nullptr;
+    if (!cap || cap->value_ != physical->shape_[1]) return false;
+    return SupportsBufferVector1DTransfer({call->args_[0], call->args_[1], valid_tuple, buf_var}, true);
+  }
+  return SupportsBufferVector1DTransfer({buf_var, call->args_[1], valid_tuple, call->args_[2]}, false);
 }
 }  // namespace pypto::backend

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "pypto/backend/common/buffer_type_support.h"
+#include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/backend/common/pto_native_ops.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
@@ -110,6 +111,14 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        "buffer.rsqrt",
        "pto.trsqrt",
        {{0}},
+       BufferPrecisionKind::Rsqrt,
+       BufferElementwiseTypePolicy::DenseFP32,
+       BufferDestinationAliasPolicy::Disjoint,
+       true},
+      {"tile.rsqrt",
+       "buffer.rsqrt_workspace",
+       "pto.trsqrt",
+       {{0}, {1, Kind::Workspace}},
        BufferPrecisionKind::Rsqrt,
        BufferElementwiseTypePolicy::DenseFP32,
        BufferDestinationAliasPolicy::Disjoint,
@@ -234,10 +243,19 @@ const BufferElementwiseRecipe* FindBufferElementwiseRecipe(const std::string& na
   return found == index.end() ? nullptr : found->second;
 }
 
+const BufferElementwiseRecipe* FindLogicalBufferElementwiseRecipe(const ir::CallPtr& call) {
+  if (!call || !call->op_ || ir::As<ir::GlobalVar>(call->op_)) return nullptr;
+  if (call->op_->name_ == "tile.rsqrt" && call->args_.size() == 2) {
+    return FindBufferElementwiseRecipe("buffer.rsqrt_workspace");
+  }
+  return FindLogicalBufferElementwiseRecipe(call->op_->name_);
+}
+
 std::vector<std::string> GetBufferElementwiseRecipeNames() {
   std::vector<std::string> names;
   for (const auto& recipe : GetBufferElementwiseRecipes()) names.emplace_back(recipe.logical_op);
   std::sort(names.begin(), names.end());
+  names.erase(std::unique(names.begin(), names.end()), names.end());
   return names;
 }
 
@@ -277,6 +295,16 @@ bool SupportsLogicalBufferElementwise(const BufferElementwiseRecipe& recipe, con
           source != DataType::BF16 && source != DataType::FP32) {
         return false;
       }
+    } else if (input.kind == BufferElementwiseOperandKind::Workspace) {
+      const auto tile = ir::As<ir::TileType>(type);
+      if (!tile || tile->dtype_ != dtype || tile->GetMemorySpace() != ir::MemorySpace::Vec) return false;
+      if (tile->shape_.size() != destination->shape_.size()) return false;
+      for (size_t i = 0; i < tile->shape_.size(); ++i) {
+        if (!ir::structural_equal(tile->shape_[i], destination->shape_[i])) return false;
+      }
+      const auto workspace = StaticLogicalBufferDescriptor(type);
+      const auto bytes = PhysicalBufferBytes(workspace);
+      if (!workspace || !bytes || *bytes < 32) return false;
     } else {
       const auto tile = ir::As<ir::TileType>(type);
       if (!tile || tile->dtype_ != dtype || tile->GetMemorySpace() != ir::MemorySpace::Vec) return false;
@@ -298,13 +326,19 @@ bool SupportsLogicalBufferElementwise(const BufferElementwiseRecipe& recipe, con
 bool SupportsBufferElementwiseAttributes(const BufferElementwiseRecipe& recipe,
                                          const std::vector<std::pair<std::string, std::any>>& kwargs) {
   if (recipe.precision != BufferPrecisionKind::Rsqrt) return true;
-  // The default two-operand native form is vrsqrt. The high-precision form
-  // requires a distinct scratch operand and is not this recipe.
+  bool has_workspace = false;
+  for (const auto& input : recipe.inputs) {
+    has_workspace |= input.kind == BufferElementwiseOperandKind::Workspace;
+  }
+  bool high_precision = false;
   for (const auto& [name, value] : kwargs) {
     const auto flag = std::any_cast<bool>(&value);
-    if (name != "high_precision" || !flag || *flag) return false;
+    if (name != "high_precision" || !flag) return false;
+    high_precision = *flag;
   }
-  return true;
+  // The default two-operand form uses vrsqrt (`high_precision=False`).
+  // The three-operand workspace form selects high-precision TRSQRT_IMPL.
+  return high_precision == has_workspace;
 }
 
 void ValidateBufferElementwiseOperands(const BufferElementwiseRecipe& recipe,
@@ -327,6 +361,20 @@ void ValidateBufferElementwiseOperands(const BufferElementwiseRecipe& recipe,
     CHECK(buffer) << recipe.buffer_op << " argument " << i << " must have BufferType";
     CHECK(buffer->memory_space_ == ir::MemorySpace::Vec)
         << recipe.buffer_op << " argument " << i << " must be in Vec memory";
+    if (i < recipe.inputs.size() && recipe.inputs[i].kind == BufferElementwiseOperandKind::Workspace) {
+      const auto bytes = PhysicalBufferBytes(buffer);
+      CHECK(IsAlignedDenseVecBuffer(buffer) && buffer->dtype_ == descriptor->dtype_ &&
+            buffer->shape_ == descriptor->shape_ && buffer->valid_shape_ == buffer->shape_ && bytes &&
+            *bytes >= 32)
+          << recipe.buffer_op << " workspace requires aligned full-valid Vec buffer matching destination shape and >= 32 bytes";
+      CHECK(args[i] != args.back()) << recipe.buffer_op << " workspace must be distinct from destination";
+      for (size_t j = 0; j < i; ++j) {
+        if (recipe.inputs[j].kind != BufferElementwiseOperandKind::ElementScalar) {
+          CHECK(args[i] != args[j]) << recipe.buffer_op << " workspace must be distinct from source operands";
+        }
+      }
+      continue;
+    }
     if (IsColumnVectorBufferGeometry(buffer)) {
       bool runtime = false;
       for (const auto extent : buffer->valid_shape_) runtime |= extent < 0;

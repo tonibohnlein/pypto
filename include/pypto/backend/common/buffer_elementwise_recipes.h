@@ -27,7 +27,7 @@ namespace backend {
 enum class BufferPrecisionKind { None, Div, Log, Recip, Rsqrt };
 enum class BufferElementwiseTypePolicy { MatchingVec, DenseFP32, DenseFillVec };
 enum class BufferDestinationAliasPolicy { ExactOrDisjoint, Disjoint };
-enum class BufferElementwiseOperandKind { Buffer, ElementScalar };
+enum class BufferElementwiseOperandKind { Buffer, ElementScalar, Workspace };
 
 /// Select a logical operand and state its already-resolved Buffer-stage type.
 struct BufferElementwiseInput {
@@ -51,6 +51,7 @@ struct BufferElementwiseRecipe {
 
 const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes();
 const BufferElementwiseRecipe* FindLogicalBufferElementwiseRecipe(const std::string& name);
+const BufferElementwiseRecipe* FindLogicalBufferElementwiseRecipe(const ir::CallPtr& call);
 const BufferElementwiseRecipe* FindBufferElementwiseRecipe(const std::string& name);
 
 /// Sorted snapshot of actual logical names; physical forms remain recipe-limited.

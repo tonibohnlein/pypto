@@ -99,12 +99,17 @@ REGISTER_OP("buffer.copy")
         .set_output_arity(0)
         .set_buffer_result_behavior(BufferResultBehavior::None);
     for (size_t i = 0; i < recipe.inputs.size(); ++i) {
-      const bool buffer = recipe.inputs[i].kind == backend::BufferElementwiseOperandKind::Buffer;
-      entry.add_argument("src" + std::to_string(i), buffer ? "Source buffer" : "Resolved element scalar");
-      if (buffer) {
-        entry.set_buffer_arg_effect(i, BufferAccess::Read, BufferAccess::Read);
+      const auto kind = recipe.inputs[i].kind;
+      if (kind == backend::BufferElementwiseOperandKind::Buffer) {
+        entry.add_argument("src" + std::to_string(i), "Source buffer")
+            .set_buffer_arg_effect(i, BufferAccess::Read, BufferAccess::Read);
+      } else if (kind == backend::BufferElementwiseOperandKind::Workspace) {
+        entry.add_argument("src" + std::to_string(i), "Scratch workspace buffer")
+            .set_buffer_arg_effect(i, BufferAccess::Write, BufferAccess::Read)
+            .set_workspace_arg(i);
       } else {
-        entry.set_buffer_non_memory_arg(i);
+        entry.add_argument("src" + std::to_string(i), "Resolved element scalar")
+            .set_buffer_non_memory_arg(i);
       }
     }
     entry.add_argument("dst", "Destination buffer")

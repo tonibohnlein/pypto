@@ -40,6 +40,9 @@ bool SupportsLogicalBufferIndexed(const BufferIndexedRecipe& recipe, const ir::C
 void ValidateBufferIndexedOperands(const BufferIndexedRecipe& recipe, const std::vector<ir::ExprPtr>& args,
                                    const std::vector<std::pair<std::string, std::any>>& kwargs);
 std::vector<std::pair<size_t, size_t>> BufferIndexedDisjointPairs(const BufferIndexedRecipe& recipe);
+bool SupportsLogicalBufferCi(const ir::CallPtr& call);
+void ValidateBufferCiOperands(bool has_workspace, const std::vector<ir::ExprPtr>& args,
+                              const std::vector<std::pair<std::string, std::any>>& kwargs);
 
 }  // namespace pypto::backend
 

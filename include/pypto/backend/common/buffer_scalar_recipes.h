@@ -32,6 +32,8 @@ bool IsBufferScalarGMSource(const ir::TensorTypePtr& tensor);
 // exactly four GM bytes. Both retain a complete aligned 32-byte local carrier.
 bool SupportsBufferScalarTransfer(const std::vector<ir::ExprPtr>& args, bool load);
 bool SupportsLogicalBufferScalarTransfer(const ir::CallPtr& call);
+bool SupportsBufferVector1DTransfer(const std::vector<ir::ExprPtr>& args, bool load);
+bool SupportsLogicalVector1DBufferTransfer(const ir::CallPtr& call);
 // Native aligned DMA may write a dummy tail inside the complete private
 // carrier. Its sound write enclosure is 32 bytes; only one GM element is read.
 constexpr uint64_t kBufferScalarCarrierBytes = 32;

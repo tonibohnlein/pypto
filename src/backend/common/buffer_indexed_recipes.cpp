@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "pypto/backend/common/buffer_type_support.h"
+#include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/backend/common/gather_compare_scratch.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
@@ -212,6 +213,53 @@ std::vector<std::pair<size_t, size_t>> BufferIndexedDisjointPairs(const BufferIn
   if (recipe.compare) return {{0, 3}, {0, 4}, {0, 5}, {3, 4}, {3, 5}, {4, 5}};
   if (recipe.scatter) return {{0, 2}, {1, 2}};
   return {{0, 3}, {1, 3}, {2, 3}, {0, 2}, {1, 2}};
+}
+
+bool SupportsLogicalBufferCi(const ir::CallPtr& call) {
+  if (!call || (call->args_.size() != 2 && call->args_.size() != 3)) return false;
+  const auto dst = StaticLogicalBufferDescriptor(call->GetType());
+  if (!dst || dst->dtype_ != DataType::INT32 || dst->shape_[0] != 1 || dst->shape_[1] <= 1 ||
+      dst->valid_shape_ != dst->shape_) {
+    return false;
+  }
+  const auto start = ir::As<ir::ScalarType>(call->args_[0]->GetType());
+  if (!start || start->dtype_ != dst->dtype_) return false;
+  if (call->args_.size() == 3) {
+    const auto tmp = StaticLogicalBufferDescriptor(call->args_[2]->GetType());
+    const auto bytes = PhysicalBufferBytes(tmp);
+    if (!tmp || (tmp->dtype_ != DataType::FP32 && tmp->dtype_ != DataType::INT32) ||
+        tmp->valid_shape_ != tmp->shape_ || !bytes || *bytes < 768) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void ValidateBufferCiOperands(bool has_workspace, const std::vector<ir::ExprPtr>& args,
+                              const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  const char* op_name = has_workspace ? "buffer.ci_workspace" : "buffer.ci";
+  CHECK(args.size() == (has_workspace ? 3U : 2U))
+      << op_name << " requires " << (has_workspace ? 3 : 2) << " explicit operands";
+  for (const auto& [key, value] : kwargs) {
+    CHECK(key == "descending" && value.type() == typeid(bool))
+        << op_name << " accepts only boolean 'descending' attribute";
+  }
+  for (const auto& arg : args) CHECK(arg) << op_name << " operands must not be null";
+  const auto dst = ir::As<ir::BufferType>(args.back()->GetType());
+  CHECK(dst && IsAlignedDenseVecBuffer(dst) && dst->dtype_ == DataType::INT32 && dst->shape_[0] == 1 &&
+        dst->shape_[1] > 1 && dst->valid_shape_ == dst->shape_)
+      << op_name << " requires a single-row full-valid aligned INT32 Vec destination";
+  const auto start = ir::As<ir::ScalarType>(args[0]->GetType());
+  CHECK(start && start->dtype_ == dst->dtype_) << op_name << " requires INT32 start scalar";
+  if (has_workspace) {
+    const auto tmp = ir::As<ir::BufferType>(args[1]->GetType());
+    const auto bytes = PhysicalBufferBytes(tmp);
+    CHECK(tmp && IsAlignedDenseVecBuffer(tmp) &&
+          (tmp->dtype_ == DataType::FP32 || tmp->dtype_ == DataType::INT32) &&
+          tmp->valid_shape_ == tmp->shape_ && bytes && *bytes >= 768)
+        << op_name << " requires >= 768-byte full-valid FP32/INT32 Vec workspace";
+    CHECK(args[1] != args[2]) << op_name << " requires distinct workspace and destination";
+  }
 }
 
 }  // namespace pypto::backend

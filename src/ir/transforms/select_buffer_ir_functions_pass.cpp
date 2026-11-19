@@ -109,6 +109,9 @@ class BufferKernelSupport : public IRVisitor {
   }
 
   static bool StaticShape(const std::vector<ExprPtr>& shape) {
+    if (shape.size() == 1) {
+      return As<ConstInt>(shape[0]) && As<ConstInt>(shape[0])->value_ > 1;
+    }
     return shape.size() == 2 && As<ConstInt>(shape[0]) && As<ConstInt>(shape[1]) &&
            As<ConstInt>(shape[0])->value_ > 0 && As<ConstInt>(shape[1])->value_ > 1;
   }
@@ -130,8 +133,13 @@ class BufferKernelSupport : public IRVisitor {
         admission.Require(false, BufferAdmissionProperty::TileShape);
         return;
       }
-      const auto cols = As<ConstInt>(tile->shape_[1])->value_;
+      const auto cols = As<ConstInt>(tile->shape_.back())->value_;
       const auto space = tile->GetMemorySpace();
+      const bool one_d = tile->shape_.size() == 1;
+      if (one_d && space && backend::IsMatrixBufferSpace(*space)) {
+        admission.Require(false, BufferAdmissionProperty::TypeLayout);
+        return;
+      }
       if (space && backend::IsMatrixBufferSpace(*space)) {
         const auto box = tile_view_semantics::GetBoxedTileAlignment(view, tile->dtype_);
         admission.Require(
@@ -154,8 +162,10 @@ class BufferKernelSupport : public IRVisitor {
             backend::IsDenseVecBufferTile(tile, view) && cols % (256 / tile->dtype_.GetBit()) == 0,
             BufferAdmissionProperty::TypeLayout);
         admission.Require(
-            view.stride.empty() || (view.stride.size() == 2 && ConstantEquals(view.stride[0], cols) &&
-                                    ConstantEquals(view.stride[1], 1)),
+            view.stride.empty() ||
+                (one_d ? (view.stride.size() == 1 && ConstantEquals(view.stride[0], 1))
+                       : (view.stride.size() == 2 && ConstantEquals(view.stride[0], cols) &&
+                          ConstantEquals(view.stride[1], 1))),
             BufferAdmissionProperty::TypeLayout);
       }
       admission.Require(!view.start_offset || ConstantEquals(view.start_offset, 0),
@@ -188,21 +198,30 @@ class BufferKernelSupport : public IRVisitor {
           backend::IsBufferTensorShape(tensor->shape_) &&
               (backend::IsDenseBufferTransferDtype(tensor->dtype_) || tensor->dtype_ == DataType::INT8),
           BufferAdmissionProperty::TypeLayout);
+      for (const auto& dim : tensor->shape_) {
+        if (!As<ConstInt>(dim)) VisitExpr(dim);
+      }
       if (admission.supported() && tensor->tensor_view_) {
         const auto& view = *tensor->tensor_view_;
         admission.Require(view.layout == TensorLayout::ND && view.pad == PadValue::null,
                           BufferAdmissionProperty::TypeLayout);
         admission.Require(view.valid_shape.empty() || SameShape(view.valid_shape, tensor->shape_),
                           BufferAdmissionProperty::TypeLayout);
-        const auto rows = As<ConstInt>(tensor->shape_[0]);
-        const auto cols = As<ConstInt>(tensor->shape_[1]);
-        const auto row_stride = view.stride.size() == 2 ? As<ConstInt>(view.stride[0]) : nullptr;
-        const bool single_row = rows && rows->value_ == 1;
-        admission.Require(
-            view.stride.empty() ||
-                (view.stride.size() == 2 && cols && row_stride && ConstantEquals(view.stride[1], 1) &&
-                 (row_stride->value_ == cols->value_ || (single_row && row_stride->value_ >= cols->value_))),
-            BufferAdmissionProperty::TypeLayout);
+        if (tensor->shape_.size() == 1) {
+          admission.Require(view.stride.empty() || (view.stride.size() == 1 && ConstantEquals(view.stride[0], 1)),
+                            BufferAdmissionProperty::TypeLayout);
+        } else {
+          const auto rows = As<ConstInt>(tensor->shape_[0]);
+          const auto cols = As<ConstInt>(tensor->shape_[1]);
+          const auto row_stride = view.stride.size() == 2 ? As<ConstInt>(view.stride[0]) : nullptr;
+          const bool single_row = rows && rows->value_ == 1;
+          admission.Require(
+              view.stride.empty() ||
+                  (view.stride.size() == 2 && ConstantEquals(view.stride[1], 1) &&
+                   (structural_equal(view.stride[0], tensor->shape_[1]) ||
+                    (single_row && cols && row_stride && row_stride->value_ >= cols->value_))),
+              BufferAdmissionProperty::TypeLayout);
+        }
       }
     } else if (!As<ScalarType>(type) && !As<PtrType>(type) && !As<VoidType>(type) && !As<TupleType>(type)) {
       admission.Require(false, BufferAdmissionProperty::TypeLayout);
@@ -519,7 +538,8 @@ class BufferKernelSupport : public IRVisitor {
       CheckTransferParameter(call, 0, true);
       CheckTransferTypes(call, true);
       if (const auto source = As<TensorType>(call->args_[0]->GetType()); source && source->shape_.size() == 1)
-        admission.Require(backend::SupportsLogicalBufferScalarTransfer(call),
+        admission.Require(backend::SupportsLogicalBufferScalarTransfer(call) ||
+                              backend::SupportsLogicalVector1DBufferTransfer(call),
                           BufferAdmissionProperty::TransferTypes);
       const int cache = GetIntKwarg(call->kwargs_, "cache", static_cast<int>(CachePolicy::kDefault));
       admission.Require(cache == static_cast<int>(CachePolicy::kDefault) ||
@@ -534,7 +554,8 @@ class BufferKernelSupport : public IRVisitor {
       CheckTransferTypes(call, false);
       if (const auto destination = As<TensorType>(call->args_[2]->GetType());
           destination && destination->shape_.size() == 1)
-        admission.Require(backend::SupportsLogicalBufferScalarTransfer(call),
+        admission.Require(backend::SupportsLogicalBufferScalarTransfer(call) ||
+                              backend::SupportsLogicalVector1DBufferTransfer(call),
                           BufferAdmissionProperty::TransferTypes);
       const auto store_source = As<TileType>(call->args_[0]->GetType());
       const auto store_destination = As<TensorType>(call->args_[2]->GetType());
@@ -620,6 +641,11 @@ class BufferKernelSupport : public IRVisitor {
       // A qualified SetValue initializes the point consumed by a staged
       // scalar store; that leaf need not contain an unrelated load or fill.
       has_scalar_write |= admission.supported() && IsOp(call, "tile.write");
+    } else if (IsOp(call, "tile.ci")) {
+      admission.Require(backend::SupportsLogicalBufferCi(call) &&
+                            (call->args_.size() < 3 || !views_.IsWindow(call->args_[2])),
+                        BufferAdmissionProperty::OperationRecipe);
+      has_fill = true;
     } else if (const auto* indexed = backend::FindLogicalBufferIndexedRecipe(call->op_->name_)) {
       admission.Require(backend::SupportsLogicalBufferIndexed(*indexed, call) &&
                             (!indexed->scatter || indexed_.HasExclusiveZeroBase(call)),
@@ -647,7 +673,7 @@ class BufferKernelSupport : public IRVisitor {
         admission.Require(!views_.IsWindow(arg) || views_.IsContiguousColumnRelabel(arg),
                           BufferAdmissionProperty::OperationRecipe);
     } else if (!IsOp(call, "tile.alloc")) {
-      const auto* recipe = backend::FindLogicalBufferElementwiseRecipe(call->op_->name_);
+      const auto* recipe = backend::FindLogicalBufferElementwiseRecipe(call);
       admission.Require(
           recipe && recipe->default_enabled && backend::SupportsLogicalBufferElementwise(*recipe, call),
           BufferAdmissionProperty::OperationRecipe);
@@ -840,8 +866,11 @@ class BufferKernelSupport : public IRVisitor {
 
   static std::optional<uint64_t> TileBytes(const TileTypePtr& tile) {
     if (!tile || !StaticShape(tile->shape_)) return std::nullopt;
-    const std::vector<int64_t> shape{As<ConstInt>(tile->shape_[0])->value_,
-                                     As<ConstInt>(tile->shape_[1])->value_};
+    const std::vector<int64_t> shape =
+        tile->shape_.size() == 1
+            ? std::vector<int64_t>{1, As<ConstInt>(tile->shape_[0])->value_}
+            : std::vector<int64_t>{As<ConstInt>(tile->shape_[0])->value_,
+                                   As<ConstInt>(tile->shape_[1])->value_};
     return backend::PhysicalBufferBytes(std::make_shared<BufferType>(shape, tile->dtype_, MemorySpace::Vec));
   }
 
