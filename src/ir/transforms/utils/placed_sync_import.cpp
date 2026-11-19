@@ -46,6 +46,7 @@
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/verifier/verifier.h"
 #include "src/ir/transforms/utils/sync_footprint_resolver.h"
+#include "src/ir/transforms/utils/sync_matrix_byte_geometry.h"
 #include "src/ir/transforms/utils/sync_scalar_readiness.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
 
@@ -929,6 +930,7 @@ class Importer {
   };
   std::unordered_map<const Expr*, SlotSelection> slots;
   std::unordered_set<const Expr*> transposed_mat;
+  std::unordered_map<size_t, size_t> placed_matrix_roots;
   std::unique_ptr<SyncControlRangeProver> prover;
   std::unique_ptr<SyncFootprintResolver> resolver;
   ParameterIndices parameters;
@@ -1557,7 +1559,9 @@ class Importer {
     auto valid = As<MakeTuple>(c->args_[0]);
     CHECK(valid && valid->elements_.empty()) << "Dynamic valid extents are not qualified";
     const auto address = Constant(c->args_[1]);
-    const auto slot_bytes = Checked(__int128(t->shape_[0]) * t->shape_[1] * t->dtype_.GetByte());
+    const auto physical_bytes = backend::PhysicalBufferBytes(t);
+    CHECK(physical_bytes) << "Synchronization import requires representable physical buffer bytes";
+    const auto slot_bytes = Checked(*physical_bytes);
     if (multi && slot_count > 1) {
       // Native multi-tile lowering rounds each slot to the target alignment.
       // Until padded slot geometry is represented, accept only equal strides.
@@ -1580,33 +1584,44 @@ class Importer {
       CHECK(t->shape_[0] % 16 == 0 && t->shape_[1] % columns == 0)
           << "Partial fractal-box footprints require separate qualification";
     }
-    for (size_t i = 0; i < result.storage.size(); ++i) {
-      const auto& old = result.storage[i];
-      if (old.space != t->memory_space_ || address >= old.address + old.bytes ||
-          old.address >= address + bytes)
-        continue;
-      const bool same_geom = old.address == address && old.bytes == bytes && old.slot_count == slot_count &&
-                             old.layout && old.layout->dtype_ == t->dtype_ &&
-                             old.layout->fractal_ == t->fractal_;
-      const bool identical_layout = same_geom && old.rows == t->shape_[0] && old.columns == t->shape_[1] &&
-                                    old.layout->blayout_ == t->blayout_ &&
-                                    old.layout->slayout_ == t->slayout_;
-      const bool transposed_mat_layout =
-          same_geom && t->memory_space_ == MemorySpace::Mat && t->slayout_ != TileLayout::none_box &&
-          t->fractal_ == 16 * 16 * t->dtype_.GetByte() && old.rows == t->shape_[1] &&
-          old.columns == t->shape_[0] && old.layout->blayout_ == t->slayout_ &&
-          old.layout->slayout_ == t->blayout_ &&
-          ((old.layout->blayout_ == TileLayout::col_major && old.layout->slayout_ == TileLayout::row_major) ||
-           (old.layout->blayout_ == TileLayout::row_major && old.layout->slayout_ == TileLayout::col_major));
-      CHECK(identical_layout || transposed_mat_layout)
-          << "Overlapping placed buffers need a common physical-layout partition";
-      objects[a->var_.get()] = i;
-      if (transposed_mat_layout) transposed_mat.insert(a->var_.get());
-      return;
+    auto layout = t;
+    if (IsSyncMatrixSpace(t->memory_space_)) {
+      // The resolver already recognizes identical windows and Mat NZ/ZN
+      // transposes. Keep incompatible windows distinct until all accesses
+      // have been checked in their original view coordinates.
+      const auto* view = resolver->ViewOf(a->var_);
+      const auto* root = view ? resolver->Root(view->root_id) : nullptr;
+      CHECK(root && root->canonical_layout) << "Matrix allocation has no placed storage identity";
+      if (view->axis_swapped) {
+        transposed_mat.insert(a->var_.get());
+      }
+      const auto [entry, inserted] = placed_matrix_roots.emplace(root->id, result.storage.size());
+      if (!inserted) {
+        objects[a->var_.get()] = entry->second;
+        return;
+      }
+      // The resolver also indexes inactive original arms. Its canonical axes
+      // still govern when the first imported handle is a transposed alias.
+      layout = root->canonical_layout;
+    } else {
+      for (size_t i = 0; i < result.storage.size(); ++i) {
+        const auto& old = result.storage[i];
+        if (old.space != t->memory_space_ || address >= old.address + old.bytes ||
+            old.address >= address + bytes) {
+          continue;
+        }
+        CHECK(old.address == address && old.bytes == bytes && old.slot_count == slot_count && old.layout &&
+              old.rows == t->shape_[0] && old.columns == t->shape_[1] && old.layout->dtype_ == t->dtype_ &&
+              old.layout->fractal_ == t->fractal_ && old.layout->blayout_ == t->blayout_ &&
+              old.layout->slayout_ == t->slayout_)
+            << "Overlapping placed buffers need a common physical-layout partition";
+        objects[a->var_.get()] = i;
+        return;
+      }
     }
     objects[a->var_.get()] = result.storage.size();
-    result.storage.push_back(
-        {a->var_->name_hint_, t->memory_space_, address, t->shape_[0], t->shape_[1], bytes, t});
+    result.storage.push_back({a->var_->name_hint_, layout->memory_space_, address, layout->shape_[0],
+                              layout->shape_[1], bytes, layout});
     result.storage.back().slot_count = slot_count;
     result.storage.back().slot_bytes = slot_bytes;
   }
@@ -1982,7 +1997,8 @@ class Importer {
       if (implementation.AccumulatorSizeEligible()) {
         CHECK(result.storage[Storage(call->args_[2])].slot_count == 1)
             << "Rotating accumulator protection requires same-physical-slot qualification";
-        site.protected_accumulator = Storage(call->args_[2]);
+        const auto storage = Storage(call->args_[2]);
+        site.protected_accumulator = SyncAccumulatorBinding{storage, storage};
       }
     } else if (IsOp(call, "buffer.transpose")) {
       CHECK(result.owner->func_type_ == FunctionType::AIV)
@@ -3050,6 +3066,7 @@ static CompactSyncInput ImportQualifiedSync(
   if (shape.second) {
     std::vector<SyncLoopFrame> frames;
     importer.result.region_tree = ImportStructuredBody(importer, function->body_, frames, nested);
+    CanonicalizeMatrixSyncStorage(importer.result);
     if (recover_accesses) {
       std::set<const ForStmt*> phase_scopes;
       for (const auto& segment : importer.result.segments)
@@ -3109,6 +3126,7 @@ static CompactSyncInput ImportQualifiedSync(
             << "Rotating family requires one common stride within a region";
       }
   }
+  CanonicalizeMatrixSyncStorage(importer.result);
   if (recover_accesses) QualifyPhysicalIntervals(importer.result);
   return std::move(importer.result);
 }

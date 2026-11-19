@@ -293,7 +293,7 @@ std::shared_ptr<const NumericalNode> MergeNumericalNodes(std::shared_ptr<const N
         bool protected_pair = false;
         if (result.State().input.region_tree && a->last_m_qualified &&
             a->last_m_qualified == b->first_m_continuation &&
-            *a->last_m_qualified == result.State().storage_classes.at(cell).storage &&
+            a->last_m_qualified->storage == result.State().storage_classes.at(cell).storage &&
             left.last_writer == a->last[matrix] && right.first_writer == b->first[matrix]) {
           protected_pair = std::none_of(left.last_readers.begin(), left.last_readers.end(),
                                         [](const auto& value) { return value.has_value(); }) &&

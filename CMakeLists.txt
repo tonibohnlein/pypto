@@ -128,6 +128,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/closed_prefix_sync.cpp
     src/ir/transforms/utils/sync_footprint_resolver.cpp
     src/ir/transforms/utils/sync_loop_trip_proof.cpp
+    src/ir/transforms/utils/sync_matrix_byte_geometry.cpp
     src/ir/transforms/utils/conservative_sync_realization.cpp
     src/ir/transforms/utils/retained_sync_child.cpp
     src/ir/transforms/utils/logical_sync_realization.cpp

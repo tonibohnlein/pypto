@@ -160,13 +160,24 @@ struct SyncAccess {
   // its geometry and may not be used as an affine selector or an empty answer.
   std::shared_ptr<const SyncExternalFootprint> external;
 };
+// Hardware accumulator protection needs both the physical conflict domain
+// and the original layout-compatible window. Partial byte overlap does not
+// establish an accumulator continuation.
+struct SyncAccumulatorBinding {
+  size_t storage, layout_identity;
+  bool operator==(const SyncAccumulatorBinding& other) const {
+    return storage == other.storage && layout_identity == other.layout_identity;
+  }
+  bool operator!=(const SyncAccumulatorBinding& other) const { return !(*this == other); }
+};
+
 struct SyncSite {
   CallPtr original;
   CallPtr continuation;  // Original else-arm; never replaced by the first arm.
   PipeType pipe;
   std::vector<SyncAccess> accesses;
   // Qualified manual a2a3 Mmad accumulator footprint; no event-order promise.
-  std::optional<size_t> protected_accumulator;
+  std::optional<SyncAccumulatorBinding> protected_accumulator;
   bool initializes_accumulator = false;
   // Non-null: first-visit initialization spans this enclosing source loop
   // through the leaf's innermost frame. Original guards/arms remain owned.

@@ -696,6 +696,18 @@ storage key, aligned activation predicates, and a proof that each lane's
 previous WAIT causally precedes its next SET. A direction at the child boundary
 does not identify those events.
 
+For overlapping placed matrix allocations on A2/A3, exact import checks each
+access in its original layout before mapping it into a shared byte domain.
+A fully tiled descriptor maps a rectangular access to contiguous runs along
+its inner box axis. A moving access retains its original affine frame and
+advances the run coordinates by the corresponding physical byte stride.
+This handles partial overlap and different pitches across same-space Mat,
+Left, Right and Acc allocations. Unsupported layouts, slots, alignment and
+effects retain the conservative route. A static effect can describe up to
+128 discontiguous runs. Accumulator hazard protection still requires the
+same qualified window and layout throughout the continuation. Overlapping Acc
+components require whole-window accesses and pairwise-intersecting windows.
+
 `sync_matmul_oracle.validate` independently interprets original Buffer addresses,
 constructs concrete conflicts, computes closure and covers, and compares the
 actual retained demand records after bounded expansion. It also checks all four

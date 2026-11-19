@@ -53,7 +53,7 @@ struct NumericalNode {
   std::array<std::vector<size_t>, kPipeCount> native_sites;
   // Existing Mmad footprint protection at native M-chain boundary events.
   // The target must be a continuation; an initialization cannot inherit it.
-  std::optional<size_t> first_m_continuation, last_m_qualified;
+  std::optional<SyncAccumulatorBinding> first_m_continuation, last_m_qualified;
   std::array<std::optional<NumericalOrdinal>, kPipeCount> first{}, last{};
   std::array<std::vector<NumericalOrdinal>, kNumericalChains> chains;
   std::array<std::vector<NumericalRow>, kNumericalChains> forward, reverse;
