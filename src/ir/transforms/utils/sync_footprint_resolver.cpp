@@ -32,6 +32,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/verifier/verifier.h"
+#include "src/ir/transforms/utils/sync_transform_common.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -133,7 +134,7 @@ void RequireBufferSyncScalarLayout(const FunctionPtr& owner) {
 }
 
 std::optional<backend::BufferSyncByteWindow> StridedByteFootprint::ByteHull() const {
-  if (rows <= 0 || width <= 0 || base < 0) return std::nullopt;
+  if (rows <= 0 || width <= 0 || base < 0 || (rows > 1 && pitch <= 0)) return std::nullopt;
   const __int128 end = __int128(base) + (rows > 1 ? __int128(rows - 1) * pitch : 0) + width;
   if (end <= base || end > std::numeric_limits<int64_t>::max()) return std::nullopt;
   return backend::BufferSyncByteWindow{base, static_cast<int64_t>(end)};
@@ -152,9 +153,9 @@ bool StridedByteFootprint::MayOverlap(const StridedByteFootprint& a, const Strid
   const int64_t g = std::gcd(p1, p2);
   if (g > 0 && a.width < g && b.width < g) {
     // Project both periodic sets onto Z_g and test circular interval intersection.
-    const int64_t r1 = ((a.base % g) + g) % g;
-    const int64_t r2 = ((b.base % g) + g) % g;
-    const int64_t d = (r2 - r1 + g) % g;
+    const int64_t r1 = PositiveMod64(a.base, g);
+    const int64_t r2 = PositiveMod64(b.base, g);
+    const int64_t d = PositiveMod64(r2 - r1, g);
     // I1 = [0, a.width), I2 = [d, d + b.width) mod g.
     return d < a.width || __int128(d) + b.width > g;
   }
@@ -591,9 +592,10 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
           (parent->kind == SyncViewKind::Slot && parent->slot_selector &&
            parent->slot_selector->is_const()) ||
           (parent->kind == SyncViewKind::VecSubview && parent->fiber.kind == IterationFiber::Kind::Wildcard &&
-           parent->byte_hull->begin == parent->base_byte_offset &&
-           (!parent->vec_lattice || (parent->vec_lattice->rows == parent_type->shape_[0] &&
-                                     parent->vec_lattice->width == parent_type->shape_[1] * elem_bytes)));
+           parent->byte_hull->begin == parent->base_byte_offset && parent->vec_lattice.has_value() &&
+           parent->vec_lattice->base == parent->base_byte_offset &&
+           parent->vec_lattice->rows == parent_type->shape_[0] &&
+           parent->vec_lattice->width == __int128(parent_type->shape_[1]) * elem_bytes);
 
       if (parent_static_origin) {
         const __int128 begin =
@@ -653,60 +655,80 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
           }
 
           // Extract AffineSlice fiber wrt single loop frame if row or column is affine.
-          const int64_t slice_extent = (dst_type->shape_[0] - 1) * pitch + dst_type->shape_[1] * elem_bytes;
-          if (r_opt && r_opt->affine_frame && r_opt->modulus == 0 && r_opt->affine_coeff != 0 &&
-              (!c_opt || (!c_opt->affine_frame && c_opt->is_const()))) {
-            const __int128 c_bytes = __int128(r_opt->affine_coeff) * pitch;
-            const __int128 b_bytes = __int128(r_opt->affine_base) * pitch + __int128(c_lo) * elem_bytes;
-            if (c_bytes >= std::numeric_limits<int64_t>::min() &&
-                c_bytes <= std::numeric_limits<int64_t>::max() &&
-                b_bytes >= std::numeric_limits<int64_t>::min() &&
-                b_bytes <= std::numeric_limits<int64_t>::max()) {
-              view.fiber.kind = IterationFiber::Kind::AffineSlice;
-              view.fiber.frame = r_opt->affine_frame;
-              view.fiber.coeff = static_cast<int64_t>(c_bytes);
-              view.fiber.offset = static_cast<int64_t>(b_bytes);
-              view.fiber.extent = slice_extent;
-              if (r_opt->symbolic_base) {
-                view.fiber.symbolic_base =
-                    MakeMul(r_opt->symbolic_base, MakeIndexConst(pitch, r_opt->symbolic_base->span_),
-                            r_opt->symbolic_base->span_);
+          const __int128 slice_extent =
+              __int128(dst_type->shape_[0] - 1) * pitch + __int128(dst_type->shape_[1]) * elem_bytes;
+          if (slice_extent >= 0 && slice_extent <= std::numeric_limits<int64_t>::max()) {
+            if (r_opt && r_opt->affine_frame && r_opt->modulus == 0 && r_opt->affine_coeff != 0 &&
+                ((c_opt && !c_opt->affine_frame && c_opt->is_const()) || max_c == 0)) {
+              const __int128 c_bytes = __int128(r_opt->affine_coeff) * pitch;
+              const __int128 b_bytes = __int128(r_opt->affine_base) * pitch + __int128(c_lo) * elem_bytes;
+              if (c_bytes >= std::numeric_limits<int64_t>::min() &&
+                  c_bytes <= std::numeric_limits<int64_t>::max() &&
+                  b_bytes >= std::numeric_limits<int64_t>::min() &&
+                  b_bytes + slice_extent <= std::numeric_limits<int64_t>::max()) {
+                view.fiber.kind = IterationFiber::Kind::AffineSlice;
+                view.fiber.frame = r_opt->affine_frame;
+                view.fiber.coeff = static_cast<int64_t>(c_bytes);
+                view.fiber.offset = static_cast<int64_t>(b_bytes);
+                view.fiber.extent = static_cast<int64_t>(slice_extent);
+                if (r_opt->symbolic_base) {
+                  view.fiber.symbolic_base =
+                      MakeMul(r_opt->symbolic_base, MakeIndexConst(pitch, r_opt->symbolic_base->span_),
+                              r_opt->symbolic_base->span_);
+                }
               }
-            }
-          } else if (c_opt && c_opt->affine_frame && c_opt->modulus == 0 && c_opt->affine_coeff != 0 &&
-                     (!r_opt || (!r_opt->affine_frame && r_opt->is_const())) && dst_type->shape_[0] == 1) {
-            const __int128 c_bytes = __int128(c_opt->affine_coeff) * elem_bytes;
-            const __int128 b_bytes = __int128(r_lo) * pitch + __int128(c_opt->affine_base) * elem_bytes;
-            if (c_bytes >= std::numeric_limits<int64_t>::min() &&
-                c_bytes <= std::numeric_limits<int64_t>::max() &&
-                b_bytes >= std::numeric_limits<int64_t>::min() &&
-                b_bytes <= std::numeric_limits<int64_t>::max()) {
-              view.fiber.kind = IterationFiber::Kind::AffineSlice;
-              view.fiber.frame = c_opt->affine_frame;
-              view.fiber.coeff = static_cast<int64_t>(c_bytes);
-              view.fiber.offset = static_cast<int64_t>(b_bytes);
-              view.fiber.extent = slice_extent;
-              if (c_opt->symbolic_base) {
-                view.fiber.symbolic_base =
-                    MakeMul(c_opt->symbolic_base, MakeIndexConst(elem_bytes, c_opt->symbolic_base->span_),
-                            c_opt->symbolic_base->span_);
+            } else if (c_opt && c_opt->affine_frame && c_opt->modulus == 0 && c_opt->affine_coeff != 0 &&
+                       ((r_opt && !r_opt->affine_frame && r_opt->is_const()) || max_r == 0) &&
+                       dst_type->shape_[0] == 1) {
+              const __int128 c_bytes = __int128(c_opt->affine_coeff) * elem_bytes;
+              const __int128 b_bytes = __int128(r_lo) * pitch + __int128(c_opt->affine_base) * elem_bytes;
+              if (c_bytes >= std::numeric_limits<int64_t>::min() &&
+                  c_bytes <= std::numeric_limits<int64_t>::max() &&
+                  b_bytes >= std::numeric_limits<int64_t>::min() &&
+                  b_bytes + slice_extent <= std::numeric_limits<int64_t>::max()) {
+                view.fiber.kind = IterationFiber::Kind::AffineSlice;
+                view.fiber.frame = c_opt->affine_frame;
+                view.fiber.coeff = static_cast<int64_t>(c_bytes);
+                view.fiber.offset = static_cast<int64_t>(b_bytes);
+                view.fiber.extent = static_cast<int64_t>(slice_extent);
+                if (c_opt->symbolic_base) {
+                  view.fiber.symbolic_base =
+                      MakeMul(c_opt->symbolic_base, MakeIndexConst(elem_bytes, c_opt->symbolic_base->span_),
+                              c_opt->symbolic_base->span_);
+                }
               }
             }
           }
         }
       } else if (parent->vec_lattice && c_lo == c_hi && r_lo == r_hi && r_lo == 0 &&
                  dst_type->shape_[0] == parent_type->shape_[0]) {
-        // Chained column subview inside a moving parent: preserve column disjointness!
-        const __int128 new_base = __int128(parent->vec_lattice->base) + __int128(c_lo) * elem_bytes;
-        const __int128 new_width = __int128(dst_type->shape_[1]) * elem_bytes;
-        if (new_base >= parent->byte_hull->begin && new_base + new_width <= parent->byte_hull->end) {
-          view.vec_lattice =
-              StridedByteFootprint{static_cast<int64_t>(new_base), parent->vec_lattice->pitch,
-                                   parent->vec_lattice->rows, static_cast<int64_t>(new_width), false};
+        // Chained column subview inside a moving parent: preserve parent column movement!
+        const __int128 parent_static_width = __int128(parent_type->shape_[1]) * elem_bytes;
+        const __int128 col_spread = __int128(parent->vec_lattice->width) - parent_static_width;
+        if (col_spread >= 0) {
+          const __int128 new_base = __int128(parent->vec_lattice->base) + __int128(c_lo) * elem_bytes;
+          const __int128 new_width = __int128(dst_type->shape_[1]) * elem_bytes + col_spread;
+          const __int128 row_span = parent->vec_lattice->rows > 1
+                                        ? __int128(parent->vec_lattice->rows - 1) * parent->vec_lattice->pitch
+                                        : 0;
+          if (new_base >= parent->byte_hull->begin &&
+              new_base + row_span + new_width <= parent->byte_hull->end &&
+              new_width <= std::numeric_limits<int64_t>::max() &&
+              (parent->vec_lattice->rows == 1 || new_width <= parent->vec_lattice->pitch)) {
+            view.vec_lattice =
+                StridedByteFootprint{static_cast<int64_t>(new_base), parent->vec_lattice->pitch,
+                                     parent->vec_lattice->rows, static_cast<int64_t>(new_width), false};
+          }
           if (parent->fiber.kind == IterationFiber::Kind::AffineSlice && dst_type->shape_[0] == 1) {
-            view.fiber = parent->fiber;
-            view.fiber.offset += c_lo * elem_bytes;
-            view.fiber.extent = static_cast<int64_t>(new_width);
+            const __int128 slice_extent = __int128(dst_type->shape_[1]) * elem_bytes;
+            const __int128 new_off = __int128(parent->fiber.offset) + __int128(c_lo) * elem_bytes;
+            if (slice_extent >= 0 && slice_extent <= std::numeric_limits<int64_t>::max() &&
+                new_off >= std::numeric_limits<int64_t>::min() &&
+                new_off + slice_extent <= std::numeric_limits<int64_t>::max()) {
+              view.fiber = parent->fiber;
+              view.fiber.offset = static_cast<int64_t>(new_off);
+              view.fiber.extent = static_cast<int64_t>(slice_extent);
+            }
           }
         }
       }
@@ -873,8 +895,9 @@ ResolvedOperandFootprint SyncFootprintResolver::ResolveOperand(const Stmt* cut, 
       // If single-axis affine subtile movement and constant other axis, attach AffineSlice fiber!
       if (out.fiber.kind == IterationFiber::Kind::Wildcard && single_slot) {
         if (r_opt && r_opt->affine_frame && r_opt->modulus == 0 && r_opt->affine_coeff != 0 &&
-            (!c_opt || (!c_opt->affine_frame && c_opt->is_const())) && !r_opt->symbolic_base &&
-            c_begin == 0 && c_end == root.columns) {
+            ((c_opt && !c_opt->affine_frame && c_opt->is_const()) || root.columns == sub_cols) &&
+            !r_opt->symbolic_base && c_begin == 0 && c_end == root.columns &&
+            __int128(r_opt->affine_base) + sub_rows <= std::numeric_limits<int64_t>::max()) {
           out.fiber.kind = IterationFiber::Kind::AffineSlice;
           out.fiber.frame = r_opt->affine_frame;
           out.fiber.coeff = r_opt->affine_coeff;
@@ -882,8 +905,9 @@ ResolvedOperandFootprint SyncFootprintResolver::ResolveOperand(const Stmt* cut, 
           out.fiber.extent = sub_rows;
           out.fiber.slice_axis = 0;
         } else if (c_opt && c_opt->affine_frame && c_opt->modulus == 0 && c_opt->affine_coeff != 0 &&
-                   (!r_opt || (!r_opt->affine_frame && r_opt->is_const())) && !c_opt->symbolic_base &&
-                   r_begin == 0 && r_end == root.rows) {
+                   ((r_opt && !r_opt->affine_frame && r_opt->is_const()) || root.rows == sub_rows) &&
+                   !c_opt->symbolic_base && r_begin == 0 && r_end == root.rows &&
+                   __int128(c_opt->affine_base) + sub_cols <= std::numeric_limits<int64_t>::max()) {
           out.fiber.kind = IterationFiber::Kind::AffineSlice;
           out.fiber.frame = c_opt->affine_frame;
           out.fiber.coeff = c_opt->affine_coeff;

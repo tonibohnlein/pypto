@@ -31,6 +31,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/buffer_acc_trim_analysis.h"
+#include "src/ir/transforms/utils/sync_transform_common.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -39,40 +40,44 @@ constexpr int kMaxBoolAliasDepth = 8;
 constexpr __int128 kBoundNegInf = arith::ConstIntBound::kNegInf;
 constexpr __int128 kBoundPosInf = arith::ConstIntBound::kPosInf;
 
+struct Bound128 {
+  __int128 lo = 0;
+  __int128 hi = 0;
+  bool is_const() const { return lo == hi; }
+};
+
 bool IsSignedIntOrIndex(const ExprPtr& expr) {
   const auto type = expr ? As<ScalarType>(expr->GetType()) : nullptr;
   return type && (type->dtype_ == DataType::INDEX || type->dtype_.IsSignedInt());
 }
 
+bool Is64BitSignedOrIndex(const ExprPtr& expr) {
+  const auto type = expr ? As<ScalarType>(expr->GetType()) : nullptr;
+  return type && (type->dtype_ == DataType::INDEX || type->dtype_.GetBit() >= 64);
+}
+
 std::pair<__int128, __int128> ScalarSignedLimits(const ExprPtr& expr) {
   const auto type = expr ? As<ScalarType>(expr->GetType()) : nullptr;
   if (!type || type->dtype_ == DataType::INDEX || type->dtype_.GetBit() >= 64) {
-    return {kBoundNegInf, kBoundPosInf};
+    return {std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max()};
   }
   const int bits = type->dtype_.GetBit();
   if (bits <= 1) return {0, 0};
   const __int128 hi = (__int128{1} << (bits - 1)) - 1;
   const __int128 lo = -hi - 1;
-  return {std::max(lo, kBoundNegInf), std::min(hi, kBoundPosInf)};
+  return {lo, hi};
 }
 
-std::optional<arith::ConstIntBound> ClampToType(const ExprPtr& expr, __int128 lo, __int128 hi) {
+std::optional<Bound128> ClampToType(const ExprPtr& expr, __int128 lo, __int128 hi) {
   const auto [tmin, tmax] = ScalarSignedLimits(expr);
   if (lo < tmin || hi > tmax || lo > hi) return std::nullopt;
-  return arith::ConstIntBound{static_cast<int64_t>(lo), static_cast<int64_t>(hi)};
+  return Bound128{lo, hi};
 }
 
-__int128 FloorDiv128(__int128 a, __int128 b) {
-  __int128 q = a / b;
-  __int128 r = a % b;
-  if (r != 0 && ((r < 0) != (b < 0))) --q;
-  return q;
-}
-
-__int128 FloorMod128(__int128 a, __int128 b) {
-  __int128 r = a % b;
-  if (r != 0 && ((r < 0) != (b < 0))) r += b;
-  return r;
+arith::ConstIntBound ToConstIntBound(const Bound128& b) {
+  const __int128 lo = std::max(b.lo, kBoundNegInf);
+  const __int128 hi = std::min(b.hi, kBoundPosInf);
+  return arith::ConstIntBound{static_cast<int64_t>(std::min(lo, hi)), static_cast<int64_t>(hi)};
 }
 
 ExprPtr MakeConstInt(int64_t val, DataType dtype, const Span& span = Span::unknown()) {
@@ -101,23 +106,26 @@ class SyncControlRangeProver::Impl {
     return it != loop_proofs_.end() && it->second.is_at_most_one_trip;
   }
 
-  std::optional<int64_t> ExactTripCount(const ForStmt* loop) const {
-    const auto it = loop_proofs_.find(loop);
-    if (it == loop_proofs_.end()) return std::nullopt;
-    return it->second.exact_trip_count;
-  }
-
   bool IsPositiveTripCompatible(const ForStmt* loop) const {
     if (!loop) return false;
-    if (IsPositiveTrip(loop)) return true;
+    if (const auto it = loop_proofs_.find(loop); it != loop_proofs_.end()) {
+      return it->second.is_positive_trip;
+    }
     const auto vit = loops_by_var_.find(loop->loop_var_.get());
     if (vit != loops_by_var_.end()) {
+      bool matched_any = false;
+      bool all_positive = true;
       for (const ForStmt* orig : vit->second) {
         if (structural_equal(orig->start_, loop->start_) && structural_equal(orig->stop_, loop->stop_) &&
             structural_equal(orig->step_, loop->step_)) {
-          if (IsPositiveTrip(orig)) return true;
+          matched_any = true;
+          if (!IsPositiveTrip(orig)) {
+            all_positive = false;
+            break;
+          }
         }
       }
+      if (matched_any) return all_positive;
     }
     if (loop->kind_ == ForKind::Sequential) {
       const auto s = As<ConstInt>(loop->start_);
@@ -126,10 +134,6 @@ class SyncControlRangeProver::Impl {
       if (s && e && st && st->value_ > 0 && e->value_ > s->value_) return true;
     }
     return false;
-  }
-
-  std::optional<SymbolicIntRange> BoundScalar(const ExprPtr& expr) const {
-    return LookupAtCut(nullptr, expr);
   }
 
   std::optional<SymbolicIntRange> LookupAtCut(const Stmt* cut, const ExprPtr& expr) const {
@@ -171,12 +175,12 @@ class SyncControlRangeProver::Impl {
           scratch_aliases[def.var.get()] = def.value;
           scratch_ready.insert(def.var.get());
         } else {
-          scratch_ready.insert(def.var.get());
+          if (def.proved_bound) {
+            scratch_ready.insert(def.var.get());
+            scratch->const_int_bound.Update(def.var, ToConstIntBound(*def.proved_bound));
+          }
           if (def.non_overflow_value) {
             scratch->Bind(def.var, def.non_overflow_value);
-          }
-          if (def.proved_bound) {
-            scratch->const_int_bound.Update(def.var, *def.proved_bound);
           }
         }
       }
@@ -209,7 +213,6 @@ class SyncControlRangeProver::Impl {
   struct LoopProof {
     bool is_positive_trip = false;
     bool is_at_most_one_trip = false;
-    std::optional<int64_t> exact_trip_count;
   };
 
   struct DefRecord {
@@ -217,7 +220,7 @@ class SyncControlRangeProver::Impl {
     ExprPtr value;
     bool is_bool_alias = false;
     ExprPtr non_overflow_value;
-    std::optional<arith::ConstIntBound> proved_bound;
+    std::optional<Bound128> proved_bound;
   };
 
   struct ScopeNode {
@@ -249,12 +252,6 @@ class SyncControlRangeProver::Impl {
   std::unordered_map<const Var*, std::vector<const ForStmt*>> loops_by_var_;
   std::unordered_map<const Var*, size_t> var_def_scope_;
   std::unordered_map<const ForStmt*, size_t> loop_body_scope_;
-
-  static bool IsPureBlockQueryCall(const CallPtr& call) {
-    return call && call->args_.empty() &&
-           (IsOp(call, "buffer.get_block_idx") || IsOp(call, "buffer.get_block_num") ||
-            IsOp(call, "buffer.get_subblock_idx"));
-  }
 
   static bool AddOverflow128(__int128 a, __int128 b, __int128& out) {
     return __builtin_add_overflow(a, b, &out);
@@ -296,27 +293,37 @@ class SyncControlRangeProver::Impl {
       ready_set.insert(param.get());
       const auto clamped = ClampToType(param, bounds.first, bounds.second);
       if (clamped) {
-        az.const_int_bound.Update(param, *clamped);
-        if (clamped->is_const()) {
-          az.Bind(param, MakeConstInt(clamped->min_value, GetScalarDtype(param)));
+        az.const_int_bound.Update(param, ToConstIntBound(*clamped));
+        if (clamped->is_const() && clamped->lo > kBoundNegInf && clamped->hi < kBoundPosInf) {
+          az.Bind(param, MakeConstInt(static_cast<int64_t>(clamped->lo), GetScalarDtype(param)));
         }
       }
     }
   }
 
-  std::optional<arith::ConstIntBound> BoundNonOverflowingScalar(
+  std::optional<Bound128> BoundNonOverflowingScalar(
       const ExprPtr& expr, arith::Analyzer& az, const std::unordered_set<const Var*>& ready_set,
-      std::unordered_map<const Expr*, std::optional<arith::ConstIntBound>>& cache) const {
+      std::unordered_map<const Expr*, std::optional<Bound128>>& cache) const {
     if (!expr || !IsSignedIntOrIndex(expr)) return std::nullopt;
     if (const auto it = cache.find(expr.get()); it != cache.end()) return it->second;
 
-    std::optional<arith::ConstIntBound> result;
+    std::optional<Bound128> result;
     if (const auto ci = As<ConstInt>(expr)) {
       result = ClampToType(expr, ci->value_, ci->value_);
     } else if (const auto var = AsVarLike(expr)) {
       if (ready_set.count(var.get()) != 0) {
         const auto b = az.const_int_bound(var);
-        result = ClampToType(expr, b.min_value, b.max_value);
+        if (Is64BitSignedOrIndex(expr)) {
+          const __int128 lo =
+              b.min_value <= kBoundNegInf ? std::numeric_limits<int64_t>::min() : __int128(b.min_value);
+          // Never treat analyzer sentinels {kNegInf, kNegInf} or {kPosInf, kPosInf} as exact constants.
+          if (!(b.min_value >= kBoundPosInf && b.max_value >= kBoundPosInf) &&
+              !(b.min_value <= kBoundNegInf && b.max_value <= kBoundNegInf)) {
+            result = ClampToType(expr, lo, b.max_value);
+          }
+        } else {
+          result = ClampToType(expr, b.min_value, b.max_value);
+        }
       }
     } else if (const auto call = As<Call>(expr)) {
       if (IsOp(call, "buffer.get_block_idx") && call->args_.empty()) {
@@ -334,20 +341,20 @@ class SyncControlRangeProver::Impl {
       if (IsSignedIntOrIndex(cast->operand_)) {
         const auto inner = BoundNonOverflowingScalar(cast->operand_, az, ready_set, cache);
         if (inner) {
-          result = ClampToType(expr, inner->min_value, inner->max_value);
+          result = ClampToType(expr, inner->lo, inner->hi);
         }
       }
     } else if (const auto neg = As<Neg>(expr)) {
       const auto inner = BoundNonOverflowingScalar(neg->operand_, az, ready_set, cache);
       if (inner) {
-        result = ClampToType(expr, -__int128(inner->max_value), -__int128(inner->min_value));
+        result = ClampToType(expr, -inner->hi, -inner->lo);
       }
     } else if (const auto binary = As<BinaryExpr>(expr)) {
       const auto a = BoundNonOverflowingScalar(binary->left_, az, ready_set, cache);
       const auto b = BoundNonOverflowingScalar(binary->right_, az, ready_set, cache);
       if (a && b) {
-        const __int128 alo = a->min_value, ahi = a->max_value;
-        const __int128 blo = b->min_value, bhi = b->max_value;
+        const __int128 alo = a->lo, ahi = a->hi;
+        const __int128 blo = b->lo, bhi = b->hi;
         if (As<Add>(expr)) {
           result = ClampToType(expr, alo + blo, ahi + bhi);
         } else if (As<Sub>(expr)) {
@@ -382,7 +389,8 @@ class SyncControlRangeProver::Impl {
           }
         } else if (As<FloorMod>(expr)) {
           if (blo > 0) {
-            if (a->is_const() && b->is_const()) {
+            if (a->is_const() && b->is_const() && alo > kBoundNegInf && ahi < kBoundPosInf &&
+                blo > kBoundNegInf && bhi < kBoundPosInf) {
               const __int128 val = FloorMod128(alo, blo);
               result = ClampToType(expr, val, val);
             } else {
@@ -401,9 +409,12 @@ class SyncControlRangeProver::Impl {
     if (result) {
       // Intersect with analyzer's const_int_bound (sound tightening, never widens).
       const auto az_b = az.const_int_bound(expr);
-      const __int128 lo = std::max<__int128>(result->min_value, az_b.min_value);
-      const __int128 hi = std::min<__int128>(result->max_value, az_b.max_value);
-      if (lo <= hi) {
+      const __int128 az_lo = Is64BitSignedOrIndex(expr) && az_b.min_value <= kBoundNegInf
+                                 ? std::numeric_limits<int64_t>::min()
+                                 : __int128(az_b.min_value);
+      const __int128 lo = std::max(result->lo, az_lo);
+      const __int128 hi = std::min(result->hi, __int128(az_b.max_value));
+      if (lo <= hi && !(az_b.min_value >= kBoundPosInf && result->lo < kBoundPosInf)) {
         result = ClampToType(expr, lo, hi);
       }
     }
@@ -422,9 +433,9 @@ class SyncControlRangeProver::Impl {
     };
     std::vector<Pending> pending{{condition, truth, 0}};
     std::unordered_set<const Expr*> positive, negative;
-    std::unordered_map<const Expr*, std::optional<arith::ConstIntBound>> bound_cache;
+    std::unordered_map<const Expr*, std::optional<Bound128>> bound_cache;
 
-    auto is_ready_expr = [&](const ExprPtr& arg) -> std::optional<arith::ConstIntBound> {
+    auto is_ready_expr = [&](const ExprPtr& arg) -> std::optional<Bound128> {
       return BoundNonOverflowingScalar(arg, *az, ready_set, bound_cache);
     };
 
@@ -468,8 +479,8 @@ class SyncControlRangeProver::Impl {
       auto normalize_cmp = [&](const ExprPtr& c) {
         if (const auto lt = As<Lt>(c)) {
           if (const auto rvar = As<Var>(lt->right_); rvar && ready_set.count(rvar.get())) {
-            if (const auto b = is_ready_expr(lt->left_); b && b->min_value > arith::ConstIntBound::kNegInf) {
-              const __int128 tight_lo = __int128(b->min_value) + 1;
+            if (const auto b = is_ready_expr(lt->left_); b && b->lo > kBoundNegInf) {
+              const __int128 tight_lo = b->lo + 1;
               if (tight_lo <= kBoundPosInf) {
                 out.push_back(az->GetConstraintContext(
                     MakeGe(rvar, MakeConstInt(static_cast<int64_t>(tight_lo), GetScalarDtype(rvar)))));
@@ -477,8 +488,8 @@ class SyncControlRangeProver::Impl {
             }
           }
           if (const auto lvar = As<Var>(lt->left_); lvar && ready_set.count(lvar.get())) {
-            if (const auto b = is_ready_expr(lt->right_); b && b->max_value < arith::ConstIntBound::kPosInf) {
-              const __int128 tight_hi = __int128(b->max_value) - 1;
+            if (const auto b = is_ready_expr(lt->right_); b && b->hi < kBoundPosInf) {
+              const __int128 tight_hi = b->hi - 1;
               if (tight_hi >= kBoundNegInf) {
                 out.push_back(az->GetConstraintContext(
                     MakeLe(lvar, MakeConstInt(static_cast<int64_t>(tight_hi), GetScalarDtype(lvar)))));
@@ -487,21 +498,21 @@ class SyncControlRangeProver::Impl {
           }
         } else if (const auto le = As<Le>(c)) {
           if (const auto rvar = As<Var>(le->right_); rvar && ready_set.count(rvar.get())) {
-            if (const auto b = is_ready_expr(le->left_); b && b->min_value > arith::ConstIntBound::kNegInf) {
-              out.push_back(
-                  az->GetConstraintContext(MakeGe(rvar, MakeConstInt(b->min_value, GetScalarDtype(rvar)))));
+            if (const auto b = is_ready_expr(le->left_); b && b->lo > kBoundNegInf) {
+              out.push_back(az->GetConstraintContext(
+                  MakeGe(rvar, MakeConstInt(static_cast<int64_t>(b->lo), GetScalarDtype(rvar)))));
             }
           }
           if (const auto lvar = As<Var>(le->left_); lvar && ready_set.count(lvar.get())) {
-            if (const auto b = is_ready_expr(le->right_); b && b->max_value < arith::ConstIntBound::kPosInf) {
-              out.push_back(
-                  az->GetConstraintContext(MakeLe(lvar, MakeConstInt(b->max_value, GetScalarDtype(lvar)))));
+            if (const auto b = is_ready_expr(le->right_); b && b->hi < kBoundPosInf) {
+              out.push_back(az->GetConstraintContext(
+                  MakeLe(lvar, MakeConstInt(static_cast<int64_t>(b->hi), GetScalarDtype(lvar)))));
             }
           }
         } else if (const auto gt = As<Gt>(c)) {
           if (const auto lvar = As<Var>(gt->left_); lvar && ready_set.count(lvar.get())) {
-            if (const auto b = is_ready_expr(gt->right_); b && b->min_value > arith::ConstIntBound::kNegInf) {
-              const __int128 tight_lo = __int128(b->min_value) + 1;
+            if (const auto b = is_ready_expr(gt->right_); b && b->lo > kBoundNegInf) {
+              const __int128 tight_lo = b->lo + 1;
               if (tight_lo <= kBoundPosInf) {
                 out.push_back(az->GetConstraintContext(
                     MakeGe(lvar, MakeConstInt(static_cast<int64_t>(tight_lo), GetScalarDtype(lvar)))));
@@ -509,8 +520,8 @@ class SyncControlRangeProver::Impl {
             }
           }
           if (const auto rvar = As<Var>(gt->right_); rvar && ready_set.count(rvar.get())) {
-            if (const auto b = is_ready_expr(gt->left_); b && b->max_value < arith::ConstIntBound::kPosInf) {
-              const __int128 tight_hi = __int128(b->max_value) - 1;
+            if (const auto b = is_ready_expr(gt->left_); b && b->hi < kBoundPosInf) {
+              const __int128 tight_hi = b->hi - 1;
               if (tight_hi >= kBoundNegInf) {
                 out.push_back(az->GetConstraintContext(
                     MakeLe(rvar, MakeConstInt(static_cast<int64_t>(tight_hi), GetScalarDtype(rvar)))));
@@ -519,15 +530,15 @@ class SyncControlRangeProver::Impl {
           }
         } else if (const auto ge = As<Ge>(c)) {
           if (const auto lvar = As<Var>(ge->left_); lvar && ready_set.count(lvar.get())) {
-            if (const auto b = is_ready_expr(ge->right_); b && b->min_value > arith::ConstIntBound::kNegInf) {
-              out.push_back(
-                  az->GetConstraintContext(MakeGe(lvar, MakeConstInt(b->min_value, GetScalarDtype(lvar)))));
+            if (const auto b = is_ready_expr(ge->right_); b && b->lo > kBoundNegInf) {
+              out.push_back(az->GetConstraintContext(
+                  MakeGe(lvar, MakeConstInt(static_cast<int64_t>(b->lo), GetScalarDtype(lvar)))));
             }
           }
           if (const auto rvar = As<Var>(ge->right_); rvar && ready_set.count(rvar.get())) {
-            if (const auto b = is_ready_expr(ge->left_); b && b->max_value < arith::ConstIntBound::kPosInf) {
-              out.push_back(
-                  az->GetConstraintContext(MakeLe(rvar, MakeConstInt(b->max_value, GetScalarDtype(rvar)))));
+            if (const auto b = is_ready_expr(ge->left_); b && b->hi < kBoundPosInf) {
+              out.push_back(az->GetConstraintContext(
+                  MakeLe(rvar, MakeConstInt(static_cast<int64_t>(b->hi), GetScalarDtype(rvar)))));
             }
           }
         }
@@ -554,7 +565,7 @@ class SyncControlRangeProver::Impl {
                             std::vector<arith::ConstraintContext>& out) const {
     ready_set.insert(loop->loop_var_.get());
     az->const_int_bound.Update(loop->loop_var_, iv_bound);
-    if (iv_bound.is_const()) {
+    if (iv_bound.is_const() && iv_bound.min_value > kBoundNegInf && iv_bound.max_value < kBoundPosInf) {
       az->Bind(loop->loop_var_, MakeConstInt(iv_bound.min_value, GetScalarDtype(loop->loop_var_)));
     }
     if (start_non_overflow) {
@@ -783,15 +794,15 @@ class SyncControlRangeProver::Impl {
   std::optional<SymbolicIntRange> EvaluateWithAnalyzer(const ExprPtr& expr, arith::Analyzer& az,
                                                        const std::unordered_set<const Var*>& ready_set,
                                                        const std::vector<const ForStmt*>& loops) const {
-    std::unordered_map<const Expr*, std::optional<arith::ConstIntBound>> bound_cache;
+    std::unordered_map<const Expr*, std::optional<Bound128>> bound_cache;
     const auto bound = BoundNonOverflowingScalar(expr, az, ready_set, bound_cache);
     if (!bound) return std::nullopt;
 
     SymbolicIntRange range;
-    range.lo = bound->min_value;
-    range.hi = bound->max_value;
+    range.lo = static_cast<int64_t>(bound->lo);
+    range.hi = static_cast<int64_t>(bound->hi);
     range.expr = expr;
-    if (range.is_const()) {
+    if (range.is_const() && bound->lo > kBoundNegInf && bound->hi < kBoundPosInf) {
       range.affine_base = range.lo;
       return range;
     }
@@ -801,8 +812,16 @@ class SyncControlRangeProver::Impl {
       if (lp && lp->loop_var_) var_to_loop[lp->loop_var_.get()] = lp;
     }
 
-    // Check FloorMod(lhs, ConstInt(M)) for ModularSlot decomposition.
-    if (const auto mod = As<FloorMod>(expr)) {
+    // Unwrap ANF SSA aliases in non_overflow_ssa_ before matching FloorMod(lhs, ConstInt(M)).
+    ExprPtr unwrapped = expr;
+    for (int hops = 0; hops < 8; ++hops) {
+      const auto v = AsVarLike(unwrapped);
+      if (!v || !non_overflow_ssa_.count(v.get())) break;
+      const auto dit = ssa_defs_.find(v.get());
+      if (dit == ssa_defs_.end() || !dit->second) break;
+      unwrapped = dit->second;
+    }
+    if (const auto mod = As<FloorMod>(unwrapped)) {
       if (const auto m_ci = As<ConstInt>(mod->right_); m_ci && m_ci->value_ > 0) {
         const int64_t M = m_ci->value_;
         std::unordered_map<const Expr*, AffineForm> memo;
@@ -853,9 +872,12 @@ class SyncControlRangeProver::Impl {
             __int128 const_base = af.const_offset;
             ExprPtr sym = af.symbolic_invariant;
             bool ok = true;
-            // Fold any outer loop terms into `sym` so `sym` is purely invariant wrt `innermost`.
-            for (const auto& [olp, oc] : af.coeffs) {
+            // Fold any outer loop terms into `sym` in deterministic lexical `loops` order.
+            for (const ForStmt* olp : loops) {
               if (olp == innermost) continue;
+              const auto oit = af.coeffs.find(olp);
+              if (oit == af.coeffs.end()) continue;
+              const __int128 oc = oit->second;
               if (oc < std::numeric_limits<int64_t>::min() || oc > std::numeric_limits<int64_t>::max()) {
                 ok = false;
                 break;
@@ -933,15 +955,15 @@ class SyncControlRangeProver::Impl {
         scopes_[scope_id].defs.push_back({assign->var_, assign->value_, true, nullptr, std::nullopt});
       } else if (IsSignedIntOrIndex(assign->var_)) {
         ssa_defs_[assign->var_.get()] = assign->value_;
-        ready_.insert(assign->var_.get());
-        std::unordered_map<const Expr*, std::optional<arith::ConstIntBound>> cache;
+        std::unordered_map<const Expr*, std::optional<Bound128>> cache;
         auto b = BoundNonOverflowingScalar(assign->value_, *analyzer_, ready_, cache);
         ExprPtr no_ov_expr;
         if (b) {
+          ready_.insert(assign->var_.get());
           no_ov_expr = assign->value_;
           non_overflow_ssa_.insert(assign->var_.get());
           analyzer_->Bind(assign->var_, assign->value_);
-          analyzer_->const_int_bound.Update(assign->var_, *b);
+          analyzer_->const_int_bound.Update(assign->var_, ToConstIntBound(*b));
         }
         scopes_[scope_id].defs.push_back({assign->var_, assign->value_, false, no_ov_expr, b});
       }
@@ -956,7 +978,7 @@ class SyncControlRangeProver::Impl {
         }
         return nullptr;
       };
-      std::vector<std::optional<arith::ConstIntBound>> then_bounds, else_bounds;
+      std::vector<std::optional<Bound128>> then_bounds, else_bounds;
       const size_t then_scope = scopes_.size();
       scopes_.push_back(ScopeNode{scope_id, ScopeNode::Kind::IfBranch, branch->condition_, true, nullptr});
       {
@@ -967,7 +989,7 @@ class SyncControlRangeProver::Impl {
           if (const auto ty = trailing_yield(branch->then_body_);
               ty && ty->value_.size() == branch->return_vars_.size()) {
             then_bounds.resize(branch->return_vars_.size());
-            std::unordered_map<const Expr*, std::optional<arith::ConstIntBound>> cache;
+            std::unordered_map<const Expr*, std::optional<Bound128>> cache;
             for (size_t i = 0; i < branch->return_vars_.size(); ++i) {
               if (IsSignedIntOrIndex(branch->return_vars_[i]) && IsSignedIntOrIndex(ty->value_[i])) {
                 then_bounds[i] = BoundNonOverflowingScalar(ty->value_[i], *analyzer_, ready_, cache);
@@ -987,7 +1009,7 @@ class SyncControlRangeProver::Impl {
           if (const auto ey = trailing_yield(*branch->else_body_);
               ey && ey->value_.size() == branch->return_vars_.size()) {
             else_bounds.resize(branch->return_vars_.size());
-            std::unordered_map<const Expr*, std::optional<arith::ConstIntBound>> cache;
+            std::unordered_map<const Expr*, std::optional<Bound128>> cache;
             for (size_t i = 0; i < branch->return_vars_.size(); ++i) {
               if (then_bounds[i] && IsSignedIntOrIndex(ey->value_[i])) {
                 else_bounds[i] = BoundNonOverflowingScalar(ey->value_[i], *analyzer_, ready_, cache);
@@ -1001,12 +1023,12 @@ class SyncControlRangeProver::Impl {
         const auto& rv = branch->return_vars_[i];
         var_def_scope_[rv.get()] = scope_id;
         if (IsSignedIntOrIndex(rv)) {
-          ready_.insert(rv.get());
-          std::optional<arith::ConstIntBound> joined;
+          std::optional<Bound128> joined;
           if (i < then_bounds.size() && i < else_bounds.size() && then_bounds[i] && else_bounds[i]) {
-            joined = arith::ConstIntBound{std::min(then_bounds[i]->min_value, else_bounds[i]->min_value),
-                                          std::max(then_bounds[i]->max_value, else_bounds[i]->max_value)};
-            analyzer_->const_int_bound.Update(rv, *joined);
+            joined = Bound128{std::min(then_bounds[i]->lo, else_bounds[i]->lo),
+                              std::max(then_bounds[i]->hi, else_bounds[i]->hi)};
+            ready_.insert(rv.get());
+            analyzer_->const_int_bound.Update(rv, ToConstIntBound(*joined));
           }
           scopes_[scope_id].defs.push_back({rv, nullptr, false, nullptr, joined});
         }
@@ -1017,8 +1039,8 @@ class SyncControlRangeProver::Impl {
     if (const auto loop = As<ForStmt>(stmt)) {
       loops_by_var_[loop->loop_var_.get()].push_back(loop.get());
       LoopProof proof;
-      std::unordered_map<const Expr*, std::optional<arith::ConstIntBound>> cache;
-      std::optional<arith::ConstIntBound> start_b, stop_b, step_b;
+      std::unordered_map<const Expr*, std::optional<Bound128>> cache;
+      std::optional<Bound128> start_b, stop_b, step_b;
 
       if (loop->kind_ == ForKind::Sequential && IsSignedIntOrIndex(loop->start_) &&
           IsSignedIntOrIndex(loop->stop_) && IsSignedIntOrIndex(loop->step_)) {
@@ -1026,40 +1048,22 @@ class SyncControlRangeProver::Impl {
         start_b = BoundNonOverflowingScalar(loop->start_, *analyzer_, ready_, cache);
         stop_b = BoundNonOverflowingScalar(loop->stop_, *analyzer_, ready_, cache);
 
-        if (step_b && step_b->min_value >= 1 && start_b && stop_b) {
+        if (step_b && step_b->lo >= 1 && start_b && stop_b) {
           // 1. Positive-trip proof (>= 1 trip).
-          if (start_b->max_value < stop_b->min_value) {
+          if (start_b->hi < stop_b->lo) {
             proof.is_positive_trip = true;
           } else if (analyzer_->CanProve(MakeGt(loop->stop_, loop->start_))) {
             proof.is_positive_trip = true;
           }
 
           // 2. At-most-one-trip proof (<= 1 trip).
-          if (stop_b->max_value <= start_b->min_value) {
+          if (stop_b->hi <= start_b->lo) {
             proof.is_at_most_one_trip = true;
-            proof.exact_trip_count = 0;
-          } else if (start_b->min_value >= 0 && stop_b->max_value <= step_b->min_value) {
+          } else if (start_b->lo >= 0 && stop_b->hi <= step_b->lo) {
             proof.is_at_most_one_trip = true;
-          } else if (__int128(start_b->max_value) + __int128(step_b->max_value) <= kBoundPosInf &&
+          } else if (start_b->hi + step_b->hi <= kBoundPosInf &&
                      analyzer_->CanProve(MakeLe(loop->stop_, MakeAdd(loop->start_, loop->step_)))) {
             proof.is_at_most_one_trip = true;
-          }
-
-          // 3. Exact constant trip count if all three are constant (or proved 1 trip).
-          if (start_b->is_const() && stop_b->is_const() && step_b->is_const()) {
-            const __int128 s = start_b->min_value;
-            const __int128 e = stop_b->min_value;
-            const __int128 st = step_b->min_value;
-            if (e <= s) {
-              proof.exact_trip_count = 0;
-            } else {
-              const __int128 trips = (e - s - 1) / st + 1;
-              if (trips <= kBoundPosInf) {
-                proof.exact_trip_count = static_cast<int64_t>(trips);
-              }
-            }
-          } else if (proof.is_positive_trip && proof.is_at_most_one_trip) {
-            proof.exact_trip_count = 1;
           }
         }
       }
@@ -1071,16 +1075,16 @@ class SyncControlRangeProver::Impl {
       if (loop->loop_var_) var_def_scope_[loop->loop_var_.get()] = body_scope;
       arith::ConstIntBound iv_bound{arith::ConstIntBound::kNegInf, arith::ConstIntBound::kPosInf};
       bool use_loop_constraints = false;
-      if (loop->kind_ == ForKind::Sequential && step_b && step_b->min_value >= 1) {
+      if (loop->kind_ == ForKind::Sequential && step_b && step_b->lo >= 1) {
         use_loop_constraints = true;
-        const __int128 lo = start_b ? start_b->min_value : kBoundNegInf;
+        const __int128 lo = start_b ? start_b->lo : kBoundNegInf;
         __int128 hi = kBoundPosInf;
         if (stop_b) {
-          // Even when stop_b->max_value == kPosInf, iv < stop => iv <= kPosInf - 1!
-          hi = std::min<__int128>(kBoundPosInf - 1, __int128(stop_b->max_value) - 1);
+          // Even when stop_b->hi == kPosInf, iv < stop => iv <= kPosInf - 1!
+          hi = std::min<__int128>(kBoundPosInf - 1, stop_b->hi - 1);
         }
         if (lo <= hi) {
-          iv_bound = {static_cast<int64_t>(lo), static_cast<int64_t>(hi)};
+          iv_bound = ToConstIntBound(Bound128{lo, hi});
         } else {
           // Loop body is unreachable (e.g. 0-trip constant loop); keep wide bound to avoid invalid analyzer
           // state.
@@ -1177,10 +1181,6 @@ bool SyncControlRangeProver::IsAtMostOneTrip(const ForStmt* loop) const {
   return impl_ && impl_->IsAtMostOneTrip(loop);
 }
 
-std::optional<int64_t> SyncControlRangeProver::ExactTripCount(const ForStmt* loop) const {
-  return impl_ ? impl_->ExactTripCount(loop) : std::nullopt;
-}
-
 bool SyncControlRangeProver::IsPositiveTripCompatible(const ForStmt* loop) const {
   return impl_ && impl_->IsPositiveTripCompatible(loop);
 }
@@ -1188,10 +1188,6 @@ bool SyncControlRangeProver::IsPositiveTripCompatible(const ForStmt* loop) const
 std::optional<SymbolicIntRange> SyncControlRangeProver::LookupAtCut(const Stmt* cut,
                                                                     const ExprPtr& expr) const {
   return impl_ ? impl_->LookupAtCut(cut, expr) : std::nullopt;
-}
-
-std::optional<SymbolicIntRange> SyncControlRangeProver::BoundScalar(const ExprPtr& expr) const {
-  return impl_ ? impl_->BoundScalar(expr) : std::nullopt;
 }
 
 }  // namespace pypto::ir::sync

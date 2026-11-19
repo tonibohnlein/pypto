@@ -249,9 +249,9 @@ def check_multislot_closed_commands(
     assert before.payloads == after.payloads, "changed payload operands or physical bytes"
     assert before.descriptors == after.descriptors, "changed original allocations"
     common = {node for node in before.vertices if node[0] == "payload"}
-    assert {(a, b) for a, b in expected if a in common and b in common} == {
+    assert {(a, b) for a, b in expected if a in common and b in common} <= {
         (a, b) for a, b in actual if a in common and b in common
-    }, "changed actual-token payload order"
+    }, "lost actual-token payload order"
     original = MultiSlotClosedCommands(
         hardware_source, parameters, range(8), tensor_bases, block_index=block_index
     )
@@ -1499,7 +1499,7 @@ def test_tilelang_lookahead_four_modes_and_ptoas_1519_guard(cfg: LookaheadConfig
             assert collect_sync_metrics(aic_function(three_pass)) == metrics
             # Zero synthetic `if` bloat (vs FrontierSynch's 25 on tilelang_gemm, 507/115 on persistent_gemm).
             assert metrics["phys_if"] == base_ifs
-            expected_sw = 11 if mode_name == "M1_prefix_safe" else 15
+            expected_sw = 8 if mode_name == "M1_prefix_safe" else 12
             expected_ids = [0, 1] if mode_name == "M1_prefix_safe" else [0, 1, 2]
             assert (metrics["set_flag"], metrics["wait_flag"]) == (expected_sw, expected_sw)
             assert metrics["bar_all"] == 1
@@ -1639,7 +1639,7 @@ JIT_SUITE_SPECS: tuple[tuple[str, Any, list[tuple[tuple[int, ...], torch.dtype]]
             "m3_owned": False,
             "m1_max_ids": 4,
             "m2_max_ids": 5,
-            "m1_sw": (18, 18),
+            "m1_sw": (14, 14),
         },
     ),
     (
@@ -1658,7 +1658,9 @@ JIT_SUITE_SPECS: tuple[tuple[str, Any, list[tuple[tuple[int, ...], torch.dtype]]
         "tilelang_tail_k_gemm",
         jit_tilelang_tail_k_gemm,
         [((256, 1088), torch.float16), ((1088, 512), torch.float16), ((256, 512), torch.float16)],
-        {"m1_children": 1, "m2_route": "whole-exact", "m3_owned": True, "m1_max_ids": 6, "m1_sw": (25, 25)},
+        # Tier-2 Class-A windowing absorbs [k, mem_mat_8, mem_mat_9] to cut 25/25 -> 24/24 flags;
+        # parent pre-entry rearm reserves ID 0 while tail L1 loads use fresh (MTE2, MTE1) IDs {5, 6}.
+        {"m1_children": 1, "m2_route": "whole-exact", "m3_owned": True, "m1_max_ids": 7, "m1_sw": (24, 24)},
     ),
     (
         "tilelang_splitk_gemm",

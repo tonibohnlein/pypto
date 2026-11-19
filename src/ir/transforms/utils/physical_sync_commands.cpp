@@ -31,6 +31,7 @@
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/sync_invocation_domains.h"
 #include "src/ir/transforms/utils/sync_token_names.h"
+#include "src/ir/transforms/utils/sync_transform_common.h"
 
 namespace pypto::ir::sync {
 namespace physical {
@@ -47,19 +48,7 @@ std::optional<int64_t> OriginalBoundary(const AxisInfo& axis, int64_t digit) {
       return std::nullopt;
     return static_cast<int64_t>(value);
   }
-  if (!axis.loop || axis.start_expression || axis.step <= 0 || axis.count <= 0 || digit < 0 ||
-      digit >= axis.count)
-    return std::nullopt;
-  const auto start = As<ConstInt>(axis.loop->start_), step = As<ConstInt>(axis.loop->step_);
-  if (!start || !step || start->value_ != axis.start || step->value_ != axis.step) return std::nullopt;
-  const auto extent = __int128(axis.count - 1) * axis.step;
-  const auto last = __int128(axis.start) + extent;
-  const auto bound = __int128(axis.start) + __int128(digit) * axis.step;
-  if (extent > std::numeric_limits<int64_t>::max() || last > std::numeric_limits<int64_t>::max() ||
-      last < std::numeric_limits<int64_t>::min() || bound > std::numeric_limits<int64_t>::max() ||
-      bound < std::numeric_limits<int64_t>::min())
-    return std::nullopt;
-  return static_cast<int64_t>(bound);
+  return OriginalLoopBoundary(axis.loop, axis.start, axis.step, axis.count, axis.start_expression, digit);
 }
 
 ExprPtr FrameDigitExpr(const AxisInfo& axis, const Span& span) {
@@ -160,6 +149,19 @@ size_t HashAxisInfo(const AxisInfo& info) {
 }
 
 }  // namespace
+
+std::optional<int64_t> OriginalLoopBoundary(const ForStmtPtr& loop, int64_t start_val, int64_t step_val,
+                                            int64_t count, const ExprPtr& start_expr, int64_t digit) {
+  if (!loop || start_expr || step_val <= 0 || count <= 0 || digit < 0 || digit >= count) return std::nullopt;
+  const auto start = As<ConstInt>(loop->start_), step = As<ConstInt>(loop->step_);
+  if (!start || !step || start->value_ != start_val || step->value_ != step_val) return std::nullopt;
+  const auto last = __int128(start_val) + __int128(count - 1) * step_val;
+  const auto bound = __int128(start_val) + __int128(digit) * step_val;
+  if (last > std::numeric_limits<int64_t>::max() || last < std::numeric_limits<int64_t>::min() ||
+      bound > std::numeric_limits<int64_t>::max() || bound < std::numeric_limits<int64_t>::min())
+    return std::nullopt;
+  return static_cast<int64_t>(bound);
+}
 
 // ============================================================================
 // GuardDomainArena & Core RadixBoxGuard Algebra
@@ -352,6 +354,10 @@ AxisAP RadixBox::AxisRange(AxisId axis, const GuardDomainArena& arena) const {
   return AxisAP{0, arena.Axis(axis).count, 1};
 }
 
+namespace {
+bool CanonicalizeBox(RadixBox& box, const GuardDomainArena& arena);
+}  // namespace
+
 RadixBoxGuard RadixBoxGuard::True() {
   RadixBoxGuard g;
   g.kind_ = Kind::kBoxes;
@@ -362,6 +368,7 @@ RadixBoxGuard RadixBoxGuard::True() {
 RadixBoxGuard RadixBoxGuard::FromBox(std::shared_ptr<const GuardDomainArena> arena,
                                      std::optional<RadixBox> box) {
   if (!box) return False();
+  if (arena && !CanonicalizeBox(*box, *arena)) return False();
   if (box->IsUnconstrained()) return True();
   RadixBoxGuard g;
   g.kind_ = Kind::kBoxes;
@@ -497,7 +504,7 @@ bool CanonicalizeBox(RadixBox& box, const GuardDomainArena& arena) {
     for (size_t ri = 0; ri < box.ranks.size();) {
       auto& rc = box.ranks[ri];
       CHECK(rc.modulus >= 1) << "Invalid RankCongruence modulus";
-      rc.base = ((rc.base % rc.modulus) + rc.modulus) % rc.modulus;
+      rc.base = PositiveMod64(rc.base, rc.modulus);
       if (rc.residues.Empty()) return false;
       if (rc.residues.Full()) {
         box.ranks.erase(box.ranks.begin() + static_cast<std::ptrdiff_t>(ri));
@@ -527,18 +534,16 @@ bool CanonicalizeBox(RadixBox& box, const GuardDomainArena& arena) {
         const AxisAP ap = box.AxisRange(term.axis, arena);
         CHECK((ap.first - term.first) % term.step == 0) << "RankTerm step does not align with AxisAP origin";
         const int64_t p0 = (ap.first - term.first) / term.step;
-        term.coeff = ((term.coeff % rc.modulus) + rc.modulus) % rc.modulus;
+        term.coeff = PositiveMod64(term.coeff, rc.modulus);
         if (ap.Count() == 1) {
-          const __int128 add = __int128(rc.base) + __int128(term.coeff) * p0;
-          rc.base = static_cast<int64_t>(((add % rc.modulus) + rc.modulus) % rc.modulus);
+          rc.base = PositiveMod128(__int128(rc.base) + __int128(term.coeff) * p0, rc.modulus);
           changed = true;
           continue;
         }
         CHECK(ap.stride % term.step == 0) << "RankTerm step does not divide AxisAP stride";
         const int64_t delta = ap.stride / term.step;
         if ((__int128(term.coeff) * delta) % rc.modulus == 0) {
-          const __int128 add = __int128(rc.base) + __int128(term.coeff) * p0;
-          rc.base = static_cast<int64_t>(((add % rc.modulus) + rc.modulus) % rc.modulus);
+          rc.base = PositiveMod128(__int128(rc.base) + __int128(term.coeff) * p0, rc.modulus);
           changed = true;
           continue;
         }
@@ -563,7 +568,7 @@ bool CanonicalizeBox(RadixBox& box, const GuardDomainArena& arena) {
         std::vector<int64_t> hits;
         for (int64_t k0 = 0; k0 < P && k0 < n; ++k0) {
           const __int128 val = __int128(rc.base) + __int128(t.coeff) * (p0 + __int128(k0) * delta);
-          const int64_t r = static_cast<int64_t>(((val % rc.modulus) + rc.modulus) % rc.modulus);
+          const int64_t r = PositiveMod128(val, rc.modulus);
           if (rc.residues.Test(r)) hits.push_back(k0);
         }
         if (hits.empty()) return false;
@@ -606,6 +611,35 @@ bool CanonicalizeBox(RadixBox& box, const GuardDomainArena& arena) {
           box.ranks.erase(box.ranks.begin() + static_cast<std::ptrdiff_t>(ri));
           changed = true;
           continue;
+        } else {
+          // Tighten t.axis to the AxisAP hull of active hits even when non-uniform.
+          int64_t max_k = hits.front();
+          int64_t step_k = 0;
+          for (int64_t k0 : hits) {
+            const int64_t top_k = k0 + ((n - 1 - k0) / P) * P;
+            max_k = std::max(max_k, top_k);
+            step_k = std::gcd(step_k, k0 - hits.front());
+            if (top_k > k0) step_k = std::gcd(step_k, P);
+          }
+          if (step_k > 0) {
+            const int64_t new_first = ap.first + hits.front() * ap.stride;
+            const int64_t new_last = ap.first + max_k * ap.stride;
+            const int64_t axis_cnt = arena.Axis(t.axis).count;
+            std::optional<AxisAP> hull_ap;
+            if (new_first == new_last) {
+              hull_ap = AxisAP{new_first, new_first + 1, 1};
+            } else {
+              const __int128 wide_stride = __int128(ap.stride) * step_k;
+              if (wide_stride <= std::numeric_limits<int64_t>::max()) {
+                hull_ap = AxisAP::MakeCanonical(new_first, new_last + 1, static_cast<int64_t>(wide_stride),
+                                                axis_cnt);
+              }
+            }
+            if (hull_ap && *hull_ap != ap) {
+              if (!FoldSingleConstraintIntoBox(box, t.axis, *hull_ap, arena)) return false;
+              changed = true;
+            }
+          }
         }
       }
       ++ri;
@@ -695,7 +729,7 @@ std::optional<unsigned __int128> BoxCardinality(const RadixBox& box, const std::
     if (rc.modulus > 64) return std::nullopt;
     const size_t M = static_cast<size_t>(rc.modulus);
     std::vector<unsigned __int128> dp(M, 0), next_dp(M, 0);
-    dp[static_cast<size_t>(rc.base)] = 1;
+    dp[static_cast<size_t>(PositiveMod64(rc.base, rc.modulus))] = 1;
     std::set<AxisId> rank_axes;
     for (const auto& t : rc.terms) {
       rank_axes.insert(t.axis);
@@ -750,7 +784,9 @@ std::optional<unsigned __int128> BoxCardinality(const RadixBox& box, const std::
   const size_t M1 = static_cast<size_t>(rc1.modulus);
   const size_t S = M0 * M1;
   std::vector<unsigned __int128> dp(S, 0), next_dp(S, 0);
-  dp[static_cast<size_t>(rc0.base) * M1 + static_cast<size_t>(rc1.base)] = 1;
+  const size_t b0 = static_cast<size_t>(PositiveMod64(rc0.base, rc0.modulus));
+  const size_t b1 = static_cast<size_t>(PositiveMod64(rc1.base, rc1.modulus));
+  dp[b0 * M1 + b1] = 1;
   std::set<AxisId> rank_axes;
   for (const auto& t : rc0.terms) rank_axes.insert(t.axis);
   for (const auto& t : rc1.terms) rank_axes.insert(t.axis);
@@ -956,8 +992,9 @@ bool CoalesceBoxes(std::vector<RadixBox>& boxes, const GuardDomainArena& arena) 
             const int64_t last = std::max(l1, l2);
             const int64_t diff = std::abs(f1 - f2);
             const int64_t s = std::gcd(c1 > 1 ? s1 : 0, std::gcd(c2 > 1 ? s2 : 0, diff));
-            if (s > 0 && __int128(last - first) / s + 1 == __int128(c1) + c2) {
-              const int64_t axis_cnt = arena.Axis(*diff_axis).count;
+            const int64_t axis_cnt = arena.Axis(*diff_axis).count;
+            if (!CRTIntersect(ap_i, ap_j, axis_cnt).has_value() && s > 0 &&
+                __int128(last - first) / s + 1 == __int128(c1) + c2) {
               auto merged = AxisAP::MakeCanonical(first, last + 1, s, axis_cnt);
               if (merged) {
                 for (auto it = boxes[i].constraints.begin(); it != boxes[i].constraints.end(); ++it) {
@@ -1034,8 +1071,17 @@ bool CoalesceBoxes(std::vector<RadixBox>& boxes, const GuardDomainArena& arena) 
             g = std::gcd(g, ap.Count() > 1 ? ap.stride : 0);
             g = std::gcd(g, ap.first - f);
           }
-          if (g > 0 && __int128(l - f) / g + 1 == sum_cnt) {
-            const int64_t axis_cnt = arena.Axis(ax).count;
+          const int64_t axis_cnt = arena.Axis(ax).count;
+          bool aps_disjoint = true;
+          for (size_t u = 0; u < aps.size() && aps_disjoint; ++u) {
+            for (size_t v = u + 1; v < aps.size(); ++v) {
+              if (CRTIntersect(aps[u], aps[v], axis_cnt).has_value()) {
+                aps_disjoint = false;
+                break;
+              }
+            }
+          }
+          if (aps_disjoint && g > 0 && __int128(l - f) / g + 1 == sum_cnt) {
             auto merged = AxisAP::MakeCanonical(f, l + 1, g, axis_cnt);
             if (merged) {
               for (auto it = boxes[members[0]].constraints.begin(); it != boxes[members[0]].constraints.end();
@@ -1117,19 +1163,34 @@ std::optional<std::vector<RadixBox>> SubtractBox(const RadixBox& s, const RadixB
     const AxisAP g_ap = g_eff->AxisRange(ax, arena);
     if (s_ap == g_ap) continue;
     const int64_t axis_cnt = arena.Axis(ax).count;
+    const auto eff_ap = CRTIntersect(s_ap, g_ap, axis_cnt);
+    if (!eff_ap.has_value()) {
+      out.push_back(std::move(cur));
+      return out;
+    }
+    if (s_ap == *eff_ap) continue;
     std::vector<AxisAP> diff_aps;
-    if (auto pre = AxisAP::MakeCanonical(s_ap.first, g_ap.first, s_ap.stride, axis_cnt))
+    if (auto pre = AxisAP::MakeCanonical(s_ap.first, eff_ap->first, s_ap.stride, axis_cnt))
       diff_aps.push_back(*pre);
-    if (auto suf = AxisAP::MakeCanonical(g_ap.Last() + s_ap.stride, s_ap.end, s_ap.stride, axis_cnt))
-      diff_aps.push_back(*suf);
-    if (g_ap.Count() >= 2 && g_ap.stride > s_ap.stride) {
-      const int64_t m = g_ap.stride / s_ap.stride;
+    if (eff_ap->Last() < s_ap.Last()) {
+      const __int128 suf_first = __int128(eff_ap->Last()) + s_ap.stride;
+      if (suf_first < s_ap.end) {
+        if (auto suf =
+                AxisAP::MakeCanonical(static_cast<int64_t>(suf_first), s_ap.end, s_ap.stride, axis_cnt))
+          diff_aps.push_back(*suf);
+      }
+    }
+    if (eff_ap->Count() >= 2 && eff_ap->stride > s_ap.stride) {
+      const int64_t m = eff_ap->stride / s_ap.stride;
       if (out.size() + diff_aps.size() + static_cast<size_t>(m - 1) > RadixBoxGuard::kMaxGuardBoxes)
         return std::nullopt;
       for (int64_t r = 1; r < m; ++r) {
-        if (auto mid =
-                AxisAP::MakeCanonical(g_ap.first + r * s_ap.stride, g_ap.Last(), g_ap.stride, axis_cnt))
-          diff_aps.push_back(*mid);
+        const __int128 mid_first = __int128(eff_ap->first) + __int128(r) * s_ap.stride;
+        if (mid_first < eff_ap->Last()) {
+          if (auto mid = AxisAP::MakeCanonical(static_cast<int64_t>(mid_first), eff_ap->Last(),
+                                               eff_ap->stride, axis_cnt))
+            diff_aps.push_back(*mid);
+        }
       }
     }
     if (out.size() + diff_aps.size() > RadixBoxGuard::kMaxGuardBoxes) return std::nullopt;
@@ -1138,7 +1199,7 @@ std::optional<std::vector<RadixBox>> SubtractBox(const RadixBox& s, const RadixB
       if (FoldSingleConstraintIntoBox(piece, ax, p_ap, arena) && CanonicalizeBox(piece, arena))
         out.push_back(std::move(piece));
     }
-    if (!FoldSingleConstraintIntoBox(cur, ax, g_ap, arena) || !CanonicalizeBox(cur, arena)) {
+    if (!FoldSingleConstraintIntoBox(cur, ax, *eff_ap, arena) || !CanonicalizeBox(cur, arena)) {
       return out;
     }
   }
@@ -1490,6 +1551,7 @@ std::vector<ExprPtr> LowerAxisConstraint(const AxisConstraint& c, const OuterAxi
   const AxisAP& ap = c.ap;
   if (axis.kind == AxisKind::LaunchBlock) {
     if (ap.IsSingleton()) {
+      if (outer.first == ap.first && outer.end == ap.end) return {};
       return {std::make_shared<Eq>(axis.var, MakeInt(axis.start + ap.first, span), DataType::BOOL, span)};
     }
     const bool need_mod = (ap.stride > 1) && !(outer.stride > 0 && outer.stride % ap.stride == 0 &&
@@ -1518,6 +1580,7 @@ std::vector<ExprPtr> LowerAxisConstraint(const AxisConstraint& c, const OuterAxi
 
   // LoopFrame lowering.
   if (ap.IsSingleton()) {
+    if (outer.first == ap.first && outer.end == ap.end) return {};
     const auto ob = OriginalBoundary(axis, ap.first);
     const ExprPtr val = ob ? ExprPtr(axis.var) : FrameDigitExpr(axis, span);
     const ExprPtr rhs = MakeInt(ob ? *ob : ap.first, span);
@@ -1560,7 +1623,11 @@ ExprPtr LowerRankCongruenceExpr(const RankCongruence& rc, const GuardDomainArena
     if (t.first != 0) digit = std::make_shared<Sub>(digit, MakeInt(t.first, span), DataType::INDEX, span);
     if (t.step != 1) digit = std::make_shared<FloorDiv>(digit, MakeInt(t.step, span), DataType::INDEX, span);
     digit = std::make_shared<FloorMod>(digit, MakeInt(rc.modulus, span), DataType::INDEX, span);
-    if (t.coeff != 1) digit = std::make_shared<Mul>(digit, MakeInt(t.coeff, span), DataType::INDEX, span);
+    if (t.coeff != 1) {
+      digit = std::make_shared<FloorMod>(
+          std::make_shared<Mul>(digit, MakeInt(t.coeff, span), DataType::INDEX, span),
+          MakeInt(rc.modulus, span), DataType::INDEX, span);
+    }
     if (rank_expr) {
       rank_expr = std::make_shared<FloorMod>(std::make_shared<Add>(rank_expr, digit, DataType::INDEX, span),
                                              MakeInt(rc.modulus, span), DataType::INDEX, span);
@@ -1572,8 +1639,6 @@ ExprPtr LowerRankCongruenceExpr(const RankCongruence& rc, const GuardDomainArena
     rank_expr = std::make_shared<FloorMod>(
         std::make_shared<Add>(MakeInt(rc.base, span), rank_expr, DataType::INDEX, span),
         MakeInt(rc.modulus, span), DataType::INDEX, span);
-  } else if (rc.terms.size() == 1 && rc.terms[0].coeff != 1) {
-    rank_expr = std::make_shared<FloorMod>(rank_expr, MakeInt(rc.modulus, span), DataType::INDEX, span);
   }
 
   const size_t pop = rc.residues.PopCount();
@@ -1652,6 +1717,22 @@ std::vector<ExprPtr> LowerBoxToSplitPredicates(const RadixBox& box, const RadixB
   return preds;
 }
 
+namespace {
+std::optional<std::vector<ExprPtr>> TryLowerSingleBoxSplitPredicates(const RadixBoxGuard& g_eff,
+                                                                     const RadixBoxGuard& scope,
+                                                                     const Span& span) {
+  if (g_eff.Boxes().size() != 1 || !g_eff.Arena()) return std::nullopt;
+  RadixBox box = g_eff.Boxes()[0];
+  if (!scope.IsOpaque() && g_eff.IsDisjoint() && scope.IsDisjoint()) {
+    const auto universe = ReferencedAxes(scope, g_eff);
+    auto relaxed = RelaxBoxesForExpr(g_eff, scope, *g_eff.Arena(), universe);
+    if (relaxed.size() != 1) return std::nullopt;
+    box = std::move(relaxed[0]);
+  }
+  return LowerBoxToSplitPredicates(box, scope, *g_eff.Arena(), span);
+}
+}  // namespace
+
 ExprPtr LowerRadixGuardToExpr(const RadixBoxGuard& g, const RadixBoxGuard& scope, const Span& span) {
   if (g.IsEmpty()) return std::make_shared<ConstBool>(false, span);
   if (g.IsTautology()) return std::make_shared<ConstBool>(true, span);
@@ -1710,6 +1791,8 @@ bool SameControl(const IRNodePtr& left, const IRNodePtr& right) {
   }
 }
 
+namespace {
+
 bool CommandValueCandidate(const ExprPtr& expression) {
   const auto binary = As<BinaryExpr>(expression);
   if (!binary) return false;
@@ -1737,8 +1820,6 @@ bool PureCommandExpression(const ExprPtr& expression, size_t* inspections) {
   return PureCommandExpression(binary->left_, inspections) &&
          PureCommandExpression(binary->right_, inspections);
 }
-
-namespace {
 
 size_t ExprNodeCount(const ExprPtr& expr) {
   if (!expr) return 0;
@@ -1837,21 +1918,27 @@ class ScalarBindingPlanner {
         } else if (node->guard.IsOpaque()) {
           item.combined_expr = node->guard.OpaqueExpr();
         } else {
-          const auto g_eff = IntersectGuards(scope, node->guard);
-          item.then_scope = g_eff;
-          if (!node->alternative.empty()) {
+          const auto g_eff = scope.IsOpaque() ? node->guard : IntersectGuards(scope, node->guard);
+          item.then_scope = scope.IsOpaque() ? scope : g_eff;
+          if (!node->alternative.empty() && !scope.IsOpaque()) {
             item.else_scope = SubtractGuards(scope, g_eff).value_or(scope);
           }
-          if (node->alternative.empty() && node->guard.Boxes().size() == 1 && node->guard.Arena()) {
-            auto preds =
-                LowerBoxToSplitPredicates(node->guard.Boxes()[0], scope, *node->guard.Arena(), node->span);
-            if (preds.empty()) {
-              item.combined_expr = std::make_shared<ConstBool>(true, node->span);
-            } else if (preds.size() == 1) {
-              item.combined_expr = preds[0];
+          if (!scope.IsOpaque() && g_eff.IsEmpty()) {
+            item.combined_expr = std::make_shared<ConstBool>(false, node->span);
+          } else if (!scope.IsOpaque() && EquivalentGuardsInScope(g_eff, RadixBoxGuard::True(), scope)) {
+            item.combined_expr = std::make_shared<ConstBool>(true, node->span);
+          } else if (node->alternative.empty()) {
+            if (auto preds = TryLowerSingleBoxSplitPredicates(g_eff, scope, node->span)) {
+              if (preds->empty()) {
+                item.combined_expr = std::make_shared<ConstBool>(true, node->span);
+              } else if (preds->size() == 1) {
+                item.combined_expr = (*preds)[0];
+              } else {
+                item.split_preds = std::move(*preds);
+                item.combined_expr = item.split_preds.front();
+              }
             } else {
-              item.split_preds = std::move(preds);
-              item.combined_expr = item.split_preds.front();
+              item.combined_expr = LowerRadixGuardToExpr(node->guard, scope, node->span);
             }
           } else {
             item.combined_expr = LowerRadixGuardToExpr(node->guard, scope, node->span);
@@ -2050,6 +2137,8 @@ std::vector<StmtPtr> MaterializeFrozenCommands(const ControlForest& forest, Sync
   return EmitFrozen(*FreezeCommandForest(forest, work, scope), names, work);
 }
 
+namespace {
+
 std::vector<const Var*> GuardPredicateInputs(const RadixBoxGuard& guard, PhysicalSyncRealization& work,
                                              bool& qualified) {
   if (guard.IsEmpty() || guard.IsTautology()) {
@@ -2086,6 +2175,8 @@ void VisitControlGuardExpressions(const RadixBoxGuard& guard, IRVisitor& visitor
     }
   }
 }
+
+}  // namespace
 
 size_t HashRadixBoxGuard(const RadixBoxGuard& guard) {
   if (guard.IsEmpty()) return 0x101;
@@ -2237,12 +2328,18 @@ GuardMetrics AnalyticGuardMetrics(const RadixBoxGuard& guard, const RadixBoxGuar
   if (guard.IsOpaque()) {
     return {1, ExprNodeCount(guard.OpaqueExpr()), 1};
   }
-  if (!has_alternative && guard.Boxes().size() == 1 && guard.Arena()) {
-    const auto preds = LowerBoxToSplitPredicates(guard.Boxes()[0], scope, *guard.Arena(), span);
-    if (preds.empty()) return {};
-    size_t exprs = 0;
-    for (const auto& p : preds) exprs += ExprNodeCount(p);
-    return {preds.size(), exprs, 2 * preds.size() - 1};
+  const RadixBoxGuard g_eff = scope.IsOpaque() ? guard : IntersectGuards(scope, guard);
+  if (!scope.IsOpaque() &&
+      (g_eff.IsEmpty() || EquivalentGuardsInScope(g_eff, RadixBoxGuard::True(), scope))) {
+    return {};
+  }
+  if (!has_alternative) {
+    if (const auto preds = TryLowerSingleBoxSplitPredicates(g_eff, scope, span)) {
+      if (preds->empty()) return {};
+      size_t exprs = 0;
+      for (const auto& p : *preds) exprs += ExprNodeCount(p);
+      return {preds->size(), exprs, 2 * preds->size() - 1};
+    }
   }
   const ExprPtr expr = LowerRadixGuardToExpr(guard, scope, span);
   if (As<ConstBool>(expr)) return {};
@@ -2392,7 +2489,8 @@ class CommandGuards {
     const bool check_launch_disjoint = GuardHasLaunchBlock(moving_guard);
     for (size_t m = lo; m < hi; ++m) {
       if (nodes[m].guard.IsOpaque() || !SameKindDisjointCommands(moving, nodes[m])) return false;
-      if (check_launch_disjoint && !AreDisjointGuardsInScope(moving_guard, nodes[m].guard, scope)) {
+      if ((check_launch_disjoint || GuardHasLaunchBlock(nodes[m].guard)) &&
+          !AreDisjointGuardsInScope(moving_guard, nodes[m].guard, scope)) {
         return false;
       }
     }
@@ -2457,6 +2555,116 @@ class CommandGuards {
   static bool IsComplementShortcutNe(const RadixBoxGuard& g, const RadixBoxGuard& scope, const Span& span) {
     if (g.IsOpaque() || scope.IsOpaque() || g.Boxes().size() < 2) return false;
     return As<Ne>(LowerRadixGuardToExpr(g, scope, span)) != nullptr;
+  }
+
+  static bool RankUsesAxis(const RadixBox& box, AxisId axis) {
+    for (const auto& r : box.ranks) {
+      for (const auto& t : r.terms) {
+        if (t.axis == axis) return true;
+      }
+    }
+    return false;
+  }
+
+  static bool MatchesOuterAxis(const Node& node, const AxisConstraint& outer_c) {
+    return !node.leaf && !node.guard.IsOpaque() && node.alternative.empty() &&
+           node.guard.Boxes().size() == 1 && !node.guard.Boxes()[0].constraints.empty() &&
+           node.guard.Boxes()[0].constraints[0] == outer_c &&
+           !RankUsesAxis(node.guard.Boxes()[0], outer_c.axis);
+  }
+
+  bool TryFactorNA4At(std::vector<Node>& list, size_t start, const RadixBoxGuard& scope,
+                      bool pair_else_branches) {
+    if (start + 1 >= list.size() || list[start].leaf || list[start].guard.IsOpaque() ||
+        !list[start].alternative.empty() || list[start].guard.Boxes().size() != 1 ||
+        list[start].guard.Boxes()[0].constraints.empty())
+      return false;
+    const auto& arena = list[start].guard.Arena();
+    if (!arena) return false;
+    const auto& box0 = list[start].guard.Boxes()[0];
+    const AxisConstraint outer_c = box0.constraints[0];
+    if (box0.constraints.size() == 1 && box0.ranks.empty()) return false;
+    if (RankUsesAxis(box0, outer_c.axis)) return false;
+    if (!MatchesOuterAxis(list[start + 1], outer_c)) return false;
+    size_t k = start + 1;
+    while (k + 1 < list.size() && MatchesOuterAxis(list[k + 1], outer_c)) ++k;
+
+    RadixBox outer_box;
+    outer_box.constraints.push_back(outer_c);
+    const RadixBoxGuard outer_guard = RadixBoxGuard::FromBox(arena, outer_box);
+    const auto span_i = list[start].span;
+    const size_t outer_guards = AnalyticGuardMetrics(outer_guard, scope, false, list[start].GetSpan()).guards;
+    size_t before_guards = 0;
+    for (size_t idx = start; idx <= k; ++idx) before_guards += CountNodeGuards({list[idx]}, scope);
+    std::vector<Node> inner(list.begin() + static_cast<std::ptrdiff_t>(start),
+                            list.begin() + static_cast<std::ptrdiff_t>(k) + 1);
+    const RadixBoxGuard inner_scope = IntersectGuards(scope, outer_guard);
+    if (!inner_scope.IsDisjoint() || inner_scope.IsEmpty()) return false;
+    for (const auto& child : inner) {
+      const auto narrowed = SimplifyGuardGiven(child.guard, inner_scope);
+      if (narrowed.Boxes().size() == 1 && !narrowed.Boxes()[0].constraints.empty() &&
+          narrowed.Boxes()[0].constraints[0] == outer_c) {
+        return false;
+      }
+    }
+    NormalizeNodes(inner, inner_scope, pair_else_branches);
+    const size_t after_guards = outer_guards + CountNodeGuards(inner, inner_scope);
+    if (after_guards >= before_guards) return false;
+    Node wrapped{outer_guard, nullptr, span_i, std::move(inner), {}};
+    list.erase(list.begin() + static_cast<std::ptrdiff_t>(start),
+               list.begin() + static_cast<std::ptrdiff_t>(k) + 1);
+    list.insert(list.begin() + static_cast<std::ptrdiff_t>(start), std::move(wrapped));
+    return true;
+  }
+
+  bool TryFuseAdjacent7BAt(std::vector<Node>& list, size_t idx, const RadixBoxGuard& scope,
+                           bool pair_else_branches) {
+    const size_t j = idx + 1;
+    const auto min_len = std::min(list[idx].children.size(), list[j].children.size());
+    size_t prefix = 0;
+    while (prefix < min_len && SameNode(list[idx].children[prefix], list[j].children[prefix])) ++prefix;
+    size_t suffix = 0;
+    while (prefix + suffix < min_len && SameNode(list[idx].children[list[idx].children.size() - 1 - suffix],
+                                                 list[j].children[list[j].children.size() - 1 - suffix]))
+      ++suffix;
+    if (!(prefix > 0 || suffix > 0 ||
+          (pair_else_branches && !list[idx].children.empty() && !list[j].children.empty()))) {
+      return false;
+    }
+    std::vector<Node> replacement;
+    for (size_t p = 0; p < prefix; ++p) replacement.push_back(list[idx].children[p]);
+    std::vector<Node> rem_i(list[idx].children.begin() + static_cast<std::ptrdiff_t>(prefix),
+                            list[idx].children.end() - static_cast<std::ptrdiff_t>(suffix));
+    std::vector<Node> rem_j(list[j].children.begin() + static_cast<std::ptrdiff_t>(prefix),
+                            list[j].children.end() - static_cast<std::ptrdiff_t>(suffix));
+    std::vector<Node> suf(list[idx].children.end() - static_cast<std::ptrdiff_t>(suffix),
+                          list[idx].children.end());
+    const auto& residual = !rem_i.empty() ? rem_i : rem_j;
+    const bool suf_before_residual = suffix > 0 && (!rem_i.empty() != !rem_j.empty()) && suf.size() == 1 &&
+                                     SameKindDisjointCommands(residual, suf.front());
+    if (suf_before_residual) {
+      replacement.insert(replacement.end(), std::make_move_iterator(suf.begin()),
+                         std::make_move_iterator(suf.end()));
+    }
+    if (pair_else_branches && !rem_i.empty() && !rem_j.empty()) {
+      replacement.push_back(
+          Node{list[idx].guard, nullptr, list[idx].span, std::move(rem_i), std::move(rem_j)});
+    } else {
+      if (!rem_i.empty())
+        replacement.push_back(Node{list[idx].guard, nullptr, list[idx].span, std::move(rem_i), {}});
+      if (!rem_j.empty())
+        replacement.push_back(Node{list[j].guard, nullptr, list[j].span, std::move(rem_j), {}});
+    }
+    if (!suf_before_residual) {
+      replacement.insert(replacement.end(), std::make_move_iterator(suf.begin()),
+                         std::make_move_iterator(suf.end()));
+    }
+    list.erase(list.begin() + static_cast<std::ptrdiff_t>(idx),
+               list.begin() + static_cast<std::ptrdiff_t>(j) + 1);
+    list.insert(list.begin() + static_cast<std::ptrdiff_t>(idx), std::make_move_iterator(replacement.begin()),
+                std::make_move_iterator(replacement.end()));
+    NormalizeNodes(list, scope, pair_else_branches);
+    return true;
   }
 
   void NormalizeNodes(std::vector<Node>& nodes, const RadixBoxGuard& scope, bool pair_else_branches) {
@@ -2642,101 +2850,46 @@ class CommandGuards {
 
       // 6. NA-4: Outer-axis factoring across 1-box then-only siblings.
       for (size_t i = 0; i < nodes.size() && !changed; ++i) {
+        if (TryFactorNA4At(nodes, i, scope, pair_else_branches)) {
+          changed = true;
+          break;
+        }
         if (nodes[i].leaf || nodes[i].guard.IsOpaque() || !nodes[i].alternative.empty() ||
             nodes[i].guard.Boxes().size() != 1 || nodes[i].guard.Boxes()[0].constraints.empty() ||
-            scope.IsOpaque())
+            scope.IsOpaque() || !nodes[i].guard.Arena())
           continue;
-        const auto& arena = nodes[i].guard.Arena();
-        if (!arena) continue;
-        const AxisConstraint outer_c = nodes[i].guard.Boxes()[0].constraints[0];
-        if (nodes[i].guard.Boxes()[0].constraints.size() == 1 && nodes[i].guard.Boxes()[0].ranks.empty())
+        const auto& box0 = nodes[i].guard.Boxes()[0];
+        const AxisConstraint outer_c = box0.constraints[0];
+        if ((box0.constraints.size() == 1 && box0.ranks.empty()) || RankUsesAxis(box0, outer_c.axis))
           continue;
-        for (const auto& r : nodes[i].guard.Boxes()[0].ranks) {
-          bool used = false;
-          for (const auto& t : r.terms)
-            if (t.axis == outer_c.axis) used = true;
-          if (used) goto skip_na4;
-        }
-        if (i + 1 < nodes.size() && !nodes[i + 1].leaf && !nodes[i + 1].guard.IsOpaque() &&
-            nodes[i + 1].alternative.empty() && nodes[i + 1].guard.Boxes().size() == 1 &&
-            !nodes[i + 1].guard.Boxes()[0].constraints.empty() &&
-            nodes[i + 1].guard.Boxes()[0].constraints[0] == outer_c) {
-          size_t k = i + 1;
-          while (k + 1 < nodes.size() && !nodes[k + 1].leaf && !nodes[k + 1].guard.IsOpaque() &&
-                 nodes[k + 1].alternative.empty() && nodes[k + 1].guard.Boxes().size() == 1 &&
-                 !nodes[k + 1].guard.Boxes()[0].constraints.empty() &&
-                 nodes[k + 1].guard.Boxes()[0].constraints[0] == outer_c) {
-            ++k;
-          }
-          bool rank_uses = false;
-          for (size_t idx = i + 1; idx <= k && !rank_uses; ++idx) {
-            for (const auto& r : nodes[idx].guard.Boxes()[0].ranks)
-              for (const auto& t : r.terms)
-                if (t.axis == outer_c.axis) rank_uses = true;
-          }
-          if (!rank_uses) {
-            RadixBox outer_box;
-            outer_box.constraints.push_back(outer_c);
-            const RadixBoxGuard outer_guard = RadixBoxGuard::FromBox(arena, outer_box);
-            const auto span_i = nodes[i].span;
-            const size_t outer_guards =
-                AnalyticGuardMetrics(outer_guard, scope, false, nodes[i].GetSpan()).guards;
-            size_t before_guards = 0;
-            for (size_t idx = i; idx <= k; ++idx) before_guards += NodeGuardCount(nodes[idx], scope);
-            std::vector<Node> inner(nodes.begin() + static_cast<std::ptrdiff_t>(i),
-                                    nodes.begin() + static_cast<std::ptrdiff_t>(k) + 1);
-            const RadixBoxGuard inner_scope = IntersectGuards(scope, outer_guard);
-            bool any_kept_outer = !inner_scope.IsDisjoint();
-            for (const auto& child : inner) {
-              if (any_kept_outer) break;
-              const auto narrowed = SimplifyGuardGiven(child.guard, inner_scope);
-              if (narrowed.Boxes().size() == 1 && !narrowed.Boxes()[0].constraints.empty() &&
-                  narrowed.Boxes()[0].constraints[0] == outer_c) {
-                any_kept_outer = true;
-              }
-            }
-            if (!any_kept_outer) {
-              NormalizeNodes(inner, inner_scope, pair_else_branches);
-              const size_t after_guards = outer_guards + CountNodeGuards(inner, inner_scope);
-              if (after_guards < before_guards) {
-                Node wrapped{outer_guard, nullptr, span_i, std::move(inner), {}};
-                nodes.erase(nodes.begin() + static_cast<std::ptrdiff_t>(i),
-                            nodes.begin() + static_cast<std::ptrdiff_t>(k) + 1);
-                nodes.insert(nodes.begin() + static_cast<std::ptrdiff_t>(i), std::move(wrapped));
-                changed = true;
-                break;
-              }
-            }
-          }
-        } else {
-          // Non-adjacent slide for NA-4.
-          for (size_t j = i + 2; j < nodes.size(); ++j) {
-            if (nodes[j].leaf || nodes[j].guard.IsOpaque() || !nodes[j].alternative.empty() ||
-                nodes[j].guard.Boxes().size() != 1 || nodes[j].guard.Boxes()[0].constraints.empty())
-              continue;
-            if (!(nodes[j].guard.Boxes()[0].constraints[0] == outer_c)) continue;
-            bool j_rank_uses = false;
-            for (const auto& r : nodes[j].guard.Boxes()[0].ranks)
-              for (const auto& t : r.terms)
-                if (t.axis == outer_c.axis) j_rank_uses = true;
-            if (j_rank_uses) continue;
-            if (CommutesAcross(nodes[i].guard, nodes[i].children, nodes, i + 1, j, scope)) {
-              Node moved = std::move(nodes[i]);
-              nodes.erase(nodes.begin() + static_cast<std::ptrdiff_t>(i));
-              nodes.insert(nodes.begin() + static_cast<std::ptrdiff_t>(j) - 1, std::move(moved));
+        // Non-adjacent slide for NA-4: commit only if factoring actually fires and strictly improves.
+        for (size_t j = i + 2; j < nodes.size(); ++j) {
+          if (!MatchesOuterAxis(nodes[j], outer_c)) continue;
+          if (CommutesAcross(nodes[i].guard, nodes[i].children, nodes, i + 1, j, scope)) {
+            std::vector<Node> trial = nodes;
+            Node moved = std::move(trial[i]);
+            trial.erase(trial.begin() + static_cast<std::ptrdiff_t>(i));
+            trial.insert(trial.begin() + static_cast<std::ptrdiff_t>(j) - 1, std::move(moved));
+            size_t factor_start = j - 1;
+            while (factor_start > 0 && MatchesOuterAxis(trial[factor_start - 1], outer_c)) --factor_start;
+            if (TryFactorNA4At(trial, factor_start, scope, pair_else_branches)) {
+              nodes = std::move(trial);
               changed = true;
               break;
             }
-            if (CommutesAcross(nodes[j].guard, nodes[j].children, nodes, i + 1, j, scope)) {
-              Node moved = std::move(nodes[j]);
-              nodes.erase(nodes.begin() + static_cast<std::ptrdiff_t>(j));
-              nodes.insert(nodes.begin() + static_cast<std::ptrdiff_t>(i) + 1, std::move(moved));
+          }
+          if (CommutesAcross(nodes[j].guard, nodes[j].children, nodes, i + 1, j, scope)) {
+            std::vector<Node> trial = nodes;
+            Node moved = std::move(trial[j]);
+            trial.erase(trial.begin() + static_cast<std::ptrdiff_t>(j));
+            trial.insert(trial.begin() + static_cast<std::ptrdiff_t>(i) + 1, std::move(moved));
+            if (TryFactorNA4At(trial, i, scope, pair_else_branches)) {
+              nodes = std::move(trial);
               changed = true;
               break;
             }
           }
         }
-      skip_na4:;
       }
       if (changed) continue;
 
@@ -2810,7 +2963,7 @@ class CommandGuards {
                   replacement.insert(replacement.end(), std::make_move_iterator(suf.begin()),
                                      std::make_move_iterator(suf.end()));
                 }
-                if (pair_else_branches && non_empty_arms.size() >= 2) {
+                if (pair_else_branches && non_empty_arms.size() == m) {
                   // Build nested if / else if / ... / else chain, ensuring GuardCount decreases.
                   Node chain = Node{RadixBoxGuard::True(),
                                     nullptr,
@@ -2856,71 +3009,34 @@ class CommandGuards {
           if (j > i + 1 && (nodes[i].guard.IsOpaque() || nodes[j].guard.IsOpaque() || scope.IsOpaque()))
             continue;
           if (j == i + 1) {
-            const auto min_len = std::min(nodes[i].children.size(), nodes[j].children.size());
-            size_t prefix = 0;
-            while (prefix < min_len && SameNode(nodes[i].children[prefix], nodes[j].children[prefix]))
-              ++prefix;
-            size_t suffix = 0;
-            while (prefix + suffix < min_len &&
-                   SameNode(nodes[i].children[nodes[i].children.size() - 1 - suffix],
-                            nodes[j].children[nodes[j].children.size() - 1 - suffix]))
-              ++suffix;
-            if (prefix > 0 || suffix > 0 ||
-                (pair_else_branches && !nodes[i].children.empty() && !nodes[j].children.empty())) {
-              std::vector<Node> replacement;
-              for (size_t p = 0; p < prefix; ++p) replacement.push_back(nodes[i].children[p]);
-              std::vector<Node> rem_i(nodes[i].children.begin() + static_cast<std::ptrdiff_t>(prefix),
-                                      nodes[i].children.end() - static_cast<std::ptrdiff_t>(suffix));
-              std::vector<Node> rem_j(nodes[j].children.begin() + static_cast<std::ptrdiff_t>(prefix),
-                                      nodes[j].children.end() - static_cast<std::ptrdiff_t>(suffix));
-              std::vector<Node> suf(nodes[i].children.end() - static_cast<std::ptrdiff_t>(suffix),
-                                    nodes[i].children.end());
-              const auto& residual = !rem_i.empty() ? rem_i : rem_j;
-              const bool suf_before_residual = suffix > 0 && (!rem_i.empty() != !rem_j.empty()) &&
-                                               suf.size() == 1 &&
-                                               SameKindDisjointCommands(residual, suf.front());
-              if (suf_before_residual) {
-                replacement.insert(replacement.end(), std::make_move_iterator(suf.begin()),
-                                   std::make_move_iterator(suf.end()));
-              }
-              if (pair_else_branches && !rem_i.empty() && !rem_j.empty()) {
-                replacement.push_back(
-                    Node{nodes[i].guard, nullptr, nodes[i].span, std::move(rem_i), std::move(rem_j)});
-              } else {
-                if (!rem_i.empty())
-                  replacement.push_back(Node{nodes[i].guard, nullptr, nodes[i].span, std::move(rem_i), {}});
-                if (!rem_j.empty())
-                  replacement.push_back(Node{nodes[j].guard, nullptr, nodes[j].span, std::move(rem_j), {}});
-              }
-              if (!suf_before_residual) {
-                replacement.insert(replacement.end(), std::make_move_iterator(suf.begin()),
-                                   std::make_move_iterator(suf.end()));
-              }
-              nodes.erase(nodes.begin() + static_cast<std::ptrdiff_t>(i),
-                          nodes.begin() + static_cast<std::ptrdiff_t>(j) + 1);
-              nodes.insert(nodes.begin() + static_cast<std::ptrdiff_t>(i),
-                           std::make_move_iterator(replacement.begin()),
-                           std::make_move_iterator(replacement.end()));
-              NormalizeNodes(nodes, scope, pair_else_branches);
+            if (TryFuseAdjacent7BAt(nodes, i, scope, pair_else_branches)) {
               changed = true;
               break;
             }
           } else {
             // Non-adjacent complementary (NA-3):
-            // 1) Whole-branch slide if either commutes across the gap.
+            // 1) Whole-branch slide only if adjacent 7B hoist/fusion actually fires.
             if (CommutesAcross(nodes[i].guard, nodes[i].children, nodes, i + 1, j, scope)) {
-              Node moved = std::move(nodes[i]);
-              nodes.erase(nodes.begin() + static_cast<std::ptrdiff_t>(i));
-              nodes.insert(nodes.begin() + static_cast<std::ptrdiff_t>(j) - 1, std::move(moved));
-              changed = true;
-              break;
+              std::vector<Node> trial = nodes;
+              Node moved = std::move(trial[i]);
+              trial.erase(trial.begin() + static_cast<std::ptrdiff_t>(i));
+              trial.insert(trial.begin() + static_cast<std::ptrdiff_t>(j) - 1, std::move(moved));
+              if (TryFuseAdjacent7BAt(trial, j - 1, scope, pair_else_branches)) {
+                nodes = std::move(trial);
+                changed = true;
+                break;
+              }
             }
             if (CommutesAcross(nodes[j].guard, nodes[j].children, nodes, i + 1, j, scope)) {
-              Node moved = std::move(nodes[j]);
-              nodes.erase(nodes.begin() + static_cast<std::ptrdiff_t>(j));
-              nodes.insert(nodes.begin() + static_cast<std::ptrdiff_t>(i) + 1, std::move(moved));
-              changed = true;
-              break;
+              std::vector<Node> trial = nodes;
+              Node moved = std::move(trial[j]);
+              trial.erase(trial.begin() + static_cast<std::ptrdiff_t>(j));
+              trial.insert(trial.begin() + static_cast<std::ptrdiff_t>(i) + 1, std::move(moved));
+              if (TryFuseAdjacent7BAt(trial, i, scope, pair_else_branches)) {
+                nodes = std::move(trial);
+                changed = true;
+                break;
+              }
             }
             // 2) Partial prefix/suffix hoist across commuting gap even if residuals don't commute.
             const auto min_len = std::min(nodes[i].children.size(), nodes[j].children.size());
@@ -3071,6 +3187,8 @@ Intervals SubtractIntervals(const Intervals& domain, const Intervals& absent) {
   return result;
 }
 
+namespace {
+
 bool DomainIntersects(const Intervals& domain, int64_t lo, int64_t hi) {
   if (lo > hi) return false;
   const auto next =
@@ -3078,8 +3196,6 @@ bool DomainIntersects(const Intervals& domain, int64_t lo, int64_t hi) {
                        [](const auto& interval, int64_t value) { return interval.second < value; });
   return next != domain.end() && next->first <= hi;
 }
-
-namespace {
 
 std::vector<CaseCommands> CoalesceCutCases(const std::vector<CaseCommands>& source, const Intervals& domain,
                                            PhysicalSyncRealization& work) {

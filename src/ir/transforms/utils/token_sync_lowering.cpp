@@ -31,7 +31,6 @@
 #include <vector>
 
 #include "pypto/backend/common/buffer_sync_contract.h"
-#include "pypto/core/any_cast.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/sync.h"
@@ -44,6 +43,7 @@
 #include "src/ir/transforms/utils/retained_sync_child.h"
 #include "src/ir/transforms/utils/sync_footprint_resolver.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
+#include "src/ir/transforms/utils/sync_transform_common.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -54,12 +54,6 @@ void Join(Row& target, const Row& source) {
   for (size_t pipe = 0; pipe < kPipeCount; ++pipe) target[pipe] = std::max(target[pipe], source[pipe]);
 }
 StmtPtr Empty(const Span& span) { return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, span); }
-PipeType Pipe(const CallPtr& call, const char* key) {
-  for (const auto& [name, value] : call->kwargs_)
-    if (name == key) return static_cast<PipeType>(AnyCast<int>(value, name));
-  INTERNAL_CHECK(false) << "Internal error: verified synchronization pipe is missing";
-  return PipeType::ALL;
-}
 // Discovery and admission use the canonical logical-op classification. Cache
 // expression nodes because token joins and scalar metadata are shared DAGs.
 class FindLogical : public IRVisitor {
@@ -282,7 +276,7 @@ class FiniteLowering {
       auto call = As<Call>(assign->value_);
       Token token;
       if (IsOp(call, "sync.record")) {
-        const auto pipe = Pipe(call, "pipe");
+        const auto pipe = RequireSyncPipeKwarg(call, "pipe");
         Row row = completions_[pipe];
         Join(row, gates_[pipe]);
         // A record of a genuinely empty prefix denotes the same satisfied
@@ -304,7 +298,7 @@ class FiniteLowering {
             << "LowerSync requires distinct token occurrence cuts";
         const auto token = Value(call->args_[0]);
         if (!token) return;  // No completion obligation, and no consuming event.
-        const auto destination = Pipe(call, "dst_pipe");
+        const auto destination = RequireSyncPipeKwarg(call, "dst_pipe");
         const auto& record = records_[*token];
         Row row = starts_[destination];
         Join(row, gates_[destination]);
@@ -513,7 +507,7 @@ class ForwardSyncOptimizer : public IRMutator {
         return op;
       }
       if (IsOp(call, "sync.record")) {
-        local_record_[op->var_.get()] = {Pipe(call, "pipe"), scope_depth_, record_seq_++};
+        local_record_[op->var_.get()] = {RequireSyncPipeKwarg(call, "pipe"), scope_depth_, record_seq_++};
         return op;
       }
       if (IsOp(call, "sync.join") && call->args_.size() == 2) {
@@ -691,7 +685,7 @@ class ForwardSyncOptimizer : public IRMutator {
     if (!call || !IsOp(call, "sync.wait") || call->args_.empty()) return std::nullopt;
     const auto tok = AsVarLike(call->args_[0]);
     if (!tok) return std::nullopt;
-    return std::make_pair(tok, Pipe(call, "dst_pipe"));
+    return std::make_pair(tok, RequireSyncPipeKwarg(call, "dst_pipe"));
   }
   std::unordered_map<const Var*, uint32_t> waited_masks_;
   std::unordered_set<const Var*> completed_;

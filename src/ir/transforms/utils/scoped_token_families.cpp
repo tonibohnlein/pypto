@@ -33,13 +33,13 @@
 #include <utility>
 #include <vector>
 
-#include "pypto/core/any_cast.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "src/ir/transforms/utils/sync_invocation_domains.h"
+#include "src/ir/transforms/utils/sync_transform_common.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -89,12 +89,6 @@ struct Cursor {
   YieldStmtPtr yield;
   bool returned = false;
 };
-PipeType Pipe(const CallPtr& call, const char* key) {
-  for (const auto& [name, value] : call->kwargs_)
-    if (name == key) return static_cast<PipeType>(AnyCast<int>(value, name));
-  CHECK(false) << "Missing logical synchronization pipe";
-  return PipeType::ALL;
-}
 ExprPtr PureYield(StmtPtr body) {
   while (auto sequence = As<SeqStmts>(body)) {
     if (sequence->stmts_.size() != 1) return nullptr;
@@ -102,18 +96,6 @@ ExprPtr PureYield(StmtPtr body) {
   }
   const auto yield = As<YieldStmt>(body);
   return yield && yield->value_.size() == 1 ? yield->value_.front() : nullptr;
-}
-CallPtr Payload(const StmtPtr& statement) {
-  if (auto eval = As<EvalStmt>(statement)) return As<Call>(eval->expr_);
-  if (auto branch = As<IfStmt>(statement)) {
-    auto first = branch->then_body_;
-    if (auto sequence = As<SeqStmts>(first)) {
-      if (sequence->stmts_.size() != 1) return nullptr;
-      first = sequence->stmts_.front();
-    }
-    if (auto eval = As<EvalStmt>(first)) return As<Call>(eval->expr_);
-  }
-  return nullptr;
 }
 class Parser {
  public:
@@ -377,7 +359,8 @@ class Parser {
     CHECK(IsOp(call, "sync.wait")) << "Conditional scoped token statement is not a wait";
     ++work_.waits_inspected;
     if (!enabled) ++work_.inactive_waits;
-    if (enabled) cursor.pending.push_back({call->args_.at(0), Pipe(call, "dst_pipe"), domain});
+    if (enabled)
+      cursor.pending.push_back({call->args_.at(0), RequireSyncPipeKwarg(call, "dst_pipe"), domain});
     cursor.last.reset();
   }
   void Read(const StmtPtr& statement, Cursor& cursor) {
@@ -387,17 +370,23 @@ class Parser {
       return;
     }
     CHECK(!cursor.returned && !cursor.yield) << "Unreachable scoped token cut";
-    auto call = Payload(statement);
     if (const auto branch = As<IfStmt>(statement); branch && branch->return_vars_.empty()) {
-      std::function<void(const StmtPtr&)> find = [&](const StmtPtr& node) {
-        if (auto sequence = As<SeqStmts>(node)) {
-          for (const auto& child : sequence->stmts_) find(child);
-        } else if (auto eval = As<EvalStmt>(node)) {
-          const auto candidate = As<Call>(eval->expr_);
-          if (sites_.count(candidate.get())) call = candidate;
+      if (const auto resolved = input_.static_branches.find(branch.get());
+          resolved != input_.static_branches.end()) {
+        if (resolved->second) {
+          Read(branch->then_body_, cursor);
+        } else if (branch->else_body_) {
+          Read(*branch->else_body_, cursor);
         }
-      };
-      find(branch->then_body_);
+        return;
+      }
+    }
+    CallPtr call = nullptr;
+    if (const auto eval = As<EvalStmt>(statement)) {
+      call = As<Call>(eval->expr_);
+    } else if (const auto branch = As<IfStmt>(statement); branch && branch->return_vars_.empty()) {
+      call = FindSiteCallInStmt(branch->then_body_, sites_);
+      if (!call && branch->else_body_) call = FindSiteCallInStmt(*branch->else_body_, sites_);
     }
     const auto payload = sites_.find(call.get());
     if (payload != sites_.end()) {
@@ -454,7 +443,8 @@ class Parser {
       if (IsOp(token, "sync.record")) {
         CHECK(cursor.last && cursor.pending.empty()) << "Scoped token record is not at a direct payload cut";
         const auto [r, s] = *cursor.last;
-        CHECK(Pipe(token, "pipe") == input_.segments[r].sites[s].pipe) << "Scoped record pipe mismatch";
+        CHECK(RequireSyncPipeKwarg(token, "pipe") == input_.segments[r].sites[s].pipe)
+            << "Scoped record pipe mismatch";
         resolved_.emplace(assign->var_.get(), Current(*cursor.last));
       } else if (IsOp(token, "sync.completed")) {
         resolved_.emplace(assign->var_.get(), Pattern{});

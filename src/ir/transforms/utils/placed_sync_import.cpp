@@ -2080,12 +2080,26 @@ class Importer {
   static bool IsInitializationContinuationBranch(const IfStmtPtr& branch) {
     if (!branch || !branch->else_body_ || !branch->return_vars_.empty()) return false;
     auto single_call = [](const StmtPtr& stmt) -> CallPtr {
-      StmtPtr leaf = stmt;
-      if (const auto seq = As<SeqStmts>(leaf)) {
-        if (seq->stmts_.size() != 1) return nullptr;
-        leaf = seq->stmts_.front();
+      std::vector<StmtPtr> stmts;
+      if (const auto seq = As<SeqStmts>(stmt)) {
+        stmts = seq->stmts_;
+      } else {
+        stmts.push_back(stmt);
       }
-      const auto eval = As<EvalStmt>(leaf);
+      if (!stmts.empty()) {
+        if (const auto yield = As<YieldStmt>(stmts.back()); yield && yield->value_.empty()) {
+          stmts.pop_back();
+        }
+      }
+      if (stmts.empty()) return nullptr;
+      for (size_t i = 0; i + 1 < stmts.size(); ++i) {
+        const auto assign = As<AssignStmt>(stmts[i]);
+        if (!assign ||
+            (!As<ScalarType>(assign->var_->GetType()) && !IsOp(As<Call>(assign->value_), "buffer.slot"))) {
+          return nullptr;
+        }
+      }
+      const auto eval = As<EvalStmt>(stmts.back());
       return eval ? As<Call>(eval->expr_) : nullptr;
     };
     const auto first = single_call(branch->then_body_);
