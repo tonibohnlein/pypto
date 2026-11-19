@@ -43,6 +43,7 @@
 #include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/core_side_ops.h"
 #include "pypto/ir/transforms/utils/per_kernel_memory_planner.h"
+#include "pypto/ir/transforms/utils/l0c_footprint.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
@@ -237,49 +238,267 @@ std::optional<std::pair<int64_t, int64_t>> FullVecShape(const TypePtr& value) {
 
 std::optional<Span> FindOverwrittenConsumer(const std::vector<StmtPtr>& stmts, size_t begin, int id,
                                             size_t slots, int slot_size) {
-  const auto& registry = OpRegistry::GetInstance();
-  std::deque<VarPtr> active;
-  VarPtr overwritten;
+  std::vector<std::pair<const Var*, int64_t>> prior_slots;
+  std::unordered_set<const Var*> overwritten;
+  std::unordered_map<const Var*, const Var*> aliases;
+  size_t slot = 0;
   for (size_t i = begin; i < stmts.size(); ++i) {
     const auto& stmt = stmts[i];
     const auto call = transform_utils::GetCallFromStmt(stmt);
-    // The concrete refusal only uses a flat unconditional prefix. Effects of
-    // arbitrary branch/carry/exit paths remain outside this witness.
-    if (!As<AssignStmt>(stmt) && !As<EvalStmt>(stmt)) break;
+    const auto assign = As<AssignStmt>(stmt);
+    // Only an unconditional read with a proven overwritten source is an
+    // error here. Branch, loop and unknown-footprint liveness remain outside
+    // this witness. TFREE does not change the physical receive cursor.
+    if (!assign && !As<EvalStmt>(stmt)) {
+      break;
+    }
     if (op_predicates::IsTPop(call) && call->GetKwarg<int>("id", 0) == id) {
-      const auto tile = As<AssignStmt>(stmt)->var_;
-      const auto shape = FullVecShape(tile->GetType());
-      overwritten.reset();
-      if (active.size() >= slots && shape && call->GetKwarg<int>("split", 0) == 0 &&
-          shape->first <= (slot_size / 4) / shape->second) {
-        const auto& earlier = active[active.size() - slots];
-        if (earlier && shape == FullVecShape(earlier->GetType())) overwritten = earlier;
+      if (!assign) {
+        return std::nullopt;
       }
-      active.push_back(call->GetKwarg<int>("split", 0) == 0 ? tile : nullptr);
+      const auto shape = FullVecShape(assign->var_->GetType());
+      const auto elements = shape && call->GetKwarg<int>("split", 0) == kSplitNone &&
+                                    shape->first <= (slot_size / 4) / shape->second
+                                ? shape->first * shape->second
+                                : 0;
+      const auto current = std::pair{assign->var_.get(), elements};
+      if (slot < prior_slots.size()) {
+        const auto& [earlier, earlier_elements] = prior_slots[slot];
+        if (earlier_elements > 0 && earlier_elements <= elements) {
+          overwritten.insert(earlier);
+        }
+        prior_slots[slot] = current;
+      } else {
+        prior_slots.push_back(current);
+      }
+      slot = (slot + 1) % slots;
       continue;
     }
-    if (op_predicates::IsTFree(call)) {
-      if (!active.empty() && !call->args_.empty() && call->args_[0].get() == active.front().get())
-        active.pop_front();
-    } else if (overwritten && call && !As<GlobalVar>(call->op_) && registry.IsRegistered(call->op_->name_)) {
-      const auto& op = registry.GetEntry(call->op_->name_);
-      const auto shape = FullVecShape(call->GetType());
-      bool active_read = false, matches_shape = shape == FullVecShape(overwritten->GetType());
-      if (matches_shape &&
-          op.GetExecutionMemoryAccessEvidence() == ExecutionMemoryAccessEvidence::Functional) {
-        for (size_t arg = 0; arg < call->args_.size(); ++arg) {
-          const auto& value = call->args_[arg];
-          if (As<TileType>(value->GetType())) matches_shape &= shape == FullVecShape(value->GetType());
-          active_read |=
-              value.get() == overwritten.get() && ArgEffectReads(op.GetArgEffect(arg, call->kwargs_));
-        }
-        if (matches_shape && active_read) return stmt->span_;
+    if (assign) {
+      if (const auto source = AsVarLike(assign->value_)) {
+        const auto original = aliases.find(source.get());
+        aliases.emplace(assign->var_.get(), original == aliases.end() ? source.get() : original->second);
       }
     }
-    overwritten.reset();
+    if (overwritten.empty()) {
+      continue;
+    }
+    const auto* op = call ? LookupOpEntry(call->op_) : nullptr;
+    const bool reads_data =
+        op && !op_predicates::IsTFree(call) &&
+        (op->GetExecutionMemoryAccessEvidence() == ExecutionMemoryAccessEvidence::Functional ||
+         IsOp(call, "tile.store"));
+    if (!reads_data) {
+      continue;
+    }
+    for (size_t arg = 0; arg < call->args_.size(); ++arg) {
+      const auto value = AsVarLike(call->args_[arg]);
+      const auto original = aliases.find(value.get());
+      const auto* root = original == aliases.end() ? value.get() : original->second;
+      const bool reads_arg = ArgEffectReads(op->GetArgEffect(arg, call->kwargs_));
+      const bool expired = overwritten.count(root) != 0;
+      if (expired && reads_arg) {
+        return stmt->span_;
+      }
+    }
   }
   return std::nullopt;
 }
+
+struct C2VReceiveSite {
+  const Stmt* stmt;
+  int pipe_id;
+  const Stmt* loop;
+  bool unconditional;
+  bool may_write;
+  std::optional<uint64_t> tile_bytes;
+};
+
+struct C2VReceiveRing {
+  const Var* reserve = nullptr;
+  int local_slots = 1;
+  int slot_bytes = 0;
+};
+
+class C2VReceiveSites : public IRVisitor {
+ public:
+  void VisitStmt(const StmtPtr& stmt) override {
+    const auto call = transform_utils::GetCallFromStmt(stmt);
+    if (IsOp(call, "system.aiv_initialize_pipe")) {
+      RecordRing(call);
+    } else if (IsOp(call, "tile.tpop_from_aic")) {
+      RecordPop(stmt, call);
+    } else if (IsOp(call, "system.reserve_buffer")) {
+      if (const auto assign = As<AssignStmt>(stmt)) {
+        reserve_declarations.emplace(assign->var_.get(), call);
+      }
+    } else if (IsOp(call, "system.wait_flag")) {
+      has_explicit_wait = true;
+    } else if (loop_ && (As<BreakStmt>(stmt) || As<ContinueStmt>(stmt) || As<ReturnStmt>(stmt))) {
+      early_exit_loops.insert(loop_);
+    }
+    IRVisitor::VisitStmt(stmt);
+  }
+
+  // Only statement cuts affect transport. Skip the scalar expression DAG.
+  void VisitExpr(const ExprPtr&) override {}
+
+  std::vector<C2VReceiveSite> sites;
+  std::map<int, C2VReceiveRing> rings;
+  // A native initializer can also take a raw scalar address. Only direct
+  // reserve_buffer results carry a trusted allocation identity and extent.
+  std::map<const Var*, CallPtr> reserve_declarations;
+  std::unordered_set<const Stmt*> early_exit_loops;
+  bool has_explicit_wait = false;
+
+ protected:
+  void VisitStmt_(const ForStmtPtr& loop) override { VisitLoop(loop, loop->body_); }
+  void VisitStmt_(const WhileStmtPtr& loop) override { VisitLoop(loop, loop->body_); }
+  void VisitStmt_(const IfStmtPtr& branch) override {
+    const bool unconditional = unconditional_;
+    unconditional_ = false;
+    IRVisitor::VisitStmt_(branch);
+    unconditional_ = unconditional;
+  }
+
+ private:
+  void VisitLoop(const StmtPtr& loop, const StmtPtr& body) {
+    const auto enclosing = loop_;
+    const bool unconditional = unconditional_;
+    if (!enclosing) {
+      loop_ = loop.get();
+    }
+    unconditional_ = !enclosing;
+    VisitStmt(body);
+    loop_ = enclosing;
+    unconditional_ = unconditional;
+  }
+
+  void RecordRing(const CallPtr& call) {
+    const int mask = call->GetKwarg<int>("dir_mask", 0);
+    const bool receives_c2v = (mask & core_affinity::kDirMaskC2V) != 0;
+    const bool has_consumer_operands = call->args_.size() == 2;
+    if (!receives_c2v || !has_consumer_operands) {
+      return;
+    }
+    const int id = call->GetKwarg<int>("id", 0);
+    const int slots = call->GetKwarg<int>("slot_num", GetPtoasImplicitSlotNum(mask));
+    const int depth = call->GetKwarg<int>("local_slot_num", slots);
+    const int bytes = call->GetKwarg<int>("slot_size", 0);
+    const C2VReceiveRing ring{AsVarLike(call->args_.front()).get(), std::max(1, depth), bytes};
+    const auto [entry, unique] = rings.emplace(id, ring);
+    if (!unique) {
+      entry->second = {};
+    }
+  }
+
+  void RecordPop(const StmtPtr& stmt, const CallPtr& call) {
+    const auto assign = As<AssignStmt>(stmt);
+    const auto tile = assign ? As<TileType>(assign->var_->GetType()) : nullptr;
+    if (!tile || tile->memory_space_ != MemorySpace::Vec) {
+      return;
+    }
+    const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
+    const bool empty = std::any_of(view.valid_shape.begin(), view.valid_shape.end(),
+                                   [](const ExprPtr& dim) { return TryGetNonNegativeConstInt(dim) == 0; });
+    sites.push_back({stmt.get(), call->GetKwarg<int>("id", 0), loop_, unconditional_, !empty,
+                     utils::StaticPhysicalAllocationBytes(tile, MemorySpace::Vec, nullptr)});
+  }
+
+  const Stmt* loop_ = nullptr;
+  bool unconditional_ = false;
+};
+
+bool MayAliasOtherRings(const C2VReceiveSites& receives) {
+  std::map<int64_t, int64_t> address_ranges;
+  std::unordered_set<const Var*> seen_reserves;
+  for (const auto& site : receives.sites) {
+    const auto entry = receives.rings.find(site.pipe_id);
+    if (entry == receives.rings.end()) {
+      return true;
+    }
+    const auto& ring = entry->second;
+    const auto reserve = receives.reserve_declarations.find(ring.reserve);
+    if (reserve == receives.reserve_declarations.end()) {
+      return true;
+    }
+    const auto size = static_cast<int64_t>(reserve->second->GetKwarg<int>("size", 0));
+    const auto base = static_cast<int64_t>(reserve->second->GetKwarg<int>("base", kAutoBufferBase));
+    if (base < 0 || ring.slot_bytes <= 0 || size < int64_t{ring.local_slots} * ring.slot_bytes) {
+      return true;
+    }
+    if (site.may_write && (!site.tile_bytes || *site.tile_bytes > static_cast<uint64_t>(ring.slot_bytes))) {
+      return true;
+    }
+    if (seen_reserves.insert(ring.reserve).second && !address_ranges.emplace(base, base + size).second) {
+      return true;
+    }
+  }
+  int64_t end = 0;
+  for (const auto& [base, next_end] : address_ranges) {
+    if (base < end) {
+      return true;
+    }
+    end = next_end;
+  }
+  return false;
+}
+
+struct LocalSlotHistory {
+  int distinct_sites = 0;
+  int first_pipe = 0;
+  int safe_depth = 1;
+  int preceding = 0;
+  const Stmt* uniform_loop = nullptr;
+  size_t period = 0;
+
+  void Include(const C2VReceiveSite& site, const C2VReceiveRing& ring) {
+    if (!site.may_write) {
+      return;
+    }
+    if (distinct_sites == 0) {
+      first_pipe = site.pipe_id;
+      safe_depth = ring.local_slots;
+      uniform_loop = site.loop;
+    }
+    if (!site.unconditional || site.loop != uniform_loop) {
+      uniform_loop = nullptr;
+    }
+    // Different pipe counters sharing a reserve can start at the same byte.
+    if (site.pipe_id != first_pipe) {
+      safe_depth = 1;
+    }
+    distinct_sites = std::min(2, distinct_sites + 1);
+  }
+
+  void ObservePeriod(const C2VReceiveSite& site) {
+    if (uniform_loop && site.loop == uniform_loop) {
+      if (site.unconditional) {
+        ++period;
+      } else {
+        uniform_loop = nullptr;
+      }
+    }
+  }
+
+  bool NeedsFence(const C2VReceiveSite& site, const std::unordered_set<const Stmt*>& early_exits) const {
+    // In an exact repeated sequence, a slot revisited after local_slots
+    // receives belongs to the original static site iff that distance is an
+    // integer multiple of the sequence's period.
+    const bool stock_covers_period = uniform_loop && period != 0 && !early_exits.count(uniform_loop) &&
+                                     static_cast<size_t>(safe_depth) % period == 0;
+    return site.may_write && distinct_sites > 1 && !stock_covers_period &&
+           (site.loop || preceding >= safe_depth);
+  }
+
+  void Advance(const C2VReceiveSite& site) {
+    if (site.loop) {
+      preceding = safe_depth;
+    } else if (preceding < safe_depth) {
+      ++preceding;
+    }
+  }
+};
 
 }  // namespace
 
@@ -633,16 +852,60 @@ ConsumerFifoEvidence AnalyzeConsumerFifo(const FunctionPtr& function) {
           << "No reserve declaration covers the consumer slot window for peer pipe id " << id;
       const auto depth = static_cast<size_t>(local);
       evidence.capacities.emplace(id, ConsumerPipeCapacity{required, depth});
-      if (side == core_affinity::CoreSide::AIV && prologue_initializers.size() == 1 && required > depth) {
+      const bool can_prove_slot_reuse =
+          side == core_affinity::CoreSide::AIV && prologue_initializers.size() == 1;
+      if (can_prove_slot_reuse) {
         if (const auto overwritten =
-                FindOverwrittenConsumer(stmts, fifo.first_transport, id, depth, slot_size))
+                FindOverwrittenConsumer(stmts, fifo.first_transport, id, depth, slot_size)) {
           evidence.overwritten_input.emplace(*overwritten);
+        }
       }
     }
   } catch (const pypto::ValueError& error) {
     return {true, {}, error.what(), std::nullopt};
   }
   return evidence;
+}
+
+std::unordered_set<const Stmt*> FindC2VSlotReuseFences(const FunctionPtr& function) {
+  C2VReceiveSites ir;
+  ir.VisitStmt(function->body_);
+  // Authored physical waits own their pipeline schedule. An all-pipe drain
+  // could block a wait whose signal is issued after the drain.
+  if (ir.has_explicit_wait) {
+    return {};
+  }
+  const C2VReceiveRing unknown;
+  const auto ring_for = [&](int id) -> const C2VReceiveRing& {
+    const auto it = ir.rings.find(id);
+    return it == ir.rings.end() ? unknown : it->second;
+  };
+  const bool may_alias_all = MayAliasOtherRings(ir);
+  const auto reserve_for = [&](const C2VReceiveSite& site) {
+    return may_alias_all ? nullptr : ring_for(site.pipe_id).reserve;
+  };
+  std::map<const Var*, LocalSlotHistory> histories;
+  for (const auto& site : ir.sites) {
+    histories[reserve_for(site)].Include(site, may_alias_all ? unknown : ring_for(site.pipe_id));
+  }
+  for (const auto& site : ir.sites) {
+    histories.at(reserve_for(site)).ObservePeriod(site);
+  }
+
+  // TFREE does not complete a tile read on A2/A3. The local index is the
+  // number of pops modulo depth regardless of the number of outstanding
+  // borrow markers. Count all branches as a conservative upper bound, and
+  // assume a loop can wrap. Stock PTOAS sees the dependence at a recurrent
+  // single static site because its tile descriptor is the same every time.
+  std::unordered_set<const Stmt*> fences;
+  for (const auto& site : ir.sites) {
+    auto& history = histories.at(reserve_for(site));
+    if (history.NeedsFence(site, ir.early_exit_loops)) {
+      fences.insert(site.stmt);
+    }
+    history.Advance(site);
+  }
+  return fences;
 }
 
 AutomaticPipeSetup BuildAutomaticPipeSetup(const std::string& func_name, const std::string& aic_name,

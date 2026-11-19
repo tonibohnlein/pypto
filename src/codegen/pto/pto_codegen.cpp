@@ -63,6 +63,7 @@
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
+#include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/l0c_footprint.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
@@ -1453,6 +1454,12 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   fs_.Reset();
   fs_.current_function = func;
   fs_.truncating_floor_div_mod = PrepareScalarFloorDivMod(func->body_, func->params_);
+  const bool has_local_receive_ring = IsAIVFunction() && GetBackendHandler()->SupportsLocalPipeDepth();
+  if (has_local_receive_ring) {
+    // Skew and pipeline lowering can move or clone pops. Find the conflicting
+    // cuts on the final body shared by stock and delegated AutoSync codegen.
+    fs_.c2v_slot_reuse_fences = ir::cross_core_pipe::FindC2VSlotReuseFences(func);
+  }
 
   // Index every `<var> = <tuple>[i]` binding once. A multi-output op's Call does
   // not carry its DPS destinations in args_ — the parser desugars them into
@@ -3055,6 +3062,12 @@ void PTOCodegen::VisitStmt(const ir::StmtPtr& stmt) {
   // VisitExpr_(CallPtr)). The statement span is what passes reliably preserve —
   // they frequently rebuild the Call underneath it with a coarser span.
   SpanScope stmt_loc(this, &stmt->span_);
+  if (fs_.c2v_slot_reuse_fences.count(stmt.get())) {
+    // Complete reads of the old peer payload before MTE2 overwrites its slot.
+    // A V-only barrier cannot hold MTE2. A PIPE_ALL barrier uses no event IDs
+    // and keeps PTOAS responsible for its ordinary automatic synchronization.
+    Emit("pto.barrier <PIPE_ALL>");
+  }
   ir::IRVisitor::VisitStmt(stmt);
 }
 
