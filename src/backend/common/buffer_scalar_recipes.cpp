@@ -177,7 +177,9 @@ bool SupportsBufferVector1DTransfer(const std::vector<ir::ExprPtr>& args, bool l
   const auto extent = ir::As<ir::ConstInt>(valid->elements_[0]);
   if (extent && (extent->value_ <= 0 || extent->value_ > buffer->shape_[1])) return false;
   if (buffer->valid_shape_[1] != -1 && (!extent || extent->value_ != buffer->valid_shape_[1])) return false;
-  return buffer->valid_shape_[0] == 1;
+  // Logical vectors use [1, n] at every transfer. A mutable native descriptor
+  // must mark both fields dynamic, with the live values checked at the use.
+  return buffer->valid_shape_[0] == 1 || (buffer->valid_shape_[0] == -1 && buffer->valid_shape_[1] == -1);
 }
 
 bool SupportsLogicalVector1DBufferTransfer(const ir::CallPtr& call) {
@@ -195,18 +197,17 @@ bool SupportsLogicalVector1DBufferTransfer(const ir::CallPtr& call) {
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
   const auto& logical_valid = view.valid_shape.empty() ? tile->shape_ : view.valid_shape;
   if (logical_valid.size() != 1) return false;
-  const auto valid_const = ir::As<ir::ConstInt>(logical_valid[0]);
-  const std::vector<int64_t> buf_valid{1, valid_const && valid_const->value_ > 0 ? valid_const->value_ : -1};
-  const auto buf_type =
-      std::make_shared<ir::BufferType>(physical->shape_, tile->dtype_, ir::MemorySpace::Vec, buf_valid);
+  const auto buf_type = std::make_shared<ir::BufferType>(physical->shape_, tile->dtype_, ir::MemorySpace::Vec,
+                                                         MutableBufferValidShape(logical_valid));
   const auto buf_var = std::make_shared<ir::Var>("vec1d", buf_type, call->span_);
   const ir::ExprPtr valid_tuple =
       load ? call->args_[3]
            : std::make_shared<ir::MakeTuple>(std::vector<ir::ExprPtr>{logical_valid[0]}, call->span_);
   if (load) {
     const auto shape_tuple = ir::As<ir::MakeTuple>(call->args_[2]);
-    const auto cap =
-        shape_tuple && shape_tuple->elements_.size() == 1 ? ir::As<ir::ConstInt>(shape_tuple->elements_[0]) : nullptr;
+    const auto cap = shape_tuple && shape_tuple->elements_.size() == 1
+                         ? ir::As<ir::ConstInt>(shape_tuple->elements_[0])
+                         : nullptr;
     if (!cap || cap->value_ != physical->shape_[1]) return false;
     return SupportsBufferVector1DTransfer({call->args_[0], call->args_[1], valid_tuple, buf_var}, true);
   }

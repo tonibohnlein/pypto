@@ -88,23 +88,10 @@ std::vector<int64_t> StaticExtents(const std::vector<ExprPtr>& extents, const Sp
   return result;
 }
 
-// Valid extents of a qualified mutable native descriptor. A runtime extent makes both dimensions
-// dynamic: the native metadata update always writes both. The lane-1 [0, 0]
-// sentinel means "no data on this lane", not a static empty window, so it is a
-// runtime value too.
-std::vector<int64_t> DescriptorValid(const std::vector<ExprPtr>& valid, const std::vector<int64_t>& shape) {
-  std::vector<int64_t> result;
-  for (const auto& extent : valid) {
-    auto constant = As<ConstInt>(extent);
-    if (!constant || constant->value_ == 0) return std::vector<int64_t>(shape.size(), -1);
-    result.push_back(constant->value_);
-  }
-  return result;
-}
-
 void CheckDenseVecTile(const TileTypePtr& tile, const TileView& view, const Span& span) {
   CHECK_SPAN(backend::IsDenseVecBufferTile(tile, view), span)
-      << "LowerTileToBuffer: this recipe requires dense rank-2 Vec tiles with a supported storage dtype";
+      << "LowerTileToBuffer: this recipe requires dense rank-1 or rank-2 Vec tiles with a supported "
+         "storage dtype";
 }
 
 BufferTypePtr DenseDescriptor(const TileTypePtr& tile, const Span& span) {
@@ -127,15 +114,13 @@ BufferTypePtr DenseDescriptor(const TileTypePtr& tile, const Span& span) {
           << "LowerTileToBuffer: strided tiles require an explicit Buffer view recipe";
     }
   }
-  const std::vector<int64_t> shape =
-      raw_shape.size() == 1 ? std::vector<int64_t>{1, raw_shape[0]} : std::move(raw_shape);
-  auto valid = DescriptorValid(view.valid_shape.empty() ? tile->shape_ : view.valid_shape, shape);
-  if (tile->shape_.size() == 1 && valid.size() == 1) valid = {1, valid[0]};
+  const auto shape = backend::NormalizeBufferTileExtents(std::move(raw_shape), int64_t{1});
   const auto& logical_valid = view.valid_shape.empty() ? tile->shape_ : view.valid_shape;
   const auto fixed_column = logical_valid.size() == 2 ? As<ConstInt>(logical_valid[1]) : nullptr;
   CHECK_SPAN(!column || (fixed_column && fixed_column->value_ == 1), span)
       << "LowerTileToBuffer: contiguous column vectors require a fixed valid column of one";
-  return std::make_shared<BufferType>(shape, tile->dtype_, MemorySpace::Vec, valid, view.blayout);
+  return std::make_shared<BufferType>(shape, tile->dtype_, MemorySpace::Vec,
+                                      backend::MutableBufferValidShape(logical_valid), view.blayout);
 }
 
 // A use-site window of another handle. Its row pitch and offset belong to the
@@ -146,16 +131,15 @@ BufferTypePtr WindowDescriptor(const TileTypePtr& tile, const Span& span) {
   const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
   const bool column = backend::IsColumnVectorBufferTile(tile, view);
   if (!column) CheckDenseVecTile(tile, view, span);
-  auto raw_shape = StaticExtents(tile->shape_, span);
-  const std::vector<int64_t> shape =
-      raw_shape.size() == 1 ? std::vector<int64_t>{1, raw_shape[0]} : std::move(raw_shape);
+  const auto shape = backend::NormalizeBufferTileExtents(StaticExtents(tile->shape_, span), int64_t{1});
   std::vector<int64_t> valid;
-  if (tile->shape_.size() == 1) valid.push_back(1);
   for (const auto& extent : view.valid_shape.empty() ? tile->shape_ : view.valid_shape) {
     auto constant = As<ConstInt>(extent);
     valid.push_back(constant && constant->value_ != 0 ? constant->value_ : -1);
   }
-  return std::make_shared<BufferType>(shape, tile->dtype_, MemorySpace::Vec, valid, view.blayout);
+  return std::make_shared<BufferType>(shape, tile->dtype_, MemorySpace::Vec,
+                                      backend::NormalizeBufferTileExtents(std::move(valid), int64_t{1}),
+                                      view.blayout);
 }
 
 bool HasDynamicValid(const BufferTypePtr& type) {
@@ -178,8 +162,9 @@ BufferTypePtr MatrixDescriptor(const TileTypePtr& tile, MemorySpace space, const
       << "LowerTileToBuffer: nonzero tile view offsets require an explicit Buffer view recipe";
   const auto shape = StaticExtents(tile->shape_, span);
   const auto& original_valid = view.valid_shape.empty() ? tile->shape_ : view.valid_shape;
-  const auto valid = acc_trims && acc_trims->Qualifies(tile) ? DescriptorValid(original_valid, shape)
-                                                             : StaticExtents(original_valid, span);
+  const auto valid = acc_trims && acc_trims->Qualifies(tile)
+                         ? backend::MutableBufferValidShape(original_valid)
+                         : StaticExtents(original_valid, span);
   return std::make_shared<BufferType>(shape, tile->dtype_, space, valid, view.blayout, view.slayout,
                                       view.fractal, view.pad, view.compact);
 }
@@ -1067,9 +1052,6 @@ class TileToBufferMutator : public IRMutator {
     INTERNAL_CHECK_SPAN(type, tile->span_) << "Internal error: valid extents require a Tile operand";
     const auto view = tile_view_semantics::GetEffectiveTileView(*type);
     std::vector<ExprPtr> extents;
-    if (type->shape_.size() == 1) {
-      extents.push_back(std::make_shared<ConstInt>(1, DataType::INDEX, tile->span_));
-    }
     for (const auto& extent : view.valid_shape.empty() ? type->shape_ : view.valid_shape) {
       if (auto constant = As<ConstInt>(extent)) {
         extents.push_back(std::make_shared<ConstInt>(constant->value_, DataType::INDEX, tile->span_));
@@ -1077,7 +1059,9 @@ class TileToBufferMutator : public IRMutator {
         extents.push_back(VisitExpr(extent));
       }
     }
-    return std::make_shared<MakeTuple>(std::move(extents), tile->span_);
+    const ExprPtr one = std::make_shared<ConstInt>(1, DataType::INDEX, tile->span_);
+    return std::make_shared<MakeTuple>(backend::NormalizeBufferTileExtents(std::move(extents), one),
+                                       tile->span_);
   }
 
   // Metadata state belongs to the shared allocation; every data use restores
@@ -1550,12 +1534,15 @@ class TileToBufferMutator : public IRMutator {
       const auto source_memory = GetDefinedMemRef(source);
       const auto destination_memory = GetDefinedMemRef(destination);
       const auto descriptor = As<BufferType>(Handle(result)->GetType());
+      INTERNAL_CHECK_SPAN(expected, call->span_) << "Internal error: tile relabel must produce a TileType";
+      const auto view = tile_view_semantics::GetEffectiveTileView(*expected);
+      const auto& expected_valid = view.valid_shape.empty() ? expected->shape_ : view.valid_shape;
+      const auto expected_shape =
+          backend::NormalizeBufferTileExtents(StaticExtents(expected->shape_, call->span_), int64_t{1});
       INTERNAL_CHECK_SPAN(
-          expected && expected->dtype_ == descriptor->dtype_ &&
-              StaticExtents(expected->shape_, call->span_) == descriptor->shape_ &&
+          expected->dtype_ == descriptor->dtype_ && expected_shape == descriptor->shape_ &&
               (HasDynamicValid(descriptor) ||
-               DescriptorValid(tile_view_semantics::GetEffectiveTileView(*expected).valid_shape,
-                               descriptor->shape_) == descriptor->valid_shape_) &&
+               backend::MutableBufferValidShape(expected_valid) == descriptor->valid_shape_) &&
               source_memory->base_ == destination_memory->base_ &&
               structural_equal(source_memory->byte_offset_, destination_memory->byte_offset_),
           call->span_)
@@ -1629,7 +1616,7 @@ class TileToBufferMutator : public IRMutator {
       ValidateKwargs(call->kwargs_, entry.GetOp()->GetAttrs(), call->op_->name_);
       // The registry documents optional operands as well as required ones.
       // Validate the original call with its registered schema, then qualify the
-      // selected fixed recipe; a valid workspace variant is not that recipe.
+      // selected fixed recipe, including its explicit workspace when present.
       (void)entry.GetDeduceType()(call->args_, call->kwargs_);
       CHECK_SPAN(backend::SupportsLogicalBufferElementwise(*recipe, call), call->span_)
           << "LowerTileToBuffer: unsupported elementwise recipe operands or native attributes";

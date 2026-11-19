@@ -743,6 +743,76 @@ def test_default_rollout_native_compilation(tmp_path, ascend_backend, planner):
 
 
 @pytest.mark.parametrize("planner", _PLANNERS)
+@pytest.mark.parametrize("compute", ["", "flat = pl.abs(flat)"], ids=["relabel", "abs"])
+def test_default_rank_one_reshape_native(tmp_path, planner, compute):
+    program = pl.parse_program(f"""
+@pl.program
+class RankOneReshape:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, source: pl.Tensor[[8, 8], pl.FP32],
+               output: pl.Out[pl.Tensor[[8, 8], pl.FP32]]) -> pl.Tensor[[8, 8], pl.FP32]:
+        matrix = pl.load(source, [0, 0], [8, 8])
+        flat = pl.tile.reshape(matrix, [64])
+        {compute}
+        restored = pl.tile.reshape(flat, [8, 8])
+        return pl.store(restored, [0, 0], output)
+""")
+    with passes.PassContext([], memory_planner=planner):
+        result = PassManager(OptimizationStrategy.Default).run_passes(program)
+    function = result.get_function("kernel")
+    assert function is not None and function.ir_stage == ir.FunctionIRStage.Buffer
+    addressed = planner != passes.MemoryPlanner.PTOAS
+    text = codegen.PTOCodegen().generate(result, emit_tile_addr=addressed)
+    # The native view keeps the vector in one row and shares the matrix bytes.
+    assert "rows=1, cols=64, v_row=1, v_col=64" in text
+    assert text.count("pto.tload") == text.count("pto.tstore") == 1
+    assert ("pto.tabs" in text) == bool(compute)
+    if find_ptoas_binary() is None:
+        pytest.skip("PTOAS is not available")
+    source, output = tmp_path / "rank_one_reshape.pto", tmp_path / "rank_one_reshape.cpp"
+    source.write_text(text)
+    _run_ptoas(
+        str(source), str(output), [f"--pto-level={'level3' if addressed else 'level2'}", "--pto-arch=a2"]
+    )
+    assert output.is_file()
+
+
+@pytest.mark.parametrize("planner", _PLANNERS)
+def test_default_runtime_rank_one_transfer_native(tmp_path, planner):
+    @pl.program
+    class RuntimeRankOneTransfer:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            source: pl.Tensor[[64], pl.FP32],
+            output: pl.Out[pl.Tensor[[64], pl.FP32]],
+            n: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[64], pl.FP32]:
+            tile = pl.load(source, [0], [64], valid_shape=[n])
+            return pl.store(tile, [0], output)
+
+    with passes.PassContext([], memory_planner=planner):
+        result = PassManager(OptimizationStrategy.Default).run_passes(RuntimeRankOneTransfer)
+    function = result.get_function("kernel")
+    assert function is not None and function.ir_stage == ir.FunctionIRStage.Buffer
+    addressed = planner != passes.MemoryPlanner.PTOAS
+    text = codegen.PTOCodegen().generate(result, emit_tile_addr=addressed)
+    # PTOAS updates both fields together, while the GM partition keeps rank one.
+    assert "rows=1, cols=64, v_row=?, v_col=?" in text
+    assert "pto.set_validshape" in text
+    assert "!pto.partition_tensor_view<?xf32>" in text
+    assert text.count("pto.tload") == text.count("pto.tstore") == 1
+    if find_ptoas_binary() is None:
+        pytest.skip("PTOAS is not available")
+    source, output = tmp_path / "rank_one_transfer.pto", tmp_path / "rank_one_transfer.cpp"
+    source.write_text(text)
+    _run_ptoas(
+        str(source), str(output), [f"--pto-level={'level3' if addressed else 'level2'}", "--pto-arch=a2"]
+    )
+    assert output.is_file()
+
+
+@pytest.mark.parametrize("planner", _PLANNERS)
 @pytest.mark.parametrize("program", [MixedBranch, NestedBranch])
 def test_default_control_flow_selects_buffer_and_off_retains_tile(planner, program):
     for enabled in (False, True):

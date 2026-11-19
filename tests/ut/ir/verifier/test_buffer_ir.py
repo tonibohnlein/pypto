@@ -627,6 +627,39 @@ def test_reciprocal_rejects_equal_addresses_even_with_distinct_handles():
     _assert_error(_placed_recipe_program("recip", 0, 0), "requires disjoint placed")
 
 
+@pytest.mark.parametrize(
+    ("scratch_address", "error"),
+    [
+        (32, "requires disjoint placed"),
+        (2048, None),
+        (2049, "requires a proven 32-byte aligned base"),
+        (8160, "requires disjoint placed"),
+    ],
+)
+def test_rsqrt_workspace_requires_aligned_disjoint_placed_capacity(scratch_address, error):
+    source, destination = _var("source"), _var("destination")
+    scratch = _var("scratch", ir.BufferType([16, 32], DataType.FP32, ir.MemorySpace.Vec, [1, 32]))
+    statements: list[ir.Stmt] = [
+        ir.AssignStmt(
+            value,
+            _call("buffer.alloc", [ir.MakeTuple([], SPAN), _int(address)], value.type),
+            SPAN,
+        )
+        for value, address in [(source, 0), (scratch, scratch_address), (destination, 8192)]
+    ]
+    statements.append(
+        ir.EvalStmt(
+            _call("buffer.rsqrt_workspace", [source, scratch, destination], kwargs={"high_precision": True}),
+            SPAN,
+        )
+    )
+    program = _program(ir.SeqStmts(statements, SPAN))
+    if error is None:
+        assert _verify(program) == []
+    else:
+        _assert_error(program, error)
+
+
 @pytest.mark.parametrize("suffix", ["add", "exp", "recip"])
 @pytest.mark.parametrize("addresses", [(None, None), (0, 2048), (2048, 0)])
 def test_elementwise_recipe_accepts_proven_disjoint_allocations(suffix, addresses):

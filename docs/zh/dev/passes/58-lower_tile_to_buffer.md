@@ -35,7 +35,7 @@ autosync 仍须独立建立范围、访问与出现坐标的证明。
 | Acc 到紧密 ND GM 的原子累加写回 | FP32 源及目标，A2/A3 |
 | add、mul | FP16、FP32、INT32 |
 | sub、div、maximum、minimum、abs、exp、sqrt、neg、relu、log、recip | FP32 |
-| rsqrt（默认精度，无 workspace） | FP32 |
+| rsqrt（默认精度，或带显式 workspace 的高精度） | FP32 |
 | adds、subs、muls、divs、maximums、minimums、lrelu、full | FP32 |
 | row_max、row_sum、row_min、row_prod | FP32，正静态 valid |
 | row_expand_add/sub/mul/div/max/min | FP32，正静态 valid，连续列向量 |
@@ -64,13 +64,12 @@ scratch 或编号事件。文档中的
 本地 GM 冲突仍产生依赖。目标初始化、任务可见性及需要的跨 worker 顺序由调用方保证。
 主机模型检查和 C++ 生成不证明跨 worker 浮点归约的确定性或原生设备行为。
 
-`rsqrt` 复用稠密一元配方，目标与输入须物理不相交。省略 `high_precision` 或显式
-`False` 选择默认双操作数实现；`True`、额外 workspace 和未知属性不在支持范围内。
-固定配方检查完整逻辑操作数数量，包括 `full` 的 shape 等元数据，不能静默丢弃可选操作数。
-已选 A2/A3 实现固定为
-[PTO-ISA `TUnaryOp.hpp`](https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TUnaryOp.hpp)：
-默认 `TRSQRT_IMPL` 调用公共 `TUNARY_IMPL<RsqrtOp>` 与 `vrsqrt`，无隐式 scratch
-或编号事件资源声明；带 workspace 的高精度重载是另一实现，不由本配方覆盖。
+省略 `high_precision` 或将其设为 false 时，`rsqrt` 使用稠密一元配方，目标与输入物理不相交。
+设置 `high_precision=True` 并传入显式 workspace 时，FP32 配方生成三操作数 `TRSQRT`。
+A2/A3 实现在 scratch 起始地址写入一个 32 字节块，并在除法中读回。指令只取 scratch 的数据指针，
+根据目标的有效范围控制计算，因此 scratch 可以只有部分区域有效。scratch 存储必须容纳该块，
+且与源和目标均不相交。[A2/A3 实现](https://github.com/hw-native-sys/pto-isa/blob/83b1b2b5/include/pto/npu/a2a3/TUnaryOp.hpp#L300)。
+
 运行时 valid 描述符复用逐次使用的元数据恢复与正范围守卫，空 valid 不执行原生一元操作。
 主机测试检查正数输入、空/部分/完整 valid、物理别名及生成的 C++，不据此宣称原生精度或设备行为。
 
@@ -242,6 +241,10 @@ yield 与结果的 valid 表达式保持相同。变化的有效尺寸通过普�
 例如 `narrowed = pl.tile.set_validshape(loaded, 16, cols)` 可以先被 store，再读取
 `loaded`；第二次读取恢复 `loaded` 原来的有效矩形。对于窗口，后续 setter 可以在
 同一物理窗口内扩大有效区，但新增可读数据必须已在此前初始化。
+
+逻辑容量为 `[C]` 的向量对应物理形状为 `[1,C]` 的 Vec tile，reshape 生成向量时也使用同一表示。
+一维 GM 传输使用长度为 `n` 的分区 `[n]`，本地 tile 的有效范围为 `[1,n]`。
+若长度在运行时确定，原生描述符的两个有效维度均可变，降低过程在传输前设置这两个值。
 
 可变 allocation 使用双轴动态 descriptor，窗口保留逐轴静态/动态 descriptor。
 PYPTO 仅允许动态 allocation 与兼容的、覆盖完整容量的 typed root 合并。

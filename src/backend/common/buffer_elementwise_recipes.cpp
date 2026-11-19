@@ -304,7 +304,7 @@ bool SupportsLogicalBufferElementwise(const BufferElementwiseRecipe& recipe, con
       }
       const auto workspace = StaticLogicalBufferDescriptor(type);
       const auto bytes = PhysicalBufferBytes(workspace);
-      if (!workspace || !bytes || *bytes < 32) return false;
+      if (!IsAlignedDenseVecBufferGeometry(workspace) || !bytes || *bytes < 32) return false;
     } else {
       const auto tile = ir::As<ir::TileType>(type);
       if (!tile || tile->dtype_ != dtype || tile->GetMemorySpace() != ir::MemorySpace::Vec) return false;
@@ -363,10 +363,13 @@ void ValidateBufferElementwiseOperands(const BufferElementwiseRecipe& recipe,
         << recipe.buffer_op << " argument " << i << " must be in Vec memory";
     if (i < recipe.inputs.size() && recipe.inputs[i].kind == BufferElementwiseOperandKind::Workspace) {
       const auto bytes = PhysicalBufferBytes(buffer);
-      CHECK(IsAlignedDenseVecBuffer(buffer) && buffer->dtype_ == descriptor->dtype_ &&
-            buffer->shape_ == descriptor->shape_ && buffer->valid_shape_ == buffer->shape_ && bytes &&
-            *bytes >= 32)
-          << recipe.buffer_op << " workspace requires aligned full-valid Vec buffer matching destination shape and >= 32 bytes";
+      // A2/A3 TRsqrtHighPrecision uses tmp.data() to initialize and reuse one
+      // 32-byte block. Source and destination valid extents drive the computation.
+      CHECK(IsAlignedDenseVecBufferGeometry(buffer) && buffer->dtype_ == descriptor->dtype_ &&
+            buffer->shape_ == descriptor->shape_ && bytes && *bytes >= 32)
+          << recipe.buffer_op
+          << " workspace requires aligned dense Vec capacity matching destination shape and at least 32 "
+             "bytes";
       CHECK(args[i] != args.back()) << recipe.buffer_op << " workspace must be distinct from destination";
       for (size_t j = 0; j < i; ++j) {
         if (recipe.inputs[j].kind != BufferElementwiseOperandKind::ElementScalar) {

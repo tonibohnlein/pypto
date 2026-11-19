@@ -830,6 +830,67 @@ def test_rank_one_dynamic_valid_operand_uses_native_column_axis(tmp_path):
     _compile_native(tmp_path, text, addressed=False)
 
 
+@pytest.mark.parametrize("load", [True, False], ids=["load", "store"])
+@pytest.mark.parametrize("wrong_axis", [0, 1], ids=["row", "column"])
+def test_runtime_rank_one_transfer_rejects_mismatched_active_extents(load, wrong_axis):
+    extent = _scalar("extent")
+    tensor = ir.Var("tensor", ir.TensorType([64], DataType.FP32), SPAN)
+    tile, allocation = _alloc("vector", _type(shape=(1, 64), valid=(-1, -1)), [_int(1), extent])
+    # A valid native allocation does not prove that later mutations leave its
+    # active rectangle compatible with the one-dimensional GM partition.
+    values = _window(0, extent) if wrong_axis == 0 else _window(1, 64)
+    update = _eval("buffer.set_validshape", tile, values)
+    transfer = (
+        _eval("buffer.load", tensor, _window(0), _window(extent), tile)
+        if load
+        else _eval("buffer.store", tile, _window(0), _window(extent), tensor)
+    )
+    params = [tensor, extent] if load else [(tensor, ir.ParamDirection.Out), extent]
+    program = _program([allocation, update, transfer], params, ir_stage=ir.FunctionIRStage.Buffer)
+    with pytest.raises(ValueError, match=r"Runtime rank-one transfer requires restored valid shape"):
+        _emit(program, flag=False)
+
+
+@pytest.mark.parametrize("subview", [False, True], ids=["allocation", "subview"])
+@pytest.mark.parametrize("matches", [False, True], ids=["mismatch", "match"])
+def test_rank_one_transfer_uses_fixed_row_descriptor_extent(subview, matches):
+    extent = _scalar("extent")
+    requested = extent if matches else _scalar("requested")
+    source = ir.Var("source", ir.TensorType([64], DataType.FP32), SPAN)
+    descriptor = _type(shape=(1, 64), valid=(1, -1))
+    if subview:
+        parent, allocation = _alloc("parent", _type(shape=(1, 64)))
+        tile = ir.Var("vector", descriptor, SPAN)
+        view = _call("buffer.subview", [parent, _window(0, 0), _window(1, extent)], descriptor)
+        definitions = [allocation, ir.AssignStmt(tile, view, SPAN)]
+    else:
+        tile, allocation = _alloc("vector", descriptor, [extent])
+        definitions = [allocation]
+    transfer = _eval("buffer.load", source, _window(0), _window(requested), tile)
+    # The native descriptor keeps its initial column across loop iterations.
+    loop = ir.ForStmt(_scalar("i"), _int(0), _int(2), _int(1), [], transfer, [], SPAN)
+    params = [source, extent] if matches else [source, extent, requested]
+    program = _program([*definitions, loop], params, ir_stage=ir.FunctionIRStage.Buffer)
+    if matches:
+        assert "pto.tload" in _emit(program, flag=False)
+    else:
+        with pytest.raises(ValueError, match=r"Runtime rank-one transfer requires restored valid shape"):
+            _emit(program, flag=False)
+
+
+def test_mutable_rank_one_transfer_rejects_stale_extent_at_loop_backedge():
+    extent, next_extent = _scalar("extent"), _scalar("next_extent")
+    source = ir.Var("source", ir.TensorType([64], DataType.FP32), SPAN)
+    tile, allocation = _alloc("vector", _type(shape=(1, 64), valid=(-1, -1)), [_int(1), extent])
+    transfer = _eval("buffer.load", source, _window(0), _window(extent), tile)
+    update = _eval("buffer.set_validshape", tile, _window(1, next_extent))
+    body = ir.SeqStmts([transfer, update], SPAN)
+    loop = ir.ForStmt(_scalar("i"), _int(0), _int(2), _int(1), [], body, [], SPAN)
+    program = _program([allocation, loop], [source, extent, next_extent], ir_stage=ir.FunctionIRStage.Buffer)
+    with pytest.raises(ValueError, match=r"Runtime rank-one transfer requires restored valid shape"):
+        _emit(program, flag=False)
+
+
 @pytest.mark.parametrize("with_scalar_body", [False, True])
 def test_native_explicit_buffer_stage_handles_empty_and_scalar_only_kernels(tmp_path, with_scalar_body):
     condition = _scalar("condition", DataType.BOOL)
@@ -1065,12 +1126,22 @@ def test_buffer_load_bypass_and_buffer_insert_emit_pto():
     source = ir.Var("source", ir.TensorType([_int(16), _int(32)], DataType.FP32), SPAN)
     vec_buf, vec_alloc = _alloc("vec_tile", _type((16, 32)), address=_int(0))
     acc_type = ir.BufferType(
-        [16, 16], DataType.FP32, ir.MemorySpace.Acc, [16, 16],
-        ir.TileLayout.col_major, ir.TileLayout.row_major, 1024,
+        [16, 16],
+        DataType.FP32,
+        ir.MemorySpace.Acc,
+        [16, 16],
+        ir.TileLayout.col_major,
+        ir.TileLayout.row_major,
+        1024,
     )
     mat_type = ir.BufferType(
-        [32, 32], DataType.BF16, ir.MemorySpace.Mat, [32, 32],
-        ir.TileLayout.col_major, ir.TileLayout.row_major, 512,
+        [32, 32],
+        DataType.BF16,
+        ir.MemorySpace.Mat,
+        [32, 32],
+        ir.TileLayout.col_major,
+        ir.TileLayout.row_major,
+        512,
     )
     acc_buf, acc_alloc = _alloc("acc_tile", acc_type, address=_int(0))
     mat_buf, mat_alloc = _alloc("mat_tile", mat_type, address=_int(0))
