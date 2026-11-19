@@ -26,6 +26,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/simplify.h"
@@ -39,6 +40,7 @@
 
 namespace pypto::ir::pass {
 namespace {
+
 // Fold only a singleton cardinality proved across every caller. This is
 // scoped specialization of an immutable function, not inference from an index
 // hull. On optional realization failure the caller retains the original body.
@@ -384,7 +386,9 @@ Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accept
           auto block = evidence.block_indices.find(global->name_);
           const auto blocks =
               block == evidence.block_indices.end() ? std::nullopt : std::make_optional(block->second);
-          function = AnalyzeRegionSync(function, target, context->GetAutoSyncDisjointGM(), prefix, parameters,
+          const auto owner =
+              children.empty() && eventful.empty() ? ElideDominatedValidityGuards(function) : function;
+          function = AnalyzeRegionSync(owner, target, context->GetAutoSyncDisjointGM(), prefix, parameters,
                                        blocks, FixedLaunchCount(evidence, global->name_), children, eventful);
           sync::CheckGeneratedLogicalSync(function);
         }
@@ -533,8 +537,9 @@ Pass RealizeSync(bool require_whole_module) {
       return CompleteOwnedInvocation(physical.function, target);
     };
     try {
+      const auto candidate = ElideDominatedValidityGuards(function);
       if (disjoint_gm) {
-        const auto owner = BindLaunchCount(function, block_count);
+        const auto owner = BindLaunchCount(candidate, block_count);
         try {
           return realize_logical(InsertLogicalSync(owner, target, bounds, block_bounds, block_count));
         } catch (const pypto::ValueError&) {
@@ -549,12 +554,12 @@ Pass RealizeSync(bool require_whole_module) {
         }
       }
       try {
-        const auto regional_logical = sync::InsertConservativePrefixes(
-            sync::AnalyzeConservativeSync(function, target, {}, {}, false, true, true, bounds, block_bounds));
+        const auto regional_logical = sync::InsertConservativePrefixes(sync::AnalyzeConservativeSync(
+            candidate, target, {}, {}, false, true, true, bounds, block_bounds));
         return realize_logical(regional_logical);
       } catch (const pypto::ValueError&) {
         const auto fallback_logical = sync::InsertConservativePrefixes(sync::AnalyzeConservativeSync(
-            function, target, {}, {}, false, false, true, bounds, block_bounds));
+            candidate, target, {}, {}, false, false, true, bounds, block_bounds));
         return realize_logical(fallback_logical);
       }
     } catch (const pypto::ValueError& error) {

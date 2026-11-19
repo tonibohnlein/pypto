@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -48,9 +49,6 @@ using Bound = ConstIntBound;
 // Overflow-safe arithmetic for bound propagation
 // ============================================================================
 
-// Note: InfAwareAdd(kPosInf, kNegInf) returns kPosInf. This is an indeterminate
-// case (+inf + -inf), but in practice valid bounds always have min <= max, so
-// this path is not hit in normal operation. This matches TVM's behavior.
 static int64_t InfAwareAdd(int64_t a, int64_t b) {
   if (a == Bound::kPosInf || b == Bound::kPosInf) return Bound::kPosInf;
   if (a == Bound::kNegInf || b == Bound::kNegInf) return Bound::kNegInf;
@@ -110,6 +108,35 @@ static int64_t InfAwarePow(int64_t base, int64_t exp) {
 
 /// Return the "everything is possible" bound.
 static Bound Everything() { return {Bound::kNegInf, Bound::kPosInf}; }
+
+static Bound BoundAddOrSubtract(const Bound& a, const Bound& b, bool subtract) {
+  // Only the outward sentinel is unbounded for each endpoint. A lower
+  // +MAX or an upper -MAX is a usable finite threshold in its direction.
+  const int64_t b_lower = subtract ? b.max_value : b.min_value;
+  const int64_t b_upper = subtract ? b.min_value : b.max_value;
+  const bool lower_unknown =
+      a.min_value == Bound::kNegInf || b_lower == (subtract ? Bound::kPosInf : Bound::kNegInf);
+  const bool upper_unknown =
+      a.max_value == Bound::kPosInf || b_upper == (subtract ? Bound::kNegInf : Bound::kPosInf);
+  // Widen before subtraction so even MIN - MIN can be evaluated exactly,
+  // without trying to negate MIN as an int64.
+  const __int128 lo = static_cast<__int128>(a.min_value) + (subtract ? -__int128(b_lower) : b_lower);
+  const __int128 hi = static_cast<__int128>(a.max_value) + (subtract ? -__int128(b_upper) : b_upper);
+  constexpr auto minimum = std::numeric_limits<int64_t>::min();
+  constexpr auto maximum = std::numeric_limits<int64_t>::max();
+  if ((!lower_unknown && (lo < minimum || lo > maximum)) ||
+      (!upper_unknown && (hi < minimum || hi > maximum))) {
+    return Everything();
+  }
+  const Bound result{lower_unknown ? Bound::kNegInf : static_cast<int64_t>(lo),
+                     upper_unknown ? Bound::kPosInf : static_cast<int64_t>(hi)};
+  // Do not turn an open endpoint into a singleton at the sentinel by
+  // coincidence, or return an inverted interval near signed MIN.
+  if (result.min_value > result.max_value || (result.is_const() && (lower_unknown || upper_unknown))) {
+    return Everything();
+  }
+  return result;
+}
 
 /// A finite interval is usable only if lowering preserves both its endpoints.
 /// Unknown intervals carry no sign/range facts to invalidate. Reject empty
@@ -244,14 +271,13 @@ class ConstIntBoundAnalyzer::Impl : public ExprFunctor<Bound> {
   Bound VisitExpr_(const AddPtr& op) override {
     auto a = VisitExpr(op->left_);
     auto b = VisitExpr(op->right_);
-    return {InfAwareAdd(a.min_value, b.min_value), InfAwareAdd(a.max_value, b.max_value)};
+    return BoundAddOrSubtract(a, b, /*subtract=*/false);
   }
 
   Bound VisitExpr_(const SubPtr& op) override {
     auto a = VisitExpr(op->left_);
     auto b = VisitExpr(op->right_);
-    return {InfAwareAdd(a.min_value, InfAwareNeg(b.max_value)),
-            InfAwareAdd(a.max_value, InfAwareNeg(b.min_value))};
+    return BoundAddOrSubtract(a, b, /*subtract=*/true);
   }
 
   Bound VisitExpr_(const MulPtr& op) override {

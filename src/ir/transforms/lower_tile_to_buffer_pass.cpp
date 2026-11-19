@@ -63,6 +63,7 @@
 #include "pypto/ir/transforms/utils/buffer_acc_trim_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_indexed_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_ir_selection.h"
+#include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_tuple_results.h"
 #include "pypto/ir/transforms/utils/buffer_valid_analysis.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
@@ -1135,9 +1136,9 @@ class TileToBufferMutator : public IRMutator {
                                     backend::SupportsLogicalBufferConversion(*conversion, call);
     const auto* axis_recipe = backend::FindLogicalBufferAxisRecipe(call->op_->name_);
     const bool guarded_axis_op = axis_recipe && backend::SupportsLogicalBufferAxis(*axis_recipe, call);
-    const bool data_operation =
-        guarded_axis_op || store || IsOp(call, "tile.load") || IsOp(call, "tile.move") ||
-        backend::FindLogicalBufferElementwiseRecipe(call) || static_cast_recipe;
+    const bool data_operation = guarded_axis_op || store || IsOp(call, "tile.load") ||
+                                IsOp(call, "tile.move") ||
+                                backend::FindLogicalBufferElementwiseRecipe(call) || static_cast_recipe;
     if (!data_operation || (!store && !result)) {
       return WithValidState(call, result, LowerCall(call, result));
     }
@@ -1496,10 +1497,9 @@ class TileToBufferMutator : public IRMutator {
         INTERNAL_CHECK_SPAN(Handle(call->args_[0]) == destination, call->span_)
             << "LowerTileToBuffer: Acc -> Mat tile.assemble must write in place into its target Mat buffer";
         const auto offsets = Offsets(call->args_[2]);
-        return Operation(
-            "buffer.insert",
-            {Handle(call->args_[1]), offsets->elements_[0], offsets->elements_[1], destination},
-            call->span_);
+        return Operation("buffer.insert",
+                         {Handle(call->args_[1]), offsets->elements_[0], offsets->elements_[1], destination},
+                         call->span_);
       }
       CHECK_SPAN(source_tile->GetMemorySpace() == MemorySpace::Vec && result_space == MemorySpace::Vec,
                  call->span_)
@@ -1567,9 +1567,9 @@ class TileToBufferMutator : public IRMutator {
       INTERNAL_CHECK_SPAN(result && call->args_.size() >= 3, call->span_)
           << "Internal error: malformed tile.load";
       const int cache = GetIntKwarg(call->kwargs_, "cache", static_cast<int>(CachePolicy::kDefault));
-      CHECK_SPAN(cache == static_cast<int>(CachePolicy::kDefault) ||
-                     cache == static_cast<int>(CachePolicy::kBypass),
-                 call->span_)
+      CHECK_SPAN(
+          cache == static_cast<int>(CachePolicy::kDefault) || cache == static_cast<int>(CachePolicy::kBypass),
+          call->span_)
           << "LowerTileToBuffer: tile.load cache requires DEFAULT or BYPASS policy";
       const bool scalar_point = backend::SupportsLogicalBufferScalarTransfer(call);
       const bool vector_1d = backend::SupportsLogicalVector1DBufferTransfer(call);
@@ -1577,8 +1577,7 @@ class TileToBufferMutator : public IRMutator {
       if (scalar_point) {
         valid = VisitExpr(call->args_[3]);
       } else if (vector_1d) {
-        valid = std::make_shared<MakeTuple>(
-            std::vector<ExprPtr>{Valid(result)->elements_[1]}, call->span_);
+        valid = std::make_shared<MakeTuple>(std::vector<ExprPtr>{Valid(result)->elements_[1]}, call->span_);
       }
       return Operation("buffer.load",
                        {VisitExpr(call->args_[0]), VisitExpr(call->args_[1]), valid, Handle(result)},
@@ -1622,9 +1621,8 @@ class TileToBufferMutator : public IRMutator {
                        atomic == 0 ? std::vector<std::pair<std::string, std::any>>{}
                                    : std::vector<std::pair<std::string, std::any>>{{"atomic", atomic}});
     }
-    if (const auto* recipe = As<GlobalVar>(call->op_)
-                                 ? nullptr
-                                 : backend::FindLogicalBufferElementwiseRecipe(call)) {
+    if (const auto* recipe =
+            As<GlobalVar>(call->op_) ? nullptr : backend::FindLogicalBufferElementwiseRecipe(call)) {
       INTERNAL_CHECK_SPAN(result, call->span_) << "Internal error: Tile elementwise recipe has no result";
       const auto& entry = OpRegistry::GetInstance().GetEntry(call->op_->name_);
       ValidateKwargs(call->kwargs_, entry.GetOp()->GetAttrs(), call->op_->name_);
@@ -1834,7 +1832,7 @@ ProgramPtr TransformProgram(const ProgramPtr& program) {
     lowered->body_ = mutator.VisitStmt(function->body_);
     lowered->ir_stage_ = FunctionIRStage::Buffer;
     // Guard bodies are newly constructed and are not revisited by the mutator.
-    functions.push_back(NormalizeStmtStructure(lowered));
+    functions.push_back(ElideDominatedValidityGuards(NormalizeStmtStructure(lowered)));
   }
   auto result = std::make_shared<Program>(functions, program->name_, program->span_);
   verifiers.VerifyOrThrow({IRProperty::BufferIR}, result);
@@ -1842,6 +1840,36 @@ ProgramPtr TransformProgram(const ProgramPtr& program) {
 }
 
 }  // namespace
+
+FunctionPtr ElideDominatedValidityGuards(const FunctionPtr& function) {
+  const BufferRuntimeValidAnalysis validity(function, /*collect_guards=*/true);
+  if (validity.issue() || !validity.HasElidableGuards()) return function;
+  class Elider : public IRMutator {
+   public:
+    explicit Elider(const BufferRuntimeValidAnalysis& validity) : validity_(validity) {}
+
+   protected:
+    StmtPtr VisitStmt_(const IfStmtPtr& branch) override {
+      if (!validity_.Elides(branch)) return IRMutator::VisitStmt_(branch);
+      const auto body = VisitStmt(branch->then_body_);
+      const auto sequence = As<SeqStmts>(body);
+      std::vector<StmtPtr> statements = sequence ? sequence->stmts_ : std::vector<StmtPtr>{body};
+      // This proven arm has no results. Its empty terminator belongs to the
+      // deleted branch, while all metadata and payload effects retain their cut.
+      if (!statements.empty()) {
+        if (const auto yield = As<YieldStmt>(statements.back()); yield && yield->value_.empty()) {
+          statements.pop_back();
+        }
+      }
+      return SeqStmts::Flatten(std::move(statements), branch->span_);
+    }
+
+   private:
+    const BufferRuntimeValidAnalysis& validity_;
+  } elider(validity);
+  auto rewritten = elider.VisitFunction(function);
+  return rewritten == function ? function : NormalizeStmtStructure(rewritten);
+}
 
 namespace pass {
 
