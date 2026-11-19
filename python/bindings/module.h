@@ -164,6 +164,8 @@ void BindArith(nanobind::module_& m);
  */
 void BindFunctor(nanobind::module_& m);
 
+void BindAutoLayout(nanobind::module_& m);
+
 }  // namespace python
 }  // namespace pypto
 

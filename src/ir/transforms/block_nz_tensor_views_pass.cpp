@@ -117,13 +117,7 @@ namespace ir {
 
 namespace {
 
-/// Function-level stamp marking that Phase 1 already ran on this function.
-///
-/// Blocking is *not* idempotent — running it twice would block an already
-/// blocked shape — and the structural ``IsBlockedNzShape`` test cannot tell a
-/// blocked shape from a logical one that merely ends in ``[16, c0]``. The stamp
-/// makes re-entry a no-op without relying on that ambiguity.
-constexpr const char* kNzBlockedAttr = "nz_tensor_views_blocked";
+// Local NZ-blocked marker uses canonical kAttrNzTensorViewsBlocked from function.h.
 
 /// True when a tensor-like type carries an NZ TensorView.
 bool IsNzTensorType(const TypePtr& type) {
@@ -830,7 +824,7 @@ class BlockNzMutator : public IRMutator {
 /// Block one function: params, return types, body. Returns the input unchanged
 /// when the function carries no NZ tensor.
 FunctionPtr TransformFunction(const FunctionPtr& func) {
-  if (func->HasAttr(kNzBlockedAttr)) return func;
+  if (func->HasAttr(kAttrNzTensorViewsBlocked)) return func;
 
   bool params_changed = false;
   std::vector<VarPtr> new_params;
@@ -881,7 +875,7 @@ FunctionPtr TransformFunction(const FunctionPtr& func) {
       value = std::move(*remapped);
     }
   }
-  new_func->attrs_.emplace_back(kNzBlockedAttr, std::any(true));
+  new_func->attrs_.emplace_back(kAttrNzTensorViewsBlocked, std::any(true));
   return new_func;
 }
 

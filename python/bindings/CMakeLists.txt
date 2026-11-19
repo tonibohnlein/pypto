@@ -23,6 +23,7 @@ set(PYPTO_BINDING_SOURCES
     modules/backend.cpp
     modules/sync.cpp
     modules/arith.cpp
+    modules/auto_layout.cpp
     modules/functor.cpp
 )
 

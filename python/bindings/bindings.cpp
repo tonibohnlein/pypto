@@ -72,6 +72,9 @@ NB_MODULE(pypto_core, m) {
   // Register IR functors (IRVisitor/IRMutator) for Python subclassing
   pypto::python::BindFunctor(m);
 
+  // Register AutoLayout model, extractor, solver, and IR writer
+  pypto::python::BindAutoLayout(m);
+
   // Validate that all tile.* ops have memory specs — fails at import time if any are missing
   pypto::ir::OpRegistry::GetInstance().ValidateTileOps();
 

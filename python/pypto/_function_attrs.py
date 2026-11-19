@@ -64,6 +64,9 @@ REQUIRE_CONTIGUOUS_OPERANDS_ATTR = "require_contiguous_operands"
 # True, so only the opt-out (False) is ever stored.
 AUTO_SCOPE_ATTR = "auto_scope"
 
+# Marker stamped by BlockNzTensorViews when logical NZ tensors are blocked (bool).
+NZ_TENSOR_VIEWS_BLOCKED_ATTR = "nz_tensor_views_blocked"
+
 __all__ = [
     "AUTO_SCOPE_ATTR",
     "BUFFER_IR_SELECTED_ATTR",
@@ -74,6 +77,7 @@ __all__ = [
     "EXTERNAL_PREFLIGHT_SYMBOL_ATTR",
     "EXTERNAL_RETURN_PARAMS_ATTR",
     "EXTERNAL_SOURCE_ATTR",
+    "NZ_TENSOR_VIEWS_BLOCKED_ATTR",
     "REQUIRE_CONTIGUOUS_OPERANDS_ATTR",
     "SPLIT_AIV_ATTR",
 ]

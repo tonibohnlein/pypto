@@ -2464,5 +2464,308 @@ def test_direction_c_fractal_nz_vec_pointwise_between_cube_matmuls_and_pto():
             run_post_layout_passes(k2_rw)
 
 
+def test_nested_if_while_yield_scoping_and_return_var_symmetry():
+    set_backend_type(BackendType.Ascend910)
+    span = ir.Span.unknown()
+    nd = ir.TensorLayout.ND
+    nz = ir.TensorLayout.NZ
+
+    gm_type = ir.TensorType([64, 64], DataType.FP16)
+    bool_type = ir.ScalarType(DataType.BOOL)
+    idx0 = ir.ConstInt(0, DataType.INDEX, span)
+    idx1 = ir.ConstInt(1, DataType.INDEX, span)
+    idx2 = ir.ConstInt(2, DataType.INDEX, span)
+    idx16 = ir.ConstInt(16, DataType.INDEX, span)
+
+    def _make_tile_type(
+        space: ir.MemorySpace,
+        blayout: ir.TileLayout = ir.TileLayout.row_major,
+        slayout: ir.TileLayout = ir.TileLayout.none_box,
+        fractal: int = 512,
+        dtype: DataType = DataType.FP16,
+    ) -> ir.TileType:
+        return ir.TileType(
+            [16, 16],
+            dtype,
+            None,
+            ir.TileView([idx16, idx16], [], None, blayout, slayout, fractal),
+            space,
+        )
+
+    vec_type = _make_tile_type(ir.MemorySpace.Vec)
+    mat_type = _make_tile_type(ir.MemorySpace.Mat, ir.TileLayout.col_major, ir.TileLayout.row_major)
+    left_type = _make_tile_type(ir.MemorySpace.Left, ir.TileLayout.col_major, ir.TileLayout.row_major)
+    right_type = _make_tile_type(ir.MemorySpace.Right, ir.TileLayout.row_major, ir.TileLayout.col_major)
+    acc_type = _make_tile_type(
+        ir.MemorySpace.Acc, ir.TileLayout.col_major, ir.TileLayout.row_major, 1024, DataType.FP32
+    )
+    out_fp32_type = ir.TensorType([64, 64], DataType.FP32)
+
+    x = ir.Var("x", gm_type, span)
+    w = ir.Var("w", gm_type, span)
+    v_in = ir.Var("v_in", gm_type, span)
+    z = ir.Var("z", gm_type, span)
+    y_acc = ir.Var("y_acc", out_fp32_type, span)
+    y_vec = ir.Var("y_vec", gm_type, span)
+    cond = ir.Var("cond", bool_type, span)
+    flag = ir.Var("flag", bool_type, span)
+
+    offs = ir.MakeTuple([idx0, idx0], span)
+    win = ir.MakeTuple([idx16, idx16], span)
+    t_v_init = ir.Var("t_v_init", vec_type, span)
+    t_v_init_stmt = ir.AssignStmt(
+        t_v_init,
+        ir.create_op_call("tile.load", [v_in, offs, win, win], {"target_memory": ir.MemorySpace.Vec}, span),
+        span,
+    )
+
+    for_gm = ir.IterArg("for_gm", gm_type, x, span)
+    for_tile = ir.IterArg("for_tile", vec_type, t_v_init, span)
+
+    while_gm = ir.IterArg("while_gm", gm_type, for_gm, span)
+    while_tile = ir.IterArg("while_tile", vec_type, for_tile, span)
+    w_gm_ret = ir.Var("w_gm_ret", gm_type, span)
+    w_tile_ret = ir.Var("w_tile_ret", vec_type, span)
+    while_stmt = ir.WhileStmt(
+        cond,
+        [while_gm, while_tile],
+        ir.YieldStmt([while_gm, while_tile], span),
+        [w_gm_ret, w_tile_ret],
+        span,
+    )
+
+    t_then = ir.Var("t_then", vec_type, span)
+    t_then_stmt = ir.AssignStmt(
+        t_then,
+        ir.create_op_call("tile.load", [z, offs, win, win], {"target_memory": ir.MemorySpace.Vec}, span),
+        span,
+    )
+    t_else_raw = ir.Var("t_else_raw", vec_type, span)
+    t_else_raw_stmt = ir.AssignStmt(
+        t_else_raw,
+        ir.create_op_call("tile.load", [z, offs, win, win], {"target_memory": ir.MemorySpace.Vec}, span),
+        span,
+    )
+    t_else = ir.Var("t_else", vec_type, span)
+    t_else_stmt = ir.AssignStmt(t_else, ir.create_op_call("tile.neg", [t_else_raw], {}, span), span)
+
+    if_gm_ret = ir.Var("if_gm_ret", gm_type, span)
+    if_tile_ret = ir.Var("if_tile_ret", vec_type, span)
+    if_stmt = ir.IfStmt(
+        flag,
+        ir.SeqStmts([t_then_stmt, ir.YieldStmt([for_gm, t_then], span)], span),
+        ir.SeqStmts([t_else_raw_stmt, t_else_stmt, ir.YieldStmt([for_gm, t_else], span)], span),
+        [if_gm_ret, if_tile_ret],
+        span,
+    )
+
+    t_mat_a = ir.Var("t_mat_a", mat_type, span)
+    t_mat_a_stmt = ir.AssignStmt(
+        t_mat_a,
+        ir.create_op_call(
+            "tile.load", [if_gm_ret, offs, win, win], {"target_memory": ir.MemorySpace.Mat}, span
+        ),
+        span,
+    )
+    t_mat_b = ir.Var("t_mat_b", mat_type, span)
+    t_mat_b_stmt = ir.AssignStmt(
+        t_mat_b,
+        ir.create_op_call("tile.load", [w, offs, win, win], {"target_memory": ir.MemorySpace.Mat}, span),
+        span,
+    )
+    t_l0a = ir.Var("t_l0a", left_type, span)
+    t_l0a_stmt = ir.AssignStmt(
+        t_l0a,
+        ir.create_op_call(
+            "tile.move",
+            [t_mat_a],
+            {
+                "target_memory": ir.MemorySpace.Left,
+                "blayout": ir.TileLayout.col_major,
+                "slayout": ir.TileLayout.row_major,
+            },
+            span,
+        ),
+        span,
+    )
+    t_l0b = ir.Var("t_l0b", right_type, span)
+    t_l0b_stmt = ir.AssignStmt(
+        t_l0b,
+        ir.create_op_call(
+            "tile.move",
+            [t_mat_b],
+            {
+                "target_memory": ir.MemorySpace.Right,
+                "blayout": ir.TileLayout.row_major,
+                "slayout": ir.TileLayout.col_major,
+            },
+            span,
+        ),
+        span,
+    )
+    t_acc = ir.Var("t_acc", acc_type, span)
+    t_acc_stmt = ir.AssignStmt(t_acc, ir.create_op_call("tile.matmul", [t_l0a, t_l0b], {}, span), span)
+    y_acc_loop = ir.Var("y_acc_loop", out_fp32_type, span)
+    store_acc_stmt = ir.AssignStmt(
+        y_acc_loop, ir.create_op_call("tile.store", [t_acc, offs, y_acc, win], {}, span), span
+    )
+
+    t_sum = ir.Var("t_sum", vec_type, span)
+    t_sum_stmt = ir.AssignStmt(
+        t_sum, ir.create_op_call("tile.add", [w_tile_ret, if_tile_ret], {}, span), span
+    )
+    f_gm_ret = ir.Var("f_gm_ret", gm_type, span)
+    f_tile_ret = ir.Var("f_tile_ret", vec_type, span)
+    for_stmt = ir.ForStmt(
+        ir.Var("loop_i", ir.ScalarType(DataType.INDEX), span),
+        idx0,
+        idx2,
+        idx1,
+        [for_gm, for_tile],
+        ir.SeqStmts(
+            [
+                while_stmt,
+                if_stmt,
+                t_mat_a_stmt,
+                t_mat_b_stmt,
+                t_l0a_stmt,
+                t_l0b_stmt,
+                t_acc_stmt,
+                store_acc_stmt,
+                t_sum_stmt,
+                ir.YieldStmt([w_gm_ret, t_sum], span),
+            ],
+            span,
+        ),
+        [f_gm_ret, f_tile_ret],
+        span,
+    )
+
+    y_vec_out = ir.Var("y_vec_out", gm_type, span)
+    store_vec_stmt = ir.AssignStmt(
+        y_vec_out, ir.create_op_call("tile.store", [f_tile_ret, offs, y_vec, win], {}, span), span
+    )
+    fn = ir.Function(
+        "nested_cf_kernel",
+        [
+            (x, ir.ParamDirection.In),
+            (w, ir.ParamDirection.In),
+            (v_in, ir.ParamDirection.In),
+            (z, ir.ParamDirection.In),
+            (y_acc, ir.ParamDirection.Out),
+            (y_vec, ir.ParamDirection.Out),
+            (cond, ir.ParamDirection.In),
+            (flag, ir.ParamDirection.In),
+        ],
+        [gm_type],
+        ir.SeqStmts([t_v_init_stmt, for_stmt, store_vec_stmt, ir.ReturnStmt([y_vec_out], span)], span),
+        span,
+        type=ir.FunctionType.InCore,
+    )
+    prog = ir.Program([fn], "nested_cf_prog", span)
+
+    # 1) Extraction must isolate inner IfStmt yields from outer ForStmt iter_args (`x`/`w` vs `v_in`/`z`).
+    inst = extract_layout_instance(
+        prog,
+        cost_model=LayoutCostModel(backend_type=BackendType.Ascend910, allow_external_input_relayout=True),
+        reusable_tensors={"x", "w", "y_acc"},
+    )
+    assert nz in inst.values["x"].admissible_layouts
+    assert nz in inst.values["w"].admissible_layouts
+    assert nz not in inst.values["z"].admissible_layouts
+
+    # 2) Writeback with both GM (ND -> NZ) and Mem.Vec (ROW_MAJOR <-> COL_MAJOR) rewrites
+    #    must update ForStmt/WhileStmt/IfStmt return_vars_ symmetrically without leaking
+    #    outer ForStmt iter_arg layouts into inner IfStmt YieldStmts.
+    assignment = LayoutAssignment(
+        value_layouts={
+            "x": nz,
+            "w": nz,
+            "v_in": nd,
+            "z": nd,
+            "y_acc": nz,
+            "y_vec": nd,
+            "t_v_init": COL_MAJOR_FLAT,
+            "t_then": ROW_MAJOR_FLAT,
+            "t_else_raw": ROW_MAJOR_FLAT,
+            "t_else": ROW_MAJOR_FLAT,
+            "t_mat_a": FRACTAL_NZ,
+            "t_mat_b": FRACTAL_NZ,
+            "t_l0a": FRACTAL_NZ,
+            "t_l0b": FRACTAL_ZN,
+            "t_acc": FRACTAL_ACC_NZ,
+            "t_sum": ROW_MAJOR_FLAT,
+        },
+        op_configs={
+            "op_0_t_v_init_load": OperatorConfig(
+                "op_0_t_v_init_load", "tile.load", (nd,), COL_MAJOR_FLAT, 1.0
+            ),
+            "op_1_t_then_load": OperatorConfig("op_1_t_then_load", "tile.load", (nd,), ROW_MAJOR_FLAT, 1.0),
+            "op_2_t_else_raw_load": OperatorConfig(
+                "op_2_t_else_raw_load", "tile.load", (nd,), ROW_MAJOR_FLAT, 1.0
+            ),
+            "op_3_t_else_generic": OperatorConfig(
+                "op_3_t_else_generic", "tile.neg", (ROW_MAJOR_FLAT,), ROW_MAJOR_FLAT, 1.0
+            ),
+            "op_4_t_mat_a_load": OperatorConfig("op_4_t_mat_a_load", "tile.load", (nz,), FRACTAL_NZ, 1.0),
+            "op_5_t_mat_b_load": OperatorConfig("op_5_t_mat_b_load", "tile.load", (nz,), FRACTAL_NZ, 1.0),
+            "op_6_t_l0a_move": OperatorConfig("op_6_t_l0a_move", "tile.move", (FRACTAL_NZ,), FRACTAL_NZ, 1.0),
+            "op_7_t_l0b_move": OperatorConfig("op_7_t_l0b_move", "tile.move", (FRACTAL_NZ,), FRACTAL_ZN, 1.0),
+            "op_8_t_acc_matmul": OperatorConfig(
+                "op_8_t_acc_matmul", "tile.matmul", (FRACTAL_NZ, FRACTAL_ZN), FRACTAL_ACC_NZ, 1.0
+            ),
+            "op_9_y_acc_loop_store": OperatorConfig(
+                "op_9_y_acc_loop_store", "tile.store", (FRACTAL_ACC_NZ, nz), nz, 1.0
+            ),
+            "op_10_t_sum_generic": OperatorConfig(
+                "op_10_t_sum_generic", "tile.add", (COL_MAJOR_FLAT, ROW_MAJOR_FLAT), ROW_MAJOR_FLAT, 1.0
+            ),
+            "op_11_y_vec_out_store": OperatorConfig(
+                "op_11_y_vec_out_store", "tile.store", (ROW_MAJOR_FLAT, nd), nd, 1.0
+            ),
+        },
+    )
+    rewritten = apply_layout_assignment(prog, assignment)
+    rw_fn = next(fn for gv, fn in rewritten.functions.items() if gv.name == "nested_cf_kernel")
+    assert rw_fn.params[0].type.tensor_view.layout == nz
+    assert rw_fn.params[1].type.tensor_view.layout == nz
+    assert rw_fn.params[4].type.tensor_view.layout == nz
+
+    rw_stmts = rw_fn.body.stmts
+    rw_for = next(s for s in rw_stmts if isinstance(s, ir.ForStmt))
+    assert rw_for.iter_args[0].type.tensor_view.layout == nz
+    assert rw_for.iter_args[1].type.tile_view.blayout == ir.TileLayout.col_major
+    assert rw_for.return_vars[0].type == rw_for.iter_args[0].type
+    assert rw_for.return_vars[1].type == rw_for.iter_args[1].type
+
+    rw_for_stmts = rw_for.body.stmts
+    rw_while = next(s for s in rw_for_stmts if isinstance(s, ir.WhileStmt))
+    assert rw_while.iter_args[0].type.tensor_view.layout == nz
+    assert rw_while.iter_args[1].type.tile_view.blayout == ir.TileLayout.col_major
+    assert rw_while.return_vars[0].type == rw_while.iter_args[0].type
+    assert rw_while.return_vars[1].type == rw_while.iter_args[1].type
+
+    rw_if = next(s for s in rw_for_stmts if isinstance(s, ir.IfStmt))
+    assert rw_if.return_vars[0].type.tensor_view.layout == nz
+    # Inner IfStmt branches must yield ROW_MAJOR_FLAT (`t_then` / `t_else`), not COL_MAJOR_FLAT.
+    then_yield = rw_if.then_body.stmts[-1]
+    assert isinstance(then_yield, ir.YieldStmt)
+    assert (
+        then_yield.value[1].type.tile_view is None
+        or then_yield.value[1].type.tile_view.blayout == ir.TileLayout.row_major
+    )
+    assert rw_if.return_vars[1].type == then_yield.value[1].type
+
+    verify_props = passes.IRPropertySet()
+    verify_props.insert(passes.IRProperty.SSAForm)
+    verify_props.insert(passes.IRProperty.AssignTypeSymmetry)
+    verify_props.insert(passes.IRProperty.NormalizedStmtStructure)
+    passes.verify_properties(
+        verify_props,
+        rewritten,
+        "test_nested_if_while_yield_scoping_and_return_var_symmetry",
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

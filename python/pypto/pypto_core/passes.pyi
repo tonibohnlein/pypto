@@ -13,6 +13,7 @@ from enum import Enum
 from types import TracebackType
 from typing import Any, overload
 
+from pypto.pypto_core.auto_layout import LayoutAssignment, LayoutCostModel
 from pypto.pypto_core.backend import Backend
 from pypto.pypto_core.ir import Function, HardwareLoopProfile, HardwareLoopQualification, Program, Span, Stmt
 
@@ -689,6 +690,21 @@ def materialize_tensor_strides() -> Pass:
     auto-verifies after the pass runs.
     """
 
+def auto_layout(
+    cost_model: LayoutCostModel | None = None,
+    reusable_tensors: set[str] | None = None,
+    solver: str = "auto",
+    max_treewidth: int = 8,
+    name: str = "AutoLayout",
+) -> Pass:
+    """Create a pass that extracts, solves, and applies global GM and on-chip tile layouts."""
+
+def auto_layout_from_assignment(
+    assignment: LayoutAssignment,
+    name: str = "AutoLayout",
+) -> Pass:
+    """Create a pass that writes a pre-computed LayoutAssignment back to IR."""
+
 def resolve_backend_op_layouts() -> Pass:
     """Create a pass that repairs backend-required layouts for constrained tile ops."""
 
@@ -1160,6 +1176,8 @@ __all__ = [
     "infer_tile_memory_space",
     "insert_mx_scale_addr",
     "materialize_tensor_strides",
+    "auto_layout",
+    "auto_layout_from_assignment",
     "resolve_backend_op_layouts",
     "normalize_return_order",
     "expand_mixed_kernel",

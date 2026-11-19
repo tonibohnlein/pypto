@@ -12,18 +12,25 @@
 #include "pypto/ir/transforms/passes.h"
 
 #include <nanobind/nanobind.h>
-#include <nanobind/stl/function.h>    // NOLINT(misc-include-cleaner) -- registers std::function casters
-#include <nanobind/stl/shared_ptr.h>  // NOLINT(misc-include-cleaner) -- registers shared_ptr casters
-#include <nanobind/stl/string.h>      // NOLINT(misc-include-cleaner) -- registers std::string casters
-#include <nanobind/stl/vector.h>      // NOLINT(misc-include-cleaner) -- registers std::vector casters
+#include <nanobind/stl/function.h>       // NOLINT(misc-include-cleaner) -- registers std::function casters
+#include <nanobind/stl/optional.h>       // NOLINT(misc-include-cleaner) -- registers std::optional casters
+#include <nanobind/stl/shared_ptr.h>     // NOLINT(misc-include-cleaner) -- registers shared_ptr casters
+#include <nanobind/stl/string.h>         // NOLINT(misc-include-cleaner) -- registers std::string casters
+#include <nanobind/stl/unordered_set.h>  // NOLINT(misc-include-cleaner) -- registers std::unordered_set casters
+#include <nanobind/stl/vector.h>         // NOLINT(misc-include-cleaner) -- registers std::vector casters
 
+#include <cstdint>
+#include <optional>
 #include <string>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
 #include "pypto/core/error.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/transforms/auto_layout/model.h"
 #include "pypto/ir/transforms/ir_property.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/utils/l0_tile_chooser.h"
@@ -655,6 +662,28 @@ void BindPass(nb::module_& m) {
              "stride per BuildLogicalStridesFromLayout. Bare TensorTypes are left\n"
              "untouched. Idempotent. Produces TensorViewCanonical so the registry\n"
              "auto-verifies after the pass runs.");
+  passes.def(
+      "auto_layout",
+      [](const std::optional<auto_layout::LayoutCostModel>& cost_model,
+         const std::optional<std::unordered_set<std::string>>& reusable_tensors, const std::string& solver,
+         int64_t max_treewidth, const std::string& name) {
+        pass::AutoLayoutOptions opts;
+        if (cost_model.has_value()) {
+          opts.cost_model = *cost_model;
+        }
+        if (reusable_tensors.has_value()) {
+          opts.reusable_tensors = *reusable_tensors;
+        }
+        opts.solver = solver;
+        opts.max_treewidth = max_treewidth;
+        opts.name = name;
+        return pass::AutoLayout(std::move(opts));
+      },
+      nb::arg("cost_model") = nb::none(), nb::arg("reusable_tensors") = nb::none(),
+      nb::arg("solver") = "auto", nb::arg("max_treewidth") = 8, nb::arg("name") = "AutoLayout",
+      "Extract, solve, and apply optimal GM and on-chip tile layouts.");
+  passes.def("auto_layout_from_assignment", &pass::AutoLayoutFromAssignment, nb::arg("assignment"),
+             nb::arg("name") = "AutoLayout", "Apply a pre-computed LayoutAssignment to a Program.");
   passes.def("resolve_backend_op_layouts", &pass::ResolveBackendOpLayouts,
              "Create a pass that repairs backend-required layouts for constrained elementwise tile ops\n\n"
              "Repairs `[N,1]` col-major vector inputs at constrained use-sites by reshaping them\n"
