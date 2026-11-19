@@ -187,5 +187,244 @@ def test_retained_queries_do_not_rebuild_or_borrow_the_function():
     assert result.describe() == before
 
 
+def placed_tile(
+    name: str, tile_type: ir.BufferType, address: int, span: ir.Span
+) -> tuple[ir.Var, ir.AssignStmt]:
+    tensor = ir.Var(name, tile_type, span)
+    allocation = ir.Call(
+        ir.get_op("buffer.alloc"),
+        [ir.MakeTuple([], span), ir.ConstInt(address, ir.DataType.INDEX, span)],
+        tile_type,
+        span,
+    )
+    return tensor, ir.AssignStmt(tensor, allocation, span)
+
+
+def matrix_overlap_fixture(
+    inner: ir.TileLayout,
+    address: int,
+    column: int = 16,
+    *,
+    width: int = 64,
+    extract_width: int = 32,
+) -> tuple[ir.Function, ir.Call]:
+    span = ir.Span.unknown()
+    index, fp32 = ir.DataType.INDEX, ir.DataType.FP32
+    row_major, col_major = ir.TileLayout.row_major, ir.TileLayout.col_major
+
+    def ci(value: int) -> ir.ConstInt:
+        return ir.ConstInt(value, index, span)
+
+    outer = row_major if inner == col_major else col_major
+    wide_type = ir.BufferType([64, width], fp32, ir.MemorySpace.Mat, blayout=outer, slayout=inner)
+    narrow_type = ir.BufferType([32, width], fp32, ir.MemorySpace.Mat, blayout=col_major, slayout=row_major)
+    left_type = ir.BufferType(
+        [16, extract_width], fp32, ir.MemorySpace.Left, blayout=row_major, slayout=row_major
+    )
+    wide, alloc_wide = placed_tile("wide_mat", wide_type, 4096, span)
+    narrow, alloc_narrow = placed_tile("narrow_mat", narrow_type, 4096 + address, span)
+    left, alloc_left = placed_tile("left", left_type, 0, span)
+    gm_wide = ir.Var("input_wide", ir.TensorType(wide_type.shape, fp32), span)
+    gm_narrow = ir.Var("input_narrow", ir.TensorType(narrow_type.shape, fp32), span)
+
+    def load(source: ir.Var, destination: ir.Var, shape: tuple[int, int]) -> ir.EvalStmt:
+        return ir.EvalStmt(
+            ir.Call(
+                ir.get_op("buffer.load"),
+                [
+                    source,
+                    ir.MakeTuple([ci(0), ci(0)], span),
+                    ir.MakeTuple([ci(n) for n in shape], span),
+                    destination,
+                ],
+                ir.VoidType(),
+                span,
+            ),
+            span,
+        )
+
+    iv = ir.Var("row", ir.ScalarType(index), span)
+    extract = ir.Call(ir.get_op("buffer.extract"), [wide, iv, ci(column), left], ir.VoidType(), span)
+    loop = ir.ForStmt(
+        iv,
+        ci(16),
+        ci(48),
+        ci(16),
+        [],
+        ir.SeqStmts([ir.EvalStmt(extract, span), ir.YieldStmt([], span)], span),
+        [],
+        span,
+    )
+    body = ir.SeqStmts(
+        [
+            alloc_wide,
+            alloc_narrow,
+            alloc_left,
+            load(gm_wide, wide, (64, width)),
+            load(gm_narrow, narrow, (32, width)),
+            loop,
+            ir.ReturnStmt([], span),
+        ],
+        span,
+    )
+    return ir.Function(
+        "overlapping_matrix_windows",
+        [gm_wide, gm_narrow],
+        [],
+        body,
+        span,
+        ir.FunctionType.AIC,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    ), extract
+
+
+@pytest.mark.parametrize("inner", [ir.TileLayout.row_major, ir.TileLayout.col_major])
+@pytest.mark.parametrize("address", [0, 2048])
+def test_overlapping_matrix_views_use_exact_native_byte_stripes(inner, address):
+    function, extract = matrix_overlap_fixture(inner, address)
+    data = testing.describe_placed_sync_input(function, True)
+    locations = [
+        (index, storage)
+        for index, storage in enumerate(data["storage"])
+        if storage["space"] == ir.MemorySpace.Mat
+    ]
+    assert len(locations) == 1
+    storage_id, matrix = locations[0]
+    assert matrix["byte_coordinates"]
+    sites = [site for region in data["regions"] for site in region["sites"]]
+    site = next(site for site in sites if site["original"].same_as(extract))
+    narrow_writes = [effect for effect in sites[1]["accesses"] if effect[0] == storage_id and effect[1]]
+    assert len(narrow_writes) == 1
+    _, _, row, col, row_step, col_step, rows, cols, _ = narrow_writes[0]
+    assert row == row_step == col_step == 0 and rows == 1
+    assert matrix["address"] + col == 4096 + address
+    assert cols == 32 * 64 * 4
+
+    # Native FP32 ZN has 8x16 column-major interiors, while NZ has 16x8
+    # row-major interiors. Independently enumerate individual bytes so a gap in
+    # the layout, an erroneous pitch or an extra stripe cannot pass.
+    zn = inner == ir.TileLayout.col_major
+    box_rows, box_cols = (8, 16) if zn else (16, 8)
+    for visit in range(2):
+        row_begin = 16 + visit * 16
+        expected = set()
+        for row in range(row_begin, row_begin + 16):
+            outer_row, r = divmod(row, box_rows)
+            for col in range(16, 48):
+                outer_col, c = divmod(col, box_cols)
+                if zn:
+                    block = outer_row * (64 // box_cols) + outer_col
+                    element = c * box_rows + r
+                else:
+                    block = outer_col * (64 // box_rows) + outer_row
+                    element = r * box_cols + c
+                start = 4096 + block * 512 + element * 4
+                expected.update(range(start, start + 4))
+        actual = set()
+        for domain, write, row, col, row_step, col_step, rows, cols, _ in site["accesses"]:
+            if domain == storage_id:
+                assert not write and row == row_step == 0 and rows == 1
+                begin = matrix["address"] + col + visit * col_step
+                actual.update(range(begin, begin + cols))
+        assert actual == expected
+
+
+def test_overlapping_zn_views_refuse_unaligned_native_box():
+    function, _ = matrix_overlap_fixture(ir.TileLayout.col_major, 2048, column=8)
+    with pytest.raises(ValueError, match="whole-box access"):
+        testing.describe_placed_sync_input(function, True)
+
+
+def test_overlapping_matrix_views_refuse_excessive_stripes():
+    # NZ with FP32 16x8 boxes. A 16x1040 partial-height extract has 130
+    # separated runs. The exact importer must refuse instead of truncating.
+    function, _ = matrix_overlap_fixture(
+        ir.TileLayout.row_major, 2048, column=0, width=1056, extract_width=1040
+    )
+    before = ir.serialize(function)
+    with pytest.raises(ValueError, match="exact physical-byte run limit"):
+        testing.describe_placed_sync_input(function, True)
+    assert ir.serialize(function) == before
+
+
+def test_overlapping_accumulator_views_only_protect_the_same_layout():
+    span = ir.Span.unknown()
+    fp32 = ir.DataType.FP32
+    row_major, col_major = ir.TileLayout.row_major, ir.TileLayout.col_major
+    wide_a = ir.BufferType(
+        [64, 64], fp32, ir.MemorySpace.Acc, blayout=col_major, slayout=row_major, fractal=1024
+    )
+    narrow_a = ir.BufferType(
+        [48, 64], fp32, ir.MemorySpace.Acc, blayout=col_major, slayout=row_major, fractal=1024
+    )
+    wide_l = ir.BufferType([64, 32], fp32, ir.MemorySpace.Left, blayout=row_major, slayout=row_major)
+    narrow_l = ir.BufferType([48, 32], fp32, ir.MemorySpace.Left, blayout=row_major, slayout=row_major)
+    right_type = ir.BufferType([32, 64], fp32, ir.MemorySpace.Right, blayout=row_major, slayout=col_major)
+    wide, alloc_wide = placed_tile("wide_acc", wide_a, 0, span)
+    narrow, alloc_narrow = placed_tile("narrow_acc", narrow_a, 0, span)
+    left_wide, alloc_lw = placed_tile("wide_lhs", wide_l, 0, span)
+    left_narrow, alloc_ln = placed_tile("narrow_lhs", narrow_l, 8192, span)
+    right, alloc_r = placed_tile("rhs", right_type, 0, span)
+
+    def matrix(name: str, lhs: ir.Var, dst: ir.Var) -> ir.EvalStmt:
+        return ir.EvalStmt(ir.Call(ir.get_op(name), [lhs, right, dst], ir.VoidType(), span), span)
+
+    body = ir.SeqStmts(
+        [
+            alloc_wide,
+            alloc_narrow,
+            alloc_lw,
+            alloc_ln,
+            alloc_r,
+            matrix("buffer.matmul", left_wide, wide),
+            matrix("buffer.matmul_acc", left_wide, wide),
+            matrix("buffer.matmul_acc", left_narrow, narrow),
+            matrix("buffer.matmul_acc", left_narrow, narrow),
+            ir.ReturnStmt([], span),
+        ],
+        span,
+    )
+    function = ir.Function(
+        "aliased_accumulator_windows",
+        [],
+        [],
+        body,
+        span,
+        ir.FunctionType.AIC,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    result = testing.analyze_placed_sync(function, True)
+    assert not result.precedes((0, 0, 0), True, (0, 0, 1), False)
+    assert result.precedes((0, 0, 1), True, (0, 0, 2), False)
+    assert not result.precedes((0, 0, 2), True, (0, 0, 3), False)
+
+
+def test_overlapping_accumulator_chain_refuses_a_common_interference_domain():
+    span = ir.Span.unknown()
+    acc_type = ir.BufferType(
+        [64, 64],
+        ir.DataType.FP32,
+        ir.MemorySpace.Acc,
+        blayout=ir.TileLayout.col_major,
+        slayout=ir.TileLayout.row_major,
+        fractal=1024,
+    )
+    # Each window is 16 KiB. The middle view overlaps both ends, but a
+    # whole-window read at one end does not interfere with the other end.
+    allocs = [placed_tile(f"acc_{i}", acc_type, offset, span)[1] for i, offset in enumerate((0, 8192, 16384))]
+    body = ir.SeqStmts([*allocs, ir.ReturnStmt([], span)], span)
+    function = ir.Function(
+        "accumulator_overlap_chain",
+        [],
+        [],
+        body,
+        span,
+        ir.FunctionType.AIC,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with pytest.raises(ValueError, match="pairwise-intersecting whole windows"):
+        testing.describe_placed_sync_input(function, True)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

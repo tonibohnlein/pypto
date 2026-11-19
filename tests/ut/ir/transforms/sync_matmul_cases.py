@@ -26,14 +26,18 @@ CASES = {
 }
 
 
-def load_case(name: str) -> JITFunction:
-    """Load an original example without executing its main block."""
-    path, _ = CASES[name]
+def _load_example_kernel(path: str, name: str) -> JITFunction:
     spec = importlib.util.spec_from_file_location(name, ROOT / path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return getattr(module, name)
+
+
+def load_case(name: str) -> JITFunction:
+    """Load an original example without executing its main block."""
+    path, _ = CASES[name]
+    return _load_example_kernel(path, name)
 
 
 def capture(name: str, shape: tuple[int, int, int] | None = None) -> ir.Function:
@@ -46,6 +50,21 @@ def capture(name: str, shape: tuple[int, int, int] | None = None) -> ir.Function
             torch.empty(m, k),
             torch.empty(k, n),
             torch.empty(m, n),
+            config=RunConfig(arch=BackendType.Ascend910),
+        )
+    return next(f for f in program.functions.values() if f.func_type == ir.FunctionType.AIC)
+
+
+def capture_mat_split_k() -> ir.Function:
+    """Capture the placed two-GEMM chain from the published AutoTile example."""
+    path, _ = CASES["ddr_split_k"]
+    kernel = _load_example_kernel(path, "mat_split_k")
+    with passes.PassContext([], enable_buffer_ir=True, memory_planner=passes.MemoryPlanner.PYPTO):
+        program = kernel.lower(
+            torch.empty(256, 192, dtype=torch.bfloat16, device="meta"),
+            torch.empty(192, 256, dtype=torch.bfloat16, device="meta"),
+            torch.empty(256, 64, dtype=torch.bfloat16, device="meta"),
+            torch.empty(256, 64, dtype=torch.float32, device="meta"),
             config=RunConfig(arch=BackendType.Ascend910),
         )
     return next(f for f in program.functions.values() if f.func_type == ir.FunctionType.AIC)

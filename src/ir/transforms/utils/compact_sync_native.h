@@ -68,10 +68,12 @@ class AccumulatorProtection {
       for (size_t s = 0; s < segment.sites.size(); ++s) {
         const auto& site = segment.sites[s];
         if (site.pipe == PipeType::M) matrix_.Add(r, segment.count, s);
-        if (site.protected_accumulator) qualified_[*site.protected_accumulator].Add(r, segment.count, s);
+        if (site.protected_accumulator) {
+          qualified_[site.protected_accumulator->layout_identity].Add(r, segment.count, s);
+        }
         for (const auto& access : site.accesses)
           if (input.storage[access.storage].space == MemorySpace::Acc &&
-              site.protected_accumulator != access.storage)
+              (!site.protected_accumulator || site.protected_accumulator->storage != access.storage))
             interference_[access.storage].Add(r, segment.count, s);
       }
     }
@@ -81,13 +83,14 @@ class AccumulatorProtection {
     const auto [br, bv, bs] = b;
     const auto& source = input_.segments[ar].sites[as];
     const auto& target = input_.segments[br].sites[bs];
-    if (source.protected_accumulator != storage || target.protected_accumulator != storage ||
+    if (!source.protected_accumulator || source.protected_accumulator->storage != storage ||
+        source.protected_accumulator != target.protected_accumulator ||
         (target.initializes_accumulator && (!target.continuation || bv == 0)))
       return false;
     // Every intervening M operation must be qualified on this same physical
     // accumulator. Any other access (including a FIX read) breaks protection.
     // This is NOT a C->I edge: consumers on other pipes still need synchronization.
-    const auto& qualified = qualified_.at(storage);
+    const auto& qualified = qualified_.at(source.protected_accumulator->layout_identity);
     if (matrix_.Before(b) - matrix_.Before(a) != qualified.Before(b) - qualified.Before(a)) return false;
     auto found = interference_.find(storage);
     return found == interference_.end() || found->second.Before(a) == found->second.Before(b);

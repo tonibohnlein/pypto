@@ -233,6 +233,14 @@ def define_storage(stmt, env, storage):
     )
 
 
+def _matrix_insert_effects(args, env, access):
+    source, row, column, destination = args
+    assert isinstance(source.type, ir.BufferType) and source.type.memory_space == ir.MemorySpace.Acc
+    assert isinstance(destination.type, ir.BufferType) and destination.type.memory_space == ir.MemorySpace.Mat
+    rect = [integer(row, env), integer(column, env), *source.type.shape]
+    return access(source), access(destination, rect), ir.PipeType.FIX
+
+
 def interpret(
     function,
     parameters=None,
@@ -281,6 +289,8 @@ def interpret(
             assert isinstance(args[1], ir.MakeTuple) and isinstance(args[2], ir.MakeTuple)
             rect = [integer(e, env) for e in [*args[1].elements, *args[2].elements]]
             reads, writes, pipe = access(args[0], rect), access(args[3]), ir.PipeType.MTE2
+        elif name == ir.get_op("buffer.insert").name:
+            reads, writes, pipe = _matrix_insert_effects(args, env, access)
         elif name == ir.get_op("buffer.store").name:
             assert isinstance(args[1], ir.MakeTuple) and isinstance(args[2], ir.MakeTuple)
             rect = [integer(e, env) for e in [*args[1].elements, *args[2].elements]]

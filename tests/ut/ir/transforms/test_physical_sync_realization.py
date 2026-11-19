@@ -12,13 +12,15 @@
 import re
 
 import pytest
-from pypto import codegen, ir, testing
+from pypto import codegen, ir, passes, testing
+from pypto.backend import BackendType
 from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.backend.pto_backend import _run_ptoas
 
 from .sync_logical_oracle import CommandExecution
-from .sync_matmul_cases import CASES, capture, staged_fixture
+from .sync_matmul_cases import CASES, capture, capture_mat_split_k, staged_fixture
 from .sync_matmul_oracle import hardware_reference, interpret, validate
+from .sync_order_metrics import completion_start_pairs
 from .sync_physical_oracle import directional_widths, run_physical
 from .test_collective_sync_interface import wrapped_collective
 from .test_finite_sync_analysis import closure
@@ -59,6 +61,32 @@ def test_original_matmuls(name):
     assert state.records and result["set_sites"] == result["wait_sites"]
     assert result["set_sites"] == text.count("pto.set_flag[") > 0
     assert result["wait_sites"] == text.count("pto.wait_flag[")
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910B], indirect=True)
+def test_autotile_mat_split_k_orders_each_operand_pair_at_its_consumer():
+    function = capture_mat_split_k()
+    program = ir.Program([function], "MatSplitKOverlap", function.span)
+    with passes.PassContext(
+        [],
+        enable_buffer_ir=True,
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+        autosync_disjoint_gm=True,
+    ):
+        emitted = passes.realize_sync()(program).get_function(function.name)
+    assert emitted is not None and emitted.attrs["pypto_autosync"]
+    assert "autosync_analysis_policy" not in emitted.attrs
+    state, _, projected = run_physical(function, emitted, range(6))
+    assert len(state.original_calls) == 36
+    pairs = completion_start_pairs(projected)
+    assert len(pairs) == 554
+    # The first cube op requires its two extracts. The next pair of extracts
+    # can still be in flight. The next reload of the first pair's slots only
+    # needs the cube op that consumed those slots.
+    assert {(2, 6), (3, 6), (6, 8), (6, 9)} <= pairs
+    assert pairs.isdisjoint({(4, 6), (5, 6), (7, 8), (7, 9)})
 
 
 @pytest.mark.ptoas_compile
