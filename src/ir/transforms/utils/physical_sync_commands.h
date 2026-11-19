@@ -39,17 +39,19 @@ using AxisId = uint32_t;
 enum class AxisKind : uint8_t {
   LaunchBlock,  // Dominating block coordinate over [blocks.first, blocks.second]
   LoopFrame,    // Normalized loop digit d in [0, count) for iv = start_expr_or_lit + d * step
+  LoopFirst,    // Digit 1 on the first visit, 0 on all later visits
+  LoopLast,     // Digit 1 on the last visit, 0 on all earlier visits
 };
 
 struct AxisInfo {
   AxisId id = 0;
   AxisKind kind = AxisKind::LoopFrame;
   VarPtr var;                // loop->loop_var_ or dominating block Var
-  ForStmtPtr loop;           // Non-null iff kind == LoopFrame
+  ForStmtPtr loop;           // Original loop, if this is a loop axis
   int64_t count = 1;         // >= 1; normalized digit domain is [0, count)
-  int64_t start = 0;         // Literal start when start_expression == nullptr (or blocks.first)
+  int64_t start = 0;         // Literal frame/block start, or iv threshold for LoopLast
   int64_t step = 1;          // >= 1
-  ExprPtr start_expression;  // Non-null only for symbolic-start LoopFrame
+  ExprPtr start_expression;  // Original symbolic start for LoopFrame or LoopFirst
 };
 
 // Transaction-owned deterministic registry of finite coordinate axes.
@@ -57,6 +59,7 @@ class GuardDomainArena {
  public:
   AxisId RegisterLaunchBlock(const VarPtr& block_var, std::pair<int64_t, int64_t> bounds);
   AxisId RegisterLoopFrame(const SyncLoopFrame& frame);
+  AxisId RegisterLoopBoundary(const ForStmtPtr& loop, AxisKind kind, int64_t last_threshold);
   const AxisInfo& Axis(AxisId id) const { return axes_.at(id); }
   size_t NumAxes() const { return axes_.size(); }
 
@@ -293,6 +296,17 @@ struct CaseCommands {
   ControlPtr body;
 };
 
+struct LoopBoundaryDomain {
+  struct Case {
+    std::pair<int64_t, int64_t> blocks;
+    int64_t count;
+  };
+  ForStmtPtr loop;
+  // Positive trip counts proved for the original invocation cases. The cut
+  // execution domain already excludes any absent loop.
+  std::vector<Case> cases;
+};
+
 struct PhysicalCuts {
   ControlForest before, after;
   std::vector<CaseCommands> before_cases, after_cases;
@@ -302,6 +316,7 @@ struct PhysicalCuts {
   std::vector<std::pair<int64_t, int64_t>> domain;
   std::set<const Var*> uniform_variables;
   bool uniform_checked = false;
+  const ForStmt* enclosing_loop = nullptr;
   // Present for production inventories. Diagnostic-only imports explicitly
   // supply readiness externally and do not manufacture production evidence.
   std::optional<CommandPredicateScope> predicate_scope;
@@ -331,7 +346,8 @@ Intervals SubtractIntervals(const Intervals& domain, const Intervals& absent);
 ControlForest ScheduleCommandCases(const ExprPtr& block, const Intervals& possible,
                                    const std::vector<CaseCommands>& source, PhysicalSyncRealization& work,
                                    const Span& span, const std::set<const Var*>& uniform_variables,
-                                   const std::shared_ptr<GuardDomainArena>& arena = nullptr);
+                                   const std::shared_ptr<GuardDomainArena>& arena = nullptr,
+                                   const LoopBoundaryDomain* boundary_domain = nullptr);
 struct CaseCodeSize {
   size_t commands = 0, guards = 0, expressions = 0, statements = 0;
   explicit CaseCodeSize(const ControlForest& body, const RadixBoxGuard& scope = RadixBoxGuard::True());

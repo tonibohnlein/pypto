@@ -12,6 +12,7 @@
 #include "src/ir/transforms/utils/physical_sync_commands.h"
 
 #include <algorithm>
+#include <bitset>
 #include <cstdlib>
 #include <limits>
 #include <map>
@@ -175,7 +176,9 @@ AxisId GuardDomainArena::RegisterLaunchBlock(const VarPtr& block_var, std::pair<
   const int64_t count = static_cast<int64_t>(wide_count);
   const auto key = std::make_tuple(block_var.get(), static_cast<uint8_t>(AxisKind::LaunchBlock), count,
                                    bounds.first, int64_t{1}, static_cast<const Expr*>(nullptr));
-  if (auto it = index_.find(key); it != index_.end()) return it->second;
+  if (auto it = index_.find(key); it != index_.end()) {
+    return it->second;
+  }
   const AxisId id = static_cast<AxisId>(axes_.size());
   axes_.push_back(AxisInfo{id, AxisKind::LaunchBlock, block_var, nullptr, count, bounds.first, 1, nullptr});
   index_.emplace(key, id);
@@ -187,10 +190,28 @@ AxisId GuardDomainArena::RegisterLoopFrame(const SyncLoopFrame& frame) {
       << "Invalid LoopFrame for GuardDomainArena";
   const auto key = std::make_tuple(frame.loop->loop_var_.get(), static_cast<uint8_t>(AxisKind::LoopFrame),
                                    frame.count, frame.start, frame.step, frame.start_expression.get());
-  if (auto it = index_.find(key); it != index_.end()) return it->second;
+  if (auto it = index_.find(key); it != index_.end()) {
+    return it->second;
+  }
   const AxisId id = static_cast<AxisId>(axes_.size());
   axes_.push_back(AxisInfo{id, AxisKind::LoopFrame, frame.loop->loop_var_, frame.loop, frame.count,
                            frame.start, frame.step, frame.start_expression});
+  index_.emplace(key, id);
+  return id;
+}
+
+AxisId GuardDomainArena::RegisterLoopBoundary(const ForStmtPtr& loop, AxisKind kind, int64_t last_threshold) {
+  const ExprPtr start_expression = kind == AxisKind::LoopFirst ? loop->start_ : nullptr;
+  const int64_t start = kind == AxisKind::LoopLast ? last_threshold : 0;
+  const auto key = std::make_tuple(loop->loop_var_.get(), static_cast<uint8_t>(kind), int64_t{2}, start,
+                                   int64_t{1}, start_expression.get());
+  if (auto it = index_.find(key); it != index_.end()) {
+    return it->second;
+  }
+  const AxisId id = static_cast<AxisId>(axes_.size());
+  // First and last need not be independent at runtime. Their Boolean product
+  // overapproximates the original visits, so box-algebra identities remain valid.
+  axes_.push_back(AxisInfo{id, kind, loop->loop_var_, loop, 2, start, 1, start_expression});
   index_.emplace(key, id);
   return id;
 }
@@ -914,7 +935,8 @@ bool CoalesceBoxes(std::vector<RadixBox>& boxes, const GuardDomainArena& arena) 
       ++i;
   }
   if (boxes.empty()) return true;
-  if (std::any_of(boxes.begin(), boxes.end(), [](const RadixBox& b) { return b.IsUnconstrained(); })) {
+  if (std::any_of(boxes.begin(), boxes.end(),
+                  [](const RadixBox& candidate_box) { return candidate_box.IsUnconstrained(); })) {
     boxes = {RadixBox{}};
     return true;
   }
@@ -1549,6 +1571,16 @@ std::vector<ExprPtr> LowerAxisConstraint(const AxisConstraint& c, const OuterAxi
                                          const GuardDomainArena& arena, const Span& span) {
   const auto& axis = arena.Axis(c.axis);
   const AxisAP& ap = c.ap;
+  if (axis.kind == AxisKind::LoopFirst || axis.kind == AxisKind::LoopLast) {
+    if (outer.first == ap.first && outer.end == ap.end) return {};
+    if (axis.kind == AxisKind::LoopFirst) {
+      if (ap.first == 1) return {std::make_shared<Eq>(axis.var, axis.start_expression, DataType::BOOL, span)};
+      return {std::make_shared<Ne>(axis.var, axis.start_expression, DataType::BOOL, span)};
+    }
+    auto limit = MakeInt(axis.start, span);
+    if (ap.first == 1) return {std::make_shared<Ge>(axis.var, limit, DataType::BOOL, span)};
+    return {std::make_shared<Lt>(axis.var, limit, DataType::BOOL, span)};
+  }
   if (axis.kind == AxisKind::LaunchBlock) {
     if (ap.IsSingleton()) {
       if (outer.first == ap.first && outer.end == ap.end) return {};
@@ -2511,8 +2543,12 @@ class CommandGuards {
 
   bool AreOpaqueComplementary(const ExprPtr& a, const ExprPtr& b) {
     if (!PureCommandExpression(a, &expressions_) || !PureCommandExpression(b, &expressions_)) return false;
-    if (const auto na = As<Not>(a); na && SameControl(na->operand_, b)) return true;
-    if (const auto nb = As<Not>(b); nb && SameControl(a, nb->operand_)) return true;
+    if (const auto na = As<Not>(a); na && SameControl(na->operand_, b)) {
+      return true;
+    }
+    if (const auto nb = As<Not>(b); nb && SameControl(a, nb->operand_)) {
+      return true;
+    }
     {
       const auto ea = As<Eq>(a);
       const auto nb = As<Ne>(b);
@@ -3574,12 +3610,154 @@ ControlForest ShareResidualSequence(const std::shared_ptr<GuardDomainArena>& are
   return candidate;
 }
 
+using DigitInterval = std::pair<int64_t, int64_t>;
+enum LoopPredicate { kEveryVisit, kFirstVisit, kLastVisit, kHasPrevious, kHasNext, kLoopPredicates };
+
+std::array<DigitInterval, kLoopPredicates> LoopPredicateRanges(int64_t count) {
+  return {{{0, count}, {0, 1}, {count - 1, count}, {1, count}, {0, count - 1}}};
+}
+
+struct GuardedLoopCommand {
+  ControlPtr leaf;
+  DigitInterval digits;
+};
+
+bool CollectLoopCommands(const ControlPtr& node, const ForStmtPtr& loop, int64_t count, DigitInterval digits,
+                         std::vector<GuardedLoopCommand>& commands, PhysicalSyncRealization& work) {
+  ++work.case_sequence_visits;
+  if (!node->alternative.empty() || node->guard.IsOpaque()) return false;
+  if (!node->guard.IsTautology()) {
+    const auto& boxes = node->guard.Boxes();
+    if (boxes.size() != 1 || boxes[0].constraints.size() != 1 || !boxes[0].ranks.empty()) return false;
+    const auto& constraint = boxes[0].constraints[0];
+    const auto& axis = node->guard.Arena()->Axis(constraint.axis);
+    if (axis.kind != AxisKind::LoopFrame || axis.loop != loop || axis.count != count ||
+        axis.start_expression != loop->start_ || constraint.ap.stride != 1)
+      return false;
+    digits.first = std::max(digits.first, constraint.ap.first);
+    digits.second = std::min(digits.second, constraint.ap.end);
+    if (digits.first >= digits.second) return true;
+  }
+  if (node->command) commands.push_back({node, digits});
+  for (const auto& child : node->body)
+    if (!CollectLoopCommands(child, loop, count, digits, commands, work)) return false;
+  return true;
+}
+
+ControlForest ShareLoopBoundaryCommands(const LoopBoundaryDomain& domain, const Intervals& possible,
+                                        const std::vector<CaseCommands>& cases,
+                                        const ControlForest& incumbent, PhysicalSyncRealization& work,
+                                        const std::shared_ptr<GuardDomainArena>& arena) {
+  const auto& loop = domain.loop;
+  const auto stop = As<ConstInt>(loop->stop_), step = As<ConstInt>(loop->step_);
+  if (cases.empty() || !stop || !step || step->value_ <= 0) return incumbent;
+  const auto last_threshold = __int128(stop->value_) - step->value_;
+  if (last_threshold < std::numeric_limits<int64_t>::min()) return incumbent;
+
+  struct Projection {
+    int64_t count;
+    std::vector<GuardedLoopCommand> commands;
+  };
+  std::vector<Projection> projections;
+  Intervals covered;
+  size_t longest = 0, singletons = 0;
+  for (const auto& arm : domain.cases) {
+    ++work.case_sequence_visits;
+    const auto [lo, hi] = arm.blocks;
+    if (!DomainIntersects(possible, lo, hi)) continue;
+    covered.push_back(arm.blocks);
+    const auto item =
+        std::lower_bound(cases.begin(), cases.end(), lo,
+                         [](const CaseCommands& c, int64_t first) { return c.blocks.second < first; });
+    Projection projection{arm.count, {}};
+    if (item != cases.end() && item->blocks.first <= hi) {
+      if (item->blocks.first > lo || item->blocks.second < hi ||
+          !CollectLoopCommands(item->body, loop, arm.count, {0, arm.count}, projection.commands, work))
+        return incumbent;
+    }
+    if (projections.empty() || arm.count > projections[longest].count) longest = projections.size();
+    singletons += arm.count == 1;
+    projections.push_back(std::move(projection));
+  }
+  if (projections.empty() || !SubtractIntervals(possible, covered).empty()) return incumbent;
+
+  // The longest case contains every command if all cases differ only by loop
+  // boundaries. Require a unique leaf identity and the same relative command
+  // order in every case. Any different event ID, alternative or permutation
+  // leaves the original dispatch intact.
+  const auto& exemplar = projections[longest].commands;
+  struct Match {
+    std::bitset<kLoopPredicates> eligible = std::bitset<kLoopPredicates>().set();
+    size_t present = 0;
+  };
+  std::map<size_t, size_t> order;
+  std::vector<Match> matches(exemplar.size());
+  for (size_t i = 0; i < exemplar.size(); ++i)
+    if (!order.emplace(structural_hash(exemplar[i].leaf->command, false), i).second) return incumbent;
+
+  for (const auto& projection : projections) {
+    const auto ranges = LoopPredicateRanges(projection.count);
+    size_t next = 0;
+    for (const auto& item : projection.commands) {
+      ++work.case_sequence_comparisons;
+      const auto found = order.find(structural_hash(item.leaf->command, false));
+      if (found == order.end() || found->second < next ||
+          !SameControl(exemplar[found->second].leaf, item.leaf))
+        return incumbent;
+      next = found->second + 1;
+      auto& match = matches[found->second];
+      for (size_t i = 0; i < ranges.size(); ++i)
+        if (ranges[i] != item.digits) match.eligible.reset(i);
+      ++match.present;
+    }
+  }
+
+  // First/last and unconditional commands execute in every positive-trip
+  // case. Previous/next commands have no visit in a singleton case.
+  std::vector<size_t> predicates;
+  for (auto& match : matches) {
+    const size_t multiple = projections.size() - singletons;
+    for (size_t i = 0; i < kLoopPredicates; ++i)
+      if (match.present != ((i == kHasPrevious || i == kHasNext) ? multiple : projections.size()))
+        match.eligible.reset(i);
+    size_t i = 0;
+    while (i < kLoopPredicates && !match.eligible.test(i)) ++i;
+    if (i == kLoopPredicates) return incumbent;
+    predicates.push_back(i);
+  }
+
+  // A valid visit has another visit exactly when iv + step < stop. Moving
+  // step to the constant side keeps the new expression free of overflow.
+  ControlForest candidate;
+  for (size_t i = 0; i < exemplar.size(); ++i) {
+    const auto& leaf = exemplar[i].leaf;
+    const auto predicate = predicates[i];
+    if (predicate == kEveryVisit) {
+      candidate.push_back(leaf);
+      continue;
+    }
+    const auto kind =
+        predicate == kFirstVisit || predicate == kHasPrevious ? AxisKind::LoopFirst : AxisKind::LoopLast;
+    const auto axis = arena->RegisterLoopBoundary(loop, kind, static_cast<int64_t>(last_threshold));
+    const int64_t digit = predicate == kFirstVisit || predicate == kLastVisit ? 1 : 0;
+    RadixBox box;
+    box.constraints.push_back(AxisConstraint{axis, AxisAP{digit, digit + 1, 1}});
+    auto guard = RadixBoxGuard::FromBox(arena, std::move(box));
+    candidate.push_back(ControlBranch(std::move(guard), leaf, std::nullopt, leaf->span, work));
+  }
+  const CaseCodeSize old_size(incumbent), new_size(candidate);
+  work.case_sequence_visits += old_size.statements + new_size.statements;
+  work.control_expression_visits += old_size.expressions + new_size.expressions;
+  return new_size.Improves(old_size) ? candidate : incumbent;
+}
+
 }  // namespace
 
 ControlForest ScheduleCommandCases(const ExprPtr& block, const Intervals& possible,
                                    const std::vector<CaseCommands>& cases, PhysicalSyncRealization& work,
                                    const Span& span, const std::set<const Var*>& uniform_variables,
-                                   const std::shared_ptr<GuardDomainArena>& supplied_arena) {
+                                   const std::shared_ptr<GuardDomainArena>& supplied_arena,
+                                   const LoopBoundaryDomain* boundary_domain) {
   ControlForest target;
   if (possible.empty()) return target;
   int64_t previous = -1;
@@ -3659,6 +3837,8 @@ ControlForest ScheduleCommandCases(const ExprPtr& block, const Intervals& possib
                                  work, span);
   target = ShareResidualSequence(arena, block_axis, block, possible, coalesced, target, uniform_variables,
                                  work, span);
+  if (boundary_domain)
+    target = ShareLoopBoundaryCommands(*boundary_domain, possible, coalesced, target, work, arena);
   return CommandGuards().Build(target, work, false, false, RadixBoxGuard::True());
 }
 
