@@ -24,6 +24,7 @@
 #include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
+#include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/pto_native_ops.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/kind_traits.h"
@@ -87,6 +88,19 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
     result.pipe_ = load                                       ? PipeType::MTE2
                    : local->memory_space_ == MemorySpace::Vec ? PipeType::MTE3
                                                               : PipeType::FIX;
+    if (!load && call->GetKwarg<int>("atomic", 0) != 0) {
+      const auto tensor = As<ir::TensorType>(call->args_[3]->GetType());
+      CHECK(target == "a2a3" && tensor &&
+            SupportsBufferStoreMode(call->GetKwarg<int>("atomic", 0), local->memory_space_, local->dtype_,
+                                    tensor->dtype_))
+          << "Atomic store requires the qualified A2/A3 FP32 Acc writeback";
+      // pto-isa 5487a6b0 TStore.hpp: the default two-operand Acc overload
+      // brackets TStoreAcc with SetAtomicAdd/SetAtomicNone, without scratch or
+      // numbered events. Native configuration applies to the subsequent issued
+      // transfer; this does not complete prior GM accesses or other workers.
+      // https://asc.gitcode.com/api/SIMD-API/c_api/atomic/key_features.html
+      result.audited_signal_free_variant_ = true;
+    }
   } else if (IsOp(call, "buffer.copy") || IsOp(call, "buffer.extract")) {
     const bool extract = IsOp(call, "buffer.extract");
     const auto source = As<BufferType>(call->args_[0]->GetType());
@@ -162,7 +176,8 @@ BufferSyncOperation QualifyBufferSyncOperation(const ir::CallPtr& call, ir::Func
   const auto& entry = registry.GetEntry(call->op_->name_);
   std::vector<ir::BufferArgEffect> effects;
   effects.reserve(call->args_.size());
-  for (size_t arg = 0; arg < call->args_.size(); ++arg) effects.push_back(entry.GetBufferArgEffect(arg));
+  for (size_t arg = 0; arg < call->args_.size(); ++arg)
+    effects.push_back(entry.GetBufferArgEffect(arg, call->kwargs_));
   return BufferSyncOperation(call, std::move(implementation), std::move(effects), entry.GetBufferResultSpec(),
                              BufferSyncOperationKind::Payload);
 }
@@ -185,7 +200,7 @@ std::optional<BufferSyncOperation> QualifyBufferSyncNonPayload(const ir::CallPtr
   const auto& entry = registry.GetEntry(call->op_->name_);
   std::vector<ir::BufferArgEffect> effects;
   for (size_t arg = 0; arg < call->args_.size(); ++arg) {
-    const auto effect = entry.GetBufferArgEffect(arg);
+    const auto effect = entry.GetBufferArgEffect(arg, call->kwargs_);
     INTERNAL_CHECK(effect.data == ir::BufferAccess::None)
         << "Internal error: descriptor/scalar recipe unexpectedly has payload effects";
     effects.push_back(effect);

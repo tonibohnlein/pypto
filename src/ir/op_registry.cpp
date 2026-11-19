@@ -173,6 +173,14 @@ OpRegistryEntry& OpRegistryEntry::set_buffer_non_memory_arg(size_t arg_index) {
   return *this;
 }
 
+OpRegistryEntry& OpRegistryEntry::set_buffer_arg_effect(size_t arg_index, BufferDataEffectResolver data,
+                                                        BufferAccess metadata) {
+  CHECK(data) << "Operator '" << name_ << "' must provide a buffer data effect resolver";
+  set_buffer_arg_effect(arg_index, BufferAccess::None, metadata);
+  buffer_data_effect_resolvers_.emplace(arg_index, std::move(data));
+  return *this;
+}
+
 OpRegistryEntry& OpRegistryEntry::set_buffer_result_behavior(size_t result_index,
                                                              BufferResultBehavior behavior,
                                                              std::optional<size_t> alias_arg) {
@@ -188,7 +196,21 @@ const BufferArgEffect& OpRegistryEntry::GetBufferArgEffect(size_t arg_index) con
   auto it = buffer_arg_effects_.find(arg_index);
   CHECK(it != buffer_arg_effects_.end())
       << "Operator '" << name_ << "' has no buffer effect for argument " << arg_index;
+  CHECK(!buffer_data_effect_resolvers_.count(arg_index))
+      << "Operator '" << name_ << "' requires actual call kwargs to resolve buffer argument " << arg_index;
   return it->second;
+}
+
+BufferArgEffect OpRegistryEntry::GetBufferArgEffect(
+    size_t arg_index, const std::vector<std::pair<std::string, std::any>>& kwargs) const {
+  const auto resolver = buffer_data_effect_resolvers_.find(arg_index);
+  if (resolver == buffer_data_effect_resolvers_.end()) return GetBufferArgEffect(arg_index);
+  auto result = buffer_arg_effects_.at(arg_index);
+  result.data = resolver->second(kwargs);
+  CHECK(result.data == BufferAccess::None || result.data == BufferAccess::Read ||
+        result.data == BufferAccess::Write || result.data == BufferAccess::ReadWrite)
+      << "Operator '" << name_ << "' returned an invalid buffer data effect";
+  return result;
 }
 
 const BufferResultSpec& OpRegistryEntry::GetBufferResultSpec(size_t result_index) const {
@@ -205,7 +227,7 @@ void OpRegistryEntry::ValidateIRStage() const {
   if (ir_stage_ == OpIRStage::Functional) {
     CHECK(output_arity_ > 0 || (op_category_ == "SimtOp" || op_category_ == "SyncOp"))
         << "Functional operator '" << name_ << "' must produce at least one value";
-    CHECK(buffer_arg_effects_.empty() && buffer_results_.empty())
+    CHECK(buffer_arg_effects_.empty() && buffer_data_effect_resolvers_.empty() && buffer_results_.empty())
         << "Functional operator '" << name_ << "' cannot carry buffer contracts";
     return;
   }
@@ -230,7 +252,7 @@ void OpRegistryEntry::ValidateIRStage() const {
     CHECK(aliases == result.alias_arg.has_value())
         << "Buffer operator '" << name_ << "' must name a source argument exactly for Alias/Borrow results";
     if (result.alias_arg.has_value()) {
-      CHECK(*result.alias_arg < GetArgumentCount() && !GetBufferArgEffect(*result.alias_arg).non_memory)
+      CHECK(*result.alias_arg < GetArgumentCount() && !buffer_arg_effects_.at(*result.alias_arg).non_memory)
           << "Buffer operator '" << name_ << "' result " << i << " has no memory source argument";
     }
   }
@@ -239,7 +261,8 @@ void OpRegistryEntry::ValidateIRStage() const {
 }
 
 void OpRegistryEntry::ValidateCall(const std::vector<ExprPtr>& args, const TypePtr& result_type,
-                                   const Span& span) const {
+                                   const Span& span,
+                                   const std::vector<std::pair<std::string, std::any>>& kwargs) const {
   INTERNAL_CHECK_SPAN(result_type, span) << "Type deduction failed for '" << name_ << "'";
   auto tuple = As<TupleType>(result_type);
   if (output_arity_ == 0) {
@@ -271,7 +294,7 @@ void OpRegistryEntry::ValidateCall(const std::vector<ExprPtr>& args, const TypeP
   for (size_t i = 0; i < args.size(); ++i) {
     CHECK(args[i]) << "Buffer operator '" << name_ << "' argument " << i << " is null";
     const auto& type = args[i]->GetType();
-    const auto& effect = GetBufferArgEffect(i);
+    const auto effect = GetBufferArgEffect(i, kwargs);
     const bool memory = IsBufferHandle(type) || AsTensorTypeLike(type);
     CHECK(effect.non_memory ? IsNonMemoryBufferOperand(type) : memory)
         << "Buffer operator '" << name_ << "' argument " << i << " has type " << type->TypeName()
@@ -464,7 +487,7 @@ TypePtr OpRegistry::ResolveAndValidateCallType(const OpRegistryEntry& entry, con
   } catch (const std::exception& e) {
     throw ValueError(std::string(e.what()) + LocationSuffix(span));
   }
-  entry.ValidateCall(args, result_type, span);
+  entry.ValidateCall(args, result_type, span, kwargs);
   return result_type;
 }
 

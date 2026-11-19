@@ -3460,8 +3460,10 @@ class BufferResultSpec:
 def get_op_ir_stage(op_name: str) -> OpIRStage:
     """Get the operator's typed representation stage."""
 
-def get_op_buffer_arg_effect(op_name: str, arg_index: int) -> BufferArgEffect:
-    """Get declared buffer data/metadata effects; fail on missing classification."""
+def get_op_buffer_arg_effect(
+    op_name: str, arg_index: int, kwargs: dict[str, Any] | None = None
+) -> BufferArgEffect:
+    """Get effects; conditional data modes require actual kwargs ({} means no attributes)."""
 
 def get_op_buffer_result_spec(op_name: str, result_index: int = 0) -> BufferResultSpec:
     """Get one buffer result's ownership; zero-result ops declare None_ at index 0."""

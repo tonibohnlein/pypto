@@ -760,9 +760,9 @@ def _buffer_load(tensor, offsets, valid, destination):
     data = _tile_load(tensor, offsets, valid)
     _buffer_write(destination, data)
 
-def _buffer_store(source, offsets, valid, tensor):
+def _buffer_store(source, offsets, valid, tensor, atomic=0):
     data = _buffer_read(source, valid)
-    _tile_store(data, offsets, tensor)
+    _tile_store(data, offsets, tensor, atomic=atomic)
 
 def _buffer_subview(source, offsets, shape, valid):
     slices = tuple(slice(int(o), int(o) + s) for o, s in zip(offsets, shape))
@@ -1445,7 +1445,7 @@ def _register_ops() -> None:  # noqa: PLR0915
 
     # --- Default Buffer rollout: explicit destination writes ---
     m["buffer.load"] = lambda a, _kw: f"_buffer_load({', '.join(a)})"
-    m["buffer.store"] = lambda a, _kw: f"_buffer_store({', '.join(a)})"
+    m["buffer.store"] = lambda a, kw: f"_buffer_store({', '.join(a)}, atomic={int(kw.get('atomic', 0))})"
     m["buffer.set_validshape"] = lambda a, _kw: f"_buffer_set_valid({a[0]}, {a[1]})"
     m["buffer.copy"] = lambda a, _kw: f"_buffer_copy({', '.join(a)})"
     m["buffer.extract"] = lambda a, _kw: f"_buffer_extract({', '.join(a)})"

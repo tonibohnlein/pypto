@@ -43,6 +43,14 @@ The internal Buffer-stage GM and addition operations have no public DSL wrappers
 These use separate data/metadata effects. See [Buffer contracts](02-types.md#buffer-operator-contracts)
 for shape, dtype, valid-state, and alias requirements.
 
+`buffer.store` keeps the original `atomic` transfer attribute. With no attribute
+or `atomic=0`, the destination data effect is Write; with `atomic=1`, it is
+ReadWrite. Source data and both handles' metadata are read in either case.
+The initial atomic recipe admits A2/A3 FP32 Acc-to-FP32 GM writeback with the
+ordinary dense transfer geometry. Effect inspection must supply the actual
+kwargs, including `{}` for an ordinary call. A call-independent query refuses
+the conditional destination effect rather than assuming an overwrite.
+
 Internal `buffer.get_block_idx`, `buffer.get_block_num`, and
 `buffer.get_subblock_idx` are zero-argument Buffer-stage queries. They return
 an INDEX scalar (`BufferResultBehavior.Value`) with no execution memory access,

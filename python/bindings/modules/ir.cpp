@@ -994,10 +994,15 @@ void BindIR(nb::module_& m) {
       nb::arg("op_name"), "Get the operator's explicitly declared IR stage");
   ir.def(
       "get_op_buffer_arg_effect",
-      [](const std::string& op_name, size_t arg_index) {
-        return OpRegistry::GetInstance().GetEntry(op_name).GetBufferArgEffect(arg_index);
+      [](const std::string& op_name, size_t arg_index, nb::object kwargs) {
+        const auto& entry = OpRegistry::GetInstance().GetEntry(op_name);
+        if (kwargs.is_none()) return BufferArgEffect(entry.GetBufferArgEffect(arg_index));
+        auto actual = ConvertKwargsDict(nb::cast<nb::dict>(kwargs));
+        ValidateKwargs(actual, entry.GetOp()->GetAttrs(), op_name);
+        return entry.GetBufferArgEffect(arg_index, actual);
       },
-      nb::arg("op_name"), nb::arg("arg_index"), "Get explicit data and metadata effects of a buffer operand");
+      nb::arg("op_name"), nb::arg("arg_index"), nb::arg("kwargs") = nb::none(),
+      "Get buffer effects; conditional data effects require actual call kwargs, including an empty dict");
   ir.def(
       "get_op_buffer_result_spec",
       [](const std::string& op_name, size_t result_index) {

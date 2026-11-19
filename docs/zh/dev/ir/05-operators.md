@@ -43,6 +43,12 @@
 这些算子分别声明数据/元数据效应。形状、dtype、valid 状态和别名要求见
 [Buffer 契约](02-types.md#buffer-算子契约)。
 
+`buffer.store` 保留原有 `atomic` 传输属性。缺省或 `atomic=0` 时目标数据效应为 Write；
+`atomic=1` 时为 ReadWrite，两种模式都读取源数据及两侧 handle 的元数据。
+初始原子配方支持 A2/A3 的 FP32 Acc 到 FP32 GM，沿用普通稠密传输几何。
+查询条件数据效应须提供实际 kwargs，普通调用显式提供 `{}`；无调用信息时拒绝回答，
+不会假定它仅覆盖目标数据。
+
 内部 `buffer.get_block_idx`、`buffer.get_block_num` 和 `buffer.get_subblock_idx`
 是无参数的 Buffer 阶段查询，返回 INDEX 标量（`BufferResultBehavior.Value`），没有执行期内存访问。
 它们读取既有运行时传入的 SPMD kernel 参数，由对应 Tile 查询转换产生，不提供公开 DSL 接口。

@@ -32,6 +32,7 @@ autosync 仍须独立建立范围、访问与出现坐标的证明。
 | 算子 | 元素类型 |
 | ---- | -------- |
 | 普通紧密 ND GM load/store | FP16、BF16、FP32、INT32 |
+| Acc 到紧密 ND GM 的原子累加写回 | FP32 源及目标，A2/A3 |
 | add、mul | FP16、FP32、INT32 |
 | sub、div、maximum、minimum、abs、exp、sqrt、neg、relu、log、recip | FP32 |
 | rsqrt（默认精度，无 workspace） | FP32 |
@@ -47,6 +48,21 @@ autosync 仍须独立建立范围、访问与出现坐标的证明。
 `recip` 的独立目的地由存储合法化和验证保证；精度属性保留原生既有策略。
 GM 返回别名必须解析到参数，其类型（包括 TensorView 元数据）须与声明的返回类型一致；
 返回视图不匹配的 kernel 保持 Tile。
+
+原子累加写回保留传输窗口，在原有 GM 写入之外增加同一窗口的读取。注册表按实际调用
+解析数据模式，元数据及内存操作数分类保持静态。选择、lowering、发射及同步复用同一模式
+资格检查；普通 store 仍只写目标。Vec 原子写回、目标 dtype 转换、非默认 phase/cache
+及 FIX 前处理仍不在支持范围。
+
+选定原生契约固定为 PTO-ISA
+[`TStore.hpp`](https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TStore.hpp)
+及 [`tstore_common.hpp`](https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/common/arch/memory/tstore_common.hpp)。
+默认双操作数 Acc 实现开启原子模式，发射既有 FIX 传输，随后恢复普通模式，无额外
+scratch 或编号事件。文档中的
+[原子配置顺序保证](https://asc.gitcode.com/api/SIMD-API/c_api/atomic/key_features.html)
+只建立配置到后续传输的顺序，不表示先前传输完成，也不提供跨 worker 同步。
+本地 GM 冲突仍产生依赖。目标初始化、任务可见性及需要的跨 worker 顺序由调用方保证。
+主机模型检查和 C++ 生成不证明跨 worker 浮点归约的确定性或原生设备行为。
 
 `rsqrt` 复用稠密一元配方，目标与输入须物理不相交。省略 `high_precision` 或显式
 `False` 选择默认双操作数实现；`True`、额外 workspace 和未知属性不在支持范围内。
@@ -432,7 +448,7 @@ buffer.store(acc, (0,0), (64,64), Out)
 （带地址时是另一个 alloc，PTOAS 下是 `buffer.reshape`），因为 PTOAS 要求原生 matmul 目标与乘积一致。
 这与旧发射器的原生写入相同：乘积之外的完整分形块保持原数据，被部分覆盖的块其余部分不保留。
 `tile.transpose_view` 不需要调用：存储索引阶段已经声明了重新标注的
-窗口。Acc store 只使用 fix-pipe 不带 scale 的转换；`pre_quant`/`pre_relu`、原子与分阶段
+窗口。Acc store 只使用 fix-pipe 不带 scale 的转换；`pre_quant`/`pre_relu`、FP32 Acc 配方以外的原子形式与分阶段
 store 以及 cache 策略 load 在对应传输配方完成前仍显式报错。
 
 流水线阶段归属属性只约束存储规划，而规划结果已经记录在 MemRef 中。本 pass 会丢弃该属性

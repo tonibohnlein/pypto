@@ -168,7 +168,7 @@ def test_gm_transfer_contract_exposes_window_and_memory_effects(name):
     assert ir.get_op_output_arity(name) == 0
     assert ir.get_op_buffer_result_spec(name).behavior == ir.BufferResultBehavior.None_
     for index, access in [(0, ir.BufferAccess.Read), (3, ir.BufferAccess.Write)]:
-        effect = ir.get_op_buffer_arg_effect(name, index)
+        effect = ir.get_op_buffer_arg_effect(name, index, {})
         assert effect.data == access
         assert effect.metadata == ir.BufferAccess.Read
         assert not effect.non_memory
