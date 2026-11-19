@@ -1,7 +1,8 @@
 # Local synchronization around existing transport
 
-Status: **design accepted for implementation with the structural proof and cost
-requirements below; no implementation or validation claim**. This extends
+Status: **shared production layout and workspace-context implementation installed;
+the coherent build and context/integration regressions pass; source hooks pass.
+Transport capsule admission remains unchanged**. This extends
 M4 consumption of existing communication boundaries. It preserves the selected
 TPUSH/TPOP/TFREE protocol, peer pairing, ring epochs and progress rules. It does
 not construct a new cross-core or inter-kernel synchronization protocol.
@@ -29,7 +30,7 @@ original injected parameter identity and its actual pipe setup/call owner.
 | `cross_core_pipe.cpp`, `BuildAutomaticPipeSetup` | Directions, slot size/depth, local reserve and original paired setup | Immutable selected pipe identity and parameters; preserve explicit handwritten settings rather than replace them with defaults |
 | `RequiredConsumerDepth` in the same file | FIFO pop/free order and supported scope-local queue closure | Retained local borrow/release evidence, including aliases handled by the existing finalizer |
 | `tpop_tfree_finalizer.cpp` | View aliases and uses extend the original popped tile lifetime | Original pop, dependent local uses and logical release cut |
-| `gm_pipe_layout.h`, `ComputeGMPipeWorkspaceElements`, `PrepareGMSlotBufferLayout` | Effective slot count, independent rings, full workspace and per-pipe offsets | One checked shared layout result consumed by orchestration, codegen and local analysis |
+| `gm_pipe_layout.h`, `LayoutEvidence`, `PrepareGMSlotBufferLayout` | Effective slot count, independent rings, full workspace and per-pipe offsets | One checked shared layout result consumed by orchestration, codegen and local analysis |
 | `pto_ops_crosscore.cpp` | Actual split, dtype, transport valid shape, initializer operands and native spelling | Selected variant identity and original local input/result binding |
 | `isa_macro_resources_protocol.cpp` | Pipe-owned ready/free signal reservations, separate local event claims where applicable | Claims selected for the actual direction, target and macro variant, with owner lifetime |
 | Existing native qualification and conservative effect services | Target/core admission, local payload effects, workspace separation and local SET/WAIT construction | Consume the transport evidence without a parallel operation-effects registry |
@@ -72,11 +73,11 @@ all other variants lack hardware contracts.
 
 ## Native entry, release and progress need separate proofs
 
-The inspected local source snapshot is
-`physical-sync-prototype/isa/hw-native-sys-pto-isa-f83d4b7`. It is useful source
-evidence, but final admission must pin the implementation actually selected by
-the compiler and verify the same obligations there; this snapshot is not itself
-proof of the current runtime/toolchain identity.
+The inspected TPUSH, TPOP, FIFO and TFREE sources are pinned at revision
+`5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f` in the disk-backed
+`native-transport-5487` artifact. The companion JSON records each primary URL,
+Git blob and SHA-256. This is source evidence, not proof of the compiler-selected
+variant correspondence or runtime/device behavior.
 
 In its A2/A3 implementation, TPUSH may wait for a free ring slot, then issues a
 TSTORE on FIX or MTE3 and publishes readiness on that pipe. TPOP waits for peer
@@ -142,7 +143,7 @@ owner or claim full PyPTO ownership for an unqualified sibling.
   compare native transport calls/settings before and after. Then recapture the six
   original leaves, reporting each new refusal rather than assuming six successes.
 
-No new runs have been performed for this proposal. The six remaining transport
+No native transport qualification runs have been performed for this proposal. The six remaining transport
 exports are actionable development work; neither this design nor successful C++
 generation establishes device behavior or complete model ownership.
 
@@ -181,6 +182,166 @@ progress argument for admitted repeated visits/resets; they cannot replace it.
 The cost ledger must separate one-time setup/layout/FIFO recovery, indexed call
 contributions, effect-incidence output and rejected attempts. Repeated whole-body
 or alias-DAG scans per call and runtime slot/visit enumeration are excluded.
-Selected5487 TPOP/TPUSH/FIFO sources are now pinned in the disk-backed
-`native-transport-5487` artifact; complete selected-variant correspondence,
-including TFREE, remains an implementation admission gate.
+Selected 5487 TPOP/TPUSH/FIFO/TFREE sources are pinned in the disk-backed
+`native-transport-5487` artifact. Tile-data TFREE overloads are no-ops; the
+GlobalData free path is distinct. Complete selected-variant correspondence
+remains an implementation admission gate.
+
+## Production layout substrate
+
+`gm_pipe::LayoutEvidence` now retains the exact immutable Program, original setup
+statements and indexed function-call graph. Orchestration entry and Graph emission
+share one owner through `KernelRegistrations`; the backend supplies contexts from
+that same owner to PTO codegen. The two former layout scans are removed.
+Existing `gm_pipe_layout.h` remains the sole ring/depth/footprint formula owner.
+
+Geometry is decoded lazily once per requested setup. Reachable-root and whole-module
+results are immutable; successes and layout refusals are memoized by original root
+identity. Foreign roots and ambiguous repeated statement identities cannot export
+an original setup cut. The unused standalone workspace-size wrapper has been deleted.
+Selected malformed kwargs keep their existing exception behavior; unrequested
+malformed geometry in unrelated functions is not decoded.
+
+Statement-only discovery covers concrete scope bodies, including Runtime,
+Hierarchy and SIMT, so layout consumers no longer disagree about hidden geometry.
+This does not admit native transport in any of those contexts. No expression DAG,
+peer schedule or runtime visit is expanded. The cost ledger separates source
+statement occurrences, setup decodes/lookups, call edges, closure function/setup
+incidences, cache hits and refusals. Distinct overlapping root queries may revisit
+indexed incidences and retain separate output maps; this is not a claim of total
+linear work across all roots.
+
+New focused tests cover ownership, geometry, failure caching, recursive calls,
+shared cuts, integer overflow, nested scopes and 8/32/128-leaf scaling. Existing
+public orchestration/PTO codegen tests remain the production regression gate.
+The earlier substrate gate passed 168 tests before the context repair; the final
+context and integration gates below pass. This substrate supplies layout evidence only: native
+readiness, FIFO lifetime, resource and uniform progress proofs are still required
+before any transport capsule or new leaf ownership is accepted.
+
+## Implemented layout-context consistency
+
+A shared formula does not establish a shared allocation context. Orchestration
+sizes `ReachableFrom(actual_launch_root)`, whereas the former PTO emitter assigned
+`WholeProgram()` offsets. For unrelated roots with `(id,dir)=(3,3)` and `(0,3)`,
+each using 2,048 bytes, the first root can receive a 2,048-byte allocation but an
+emitted offset of 2,048. Ordinary backend generation already separates Groups,
+so that example must be tested at both the direct codegen API and actual Group
+boundary before claiming an ordinary compiler failure. Ungrouped peer inclusion
+and independently owned workspaces are also relevant. Increasing every allocation
+to the entire model's footprint would undo the per-callee workspace contract.
+
+The accepted repair extends the existing layout owner with an immutable
+`WorkspaceContext`, issued only by `LayoutEvidence::BindRoot(original_root)`.
+The context has no public constructor or mutable fields. It retains the source
+owner, original root, checked workspace formal/call forwarding, admitted setup
+cuts and the exact `LayoutResult` used for both allocation bytes and offsets.
+A geometry result alone is not a context certificate.
+
+Binding must establish that every contributing original setup belongs to the
+root's actual workspace: find the existing injected formal role, then validate
+original call/Submit argument forwarding through the existing ABI mapping.
+The argument identity, rather than the reserved parameter name, proves sharing.
+A missing, ambiguous, separately allocated or unsupported alias/carry binding
+refuses the context. Duplicate statement occurrences cannot manufacture a unique
+setup cut. Reuse the original call index and existing ABI helpers; do not scan
+whole bodies for each contribution. No physical size is inferred from the
+four-byte placeholder. Contexts with no setup need no workspace proof.
+
+Concrete API and consumer changes installed for this subgate:
+
+1. Expose the existing production layout owner through the codegen binding and
+   add its opaque `bind_root` result. Keep inspection counters on that same owner;
+   do not add another layout analyzer or an attribute-based certificate.
+2. `_generate_single_chip` creates one owner for its immutable original Program.
+   It binds the actual Group root before reducing to the member PTO Program, or
+   the actual ungrouped launch root before including peer/helper definitions.
+   Merely adding a peer definition does not enlarge the root allocation.
+3. `GenerateOrchestration` accepts an optional shared layout owner. Its existing
+   create-use resolver selects the actual root; the corresponding bound context
+   supplies allocation bytes. Entry and Graph emitters share that owner.
+4. Both `PTOCodegen::Generate` and `GenerateBundle` accept an optional immutable
+   workspace context, forwarded by `_generate_pto_bundle` in normal and diagnostic
+   routes. Every emitted setup must match `SetupAt(original_function,original_cut)`
+   and belong to that context, with unchanged geometry. Original function identity
+   remains valid when a reduced Program reuses the original Function objects.
+   Unknown or copied/modified function/cut identities refuse before publication.
+5. Without an explicit context, direct PTO generation may infer one only when all
+   GM-bearing entry roots have individually valid, identical complete layouts
+   (same keys, offsets and extents). A single root is the ordinary case. Differing
+   entry layouts refuse with a request for an explicit original-root context;
+   the API must not silently combine them into a shared allocation. A Group whose
+   members intentionally use different subsets supplies its explicit context.
+6. Context handles are process-local capabilities, not serialized attributes.
+   After deserialization or source rewriting, reconstruct them from the complete
+   original Program and root. A reduced debug module lacking that owner must
+   satisfy the direct default rule or refuse; it cannot recover authority from a
+   matching function name, saved byte count or user-authored metadata.
+
+Validation must pair actual orchestration allocation with actual emitted offsets:
+unequal, reversed-ID independent Groups keep separate extents; a valid multi-pipe
+Group keeps disjoint shared offsets; direct unrelated roots refuse; foreign owner,
+changed setup, missing forwarding, separately bound workspace and ambiguous cut
+cases refuse. Graph forwarding, repeated generator use, `generate_bundle`, debug
+output and fresh serialized-original reconstruction must follow the same rule.
+No native transport admission changes as part of this repair.
+
+Charge once-owned source and forwarding indexes, requested context closure work,
+setup-membership validation, cache hits and refused bindings separately. Distinct
+contexts may have overlapping indexed closures; retained maps and validation cost
+are charged to that output. The implementation is installed and frozen for build and regression review.
+The final context and integration tests pass; results and limits are recorded below.
+
+The installed implementation keeps immutable `LayoutSource` separate from query
+memoization, so retained contexts do not form a cycle with their cache. It checks
+every contributing Call/Submit occurrence, including repeated calls to the same
+callee, using the existing caller-supplied ABI mapping. The narrow forwarding
+contract requires the exact original formal; it does not infer alias/carry
+relationships. Reduced-module validation uses immutable original Function identity
+to seal its body and indexed setup cuts without rescanning those bodies. The
+public `codegen.GMPipeLayoutEvidence` is the production owner; the testing name is
+only an alias of that binding. The old standalone size adapter is removed.
+
+The added context regression pairs actual orchestration allocations of 3,072 and
+4,096 bytes with their separately emitted Group offsets. It also covers explicit
+and default entry contexts, Call/Submit forwarding, memoized refusal, ambiguous
+cuts, foreign/deserialized identities, fresh reconstruction, owner lifetime, and
+repeated normal/bundle generation. Native capsule readiness, rearm, resource and
+progress obligations remain closed and outside this batch.
+
+A reviewed compatibility exception preserves the existing unmanaged direct-codegen
+spelling path: no explicit context and no managed-workspace formal anywhere in
+the emitted Program. That path retains the former whole-module numeric geometry
+checks, emits no GM pointer or managed offsets, and publishes no workspace
+certificate. It does not assert that an A2/A3 native pipeline can lower an omitted
+GM operand. Local PTOAS source requires that operand for A2/A3; these historical
+unit fixtures deliberately exercise spelling before the injection prerequisite.
+Any managed-role formal (including malformed/ambiguous forms), mixed mode or
+explicit context uses the strict context checks. Existing `BindRoot` refusal is
+unchanged. The regression compares each unmanaged function body with its separate
+emission and checks numeric errors, mixed-mode refusal and absence of GM offsets.
+
+## Final worktree closure
+
+The final coherent build passes. The passing module gates contain 681 verifier,
+token-erasure and layout cases; 26 shared-DAG cases under the original 10 s
+watchdog; 274 PTO-codegen cases; 151 native/orchestration cases; 96 ownership,
+runtime and backend cases; and three C++ resource/order tests. These overlapping
+runs are reported separately, not added into a new aggregate test count.
+The companion JSON pins each source file, loaded binary, Python, PTOAS, model,
+commands and logs under `final_validation`.
+
+The original two-layer model still generates 32 C++ leaves: 21 local PyPTO
+owners, 11 delegates and 47 existing task-control owners observed. All 32 C++
+files are byte-identical to the accepted scalar-write checkpoint. The eight-case
+actual-command audit passes, including replay without clearing physical history.
+Its staged shared-carrier reference is already totally ordered: zero excess
+establishes neither improved overlap nor minimum commands. No new kernel or
+native transport admission, protocol, ID budget or allocation algorithm is added.
+
+The earlier 5,014-pass/one-failure run is preserved. It exposed partial erasure of
+a guarded token cut; the valid-fixture regression and pre-import refusal now pass.
+Other preserved failures are the aggregate120s watchdog and stale API/metadata
+expectations. The final smaller integration batches retain that120s watchdog.
+No failed run is relabeled as an all-green full-suite result. Final hook and
+receipt review status is recorded in the machine-readable checkpoint.

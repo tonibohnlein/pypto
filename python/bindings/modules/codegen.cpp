@@ -12,12 +12,14 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/map.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
 #include "pypto/backend/common/backend.h"
 #include "pypto/codegen/distributed/distributed_codegen.h"
+#include "pypto/codegen/gm_pipe_layout_evidence.h"
 #include "pypto/codegen/orchestration/orchestration_codegen.h"
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/codegen/pto/pto_type_utils.h"
@@ -31,10 +33,59 @@ using namespace pypto::backend;  // NOLINT(build/namespaces)
 using namespace pypto::codegen;  // NOLINT(build/namespaces)
 using namespace pypto::ir;       // NOLINT(build/namespaces)
 
+nb::dict DescribeGMPipeLayoutWork(const codegen::gm_pipe::LayoutEvidence& evidence) {
+  const auto& work = evidence.Work();
+  nb::dict out;
+  out["statements"] = work.statements;
+  out["setup_entries"] = work.setup_entries;
+  out["setup_decodes"] = work.setup_decodes;
+  out["setup_lookups"] = work.setup_lookups;
+  out["call_edges"] = work.call_edges;
+  out["layout_requests"] = work.layout_requests;
+  out["layout_cache_hits"] = work.layout_cache_hits;
+  out["functions_visited"] = work.functions_visited;
+  out["setup_incidences"] = work.setup_incidences;
+  out["layouts_rejected"] = work.layouts_rejected;
+  out["binding_requests"] = work.binding_requests;
+  out["binding_cache_hits"] = work.binding_cache_hits;
+  out["forwarding_edges"] = work.forwarding_edges;
+  out["setup_validations"] = work.setup_validations;
+  out["bindings_rejected"] = work.bindings_rejected;
+  return out;
+}
+
+nb::dict DescribeGMPipeLayout(codegen::gm_pipe::LayoutEvidence& evidence, const ir::FunctionPtr& root) {
+  const auto result = root ? evidence.ReachableFrom(root) : evidence.WholeProgram();
+  nb::dict out;
+  out["bytes"] = result->bytes;
+  out["elements"] = result->Elements();
+  out["offsets"] = result->offsets;
+  out["error"] = result->error;
+  return out;
+}
+
 void BindCodegen(nb::module_& m) {
   // Create a new 'codegen' submodule
   nb::module_ codegen_module =
       m.def_submodule("codegen", "Code generation module for converting IR to pto-isa C++");
+
+  nb::class_<gm_pipe::WorkspaceContext>(codegen_module, "GMPipeWorkspaceContext")
+      .def_prop_ro("bytes", [](const gm_pipe::WorkspaceContext& context) { return context.Layout().bytes; })
+      .def_prop_ro("elements",
+                   [](const gm_pipe::WorkspaceContext& context) { return context.Layout().Elements(); })
+      .def_prop_ro("offsets",
+                   [](const gm_pipe::WorkspaceContext& context) { return context.Layout().offsets; });
+  nb::class_<codegen::gm_pipe::LayoutEvidence>(codegen_module, "GMPipeLayoutEvidence")
+      .def(nb::init<ir::ProgramPtr>(), nb::arg("program"))
+      .def("layout", &DescribeGMPipeLayout, nb::arg("root") = nb::none())
+      .def("work", &DescribeGMPipeLayoutWork)
+      .def("bind_root", &codegen::gm_pipe::LayoutEvidence::BindRoot, nb::arg("root"))
+      .def(
+          "has_setup",
+          [](const codegen::gm_pipe::LayoutEvidence& evidence, const ir::FunctionPtr& function,
+             const ir::StmtPtr& cut) { return evidence.SetupAt(function, cut) != nullptr; },
+          nb::arg("function"), nb::arg("cut"));
+  m.attr("testing").attr("GMPipeLayoutEvidence") = codegen_module.attr("GMPipeLayoutEvidence");
 
   codegen_module.def("data_type_to_mlir", &DataTypeToMLIR, nb::arg("dtype"),
                      "Return the PTO MLIR spelling of an element data type.");
@@ -65,9 +116,10 @@ void BindCodegen(nb::module_& m) {
       .def(nb::init<>(), "Create a PTO code generator (backend is always PTO)")
       .def("generate_bundle", &PTOCodegen::GenerateBundle, nb::arg("program"),
            nb::arg("emit_tile_addr") = true, nb::arg("emit_source_loc") = true,
+           nb::arg("workspace") = nb::none(),
            "Generate an EmitC caller and separate typed-VMI helpers for A5/AIV execution.")
       .def("generate", &PTOCodegen::Generate, nb::arg("program"), nb::arg("emit_tile_addr") = true,
-           nb::arg("emit_source_loc") = true,
+           nb::arg("emit_source_loc") = true, nb::arg("workspace") = nb::none(),
            "Generate PTO assembly from PyPTO IR Program. Returns PTO assembly code string (.pto format) with "
            "instructions like tmul, tadd, FOR/ENDFOR, etc. When emit_tile_addr=False, pto.alloc_tile omits "
            "the "
@@ -95,6 +147,7 @@ void BindCodegen(nb::module_& m) {
 
   // Free functions for orchestration codegen (backend-agnostic)
   codegen_module.def("generate_orchestration", &GenerateOrchestration, nb::arg("program"), nb::arg("func"),
+                     nb::arg("layout") = nb::none(),
                      "Generate C++ orchestration code for a function.\n\n"
                      "Uses simpler runtime API (rt_submit_task, make_tensor_external, etc.).\n"
                      "This is backend-agnostic.\n\n"

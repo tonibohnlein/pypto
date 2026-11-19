@@ -40,7 +40,7 @@
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/codegen/codegen_preconditions.h"
 #include "pypto/codegen/distributed/comm_layout.h"
-#include "pypto/codegen/gm_pipe_layout.h"
+#include "pypto/codegen/gm_pipe_layout_evidence.h"
 #include "pypto/codegen/pto/pto_type_utils.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
@@ -1104,15 +1104,17 @@ void PTOCodegen::WarnIfHighPrecisionIgnored(const std::string& op_name, const st
 // Generate entry and GenerateFunction
 // ========================================================================
 
-std::string PTOCodegen::Generate(const ProgramPtr& program, bool emit_tile_addr, bool emit_source_loc) {
+std::string PTOCodegen::Generate(const ProgramPtr& program, bool emit_tile_addr, bool emit_source_loc,
+                                 std::shared_ptr<const gm_pipe::WorkspaceContext> workspace) {
   separate_vf_ = false;
-  return GenerateImpl(program, emit_tile_addr, emit_source_loc);
+  return GenerateImpl(program, emit_tile_addr, emit_source_loc, std::move(workspace));
 }
 
 PTOCodegenBundle PTOCodegen::GenerateBundle(const ProgramPtr& program, bool emit_tile_addr,
-                                            bool emit_source_loc) {
+                                            bool emit_source_loc,
+                                            std::shared_ptr<const gm_pipe::WorkspaceContext> workspace) {
   separate_vf_ = true;
-  auto caller = GenerateImpl(program, emit_tile_addr, emit_source_loc);
+  auto caller = GenerateImpl(program, emit_tile_addr, emit_source_loc, std::move(workspace));
   return {std::move(caller), vf_helpers_, entry_helpers_};
 }
 
@@ -1127,7 +1129,8 @@ void PTOCodegen::RecordEntryHelperUse(const std::string& symbol) {
   }
 }
 
-std::string PTOCodegen::GenerateImpl(const ProgramPtr& program, bool emit_tile_addr, bool emit_source_loc) {
+std::string PTOCodegen::GenerateImpl(const ProgramPtr& program, bool emit_tile_addr, bool emit_source_loc,
+                                     std::shared_ptr<const gm_pipe::WorkspaceContext> workspace) {
   ir::return_lineage::ScopedTraceCache lineage_cache;
   // Logical completion values have no physical event protocol yet. Check the
   // entire input before outlining VF helpers or emitting no-result calls so a
@@ -1254,7 +1257,7 @@ std::string PTOCodegen::GenerateImpl(const ProgramPtr& program, bool emit_tile_a
   for (const auto& [_, function] : program->functions_) {
     if (function->func_type_ == ir::FunctionType::SIMT) simt_functions_.emplace(function->name_, function);
   }
-  PrepareGMSlotBufferLayout(program);
+  PrepareGMSlotBufferLayout(program, std::move(workspace));
 
   const std::string target_arch = backend_->GetHandler()->GetPtoTargetArch();
   // Select the compiler from structured IR, before serializing it. EmitC cannot
@@ -1323,69 +1326,31 @@ std::string PTOCodegen::GenerateImpl(const ProgramPtr& program, bool emit_tile_a
   return stream_.str();
 }
 
-void PTOCodegen::PrepareGMSlotBufferLayout(const ProgramPtr& program) {
-  std::map<std::pair<int, int>, int> slot_size_by_pipe;
-  std::map<std::pair<int, int>, int> slot_count_by_pipe;
-
-  std::function<void(const std::vector<StmtPtr>&)> scan_stmts;
-  scan_stmts = [&](const std::vector<StmtPtr>& stmts) {
-    for (const auto& stmt : stmts) {
-      auto call = transform_utils::GetCallFromStmt(stmt);
-      if (ir::op_predicates::IsInitializePipe(call)) {
-        const int pipe_id = call->GetKwarg<int>("id", 0);
-        const int dir_mask = call->GetKwarg<int>("dir_mask", 0);
-        const int slot_size = call->GetKwarg<int>("slot_size", 0);
-        const int slot_num = call->GetKwarg<int>("slot_num", 0);
-        if (dir_mask > 0 && slot_size > 0) {
-          const auto key = std::make_pair(pipe_id, dir_mask);
-          const int slot_count = gm_pipe::EffectiveSlotCount(dir_mask, slot_num);
-          auto [nit, ninserted] = slot_count_by_pipe.emplace(key, slot_count);
-          CHECK(ninserted || nit->second == slot_count)
-              << "initialize_pipe for frontend pipe id " << pipe_id << " and dir_mask " << dir_mask
-              << " uses inconsistent slot counts: " << nit->second << " and " << slot_count;
-          auto [it, inserted] = slot_size_by_pipe.emplace(key, slot_size);
-          CHECK(inserted || it->second == slot_size)
-              << "initialize_pipe for frontend pipe id " << pipe_id << " and dir_mask " << dir_mask
-              << " uses inconsistent slot_size values: " << it->second << " and " << slot_size;
-        }
-      }
-      if (auto for_stmt = As<ir::ForStmt>(stmt)) {
-        scan_stmts(FlattenBody(for_stmt->body_));
-      } else if (auto if_stmt = As<ir::IfStmt>(stmt)) {
-        scan_stmts(FlattenBody(if_stmt->then_body_));
-        if (if_stmt->else_body_.has_value()) {
-          scan_stmts(FlattenBody(if_stmt->else_body_.value()));
-        }
-      } else if (auto while_stmt = As<ir::WhileStmt>(stmt)) {
-        scan_stmts(FlattenBody(while_stmt->body_));
-      }
-    }
-  };
-
-  for (const auto& [gvar, func] : program->functions_) {
-    (void)gvar;
-    if (func->body_) {
-      scan_stmts(FlattenBody(func->body_));
-    }
+void PTOCodegen::PrepareGMSlotBufferLayout(const ProgramPtr& program,
+                                           std::shared_ptr<const gm_pipe::WorkspaceContext> workspace) {
+  gm_pipe_layout_evidence_.reset();
+  gm_workspace_context_.reset();
+  if (!backend_->GetHandler()->RequiresGMPipeBuffer()) {
+    CHECK(!workspace || workspace->Layout().bytes == 0)
+        << "Selected backend does not consume a GM pipe workspace context";
+    return;
   }
-
-  // Each pipe's region must advance by its FULL footprint — both rings of a bidirectional pipe,
-  // and an explicit slot_num where given — or the next pipe's base lands inside this one. This
-  // has to stay in step with ComputeGMPipeWorkspaceElements, which sizes the whole workspace;
-  // both derive it from gm_pipe_layout.h.
-  int64_t byte_offset = 0;
-  for (const auto& [key, slot_size] : slot_size_by_pipe) {
-    gm_slot_buffer_offsets_[key] = byte_offset;
-    const int dir_mask = key.second;
-    CHECK(gm_pipe::SlotCountForDirMask(dir_mask) > 0)
-        << "initialize_pipe has invalid dir_mask for GM slot buffer: " << dir_mask;
-    auto num_it = slot_count_by_pipe.find(key);
-    const int slot_count = num_it != slot_count_by_pipe.end() ? num_it->second : 0;
-    const int64_t pipe_bytes = gm_pipe::FootprintBytes(dir_mask, slot_count, slot_size);
-    CHECK(byte_offset <= std::numeric_limits<int64_t>::max() - pipe_bytes)
-        << "GM slot buffer offset overflow while assigning frontend pipe id " << key.first;
-    byte_offset += pipe_bytes;
+  if (!workspace) {
+    gm_pipe_layout_evidence_ = std::make_unique<gm_pipe::LayoutEvidence>(program);
+    if (!gm_pipe_layout_evidence_->HasWorkspaceFormal()) {
+      // Preserve the legacy low-level spelling path without a managed GM
+      // pointer. It never consumes offsets or publishes a workspace proof.
+      // Keep the former module-wide numeric consistency/error checks here.
+      const auto layout = gm_pipe_layout_evidence_->WholeProgram();
+      CHECK(layout->error.empty()) << layout->error;
+      return;
+    }
+    workspace = gm_pipe_layout_evidence_->InferCodegenContext();
   }
+  const auto error = workspace->ValidateProgram(program);
+  CHECK(error.empty()) << error;
+  gm_slot_buffer_offsets_ = workspace->Layout().offsets;
+  gm_workspace_context_ = std::move(workspace);
 }
 
 // ========================================================================

@@ -97,14 +97,20 @@ bool OrchestrationStmtCodegen::IsInjectedGMPipeCreateVar(const VarPtr& var) {
   return alloc_batching::IsInjectedGMPipeCreateVar(var);
 }
 
+gm_pipe::LayoutEvidence& KernelRegistrations::GMPipeLayout(const ProgramPtr& program) {
+  if (!gm_pipe_layout_) {
+    gm_pipe_layout_ = std::make_shared<gm_pipe::LayoutEvidence>(program);
+  }
+  CHECK(gm_pipe_layout_->Owner() == program)
+      << "GM pipe layout evidence belongs to a different original Program";
+  return *gm_pipe_layout_;
+}
+
 int64_t OrchestrationStmtCodegen::GetGMPipeWorkspaceElements(const FunctionPtr& root_func) {
   INTERNAL_CHECK(root_func != nullptr) << "Internal error: GM pipe workspace root function must not be null";
-  auto it = gm_pipe_workspace_elements_by_callee_.find(root_func->name_);
-  if (it == gm_pipe_workspace_elements_by_callee_.end()) {
-    const int64_t elements = ComputeGMPipeWorkspaceElements(program_, root_func);
-    it = gm_pipe_workspace_elements_by_callee_.emplace(root_func->name_, elements).first;
-  }
-  return it->second;
+  INTERNAL_CHECK(registrations_) << "Internal error: GM pipe workspace requires the generation owner";
+  const auto context = registrations_->GMPipeLayout(program_).BindRoot(root_func);
+  return context->Layout().Elements();
 }
 
 std::optional<OrchestrationStmtCodegen::GMPipeCreateUse> OrchestrationStmtCodegen::ResolveGMPipeCreateUse(

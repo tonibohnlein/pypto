@@ -1,5 +1,5 @@
 {
-  "status": "Architecture/correctness design accepted for implementation; no implementation or validation claim",
+  "status": "Accepted implementation, final source/hooks and receipt checkpoint",
   "scope": "local capsules for existing selected transport; no new cross-core/inter-kernel protocol",
   "capture": "build-py314/review-repairs-20261116/qwen-pure-write-qualified/receipt.json",
   "remaining_leaves": [
@@ -29,8 +29,8 @@
     "local_reserve_bytes": 16384,
     "placeholder_bytes_not_footprint": 4
   },
-  "native_snapshot_inspected": "build-py314/physical-sync-prototype/isa/hw-native-sys-pto-isa-f83d4b7",
-  "native_snapshot_qualification": "Final selected compiler/toolchain source identity and variant correspondence must be pinned separately. Snapshot is source evidence, not runtime proof.",
+  "native_snapshot_inspected": "build-py314/review-repairs-20261116/native-transport-5487",
+  "native_snapshot_qualification": "Pinned selected-revision source evidence; compiler variant correspondence, lifetime/progress proof and device behavior remain separate obligations.",
   "critical_lifetimes": [
     "push local source read pending on FIX/MTE3",
     "pop peer readiness distinct from MTE2 result completion",
@@ -80,6 +80,348 @@
     "failure": "retain immutable failed recovery and precise unmet obligation",
     "nonclaim": "whole compiler linearity"
   },
-  "initial_component": "Shared original evidence export only; admission remains closed until all native/lifetime/progress proofs and production consumers are connected",
-  "review_gate": "Independent reviewer accepted with stated context/occurrence or uniform lifetime/progress/cost obligations"
+  "initial_component": "Production LayoutEvidence owns original setup/call indexes and memoized layouts; orchestration and PTO codegen consume it. No native transport capsule is published.",
+  "review_gate": "Independent source and final receipt review accepted",
+  "native_sources": [
+    {
+      "display_url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TPop.hpp",
+      "display_title": "TPop.hpp",
+      "git_blob_sha": "a782be09f902ba61a8ce250d7257a10a24a32420",
+      "sha256": "20f4f4a34d4824151c60f83f1c1367d14656b614e3a5cdee561776f8613925eb"
+    },
+    {
+      "display_url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TPush.hpp",
+      "display_title": "TPush.hpp",
+      "git_blob_sha": "7d79d17d13e31b81c14e40b7fc6b9b70975bc81c",
+      "sha256": "0bc2fafce80007e3499a56bce6b4677c7eea694ef472763063b28145bcc795aa"
+    },
+    {
+      "display_url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/common/fifo.hpp",
+      "display_title": "fifo.hpp",
+      "git_blob_sha": "c392331e02f4f1b67bb9080d27461e8c93b84fbd",
+      "sha256": "da53bae00bb98c1c5df8db3d5c8215192e2d2b5cdec3237e254a7db905015c63"
+    },
+    {
+      "display_title": "TFree.hpp",
+      "display_url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TFree.hpp",
+      "git_blob_sha": "e0705c307aa979b85c504b926ea9a7e24e7d89fb",
+      "sha256": "e091cc9b0e3f2f0341e38fdad2fb13bee47265c785ebc7b80a33417cee1ec1dc"
+    }
+  ],
+  "layout_substrate": {
+    "source_owner": "exact immutable Program retained per code generation context",
+    "consumers": [
+      "KernelRegistrations shared by orchestration entry and Graph emitters",
+      "PTOCodegen Generate/GenerateBundle with context from actual original launch root"
+    ],
+    "geometry": "existing gm_pipe_layout.h formulas; checked accumulation and overflow-safe FP32 element ceiling",
+    "memo": "original root identity; successful and refused layouts; lazy setup geometry decoded once",
+    "scope_discovery": "all statement bodies including Runtime, Hierarchy and SIMT; geometry only, not native scope admission",
+    "compatibility": "Unused standalone size wrapper removed. Non-GM backend behavior preserved; malformed selected kwargs still raise; incompatible direct entry layouts refuse.",
+    "tests_added": "tests/ut/codegen/test_gm_pipe_layout_evidence.py and test_gm_pipe_workspace_context.py",
+    "cost": "one source statement-occurrence scan; indexed function/setup incidences per distinct root closure plus ordered map output; overlapping distinct roots may revisit incidences and retain separate output maps"
+  },
+  "layout_context_subgate": {
+    "status": "accepted design implemented and source frozen; build/runtime gate pending",
+    "problem": "per-launch-root allocated extent versus whole-reduced-module offsets; direct incompatible multi-entry module demonstrably unsafe without common workspace contract",
+    "normal_production_scope": "Group modules are already separated; ordinary production reproduction must establish actual root/module mismatch",
+    "owner": "opaque immutable WorkspaceContext from existing LayoutEvidence.BindRoot; original Program/root/cuts and actual workspace ABI forwarding",
+    "api": [
+      "shared owner optional in GenerateOrchestration",
+      "opaque context optional in PTOCodegen.Generate and GenerateBundle",
+      "same owner/context forwarded through _generate_single_chip and _generate_pto_bundle"
+    ],
+    "binding": "original workspace argument identity through existing Call/Submit ABI; refuse ambiguous, separately allocated or unsupported alias/carry bindings",
+    "default_direct_api": "infer only individually qualified identical full layouts across GM-bearing entries; otherwise explicit original-root context or refusal",
+    "serialization": "no trusted serialized context; rebuild from complete original Program and root; reduced standalone module must qualify default or refuse",
+    "validation": [
+      "allocation-offset agreement for independent reversed-ID Groups",
+      "valid shared multi-pipe Group",
+      "direct unrelated entry refusal",
+      "foreign/changed/ambiguous cut and workspace forwarding negatives",
+      "Graph, bundle, debug, repeated generation and serialized-original reconstruction"
+    ],
+    "cost": "shared source/forwarding indexes; indexed requested closures, per-setup validation and cached refused bindings; overlapping context outputs charged explicitly",
+    "native_admission_change": false,
+    "implemented_ownership": "immutable LayoutSource separate from mutable query memo; context owns source/root/layout/admitted identities without cache cycle",
+    "regression_allocation_bytes": [
+      3072,
+      4096
+    ],
+    "test_file": "tests/ut/codegen/test_gm_pipe_workspace_context.py",
+    "unmanaged_compatibility": {
+      "condition": "no explicit WorkspaceContext and no managed-role formal anywhere in emitted Program",
+      "behavior": "retain former whole-program numeric validation; emit no managed pointer/offsets; no context certificate",
+      "strict": "BindRoot unchanged; managed, ambiguous/malformed formal and mixed modes retain strict checks",
+      "native_claim": false,
+      "regression": "unchanged independent versus combined function text, no GM operand/addptr, preserved numeric error and mixed-mode refusal"
+    }
+  },
+  "substrate_gate_before_context": {
+    "passed": 168,
+    "seconds": 41.09,
+    "scope": "before WorkspaceContext repair; not evidence for new context gate"
+  },
+  "final_validation": {
+    "base_revision": "41a0c33870f4f955b4a2e87c26e38c711785509f",
+    "source_hashes": {
+      "CMakeLists.txt": "ffaff594cd06f88d0d97b94bb9e29d61bd0535ddd6ef6cc70e5647b273f9749a",
+      "include/pypto/codegen/gm_pipe_layout_evidence.h": "ba2e849fbd095fab9fe9b21ba6de0665ac156e69dc5ff6609aed51786c528358",
+      "include/pypto/codegen/orchestration/orchestration_analysis.h": "c32255398ceb8500fd1cb969dfc9002b369348e1f964e0f9bbf3643cd05cd71c",
+      "include/pypto/codegen/orchestration/orchestration_codegen.h": "2042f80dc4f83c8d56ddc98ecae94853ffb61701cb13f6b65cefd66ffc29ea36",
+      "include/pypto/codegen/pto/pto_codegen.h": "423c7aa28d89bc8c727cb845c44d93ff5d0d3f1b5712a0acbade45308d8b701e",
+      "include/pypto/ir/transforms/utils/var_collectors.h": "3fc6f8328c2a686e2baf14162acbd6918c81a951cad26db544245b0ac420b49c",
+      "include/pypto/ir/verifier/expression_use_cache.h": "f9ab48fc459dc83eb1f220a65efc753ac05de8a54690042f3abfb4e3cd4b99e3",
+      "python/bindings/modules/codegen.cpp": "8fedbb4d92e7e37adc60e91be3191e2bf776231c62f21c60d68e027574c47d36",
+      "python/pypto/backend/pto_backend.py": "b03bf9c56e5c62c5290da45c619cdd0409e22e0c01cb1d7d9d828d0e5af0d372",
+      "python/pypto/pypto_core/codegen.pyi": "ddb448455dbe8ff6f03040aba9b8f084a13c185ae1aea6038ad56a5ae0c29b20",
+      "python/pypto/pypto_core/testing.pyi": "b2ebe2a1b42788bd2f8ad56174bf62c1798b7947bd2801eba3c1548c2e34e6d2",
+      "src/codegen/gm_pipe_layout_evidence.cpp": "59b9967a72df000461003afb59eafc70161f480dc5b1a69069af7f4bc384130f",
+      "src/codegen/orchestration/orchestration_analysis.cpp": "b135b77e5d1c94cfb33c0ee379bddb387fcf38d55de5ef221f40a574b0559e96",
+      "src/codegen/orchestration/orchestration_codegen.cpp": "5838842bf91b232e3c1aa0ae3583db366bb25c3307f17edb90432d860f36ab80",
+      "src/codegen/orchestration/orchestration_stmt_codegen.h": "22d51e563dda57f21d7d42f9884be7f6181615bd856ae3aa5c3485d3f46e1593",
+      "src/codegen/orchestration/orchestration_tensor_codegen.cpp": "dc3f99b4903f05304f4bfb3ad8e2f91a748cb6e862f8c7cbc54c50888c81de2c",
+      "src/codegen/pto/pto_codegen.cpp": "ed86c75e19ed757662ed94cbb126bfb9cda250a93054a43f9925eb30757b4c74",
+      "src/ir/transforms/utils/structured_token_sync.cpp": "dcce1cb6a0db5a3891ccef58aa313d5ccf5a061105bde19e9df3b1f7d9614858",
+      "src/ir/verifier/type_check_pass.cpp": "d702c3df1e024fd87d9e8bd04e8dc573a17e38d8dd207859e1361f0f0b05bcbb",
+      "src/ir/verifier/verify_assign_type_symmetry.cpp": "aaeeaf39e9064816159e009af4dc3e7d63ea586e91e1ae941d6c0b780a2ef955",
+      "src/ir/verifier/verify_buffer_ir.cpp": "b362cdc460c23b7365fba207ab2c7b9de99ed5d241319a468e6cb33b726c8f5a",
+      "src/ir/verifier/verify_manual_deps_on_submit_only.cpp": "884dc41d9c09efd6f4d858e9ece7f53642d705692e14f9422a0606f5f8dc547c",
+      "src/ir/verifier/verify_no_nested_call_pass.cpp": "78f466a21f9f03c751e5c30e9f3cdcdaec90e72e13050d58205a0e8857814aad",
+      "src/ir/verifier/verify_ssa_pass.cpp": "fb0fc437277dbcae823b9cd67a6f56480b8b3af20d6e0a7c4e2a7f3fabea626b",
+      "src/ir/verifier/verify_use_after_def.cpp": "fef7603ccd012fec8cb410af8fe20f3d2d3c79b2c960fe596bc79aa604b46191",
+      "tests/ut/codegen/test_gm_pipe_layout_evidence.py": "004d5ef6ab26ac84ed482a372cd3ab653f2d882f0151404b88e6bc1d75894ded",
+      "tests/ut/codegen/test_gm_pipe_workspace_context.py": "dbafcaf7cf461abbe2b95adfb90758d1ed4e625159c18f578b05bab91490a0d4",
+      "tests/ut/codegen/test_pto_codegen.py": "be0ce75177d16374b0033da3a101b93e8f35f51686dc51a7e464c6322e3376a6",
+      "tests/ut/ir/transforms/test_scoped_token_families.py": "fc986139c7fa6411c7a83e478b697dffe0d2cde537c0cbb6575a38db882f0599",
+      "tests/ut/ir/transforms/test_verifier_expression_dag.py": "2d5e7a6671236036b5d7ec5aaab34672f6e6084951774afb2711a40e8f5372d8"
+    },
+    "source_fingerprint": "19af08143fbba1d6626ad5a102e874869a93d1759aa47259aaad87e75b1d7af3",
+    "binary_hashes": {
+      "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "ecacba6b9657e6afd146e6a81aa1fef723287862d92fb8d35bb893d0d8c29d3e"
+    },
+    "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+    "ptoas": {
+      "path": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher/ptoas",
+      "hash": "8b52c0bfe3259f37dd17331ec0b8ee534461f18e70042edce0e2b6ee2fd7adf8",
+      "version": "ptoas 0.72",
+      "additional_artifacts": {
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/bin/ptoas": "08b609372cbf5fd03008717214421c46c699b96d9fe84eee7aed0a90eecffcf3",
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/ptoas/mlir/_mlir_libs/libPTOASCompiler.so": "86655444ce6e3470dbbbf061438046bc5f87c5f0f89f4145fd2a4340c8fd70e9",
+        "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/physical-sync-prototype/ptoas-v072/ptoas/_core.cpython-311-x86_64-linux-gnu.so": "0aa83ba0abbd3432c2ce9ecb6c854485b5502d51b181fa200ee87fd9254ea321"
+      }
+    },
+    "library_revision": "b72c66d9df69ba5f11982b212530a255c050988d",
+    "model_sources": {
+      "config.py": "dbfc3d2c780d390566d53f1b72444f25105934a68eecdcfc97a1f001c1eba262",
+      "constants.py": "ace26981ab008a192d63ce2d7e15ac9be2765a7d1772a41f85b9bb31f80f64a6",
+      "contract.py": "f16c43df64c42769dc365a820e5fbc0ff6e9c4d3ceada21660003869ccbeaf15",
+      "decode_fwd.py": "c2f7288ce1e45cbe9fe99d60484aed7a4cb6b4d7255701c4692692a7586dd6f3",
+      "decode_layer_a8w8.py": "4074dea2e5225818108bc088d06dc1717cb2706dd004255a96c05843ba7a5fb8",
+      "decode_ssn_draft.py": "55016c298d42f77500e87bccdf020dbc3e78210cbe1a4c526b97f59466d77705",
+      "decode_tq_draft.py": "9daf2b9b1851d646552cb75504f33aad4766569ff740462a16cdf06d99f352ec",
+      "greedy_sample.py": "8f3fc3e4c533abf01140b299cac35a11185c5151e92df5ba84327afdfa3fceb8",
+      "paged_attention_cce.py": "aafa0bc6dde1758f5518081f3814449e0ca93d137451b67065a06f4b8a375b2d",
+      "paged_attention_pypto.py": "4087a49cd0b6c6396d4fef859576a02f8c6b096e9b94f5b55560e1f4b238e843",
+      "prefill_fwd.py": "3e05b6f910055549d6f89c24743dc384acfb0134be059efe4351b72092824dcb",
+      "prefill_fwd_a8w8.py": "3f359f5b5147c025efa21152117f75291c07826d9675f0a5bc9b76c3a13c67ac",
+      "prefill_tq_draft.py": "0eb51c30bfce55eabbb3318d39542813aef8687858957e41dcfafd5b93c5d8da",
+      "rms_lm_head.py": "0cafe8226d85659afd9d1c19e3c9ae46269a109a7c3c501d846a366e3826e3ce",
+      "rope_qkv_regen.py": "17d868b0527f6555e48426d4fe74526c8d72b5126d442efd2727cf9078c94076",
+      "test_paged_attention_cce.py": "7098e2cea21d017ef6f13f0261b19d37a3af62103045543862cf51b99d793f6c",
+      "test_paged_attention_pypto.py": "9bf0d2ea18b5d995a846858df23c301e32ff79849a08a1bb4250101ff468f32d",
+      "topk_select.py": "60ddb96ee27846c0dfb23f95a59cf53701eed94cca88bf7b5eb3802a5aaef267",
+      "turboquant_kv.py": "d49c3cb4764e524b96be5bffd57cbf6138061e65c5b762ac4781741d2181bf7d",
+      "weights.py": "d23e15850574369379e8140eb7a97be000274250dd6369544cc2108132125bf5"
+    },
+    "test_runs": [
+      {
+        "log": "finish-pinned-tests.log",
+        "passed": 681,
+        "failed": 0,
+        "seconds": 6.03,
+        "watchdog_seconds": 120,
+        "scope": "verifier/token-erasure plus layout/context"
+      },
+      {
+        "log": "finish-dag-watchdog.log",
+        "passed": 26,
+        "failed": 0,
+        "seconds": 0.07,
+        "watchdog_seconds": 10,
+        "scope": "shared scalar DAG"
+      },
+      {
+        "log": "finish-codegen-corrected.log",
+        "passed": 274,
+        "failed": 0,
+        "seconds": 56.11,
+        "watchdog_seconds": 120,
+        "scope": "PTO codegen and layout/context"
+      },
+      {
+        "log": "finish-native-final.log",
+        "passed": 151,
+        "failed": 0,
+        "seconds": 52.35,
+        "watchdog_seconds": 120,
+        "scope": "native/orchestration/injection"
+      },
+      {
+        "log": "finish-ownership-final.log",
+        "passed": 96,
+        "failed": 0,
+        "seconds": 10.23,
+        "watchdog_seconds": 120,
+        "scope": "ownership/runtime and A2/A3/A5 backend"
+      },
+      {
+        "log": "finish-ctest-final.log",
+        "passed": 3,
+        "failed": 0,
+        "scope": "C++ resource/native/order"
+      },
+      {
+        "log": "closed-formatted-context-tests.log",
+        "passed": 22,
+        "failed": 0,
+        "seconds": 0.91,
+        "watchdog_seconds": 60,
+        "scope": "formatted layout/context cases"
+      }
+    ],
+    "test_accounting": "Runs overlap; counts are not summed or presented as one deduplicated gate.",
+    "qwen_capture": {
+      "path": "build-py314/review-repairs-20261116/qwen-closed-changes/receipt.json",
+      "sha256": "843881a3ccfc49a2b05cb9dc1c8a841185dd42bfa79af8a13a1afc8fe741caa5",
+      "cpp_files": 32,
+      "owner_counts": {
+        "verified_pypto_leaf": 21,
+        "task_control_owner_observed": 47,
+        "delegated": 11
+      },
+      "byte_identical_cpp": 32,
+      "comparison": "build-py314/review-repairs-20261116/qwen-final-write-identity/receipt.json",
+      "compile_seconds_inclusive": 9.847181089688092,
+      "timing_scope": "one descriptive host run, not a speedup"
+    },
+    "command_audit": {
+      "path": "build-py314/review-repairs-20261116/qwen-closed-audit/receipt.json",
+      "sha256": "9e97398c4789ff5da9f3e678b4eda6f6f26218d186459f8e561bb147feee3490",
+      "cases": 8,
+      "missing_pairs": 0,
+      "excess_pairs": 0,
+      "reference": "selected staged-byte model, already total order; not original scalar order/minimum commands"
+    },
+    "logs": {
+      "build-py314/review-repairs-20261116/finish-pinned-build.log": "b2233cd22923fae7dcac44d0c32eb9fa27d29969b4c30003852baaa9192c19c8",
+      "build-py314/review-repairs-20261116/finish-pinned-tests.log": "6f59fff34b22052e9ed0125a691328937748910fc93479133abc653f6e875794",
+      "build-py314/review-repairs-20261116/finish-dag-watchdog.log": "e23f44c2d13e8da0b30b78b1310614232400b857ed704331a0e56a0e94735d62",
+      "build-py314/review-repairs-20261116/finish-codegen-corrected.log": "3fdd40fd44dd8391727847f29bd1eaf9af1f7b98916052ddb58b0f205046c1f4",
+      "build-py314/review-repairs-20261116/finish-native-final.log": "139fcdb0a1c6a6a9fd8d3e1cc134783f10b18f48a6a7de017dbb07afbed9428f",
+      "build-py314/review-repairs-20261116/finish-ownership-final.log": "28f81a287171ec9273dd61267dbac8270e5e665286f5e40577205da09e77f939",
+      "build-py314/review-repairs-20261116/finish-ctest-final.log": "4ae704fd2af427a1571e33cd4da1c2fbe4a9b58e94003a102a52cf8ceb3bcbf7",
+      "build-py314/review-repairs-20261116/closed-qwen-capture.log": "4778aaef2b3285192e2e0d6d20b368c7fc680efc9906b7e2c8226c8bbf87aa4f",
+      "build-py314/review-repairs-20261116/closed-qwen-audit.log": "36ff26125bf11ef19dfbbe5f91b0b5207d6f3fa5bdfa6919493040c436022ac3",
+      "build-py314/review-repairs-20261116/closed-formatted-context-tests.log": "3bc05479b254367d4b92d474f2744bf2880f1d01508f76c9ad4d03216140542e"
+    },
+    "historical_failures": [
+      {
+        "log": "continued-combined-gate.log",
+        "passed": 5014,
+        "failed": 1,
+        "cause": "unsupported-cut test exposed partial token erasure; source fix and valid-fixture checks followed"
+      },
+      {
+        "log": "finish-context-integration.log",
+        "exit_code": 124,
+        "watchdog_seconds": 120,
+        "cause": "aggregate integration batch hit watchdog; split into module batches with the same120s watchdog"
+      },
+      {
+        "log": "finish-native-compatibility.log",
+        "passed": 140,
+        "failed": 11,
+        "cause": "managed workspace binding was incorrectly required for legacy unmanaged spelling; compatibility repaired without a certificate"
+      },
+      {
+        "log": "finish-codegen-final.log",
+        "passed": 273,
+        "failed": 1,
+        "cause": "old raw-source test omitted paired ownership manifests; now checks exact source/manifest set and source SHA"
+      }
+    ],
+    "hooks": {
+      "status": "All applicable source and final documentation hooks passed",
+      "full_log": "build-py314/review-repairs-20261116/closed-changes-hooks.log",
+      "full_log_sha256": "b8ff358128afbbe58c4adb7da8f71304026f279278e08fb5e8ac70d7bd54fa83",
+      "full_run_exit_code": 1,
+      "full_run_note": "Only Markdown autofix marked the run changed; all source hooks including cpplint and Pyright passed. Final documentation rerun passed.",
+      "docs_log": "build-py314/review-repairs-20261116/closed-doc-hooks.log",
+      "docs_log_sha256": "ddf993e1142c69568bf1bf8bfbff02090e8617b62e6785a69081a7e6d78b963d",
+      "docs_exit_code": 0
+    },
+    "device_validation": false,
+    "native_transport_admission_changes": false,
+    "all_original_milestones_complete": false,
+    "formatting_note": "Final hook formatted the untracked context test. Its22-case fresh gate passed; production and binary hashes are unchanged.",
+    "commands": {
+      "build-py314/review-repairs-20261116/finish-pinned-build-command.json": "d5f14076f365c20516e40803fa213223c585d132d286e6326714f20f1c34196b",
+      "build-py314/review-repairs-20261116/finish-pinned-tests-command.json": "770b93ecc4a6fa9a5ca5c77b87ffd805b84bdc40fa057b175a9ae515c3d710dc",
+      "build-py314/review-repairs-20261116/finish-dag-watchdog-command.json": "055a34e463448817c1f7d24ff914fe0d28b7da972a9f9a002cbc6fe6a3baf036",
+      "build-py314/review-repairs-20261116/closed-codegen-corrected-command.json": "2872a8ed54972c50fffe4a59c7110b846b5f44d6f90193510e79074327b83970",
+      "build-py314/review-repairs-20261116/finish-native-final-command.json": "1c4472da8a8cd0995515ad3b301a9c0d3e6fcb3c4622d93a586233904d2408fc",
+      "build-py314/review-repairs-20261116/finish-ownership-final-command.json": "ef393a76a9263c93abc9f2024055e999a1838e4c7cd7a80e33c9a08b1f138da0",
+      "build-py314/review-repairs-20261116/finish-ctest-final-command.json": "cf611b869443fd51707a6dec784d0a4f958ed63f05a9055d7ecb22d83c0422ef",
+      "build-py314/review-repairs-20261116/closed-qwen-capture-command.json": "9d7ea97bb63f1c17930b5bf7d93da5333ddfece7ab60d4da8ce43987f34c886f",
+      "build-py314/review-repairs-20261116/closed-qwen-audit-command.json": "826fc6df9bdc4c3060c64b7f0224dfc117c8c125af9d0dc7234effd10e95140f",
+      "build-py314/review-repairs-20261116/closed-formatted-context-command.json": "85c5d482431fa39bd953fe7c3adf610d77a48225850249070d01f21ceeebb081",
+      "build-py314/review-repairs-20261116/closed-source-hooks-command.json": "70a10fb9805eaefab29dfcae8e2008a7f730758aad3909f947a938f5a2800e21"
+    },
+    "execution_environment": {
+      "cwd": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106",
+      "PYTHONPATH": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/ir:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/tests/ut/codegen:/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106",
+      "PTOAS_ROOT": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/architecture-correction/ptoas-launcher",
+      "TMPDIR": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/review-repairs-20261116/scratch",
+      "PYPTO_BUILD_JOBS": "1",
+      "PYPTO_TEST_JOBS": "1",
+      "CMAKE_BUILD_PARALLEL_LEVEL": "1",
+      "MAKEFLAGS": "-j1",
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "PYPTO_CODEGEN_MAX_WORKERS": "1"
+    },
+    "hook_environment": {
+      "PRE_COMMIT_NO_CONCURRENCY": "1",
+      "RAYON_NUM_THREADS": "1",
+      "PRE_COMMIT_HOME": "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/build-py314/pre-commit-cache",
+      "NODE_OPTIONS": "--max-old-space-size=2048"
+    }
+  },
+  "source_hashes": {
+    "CMakeLists.txt": "ffaff594cd06f88d0d97b94bb9e29d61bd0535ddd6ef6cc70e5647b273f9749a",
+    "include/pypto/codegen/gm_pipe_layout_evidence.h": "ba2e849fbd095fab9fe9b21ba6de0665ac156e69dc5ff6609aed51786c528358",
+    "include/pypto/codegen/orchestration/orchestration_analysis.h": "c32255398ceb8500fd1cb969dfc9002b369348e1f964e0f9bbf3643cd05cd71c",
+    "include/pypto/codegen/orchestration/orchestration_codegen.h": "2042f80dc4f83c8d56ddc98ecae94853ffb61701cb13f6b65cefd66ffc29ea36",
+    "include/pypto/codegen/pto/pto_codegen.h": "423c7aa28d89bc8c727cb845c44d93ff5d0d3f1b5712a0acbade45308d8b701e",
+    "python/bindings/modules/codegen.cpp": "8fedbb4d92e7e37adc60e91be3191e2bf776231c62f21c60d68e027574c47d36",
+    "python/pypto/backend/pto_backend.py": "b03bf9c56e5c62c5290da45c619cdd0409e22e0c01cb1d7d9d828d0e5af0d372",
+    "python/pypto/pypto_core/codegen.pyi": "ddb448455dbe8ff6f03040aba9b8f084a13c185ae1aea6038ad56a5ae0c29b20",
+    "python/pypto/pypto_core/testing.pyi": "b2ebe2a1b42788bd2f8ad56174bf62c1798b7947bd2801eba3c1548c2e34e6d2",
+    "src/codegen/gm_pipe_layout_evidence.cpp": "59b9967a72df000461003afb59eafc70161f480dc5b1a69069af7f4bc384130f",
+    "src/codegen/orchestration/orchestration_analysis.cpp": "b135b77e5d1c94cfb33c0ee379bddb387fcf38d55de5ef221f40a574b0559e96",
+    "src/codegen/orchestration/orchestration_codegen.cpp": "5838842bf91b232e3c1aa0ae3583db366bb25c3307f17edb90432d860f36ab80",
+    "src/codegen/orchestration/orchestration_stmt_codegen.h": "22d51e563dda57f21d7d42f9884be7f6181615bd856ae3aa5c3485d3f46e1593",
+    "src/codegen/orchestration/orchestration_tensor_codegen.cpp": "dc3f99b4903f05304f4bfb3ad8e2f91a748cb6e862f8c7cbc54c50888c81de2c",
+    "src/codegen/pto/pto_codegen.cpp": "ed86c75e19ed757662ed94cbb126bfb9cda250a93054a43f9925eb30757b4c74",
+    "tests/ut/codegen/test_gm_pipe_layout_evidence.py": "004d5ef6ab26ac84ed482a372cd3ab653f2d882f0151404b88e6bc1d75894ded",
+    "tests/ut/codegen/test_gm_pipe_workspace_context.py": "dbafcaf7cf461abbe2b95adfb90758d1ed4e625159c18f578b05bab91490a0d4",
+    "tests/ut/codegen/test_pto_codegen.py": "be0ce75177d16374b0033da3a101b93e8f35f51686dc51a7e464c6322e3376a6"
+  },
+  "binary_pins": {
+    "/home/toni/work/pypto3_sync_more/PTOAS-handoff/workspaces/pypto-autosync-main-20261106/python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "ecacba6b9657e6afd146e6a81aa1fef723287862d92fb8d35bb893d0d8c29d3e"
+  },
+  "pin_stage": "Final coherent build contains both worktree packages; separately pinned capture uses this binary",
+  "pending_gates": []
 }

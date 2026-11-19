@@ -971,3 +971,10 @@ The final47–49 gate and independent report review are accepted: 4,259 broad
 tests, 128 post-format tests, three CTests, all configured hooks, strict original
 model capture and eight actual-command cases pass. Reviewed designs50/51 are the
 next implementation gates; their acceptance does not claim implementation.
+
+The bounded worktree packages [50](50-autosync-verifier-expression-dag.md) and
+[51](51-autosync-existing-transport-capsules.md) now have passing coherent builds,
+scoped regression gates and an unchanged 32-leaf C++ capture. They close verifier
+traversal/refusal and workspace-layout ownership gaps. Native transport admission
+and all remaining original M1–M6 obligations stay separate; whole-model local
+ownership is still 21/32. Final acceptance evidence is in their companion receipts.

@@ -13,17 +13,11 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
-#include <limits>
-#include <map>
 #include <optional>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include "pypto/codegen/gm_pipe_layout.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
@@ -71,96 +65,6 @@ std::string FormatConstFloatValue(const ConstFloatPtr& c, const std::string& cpp
     return std::to_string(static_cast<float>(v));
   }
   return std::to_string(v);  // double
-}
-
-int64_t ComputeGMPipeWorkspaceElements(const ProgramPtr& program, const FunctionPtr& root_func) {
-  std::map<std::pair<int, int>, int> slot_size_by_pipe;
-  std::map<std::pair<int, int>, int> slot_count_by_pipe;
-
-  std::unordered_set<std::string> visited_funcs;
-  std::function<void(const std::vector<StmtPtr>&)> scan_stmts;
-  std::function<void(const FunctionPtr&)> scan_func;
-  scan_stmts = [&](const std::vector<StmtPtr>& stmts) {
-    for (const auto& stmt : stmts) {
-      CallPtr call;
-      if (auto assign = As<AssignStmt>(stmt)) {
-        call = transform_utils::AsCallOrSubmitView(assign->value_);
-      } else if (auto eval = As<EvalStmt>(stmt)) {
-        call = transform_utils::AsCallOrSubmitView(eval->expr_);
-      }
-      if (op_predicates::IsInitializePipe(call)) {
-        const int pipe_id = call->GetKwarg<int>("id", 0);
-        const int dir_mask = call->GetKwarg<int>("dir_mask", 0);
-        const int slot_size = call->GetKwarg<int>("slot_size", 0);
-        const int slot_num = call->GetKwarg<int>("slot_num", 0);
-        if (dir_mask > 0 && slot_size > 0) {
-          const auto key = std::make_pair(pipe_id, dir_mask);
-          // Compare the *effective* slot count, so a call that omits slot_num and one that
-          // states the dir_mask default agree, and a call that omits it while another states a
-          // non-default value is caught rather than silently sized from the explicit one.
-          const int slot_count = codegen::gm_pipe::EffectiveSlotCount(dir_mask, slot_num);
-          auto [nit, ninserted] = slot_count_by_pipe.emplace(key, slot_count);
-          CHECK(ninserted || nit->second == slot_count)
-              << "initialize_pipe for frontend pipe id " << pipe_id << " and dir_mask " << dir_mask
-              << " uses inconsistent slot counts: " << nit->second << " and " << slot_count;
-          auto [it, inserted] = slot_size_by_pipe.emplace(key, slot_size);
-          CHECK(inserted || it->second == slot_size)
-              << "initialize_pipe for frontend pipe id " << pipe_id << " and dir_mask " << dir_mask
-              << " uses inconsistent slot_size values: " << it->second << " and " << slot_size;
-        }
-      } else if (call) {
-        auto gv = As<GlobalVar>(call->op_);
-        if (gv) {
-          scan_func(program->GetFunction(gv->name_));
-        }
-      }
-
-      if (auto for_stmt = As<ForStmt>(stmt)) {
-        scan_stmts(transform_utils::FlattenToStmts(for_stmt->body_));
-      } else if (auto if_stmt = As<IfStmt>(stmt)) {
-        scan_stmts(transform_utils::FlattenToStmts(if_stmt->then_body_));
-        const auto& else_body = if_stmt->else_body_;
-        if (else_body) {
-          scan_stmts(transform_utils::FlattenToStmts(*else_body));
-        }
-      } else if (auto while_stmt = As<WhileStmt>(stmt)) {
-        scan_stmts(transform_utils::FlattenToStmts(while_stmt->body_));
-      } else if (auto scope = As<RuntimeScopeStmt>(stmt)) {
-        scan_stmts(transform_utils::FlattenToStmts(scope->body_));
-      }
-    }
-  };
-
-  scan_func = [&](const FunctionPtr& func) {
-    if (!func || !visited_funcs.insert(func->name_).second) {
-      return;
-    }
-    if (func->body_) {
-      scan_stmts(transform_utils::FlattenToStmts(func->body_));
-    }
-  };
-
-  scan_func(root_func);
-
-  int64_t total_bytes = 0;
-  for (const auto& [key, slot_size] : slot_size_by_pipe) {
-    const int dir_mask = key.second;
-    // The dir_mask must describe a GM-backed pipe before any explicit slot_num is honoured,
-    // so an unlayoutable direction is still rejected rather than sized from the override.
-    CHECK(codegen::gm_pipe::SlotCountForDirMask(dir_mask) > 0)
-        << "initialize_pipe has invalid dir_mask for GM slot buffer: " << dir_mask;
-    auto num_it = slot_count_by_pipe.find(key);
-    const int slot_count = num_it != slot_count_by_pipe.end() ? num_it->second : 0;
-    const int64_t pipe_bytes = codegen::gm_pipe::FootprintBytes(dir_mask, slot_count, slot_size);
-    CHECK(total_bytes <= std::numeric_limits<int64_t>::max() - pipe_bytes)
-        << "GM slot buffer size overflow while sizing frontend pipe id " << key.first;
-    total_bytes += pipe_bytes;
-  }
-
-  if (total_bytes == 0) {
-    return 0;
-  }
-  return (total_bytes + static_cast<int64_t>(sizeof(float)) - 1) / static_cast<int64_t>(sizeof(float));
 }
 
 // ---------------------------------------------------------------------------

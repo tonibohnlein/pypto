@@ -15,6 +15,7 @@ Internal testing utilities (do not use in production)
 
 from typing import Any, Literal, NoReturn, TypedDict
 
+from .codegen import GMPipeLayoutEvidence as GMPipeLayoutEvidence
 from .ir import (
     BufferAccess,
     BufferResultBehavior,

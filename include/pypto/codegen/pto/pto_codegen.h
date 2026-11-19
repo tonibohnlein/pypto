@@ -27,6 +27,7 @@
 
 #include "pypto/backend/common/backend.h"
 #include "pypto/codegen/codegen_base.h"
+#include "pypto/codegen/gm_pipe_layout_evidence.h"
 #include "pypto/core/dtype.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
@@ -182,13 +183,14 @@ class PTOCodegen : public CodegenBase {
    *        carries no filename. When false, emit no locations at all.
    * @return MLIR code as string
    */
-  std::string Generate(const ir::ProgramPtr& program, bool emit_tile_addr = true,
-                       bool emit_source_loc = true);
+  std::string Generate(const ir::ProgramPtr& program, bool emit_tile_addr = true, bool emit_source_loc = true,
+                       std::shared_ptr<const gm_pipe::WorkspaceContext> workspace = nullptr);
 
   /// Separate explicit RegScopes into A5/AIV no-Bridge helpers for execution.
   /// Generate() retains the combined typed-VMI diagnostic representation.
   PTOCodegenBundle GenerateBundle(const ir::ProgramPtr& program, bool emit_tile_addr = true,
-                                  bool emit_source_loc = true);
+                                  bool emit_source_loc = true,
+                                  std::shared_ptr<const gm_pipe::WorkspaceContext> workspace = nullptr);
 
   // CodegenBase interface (unified API for operator codegen callbacks)
   [[nodiscard]] std::string GetCurrentResultTarget() const override;
@@ -940,7 +942,8 @@ class PTOCodegen : public CodegenBase {
   /// Separate membership index preserves first-use order without linear scans.
   std::set<std::pair<std::string, std::string>> entry_helper_uses_;
   void RecordEntryHelperUse(const std::string& symbol);
-  std::string GenerateImpl(const ir::ProgramPtr& program, bool emit_tile_addr, bool emit_source_loc);
+  std::string GenerateImpl(const ir::ProgramPtr& program, bool emit_tile_addr, bool emit_source_loc,
+                           std::shared_ptr<const gm_pipe::WorkspaceContext> workspace);
   // Retained for the generation call: owns original Vars used as alias keys.
   ir::ProgramPtr vf_program_;
   // Bound regions own cloned Vars referenced by emission state. Both these
@@ -1028,7 +1031,8 @@ class PTOCodegen : public CodegenBase {
   /**
    * @brief Collect deterministic GM slot buffer byte offsets for frontend pipe ids in a module.
    */
-  void PrepareGMSlotBufferLayout(const ir::ProgramPtr& program);
+  void PrepareGMSlotBufferLayout(const ir::ProgramPtr& program,
+                                 std::shared_ptr<const gm_pipe::WorkspaceContext> workspace);
 
   /// Emit the external declaration implemented by the generated kernel wrapper.
   void EmitDeferredCompletionAdapterDeclaration();
@@ -1479,6 +1483,8 @@ class PTOCodegen : public CodegenBase {
   std::ostringstream stream_;
   int indent_level_ = 0;
   std::map<std::pair<int, int>, int64_t> gm_slot_buffer_offsets_;
+  std::unique_ptr<gm_pipe::LayoutEvidence> gm_pipe_layout_evidence_;
+  std::shared_ptr<const gm_pipe::WorkspaceContext> gm_workspace_context_;
 
   /// True when the module needs the wrapper-defined counter-completion adapter.
   bool needs_deferred_completion_adapter_ = false;

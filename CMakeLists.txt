@@ -107,6 +107,7 @@ set(PYPTO_SOURCES
     # Core
     src/core/backtrace.cpp
     src/core/error.cpp
+    src/codegen/gm_pipe_layout_evidence.cpp
 
     # IR - Core
     src/ir/transforms/utils/finite_sync_analysis.cpp

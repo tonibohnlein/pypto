@@ -13,9 +13,11 @@
 #define PYPTO_CODEGEN_ORCHESTRATION_ORCHESTRATION_CODEGEN_H_
 
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "pypto/codegen/gm_pipe_layout_evidence.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/pipe.h"
 #include "pypto/ir/program.h"
@@ -66,7 +68,8 @@ struct OrchestrationResult {
  * @return OrchestrationResult containing generated code and function metadata
  * @throws ValueError if referenced functions are missing from the program
  */
-OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const ir::FunctionPtr& func);
+OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const ir::FunctionPtr& func,
+                                          std::shared_ptr<gm_pipe::LayoutEvidence> layout = nullptr);
 
 /**
  * @brief Infer the core type of a function from operand MemorySpace
