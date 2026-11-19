@@ -271,6 +271,7 @@ struct TensorView {
   std::vector<ExprPtr>
       valid_shape;                ///< Valid shape for each dimension (optional, empty means use full shape)
   PadValue pad = PadValue::null;  ///< Pad mode for accesses outside valid_shape but within shape
+  bool nz_blocked = false;        ///< NZ shape and accesses use physical fractal coordinates
 
   /**
    * @brief Default constructor with ND layout and empty stride/valid_shape
@@ -284,9 +285,10 @@ struct TensorView {
    * @param layout Tensor layout type
    * @param valid_shape Valid shape for each dimension (optional, defaults to empty)
    * @param pad Pad mode (optional, defaults to PadValue::null)
+   * @param nz_blocked Whether the NZ view already has physical fractal coordinates
    */
   TensorView(std::vector<ExprPtr> stride, TensorLayout layout, std::vector<ExprPtr> valid_shape = {},
-             PadValue pad = PadValue::null);
+             PadValue pad = PadValue::null, bool nz_blocked = false);
 
   /**
    * @brief Constructor with integer stride and valid_shape (auto-converted to ConstInt)
@@ -295,9 +297,11 @@ struct TensorView {
    * @param layout Tensor layout type
    * @param valid_shape Valid shape for each dimension (int64, defaults to empty)
    * @param pad Pad mode (optional, defaults to PadValue::null)
+   * @param nz_blocked Whether the NZ view already has physical fractal coordinates
    */
   TensorView(const std::vector<int64_t>& stride, TensorLayout layout,
-             const std::vector<int64_t>& valid_shape = {}, PadValue pad = PadValue::null);
+             const std::vector<int64_t>& valid_shape = {}, PadValue pad = PadValue::null,
+             bool nz_blocked = false);
 
   /**
    * @brief Get field descriptors for reflection-based visitation
@@ -308,7 +312,8 @@ struct TensorView {
     return std::make_tuple(reflection::UsualField(&TensorView::stride, "stride"),
                            reflection::UsualField(&TensorView::layout, "layout"),
                            reflection::UsualField(&TensorView::valid_shape, "valid_shape"),
-                           reflection::UsualField(&TensorView::pad, "pad"));
+                           reflection::UsualField(&TensorView::pad, "pad"),
+                           reflection::UsualField(&TensorView::nz_blocked, "nz_blocked"));
   }
 };
 
