@@ -26,6 +26,7 @@
 #include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
+#include "pypto/backend/common/buffer_sync_contract.h"
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/backend/common/pto_native_ops.h"
@@ -814,8 +815,9 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
         extent_values, *this);
     const std::string buffer_operand = GetExprAsCode(buffer) + " : " + GetExprTypeAnnotation(buffer);
     const std::string tensor_operand = partition + " : " + partition_type;
-    Emit(load ? "pto.tload ins(" + tensor_operand + ") outs(" + buffer_operand + ")"
-              : "pto.tstore ins(" + buffer_operand + ") outs(" + tensor_operand + ")");
+    const std::string operation = backend::BufferNativeOperation(call);
+    Emit(load ? operation + " ins(" + tensor_operand + ") outs(" + buffer_operand + ")"
+              : operation + " ins(" + buffer_operand + ") outs(" + tensor_operand + ")");
     backend::pto_ops_detail::EndNonEmptyRegion(guarded, *this);
   } else if (const auto* indexed = backend::FindBufferIndexedRecipe(call->op_->name_)) {
     if (indexed->compare) {
@@ -823,13 +825,13 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
       // TGATHER receives its mask view; the remaining scratch regions follow
       // that view in the same allocation, as checked by the Buffer verifier.
       const std::string mode = call->GetKwarg<int>("cmp_mode") == 0 ? "eq" : "gt";
-      Emit(std::string(indexed->native_op) + " " +
+      Emit(std::string(backend::BufferNativeOperation(call)) + " " +
            BufferInsOutsClause({call->args_[0], call->args_[1], call->args_[2]},
                                std::vector<ir::ExprPtr>{call->args_[4], call->args_[5]}) +
            " {cmpMode = #pto<cmp " + mode +
            ">, offset = " + std::to_string(call->GetKwarg<int>("offset", 0)) + " : i32}");
     } else {
-      Emit(std::string(indexed->native_op) + " " +
+      Emit(std::string(backend::BufferNativeOperation(call)) + " " +
            BufferInsOutsClause({call->args_.begin(), call->args_.end() - 1}, call->args_.back()));
     }
   } else if (const auto* conversion = backend::FindBufferConversionRecipe(call->op_->name_)) {
@@ -843,7 +845,7 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
       attributes = "{cmpMode = #pto<cmp " +
                    backend::pto_ops_detail::cmp_modes.at(call->GetKwarg<int>("cmp_type")) + ">}";
     }
-    Emit(std::string(conversion->native_op) + " " +
+    Emit(std::string(backend::BufferNativeOperation(call)) + " " +
          BufferInsOutsClause({call->args_.begin(), call->args_.end() - 1}, call->args_.back(), attributes));
   } else if (ir::IsOp(call, "buffer.matmul") || ir::IsOp(call, "buffer.matmul_acc")) {
     // The accumulating form names its destination as the running-sum input:
@@ -851,17 +853,17 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
     const bool accumulate = ir::IsOp(call, "buffer.matmul_acc");
     std::vector<ir::ExprPtr> inputs{call->args_[0], call->args_[1]};
     if (accumulate) inputs.insert(inputs.begin(), call->args_[2]);
-    Emit(std::string(accumulate ? "pto.tmatmul.acc " : "pto.tmatmul ") +
+    Emit((std::string(backend::BufferNativeOperation(call)) + " ") +
          BufferInsOutsClause(inputs, call->args_[2]) +
          FormatMatmulTf32Attr(call, GetBackendHandler()->GetPtoTargetArch()));
   } else if (ir::IsOp(call, "buffer.extract")) {
     const std::string row = EmitBufferIntegerOperand(call->args_[1], DataType::INDEX);
     const std::string col = EmitBufferIntegerOperand(call->args_[2], DataType::INDEX);
-    Emit("pto.textract ins(" + GetExprAsCode(call->args_[0]) + ", " + row + ", " + col + " : " +
-         GetExprTypeAnnotation(call->args_[0]) + ", index, index) outs(" + GetExprAsCode(call->args_[3]) +
-         " : " + GetExprTypeAnnotation(call->args_[3]) + ")");
+    Emit(std::string(backend::BufferNativeOperation(call)) + " ins(" + GetExprAsCode(call->args_[0]) + ", " +
+         row + ", " + col + " : " + GetExprTypeAnnotation(call->args_[0]) + ", index, index) outs(" +
+         GetExprAsCode(call->args_[3]) + " : " + GetExprTypeAnnotation(call->args_[3]) + ")");
   } else if (ir::IsOp(call, "buffer.transpose")) {
-    Emit(std::string(backend::GetPtoNativeOpSpec("tile.transpose").native_op) + " " +
+    Emit(std::string(backend::BufferNativeOperation(call)) + " " +
          BufferInsOutsClause({call->args_[0], call->args_[1]}, call->args_[2]));
   } else {
     const auto* recipe = backend::FindBufferElementwiseRecipe(call->op_->name_);
@@ -870,10 +872,7 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
         << "Internal error: missing preflighted buffer emitter for " << call->op_->name_;
     const size_t input_count = recipe ? recipe->inputs.size() : axis_recipe ? axis_recipe->InputCount() : 1;
     std::ostringstream line;
-    line << (recipe        ? recipe->native_op
-             : axis_recipe ? axis_recipe->native_op
-                           : "pto.tmov")
-         << " "
+    line << backend::BufferNativeOperation(call) << " "
          << BufferInsOutsClause(
                 {call->args_.begin(), call->args_.begin() + static_cast<std::ptrdiff_t>(input_count)},
                 call->args_.back());

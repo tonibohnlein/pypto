@@ -499,16 +499,17 @@ std::optional<std::pair<int64_t, int64_t>> Progression(int64_t low, int64_t high
 }  // namespace
 size_t BuildPeriodicCoreFrontiers(CompactSegmentResult& result) { return Reduce(result, false); }
 
-CompactSyncResult AnalyzeRotatingSync(CompactSyncInput input) {
+CompactSyncBuilder AnalyzeRotatingSync(CompactSyncInput input) {
   CHECK(input.segments.size() == 1)
       << "Rotating child mathematics is supported; multi-region composition export is unavailable";
-  CompactSyncResult result;
-  result.input = std::move(input);
-  result.segments.push_back(AnalyzeRotatingSegment(result.input, 0, result.input.segments[0].count, result));
+  CompactSyncBuilder result;
+  result.State().input = std::move(input);
+  result.State().segments.push_back(
+      AnalyzeRotatingSegment(result.State().input, 0, result.State().input.segments[0].count, result));
   return result;
 }
 CompactSegmentResult AnalyzeRotatingSegment(const CompactSyncInput& input, size_t region, int64_t count,
-                                            CompactSyncResult& work) {
+                                            CompactSyncBuilder& work) {
   CompactSegmentResult output;
   const auto& segment = input.segments.at(region);
   CHECK(count >= 0) << "Negative rotating invocation count";
@@ -569,7 +570,7 @@ CompactSegmentResult AnalyzeRotatingSegment(const CompactSyncInput& input, size_
       continue;
     }
     auto atoms = Normalize(domain, fragments, output, ownership.has_value());
-    work.cells += atoms.size();
+    work.Diagnostics().cells += atoms.size();
     for (const auto& atom : atoms) {
       if (ownership)
         ExtractVisitOwned(atom, output, generators);
@@ -585,11 +586,11 @@ CompactSegmentResult AnalyzeRotatingSegment(const CompactSyncInput& input, size_
     output.generators.push_back({source, target, distance});
   }
   const auto extracted = Clock::now();
-  work.partition_seconds += std::chrono::duration<double>(extracted - start).count();
+  work.Diagnostics().partition_seconds += std::chrono::duration<double>(extracted - start).count();
   output.quotient_edges = Reduce(output);
-  work.reduction_seconds += std::chrono::duration<double>(Clock::now() - extracted).count();
+  work.Diagnostics().reduction_seconds += std::chrono::duration<double>(Clock::now() - extracted).count();
   // This is the static number of described sites, not an unrolled witness.
-  work.analyzed_occurrences += segment.sites.size();
+  work.Diagnostics().analyzed_occurrences += segment.sites.size();
   return output;
 }
 

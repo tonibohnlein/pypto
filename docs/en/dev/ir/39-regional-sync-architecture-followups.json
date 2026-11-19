@@ -1,0 +1,225 @@
+{
+  "baseline_revision": "12e99a75cb7a0beea081b3451cae42dba34d4893",
+  "status": "All three implementation gates independently accepted; uncommitted candidate.",
+  "baseline_extension_sha256": {
+    "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "d10f43f95a169443369395ca2ae55ef5ea5821444fb6fa1c3c011dcd5b1e137a"
+  },
+  "source_sha256": {
+    "CMakeLists.txt": "2a734c43eacc9e4c879b093f457f91557f7ae74f4dc42d98cb2f494939486012",
+    "docs/en/dev/ir/39-regional-sync-architecture.md": "c574511402c462ba89a4c46c4480eac3a1016d7c9a94c0f397c1c6b8c8a881ad",
+    "docs/zh/dev/ir/39-regional-sync-architecture.md": "ec6d883cc734898a698060bae2a5a5f3f47c4c7b4db31189100e32487ad2478d",
+    "include/pypto/backend/common/buffer_sync_contract.h": "df25d7718c0d43ba53e28aad08e7770b9a9a4cdce47a7e1386f9695846f428b4",
+    "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "ad7d2c030a6baee58b90af6b274eaa198d641ef4bb61c0a730ff3699643d848a",
+    "python/bindings/modules/testing.cpp": "63f6305685f26ccb6320d7fb7b8b54391210b9f715182ca6ab8685bf3cbfdaa0",
+    "python/bindings/modules/testing_sync_support.cpp": "b2b104f5d9adffb3a79a6ab73bf844fb2cf6d9845621ffcc9450c84408d3edcf",
+    "src/backend/common/buffer_sync_contract.cpp": "800d97ccfe47f1a7270a1d8c92ef00086a67b44987814b08773e11e5c8945341",
+    "src/codegen/pto/pto_buffer_codegen.cpp": "b651e2f9002eaef729c21698b0bbecce026ca6f862a16d6f5be1a2d680b80476",
+    "src/ir/transforms/token_sync.cpp": "b94d730ed1c72338aa3bbdf7ca20d75365232a63a87d978118ffecfa9322a5e4",
+    "src/ir/transforms/utils/compact_sync_analysis.cpp": "c009e9843756c686889597203feec60d4809a1870f2ab5c2242746d5fc038da3",
+    "src/ir/transforms/utils/compact_sync_builder.h": "be43838f46c632fa70c58a7088acc3e2bf2175702867952f874ae206eef4708c",
+    "src/ir/transforms/utils/logical_sync_realization.cpp": "bacb69e7fe11ea9701ba17c6c99bf7657136131c4db6683bb12b973f96ed3aee",
+    "src/ir/transforms/utils/numerical_sync_hierarchy.cpp": "b20608558787cc30cbe8f82c14617feed2563a2e3b47051923d99fb794091267",
+    "src/ir/transforms/utils/numerical_sync_hierarchy.h": "78a0c3eb9f71fb8c61c311434e522aa761fde82e0ae3210d6f161b178c994f9c",
+    "src/ir/transforms/utils/numerical_sync_merge.cpp": "83c12a2cd83bd9298c21c4b1dd573fd4f17606df156c500f48cd211885db013f",
+    "src/ir/transforms/utils/numerical_sync_merge.h": "ad766734779023e124d82677693a09a2b21e4a7a618501e9a10cc68e6acd8c16",
+    "src/ir/transforms/utils/numerical_sync_phase.cpp": "f43499c5f6e6a797f23c5f70e0c6cb77a7b854ea65b59cdb2e8c8179b0c42063",
+    "src/ir/transforms/utils/numerical_sync_phase.h": "aaf2f854e52186d0868a6af5209368da58d9a56df989f0db727f3ca700e36d14",
+    "src/ir/transforms/utils/physical_sync_allocation.cpp": "07e837f3572885394f23c45eb3e45b341a773cd22a8d5aa95c0fd92d39d7e070",
+    "src/ir/transforms/utils/physical_sync_allocation.h": "70b2a76b17955c461d6a5c819e988a5b2404987c830f65531b99cf6b9c4fc00c",
+    "src/ir/transforms/utils/placed_sync_import.cpp": "7d732d17fbf77e2a0c626073fcc9b54b5a6dda80afba2d5cba9972fc5a80a75f",
+    "src/ir/transforms/utils/rotating_sync_analysis.cpp": "9fff3c89db5f8926208cde59cbda570ec82614a2c608478c376631f13814a2e1",
+    "src/ir/transforms/utils/rotating_sync_analysis.h": "319a616583f1ff1df59283488a87668416e062ef3deb06edb42a913506ba986b",
+    "src/ir/transforms/utils/scoped_logical_sync.cpp": "378cce2cfee11225c35fd79486e3dab4c2de10b8b5f6c24a41650598c5d3cea5",
+    "src/ir/transforms/utils/scoped_token_order.cpp": "7f607b210f79a2e7ef5ad29f3fa20ab6458c689c30f4adfa03826699b88b0148",
+    "src/ir/transforms/utils/token_sync_lowering.cpp": "1e7e8c47efd90e258c8d0e98534a8a978fd0e973eba62e0c8c53ef63597c529e",
+    "tests/ut/codegen/test_buffer_codegen.py": "87b6f4cb9ee58b5e718152678606a0730906547693fddf972a28d49eda790dba",
+    "tests/ut/cpp/numerical_sync_order_test.cpp": "912c7866c15d438a9ff3af676acda5facef2ac2ff68052ea389ab3d6c2a78d45",
+    "tests/ut/ir/transforms/test_nested_sync_repetition.py": "fdb9ee4d9bb3c7742db51bde28a23ea739ae81004162e1608735a66e31ee6f5b",
+    "tests/ut/ir/transforms/test_sync_construction_scaling.py": "a34c2173d440c00268e5032ef8e7c2e31a474e5da7505e0628dd2dd0b2464d59",
+    "tests/ut/ir/transforms/test_vec_sync_analysis.py": "7452a8dfb101490bd4595457bec5962bc778b7a40b1ad59552029b8778088a50"
+  },
+  "extension_sha256": {
+    "python/pypto/pypto_core.cpython-314-x86_64-linux-gnu.so": "1fd7a6f2b26a3827a37de718ddfd125b38ff88a2839164a989a94d8b470c73b7"
+  },
+  "python": "3.14.7 (main, Aug 10 2026, 00:00:00) [GCC 15.3.1 20260722 (Red Hat 15.3.1-1)]",
+  "build_type": "Release",
+  "ptoas": "0.72",
+  "ptoas_launcher_sha256": "8b52c0bfe3259f37dd17331ec0b8ee534461f18e70042edce0e2b6ee2fd7adf8",
+  "submodules": [
+    " 6f8310e238fc3ce68f42f391cbe93fd156bb2c23 3rdparty/libbacktrace (6f8310e)",
+    " 919908742b4fdbc575e77fe1a8657e70c9573c44 3rdparty/msgpack-c (cpp-1.3.0-769-g91990874)",
+    " 355ce3015e3e344d1fc3a61c206ee01823ce292c runtime (355ce3015)"
+  ],
+  "gates": {
+    "A": {
+      "base": "12e99a75cb7a0beea081b3451cae42dba34d4893",
+      "gate": "A",
+      "source_sha256": {
+        "include/pypto/ir/transforms/utils/compact_sync_analysis.h": "ad7d2c030a6baee58b90af6b274eaa198d641ef4bb61c0a730ff3699643d848a",
+        "python/bindings/modules/testing.cpp": "63f6305685f26ccb6320d7fb7b8b54391210b9f715182ca6ab8685bf3cbfdaa0",
+        "python/bindings/modules/testing_sync_support.cpp": "b2b104f5d9adffb3a79a6ab73bf844fb2cf6d9845621ffcc9450c84408d3edcf",
+        "src/ir/transforms/utils/compact_sync_analysis.cpp": "c009e9843756c686889597203feec60d4809a1870f2ab5c2242746d5fc038da3",
+        "src/ir/transforms/utils/logical_sync_realization.cpp": "bacb69e7fe11ea9701ba17c6c99bf7657136131c4db6683bb12b973f96ed3aee",
+        "src/ir/transforms/utils/numerical_sync_hierarchy.cpp": "b20608558787cc30cbe8f82c14617feed2563a2e3b47051923d99fb794091267",
+        "src/ir/transforms/utils/numerical_sync_hierarchy.h": "78a0c3eb9f71fb8c61c311434e522aa761fde82e0ae3210d6f161b178c994f9c",
+        "src/ir/transforms/utils/numerical_sync_merge.cpp": "83c12a2cd83bd9298c21c4b1dd573fd4f17606df156c500f48cd211885db013f",
+        "src/ir/transforms/utils/numerical_sync_merge.h": "ad766734779023e124d82677693a09a2b21e4a7a618501e9a10cc68e6acd8c16",
+        "src/ir/transforms/utils/numerical_sync_phase.cpp": "f43499c5f6e6a797f23c5f70e0c6cb77a7b854ea65b59cdb2e8c8179b0c42063",
+        "src/ir/transforms/utils/numerical_sync_phase.h": "aaf2f854e52186d0868a6af5209368da58d9a56df989f0db727f3ca700e36d14",
+        "src/ir/transforms/utils/rotating_sync_analysis.cpp": "9fff3c89db5f8926208cde59cbda570ec82614a2c608478c376631f13814a2e1",
+        "src/ir/transforms/utils/rotating_sync_analysis.h": "319a616583f1ff1df59283488a87668416e062ef3deb06edb42a913506ba986b",
+        "src/ir/transforms/utils/scoped_logical_sync.cpp": "378cce2cfee11225c35fd79486e3dab4c2de10b8b5f6c24a41650598c5d3cea5",
+        "tests/ut/cpp/numerical_sync_order_test.cpp": "78c75ade2bd95eb24d3bd9df92419451c2cf868ccdb89417de03985bd2c5c727",
+        "tests/ut/ir/transforms/test_nested_sync_repetition.py": "fdb9ee4d9bb3c7742db51bde28a23ea739ae81004162e1608735a66e31ee6f5b",
+        "tests/ut/ir/transforms/test_sync_construction_scaling.py": "a34c2173d440c00268e5032ef8e7c2e31a474e5da7505e0628dd2dd0b2464d59",
+        "src/ir/transforms/utils/compact_sync_builder.h": "be43838f46c632fa70c58a7088acc3e2bf2175702867952f874ae206eef4708c"
+      },
+      "log_sha256": {
+        "build-py314/gate-a-build.log": "589da10cf5d9a0c3a51eaf89f3b47e533d6dc1ef293376cc0ff917d5f68cb854",
+        "build-py314/gate-a-tests.log": "7ac38e6d419e48c33d848192bc23495b950896c1eb8335d5cb890d582f2e30eb",
+        "build-py314/gate-a-cpp-tests.log": "a89e5d9164d2242c31f555518b71b7b6492e729d8d12a7138fc9eb2b705e01f6"
+      },
+      "pytest": {
+        "passed": 354,
+        "deselected": 1,
+        "seconds": 115.96,
+        "deselected_reason": "pre-existing small-GEMM Buffer admission"
+      },
+      "ctest": {
+        "passed": 1,
+        "name": "pypto_numerical_sync_order_test",
+        "seconds": 0.31
+      },
+      "publication": "constant-time transfer of builder handles; published copies share const premises and export cache",
+      "claims": "Host-model ownership/interface refactor, no new mathematical/native guarantee"
+    },
+    "B": {
+      "focused_passed": 219,
+      "codegen_and_vec_passed": 458,
+      "baseline_plans_byte_identical": 6,
+      "test_maintenance": "Two stale baseline positive-step regexes corrected, nine negative parameterizations remain refusals.",
+      "logs": {
+        "build-py314/architecture-followups-20261114/gate-b-build.log": "067324716a602557f6b4b9b46cb424225c428331df22c51cbd5de3cfd95298bf",
+        "build-py314/architecture-followups-20261114/gate-b-tests.log": "a83fa4348a58a1f474113992a855ff7cff64472a15854a2fb7ac82759865625d",
+        "build-py314/architecture-followups-20261114/gate-b-plans.json": "a132b9a8e6bb9306c7af829190fd99013a96baaa9ec1b721b1967007efd8ebed",
+        "build-py314/architecture-followups-20261114/gate-b-codegen.log": "e54688ea2c58b020c42753a91d5621264e0393637d871106166cb45cf5f8f2fe",
+        "build-py314/architecture-followups-20261114/gate-b-final-build.log": "29ca021c0f27027271d2509f173617bf49b37153e68a1b1e6603d346cbff9623",
+        "build-py314/architecture-followups-20261114/gate-b-final-tests.log": "dbaa07491bd94f50fb528a54bfb10db7c44684901baa24d35d4923c4504c02d5"
+      }
+    },
+    "C": {
+      "base": "12e99a75cb7a0beea081b3451cae42dba34d4893",
+      "gate": "C",
+      "source_sha256": {
+        "src/ir/transforms/utils/physical_sync_allocation.h": "70b2a76b17955c461d6a5c819e988a5b2404987c830f65531b99cf6b9c4fc00c",
+        "src/ir/transforms/utils/physical_sync_allocation.cpp": "07e837f3572885394f23c45eb3e45b341a773cd22a8d5aa95c0fd92d39d7e070",
+        "src/ir/transforms/utils/scoped_token_order.cpp": "7f607b210f79a2e7ef5ad29f3fa20ab6458c689c30f4adfa03826699b88b0148",
+        "tests/ut/cpp/numerical_sync_order_test.cpp": "912c7866c15d438a9ff3af676acda5facef2ac2ff68052ea389ab3d6c2a78d45"
+      },
+      "log_sha256": {
+        "build-py314/gate-c-build.log": "27f8e099d02b23cd9107f08b70ab788da6c86d0ebbd1b2347506c77e56359c44",
+        "build-py314/gate-c-tests.log": "593889bcc630ad13dde8bf5b5764ac7e980058d06a36179ce71f0b4d2dea0ecf",
+        "build-py314/gate-c-cpp-tests.log": "a89e5d9164d2242c31f555518b71b7b6492e729d8d12a7138fc9eb2b705e01f6"
+      },
+      "commands": [
+        "source .claude/skills/testing/load-env.sh",
+        "cmake --build build-py314 --parallel 1",
+        "ctest --test-dir build-py314 --parallel 1 -R '^pypto_numerical_sync_order_test$' --output-on-failure",
+        "export PYTHONPATH=\"$PWD/python:$PWD/tests/ut/ir\" PTOAS_ROOT=\"$PWD/build-py314/architecture-correction/ptoas-launcher\" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1",
+        "python3 -m pytest -q tests/ut/ir/transforms/test_sync_construction_scaling.py tests/ut/ir/transforms/test_token_sync_lowering.py tests/ut/ir/transforms/test_vec_sync_analysis.py tests/ut/ir/transforms/test_compact_sync_analysis.py tests/ut/ir/transforms/test_rotating_sync_analysis.py tests/ut/ir/transforms/test_nested_sync_repetition.py tests/ut/ir/transforms/test_autosync_switch.py tests/ut/ir/transforms/test_scoped_token_families.py tests/ut/ir/transforms/test_scoped_token_order.py tests/ut/ir/transforms/test_scoped_sync_palette.py tests/ut/ir/transforms/test_scoped_palette_realization.py tests/ut/ir/transforms/test_scoped_resource_transitions.py tests/ut/ir/transforms/test_scoped_physical_sync.py tests/ut/ir/transforms/test_physical_sync_realization.py tests/ut/ir/transforms/test_logical_sync_realization.py --require-ptoas"
+      ],
+      "pytest": {
+        "passed": 651,
+        "failed": 1,
+        "warnings": 2,
+        "seconds": 337.42,
+        "failure": "test_scoped_token_order.py::test_shenggan_original_tiles_single_invocation_cpp",
+        "reason": "Pre-existing InsertSync requires physically placed Buffer IR; fails before analysis/endpoint decoding"
+      },
+      "ctest": {
+        "passed": 1,
+        "name": "pypto_numerical_sync_order_test",
+        "seconds": 0.31,
+        "endpoint_checks": "150 independent nested tuples for both endpoints plus empty-axis conventions, holes, zero strides and malformed/overflow maps"
+      },
+      "scope": "Shared checked record-coordinate arithmetic; existing caller frame/guard/cut qualification and allocation algorithms unchanged",
+      "limitations": "No native/device qualification; arithmetic decoder alone supplies no frame or activity proof"
+    }
+  },
+  "review": {
+    "A": "Accepted before B implementation",
+    "B": "Accepted before C implementation",
+    "C": "Accepted; combined architecture/correctness review passed"
+  },
+  "final_plans": {
+    "matmul_64": {
+      "pto_sha256": "348f53a367bff1ed97ea08874a4d72c1af5c1c6210147958c78f08c486b63f9b",
+      "set_sites": 4,
+      "wait_sites": 4,
+      "barrier_sites": 0
+    },
+    "matmul_acc_64": {
+      "pto_sha256": "db71a1b43d65c040c9009c1e0015c52632309fb541d62caa2d00073049e4d6b8",
+      "set_sites": 10,
+      "wait_sites": 10,
+      "barrier_sites": 0
+    },
+    "ddr_split_k": {
+      "pto_sha256": "12447db32478fbe6b9b49b7e9b7300946aa0730009c7caea90c9026f9bcc9eba",
+      "set_sites": 15,
+      "wait_sites": 15,
+      "barrier_sites": 0
+    },
+    "vec": {
+      "pto_sha256": "e35ef36b5dad84123ed40fbcf66198f784a027e780f5d8976645621c5de7db73",
+      "set_sites": 2,
+      "wait_sites": 2,
+      "barrier_sites": 1
+    },
+    "vec_reset": {
+      "pto_sha256": "a06e367f58c3483e8c2b7a58e6a0b8d6b66838a91d940ab2b1b41ada3fc89c94",
+      "set_sites": 10,
+      "wait_sites": 10,
+      "barrier_sites": 2
+    },
+    "staged": {
+      "pto_sha256": "c14f1b4f6ee3c220b69d95a77851035e548bbf8f52ea17e5a65f6bdaaf0e5c41",
+      "set_sites": 13,
+      "wait_sites": 13,
+      "barrier_sites": 2
+    }
+  },
+  "comparison": "Six retained physical realization plans emit byte-identical PTO to the baseline, without normalization. These internal plans are separate from public terminal-drain tests.",
+  "commands": [
+    "source .claude/skills/testing/load-env.sh",
+    "cmake --build build-py314 --parallel 1",
+    "ctest --test-dir build-py314 --parallel 1 -R '^pypto_numerical_sync_order_test$' --output-on-failure",
+    "export PYTHONPATH=\"$PWD/python:$PWD/tests/ut/ir\" PTOAS_ROOT=\"$PWD/build-py314/architecture-correction/ptoas-launcher\" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1",
+    "python3 -m pytest -q tests/ut/ir/transforms/test_sync_construction_scaling.py tests/ut/ir/transforms/test_token_sync_lowering.py tests/ut/ir/transforms/test_vec_sync_analysis.py tests/ut/ir/transforms/test_compact_sync_analysis.py tests/ut/ir/transforms/test_rotating_sync_analysis.py tests/ut/ir/transforms/test_nested_sync_repetition.py tests/ut/ir/transforms/test_autosync_switch.py tests/ut/ir/transforms/test_scoped_token_families.py tests/ut/ir/transforms/test_scoped_token_order.py tests/ut/ir/transforms/test_scoped_sync_palette.py tests/ut/ir/transforms/test_scoped_palette_realization.py tests/ut/ir/transforms/test_scoped_resource_transitions.py tests/ut/ir/transforms/test_scoped_physical_sync.py tests/ut/ir/transforms/test_physical_sync_realization.py tests/ut/ir/transforms/test_logical_sync_realization.py --require-ptoas",
+    "python3 -m pytest -q tests/ut/ir/transforms/test_vec_sync_analysis.py tests/ut/ir/transforms/test_physical_sync_realization.py tests/ut/ir/transforms/test_token_sync_lowering.py tests/ut/ir/transforms/test_sync_cast_contract.py tests/ut/backend/test_isa_macro_resources.py --require-ptoas",
+    "python3 -m pytest -q tests/ut/codegen/test_buffer_codegen.py tests/ut/codegen/test_buffer_elementwise_codegen.py tests/ut/codegen/test_buffer_view_native_forms.py tests/ut/codegen/test_multi_buffer_codegen.py tests/ut/ir/transforms/test_vec_sync_analysis.py --require-ptoas"
+  ],
+  "checks": {
+    "configured_hooks": "Passed on tracked tree plus exact task-owned changes. Default hook Python3.11 supports pinned torch2.8.0; repository hook revisions/dependencies unchanged.",
+    "final_type_check": "Passed after test-only override parameter-name correction; affected two tests passed again.",
+    "documentation": "English and Chinese architecture plan updated; final Markdown check applied blank-line formatting only."
+  },
+  "logs": {
+    "build-py314/architecture-followups-20261114/gate-b-build.log": "067324716a602557f6b4b9b46cb424225c428331df22c51cbd5de3cfd95298bf",
+    "build-py314/architecture-followups-20261114/gate-b-tests.log": "a83fa4348a58a1f474113992a855ff7cff64472a15854a2fb7ac82759865625d",
+    "build-py314/architecture-followups-20261114/gate-b-codegen.log": "e54688ea2c58b020c42753a91d5621264e0393637d871106166cb45cf5f8f2fe",
+    "build-py314/architecture-followups-20261114/gate-b-final-build.log": "29ca021c0f27027271d2509f173617bf49b37153e68a1b1e6603d346cbff9623",
+    "build-py314/architecture-followups-20261114/gate-b-final-tests.log": "dbaa07491bd94f50fb528a54bfb10db7c44684901baa24d35d4923c4504c02d5",
+    "build-py314/architecture-followups-20261114/hooks.log": "bd07814f39ec06695c63a3ac6bac418537786064bb6d16e7add8c73adb5ee166",
+    "build-py314/architecture-followups-20261114/pyright-final.log": "0b7249c7b442157826036b3870a1681ed1573cbfbaadba18774e2e43275835b8",
+    "build-py314/architecture-followups-20261114/test-typing-recheck.log": "556300c20896095badcee1b18cf0891336c215eaeb2ced301b7d74f64f67bea7"
+  },
+  "limits": [
+    "One inherited small-GEMM Buffer-admission failure precedes synchronization analysis.",
+    "Two pre-existing deprecation warnings in final integration.",
+    "No new native/device qualification or speedup claim.",
+    "No allocation, protocol, hardware exemption, target coverage or token optimizer change.",
+    "Immutable evidence does not add concurrent mutation support for diagnostic/cache state.",
+    "Two stale positive-step error regexes corrected; negative admission checks retained."
+  ]
+}

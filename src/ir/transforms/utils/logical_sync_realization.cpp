@@ -59,13 +59,13 @@ struct Incoming {
 class Realizer : public SyncPlacement {
  public:
   explicit Realizer(const CompactSyncResult& analysis)
-      : SyncPlacement(analysis.input), names_(analysis.input.owner) {
-    CHECK(analysis.input.owner) << "Logical realization requires the original occurrence owner";
+      : SyncPlacement(analysis.State().input), names_(analysis.State().input.owner) {
+    CHECK(analysis.State().input.owner) << "Logical realization requires the original occurrence owner";
     result.name_scan_visits = names_.visits;
     result.name_scan_nodes = names_.Nodes();
-    for (size_t r = 0; r < analysis.input.segments.size(); ++r) {
-      const auto& segment = analysis.input.segments[r];
-      for (const auto& f : analysis.segments[r].demands) {
+    for (size_t r = 0; r < analysis.State().input.segments.size(); ++r) {
+      const auto& segment = analysis.State().input.segments[r];
+      for (const auto& f : analysis.State().segments[r].demands) {
         CHECK(f.distance >= 0) << "Invalid logical token displacement";
         if (segment.count <= f.distance) continue;
         Site source{r, f.source}, target{r, f.target};
@@ -78,13 +78,13 @@ class Realizer : public SyncPlacement {
     for (const auto& [a, b] : *crossings) {
       auto [ar, av, as] = a;
       auto [br, bv, bs] = b;
-      CHECK(ar < br && br < analysis.input.segments.size() && av >= 0 && bv >= 0 &&
-            av < analysis.input.segments[ar].count && bv < analysis.input.segments[br].count)
+      CHECK(ar < br && br < analysis.State().input.segments.size() && av >= 0 && bv >= 0 &&
+            av < analysis.State().input.segments[ar].count && bv < analysis.State().input.segments[br].count)
           << "Crossing token export requires qualified original occurrence coordinates";
       Site source{ar, as};
       auto& retained = sources_[source];
-      if (analysis.input.segments[ar].original_loop) {
-        if (av == analysis.input.segments[ar].count - 1)
+      if (analysis.State().input.segments[ar].original_loop) {
+        if (av == analysis.State().input.segments[ar].count - 1)
           retained.history = std::max<int64_t>(retained.history, 1);
         else
           retained.captures.try_emplace(av);
@@ -237,12 +237,12 @@ class Realizer : public SyncPlacement {
 };
 }  // namespace
 LogicalSyncRealization RealizeCompactSync(const CompactSyncResult& analysis) {
-  if (analysis.input.region_tree) return RealizeScopedLogicalSync(analysis);
-  for (const auto& segment : analysis.input.segments)
+  if (analysis.State().input.region_tree) return RealizeScopedLogicalSync(analysis);
+  for (const auto& segment : analysis.State().input.segments)
     CHECK(segment.nested_frames.empty()) << "Nested repetition requires token transport across every "
                                             "enclosing frame; physical export is available";
   Realizer realizer(analysis);
-  realizer.result.function = realizer.VisitFunction(analysis.input.owner);
+  realizer.result.function = realizer.VisitFunction(analysis.State().input.owner);
   CheckLogicalSync(realizer.result.function);
   return realizer.result;
 }

@@ -476,6 +476,7 @@ set(PYPTO_SOURCES
     src/backend/common/buffer_axis_recipes.cpp
     src/backend/common/buffer_transpose_recipe.cpp
     src/backend/common/buffer_view_semantics.cpp
+    src/backend/common/buffer_sync_contract.cpp
     src/backend/common/pto_ops_common.cpp
     src/backend/common/pto_ops_shared.cpp
     src/backend/common/pto_ops_cast.cpp

@@ -27,6 +27,7 @@
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
 #include "pypto/backend/common/buffer_row_recipes.h"
+#include "pypto/backend/common/buffer_sync_contract.h"
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/core/logging.h"
@@ -747,7 +748,9 @@ class Importer {
   }
   SyncSite Site(const CallPtr& call, const SyncSegment& segment) {
     OpRegistry::GetInstance().ValidateBufferCall(call);
-    SyncSite site{call, nullptr, PipeType::ALL, {}};
+    const auto implementation =
+        backend::SelectBufferSyncImplementation(call, result.owner->func_type_, result.hardware_target);
+    SyncSite site{call, nullptr, implementation.Pipe(), {}};
     // Track modes by operand, not storage: in-place operands can share bytes
     // while retaining different registered read/write modes.
     std::vector<std::pair<bool, bool>> modes(call->args_.size());
@@ -854,8 +857,6 @@ class Importer {
             (load ? local->memory_space_ == MemorySpace::Mat : local->memory_space_ == MemorySpace::Acc))
           << "Only GM/Mat, Acc/GM and GM/Vec DMA contracts are qualified";
       whole(load ? 3 : 0, load);
-      site.pipe =
-          load ? PipeType::MTE2 : (local->memory_space_ == MemorySpace::Vec ? PipeType::MTE3 : PipeType::FIX);
     } else if (IsOp(call, "buffer.copy") || IsOp(call, "buffer.extract")) {
       const bool extract = IsOp(call, "buffer.extract");
       const auto target = extract ? 3 : 1;
@@ -892,29 +893,17 @@ class Importer {
       }
       modes[0].first = true;
       whole(target, true);
-      site.pipe = PipeType::MTE1;
     } else if (IsOp(call, "buffer.matmul") || IsOp(call, "buffer.matmul_acc")) {
       whole(0, false);
       whole(1, false);
       if (IsOp(call, "buffer.matmul_acc")) whole(2, false);
       whole(2, true);
-      site.pipe = PipeType::M;
       // Initialization is an operation effect, independent of native completion
       // protection. Small valid tiles still overwrite rather than read L0C.
       site.initializes_accumulator = IsOp(call, "buffer.matmul");
-      const auto lhs = As<BufferType>(call->args_[0]->GetType());
-      const auto rhs = As<BufferType>(call->args_[1]->GetType());
-      const auto dst = As<BufferType>(call->args_[2]->GetType());
-      // Ascend C Mmad synchronization optimization: consecutive K accumulation
-      // on the same L0C footprint needs no M barrier when floor(M/16)*floor(N/16)
-      // >= 10. Admission already validates full-valid shapes and native layouts.
-      // https://asc.gitcode.com/api/SIMD-API/basic_api/cube_compute_ISASI/mmad_compute/Mmad.html
-      if (result.hardware_target == "a2a3" && lhs && rhs && dst && lhs->memory_space_ == MemorySpace::Left &&
-          rhs->memory_space_ == MemorySpace::Right && dst->memory_space_ == MemorySpace::Acc &&
-          lhs->shape_[0] > 0 && lhs->shape_[0] <= 4095 && lhs->shape_[1] > 0 && lhs->shape_[1] <= 4095 &&
-          rhs->shape_[1] > 0 && rhs->shape_[1] <= 4095 && lhs->shape_[1] == rhs->shape_[0] &&
-          dst->shape_[0] == lhs->shape_[0] && dst->shape_[1] == rhs->shape_[1] &&
-          (lhs->shape_[0] / 16) * (rhs->shape_[1] / 16) >= 10) {
+      // Backend size eligibility does not certify a common physical slot or
+      // absence of interference; those remain analysis obligations.
+      if (implementation.AccumulatorSizeEligible()) {
         CHECK(result.storage[Storage(call->args_[2])].slot_count == 1)
             << "Rotating accumulator protection requires same-physical-slot qualification";
         site.protected_accumulator = Storage(call->args_[2]);
@@ -933,7 +922,6 @@ class Importer {
       }
       whole(0, false);
       whole(1, true);
-      site.pipe = PipeType::V;
     } else if (auto recipe = backend::FindBufferIndexedRecipe(call->op_->name_)) {
       CHECK(result.owner->func_type_ == FunctionType::AIV) << "Indexed synchronization requires an AIV leaf";
       // The shared contract uses in-range physical element offsets into a
@@ -948,7 +936,6 @@ class Importer {
       whole(1, false);
       // TSCATTER clears the entire destination before its indexed writes.
       whole(recipe->input_count, true);
-      site.pipe = PipeType::V;
     } else if (auto recipe = backend::FindBufferRowRecipe(call->op_->name_)) {
       CHECK(result.owner->func_type_ == FunctionType::AIV) << "Row synchronization requires an AIV leaf";
       whole(0, false);
@@ -961,7 +948,6 @@ class Importer {
         whole(1, false);
       }
       whole(2, true);
-      site.pipe = PipeType::V;
     } else if (auto recipe = backend::FindBufferElementwiseRecipe(call->op_->name_)) {
       CHECK(result.owner->func_type_ == FunctionType::AIV) << "Vec synchronization requires an AIV leaf";
       for (size_t arg = 0; arg < recipe->inputs.size(); ++arg) {
@@ -973,15 +959,9 @@ class Importer {
         }
       }
       whole(recipe->inputs.size(), true);
-      site.pipe = PipeType::V;
     } else {
       CHECK(false) << "Unavailable instruction contract in synchronization import: " << call->op_->name_;
     }
-    const bool vector = result.owner->func_type_ == FunctionType::AIV;
-    CHECK(vector ? (site.pipe == PipeType::MTE2 || site.pipe == PipeType::MTE3 || site.pipe == PipeType::V)
-                 : (site.pipe == PipeType::MTE2 || site.pipe == PipeType::MTE1 || site.pipe == PipeType::M ||
-                    site.pipe == PipeType::FIX))
-        << "Payload pipe is unavailable on the owning synchronization core";
     // Geometry above qualifies one explicit payload contract. Validate its
     // data modes against the registry rather than guessing other op effects.
     for (size_t arg = 0; arg < call->args_.size(); ++arg) {

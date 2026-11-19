@@ -21,11 +21,11 @@ namespace pypto::ir::sync {
 // Qualified finite phase specialization inside the numerical regional service.
 // Owners retain original source identities; only a finite microbody is sampled
 // under proved modular phases. No repeated invocation domain is unfolded.
-void PlanNumericalPhases(const SyncRegion& source, CompactSyncResult& result,
+void PlanNumericalPhases(const SyncRegion& source, CompactSyncBuilder& result,
                          NumericalSyncHierarchy& hierarchy);
-void BuildNumericalPhaseCells(CompactSyncResult& result, NumericalSyncHierarchy& hierarchy);
+void BuildNumericalPhaseCells(CompactSyncBuilder& result, NumericalSyncHierarchy& hierarchy);
 std::map<size_t, std::shared_ptr<const NumericalNode>> BuildNumericalPhaseProviders(
-    CompactSyncResult& result, NumericalSyncHierarchy& hierarchy);
+    CompactSyncBuilder& result, NumericalSyncHierarchy& hierarchy);
 }  // namespace pypto::ir::sync
 
 #endif  // SRC_IR_TRANSFORMS_UTILS_NUMERICAL_SYNC_PHASE_H_

@@ -273,17 +273,10 @@ class ScopedTokenOrder::State {
     return true;
   }
   Occurrence FamilyOccurrence(const PhysicalSyncFamily& f, int64_t record, bool target) const {
-    CHECK(record >= 0 && record < f.count) << "Scoped token record is outside its family";
-    Ordinal visit = target ? f.target_first : f.source_first;
-    for (size_t i = f.axes.size(); i-- > 0;) {
-      visit = NumericalAdd(visit, Product(target ? f.axes[i].target_stride : f.axes[i].source_stride,
-                                          record % f.axes[i].count));
-      record /= f.axes[i].count;
-    }
-    CHECK(!record && visit <= std::numeric_limits<int64_t>::max())
-        << "Scoped token family record has incompatible coordinates";
-    return {target ? f.target_region : f.source_region, static_cast<int64_t>(visit),
-            target ? f.target_site : f.source_site};
+    const auto occurrence = DecodeSyncFamilyEndpoint(
+        f, record, target ? SyncEndpointKind::Target : SyncEndpointKind::Source, SyncEmptyAxes::Singleton);
+    CHECK(occurrence) << "Scoped token family record has incompatible coordinates";
+    return *occurrence;
   }
   int64_t FirstSourceAtOrAfter(const PhysicalSyncFamily& edge, Ordinal position) const {
     int64_t lo = 0, hi = edge.count;

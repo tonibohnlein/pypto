@@ -13,6 +13,7 @@
 #define SRC_IR_TRANSFORMS_UTILS_PHYSICAL_SYNC_ALLOCATION_H_
 
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -75,6 +76,52 @@ FunctionPtr EmitAssignedSyncCases(const FunctionPtr& owner, const SyncParameterB
 // Publish only an established complete physical owner (literal SET and WAIT),
 // or an explicit delegation outcome. This does not qualify or allocate a plan.
 FunctionPtr SyncOutcome(const FunctionPtr& function, bool pypto, const std::string& reason);
+
+enum class SyncEndpointKind { Source, Target };
+enum class SyncEmptyAxes { ContiguousVisits, Singleton };
+
+// Decode a logical record, never a physical ID, into the original occurrence
+// namespace. Flat families with no axes advance consecutive visits; a scoped
+// Cartesian family with no axes has one record. Callers must name that convention
+// rather than silently interpreting missing scoped coordinates as flat visits.
+// This is only checked arithmetic: existing providers still qualify the frames,
+// guards, endpoint bounds and cuts. Nullopt is unavailable, never occurrence zero.
+// Work is O(axis count), independent of trip counts and record ordinal.
+inline std::optional<Occurrence> DecodeSyncFamilyEndpoint(const PhysicalSyncFamily& family, int64_t ordinal,
+                                                          SyncEndpointKind endpoint,
+                                                          SyncEmptyAxes empty_axes) {
+  if (family.count <= 0 || ordinal < 0 || ordinal >= family.count ||
+      (endpoint != SyncEndpointKind::Source && endpoint != SyncEndpointKind::Target) ||
+      (empty_axes != SyncEmptyAxes::ContiguousVisits && empty_axes != SyncEmptyAxes::Singleton))
+    return std::nullopt;
+  const bool source = endpoint == SyncEndpointKind::Source;
+  __int128 visit = source ? family.source_first : family.target_first;
+  if (visit < 0) return std::nullopt;
+  constexpr auto maximum = std::numeric_limits<int64_t>::max();
+  if (family.axes.empty()) {
+    if (empty_axes == SyncEmptyAxes::Singleton && family.count != 1) return std::nullopt;
+    visit += ordinal;
+    if (visit > maximum) return std::nullopt;
+  } else {
+    __int128 volume = 1;
+    for (const auto& axis : family.axes) {
+      if (axis.count <= 0 || axis.source_stride < 0 || axis.target_stride < 0) return std::nullopt;
+      // Cap every intermediate product: even a very deep malformed map cannot
+      // overflow int128 before the final family-count comparison.
+      volume *= axis.count;
+      if (volume > maximum) return std::nullopt;
+    }
+    if (volume != family.count) return std::nullopt;
+    for (auto axis = family.axes.rbegin(); axis != family.axes.rend(); ++axis) {
+      visit += __int128(ordinal % axis->count) * (source ? axis->source_stride : axis->target_stride);
+      if (visit > maximum) return std::nullopt;
+      ordinal /= axis->count;
+    }
+    if (ordinal) return std::nullopt;
+  }
+  return Occurrence{source ? family.source_region : family.target_region, static_cast<int64_t>(visit),
+                    source ? family.source_site : family.target_site};
+}
 
 // Read the already-qualified endpoint pipe pair; no access recovery or policy selection.
 SyncDirection SyncFamilyPipes(const CompactSyncInput& input, const PhysicalSyncFamily& family);

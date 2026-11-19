@@ -459,5 +459,39 @@ def test_static_stage_membership_work_is_indexed(stages):
         validate(function, analysis)
 
 
+def test_broad_buffer_emission_does_not_imply_sync_variant_admission():
+    # Vec TMOV is an existing emission form, but the sync contract admits only
+    # Mat->Left/Right movement. Centralizing names must not conflate the two.
+    class Copy(ir.IRMutator):
+        def visit_call(self, op):
+            if op.op.name == ir.get_op("buffer.abs").name:
+                return ir.Call(ir.get_op("buffer.copy"), op.args, op.type, op.span)
+            return op
+
+    original = Copy().visit_function(vec_fixture(operation="buffer.abs"))
+    text = codegen.PTOCodegen().generate(ir.Program([original], "VecCopy", original.span))
+    assert "pto.tmov" in text
+    with pytest.raises(ValueError, match="Only Mat to operand-buffer"):
+        testing.analyze_placed_sync(original, True)
+    delegated = apply_hybrid([original])[original.name]
+    assert not dict(delegated.attrs)[PYPTO_AUTOSYNC_ATTR]
+    ir.assert_structural_equal(original.body, delegated.body)
+
+
+def test_native_variant_qualification_preserves_core_ownership():
+    original = vec_fixture()
+    wrong_core = ir.Function(
+        original.name,
+        original.params,
+        original.return_types,
+        original.body,
+        original.span,
+        ir.FunctionType.AIC,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    with pytest.raises(ValueError, match="owning synchronization core"):
+        testing.analyze_placed_sync(wrong_core, True)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

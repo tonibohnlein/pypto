@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/buffer_sync_contract.h"
 #include "pypto/core/any_cast.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/op_registry.h"
@@ -141,6 +142,7 @@ class FiniteLowering {
     }
   }
   PhysicalSyncRealization Run() {
+    scalar_native_order_ = backend::RequireLocalSyncExecutionContract(target_).scalar_prefix_serialized;
     Read(function_->body_);
     auto reservations = SyncNativeClaims(input_, target_);
     for (const auto& [direction, ids] : reservations)
@@ -218,6 +220,7 @@ class FiniteLowering {
   std::map<const Stmt*, StmtPtr> barriers_;
   PhysicalSyncRealization result_;
   bool returned_ = false;
+  bool scalar_native_order_ = false;
 
   Token Value(const ExprPtr& expression) {
     const auto cached = values_.find(expression.get());
@@ -293,9 +296,10 @@ class FiniteLowering {
           // A hardware barrier completes the entire destination prefix. It
           // implements this token wait exactly only if no later payload was
           // issued on that pipe, except the natively serial scalar pipeline.
-          CHECK(destination == PipeType::S || record.payload == payloads_[destination])
+          CHECK((destination == PipeType::S && scalar_native_order_) ||
+                record.payload == payloads_[destination])
               << "LowerSync same-pipe barrier would strengthen the recorded prefix";
-          if (destination == PipeType::S || !payloads_[destination]) return;
+          if ((destination == PipeType::S && scalar_native_order_) || !payloads_[destination]) return;
           CHECK(destination == PipeType::M || destination == PipeType::V)
               << "LowerSync same-pipe barrier mechanism is unavailable";
           const auto barrier = OpRegistry::GetInstance().Create(
@@ -312,7 +316,7 @@ class FiniteLowering {
         Row start = starts_[pipe];
         Join(start, gates_[pipe]);
         // This is the shared target's qualified scalar order, not a barrier.
-        if (pipe == PipeType::S) Join(start, completions_[pipe]);
+        if (pipe == PipeType::S && scalar_native_order_) Join(start, completions_[pipe]);
         starts_[pipe] = start;
         Join(completions_[pipe], start);
         ++payloads_[pipe];

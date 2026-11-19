@@ -48,11 +48,12 @@ using ir::sync::physical::ShareCommandGuards;
 PhysicalSyncRealization RealizeDemandPlan(const CompactSyncResult& analysis, const std::string& target,
                                           const std::optional<std::vector<int>>& eligible_ids,
                                           const SyncSchedulePolicy& policy) {
-  CHECK(analysis.input.hardware_target == target)
+  CHECK(analysis.State().input.hardware_target == target)
       << "Synchronization hardware contract differs from lowering target";
   auto logical = RealizeCompactSync(analysis);
-  auto lowered = LowerLogicalSync(OptimizeLogicalSync(logical.function), target, eligible_ids,
-                                  analysis.input.parameter_bounds, analysis.input.block_bounds, policy);
+  auto lowered =
+      LowerLogicalSync(OptimizeLogicalSync(logical.function), target, eligible_ids,
+                       analysis.State().input.parameter_bounds, analysis.State().input.block_bounds, policy);
   CHECK(lowered.physical_cases.size() == 1)
       << "Single-region test realization needs one physical case; use the invocation adapter";
   auto result = std::move(lowered.physical_cases.front());
@@ -63,7 +64,7 @@ DemandInvocation RealizeDemandInvocation(const SyncInvocationAnalysis& analysis,
                                          const std::optional<std::vector<int>>& eligible_ids,
                                          const SyncSchedulePolicy& policy) {
   for (const auto& item : analysis.cases)
-    CHECK(item.mathematics && item.mathematics->input.hardware_target == target)
+    CHECK(item.mathematics && item.mathematics->State().input.hardware_target == target)
         << "Synchronization hardware contract differs from lowering target";
   auto logical = RealizeLogicalInvocation(analysis);
   auto lowered = LowerLogicalSync(OptimizeLogicalSync(logical.function), target, eligible_ids,

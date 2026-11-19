@@ -20,7 +20,7 @@
 #include <utility>
 #include <vector>
 
-#include "pypto/ir/transforms/utils/compact_sync_analysis.h"
+#include "src/ir/transforms/utils/compact_sync_builder.h"
 namespace pypto::ir::sync {
 using NumericalOrdinal = __int128;
 constexpr size_t kNumericalChains = 2 * kPipeCount;
@@ -123,7 +123,7 @@ NumericalBoundary MergeNumericalBoundary(const NumericalBoundary& a, const Numer
 std::set<NumericalEvent> NumericalPorts(const NumericalNode& node, size_t& visits);
 void IndexNumericalPositions(NumericalNode& node);
 void InvertNumericalRows(NumericalNode& node);
-void CountNumericalInterface(const NumericalNode& node, CompactSyncResult& result);
+void CountNumericalInterface(const NumericalNode& node, CompactSyncBuilder& result);
 // Order-only service: supplied child order, complete parent ports and explicit
 // crossing edges. It performs no access recovery, storage bridging or reduction.
 // Children have sorted original-event chains and exact monotone forward/reverse
@@ -147,6 +147,6 @@ bool QueryNumericalOrder(const NumericalOrderQuery& query, const std::shared_ptr
                          bool target_completion);
 std::shared_ptr<const NumericalNode> MergeNumericalNodes(std::shared_ptr<const NumericalNode> a,
                                                          std::shared_ptr<const NumericalNode> b,
-                                                         CompactSyncResult& result);
+                                                         CompactSyncBuilder& result);
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_NUMERICAL_SYNC_MERGE_H_

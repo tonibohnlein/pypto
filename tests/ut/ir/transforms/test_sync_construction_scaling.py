@@ -169,3 +169,21 @@ def test_interior_crossing_ports_and_empty_middle_region(count):
         ir_stage=function.ir_stage,
     )
     validate(from_function, testing.analyze_placed_sync(from_function, True))
+
+
+def test_unavailable_scoped_export_is_memoized_without_losing_local_queries():
+    original = scaling_fixture(4)
+    retained = testing.analyze_placed_sync(original, True)
+    checked = validate(original, retained)
+    before = retained.describe()
+    pairs = retained.expand_retained_demands(checked["payloads"])
+    # A flat result has no original structured source tree. Missing capability
+    # is not an empty family list, and repeated requests must not reconstruct it.
+    assert retained.export_scoped_demands() is None
+    assert retained.export_scoped_demands() is None
+    after = retained.describe()
+    assert after.pop("scoped_export_attempts") == 1
+    assert before.pop("scoped_export_attempts") == 0
+    assert after == before
+    assert retained.expand_retained_demands(checked["payloads"]) == pairs
+    validate(original, retained)
