@@ -73,11 +73,6 @@ inline int64_t EvalConstTripCount(const ir::ForStmtPtr& for_stmt) {
   return ir::transform_utils::EvalConstTripCount(for_stmt).value_or(0);
 }
 
-/// Compute total GM-pipe workspace elements required by a root orchestration
-/// function by walking reachable statements/callees and summing
-/// ``initialize_pipe`` slot_count * slot_size.
-int64_t ComputeGMPipeWorkspaceElements(const ir::ProgramPtr& program, const ir::FunctionPtr& root_func);
-
 // ---------------------------------------------------------------------------
 // Supporting types
 // ---------------------------------------------------------------------------

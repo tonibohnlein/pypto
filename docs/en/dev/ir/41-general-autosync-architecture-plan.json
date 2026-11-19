@@ -88,7 +88,7 @@
     "fresh_whole_qwen_capture": false,
     "device": false
   },
-  "next_gate": "Implement reviewed designs50/51 with reviewer gates; preserve all original M1-M6 and explicit missing mixed-valid/native/caller premises.",
+  "next_gate": "This bounded worktree batch is closed; original remaining native/coverage milestones require separate continuation.",
   "latest_checkpoint": {
     "date": "2026-11-16",
     "source_parent": "30864da6221d781b3e4ba77a494d2a5b5b8fcd02",
@@ -99,9 +99,11 @@
       "46-autosync-acc-row-trim.json",
       "47-autosync-gm-scalar-write-staging.json",
       "48-autosync-vector-identity-reshape.json",
-      "49-autosync-statement-rewrite.json"
+      "49-autosync-statement-rewrite.json",
+      "50-autosync-verifier-expression-dag.json",
+      "51-autosync-existing-transport-capsules.json"
     ],
-    "review_status": "47-49 source and final report accepted; 4259 broad tests,128 posthook focused,3CTests,all hooks and final capture/audit pass",
+    "review_status": "50-51 source, scoped tests, hooks and final receipts accepted",
     "whole_model": {
       "cpp_leaves": 32,
       "prefix_owned": 21,
@@ -118,7 +120,7 @@
     ],
     "scope": "Original M1-M6 retained; repairs extend them; no new cross-core/inter-kernel protocol",
     "all_original_milestones_complete": false,
-    "final_verification": "build-py314/review-repairs-20261116/final-accepted-verification.json"
+    "final_verification": "build-py314/review-repairs-20261116/closed-changes-evidence.json"
   },
   "historical_field_scope": "compiler_revision, source_sha256, historical_evidence, draft, review and validation preserve the original architecture-plan audit; they are not a current build or test claim. latest_checkpoint and its linked receipts identify current implementation and dirty-source evidence.",
   "historical_next_gate": "M1 shared qualification and domain ownership; refresh existing pinned capture",
@@ -280,5 +282,20 @@
     ],
     "all_original_milestones_complete": false,
     "task_domain_report": "41-general-autosync-task-domains.json"
+  },
+  "bounded_worktree_closure_20261116": {
+    "reports": [
+      "50-autosync-verifier-expression-dag.json",
+      "51-autosync-existing-transport-capsules.json"
+    ],
+    "source_review": "accepted",
+    "final_hooks_and_receipt_review": "accepted",
+    "owner_counts": {
+      "verified_pypto_leaf": 21,
+      "task_control_owner_observed": 47,
+      "delegated": 11
+    },
+    "cpp_byte_identical": 32,
+    "all_original_milestones_complete": false
   }
 }

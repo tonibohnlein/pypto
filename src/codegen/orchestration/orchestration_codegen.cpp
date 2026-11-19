@@ -451,12 +451,13 @@ static std::vector<uint64_t> pypto_graph_boundary_layout(const GraphTaskArgs& ar
   return oss.str();
 }
 
-OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const ir::FunctionPtr& func) {
+OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const ir::FunctionPtr& func,
+                                          std::shared_ptr<gm_pipe::LayoutEvidence> layout) {
   CHECK(program != nullptr) << "Cannot generate orchestration for null program";
   CHECK(func != nullptr) << "Cannot generate orchestration for null function";
   VerifyOrchestrationCodegenPreconditions(program, func);
 
-  KernelRegistrations registrations;
+  KernelRegistrations registrations(std::move(layout));
   registrations.RecordTaskDomain(func);
 
   OrchestrationInfoCollector info_collector;

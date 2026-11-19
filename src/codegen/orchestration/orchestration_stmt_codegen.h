@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -27,6 +28,7 @@
 
 #include "pypto/codegen/code_emitter.h"
 #include "pypto/codegen/codegen_base.h"
+#include "pypto/codegen/gm_pipe_layout_evidence.h"
 #include "pypto/codegen/orchestration/orchestration_analysis.h"
 #include "pypto/codegen/orchestration/orchestration_codegen.h"
 #include "pypto/core/dtype.h"
@@ -51,16 +53,21 @@ std::string GraphFunctionSymbol(const std::string& func_name);
 // while code_name identifies the binary compiled once for all registrations.
 class KernelRegistrations {
  public:
+  explicit KernelRegistrations(std::shared_ptr<gm_pipe::LayoutEvidence> layout = nullptr)
+      : gm_pipe_layout_(std::move(layout)) {}
   int GetOrCreate(const std::string& name, ir::CoreType core_type, std::vector<std::string> signature);
 
   // The same dispatch owner records only domains it actually lowers. A failed
   // generation publishes no OrchestrationResult and therefore no such evidence.
   void RecordTaskDomain(const ir::FunctionPtr& function);
+  gm_pipe::LayoutEvidence& GMPipeLayout(const ir::ProgramPtr& program);
   std::map<std::string, ir::FunctionType> task_domains;
   std::vector<KernelRegistration> entries;
 
  private:
   std::map<std::tuple<std::string, ir::CoreType, std::vector<std::string>>, int> ids_;
+  // One source-fact owner shared by entry and Graph emitters in this generation.
+  std::shared_ptr<gm_pipe::LayoutEvidence> gm_pipe_layout_;
 };
 
 // Private statement visitor shared by entry and Graph emission. Implementations
@@ -718,7 +725,6 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::unordered_set<const ir::Stmt*> batched_create_stmts_;
   std::unordered_set<const ir::Var*> effective_uses_;
   ir::alloc_batching::GMPipeConsumerIndex gm_pipe_consumers_;
-  std::unordered_map<std::string, int64_t> gm_pipe_workspace_elements_by_callee_;
   std::unordered_map<std::string, std::string> tensor_create_size_expr_by_emit_name_;
   std::unordered_map<std::string, std::string> dist_param_to_ctx_param_;
   /// Memoizes ``ExplicitReturnedParamIndices`` per callee Function. Tuple/submit

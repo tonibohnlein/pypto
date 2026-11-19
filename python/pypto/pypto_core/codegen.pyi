@@ -9,11 +9,33 @@
 # pylint: disable=unused-argument
 """Code generation module for converting IR to PTO assembly (PTOCodegen)."""
 
+from typing import Any
+
 from pypto.pypto_core import DataType
-from pypto.pypto_core.ir import CoreType, Expr, Function, FunctionType, Program, Var
+from pypto.pypto_core.ir import CoreType, Expr, Function, FunctionType, Program, Stmt, Var
 
 def data_type_to_mlir(dtype: DataType) -> str:
     """Return the PTO MLIR spelling of an element data type."""
+
+class GMPipeWorkspaceContext:
+    """Factory-owned original-root workspace proof; not serializable metadata."""
+
+    @property
+    def bytes(self) -> int: ...
+    @property
+    def elements(self) -> int: ...
+    @property
+    def offsets(self) -> dict[tuple[int, int], int]: ...
+
+class GMPipeLayoutEvidence:
+    """Shared immutable source index and request-local layout/context memo."""
+
+    def __init__(self, program: Program) -> None: ...
+    def layout(self, root: Function | None = None) -> dict[str, Any]: ...
+    def work(self) -> dict[str, int]: ...
+    def has_setup(self, function: Function, cut: Stmt) -> bool: ...
+    def bind_root(self, root: Function) -> GMPipeWorkspaceContext:
+        """Bind original workspace forwarding, or refuse without publishing a context."""
 
 class VFHelper:
     """No-Bridge VF/SIMT helper and adapter with ordered storage effects."""
@@ -68,7 +90,11 @@ class PTOCodegen:
         """Create a new PTO code generator."""
 
     def generate_bundle(
-        self, program: Program, emit_tile_addr: bool = True, emit_source_loc: bool = True
+        self,
+        program: Program,
+        emit_tile_addr: bool = True,
+        emit_source_loc: bool = True,
+        workspace: GMPipeWorkspaceContext | None = None,
     ) -> PTOCodegenBundle:
         """Generate an EmitC caller and separate typed-VMI helpers for A5/AIV."""
 
@@ -77,6 +103,7 @@ class PTOCodegen:
         program: Program,
         emit_tile_addr: bool = True,
         emit_source_loc: bool = True,
+        workspace: GMPipeWorkspaceContext | None = None,
     ) -> str:
         """Generate PTO assembly from PyPTO IR Program.
 
@@ -183,7 +210,9 @@ class DistributedCodegen:
         """Return builtin ``next_levels`` variants referenced by the generated host orchestration."""
         ...
 
-def generate_orchestration(program: Program, func: Function) -> OrchestrationResult:
+def generate_orchestration(
+    program: Program, func: Function, layout: GMPipeLayoutEvidence | None = None
+) -> OrchestrationResult:
     """Generate C++ orchestration code for a function.
 
     Uses simpler runtime API. This is backend-agnostic.

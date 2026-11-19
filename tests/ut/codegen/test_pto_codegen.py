@@ -19,6 +19,8 @@ Tests verify:
 - SSA form with correct variable naming
 """
 
+import hashlib
+import json
 import math
 import re
 import shutil
@@ -2882,12 +2884,24 @@ AICORE void split_vec() {
         assert split_vec is not None
         assert _uses_dynamic_subblock_id(split_vec) is True
 
-        monkeypatch.setattr(
-            "pypto.backend.pto_backend._compile_pto_module",
-            lambda _pto_code, _module_name, _output_dir, _memory_planner=None: (
-                SAMPLE_GROUPED_SPLIT_PTOAS_OUTPUT
-            ),
-        )
+        def compile_group(
+            pto_code,
+            unit_name,
+            output_dir,
+            memory_planner=passes.MemoryPlanner.PYPTO,
+            dump_ptoas_passes=False,
+            sync_ownership=None,
+        ):
+            # Match the current compiler API explicitly; this wrapper-only
+            # fixture still exercises an unowned ordinary compile, without a
+            # debug rebuild or an autosync ownership certificate.
+            assert pto_code == "unused grouped pto" and unit_name == "mixed_group"
+            assert output_dir == str(tmp_path)
+            assert memory_planner == passes.MemoryPlanner.PYPTO
+            assert dump_ptoas_passes is False and sync_ownership is None
+            return SAMPLE_GROUPED_SPLIT_PTOAS_OUTPUT
+
+        monkeypatch.setattr("pypto.backend.pto_backend._compile_pto_module", compile_group)
 
         result_files = {}
         _emit_group_output(
@@ -3162,11 +3176,16 @@ class TestGenerateSkipPtoas:
 
         result = generate(transformed_program, str(tmp_path), skip_ptoas=True)
 
-        kernel_keys = [k for k in result if k.startswith("kernels/")]
-        assert len(kernel_keys) > 0, "Expected at least one kernel file"
-        for key in kernel_keys:
-            assert key.endswith(".pto"), f"Expected .pto extension, got: {key}"
-            assert not key.endswith(".cpp"), f"Unexpected .cpp extension: {key}"
+        kernel_keys = {key for key in result if key.startswith("kernels/")}
+        sources = {key for key in kernel_keys if key.endswith(".pto")}
+        assert sources, "Expected at least one PTO source"
+        # Raw PTO now carries source-associated ownership metadata. Keep the
+        # no-C++ assertion and verify each auxiliary file names these bytes.
+        manifests = {key.removesuffix(".pto") + ".sync.json" for key in sources}
+        assert kernel_keys == sources | manifests
+        for key in sources:
+            manifest = json.loads(result[key.removesuffix(".pto") + ".sync.json"])
+            assert manifest["source_sha256"] == hashlib.sha256(result[key].encode()).hexdigest()
 
 
 def test_compile_writes_orchestration_on_partial_codegen_failure(tmp_path, monkeypatch):
@@ -4608,7 +4627,7 @@ def test_gm_slot_buffer_regions_do_not_overlap_across_pipes():
     """A second frontend pipe starts past the first pipe's FULL footprint.
 
     PrepareGMSlotBufferLayout must advance by rings * slots * slot_size, the same rule
-    ComputeGMPipeWorkspaceElements uses to size the workspace. Pipe 0 here is bidirectional
+    the shared original-root layout uses to size the workspace. Pipe 0 here is bidirectional
     (two rings) *and* carries an explicit slot_num, so a layout that counted one ring, or
     that ignored slot_num, hands pipe 1 an addptr pointing inside pipe 0's region.
     """

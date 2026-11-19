@@ -2619,20 +2619,23 @@ def _generate_pto_bundle(
     memory_planner: _passes.MemoryPlanner,
     emit_source_loc: bool,
     is_group: bool = False,
+    workspace: _codegen_core.GMPipeWorkspaceContext | None = None,
 ) -> tuple[str, tuple[_codegen_core.VFHelper, ...], dict[str, list[str]]]:
     """Retain combined diagnostic output; execution consumes structured artifacts."""
     generator = _codegen_core.PTOCodegen()
     emit_tile_addr = memory_planner != _passes.MemoryPlanner.PTOAS
     if skip_ptoas:
         return (
-            generator.generate(program, emit_tile_addr=emit_tile_addr, emit_source_loc=emit_source_loc),
+            generator.generate(
+                program, emit_tile_addr=emit_tile_addr, emit_source_loc=emit_source_loc, workspace=workspace
+            ),
             (),
             {},
         )
     if uses_native_fp4_mx(program):
         check_native_fp4_mx_support()
     bundle = generator.generate_bundle(
-        program, emit_tile_addr=emit_tile_addr, emit_source_loc=emit_source_loc
+        program, emit_tile_addr=emit_tile_addr, emit_source_loc=emit_source_loc, workspace=workspace
     )
     if bundle.helpers:
         entries = [f for f in program.functions.values() if _ir_core.is_incore_type(f.func_type)]
@@ -2853,6 +2856,13 @@ def _generate_single_chip(
     _validate_external_bridge_runtime(transformed_program, runtime)
 
     groups, ungrouped = _build_group_mapping(transformed_program)
+    # The actual launch root owns both allocation bytes and native offsets.
+    # Reduced PTO modules retain original Function identity, not a new layout.
+    gm_layout = (
+        _codegen_core.GMPipeLayoutEvidence(transformed_program)
+        if _backend_core.get_handler().requires_gm_pipe_buffer()
+        else None
+    )
 
     # Builtin-template kernels are generated from a template rather than by
     # PyPTO codegen, so they are skipped in the same places external kernels are
@@ -2906,6 +2916,8 @@ def _generate_single_chip(
                         f"(DSL members: {dsl}). A group must be all-external or all-DSL."
                     )
                 continue
+            group_root = transformed_program.get_function(group_name)
+            assert group_root is not None
             grouped_program = _ir_core.Program(
                 _with_device_helpers(members, transformed_program), group_name, transformed_program.span
             )
@@ -2917,6 +2929,7 @@ def _generate_single_chip(
                 memory_planner=memory_planner,
                 emit_source_loc=emit_source_loc,
                 is_group=True,
+                workspace=gm_layout.bind_root(group_root) if gm_layout is not None else None,
             )
             ir_record.end = time.perf_counter()
             stage.children.append(ir_record)
@@ -2966,6 +2979,7 @@ def _generate_single_chip(
                 skip_ptoas=skip_ptoas,
                 memory_planner=memory_planner,
                 emit_source_loc=emit_source_loc,
+                workspace=gm_layout.bind_root(func) if gm_layout is not None else None,
             )
             ir_record.end = time.perf_counter()
             stage.children.append(ir_record)
@@ -3019,7 +3033,9 @@ def _generate_single_chip(
                     "The compiled .o files are retained; runtime execution is unsupported."
                 )
             with _profiling_stage(prof, "orchestration_codegen"):
-                orch_result = _codegen_core.generate_orchestration(transformed_program, orch_func)
+                orch_result = _codegen_core.generate_orchestration(
+                    transformed_program, orch_func, layout=gm_layout
+                )
             task_domains = orch_result.task_domains
             task_artifact = f"orchestration/{orch_func.name}.cpp"
             result_files[f"orchestration/{orch_func.name}.cpp"] = (
