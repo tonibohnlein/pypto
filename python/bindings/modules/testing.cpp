@@ -412,7 +412,7 @@ void ValidateBufferOpContractForTesting(
     entry.set_buffer_result_behavior(index, behavior, alias_arg);
   }
   entry.ValidateIRStage();
-  entry.ValidateCall(args, result_type, ir::Span::unknown());
+  entry.ValidateCall(args, result_type, ir::Span::unknown(), {});
 }
 
 /// Exercise typing-mode registration failures without modifying the singleton.

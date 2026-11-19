@@ -795,6 +795,10 @@ class Importer {
     };
     if (IsOp(call, "buffer.load") || IsOp(call, "buffer.store")) {
       const bool load = IsOp(call, "buffer.load");
+      const auto gm_arg = load ? 0 : 3;
+      const auto gm_mode = operation.ArgumentEffects()[gm_arg].data;
+      const bool gm_read = gm_mode == BufferAccess::Read || gm_mode == BufferAccess::ReadWrite;
+      const bool gm_write = gm_mode == BufferAccess::Write || gm_mode == BufferAccess::ReadWrite;
       auto offsets = As<MakeTuple>(call->args_[1]), shape = As<MakeTuple>(call->args_[2]);
       CHECK(offsets && shape && offsets->elements_.size() == 2 && shape->elements_.size() == 2)
           << "Synchronization DMA requires a rank-two rectangle";
@@ -832,7 +836,7 @@ class Importer {
         }
         if (!row || !column || moving.size() > 1) {
           CHECK(storage.space == MemorySpace::DDR) << "External coordinate needs a global storage domain";
-          SyncAccess access{id, !load, 0, 0, 0, 0, rows, columns};
+          SyncAccess access{id, gm_write, 0, 0, 0, 0, rows, columns};
           access.external = coordinates.External(row_root, column_root, storage, rows, columns);
           site.accesses.push_back(std::move(access));
         } else {
@@ -848,11 +852,18 @@ class Importer {
                 << "GM accesses need a common invocation translation; parameter-dependent overlap is "
                    "unproved";
           }
-          site.accesses.push_back(Access(id, !load, *row, *column, rows, columns, segment));
+          site.accesses.push_back(Access(id, gm_write, *row, *column, rows, columns, segment));
+        }
+        if (gm_read && gm_write) {
+          // Atomic accumulation reads and writes exactly the same GM window.
+          // Both effects belong to this occurrence; no new storage root or
+          // cross-worker ordering is inferred from the atomic mode.
+          auto write = site.accesses.back();
+          site.accesses.back().write = false;
+          site.accesses.push_back(std::move(write));
         }
       }
-      const auto gm_arg = load ? 0 : 3;
-      (load ? modes[gm_arg].first : modes[gm_arg].second) = true;
+      modes[gm_arg] = {gm_read, gm_write};
       const auto local = As<BufferType>(call->args_[load ? 3 : 0]->GetType());
       CHECK(local && local->shape_[0] == Constant(shape->elements_[0]) &&
             local->shape_[1] == Constant(shape->elements_[1]))

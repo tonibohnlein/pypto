@@ -823,8 +823,18 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
     const std::string buffer_operand = GetExprAsCode(buffer) + " : " + GetExprTypeAnnotation(buffer);
     const std::string tensor_operand = partition + " : " + partition_type;
     const std::string operation = backend::BufferNativeOperation(call);
+    std::string attributes;
+    if (!load && call->GetKwarg<int>("atomic", 0) != 0) {
+      const auto source = As<ir::BufferType>(buffer->GetType());
+      CHECK_SPAN(GetBackendHandler()->GetPtoTargetArch() == "a2a3" && source &&
+                     backend::SupportsBufferStoreMode(call->GetKwarg<int>("atomic", 0), source->memory_space_,
+                                                      source->dtype_, type->dtype_),
+                 call->span_)
+          << "Atomic store requires the qualified A2/A3 FP32 Acc writeback";
+      attributes = " {atomicType = #pto<atomic_type atomic_add>}";
+    }
     Emit(load ? operation + " ins(" + tensor_operand + ") outs(" + buffer_operand + ")"
-              : operation + " ins(" + buffer_operand + ") outs(" + tensor_operand + ")");
+              : operation + " ins(" + buffer_operand + ") outs(" + tensor_operand + ")" + attributes);
     backend::pto_ops_detail::EndNonEmptyRegion(guarded, *this);
   } else if (const auto* indexed = backend::FindBufferIndexedRecipe(call->op_->name_)) {
     if (indexed->compare) {

@@ -1,0 +1,26 @@
+{
+  "source_revision": "5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f",
+  "method": "Pinned source audit plus documented native configuration semantics; no CCEC/device validation.",
+  "files": [
+    {
+      "path": "include/pto/npu/a2a3/TStore.hpp",
+      "sha": "2c10e91a3ec26db5d4cba31b3b51a1563f2aeb7a",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TStore.hpp"
+    },
+    {
+      "path": "include/pto/common/arch/memory/tstore_common.hpp",
+      "sha": "09cc3043d589df29200aaaecda54db601b860185",
+      "url": "https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/common/arch/memory/tstore_common.hpp"
+    }
+  ],
+  "scope": "Default A2/A3 two-operand FP32 Acc to FP32 packed ND GM; no pre-quantization, pre-ReLU, nondefault phase/cache.",
+  "findings": [
+    "Default TSTORE_IMPL enables atomic mode, invokes the same TStoreAcc geometry, resets atomic mode; selected path contains no scratch or numbered events.",
+    "Read and write refer to the same GM rectangle. Existing GM contents are required, not implicitly initialized.",
+    "Configuration-to-subsequent-transfer order is a documented native property; earlier payload completion, cross-worker visibility and deterministic reduction are separate obligations."
+  ],
+  "documentation": [
+    "https://asc.gitcode.com/api/SIMD-API/c_api/atomic/key_features.html",
+    "https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/SIMD-API/basic_api/atomic_operations/SetAtomicAdd.md"
+  ]
+}

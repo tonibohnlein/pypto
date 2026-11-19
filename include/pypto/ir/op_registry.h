@@ -1020,6 +1020,12 @@ class OpRegistryEntry {
   /// Classify both data and metadata explicitly, including a view that only
   /// reads metadata or an allocation address that names no buffer at all.
   OpRegistryEntry& set_buffer_arg_effect(size_t arg_index, BufferAccess data, BufferAccess metadata);
+  using BufferDataEffectResolver =
+      std::function<BufferAccess(const std::vector<std::pair<std::string, std::any>>&)>;
+  /// Only data mode varies with the call. Metadata and memory classification
+  /// remain registration-owned; a missing call cannot resolve this effect.
+  OpRegistryEntry& set_buffer_arg_effect(size_t arg_index, BufferDataEffectResolver data,
+                                         BufferAccess metadata);
   OpRegistryEntry& set_buffer_non_memory_arg(size_t arg_index);
 
   /// Declare one result's storage behavior. The shorthand names result zero;
@@ -1032,12 +1038,15 @@ class OpRegistryEntry {
                                               std::optional<size_t> alias_arg = std::nullopt);
 
   [[nodiscard]] const BufferArgEffect& GetBufferArgEffect(size_t arg_index) const;
+  [[nodiscard]] BufferArgEffect GetBufferArgEffect(
+      size_t arg_index, const std::vector<std::pair<std::string, std::any>>& kwargs) const;
   [[nodiscard]] const BufferResultSpec& GetBufferResultSpec(size_t result_index = 0) const;
 
   /// Validate registrations separately from call types. Both are public so
   /// tools can inspect a contract without mutating the global registry.
   void ValidateIRStage() const;
-  void ValidateCall(const std::vector<ExprPtr>& args, const TypePtr& result_type, const Span& span) const;
+  void ValidateCall(const std::vector<ExprPtr>& args, const TypePtr& result_type, const Span& span,
+                    const std::vector<std::pair<std::string, std::any>>& kwargs) const;
 
   /// Opaque queue state shared by submissions on the issuing core.
   OpRegistryEntry& set_mutable_session_arg(size_t arg_index) {
@@ -1251,6 +1260,7 @@ class OpRegistryEntry {
   OpIRStage ir_stage_{OpIRStage::Functional};
   bool output_arity_declared_{false};
   std::map<size_t, BufferArgEffect> buffer_arg_effects_;
+  std::map<size_t, BufferDataEffectResolver> buffer_data_effect_resolvers_;
   std::map<size_t, BufferResultSpec> buffer_results_;
   std::map<size_t, size_t> tuple_result_aliases_;  ///< Tuple result index to aliased tensor operand
   std::optional<size_t> mutable_session_arg_;      ///< Opaque state updated by an async submission

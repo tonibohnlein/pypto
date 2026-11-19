@@ -270,6 +270,8 @@ def interpret(
             assert isinstance(args[1], ir.MakeTuple) and isinstance(args[2], ir.MakeTuple)
             rect = [integer(e, env) for e in [*args[1].elements, *args[2].elements]]
             reads, writes = access(args[0]), access(args[3], rect)
+            if call.kwargs.get("atomic", 0):
+                reads |= writes
             assert isinstance(args[0].type, ir.BufferType)
             pipe = ir.PipeType.MTE3 if args[0].type.memory_space == ir.MemorySpace.Vec else ir.PipeType.FIX
         elif name in {ir.get_op("buffer.copy").name, ir.get_op("buffer.extract").name}:

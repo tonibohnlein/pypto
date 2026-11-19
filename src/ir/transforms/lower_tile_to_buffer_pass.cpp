@@ -1456,10 +1456,16 @@ class TileToBufferMutator : public IRMutator {
           << "LowerTileToBuffer: non-default cache requires a Buffer transfer recipe";
       INTERNAL_CHECK_SPAN(call->args_.size() == 3, call->span_)
           << "Internal error: dense rank-2 tile.store requires three operands";
-      CHECK_SPAN(
-          GetIntKwarg(call->kwargs_, "atomic", 0) == 0 && GetIntKwarg(call->kwargs_, "st_phase", 0) == 0,
-          call->span_)
-          << "LowerTileToBuffer: atomic and phased stores require a Buffer transfer recipe";
+      const auto store_source = As<TileType>(call->args_[0]->GetType());
+      const auto store_destination = As<TensorType>(call->args_[2]->GetType());
+      const int atomic = GetIntKwarg(call->kwargs_, "atomic", 0);
+      CHECK_SPAN(store_source && store_destination &&
+                     backend::SupportsBufferStoreMode(atomic, store_source->GetMemorySpace(),
+                                                      store_source->dtype_, store_destination->dtype_),
+                 call->span_)
+          << "LowerTileToBuffer: atomic Add requires FP32 Acc to FP32 GM";
+      CHECK_SPAN(GetIntKwarg(call->kwargs_, "st_phase", 0) == 0, call->span_)
+          << "LowerTileToBuffer: phased stores require a Buffer transfer recipe";
       CHECK_SPAN(!GetOptionalDoubleKwarg(call->kwargs_, "pre_quant") &&
                      !GetKwargOr<bool>(call->kwargs_, "pre_relu", false),
                  call->span_)
@@ -1468,7 +1474,9 @@ class TileToBufferMutator : public IRMutator {
       if (result) tensor_aliases_[result.get()] = output;
       return Operation("buffer.store",
                        {Handle(call->args_[0]), VisitExpr(call->args_[1]), Valid(call->args_[0]), output},
-                       call->span_);
+                       call->span_,
+                       atomic == 0 ? std::vector<std::pair<std::string, std::any>>{}
+                                   : std::vector<std::pair<std::string, std::any>>{{"atomic", atomic}});
     }
     if (const auto* recipe = As<GlobalVar>(call->op_)
                                  ? nullptr

@@ -15,9 +15,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "pypto/core/dtype.h"
+#include "pypto/ir/comm.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memory_space.h"
@@ -32,6 +34,17 @@ namespace pypto::backend {
 inline bool IsDenseBufferTransferDtype(DataType dtype) {
   return dtype == DataType::FP16 || dtype == DataType::BF16 || dtype == DataType::FP32 ||
          dtype == DataType::INT32;
+}
+
+/// Mode qualification shared by logical selection, explicit Buffer validation,
+/// lowering and emission. Geometry is still checked by the existing transfer
+/// and view contracts. Initial atomic support is the default A2/A3 FP32 Acc
+/// writeback; it does not supply initialization or inter-worker synchronization.
+inline bool SupportsBufferStoreMode(int atomic, std::optional<ir::MemorySpace> source_space,
+                                    DataType source_dtype, DataType destination_dtype) {
+  if (atomic == static_cast<int>(ir::AtomicType::kNone)) return true;
+  return atomic == static_cast<int>(ir::AtomicType::kAdd) && source_space == ir::MemorySpace::Acc &&
+         source_dtype == DataType::FP32 && destination_dtype == DataType::FP32;
 }
 
 /// GM descriptor geometry admitted by Buffer selection and direct emission.

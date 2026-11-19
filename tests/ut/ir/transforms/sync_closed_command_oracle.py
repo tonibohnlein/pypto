@@ -217,7 +217,15 @@ class ClosedCommands:
                     ir.PipeType.MTE3 if args[0].type.memory_space == ir.MemorySpace.Vec else ir.PipeType.FIX
                 )
                 reads, writes = self.bytes(args[0]), self.bytes(args[3], rect)
-            signature = name, self.signature(args[0]), rect, self.signature(args[3])
+                if call.kwargs.get("atomic", 0):
+                    reads |= writes
+            signature = (
+                name,
+                self.signature(args[0]),
+                rect,
+                self.signature(args[3]),
+                call.kwargs.get("atomic", 0),
+            )
         elif name == opname("buffer.copy"):
             pipe, reads, writes = ir.PipeType.MTE1, self.bytes(args[0]), self.bytes(args[1])
             signature = name, self.signature(args[0]), self.signature(args[1])

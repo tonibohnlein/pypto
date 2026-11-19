@@ -66,7 +66,7 @@ std::vector<CallWriteTarget> CallWriteTargets(const CallPtr& call) {
     if (buffer_stage) {
       // Direction inference and input-write diagnostics describe data writes.
       // Mutating valid-shape metadata does not overwrite parameter data.
-      const auto data = entry->GetBufferArgEffect(i).data;
+      const auto data = entry->GetBufferArgEffect(i, call->kwargs_).data;
       if (data != BufferAccess::Write && data != BufferAccess::ReadWrite) continue;
       effect = data == BufferAccess::Write ? ArgEffect::Write : ArgEffect::ReadWrite;
     } else {

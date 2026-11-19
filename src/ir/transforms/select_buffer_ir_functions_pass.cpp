@@ -484,10 +484,15 @@ class BufferKernelSupport : public IRVisitor {
       admission.Require(call->args_.size() == 3, BufferAdmissionProperty::OperationRecipe);
       CheckTransferParameter(call, 2, false);
       CheckTransferTypes(call, false);
-      const bool ordinary_store = GetIntKwarg(call->kwargs_, "atomic", 0) == 0;
-      admission.Require(ordinary_store, BufferAdmissionProperty::AtomicStore);
+      const auto store_source = As<TileType>(call->args_[0]->GetType());
+      const auto store_destination = As<TensorType>(call->args_[2]->GetType());
+      const bool store_mode = store_source && store_destination &&
+                              backend::SupportsBufferStoreMode(
+                                  GetIntKwarg(call->kwargs_, "atomic", 0), store_source->GetMemorySpace(),
+                                  store_source->dtype_, store_destination->dtype_);
+      admission.Require(store_mode, BufferAdmissionProperty::AtomicStore);
       // Preserve the original conjunction's short-circuiting of kwarg checks.
-      admission.Require(ordinary_store && GetIntKwarg(call->kwargs_, "st_phase", 0) == 0 &&
+      admission.Require(store_mode && GetIntKwarg(call->kwargs_, "st_phase", 0) == 0 &&
                             !GetOptionalDoubleKwarg(call->kwargs_, "pre_quant") &&
                             !GetKwargOr<bool>(call->kwargs_, "pre_relu", false) &&
                             GetIntKwarg(call->kwargs_, "cache", 0) == 0,

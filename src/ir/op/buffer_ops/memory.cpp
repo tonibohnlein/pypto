@@ -306,15 +306,30 @@ REGISTER_OP("buffer.store")
     .add_argument("offsets", "Tuple of GM element offsets")
     .add_argument("valid_extents", "Tuple of transfer extents matching current buffer valid metadata")
     .add_argument("tensor", "Destination GM tensor")
+    .set_attr<int>("atomic")
     .set_output_arity(0)
     .set_buffer_arg_effect(0, BufferAccess::Read, BufferAccess::Read)
     .set_buffer_non_memory_arg(1)
     .set_buffer_non_memory_arg(2)
-    .set_buffer_arg_effect(3, BufferAccess::Write, BufferAccess::Read)
+    .set_buffer_arg_effect(
+        3,
+        [](const std::vector<std::pair<std::string, std::any>>& kwargs) {
+          const int atomic = GetIntKwarg(kwargs, "atomic", static_cast<int>(AtomicType::kNone));
+          CHECK(atomic == static_cast<int>(AtomicType::kNone) || atomic == static_cast<int>(AtomicType::kAdd))
+              << "buffer.store atomic must be None or Add";
+          return atomic == static_cast<int>(AtomicType::kAdd) ? BufferAccess::ReadWrite : BufferAccess::Write;
+        },
+        BufferAccess::Read)
     .set_buffer_result_behavior(BufferResultBehavior::None)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
-                      const std::vector<std::pair<std::string, std::any>>&) {
-      return DeduceBufferTransfer(args, false);
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      const auto result = DeduceBufferTransfer(args, false);
+      const auto source = As<BufferType>(args[0]->GetType());
+      const auto destination = As<TensorType>(args[3]->GetType());
+      CHECK(backend::SupportsBufferStoreMode(GetIntKwarg(kwargs, "atomic", 0), source->memory_space_,
+                                             source->dtype_, destination->dtype_))
+          << "buffer.store atomic Add requires FP32 Acc to FP32 GM";
+      return result;
     });
 
 // Runtime identity reads are scalar values, not storage handles. They use the

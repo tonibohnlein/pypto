@@ -43,6 +43,7 @@ partition form before storage planning rather than failing during final lowering
 | Operations | Element types |
 | ---------- | ------------- |
 | Ordinary packed ND GM load/store | FP16, BF16, FP32, INT32 |
+| Atomic-add Acc writeback to packed ND GM | FP32 source and destination, A2/A3 |
 | add, mul | FP16, FP32, INT32 |
 | sub, div, maximum, minimum, abs, exp, sqrt, neg, relu, log, recip | FP32 |
 | rsqrt (default precision, no workspace) | FP32 |
@@ -60,6 +61,27 @@ requires a distinct destination, enforced by storage legalization and verificati
 Precision attributes retain their existing native policy. GM return aliases must
 resolve to parameters whose types match the declared results, including TensorView
 metadata; kernels with mismatched return views retain Tile IR.
+
+Atomic-add writeback retains the same transfer window and adds a read of that
+GM window to the existing write. The registry resolves the data mode from the
+actual call while metadata and operand classification stay fixed. Selection,
+lowering, native emission and synchronization share the mode qualification;
+ordinary stores remain write-only. Vec atomics, converted destinations,
+non-default phases, cache policies and FIX pre-operations remain unavailable.
+
+This selected native contract is pinned to PTO-ISA
+[`TStore.hpp`](https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/npu/a2a3/TStore.hpp)
+and [`tstore_common.hpp`](https://github.com/hw-native-sys/pto-isa/blob/5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f/include/pto/common/arch/memory/tstore_common.hpp).
+The default two-operand Acc implementation enables atomic mode, issues the
+unchanged FIX transfer and restores ordinary mode, using no temporary storage
+or numbered events. The documented
+[atomic configuration ordering](https://asc.gitcode.com/api/SIMD-API/c_api/atomic/key_features.html)
+guarantees configuration before the subsequent transfer; it does not complete
+earlier transfers or synchronize other workers. Required local GM conflicts
+remain dependencies. The caller must initialize the destination and establish
+task-level visibility and inter-worker ordering where required. Host-model
+validation and generated C++ do not establish deterministic floating-point
+reduction across workers or native/device qualification.
 
 `rsqrt` uses the existing dense unary recipe with a disjoint destination. Both
 omitted `high_precision` and explicit `False` select the two-operand default
@@ -568,7 +590,7 @@ fractal boxes outside the product keep their data, the rest of a partially
 covered box does not. `tile.transpose_view`
 needs no call: storage indexing has already declared the relabelled window.
 Acc stores drain through the fix-pipe with its unscaled conversions only;
-`pre_quant`/`pre_relu`, atomic and phased stores, and cache-policy loads still
+`pre_quant`/`pre_relu`, atomic variants outside the FP32 Acc recipe, phased stores, and cache-policy loads still
 fail explicitly until their transfer recipes exist.
 
 Pipeline-stage membership attributes only constrain storage planning, which the
