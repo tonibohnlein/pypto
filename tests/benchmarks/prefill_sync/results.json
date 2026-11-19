@@ -1,0 +1,282 @@
+{
+  "silu": {
+    "static_guard_sites": [
+      12,
+      4
+    ],
+    "trips": {
+      "3": {
+        "baseline": 24,
+        "candidate": 12,
+        "sets": 13,
+        "waits": 13,
+        "local_barriers": 18,
+        "workers": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19
+        ]
+      },
+      "2": {
+        "baseline": 16,
+        "candidate": 8,
+        "sets": 8,
+        "waits": 8,
+        "local_barriers": 12,
+        "workers": [
+          20,
+          21,
+          22,
+          23
+        ]
+      }
+    }
+  },
+  "gate_up_proj": {
+    "gate": {
+      "payloads": 521,
+      "required_pairs": 132670,
+      "baseline": {
+        "extra": 0,
+        "missing": 0
+      },
+      "candidate": {
+        "extra": 0,
+        "missing": 0
+      },
+      "commands": [
+        {
+          "if": 784,
+          "op": 521,
+          "set": 357,
+          "wait": 357,
+          "bar ALL": 1
+        },
+        {
+          "if": 785,
+          "op": 521,
+          "set": 357,
+          "wait": 357,
+          "bar ALL": 1
+        }
+      ],
+      "event_reuses_checked": [
+        340,
+        340
+      ],
+      "workers_by_band": {
+        "0": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ],
+        "1": [
+          0,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "2": [
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18
+        ],
+        "3": [
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12
+        ]
+      }
+    },
+    "both": {
+      "payloads": 1042,
+      "required_pairs": 536687,
+      "baseline": {
+        "extra": 78,
+        "missing": 0
+      },
+      "candidate": {
+        "extra": 0,
+        "missing": 0
+      },
+      "commands": [
+        {
+          "if": 1568,
+          "op": 1042,
+          "set": 719,
+          "wait": 719,
+          "bar MTE1": 1,
+          "bar MTE2": 1,
+          "bar M": 1,
+          "bar ALL": 1
+        },
+        {
+          "if": 1586,
+          "op": 1042,
+          "set": 719,
+          "wait": 719,
+          "bar ALL": 1
+        }
+      ],
+      "event_reuses_checked": [
+        697,
+        701
+      ],
+      "workers_by_band": {
+        "0": [
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "1": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10
+        ],
+        "2": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "3": [
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22
+        ]
+      }
+    },
+    "up": {
+      "payloads": 521,
+      "required_pairs": 132670,
+      "baseline": {
+        "extra": 0,
+        "missing": 0
+      },
+      "candidate": {
+        "extra": 0,
+        "missing": 0
+      },
+      "commands": [
+        {
+          "bar MTE1": 1,
+          "set": 362,
+          "wait": 362,
+          "bar MTE2": 1,
+          "bar M": 1,
+          "if": 784,
+          "op": 521,
+          "bar ALL": 1
+        },
+        {
+          "if": 785,
+          "op": 521,
+          "set": 357,
+          "wait": 357,
+          "bar ALL": 1
+        }
+      ],
+      "event_reuses_checked": [
+        340,
+        340
+      ],
+      "workers_by_band": {
+        "0": [
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "1": [
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17
+        ],
+        "2": [
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
+        ],
+        "3": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          23
+        ]
+      }
+    }
+  }
+}

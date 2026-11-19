@@ -1,0 +1,153 @@
+module attributes {pto.target_arch = "a2a3"} {
+  func.func @gate_up_proj(%arg0: !pto.ptr<f32>, %arg1: !pto.ptr<bf16>, %arg2: !pto.ptr<bf16>, %arg3: !pto.ptr<bf16>, %arg4: index, %arg5: index, %arg6: index, %arg7: index, %__pypto_spmd_block_idx: i32, %__pypto_spmd_block_num: i32) attributes {pto.kernel_kind = #pto.kernel_kind<cube>} {
+  %c256_index = arith.constant 256 : index
+  %c4352_index = arith.constant 4352 : index
+  %c1_index = arith.constant 1 : index
+  %c128_index = arith.constant 128 : index
+  %c5120_index = arith.constant 5120 : index
+  %c17408_index = arith.constant 17408 : index
+  %c0_i64 = arith.constant 0 : i64
+  %c65536_i64 = arith.constant 65536 : i64
+  %c196608_i64 = arith.constant 196608 : i64
+  %c262144_i64 = arith.constant 262144 : i64
+  %c24576_i64 = arith.constant 24576 : i64
+  %c16384_i64 = arith.constant 16384 : i64
+  %c8192_i64 = arith.constant 8192 : i64
+  %c32768_i64 = arith.constant 32768 : i64
+  %c49152_i64 = arith.constant 49152 : i64
+  %c24_index = arith.constant 24 : index
+  %c0_index = arith.constant 0 : index
+  %c17_index = arith.constant 17 : index
+  %c20_index = arith.constant 20 : index
+  %c2_index = arith.constant 2 : index
+  %c64_index = arith.constant 64 : index
+  %c32_index = arith.constant 32 : index
+  %gate_up_acc_b_inline1623__ssa_v0_view = pto.make_tensor_view %arg0, shape = [%c256_index, %c4352_index], strides = [%c4352_index, %c1_index] {layout = #pto.layout<nd>} : !pto.tensor_view<?x?xf32> loc("models/qwen3_14b/prefill_fwd.py":1367:25)
+  %post_norm_mtile_inline1509__ssa_v0_view = pto.make_tensor_view %arg1, shape = [%c128_index, %c5120_index], strides = [%c5120_index, %c1_index] {layout = #pto.layout<nd>} : !pto.tensor_view<?x?xbf16> loc("models/qwen3_14b/prefill_fwd.py":1367:25)
+  %w_gate__ssa_v0_view = pto.make_tensor_view %arg2, shape = [%arg7, %c17408_index], strides = [%c17408_index, %c1_index] {layout = #pto.layout<nd>} : !pto.tensor_view<?x?xbf16> loc("models/qwen3_14b/prefill_fwd.py":1367:25)
+  %w_up__ssa_v0_view = pto.make_tensor_view %arg3, shape = [%arg7, %c17408_index], strides = [%c17408_index, %c1_index] {layout = #pto.layout<nd>} : !pto.tensor_view<?x?xbf16> loc("models/qwen3_14b/prefill_fwd.py":1367:25)
+  %mem_acc_4_buffer = pto.alloc_tile addr = %c0_i64 : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0> loc("models/qwen3_14b/prefill_fwd.py":1375:33)
+  %mem_mat_5_buffer = pto.alloc_tile addr = %c0_i64 : !pto.tile_buf<loc=mat, dtype=bf16, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0> loc("models/qwen3_14b/prefill_fwd.py":1378:37)
+  %mem_mat_6_buffer = pto.alloc_tile addr = %c65536_i64 : !pto.tile_buf<loc=mat, dtype=bf16, rows=256, cols=256, v_row=256, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0> loc("models/qwen3_14b/prefill_fwd.py":1379:37)
+  %mem_mat_7_buffer = pto.alloc_tile addr = %c196608_i64 : !pto.tile_buf<loc=mat, dtype=bf16, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0> loc("models/qwen3_14b/prefill_fwd.py":1378:37)
+  %mem_mat_8_buffer = pto.alloc_tile addr = %c262144_i64 : !pto.tile_buf<loc=mat, dtype=bf16, rows=256, cols=256, v_row=256, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0> loc("models/qwen3_14b/prefill_fwd.py":1379:37)
+  %mem_left_9_buffer = pto.alloc_tile addr = %c24576_i64 : !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0> loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+  %mem_right_10_buffer = pto.alloc_tile addr = %c0_i64 : !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0> loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+  %mem_left_11_buffer = pto.alloc_tile addr = %c0_i64 : !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0> loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+  %mem_right_12_buffer = pto.alloc_tile addr = %c16384_i64 : !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0> loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+  %mem_left_14_buffer = pto.alloc_tile addr = %c8192_i64 : !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0> loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+  %mem_right_15_buffer = pto.alloc_tile addr = %c32768_i64 : !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0> loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+  %mem_left_16_buffer = pto.alloc_tile addr = %c16384_i64 : !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0> loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+  %mem_right_17_buffer = pto.alloc_tile addr = %c49152_i64 : !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0> loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+  %t__tmp_v113 = arith.index_cast %__pypto_spmd_block_idx : i32 to index loc("models/qwen3_14b/prefill_fwd.py":1372:29)
+  %0 = arith.addi %t__tmp_v113, %arg4 : index loc("models/qwen3_14b/prefill_fwd.py":1372:29)
+  %1 = arith.remsi %0, %c24_index : index loc("models/qwen3_14b/prefill_fwd.py":1372:29)
+  %2 = arith.cmpi slt, %1, %c0_index : index loc("models/qwen3_14b/prefill_fwd.py":1372:29)
+  %3 = arith.addi %1, %c24_index : index loc("models/qwen3_14b/prefill_fwd.py":1372:29)
+  %4 = arith.select %2, %3, %1 : index loc("models/qwen3_14b/prefill_fwd.py":1372:29)
+  scf.for %rel_ob_inline1628__idx_v0 = %4 to %c17_index step %c24_index {
+    %5 = arith.addi %arg5, %rel_ob_inline1628__idx_v0 : index loc("models/qwen3_14b/prefill_fwd.py":1374:33)
+    %6 = arith.muli %5, %c256_index : index loc("models/qwen3_14b/prefill_fwd.py":1374:33)
+    scf.for %kb_inline1630__idx_v0 = %c0_index to %c20_index step %c2_index {
+      %7 = arith.muli %kb_inline1630__idx_v0, %c256_index : index loc("models/qwen3_14b/prefill_fwd.py":1377:37)
+      %8 = arith.muli %kb_inline1630__idx_v0, %c256_index : index loc("models/qwen3_14b/prefill_fwd.py":1377:37)
+      %9 = arith.addi %8, %c256_index : index loc("models/qwen3_14b/prefill_fwd.py":1377:37)
+      %post_norm_mtile_inline1509__ssa_v0_pview = pto.partition_view %post_norm_mtile_inline1509__ssa_v0_view, offsets = [%c0_index, %7], sizes = [%c128_index, %c256_index] : !pto.tensor_view<?x?xbf16> -> !pto.partition_tensor_view<128x256xbf16> loc("models/qwen3_14b/prefill_fwd.py":1378:37)
+      pto.tload ins(%post_norm_mtile_inline1509__ssa_v0_pview : !pto.partition_tensor_view<128x256xbf16>) outs(%mem_mat_5_buffer : !pto.tile_buf<loc=mat, dtype=bf16, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1378:37)
+      %10 = arith.addi %arg6, %7 : index loc("models/qwen3_14b/prefill_fwd.py":1379:37)
+      %w_gate__ssa_v0_pview = pto.partition_view %w_gate__ssa_v0_view, offsets = [%10, %6], sizes = [%c256_index, %c256_index] : !pto.tensor_view<?x?xbf16> -> !pto.partition_tensor_view<256x256xbf16> loc("models/qwen3_14b/prefill_fwd.py":1379:37)
+      pto.tload ins(%w_gate__ssa_v0_pview : !pto.partition_tensor_view<256x256xbf16>) outs(%mem_mat_6_buffer : !pto.tile_buf<loc=mat, dtype=bf16, rows=256, cols=256, v_row=256, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1379:37)
+      %11 = pto.partition_view %post_norm_mtile_inline1509__ssa_v0_view, offsets = [%c0_index, %9], sizes = [%c128_index, %c256_index] : !pto.tensor_view<?x?xbf16> -> !pto.partition_tensor_view<128x256xbf16> loc("models/qwen3_14b/prefill_fwd.py":1378:37)
+      pto.tload ins(%11 : !pto.partition_tensor_view<128x256xbf16>) outs(%mem_mat_7_buffer : !pto.tile_buf<loc=mat, dtype=bf16, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1378:37)
+      %12 = arith.addi %arg6, %9 : index loc("models/qwen3_14b/prefill_fwd.py":1379:37)
+      %13 = pto.partition_view %w_gate__ssa_v0_view, offsets = [%12, %6], sizes = [%c256_index, %c256_index] : !pto.tensor_view<?x?xbf16> -> !pto.partition_tensor_view<256x256xbf16> loc("models/qwen3_14b/prefill_fwd.py":1379:37)
+      pto.tload ins(%13 : !pto.partition_tensor_view<256x256xbf16>) outs(%mem_mat_8_buffer : !pto.tile_buf<loc=mat, dtype=bf16, rows=256, cols=256, v_row=256, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1379:37)
+      scf.for %gate_acc_inline1629__tile_mn0_l0_ko = %c0_index to %c256_index step %c64_index {
+        pto.textract ins(%mem_mat_5_buffer, %c0_index, %gate_acc_inline1629__tile_mn0_l0_ko : !pto.tile_buf<loc=mat, dtype=bf16, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>, index, index) outs(%mem_left_9_buffer : !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        pto.textract ins(%mem_mat_6_buffer, %gate_acc_inline1629__tile_mn0_l0_ko, %c0_index : !pto.tile_buf<loc=mat, dtype=bf16, rows=256, cols=256, v_row=256, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>, index, index) outs(%mem_right_10_buffer : !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        %14 = arith.addi %gate_acc_inline1629__tile_mn0_l0_ko, %c32_index : index loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        pto.textract ins(%mem_mat_5_buffer, %c0_index, %14 : !pto.tile_buf<loc=mat, dtype=bf16, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>, index, index) outs(%mem_left_11_buffer : !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        %15 = arith.addi %gate_acc_inline1629__tile_mn0_l0_ko, %c32_index : index loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        pto.textract ins(%mem_mat_6_buffer, %15, %c0_index : !pto.tile_buf<loc=mat, dtype=bf16, rows=256, cols=256, v_row=256, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>, index, index) outs(%mem_right_12_buffer : !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        %16 = arith.cmpi eq, %kb_inline1630__idx_v0, %c0_index : index loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        %17 = arith.cmpi eq, %gate_acc_inline1629__tile_mn0_l0_ko, %c0_index : index loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        %18 = arith.andi %16, %17 : i1 loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        scf.if %18 {
+          pto.tmatmul ins(%mem_left_9_buffer, %mem_right_10_buffer : !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>, !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) outs(%mem_acc_4_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        } else {
+          pto.tmatmul.acc ins(%mem_acc_4_buffer, %mem_left_9_buffer, %mem_right_10_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>, !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>, !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) outs(%mem_acc_4_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        }
+        pto.tmatmul.acc ins(%mem_acc_4_buffer, %mem_left_11_buffer, %mem_right_12_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>, !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>, !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) outs(%mem_acc_4_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+      }
+      scf.for %19 = %c0_index to %c256_index step %c64_index {
+        pto.textract ins(%mem_mat_7_buffer, %c0_index, %19 : !pto.tile_buf<loc=mat, dtype=bf16, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>, index, index) outs(%mem_left_14_buffer : !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        pto.textract ins(%mem_mat_8_buffer, %19, %c0_index : !pto.tile_buf<loc=mat, dtype=bf16, rows=256, cols=256, v_row=256, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>, index, index) outs(%mem_right_15_buffer : !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        %20 = arith.addi %19, %c32_index : index loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        pto.textract ins(%mem_mat_7_buffer, %c0_index, %20 : !pto.tile_buf<loc=mat, dtype=bf16, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>, index, index) outs(%mem_left_16_buffer : !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        %21 = arith.addi %19, %c32_index : index loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        pto.textract ins(%mem_mat_8_buffer, %21, %c0_index : !pto.tile_buf<loc=mat, dtype=bf16, rows=256, cols=256, v_row=256, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>, index, index) outs(%mem_right_17_buffer : !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        pto.tmatmul.acc ins(%mem_acc_4_buffer, %mem_left_14_buffer, %mem_right_15_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>, !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>, !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) outs(%mem_acc_4_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+        pto.tmatmul.acc ins(%mem_acc_4_buffer, %mem_left_16_buffer, %mem_right_17_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>, !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>, !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) outs(%mem_acc_4_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1384:37)
+      }
+    }
+    %22 = arith.muli %rel_ob_inline1628__idx_v0, %c256_index : index loc("models/qwen3_14b/prefill_fwd.py":1385:33)
+    %gate_up_acc_b_inline1623__ssa_v0_pview = pto.partition_view %gate_up_acc_b_inline1623__ssa_v0_view, offsets = [%c0_index, %22], sizes = [%c128_index, %c256_index] : !pto.tensor_view<?x?xf32> -> !pto.partition_tensor_view<128x256xf32> loc("models/qwen3_14b/prefill_fwd.py":1385:33)
+    pto.tstore ins(%mem_acc_4_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>) outs(%gate_up_acc_b_inline1623__ssa_v0_pview : !pto.partition_tensor_view<128x256xf32>) loc("models/qwen3_14b/prefill_fwd.py":1385:33)
+  }
+  %23 = arith.addi %4, %c17_index : index loc("models/qwen3_14b/prefill_fwd.py":1391:29)
+  %24 = arith.remsi %23, %c24_index : index loc("models/qwen3_14b/prefill_fwd.py":1391:29)
+  %25 = arith.cmpi slt, %24, %c0_index : index loc("models/qwen3_14b/prefill_fwd.py":1391:29)
+  %26 = arith.addi %24, %c24_index : index loc("models/qwen3_14b/prefill_fwd.py":1391:29)
+  %27 = arith.select %25, %26, %24 : index loc("models/qwen3_14b/prefill_fwd.py":1391:29)
+  scf.for %rel_ob_inline1634__idx_v0 = %27 to %c17_index step %c24_index {
+    %28 = arith.addi %arg5, %rel_ob_inline1634__idx_v0 : index loc("models/qwen3_14b/prefill_fwd.py":1393:33)
+    %29 = arith.muli %28, %c256_index : index loc("models/qwen3_14b/prefill_fwd.py":1393:33)
+    scf.for %kb_inline1636__idx_v0 = %c0_index to %c20_index step %c2_index {
+      %30 = arith.muli %kb_inline1636__idx_v0, %c256_index : index loc("models/qwen3_14b/prefill_fwd.py":1396:37)
+      %31 = arith.muli %kb_inline1636__idx_v0, %c256_index : index loc("models/qwen3_14b/prefill_fwd.py":1396:37)
+      %32 = arith.addi %31, %c256_index : index loc("models/qwen3_14b/prefill_fwd.py":1396:37)
+      %33 = pto.partition_view %post_norm_mtile_inline1509__ssa_v0_view, offsets = [%c0_index, %30], sizes = [%c128_index, %c256_index] : !pto.tensor_view<?x?xbf16> -> !pto.partition_tensor_view<128x256xbf16> loc("models/qwen3_14b/prefill_fwd.py":1397:37)
+      pto.tload ins(%33 : !pto.partition_tensor_view<128x256xbf16>) outs(%mem_mat_5_buffer : !pto.tile_buf<loc=mat, dtype=bf16, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1397:37)
+      %34 = arith.addi %arg6, %30 : index loc("models/qwen3_14b/prefill_fwd.py":1398:37)
+      %w_up__ssa_v0_pview = pto.partition_view %w_up__ssa_v0_view, offsets = [%34, %29], sizes = [%c256_index, %c256_index] : !pto.tensor_view<?x?xbf16> -> !pto.partition_tensor_view<256x256xbf16> loc("models/qwen3_14b/prefill_fwd.py":1398:37)
+      pto.tload ins(%w_up__ssa_v0_pview : !pto.partition_tensor_view<256x256xbf16>) outs(%mem_mat_6_buffer : !pto.tile_buf<loc=mat, dtype=bf16, rows=256, cols=256, v_row=256, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1398:37)
+      %35 = pto.partition_view %post_norm_mtile_inline1509__ssa_v0_view, offsets = [%c0_index, %32], sizes = [%c128_index, %c256_index] : !pto.tensor_view<?x?xbf16> -> !pto.partition_tensor_view<128x256xbf16> loc("models/qwen3_14b/prefill_fwd.py":1397:37)
+      pto.tload ins(%35 : !pto.partition_tensor_view<128x256xbf16>) outs(%mem_mat_7_buffer : !pto.tile_buf<loc=mat, dtype=bf16, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1397:37)
+      %36 = arith.addi %arg6, %32 : index loc("models/qwen3_14b/prefill_fwd.py":1398:37)
+      %37 = pto.partition_view %w_up__ssa_v0_view, offsets = [%36, %29], sizes = [%c256_index, %c256_index] : !pto.tensor_view<?x?xbf16> -> !pto.partition_tensor_view<256x256xbf16> loc("models/qwen3_14b/prefill_fwd.py":1398:37)
+      pto.tload ins(%37 : !pto.partition_tensor_view<256x256xbf16>) outs(%mem_mat_8_buffer : !pto.tile_buf<loc=mat, dtype=bf16, rows=256, cols=256, v_row=256, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1398:37)
+      scf.for %up_acc_inline1635__tile_mn0_l0_ko = %c0_index to %c256_index step %c64_index {
+        pto.textract ins(%mem_mat_5_buffer, %c0_index, %up_acc_inline1635__tile_mn0_l0_ko : !pto.tile_buf<loc=mat, dtype=bf16, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>, index, index) outs(%mem_left_9_buffer : !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        pto.textract ins(%mem_mat_6_buffer, %up_acc_inline1635__tile_mn0_l0_ko, %c0_index : !pto.tile_buf<loc=mat, dtype=bf16, rows=256, cols=256, v_row=256, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>, index, index) outs(%mem_right_10_buffer : !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        %38 = arith.addi %up_acc_inline1635__tile_mn0_l0_ko, %c32_index : index loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        pto.textract ins(%mem_mat_5_buffer, %c0_index, %38 : !pto.tile_buf<loc=mat, dtype=bf16, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>, index, index) outs(%mem_left_11_buffer : !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        %39 = arith.addi %up_acc_inline1635__tile_mn0_l0_ko, %c32_index : index loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        pto.textract ins(%mem_mat_6_buffer, %39, %c0_index : !pto.tile_buf<loc=mat, dtype=bf16, rows=256, cols=256, v_row=256, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>, index, index) outs(%mem_right_12_buffer : !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        %40 = arith.cmpi eq, %kb_inline1636__idx_v0, %c0_index : index loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        %41 = arith.cmpi eq, %up_acc_inline1635__tile_mn0_l0_ko, %c0_index : index loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        %42 = arith.andi %40, %41 : i1 loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        scf.if %42 {
+          pto.tmatmul ins(%mem_left_9_buffer, %mem_right_10_buffer : !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>, !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) outs(%mem_acc_4_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        } else {
+          pto.tmatmul.acc ins(%mem_acc_4_buffer, %mem_left_9_buffer, %mem_right_10_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>, !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>, !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) outs(%mem_acc_4_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        }
+        pto.tmatmul.acc ins(%mem_acc_4_buffer, %mem_left_11_buffer, %mem_right_12_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>, !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>, !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) outs(%mem_acc_4_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+      }
+      scf.for %43 = %c0_index to %c256_index step %c64_index {
+        pto.textract ins(%mem_mat_7_buffer, %c0_index, %43 : !pto.tile_buf<loc=mat, dtype=bf16, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>, index, index) outs(%mem_left_14_buffer : !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        pto.textract ins(%mem_mat_8_buffer, %43, %c0_index : !pto.tile_buf<loc=mat, dtype=bf16, rows=256, cols=256, v_row=256, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>, index, index) outs(%mem_right_15_buffer : !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        %44 = arith.addi %43, %c32_index : index loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        pto.textract ins(%mem_mat_7_buffer, %c0_index, %44 : !pto.tile_buf<loc=mat, dtype=bf16, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>, index, index) outs(%mem_left_16_buffer : !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        %45 = arith.addi %43, %c32_index : index loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        pto.textract ins(%mem_mat_8_buffer, %45, %c0_index : !pto.tile_buf<loc=mat, dtype=bf16, rows=256, cols=256, v_row=256, v_col=256, blayout=col_major, slayout=row_major, fractal=512, pad=0>, index, index) outs(%mem_right_17_buffer : !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        pto.tmatmul.acc ins(%mem_acc_4_buffer, %mem_left_14_buffer, %mem_right_15_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>, !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>, !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) outs(%mem_acc_4_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+        pto.tmatmul.acc ins(%mem_acc_4_buffer, %mem_left_16_buffer, %mem_right_17_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>, !pto.tile_buf<loc=left, dtype=bf16, rows=128, cols=32, v_row=128, v_col=32, blayout=row_major, slayout=row_major, fractal=512, pad=0>, !pto.tile_buf<loc=right, dtype=bf16, rows=32, cols=256, v_row=32, v_col=256, blayout=row_major, slayout=col_major, fractal=512, pad=0>) outs(%mem_acc_4_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>) loc("models/qwen3_14b/prefill_fwd.py":1403:37)
+      }
+    }
+    %46 = arith.muli %rel_ob_inline1634__idx_v0, %c256_index : index loc("models/qwen3_14b/prefill_fwd.py":1404:33)
+    %47 = pto.partition_view %gate_up_acc_b_inline1623__ssa_v0_view, offsets = [%c128_index, %46], sizes = [%c128_index, %c256_index] : !pto.tensor_view<?x?xf32> -> !pto.partition_tensor_view<128x256xf32> loc("models/qwen3_14b/prefill_fwd.py":1404:33)
+    pto.tstore ins(%mem_acc_4_buffer : !pto.tile_buf<loc=acc, dtype=f32, rows=128, cols=256, v_row=128, v_col=256, blayout=col_major, slayout=row_major, fractal=1024, pad=0>) outs(%47 : !pto.partition_tensor_view<128x256xf32>) loc("models/qwen3_14b/prefill_fwd.py":1404:33)
+  }
+  return
+  }
+}
