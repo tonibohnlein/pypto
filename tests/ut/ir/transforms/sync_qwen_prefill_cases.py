@@ -168,7 +168,9 @@ def capture_qwen_projection(name: str, **configuration: Any) -> ir.Program:
         return entry.lower(config=RunConfig(arch=BackendType.Ascend910))
 
 
-def original_control_trace(function: ir.Function, layer: int, block: int) -> list[tuple[str, dict[str, int]]]:
+def control_calls(
+    function: ir.Function, block: int, parameters: dict[str, int] | None = None
+) -> list[tuple[ir.Call, dict[str, int]]]:
     """Execute original scalar/control IR without allocating an address set.
 
     This is a control-only oracle for the complete worker/band domain. The
@@ -193,12 +195,19 @@ def original_control_trace(function: ir.Function, layer: int, block: int) -> lis
                 walk(arm, env)
         elif isinstance(stmt, ir.EvalStmt):
             assert isinstance(stmt.expr, ir.Call)
-            events.append((stmt.expr.op.name, env.copy()))
+            events.append((stmt.expr, env.copy()))
         else:
             assert isinstance(stmt, (ir.YieldStmt, ir.ReturnStmt))
 
-    walk(function.body, {function.params[3].name_hint: layer, "__block_index__": block})
+    walk(function.body, {**(parameters or {}), "__block_index__": block})
     return events
+
+
+def original_control_trace(function: ir.Function, layer: int, block: int) -> list[tuple[str, dict[str, int]]]:
+    return [
+        (call.op.name, env)
+        for call, env in control_calls(function, block, {function.params[3].name_hint: layer})
+    ]
 
 
 def assert_output_body_identity() -> None:

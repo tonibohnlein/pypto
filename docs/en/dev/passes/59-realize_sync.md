@@ -253,6 +253,9 @@ opt-in pass. Closed-program caller and launch evidence qualify ready invariant
 coordinates; numerical regional composition preserves resident operands,
 accumulator initialization and counter resets. Every activation case must
 qualify before the original payload body receives guarded command cuts.
+When launch cases differ only in the trip count of an original symbolic-start
+loop, lowering can use first, last, previous-visit or next-visit predicates
+if they select the same physical commands in the same order in every case.
 Six-ID allocation uses the existing sufficient certificate. Unsupported
 coordinates, same-pipe mechanisms or resource evidence still delegate.
 See the [pipeline checkpoint](https://github.com/tonibohnlein/pypto/blob/365b803a45072f1c00e8eca5da9942bd9828685f/docs/en/dev/ir/18-qwen-prefill-pipeline.md) for exact

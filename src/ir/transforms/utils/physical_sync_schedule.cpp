@@ -59,6 +59,7 @@ class CutDomains : public IRVisitor {
   PhysicalSyncRealization& work_;
   std::set<const Var*> uniform_variables_;
   CommandPredicateScope scope_;
+  const ForStmt* enclosing_loop_ = nullptr;
   size_t conditional_depth_ = 0;
   void VisitStmt_(const ForStmtPtr& loop) override {
     auto saved = domain_;
@@ -74,7 +75,10 @@ class CutDomains : public IRVisitor {
     if (!uniform) uniform_variables_.clear();
     if (uniform) uniform_variables_.insert(loop->loop_var_.get());
     const bool inserted = scope_.ready.insert(loop->loop_var_.get()).second;
+    auto* saved_loop = enclosing_loop_;
+    enclosing_loop_ = loop.get();
     VisitStmt(loop->body_);
+    enclosing_loop_ = saved_loop;
     if (inserted) scope_.ready.erase(loop->loop_var_.get());
     uniform_variables_ = std::move(saved_variables);
     domain_ = std::move(saved);
@@ -110,7 +114,9 @@ class CutDomains : public IRVisitor {
       const auto qualified = conditional_depth_ ? std::set<const Var*>{} : uniform_variables_;
       if (!cut.uniform_checked) {
         cut.uniform_variables = qualified;
+        if (!conditional_depth_) cut.enclosing_loop = enclosing_loop_;
       } else {
+        if (conditional_depth_ || cut.enclosing_loop != enclosing_loop_) cut.enclosing_loop = nullptr;
         for (auto it = cut.uniform_variables.begin(); it != cut.uniform_variables.end();) {
           if (!qualified.count(*it))
             it = cut.uniform_variables.erase(it);
@@ -226,6 +232,7 @@ class AssignedRegionSchedule {
   const std::vector<AssignedSyncCase> cases;
   std::shared_ptr<GuardDomainArena> arena = std::make_shared<GuardDomainArena>();
   std::vector<AssignedCut> cuts;
+  std::map<const ForStmt*, LoopBoundaryDomain> loop_boundaries;
   AssignedRegionSchedule(FunctionPtr function, std::vector<AssignedSyncCase> supplied)
       : owner(std::move(function)),
         block(!supplied.empty() && supplied.front().input && supplied.front().input->invocation_coordinate
@@ -242,6 +249,25 @@ class AssignedRegionSchedule {
       INTERNAL_CHECK(input.owner == owner) << "Foreign assigned schedule owner";
       CHECK(input.invocation_coordinate == cases.front().input->invocation_coordinate)
           << "Assigned cases disagree on their invocation coordinate owner";
+      if (cases.size() > 1 && input.block_bounds) {
+        for (const auto& segment : input.segments) {
+          // CutDomains uses the innermost lexical loop. A payload in an
+          // outer loop's own body has a segment whose frame path ends there.
+          if (segment.nested_frames.empty()) continue;
+          const auto& frame = segment.nested_frames.back();
+          if (!frame.count || !As<Var>(frame.start_expression) ||
+              frame.start_expression != frame.loop->start_)
+            continue;
+          auto& domain = loop_boundaries[frame.loop.get()];
+          domain.loop = frame.loop;
+          if (domain.cases.empty() || domain.cases.back().blocks != *input.block_bounds) {
+            domain.cases.push_back({*input.block_bounds, frame.count});
+          } else {
+            INTERNAL_CHECK_SPAN(domain.cases.back().count == frame.count, frame.loop->span_)
+                << "Inconsistent trip count for the same original loop and launch case";
+          }
+        }
+      }
       ScheduleDomains domains(input);
       if (const auto& protocol = cases[c].assignment->Protocol()) {
         protocol->ValidateFor(input);
@@ -933,10 +959,12 @@ CutInventory LowerScheduleCuts(const AssignedRegionSchedule& schedule, const Cut
     cut->predicate_scope = facts.predicate_scope;
     for (const auto& item : cut->before_cases) RequireCommandScope({item.body}, *cut->predicate_scope, work);
     for (const auto& item : cut->after_cases) RequireCommandScope({item.body}, *cut->predicate_scope, work);
+    const auto loop = schedule.loop_boundaries.find(facts.enclosing_loop);
+    const auto* boundary_domain = !phase && loop != schedule.loop_boundaries.end() ? &loop->second : nullptr;
     cut->before = ScheduleCommandCases(block, facts.domain, cut->before_cases, work, schedule.owner->span_,
-                                       facts.uniform_variables, schedule.arena);
+                                       facts.uniform_variables, schedule.arena, boundary_domain);
     cut->after = ScheduleCommandCases(block, facts.domain, cut->after_cases, work, schedule.owner->span_,
-                                      facts.uniform_variables, schedule.arena);
+                                      facts.uniform_variables, schedule.arena, boundary_domain);
     RequireCommandScope(cut->before, *cut->predicate_scope, work);
     RequireCommandScope(cut->after, *cut->predicate_scope, work);
   }
@@ -1335,7 +1363,9 @@ std::vector<InvocationScheduleGroup> GroupInvocationSchedules(
       };
       if (!anchor_order.empty()) {
         for (const Call* anchor : anchor_order) {
-          if (const auto it = inventory.find(anchor); it != inventory.end()) append_cut(it->second);
+          if (const auto it = inventory.find(anchor); it != inventory.end()) {
+            append_cut(it->second);
+          }
         }
       }
       for (const auto& [anchor, cut] : inventory) append_cut(cut);
