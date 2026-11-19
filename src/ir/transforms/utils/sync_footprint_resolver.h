@@ -120,7 +120,7 @@ struct IterationFiber {
   const ForStmt* frame = nullptr;
   int64_t modulus = 0;     // ModularSlot: slot = (coeff * iv_norm + offset) mod modulus
   int64_t coeff = 0;       // Step per normalized trip of `frame` (slots or bytes/rows)
-  int64_t offset = 0;      // Residue in [0, modulus) or static start offset
+  int64_t offset = 0;      // Slot residue, Vec physical byte origin, or Matrix canonical axis origin
   int64_t extent = 0;      // Slice width (1 for ModularSlot)
   uint8_t slice_axis = 0;  // 0 = byte / matrix row, 1 = matrix col
   ExprPtr symbolic_base;

@@ -11,10 +11,14 @@
 
 from itertools import product
 
+import pypto.language as pl
 import pytest
 from pypto import ir, passes, testing
+from pypto._function_attrs import PYPTO_AUTOSYNC_ATTR
+from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
-from .sync_closed_command_oracle import ClosedCommands, check_closed_commands
+from .sync_closed_command_oracle import ClosedCommands, check_closed_commands, opname
+from .sync_logical_oracle import value
 from .test_closed_prefix_sync import lower
 from .test_conservative_sync_dataflow import conservative_fixture
 from .test_implicit_sync_effects import independent_broadcasts
@@ -357,6 +361,95 @@ def test_registered_local_alias_retains_the_parent_physical_domain():
     assert first_local == alias_local and 0 not in alias_local
 
 
+class _RowSubviewCommands(ClosedCommands):
+    def assign(self, statement, env):
+        call = statement.value
+        if not isinstance(call, ir.Call) or call.op.name != opname("buffer.subview"):
+            super().assign(statement, env)
+            return
+
+        parent, offsets = call.args[:2]
+        space, base, parent_rows, parent_cols, element_bytes = self.storage[parent]
+        assert isinstance(offsets, ir.MakeTuple)
+        row, col = (value(offset, env) for offset in offsets.elements)
+        rows, cols = statement.var.type.shape
+        assert isinstance(row, int)
+        assert col == 0 and cols == parent_cols
+        assert 0 <= row <= parent_rows - rows
+        self.storage[statement.var] = (
+            space,
+            base + row * parent_cols * element_bytes,
+            rows,
+            cols,
+            element_bytes,
+        )
+        self.layouts[statement.var] = statement.var.type
+
+
+@pytest.mark.parametrize("view", ["direct", "nested_store", "nested_write", "disjoint"])
+def test_affine_row_slice_uses_physical_origin_for_store_before_scalar_write(view: str) -> None:
+    # Store odd rows. The nested view reaches those same physical rows through
+    # a one-row shift, while the disjoint variant writes even rows.
+    direct = "pl.tile.slice(root, [1, 8], [2 * i + 1, 0])"
+    nested = "pl.tile.slice(window, [1, 8], [2 * i, 0])"
+    stored = nested if view == "nested_store" else direct
+    overwritten = nested if view == "nested_write" else direct
+    if view == "disjoint":
+        overwritten = "pl.tile.slice(root, [1, 8], [2 * i, 0])"
+    program = pl.parse_program(f"""
+@pl.program
+class StoreBeforeScalarWrite:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, x: pl.Tensor[[16, 8], pl.FP32],
+               out: pl.Out[pl.Tensor[[8, 8], pl.FP32]]) -> pl.Tensor[[8, 8], pl.FP32]:
+        root = pl.load(x, [0, 0], [16, 8])
+        replacement = pl.const(7.0, pl.FP32)
+        for i in pl.range(8):
+            window = pl.tile.slice(root, [15, 8], [1, 0])
+            stored = {stored}
+            out = pl.store(stored, [i, 0], out)
+            overwritten = {overwritten}
+            pl.tile.write(overwritten, [0, 0], replacement)
+        return out
+""")
+    placed = []
+
+    def capture(transform, before):
+        if transform.get_name() == "RealizeSync":
+            placed.append(before.get_function("kernel"))
+
+    with passes.PassContext(
+        [passes.CallbackInstrument(before_pass=capture, name="capture_placed_fibers")],
+        enable_buffer_ir=True,
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+        autosync_disjoint_gm=False,
+    ):
+        lowered = PassManager(OptimizationStrategy.Default).run_passes(program)
+        (original,) = placed
+        assert original.ir_stage == ir.FunctionIRStage.Buffer, dict(original.attrs)
+        summary = testing.analyze_conservative_sync(original)
+    function = lowered.get_function("kernel")
+    assert function is not None and function.attrs[PYPTO_AUTOSYNC_ATTR]
+    execution = _RowSubviewCommands(function, {}, range(8))
+    order = execution.run()
+    conflicts = set()
+    for store_index, (_, pipe, reads, _) in enumerate(execution.payloads):
+        if pipe != ir.PipeType.MTE3:
+            continue
+        for write_index, (_, later_pipe, _, writes) in enumerate(
+            execution.payloads[store_index + 1 :], start=store_index + 1
+        ):
+            if later_pipe == ir.PipeType.S and reads & writes:
+                conflicts.add((("payload", store_index, "C"), ("payload", write_index, "I")))
+    assert len(conflicts) == (0 if view == "disjoint" else 8)
+    unordered = conflicts - order
+    assert not unordered, f"store completion must precede scalar overwrite issue: {unordered}"
+    (write,) = [site for site in summary["sites"] if site["pipe"] == ir.PipeType.S]
+    assert (ir.PipeType.MTE3 in write["required_source_pipes"]) == (view != "disjoint")
+
+
 @pytest.mark.parametrize("count", [8, 32, 128])
 def test_flat_production_state_avoids_copied_prefix_histories(count):
     function = many_independent_windows(count)
@@ -581,7 +674,10 @@ def test_disjoint_domain_delivery_and_loop_invariant_pruning():
     a, b, out = ir.Var("a", gm, SPAN), ir.Var("b", gm, SPAN), ir.Var("out", gm, SPAN)
     ub = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
     x, y, z1, z2 = [ir.Var(n, ub, SPAN) for n in ("x", "y", "z1", "z2")]
-    allocs = [ir.AssignStmt(v, call("buffer.alloc", [tup([]), ci(addr)], ub), SPAN) for v, addr in ((x, 0), (y, 128), (z1, 256), (z2, 384))]
+    allocs = [
+        ir.AssignStmt(v, call("buffer.alloc", [tup([]), ci(addr)], ub), SPAN)
+        for v, addr in ((x, 0), (y, 128), (z1, 256), (z2, 384))
+    ]
 
     # Intervening MTE2 load to disjoint `y`/`b` must not wipe already-delivered MTE2->V completion on `x`.
     disjoint_fn = ir.Function(

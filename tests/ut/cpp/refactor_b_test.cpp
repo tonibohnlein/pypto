@@ -369,6 +369,53 @@ void TestB3IterationFiberRefinement() {
                    PipeType::V) != analysis.Sites()[2].source_pipes.end());
 }
 
+void TestAffineVecPhysicalByteOrigins() {
+  const auto tile = VecType(8, 8);
+  const auto row = VecType(1, 8);
+  const auto a = MakeVar("a", tile);
+  const auto b = MakeVar("b", tile);
+  const auto i = MakeVar("i", IndexType());
+  const auto a_next = MakeVar("a_next", row);
+  const auto b_current = MakeVar("b_current", row);
+  const auto b_next = MakeVar("b_next", row);
+  const auto wide_type = VecType(2, 64);
+  const auto wide = MakeVar("wide", wide_type);
+  const auto window_type = VecType(1, 48);
+  const auto window = MakeVar("window", window_type);
+  const auto direct = MakeVar("direct", row);
+  const auto nested = MakeVar("nested", row);
+  const auto adjacent = MakeVar("adjacent", row);
+  const auto next = MakeAdd(i, CI(1));
+  const auto column = MakeMul(i, CI(8));
+  const auto loop =
+      SimpleFor(i, CI(0), CI(4), CI(1),
+                {BufferSubview(a_next, a, next, CI(0), row), BufferSubview(b_current, b, i, CI(0), row),
+                 BufferSubview(b_next, b, next, CI(0), row),
+                 BufferSubview(direct, wide, CI(1), MakeAdd(column, CI(8)), row),
+                 BufferSubview(nested, window, CI(0), column, row),
+                 BufferSubview(adjacent, window, CI(0), MakeAdd(column, CI(8)), row)});
+  const auto fn = MakeAicFn("vec_physical_byte_origins", {}, {},
+                            {AllocBuf(a, 32, tile), AllocBuf(b, 64, tile), AllocBuf(wide, 1024, wide_type),
+                             BufferSubview(window, wide, CI(1), CI(8), window_type), loop,
+                             std::make_shared<ReturnStmt>(std::vector<ExprPtr>{}, kSpan)});
+  SyncFootprintResolver resolver(fn);
+  const auto offset = [&](const VarPtr& view) {
+    const auto* resolved = resolver.ViewOf(view);
+    assert(resolved && resolved->fiber.kind == IterationFiber::Kind::AffineSlice);
+    assert(resolved->fiber.frame == loop.get());
+    assert(resolved->fiber.coeff == 32 && resolved->fiber.extent == 32);
+    return resolved->fiber.offset;
+  };
+  // b begins one FP32 row into a. On every trip, a[i + 1] aliases b[i], and b[i + 1] is adjacent.
+  assert(offset(a_next) == 64);
+  assert(offset(b_current) == 64);
+  assert(offset(b_next) == 96);
+  // window begins at wide[1, 8]: byte 1024 + (64 + 8) * 4. Each column fiber moves eight FP32s per trip.
+  assert(offset(direct) == 1312);
+  assert(offset(nested) == 1312);
+  assert(offset(adjacent) == 1344);
+}
+
 // ============================================================================
 // B4: Init-Guard k0==0, Geometry Enclosing Capture, Tier 2 Class A & B, 64-bit Rearm
 // ============================================================================
@@ -1273,6 +1320,7 @@ int main() {
   pypto::ir::sync::TestB1PositiveTripCompletionAndRelay();
   pypto::ir::sync::TestB2StridedVecAndMatStorageClasses();
   pypto::ir::sync::TestB3IterationFiberRefinement();
+  pypto::ir::sync::TestAffineVecPhysicalByteOrigins();
   pypto::ir::sync::TestB4InitGuardAndSubblockPromotion();
   pypto::ir::sync::TestRound1AuditFixes();
   pypto::ir::sync::TestRound2AuditAndCleanupFixes();

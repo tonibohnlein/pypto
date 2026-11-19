@@ -52,6 +52,35 @@ bool IsMatrixSpace(MemorySpace space) {
          space == MemorySpace::Acc;
 }
 
+bool FitsAffineByteInterval(__int128 origin, __int128 extent) {
+  constexpr auto kMax = std::numeric_limits<int64_t>::max();
+  // The constant origin can be negative when the symbolic base adds a displacement.
+  return origin >= std::numeric_limits<int64_t>::min() && origin <= kMax && extent > 0 && extent <= kMax &&
+         origin + extent <= kMax;
+}
+
+IterationFiber MakeVecAffineFiber(const SymbolicIntRange& axis, int64_t stride_bytes, __int128 fixed_origin,
+                                  __int128 extent) {
+  const __int128 coeff = __int128(axis.affine_coeff) * stride_bytes;
+  const __int128 origin = fixed_origin + __int128(axis.affine_base) * stride_bytes;
+  if (coeff < std::numeric_limits<int64_t>::min() || coeff > std::numeric_limits<int64_t>::max() ||
+      !FitsAffineByteInterval(origin, extent)) {
+    return IterationFiber::Wildcard();
+  }
+
+  IterationFiber fiber;
+  fiber.kind = IterationFiber::Kind::AffineSlice;
+  fiber.frame = axis.affine_frame;
+  fiber.coeff = static_cast<int64_t>(coeff);
+  fiber.offset = static_cast<int64_t>(origin);
+  fiber.extent = static_cast<int64_t>(extent);
+  if (axis.symbolic_base) {
+    const auto& span = axis.symbolic_base->span_;
+    fiber.symbolic_base = MakeMul(axis.symbolic_base, MakeIndexConst(stride_bytes, span), span);
+  }
+  return fiber;
+}
+
 bool IsTransposedMatPair(const SyncCanonicalRoot& root, const BufferTypePtr& type) {
   if (!root.canonical_layout || !type) return false;
   if (type->memory_space_ != MemorySpace::Mat || root.space != MemorySpace::Mat) return false;
@@ -606,10 +635,9 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
       if (r_opt) view.view_offsets[0] = *r_opt;
       if (c_opt) view.view_offsets[1] = *c_opt;
 
-      // Only tighten byte_hull relative to parent's base_byte_offset when parent itself is not
-      // already an uncertain moving subview with wider span than base_byte_offset!
-      // Specifically, parent->byte_hull->begin is parent's min byte address; parent's max offset is
-      // bounded by parent->byte_hull->end.
+      // A moving parent's base_byte_offset is only a lower bound. For a chained
+      // subview, require a lattice of exactly the parent's static shape: any
+      // movement in the lattice adds rows or widens its byte intervals.
       const bool parent_static_origin =
           (parent->kind == SyncViewKind::PlacedLocal) ||
           (parent->kind == SyncViewKind::Slot && parent->slot_selector &&
@@ -624,8 +652,8 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
         const __int128 begin =
             __int128(parent->base_byte_offset) + __int128(r_lo) * pitch + __int128(c_lo) * elem_bytes;
         const __int128 end = __int128(parent->base_byte_offset) +
-                             __int128(r_hi + dst_type->shape_[0] - 1) * pitch +
-                             __int128(c_hi + dst_type->shape_[1]) * elem_bytes;
+                             (__int128(r_hi) + dst_type->shape_[0] - 1) * pitch +
+                             (__int128(c_hi) + dst_type->shape_[1]) * elem_bytes;
         if (begin >= parent->byte_hull->begin && end > begin && end <= parent->byte_hull->end) {
           view.byte_hull =
               backend::BufferSyncByteWindow{static_cast<int64_t>(begin), static_cast<int64_t>(end)};
@@ -688,50 +716,21 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
                                      (c_hi - c_lo + dst_type->shape_[1]) * elem_bytes, false};
           }
 
-          // Extract AffineSlice fiber wrt single loop frame if row or column is affine.
+          // Fiber consumers can compare distinct allocations whose byte hulls
+          // overlap. Use the parent's physical origin and the fixed orthogonal
+          // offset to put both fibers in the same byte coordinate system.
           const __int128 slice_extent =
               __int128(dst_type->shape_[0] - 1) * pitch + __int128(dst_type->shape_[1]) * elem_bytes;
-          if (slice_extent >= 0 && slice_extent <= std::numeric_limits<int64_t>::max()) {
-            if (r_opt && r_opt->affine_frame && r_opt->modulus == 0 && r_opt->affine_coeff != 0 &&
-                ((c_opt && !c_opt->affine_frame && c_opt->is_const()) || max_c == 0)) {
-              const __int128 c_bytes = __int128(r_opt->affine_coeff) * pitch;
-              const __int128 b_bytes = __int128(r_opt->affine_base) * pitch + __int128(c_lo) * elem_bytes;
-              if (c_bytes >= std::numeric_limits<int64_t>::min() &&
-                  c_bytes <= std::numeric_limits<int64_t>::max() &&
-                  b_bytes >= std::numeric_limits<int64_t>::min() &&
-                  b_bytes + slice_extent <= std::numeric_limits<int64_t>::max()) {
-                view.fiber.kind = IterationFiber::Kind::AffineSlice;
-                view.fiber.frame = r_opt->affine_frame;
-                view.fiber.coeff = static_cast<int64_t>(c_bytes);
-                view.fiber.offset = static_cast<int64_t>(b_bytes);
-                view.fiber.extent = static_cast<int64_t>(slice_extent);
-                if (r_opt->symbolic_base) {
-                  view.fiber.symbolic_base =
-                      MakeMul(r_opt->symbolic_base, MakeIndexConst(pitch, r_opt->symbolic_base->span_),
-                              r_opt->symbolic_base->span_);
-                }
-              }
-            } else if (c_opt && c_opt->affine_frame && c_opt->modulus == 0 && c_opt->affine_coeff != 0 &&
-                       ((r_opt && !r_opt->affine_frame && r_opt->is_const()) || max_r == 0) &&
-                       dst_type->shape_[0] == 1) {
-              const __int128 c_bytes = __int128(c_opt->affine_coeff) * elem_bytes;
-              const __int128 b_bytes = __int128(r_lo) * pitch + __int128(c_opt->affine_base) * elem_bytes;
-              if (c_bytes >= std::numeric_limits<int64_t>::min() &&
-                  c_bytes <= std::numeric_limits<int64_t>::max() &&
-                  b_bytes >= std::numeric_limits<int64_t>::min() &&
-                  b_bytes + slice_extent <= std::numeric_limits<int64_t>::max()) {
-                view.fiber.kind = IterationFiber::Kind::AffineSlice;
-                view.fiber.frame = c_opt->affine_frame;
-                view.fiber.coeff = static_cast<int64_t>(c_bytes);
-                view.fiber.offset = static_cast<int64_t>(b_bytes);
-                view.fiber.extent = static_cast<int64_t>(slice_extent);
-                if (c_opt->symbolic_base) {
-                  view.fiber.symbolic_base =
-                      MakeMul(c_opt->symbolic_base, MakeIndexConst(elem_bytes, c_opt->symbolic_base->span_),
-                              c_opt->symbolic_base->span_);
-                }
-              }
-            }
+          const __int128 parent_origin = parent->base_byte_offset;
+          if (r_opt && r_opt->affine_frame && r_opt->modulus == 0 && r_opt->affine_coeff != 0 &&
+              ((c_opt && !c_opt->affine_frame && c_opt->is_const()) || max_c == 0)) {
+            view.fiber =
+                MakeVecAffineFiber(*r_opt, pitch, parent_origin + __int128(c_lo) * elem_bytes, slice_extent);
+          } else if (c_opt && c_opt->affine_frame && c_opt->modulus == 0 && c_opt->affine_coeff != 0 &&
+                     ((r_opt && !r_opt->affine_frame && r_opt->is_const()) || max_r == 0) &&
+                     dst_type->shape_[0] == 1) {
+            view.fiber =
+                MakeVecAffineFiber(*c_opt, elem_bytes, parent_origin + __int128(r_lo) * pitch, slice_extent);
           }
         }
       } else if (parent->vec_lattice && c_lo == c_hi && r_lo == r_hi && r_lo == 0 &&
@@ -755,10 +754,9 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
           }
           if (parent->fiber.kind == IterationFiber::Kind::AffineSlice && dst_type->shape_[0] == 1) {
             const __int128 slice_extent = __int128(dst_type->shape_[1]) * elem_bytes;
+            // The parent fiber already carries the physical origin and movement.
             const __int128 new_off = __int128(parent->fiber.offset) + __int128(c_lo) * elem_bytes;
-            if (slice_extent >= 0 && slice_extent <= std::numeric_limits<int64_t>::max() &&
-                new_off >= std::numeric_limits<int64_t>::min() &&
-                new_off + slice_extent <= std::numeric_limits<int64_t>::max()) {
+            if (FitsAffineByteInterval(new_off, slice_extent)) {
               view.fiber = parent->fiber;
               view.fiber.offset = static_cast<int64_t>(new_off);
               view.fiber.extent = static_cast<int64_t>(slice_extent);
