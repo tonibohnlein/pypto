@@ -225,6 +225,63 @@ void TestB1SyncControlRangeProver() {
   }
 }
 
+void TestB1RangeUseCuts() {
+  auto iv = MakeVar("row", IndexType());
+  auto shadow = MakeVar("row", IndexType());
+  auto late = MakeVar("late", IndexType());
+  auto condition = MakeVar("condition", BoolType());
+  auto parent_type = VecType(8, 16);
+  auto row_type = VecType(1, 16);
+  auto parent = MakeVar("parent", parent_type);
+  constexpr size_t kGuardDefinitions = 16;
+  constexpr size_t kSharedGuardViews = 32;
+  std::vector<StmtPtr> loop_body;
+  ExprPtr bound = CI(1 - static_cast<int64_t>(kGuardDefinitions));
+  for (size_t i = 0; i < kGuardDefinitions; ++i) {
+    auto next = MakeVar("bound_" + std::to_string(i), IndexType());
+    loop_body.push_back(std::make_shared<AssignStmt>(next, MakeAdd(bound, CI(1)), kSpan));
+    bound = next;
+  }
+  auto assign_guard = std::make_shared<AssignStmt>(condition, MakeLt(iv, bound), kSpan);
+  auto assign_shadow = std::make_shared<AssignStmt>(shadow, CI(5), kSpan);
+  auto else_view = BufferSubview(MakeVar("else", row_type), parent, iv, CI(0), row_type);
+  std::vector<StmtPtr> then_stmts{assign_shadow};
+  for (size_t i = 0; i < kSharedGuardViews; ++i) {
+    auto dst = MakeVar("then_" + std::to_string(i), row_type);
+    then_stmts.push_back(BufferSubview(dst, parent, iv, CI(0), row_type));
+  }
+  auto then_body = std::make_shared<SeqStmts>(then_stmts, kSpan);
+  auto branch = std::make_shared<IfStmt>(condition, then_body, else_view, std::vector<VarPtr>{}, kSpan);
+  loop_body.push_back(assign_guard);
+  loop_body.push_back(branch);
+  auto loop = SimpleFor(iv, CI(0), CI(2), CI(1), std::move(loop_body));
+  auto assign_late = std::make_shared<AssignStmt>(late, CI(7), kSpan);
+  auto end = std::make_shared<ReturnStmt>(std::vector<ExprPtr>{}, kSpan);
+  auto fn = MakeAicFn("range_use_cuts", {}, {}, {AllocBuf(parent, 0, parent_type), loop, assign_late, end});
+  const SyncControlRangeProver prover(fn);
+
+  // Query out of order to distinguish a cut's lexical facts from traversal state.
+  const auto in_else = prover.LookupAtCut(else_view.get(), iv);
+  assert(in_else && in_else->lo == 1 && in_else->hi == 1);
+  for (size_t i = 1; i < then_stmts.size(); ++i) {
+    const auto in_then = prover.LookupAtCut(then_stmts[i].get(), iv);
+    assert(in_then && in_then->lo == 0 && in_then->hi == 0);
+  }
+  assert(prover.Work().footprint_queries == 2 * (kSharedGuardViews + 1));
+  assert(prover.Work().fallback_definitions == 0);
+
+  const auto at_branch = prover.LookupAtCut(branch.get(), iv);
+  assert(at_branch && at_branch->lo == 0 && at_branch->hi == 1);
+  assert(at_branch->affine_frame == loop.get() && at_branch->affine_coeff == 1);
+  const auto local = prover.LookupAtCut(then_stmts.back().get(), shadow);
+  assert(local && local->is_const() && local->lo == 5);
+  assert(!prover.LookupAtCut(else_view.get(), shadow));
+  assert(!prover.LookupAtCut(end.get(), iv));
+  assert(!prover.LookupAtCut(assign_late.get(), late));
+  const auto after = prover.LookupAtCut(end.get(), late);
+  assert(after && after->is_const() && after->lo == 7);
+}
+
 void TestB1PositiveTripCompletionAndRelay() {
   // Promoted ForStmt child (positive-trip): MTE2 loads x, V adds x ->
   // positive-trip prover makes MTE2->V relay and post_write_safe visible in parent!
@@ -1317,6 +1374,7 @@ void TestRound2AuditAndCleanupFixes() {
 int main() {
   pypto::backend::BackendConfig::SetBackendType(pypto::backend::BackendType::Ascend910);
   pypto::ir::sync::TestB1SyncControlRangeProver();
+  pypto::ir::sync::TestB1RangeUseCuts();
   pypto::ir::sync::TestB1PositiveTripCompletionAndRelay();
   pypto::ir::sync::TestB2StridedVecAndMatStorageClasses();
   pypto::ir::sync::TestB3IterationFiberRefinement();

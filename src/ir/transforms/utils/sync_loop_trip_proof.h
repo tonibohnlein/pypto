@@ -12,6 +12,7 @@
 #ifndef SRC_IR_TRANSFORMS_UTILS_SYNC_LOOP_TRIP_PROOF_H_
 #define SRC_IR_TRANSFORMS_UTILS_SYNC_LOOP_TRIP_PROOF_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -43,8 +44,15 @@ struct SymbolicIntRange {
   bool is_const() const { return lo == hi; }
 };
 
-// Shared O(N) non-wrapping __int128 range and trip-count prover for synchronization
+struct SyncControlRangeWork {
+  size_t indexed_definitions = 0;
+  size_t footprint_queries = 0;
+  size_t fallback_definitions = 0;
+};
+
+// Shared non-wrapping __int128 range and trip-count prover for synchronization
 // consumers (SyncFootprintResolver, ConservativeSyncDataflow, ClosedPrefixSync).
+// Footprint operands are analyzed at the original cuts in a single scoped walk.
 //
 // Soundness invariants:
 // - Correlated difference cancellation (e.g. (base + 64) - base) is strictly gated
@@ -73,6 +81,7 @@ class SyncControlRangeProver {
   // Query bounds + affine decomposition of `expr` under the dominating constraints
   // at `cut` (or function-level bounds if `cut == nullptr`).
   std::optional<SymbolicIntRange> LookupAtCut(const Stmt* cut, const ExprPtr& expr) const;
+  SyncControlRangeWork Work() const;
 
  private:
   class Impl;

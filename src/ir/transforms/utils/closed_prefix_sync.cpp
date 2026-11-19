@@ -68,14 +68,20 @@ RelayMatrix IntersectRelay(const RelayMatrix& a, const RelayMatrix& b) {
   return out;
 }
 
+RelayMask RelayReach(const RelayMatrix& matrix, RelayMask sources) {
+  RelayMask reached = 0;
+  for (size_t i = 0; i < kRelayPipeCount; ++i) {
+    if ((sources & (RelayMask{1} << i)) != 0) {
+      reached |= matrix[i];
+    }
+  }
+  return reached;
+}
+
 RelayMatrix ComposeRelay(const RelayMatrix& first, const RelayMatrix& second) {
   RelayMatrix out{};
   for (size_t i = 0; i < kRelayPipeCount; ++i) {
-    RelayMask r = first[i];
-    for (size_t mid = 0; mid < kRelayPipeCount; ++mid) {
-      if ((first[i] & (RelayMask{1} << mid)) != 0) r |= second[mid];
-    }
-    out[i] = r;
+    out[i] = first[i] | RelayReach(second, first[i]);
   }
   return out;
 }
@@ -89,8 +95,62 @@ void ApplyCapturedRelayEdge(RelayMatrix& matrix, const RelayMatrix& captured, Re
   }
 }
 
-void ApplyRelayEdge(RelayMatrix& matrix, PipeType src, PipeType dst) {
-  ApplyCapturedRelayEdge(matrix, matrix, RelayPipeBit(src), RelayPipeBit(dst));
+struct SeqWaitEdge {
+  size_t rec_idx;
+  size_t wait_idx;
+  PipeType src;
+  PipeType dst;
+};
+
+struct SeqRelays {
+  // Cut i is before child i, and cut n is after the last child.
+  std::vector<RelayMatrix> prefix;  // Reachability from cut 0 to cut i.
+  std::vector<RelayMatrix> suffix;  // Reachability from cut i to cut n.
+};
+
+SeqRelays ComputeSequenceRelays(const std::vector<RelayMatrix>& children,
+                                const std::vector<SeqWaitEdge>& waits, size_t& suffix_visits) {
+  const size_t n = children.size();
+  const auto identity = IdentityRelay();
+  SeqRelays out{std::vector<RelayMatrix>(n + 1, identity), std::vector<RelayMatrix>(n + 1, identity)};
+  std::vector<const SeqWaitEdge*> capture_at(n, nullptr);
+  for (const auto& wait : waits) {
+    // Discover accepts only one wait per record on this lowering path.
+    capture_at[wait.rec_idx] = &wait;
+  }
+
+  // Each child connects adjacent cuts. Each capture connects the cut before
+  // its record to the cut after its wait. Both kinds of edges go forward.
+  for (size_t i = 0; i < n; ++i) {
+    const auto flow = children[i] == identity ? out.prefix[i] : ComposeRelay(out.prefix[i], children[i]);
+    for (size_t p = 0; p < kRelayPipeCount; ++p) {
+      out.prefix[i + 1][p] |= flow[p];
+    }
+    if (const auto* wait = capture_at[i]) {
+      ApplyCapturedRelayEdge(out.prefix[wait->wait_idx + 1], out.prefix[i], RelayPipeBit(wait->src),
+                             RelayPipeBit(wait->dst));
+    }
+  }
+
+  // Reverse the cut traversal to summarize every suffix in one pass. The
+  // capture edge contributes only at its record cut, so a suffix starting
+  // after the record cannot acquire facts from its later wait.
+  for (size_t cut = n; cut > 0; --cut) {
+    ++suffix_visits;
+    const size_t i = cut - 1;
+    out.suffix[i] = children[i] == identity ? out.suffix[cut] : ComposeRelay(children[i], out.suffix[cut]);
+    if (const auto* wait = capture_at[i]) {
+      ++suffix_visits;
+      const auto source = RelayPipeBit(wait->src);
+      const auto reached = RelayReach(out.suffix[wait->wait_idx + 1], RelayPipeBit(wait->dst));
+      for (size_t p = 0; p < kRelayPipeCount; ++p) {
+        if ((source & (RelayMask{1} << p)) != 0) {
+          out.suffix[i][p] |= reached;
+        }
+      }
+    }
+  }
+  return out;
 }
 
 RelayMatrix ComputeChildLoopRelayMatrix(const StmtPtr& root, const SyncControlRangeProver& prover) {
@@ -614,17 +674,10 @@ class Assignment {
   // The loop-closure decision determines which physical directions exist,
   // independently of their lane assignment. Retained children use the same
   // decision before the parent plans its entry protocols.
-  static void PlanOneWayClosure(const FunctionPtr& owner, Discover& discovered,
-                                const SyncControlRangeProver& prover) {
-    // Index statement ordering/edges inside loops so we only fall back to the
-    // 4-command protocol when a 1-way loop edge lacks an unconditional reverse cycle.
-    // A wait at `wait_idx` only relays completion facts captured on `source` at `rec_idx`.
-    struct SeqWaitEdge {
-      size_t rec_idx;
-      size_t wait_idx;
-      PipeType src;
-      PipeType dst;
-    };
+  static size_t PlanOneWayClosure(const FunctionPtr& owner, Discover& discovered,
+                                  const SyncControlRangeProver& prover) {
+    // Fall back to the 4-command protocol when a 1-way loop edge lacks an
+    // unconditional reverse cycle.
     std::unordered_map<const SeqStmts*, std::vector<SeqWaitEdge>> seq_wait_edges;
     for (const auto& ow : discovered.one_way) {
       if (ow.parent_seq) {
@@ -632,18 +685,15 @@ class Assignment {
       }
     }
 
-    // Precompute O(N) bottom-up relay summaries + prefix/suffix tables for SeqStmts so each
-    // 1-way transaction checks loop backedge closure in O(nesting_depth).
-    struct SeqRelays {
-      std::vector<RelayMatrix> prefix;
-      std::vector<RelayMatrix> suffix;
-    };
+    // Precompute bottom-up relay summaries and cut tables in O(statements + waits)
+    // so each transaction checks loop backedge closure in O(nesting_depth).
     struct AncestorLink {
       const Stmt* parent = nullptr;
       size_t index_in_seq = 0;
     };
     std::unordered_map<const Stmt*, SeqRelays> seq_relays;
     std::unordered_map<const Stmt*, AncestorLink> ancestors;
+    size_t suffix_visits = 0;
 
     std::function<RelayMatrix(const StmtPtr&)> precompute = [&](const StmtPtr& s) -> RelayMatrix {
       if (!s) return IdentityRelay();
@@ -655,52 +705,10 @@ class Assignment {
           if (c) ancestors[c.get()] = {seq.get(), i};
           child_sums[i] = precompute(c);
         }
-        std::unordered_map<size_t, std::vector<SeqWaitEdge>> edges_at_wait;
-        bool has_non_adjacent_edge = false;
-        if (const auto found = seq_wait_edges.find(seq.get()); found != seq_wait_edges.end()) {
-          for (const auto& edge : found->second) {
-            edges_at_wait[edge.wait_idx].push_back(edge);
-            if (edge.wait_idx > edge.rec_idx + 1 || child_sums[edge.rec_idx] != IdentityRelay()) {
-              has_non_adjacent_edge = true;
-            }
-          }
-        }
-        auto scan_from = [&](size_t start_idx, std::vector<RelayMatrix>& pref) {
-          pref.assign(n + 1, IdentityRelay());
-          for (size_t i = start_idx; i < n; ++i) {
-            RelayMatrix next = ComposeRelay(pref[i], child_sums[i]);
-            if (const auto wit = edges_at_wait.find(i); wit != edges_at_wait.end()) {
-              for (const auto& edge : wit->second) {
-                if (edge.rec_idx < start_idx) continue;
-                ApplyCapturedRelayEdge(next, pref[edge.rec_idx], RelayPipeBit(edge.src),
-                                       RelayPipeBit(edge.dst));
-              }
-            }
-            pref[i + 1] = next;
-          }
-        };
-        SeqRelays sr;
-        scan_from(0, sr.prefix);
-        sr.suffix.assign(n, IdentityRelay());
-        if (n > 0) {
-          if (!has_non_adjacent_edge) {
-            std::vector<RelayMatrix> effective_child = child_sums;
-            for (const auto& [wait_idx, edges] : edges_at_wait) {
-              for (const auto& edge : edges) {
-                ApplyRelayEdge(effective_child[wait_idx], edge.src, edge.dst);
-              }
-            }
-            for (size_t i = n - 1; i-- > 0;) {
-              sr.suffix[i] = ComposeRelay(effective_child[i + 1], sr.suffix[i + 1]);
-            }
-          } else {
-            std::vector<RelayMatrix> scratch;
-            for (size_t i = 0; i < n; ++i) {
-              scan_from(i + 1, scratch);
-              sr.suffix[i] = scratch[n];
-            }
-          }
-        }
+        const auto found = seq_wait_edges.find(seq.get());
+        const std::vector<SeqWaitEdge> no_waits;
+        SeqRelays sr = ComputeSequenceRelays(
+            child_sums, found == seq_wait_edges.end() ? no_waits : found->second, suffix_visits);
         const RelayMatrix total = sr.prefix[n];
         seq_relays.emplace(seq.get(), std::move(sr));
         return total;
@@ -755,7 +763,7 @@ class Assignment {
             const AncestorLink& link = ait->second;
             if (const auto sit = seq_relays.find(link.parent); sit != seq_relays.end()) {
               mat = is_prefix ? ComposeRelay(sit->second.prefix[link.index_in_seq], mat)
-                              : ComposeRelay(mat, sit->second.suffix[link.index_in_seq]);
+                              : ComposeRelay(mat, sit->second.suffix[link.index_in_seq + 1]);
             }
             cur = link.parent;
           }
@@ -784,6 +792,7 @@ class Assignment {
       ow.loop_pre_reach = closed_all ? pre_reach_all : 0;
       ow.loop_post_reach = closed_all ? post_reach_all : 0;
     }
+    return suffix_visits;
   }
 
   Assignment(const FunctionPtr& owner, Discover& discovered, const NativeOperations& native_ops,
@@ -798,7 +807,7 @@ class Assignment {
     for (const auto& [direction, ids] : extra_reservations)
       reservations_[direction].insert(ids.begin(), ids.end());
 
-    PlanOneWayClosure(owner, discovered, prover);
+    suffix_visits_ = PlanOneWayClosure(owner, discovered, prover);
 
     // Allocate directional IDs for all 1-way transactions (both 2-cmd and 4-cmd fallback),
     // tracking in-flight lifetimes so concurrent operations never share a flag ID and
@@ -1357,6 +1366,7 @@ class Assignment {
   size_t Barriers() const { return barriers_; }
   size_t OneWaySites() const { return one_way_sites_; }
   size_t OneWayFallbackSites() const { return one_way_fallback_sites_; }
+  size_t SuffixVisits() const { return suffix_visits_; }
 
  private:
   std::map<const Stmt*, AssignedCommand> commands_;
@@ -1366,6 +1376,7 @@ class Assignment {
   size_t barriers_ = 0;
   size_t one_way_sites_ = 0;
   size_t one_way_fallback_sites_ = 0;
+  size_t suffix_visits_ = 0;
 };
 
 class Emit : public SyncStatementMutator {
@@ -1677,7 +1688,7 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
 
   std::map<const ForStmt*, StmtPtr> children;
   ChildResourceDirections child_directions;
-  size_t child_sets = 0, child_waits = 0, child_barriers = 0, child_lanes = 0;
+  size_t child_sets = 0, child_waits = 0, child_barriers = 0, child_lanes = 0, child_suffix_visits = 0;
   const auto bindings =
       discovered.children.empty()
           ? std::optional<SyncRegionBindings>{}
@@ -1784,6 +1795,7 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     for (const auto& plan : lowered.physical_cases) {
       child_barriers += plan.barrier_sites;
       child_lanes += plan.reserved_lanes;
+      child_suffix_visits += plan.closed_prefix_suffix_visits;
     }
   }
 
@@ -1797,6 +1809,7 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
   result.wait_sites = assignment.OneWaySites() + assignment.OneWayFallbackSites() + child_waits;
   result.barrier_sites = assignment.Barriers() + child_barriers;
   result.reserved_lanes = assignment.Roles() + child_lanes;
+  result.closed_prefix_suffix_visits = assignment.SuffixVisits() + child_suffix_visits;
   result.native_reserved_ids = assignment.NativeClaimed();
   return result;
 }

@@ -1122,6 +1122,10 @@ class Builder {
   void Build() {
     Read(function_->body_);
     RefineStorage();
+    const auto range_work = trip_prover_.Work();
+    cost.range_indexed_definitions = range_work.indexed_definitions;
+    cost.range_footprint_queries = range_work.footprint_queries;
+    cost.range_fallback_definitions = range_work.fallback_definitions;
     for (size_t idx = 0; idx < children.size(); ++idx) {
       auto& child = children[idx];
       if (child.IsSubblockSlice()) {

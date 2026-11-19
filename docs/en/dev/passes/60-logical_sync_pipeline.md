@@ -33,10 +33,15 @@ No physical event IDs are assigned at this stage.
 
 ## OptimizeSync
 
-The initial implementation verifies logical token schemas, ownership and lexical
-SSA uses and returns the same program. Lowering cannot depend on an optimization
-having run. Well-formedness does not establish dependence coverage or physical
-feasibility.
+Optimization verifies token schemas, execution ownership and lexical SSA uses.
+It simplifies join bindings with completed or identical operands, removes waits
+on known completed tokens and redundant waits, then removes unused record,
+completed and join bindings and token aliases. A live record remains tied to
+its original capture position. Join simplification and liveness each traverse
+shared expressions by distinct DAG nodes and edges.
+
+`LowerSync` also accepts well-formed logical IR directly. Dependence coverage
+and physical feasibility require separate proofs.
 
 ## LowerSync
 
@@ -70,6 +75,11 @@ In default per-kernel mode, `LowerSync` keeps the barriers from a supplied
 barrier-only plan at their lowered positions. A caller can therefore order
 independent operations with a same-pipe wait while PTOAS adds synchronization
 for storage hazards elsewhere in the kernel.
+This applies even when a caller built the token program with `InsertSync`.
+The Default pipeline calls `RealizeSync` once. It uses the same logical
+optimizer and physical lowering, and still has the original placed kernel.
+When its automatic plan contains only local barriers, it hands that original
+kernel to PTOAS for synchronization.
 
 ## Finite validity argument and costs
 
@@ -330,9 +340,7 @@ and already-owned physical plans refuse before all delegation exits.
 
 The wrapper collects caller evidence once because its own insertion preserves
 callers, scalar definitions, payloads and control. Public `LowerSync` continues
-to collect fresh evidence from its current input. `OptimizeSync` currently
-verifies without rewriting tokens. No additional token simplification or
-hardware exemption is introduced by this orchestration change.
+to collect fresh evidence from its current input.
 
 The historical direct construction is available through explicit testing APIs.
 The invocation qualification driver uses those APIs for its baseline, so it does
