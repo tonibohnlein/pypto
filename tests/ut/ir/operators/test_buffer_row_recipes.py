@@ -249,6 +249,26 @@ _COLUMN_BROADCASTS = tuple(f"col_expand_{op}" for op in ("add", "sub", "mul", "d
 _COLUMN_RECIPES = (*_COLUMN_REDUCTIONS, *_COLUMN_BROADCASTS)
 
 
+@pytest.mark.usefixtures("ascend_backend")
+@pytest.mark.parametrize(
+    "rows,cols,field",
+    [
+        pytest.param(256, 8, "repeat count", id="repeat-256"),
+        pytest.param(257, 8, "repeat count", id="repeat-257"),
+        pytest.param(2, 2048, "repeat stride", id="stride-256-blocks"),
+    ],
+)
+def test_explicit_column_broadcast_rejects_native_overflow(rows: int, cols: int, field: str) -> None:
+    """Explicit static Buffer descriptors would select the A2/A3 uint8 normal-mode fields."""
+    arguments = [
+        _buffer("src", shape=[rows, cols]),
+        _buffer("row", shape=[1, cols]),
+        _buffer("dst", shape=[rows, cols]),
+    ]
+    with pytest.raises(ValueError, match=rf"A2/A3.*native {field}"):
+        _call("col_expand_mul", arguments)
+
+
 @pytest.mark.parametrize("suffix", _COLUMN_RECIPES)
 def test_column_effects_and_roundtrip(suffix):
     arguments = _args(suffix)

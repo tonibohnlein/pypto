@@ -105,8 +105,15 @@ def _elementwise_program(
     statements: list[ir.Stmt] = [
         ir.AssignStmt(root, ir.Call(ir.Op("tile.create"), [], root_type, span), span),
         ir.AssignStmt(source, ir.Call(ir.Op("tile.create"), [], source_type, span), span),
-        ir.AssignStmt(destination, ir.Call(ir.Op(f"tile.{operation}"), args, destination_type, span), span),
     ]
+    if operation == "col_expand_mul":
+        carrier_type = tile_type("carrier_base", (1, result_shape[1]))
+        carrier = ir.Var("carrier", carrier_type, span)
+        statements.append(ir.AssignStmt(carrier, ir.Call(ir.Op("tile.create"), [], carrier_type, span), span))
+        args = [source, carrier]
+    statements.append(
+        ir.AssignStmt(destination, ir.Call(ir.Op(f"tile.{operation}"), args, destination_type, span), span)
+    )
     result = destination
     if with_consumer:
         consumer_type = tile_type("consumer_base", root_shape if consume_root else result_shape)
@@ -153,6 +160,19 @@ def test_elementwise_output_uses_its_own_shape(operation, root_shape, result_sha
     assert f"{destinations[0]} = pto.treshape %root " in mlir, mlir
     assert _operands(_line(mlir, "pto.tstore"), "ins")[0] == destinations, mlir
     assert mlir.count("= pto.alloc_tile") == 2, mlir
+
+
+@pytest.mark.parametrize("rows", [255, 256])
+def test_retyped_column_broadcast_qualifies_actual_destination(rows):
+    program = _elementwise_program("col_expand_mul", (1, rows * 8), (rows, 8))
+    if rows > 255:
+        with pytest.raises(ValueError, match="repeat count"):
+            _generate(program)
+        return
+    mlir = _generate(program)
+    destination, types = _operands(_line(mlir, "pto.tcolexpandmul "), "outs")
+    assert f"{destination[0]} = pto.treshape %root " in mlir
+    assert f"v_row={rows}, v_col=8" in types[0]
 
 
 def test_reduction_output_uses_its_own_shape():
@@ -215,6 +235,43 @@ def test_matching_output_type_does_not_create_a_view(operation):
     _assert_operand_declarations(_line(mlir, f"pto.t{operation} ins("), _definitions(mlir))
     assert "pto.treshape" not in mlir, mlir
     assert mlir.count("= pto.alloc_tile") == 2, mlir
+
+
+def test_extract_checks_shared_destination_validity():
+    span = ir.Span.unknown()
+    zero = ir.ConstInt(0, pl.INDEX, span)
+    width = 65536
+    shape = [1, width]
+    valid = ir.TileView(valid_shape=[1, 65504])
+    root_storage = ir.MemRef(ir.Var("root_base", ir.PtrType(), span), zero, width, span)
+    source_storage = ir.MemRef(
+        ir.Var("source_base", ir.PtrType(), span), ir.ConstInt(width, pl.INDEX, span), width, span
+    )
+    root = ir.Var("root", ir.TileType(shape, pl.INT8, root_storage, None, ir.MemorySpace.Vec), span)
+    source = ir.Var("source", ir.TileType(shape, pl.INT8, source_storage, valid, ir.MemorySpace.Vec), span)
+    result = ir.Var("result", ir.TileType(shape, pl.INT8, root_storage, valid, ir.MemorySpace.Vec), span)
+    window = ir.MakeTuple([ir.ConstInt(dim, pl.INDEX, span) for dim in shape], span)
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(root, ir.Call(ir.Op("tile.create"), [], root.type, span), span),
+            ir.AssignStmt(source, ir.Call(ir.Op("tile.create"), [], source.type, span), span),
+            ir.AssignStmt(
+                result, ir.Call(ir.Op("tile.extract"), [source, zero, zero, window], result.type, span), span
+            ),
+            ir.ReturnStmt([], span),
+        ],
+        span,
+    )
+    function = ir.Function("kernel", [], [], body, span, ir.FunctionType.AIV)
+    program = ir.Program([function], "SharedExtractDestination", span)
+
+    # Without addresses both result tiles share the root's full-valid handle.
+    with pytest.raises(ValueError, match=r"A2/A3 TEXTRACT destination valid column extent"):
+        _generate(program)
+    addressed = _generate(program, emit_tile_addr=True)
+    destinations, _ = _operands(_line(addressed, "pto.textract"), "outs")
+    assert f"{destinations[0]} = pto.alloc_tile" in addressed
+    assert "valid_col = %c65504_index" in _line(addressed, f"{destinations[0]} = pto.alloc_tile")
 
 
 def _packed_fp4_destination_program(root_dtype, result_dtype) -> ir.Program:
