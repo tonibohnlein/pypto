@@ -819,6 +819,7 @@ nb::dict DescribePhysicalSync(const ir::sync::PhysicalSyncRealization& result) {
   out["shared_guard_sites"] = result.shared_guard_sites;
   out["shared_composed_guard_sites"] = result.shared_composed_guard_sites;
   out["control_statement_visits"] = result.control_statement_visits;
+  out["closed_prefix_suffix_visits"] = result.closed_prefix_suffix_visits;
   out["simplified_guard_sites"] = result.simplified_guard_sites;
   out["shared_control_values"] = result.shared_control_values;
   out["cut_domain_interval_visits"] = result.cut_domain_interval_visits;
@@ -1653,6 +1654,9 @@ void BindTesting(nb::module_& m) {
         counters["control_snapshot_facts"] = cost.control_snapshot_facts;
         counters["control_merge_facts"] = cost.control_merge_facts;
         counters["diagnostic_control_output_nodes"] = control_output_nodes;
+        counters["range_indexed_definitions"] = cost.range_indexed_definitions;
+        counters["range_footprint_queries"] = cost.range_footprint_queries;
+        counters["range_fallback_definitions"] = cost.range_fallback_definitions;
         nb::dict result;
         result["function"] = analysis.Function();
         result["sites"] = sites;

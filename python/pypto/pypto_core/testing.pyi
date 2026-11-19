@@ -229,6 +229,7 @@ class PhysicalSyncRealization(TypedDict):
     shared_guard_sites: int
     shared_composed_guard_sites: int
     control_statement_visits: int
+    closed_prefix_suffix_visits: int
     reuse_queries: int
     reserved_lanes: int
     native_reserved_ids: list[tuple[PipeType, PipeType, int]]

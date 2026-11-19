@@ -612,6 +612,8 @@ struct PhysicalSyncRealization {
   size_t schedule_body_visits = 0, schedule_descriptor_visits = 0;
   size_t schedule_original_nodes = 0, schedule_candidate_nodes = 0;
   size_t control_expression_visits = 0;
+  // Statement cuts and capture edges visited when building closed-prefix suffixes.
+  size_t closed_prefix_suffix_visits = 0;
   size_t reuse_queries = 0, reserved_lanes = 0;
   std::vector<std::tuple<PipeType, PipeType, int>> native_reserved_ids;  // Fixed macro owners.
   bool finite_minimum = true;

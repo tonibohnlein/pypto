@@ -15,6 +15,8 @@
 // This is command semantics, not access-conflict analysis or demand reduction.
 // Original operation/footprint import is reused for pipe/native qualification;
 // its normalization costs are separate from these token-interpretation bounds.
+// OptimizeSync is independent of physical qualification. Its shared join
+// simplifier and backward liveness expand each expression DAG node once.
 #include "src/ir/transforms/utils/token_sync_lowering.h"
 
 #include <algorithm>
@@ -404,19 +406,7 @@ namespace {
 //    - eliminate dominated duplicate `(token, dst)` waits,
 //    - eliminate intra-bundle FIFO-subsumed waits on the same producer pipe.
 // 2. Backward liveness DCE removing dead `sync.record`/`sync.completed`/`sync.join` bindings.
-class ForwardSyncOptimizer : public IRMutator {
- public:
-  StmtPtr Run(const StmtPtr& body) {
-    waited_masks_.clear();
-    completed_.clear();
-    local_record_.clear();
-    alias_of_.clear();
-    record_seq_ = 0;
-    scope_depth_ = 0;
-    next_scope_id_ = 1;
-    return VisitStmt(body);
-  }
-
+class ForwardSyncOptimizer : public SyncStatementMutator {
  protected:
   StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
     std::vector<StmtPtr> rewritten;
@@ -481,25 +471,8 @@ class ForwardSyncOptimizer : public IRMutator {
     completed_.erase(op->var_.get());
     local_record_.erase(op->var_.get());
     waited_masks_.erase(op->var_.get());
-    auto bind_alias = [&](const VarPtr& target, const VarPtr& rhs) -> StmtPtr {
-      const VarPtr root = Canonical(rhs);
-      alias_of_[target.get()] = root;
-      if (completed_.count(root.get())) completed_.insert(target.get());
-      if (const auto rec = local_record_.find(root.get()); rec != local_record_.end()) {
-        local_record_[target.get()] = rec->second;
-      }
-      return std::make_shared<AssignStmt>(target, root, op->span_, op->leading_comments_);
-    };
     if (const auto rhs_var = AsVarLike(op->value_)) {
-      const VarPtr root = Canonical(rhs_var);
-      alias_of_[op->var_.get()] = root;
-      if (completed_.count(root.get())) completed_.insert(op->var_.get());
-      if (const auto rec = local_record_.find(root.get()); rec != local_record_.end()) {
-        local_record_[op->var_.get()] = rec->second;
-      }
-      return root.get() == rhs_var.get()
-                 ? StmtPtr(op)
-                 : std::make_shared<AssignStmt>(op->var_, root, op->span_, op->leading_comments_);
+      return BindAlias(op, Canonical(rhs_var));
     }
     if (const auto call = As<Call>(op->value_)) {
       if (IsOp(call, "sync.completed")) {
@@ -510,36 +483,12 @@ class ForwardSyncOptimizer : public IRMutator {
         local_record_[op->var_.get()] = {RequireSyncPipeKwarg(call, "pipe"), scope_depth_, record_seq_++};
         return op;
       }
-      if (IsOp(call, "sync.join") && call->args_.size() == 2) {
-        auto is_completed_expr = [&](const ExprPtr& e) -> bool {
-          if (const auto c = As<Call>(e); c && IsOp(c, "sync.completed")) return true;
-          if (const auto v = AsVarLike(e)) return completed_.count(v.get()) != 0;
-          return false;
-        };
-        std::function<ExprPtr(const ExprPtr&)> simplify_join = [&](const ExprPtr& e) -> ExprPtr {
-          if (const auto v = AsVarLike(e)) return Canonical(v);
-          const auto c = As<Call>(e);
-          if (!c || !IsOp(c, "sync.join") || c->args_.size() != 2) return e;
-          ExprPtr lhs = simplify_join(c->args_[0]);
-          ExprPtr rhs = simplify_join(c->args_[1]);
-          const bool lc = is_completed_expr(lhs);
-          const bool rc = is_completed_expr(rhs);
-          if (lc && !rc) return rhs;
-          if (rc) return lhs;
-          const auto va = AsVarLike(lhs);
-          const auto vb = AsVarLike(rhs);
-          if (va && vb && va.get() == vb.get()) return va;
-          if (lhs.get() != c->args_[0].get() || rhs.get() != c->args_[1].get()) {
-            return OpRegistry::GetInstance().Create(c->op_->name_, {std::move(lhs), std::move(rhs)},
-                                                    c->kwargs_, c->span_);
-          }
-          return e;
-        };
-        const ExprPtr simplified_rhs = simplify_join(call);
+      if (IsOp(call, "sync.join")) {
+        const ExprPtr simplified_rhs = SimplifyJoin(call);
         if (const auto v = AsVarLike(simplified_rhs)) {
-          return bind_alias(op->var_, v);
+          return BindAlias(op, v);
         }
-        if (is_completed_expr(simplified_rhs)) {
+        if (IsCompleted(simplified_rhs)) {
           completed_.insert(op->var_.get());
         }
         if (simplified_rhs.get() != op->value_.get()) {
@@ -671,6 +620,62 @@ class ForwardSyncOptimizer : public IRMutator {
     size_t scope_id;
     size_t seq;
   };
+  StmtPtr BindAlias(const AssignStmtPtr& assignment, const VarPtr& root) {
+    const auto* target = assignment->var_.get();
+    alias_of_[target] = root;
+    if (completed_.count(root.get())) {
+      completed_.insert(target);
+    }
+    if (const auto record = local_record_.find(root.get()); record != local_record_.end()) {
+      local_record_[target] = record->second;
+    }
+    if (root == assignment->value_) {
+      return assignment;
+    }
+    return std::make_shared<AssignStmt>(assignment->var_, root, assignment->span_,
+                                        assignment->leading_comments_);
+  }
+
+  bool IsCompleted(const ExprPtr& expression) const {
+    if (const auto call = As<Call>(expression)) {
+      return IsOp(call, "sync.completed");
+    }
+    const auto var = AsVarLike(expression);
+    return var && completed_.count(var.get()) != 0;
+  }
+
+  ExprPtr SimplifyJoin(const ExprPtr& expression) {
+    if (const auto var = AsVarLike(expression)) {
+      return Canonical(var);
+    }
+    const auto join = As<Call>(expression);
+    if (!join || !IsOp(join, "sync.join")) {
+      return expression;
+    }
+    if (const auto found = simplified_joins_.find(join.get()); found != simplified_joins_.end()) {
+      return found->second;
+    }
+    auto result = SimplifyJoinOperands(join);
+    simplified_joins_.emplace(join.get(), result);
+    return result;
+  }
+
+  ExprPtr SimplifyJoinOperands(const CallPtr& join) {
+    auto lhs = SimplifyJoin(join->args_[0]);
+    auto rhs = SimplifyJoin(join->args_[1]);
+    if (IsCompleted(rhs) || lhs == rhs) {
+      return lhs;
+    }
+    if (IsCompleted(lhs)) {
+      return rhs;
+    }
+    if (lhs == join->args_[0] && rhs == join->args_[1]) {
+      return join;
+    }
+    return OpRegistry::GetInstance().Create(join->op_->name_, {std::move(lhs), std::move(rhs)}, join->kwargs_,
+                                            join->span_);
+  }
+
   VarPtr Canonical(VarPtr v) const {
     while (v) {
       const auto it = alias_of_.find(v.get());
@@ -691,156 +696,83 @@ class ForwardSyncOptimizer : public IRMutator {
   std::unordered_set<const Var*> completed_;
   std::unordered_map<const Var*, RecordInfo> local_record_;
   std::unordered_map<const Var*, VarPtr> alias_of_;
+  // The verified input owns the keys for this whole function rewrite. Each
+  // operand has one SSA binding in every scope where the join can occur, so
+  // the alias/completed facts for a pure join are independent of the use site.
+  // A record is processed per assignment because its capture depends on position.
+  std::unordered_map<const Call*, ExprPtr> simplified_joins_;
   size_t record_seq_ = 0;
   size_t scope_depth_ = 0;
   size_t next_scope_id_ = 1;
 };
 
+bool CanEraseTokenDefinition(const AssignStmtPtr& assignment) {
+  if (!As<SyncTokenType>(assignment->var_->GetType())) {
+    return false;
+  }
+  if (const auto call = As<Call>(assignment->value_)) {
+    const auto kind = GetLogicalSyncKind(call->op_);
+    return kind == LogicalSyncKind::Completed || kind == LogicalSyncKind::Record ||
+           kind == LogicalSyncKind::Join;
+  }
+  return static_cast<bool>(AsVarLike(assignment->value_));
+}
+
 class SyncLivenessCollector : public IRVisitor {
  public:
   std::unordered_set<const Var*> Solve(const StmtPtr& body) {
+    // Collect removable definitions and seed the worklist with references from
+    // statements that will remain, including yields and loop initializers.
     VisitStmt(body);
-    std::deque<const Var*> work(live_.begin(), live_.end());
-    while (!work.empty()) {
-      const Var* cur = work.front();
-      work.pop_front();
-      if (const auto found = deps_.find(cur); found != deps_.end()) {
-        for (const Var* next : found->second) {
-          if (live_.insert(next).second) work.push_back(next);
-        }
+    while (!pending_.empty()) {
+      const auto* variable = pending_.front();
+      pending_.pop_front();
+      if (const auto definition = definitions_.find(variable); definition != definitions_.end()) {
+        VisitExpr(definition->second);
       }
     }
-    return live_;
+    return std::move(live_);
+  }
+
+  void VisitExpr(const ExprPtr& expression) override {
+    // Every reached expression contributes its token references to the same
+    // live set. Deferring removable RHSs avoids marking a dead use as reached.
+    if (expression && reached_.insert(expression.get()).second) {
+      IRVisitor::VisitExpr(expression);
+    }
   }
 
  protected:
-  void VisitExpr_(const VarPtr& var) override {
-    if (As<SyncTokenType>(var->GetType())) live_.insert(var.get());
-  }
-
-  void VisitExpr_(const IterArgPtr& arg) override {
-    if (As<SyncTokenType>(arg->GetType())) live_.insert(arg.get());
-  }
-
-  void VisitStmt_(const AssignStmtPtr& op) override {
-    if (!As<SyncTokenType>(op->var_->GetType())) {
-      IRVisitor::VisitStmt_(op);
-      return;
+  void VisitVarLike_(const VarPtr& variable) override {
+    if (As<SyncTokenType>(variable->GetType()) && live_.insert(variable.get()).second) {
+      pending_.push_back(variable.get());
     }
-    auto& dst = deps_[op->var_.get()];
-    std::function<void(const ExprPtr&)> collect_token_deps = [&](const ExprPtr& expr) {
-      if (!expr) return;
-      if (const auto v = AsVarLike(expr)) {
-        dst.push_back(v.get());
-        return;
-      }
-      if (const auto call = As<Call>(expr)) {
-        if (IsOp(call, "sync.completed") || IsOp(call, "sync.record")) return;
-        if (IsOp(call, "sync.join")) {
-          for (const auto& arg : call->args_) collect_token_deps(arg);
-          return;
-        }
-      }
-      VisitExpr(expr);
-    };
-    collect_token_deps(op->value_);
+    IRVisitor::VisitVarLike_(variable);
   }
 
-  void VisitStmt_(const IfStmtPtr& op) override {
-    VisitExpr(op->condition_);
-    std::vector<std::vector<const Var*>> targets(op->return_vars_.size());
-    for (size_t i = 0; i < op->return_vars_.size(); ++i) targets[i].push_back(op->return_vars_[i].get());
-    active_yield_targets_.push_back(std::move(targets));
-    VisitStmt(op->then_body_);
-    if (op->else_body_) VisitStmt(*op->else_body_);
-    active_yield_targets_.pop_back();
-  }
-
-  void VisitStmt_(const ForStmtPtr& op) override {
-    VisitExpr(op->start_);
-    VisitExpr(op->stop_);
-    VisitExpr(op->step_);
-    LinkLoop(op->iter_args_, op->return_vars_, op->body_);
-  }
-
-  void VisitStmt_(const WhileStmtPtr& op) override {
-    VisitExpr(op->condition_);
-    LinkLoop(op->iter_args_, op->return_vars_, op->body_);
-  }
-
-  void VisitStmt_(const YieldStmtPtr& op) override {
-    // Yielded SyncToken variables remain referenced inside YieldStmt unless the
-    // enclosing IfStmt/loop return arity is also pruned; keep them alive.
-    for (const auto& val : op->value_) VisitExpr(val);
-    if (active_yield_targets_.empty() || active_yield_targets_.back().size() != op->value_.size()) {
-      return;
-    }
-    const auto& targets = active_yield_targets_.back();
-    for (size_t i = 0; i < targets.size(); ++i) {
-      if (const auto v = AsVarLike(op->value_[i]); v && As<SyncTokenType>(v->GetType())) {
-        for (const Var* target : targets[i]) deps_[target].push_back(v.get());
-      }
+  void VisitStmt_(const AssignStmtPtr& assignment) override {
+    if (CanEraseTokenDefinition(assignment)) {
+      definitions_.emplace(assignment->var_.get(), assignment->value_);
+    } else {
+      IRVisitor::VisitStmt_(assignment);
     }
   }
 
  private:
-  void LinkLoop(const std::vector<IterArgPtr>& iter_args, const std::vector<VarPtr>& return_vars,
-                const StmtPtr& body) {
-    std::vector<std::vector<const Var*>> targets(iter_args.size());
-    for (size_t i = 0; i < iter_args.size(); ++i) {
-      const auto& arg = iter_args[i];
-      VisitExpr(arg->initValue_);
-      if (As<SyncTokenType>(arg->GetType())) {
-        if (const auto init_v = AsVarLike(arg->initValue_)) deps_[arg.get()].push_back(init_v.get());
-        targets[i].push_back(arg.get());
-        if (i < return_vars.size()) {
-          deps_[return_vars[i].get()].push_back(arg.get());
-          if (const auto init_v = AsVarLike(arg->initValue_))
-            deps_[return_vars[i].get()].push_back(init_v.get());
-          targets[i].push_back(return_vars[i].get());
-        }
-      }
-    }
-    active_yield_targets_.push_back(std::move(targets));
-    VisitStmt(body);
-    active_yield_targets_.pop_back();
-  }
-
   std::unordered_set<const Var*> live_;
-  std::unordered_map<const Var*, std::vector<const Var*>> deps_;
-  std::vector<std::vector<std::vector<const Var*>>> active_yield_targets_;
+  std::unordered_set<const Expr*> reached_;
+  std::unordered_map<const Var*, ExprPtr> definitions_;
+  std::deque<const Var*> pending_;
 };
 
-class DeadSyncTokenEraser : public IRMutator {
+class DeadSyncTokenEraser : public SyncStatementMutator {
  public:
   explicit DeadSyncTokenEraser(std::unordered_set<const Var*> live) : live_(std::move(live)) {}
 
  protected:
-  StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
-    std::vector<StmtPtr> out;
-    out.reserve(op->stmts_.size());
-    for (const auto& child : op->stmts_) {
-      auto next = VisitStmt(child);
-      if (const auto nested = As<SeqStmts>(next)) {
-        for (const auto& s : nested->stmts_) out.push_back(s);
-      } else {
-        out.push_back(std::move(next));
-      }
-    }
-    return std::make_shared<SeqStmts>(std::move(out), op->span_);
-  }
-
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
-    if (As<SyncTokenType>(op->var_->GetType()) && !live_.count(op->var_.get())) {
-      if (const auto call = As<Call>(op->value_)) {
-        const auto kind = GetLogicalSyncKind(call->op_);
-        if (kind == LogicalSyncKind::Completed || kind == LogicalSyncKind::Record ||
-            kind == LogicalSyncKind::Join) {
-          return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, op->span_);
-        }
-      } else if (AsVarLike(op->value_)) {
-        return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, op->span_);
-      }
+    if (CanEraseTokenDefinition(op) && !live_.count(op->var_.get())) {
+      return Empty(op->span_);
     }
     return op;
   }
@@ -854,7 +786,7 @@ class DeadSyncTokenEraser : public IRMutator {
 FunctionPtr OptimizeLogicalSync(const FunctionPtr& function) {
   CheckLogicalSync(function);
   if (!HasLogicalSync(function)) return function;
-  StmtPtr simplified = ForwardSyncOptimizer().Run(function->body_);
+  StmtPtr simplified = ForwardSyncOptimizer().VisitStmt(function->body_);
   std::unordered_set<const Var*> live = SyncLivenessCollector().Solve(simplified);
   StmtPtr cleaned = DeadSyncTokenEraser(std::move(live)).VisitStmt(simplified);
   if (cleaned == function->body_) return function;

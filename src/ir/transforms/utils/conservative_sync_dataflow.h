@@ -127,6 +127,9 @@ struct ConservativeSyncCost {
   size_t incoming_diagnostic_facts = 0;
   size_t control_snapshot_facts = 0;
   size_t control_merge_facts = 0;
+  size_t range_indexed_definitions = 0;
+  size_t range_footprint_queries = 0;
+  size_t range_fallback_definitions = 0;
 };
 
 // Published immutable input/evidence for a subsequent explicit conservative

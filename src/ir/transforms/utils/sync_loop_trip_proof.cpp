@@ -12,6 +12,8 @@
 #include "src/ir/transforms/utils/sync_loop_trip_proof.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -31,6 +33,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/buffer_acc_trim_analysis.h"
+#include "src/ir/transforms/utils/sync_footprint_resolver.h"
 #include "src/ir/transforms/utils/sync_transform_common.h"
 
 namespace pypto::ir::sync {
@@ -96,6 +99,12 @@ class SyncControlRangeProver::Impl {
     InitParametersAndScopes();
   }
 
+  SyncControlRangeWork Work() const {
+    auto work = work_;
+    work.fallback_definitions = fallback_definitions_.load(std::memory_order_relaxed);
+    return work;
+  }
+
   bool IsPositiveTrip(const ForStmt* loop) const {
     const auto it = loop_proofs_.find(loop);
     return it != loop_proofs_.end() && it->second.is_positive_trip;
@@ -138,56 +147,65 @@ class SyncControlRangeProver::Impl {
 
   std::optional<SymbolicIntRange> LookupAtCut(const Stmt* cut, const ExprPtr& expr) const {
     if (!expr || !IsSignedIntOrIndex(expr) || !analyzer_) return std::nullopt;
-    size_t target_scope = 0;
+    Cut target{0, clock_};
     if (cut) {
-      const auto it = stmt_scope_.find(cut);
-      if (it == stmt_scope_.end()) return std::nullopt;
-      target_scope = it->second;
+      const auto it = cuts_.find(cut);
+      if (it == cuts_.end() || ambiguous_cuts_.count(cut)) {
+        return std::nullopt;
+      }
+      target = it->second;
+      if (const auto stored = footprint_ranges_.find(cut); stored != footprint_ranges_.end()) {
+        for (const auto& result : stored->second) {
+          if (result.expression == expr.get()) {
+            return result.range;
+          }
+        }
+      }
     }
-    if (target_scope == 0) {
-      return EvaluateInCurrentAnalyzer(expr);
-    }
-    // Replay the scope chain from root (0) down to target_scope on a fresh analyzer
-    // or temporary scope stack on analyzer_. Since scopes_ holds lightweight parent links,
-    // depth is O(nesting <= 16).
+    const size_t target_scope = target.scope;
     std::vector<size_t> chain;
-    for (size_t cur = target_scope; cur != 0; cur = scopes_[cur].parent) {
-      chain.push_back(cur);
+    for (size_t scope = target_scope; scope != 0; scope = scopes_[scope].parent) {
+      chain.push_back(scope);
     }
-    std::reverse(chain.begin(), chain.end());
 
-    // Save/restore using an isolated Analyzer clone-less replay on a scratch Analyzer
-    // only when target_scope != 0. Using a small local Analyzer keeps LookupAtCut const & thread-safe.
+    // Non-footprint queries (e.g. a retained child's enclosing coordinate) can
+    // arrive at any cut. Recreate only the scalar dependencies of the expression
+    // and its dominating control facts, in their original order.
     auto scratch = std::make_shared<arith::Analyzer>();
     std::unordered_set<const Var*> scratch_ready;
     std::unordered_map<const Var*, ExprPtr> scratch_aliases;
     std::vector<const ForStmt*> scratch_loops;
     std::vector<arith::ConstraintContext> scratch_contexts;
+    auto dependencies = CollectDependencies(expr, target, chain);
 
-    BindRoot(*scratch, scratch_ready);
-    // Re-enter root-level SSA bounds first (any var whose defining scope is 0 or an ancestor).
-    std::unordered_set<size_t> active_scopes{0};
-    for (size_t sid : chain) active_scopes.insert(sid);
+    for (const auto& var : dependencies.parameters) {
+      const auto b = root_bindings_.at(var.get());
+      scratch_ready.insert(var.get());
+      if (b.is_const() && b.min_value > kBoundNegInf && b.max_value < kBoundPosInf) {
+        scratch->Bind(var, MakeConstInt(b.min_value, GetScalarDtype(var)));
+      }
+      scratch->const_int_bound.Update(var, b);
+    }
 
-    auto replay_defs = [&](size_t sid) {
-      for (const auto& def : scopes_[sid].defs) {
+    auto next = dependencies.definitions.begin();
+    auto bind_before = [&](size_t before) {
+      for (; next != dependencies.definitions.end() && (*next)->position < before; ++next) {
+        const auto& def = **next;
+        scratch_ready.insert(def.var.get());
         if (def.is_bool_alias) {
-          scratch_aliases[def.var.get()] = def.value;
-          scratch_ready.insert(def.var.get());
-        } else {
-          if (def.proved_bound) {
-            scratch_ready.insert(def.var.get());
-            scratch->const_int_bound.Update(def.var, ToConstIntBound(*def.proved_bound));
-          }
-          if (def.non_overflow_value) {
-            scratch->Bind(def.var, def.non_overflow_value);
-          }
+          scratch_aliases.emplace(def.var.get(), def.value);
+          continue;
         }
+        if (def.non_overflow_value) {
+          scratch->Bind(def.var, def.non_overflow_value);
+        }
+        scratch->const_int_bound.Update(def.var, ToConstIntBound(*def.proved_bound));
       }
     };
-    replay_defs(0);
-    for (size_t sid : chain) {
-      const auto& step = scopes_[sid];
+
+    for (auto scope = chain.rbegin(); scope != chain.rend(); ++scope) {
+      const auto& step = scopes_[*scope];
+      bind_before(step.entry);
       if (step.kind == ScopeNode::Kind::IfBranch) {
         PushGuardConstraints(step.condition, step.truth, scratch, scratch_aliases, scratch_ready,
                              scratch_contexts);
@@ -196,12 +214,9 @@ class SyncControlRangeProver::Impl {
         EnterLoopConstraints(step.loop, step.loop_var_bound, step.start_non_overflow, step.stop_non_overflow,
                              scratch, scratch_ready, scratch_contexts);
       }
-      replay_defs(sid);
     }
-    // Also admit any SSA definitions that occurred earlier in the same scope before `cut`,
-    // which are already in `scopes_[sid].defs` (if `cut` is at `sid`, wait: `cut` only sees
-    // defs before `cut` in `sid`; since SSA vars cannot be referenced before their def, any var
-    // appearing inside `expr` at `cut` was necessarily defined before `cut`!).
+    bind_before(target.position);
+    fallback_definitions_.fetch_add(dependencies.definitions.size(), std::memory_order_relaxed);
     auto res = EvaluateWithAnalyzer(expr, *scratch, scratch_ready, scratch_loops);
     for (auto it = scratch_contexts.rbegin(); it != scratch_contexts.rend(); ++it) {
       it->ExitScope();
@@ -215,12 +230,33 @@ class SyncControlRangeProver::Impl {
     bool is_at_most_one_trip = false;
   };
 
+  struct Cut {
+    size_t scope;
+    size_t position;
+  };
+
+  struct RangeResult {
+    const Expr* expression = nullptr;
+    std::optional<SymbolicIntRange> range;
+  };
+
   struct DefRecord {
     VarPtr var;
     ExprPtr value;
     bool is_bool_alias = false;
     ExprPtr non_overflow_value;
     std::optional<Bound128> proved_bound;
+    size_t position = 0;
+  };
+
+  struct DefinitionIndex {
+    size_t scope;
+    size_t index;
+  };
+
+  struct Dependencies {
+    std::vector<VarPtr> parameters;
+    std::vector<const DefRecord*> definitions;
   };
 
   struct ScopeNode {
@@ -234,6 +270,9 @@ class SyncControlRangeProver::Impl {
     bool start_non_overflow = false;
     bool stop_non_overflow = false;
     std::vector<DefRecord> defs;
+    // The parent control cut and the exclusive end of this lexical subtree.
+    size_t entry = 0;
+    size_t exit = 0;
   };
 
   FunctionPtr function_;
@@ -247,11 +286,86 @@ class SyncControlRangeProver::Impl {
   std::unordered_set<const Var*> non_overflow_ssa_;
   std::vector<const ForStmt*> active_loops_;
   std::vector<ScopeNode> scopes_;
-  std::unordered_map<const Stmt*, size_t> stmt_scope_;
+  size_t clock_ = 0;
+  SyncControlRangeWork work_;
+  mutable std::atomic<size_t> fallback_definitions_{0};
+  std::unordered_map<const Var*, arith::ConstIntBound> root_bindings_;
+  std::unordered_map<const Var*, std::optional<DefinitionIndex>> definitions_;
+  std::unordered_map<const Stmt*, Cut> cuts_;
+  std::unordered_set<const Stmt*> ambiguous_cuts_;
+  std::unordered_map<const Stmt*, std::array<RangeResult, 2>> footprint_ranges_;
   std::unordered_map<const ForStmt*, LoopProof> loop_proofs_;
   std::unordered_map<const Var*, std::vector<const ForStmt*>> loops_by_var_;
   std::unordered_map<const Var*, size_t> var_def_scope_;
   std::unordered_map<const ForStmt*, size_t> loop_body_scope_;
+
+  const DefRecord* FindDefinition(const Var* variable, Cut target) const {
+    const auto found = definitions_.find(variable);
+    if (found == definitions_.end() || !found->second) {
+      return nullptr;
+    }
+    const auto [scope_id, index] = *found->second;
+    const auto& scope = scopes_[scope_id];
+    const auto& def = scope.defs[index];
+    if (def.position >= target.position || target.position >= scope.exit) {
+      return nullptr;
+    }
+    return &def;
+  }
+
+  Dependencies CollectDependencies(const ExprPtr& expr, Cut target, const std::vector<size_t>& chain) const {
+    std::vector<std::pair<ExprPtr, Cut>> pending;
+    for (const auto id : chain) {
+      const auto& scope = scopes_[id];
+      const Cut before{scope.parent, scope.entry};
+      if (scope.condition) {
+        pending.emplace_back(scope.condition, before);
+      }
+      if (scope.start_non_overflow) {
+        pending.emplace_back(scope.loop->start_, before);
+      }
+      if (scope.stop_non_overflow) {
+        pending.emplace_back(scope.loop->stop_, before);
+      }
+    }
+    pending.emplace_back(expr, target);
+
+    Dependencies result;
+    std::unordered_map<const Expr*, size_t> inspected;
+    std::unordered_set<const DefRecord*> needed;
+    std::unordered_set<const Var*> parameters;
+    while (!pending.empty()) {
+      auto [current, use] = std::move(pending.back());
+      pending.pop_back();
+      auto [entry, inserted] = inspected.emplace(current.get(), use.position);
+      if (!inserted && entry->second >= use.position) {
+        continue;
+      }
+      entry->second = use.position;
+      if (const auto var = AsVarLike(current)) {
+        if (const auto* def = FindDefinition(var.get(), use);
+            def && (def->is_bool_alias || def->proved_bound)) {
+          if (needed.insert(def).second) {
+            result.definitions.push_back(def);
+            const auto& value = def->is_bool_alias ? def->value : def->non_overflow_value;
+            if (value) {
+              pending.emplace_back(value, Cut{use.scope, def->position});
+            }
+          }
+        } else if (root_bindings_.count(var.get()) && parameters.insert(var.get()).second) {
+          result.parameters.push_back(var);
+        }
+      } else if (const auto binary = As<BinaryExpr>(current)) {
+        pending.emplace_back(binary->left_, use);
+        pending.emplace_back(binary->right_, use);
+      } else if (const auto unary = As<UnaryExpr>(current)) {
+        pending.emplace_back(unary->operand_, use);
+      }
+    }
+    std::sort(result.definitions.begin(), result.definitions.end(),
+              [](const DefRecord* a, const DefRecord* b) { return a->position < b->position; });
+    return result;
+  }
 
   static bool AddOverflow128(__int128 a, __int128 b, __int128& out) {
     return __builtin_add_overflow(a, b, &out);
@@ -305,7 +419,9 @@ class SyncControlRangeProver::Impl {
       const ExprPtr& expr, arith::Analyzer& az, const std::unordered_set<const Var*>& ready_set,
       std::unordered_map<const Expr*, std::optional<Bound128>>& cache) const {
     if (!expr || !IsSignedIntOrIndex(expr)) return std::nullopt;
-    if (const auto it = cache.find(expr.get()); it != cache.end()) return it->second;
+    if (const auto it = cache.find(expr.get()); it != cache.end()) {
+      return it->second;
+    }
 
     std::optional<Bound128> result;
     if (const auto ci = As<ConstInt>(expr)) {
@@ -594,7 +710,9 @@ class SyncControlRangeProver::Impl {
                            const std::unordered_map<const Var*, const ForStmt*>& var_to_loop,
                            std::unordered_map<const Expr*, AffineForm>& memo, int depth = 0) const {
     if (!expr || depth > 64) return {};
-    if (const auto it = memo.find(expr.get()); it != memo.end()) return it->second;
+    if (const auto it = memo.find(expr.get()); it != memo.end()) {
+      return it->second;
+    }
 
     auto add_sym = [&](const ExprPtr& a, const ExprPtr& b) -> ExprPtr {
       if (!a) return b;
@@ -923,8 +1041,49 @@ class SyncControlRangeProver::Impl {
     return range;
   }
 
-  std::optional<SymbolicIntRange> EvaluateInCurrentAnalyzer(const ExprPtr& expr) const {
-    return EvaluateWithAnalyzer(expr, *analyzer_, ready_, active_loops_);
+  // Footprint clients can ask from multiple passes and in arbitrary order. Prove
+  // their static operands once at the original use cut, while lexical bindings
+  // and guards are already active. Store unknown results as well as proved ones.
+  void RecordFootprintRanges(const Stmt* cut, const CallPtr& call) {
+    if (!call) {
+      return;
+    }
+    const auto operands = FootprintRangeOperands(call);
+    for (size_t i = 0; i < operands.size(); ++i) {
+      if (!IsSignedIntOrIndex(operands[i])) {
+        continue;
+      }
+      auto& result = footprint_ranges_[cut][i];
+      result = {operands[i].get(), EvaluateWithAnalyzer(operands[i], *analyzer_, ready_, active_loops_)};
+      ++work_.footprint_queries;
+    }
+  }
+
+  void RecordDef(size_t scope_id, DefRecord def) {
+    def.position = clock_++;
+    auto& definitions = scopes_[scope_id].defs;
+    auto [entry, inserted] =
+        definitions_.emplace(def.var.get(), DefinitionIndex{scope_id, definitions.size()});
+    if (!inserted) {
+      // A raw Var reused as a declaration has no unique SSA definition. Keep
+      // the ad-hoc cut query conservative. Normal lexical shadowing uses a new Var.
+      entry->second.reset();
+    }
+    definitions.push_back(std::move(def));
+    ++work_.indexed_definitions;
+  }
+
+  void ExitScope(size_t scope_id) {
+    scopes_[scope_id].exit = clock_;
+    // A local SSA equality can stay in the private construction analyzer.
+    // Its identity is no longer ready outside the scope, and a Boolean
+    // alias has to be removed so a later guard cannot expand it.
+    for (const auto& def : scopes_[scope_id].defs) {
+      ready_.erase(def.var.get());
+      if (def.is_bool_alias) {
+        guard_aliases_.erase(def.var.get());
+      }
+    }
   }
 
   void InitParametersAndScopes() {
@@ -933,12 +1092,29 @@ class SyncControlRangeProver::Impl {
       if (param) var_def_scope_[param.get()] = 0;
     }
     BindRoot(*analyzer_, ready_);
+    const auto remember_root = [&](const VarPtr& var) {
+      if (var && ready_.count(var.get())) {
+        root_bindings_.try_emplace(var.get(), analyzer_->const_int_bound(var));
+      }
+    };
+    for (const auto& param : function_->params_) {
+      remember_root(param);
+      if (const auto tensor = As<TensorType>(param->GetType())) {
+        for (const auto& dim : tensor->shape_) {
+          remember_root(AsVarLike(dim));
+        }
+      }
+    }
     VisitBody(function_->body_, 0);
+    scopes_[0].exit = clock_ + 1;
   }
 
   void VisitBody(const StmtPtr& stmt, size_t scope_id) {
     if (!stmt) return;
-    stmt_scope_[stmt.get()] = scope_id;
+    const Cut cut{scope_id, clock_++};
+    if (!cuts_.emplace(stmt.get(), cut).second) {
+      ambiguous_cuts_.insert(stmt.get());
+    }
 
     if (const auto seq = As<SeqStmts>(stmt)) {
       for (const auto& child : seq->stmts_) VisitBody(child, scope_id);
@@ -948,11 +1124,12 @@ class SyncControlRangeProver::Impl {
     if (const auto assign = As<AssignStmt>(stmt)) {
       var_def_scope_[assign->var_.get()] = scope_id;
       const auto call = As<Call>(assign->value_);
+      RecordFootprintRanges(stmt.get(), call);
       const auto scalar = As<ScalarType>(assign->var_->GetType());
       if (scalar && scalar->dtype_ == DataType::BOOL && !call) {
         guard_aliases_.emplace(assign->var_.get(), assign->value_);
         ready_.insert(assign->var_.get());
-        scopes_[scope_id].defs.push_back({assign->var_, assign->value_, true, nullptr, std::nullopt});
+        RecordDef(scope_id, {assign->var_, assign->value_, true, nullptr, std::nullopt});
       } else if (IsSignedIntOrIndex(assign->var_)) {
         ssa_defs_[assign->var_.get()] = assign->value_;
         std::unordered_map<const Expr*, std::optional<Bound128>> cache;
@@ -965,8 +1142,13 @@ class SyncControlRangeProver::Impl {
           analyzer_->Bind(assign->var_, assign->value_);
           analyzer_->const_int_bound.Update(assign->var_, ToConstIntBound(*b));
         }
-        scopes_[scope_id].defs.push_back({assign->var_, assign->value_, false, no_ov_expr, b});
+        RecordDef(scope_id, {assign->var_, assign->value_, false, no_ov_expr, b});
       }
+      return;
+    }
+
+    if (const auto evaluate = As<EvalStmt>(stmt)) {
+      RecordFootprintRanges(stmt.get(), As<Call>(evaluate->expr_));
       return;
     }
 
@@ -981,6 +1163,7 @@ class SyncControlRangeProver::Impl {
       std::vector<std::optional<Bound128>> then_bounds, else_bounds;
       const size_t then_scope = scopes_.size();
       scopes_.push_back(ScopeNode{scope_id, ScopeNode::Kind::IfBranch, branch->condition_, true, nullptr});
+      scopes_.back().entry = cut.position;
       {
         std::vector<arith::ConstraintContext> ctxs;
         PushGuardConstraints(branch->condition_, true, analyzer_, guard_aliases_, ready_, ctxs);
@@ -997,11 +1180,13 @@ class SyncControlRangeProver::Impl {
             }
           }
         }
+        ExitScope(then_scope);
         for (auto it = ctxs.rbegin(); it != ctxs.rend(); ++it) it->ExitScope();
       }
       if (branch->else_body_) {
         const size_t else_scope = scopes_.size();
         scopes_.push_back(ScopeNode{scope_id, ScopeNode::Kind::IfBranch, branch->condition_, false, nullptr});
+        scopes_.back().entry = cut.position;
         std::vector<arith::ConstraintContext> ctxs;
         PushGuardConstraints(branch->condition_, false, analyzer_, guard_aliases_, ready_, ctxs);
         VisitBody(*branch->else_body_, else_scope);
@@ -1017,6 +1202,7 @@ class SyncControlRangeProver::Impl {
             }
           }
         }
+        ExitScope(else_scope);
         for (auto it = ctxs.rbegin(); it != ctxs.rend(); ++it) it->ExitScope();
       }
       for (size_t i = 0; i < branch->return_vars_.size(); ++i) {
@@ -1030,7 +1216,7 @@ class SyncControlRangeProver::Impl {
             ready_.insert(rv.get());
             analyzer_->const_int_bound.Update(rv, ToConstIntBound(*joined));
           }
-          scopes_[scope_id].defs.push_back({rv, nullptr, false, nullptr, joined});
+          RecordDef(scope_id, {rv, nullptr, false, nullptr, joined});
         }
       }
       return;
@@ -1095,6 +1281,7 @@ class SyncControlRangeProver::Impl {
       scopes_.push_back(ScopeNode{scope_id, ScopeNode::Kind::ForLoop, nullptr, true, loop.get(), iv_bound,
                                   use_loop_constraints && start_b.has_value(),
                                   use_loop_constraints && stop_b.has_value()});
+      scopes_.back().entry = cut.position;
 
       std::vector<arith::ConstraintContext> ctxs;
       const bool inserted_iv = ready_.insert(loop->loop_var_.get()).second;
@@ -1108,12 +1295,13 @@ class SyncControlRangeProver::Impl {
         var_def_scope_[arg.get()] = body_scope;
         if (IsSignedIntOrIndex(arg)) {
           ready_.insert(arg.get());
-          scopes_[body_scope].defs.push_back({arg, nullptr, false, nullptr, std::nullopt});
+          RecordDef(body_scope, {arg, nullptr, false, nullptr, std::nullopt});
         }
       }
       active_loops_.push_back(loop.get());
       VisitBody(loop->body_, body_scope);
       active_loops_.pop_back();
+      ExitScope(body_scope);
       for (auto it = ctxs.rbegin(); it != ctxs.rend(); ++it) it->ExitScope();
       if (inserted_iv) {
         ready_.erase(loop->loop_var_.get());
@@ -1129,7 +1317,7 @@ class SyncControlRangeProver::Impl {
         var_def_scope_[rv.get()] = scope_id;
         if (IsSignedIntOrIndex(rv)) {
           ready_.insert(rv.get());
-          scopes_[scope_id].defs.push_back({rv, nullptr, false, nullptr, std::nullopt});
+          RecordDef(scope_id, {rv, nullptr, false, nullptr, std::nullopt});
         }
       }
       return;
@@ -1138,14 +1326,16 @@ class SyncControlRangeProver::Impl {
     if (const auto loop = As<WhileStmt>(stmt)) {
       const size_t body_scope = scopes_.size();
       scopes_.push_back(ScopeNode{scope_id, ScopeNode::Kind::WhileLoop, nullptr, true, nullptr});
+      scopes_.back().entry = cut.position;
       for (const auto& arg : loop->iter_args_) {
         var_def_scope_[arg.get()] = body_scope;
         if (IsSignedIntOrIndex(arg)) {
           ready_.insert(arg.get());
-          scopes_[body_scope].defs.push_back({arg, nullptr, false, nullptr, std::nullopt});
+          RecordDef(body_scope, {arg, nullptr, false, nullptr, std::nullopt});
         }
       }
       VisitBody(loop->body_, body_scope);
+      ExitScope(body_scope);
       for (const auto& arg : loop->iter_args_) {
         if (IsSignedIntOrIndex(arg)) {
           ready_.erase(arg.get());
@@ -1156,7 +1346,7 @@ class SyncControlRangeProver::Impl {
         var_def_scope_[rv.get()] = scope_id;
         if (IsSignedIntOrIndex(rv)) {
           ready_.insert(rv.get());
-          scopes_[scope_id].defs.push_back({rv, nullptr, false, nullptr, std::nullopt});
+          RecordDef(scope_id, {rv, nullptr, false, nullptr, std::nullopt});
         }
       }
       return;
@@ -1172,6 +1362,10 @@ SyncControlRangeProver::SyncControlRangeProver(const FunctionPtr& function,
 SyncControlRangeProver::~SyncControlRangeProver() = default;
 SyncControlRangeProver::SyncControlRangeProver(SyncControlRangeProver&&) noexcept = default;
 SyncControlRangeProver& SyncControlRangeProver::operator=(SyncControlRangeProver&&) noexcept = default;
+
+SyncControlRangeWork SyncControlRangeProver::Work() const {
+  return impl_ ? impl_->Work() : SyncControlRangeWork{};
+}
 
 bool SyncControlRangeProver::IsPositiveTrip(const ForStmt* loop) const {
   return impl_ && impl_->IsPositiveTrip(loop);

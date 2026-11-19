@@ -15,6 +15,8 @@ from pypto.backend.pto_backend import _run_ptoas
 
 from .sync_matmul_oracle import validate
 from .sync_physical_oracle import run_physical
+from .sync_range_scaling_cases import lower_moving_subviews, moving_subviews
+from .test_conservative_sync_storage import _RowSubviewCommands
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
 
@@ -397,6 +399,42 @@ def test_launch_cardinality_is_not_inferred_from_index_hull(submit, launches, ex
     for name in ("f0", "f1"):
         assert evidence["block_indices"][name] == (0, 23)
         assert evidence["block_counts"][name] == expected
+
+
+@pytest.mark.parametrize("sites", [8, 32, 128])
+def test_default_moving_subviews_prove_ranges_without_replaying_definitions(sites):
+    placed = []
+
+    def capture(transform, program):
+        if transform.get_name() == "RealizeSync":
+            placed.append(program.get_function("kernel"))
+
+    instrument = passes.CallbackInstrument(before_pass=capture, name="capture_range_scaling")
+    lowered = lower_moving_subviews(moving_subviews(sites), instruments=[instrument])
+    (original,) = placed
+    assert original.ir_stage == ir.FunctionIRStage.Buffer
+    actual = lowered.get_function("kernel")
+    assert actual is not None
+    assert actual.attrs["pypto_autosync"], dict(actual.attrs)
+    summary = testing.analyze_conservative_sync(original, retain_incoming_diagnostics=False)
+    assert len(summary["sites"]) == sites + 1  # One load, then the static stores in the loop.
+    cost = summary["cost"]
+    assert sites - 1 <= cost["range_indexed_definitions"] <= 4 * sites
+    assert cost["range_footprint_queries"] == 2 * sites
+    assert cost["range_fallback_definitions"] == 0
+    if sites == 8:
+        before = _RowSubviewCommands(original, {}, range(6))
+        after = _RowSubviewCommands(actual, {}, range(6))
+        before.run()
+        order = after.run()
+        assert before.payloads == after.payloads
+        assert len(after.payloads) == 2 * sites + 1
+        _, load_pipe, _, loaded = before.payloads[0]
+        assert load_pipe == ir.PipeType.MTE2
+        for index, (_, pipe, reads, _) in enumerate(before.payloads[1:], start=1):
+            assert pipe == ir.PipeType.MTE3
+            assert reads and reads <= loaded
+            assert (("payload", 0, "C"), ("payload", index, "I")) in order
 
 
 if __name__ == "__main__":

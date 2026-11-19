@@ -214,6 +214,21 @@ bool MatrixBoxFootprint::MayOverlap(const MatrixBoxFootprint& a, const MatrixBox
   return a_begin < b_end && b_begin < a_end;
 }
 
+std::array<ExprPtr, 2> FootprintRangeOperands(const CallPtr& call) {
+  if (IsOp(call, "buffer.slot") && call->args_.size() == 2) {
+    return {call->args_[1], nullptr};
+  }
+  if (IsOp(call, "buffer.subview") && call->args_.size() >= 2) {
+    if (const auto offsets = As<MakeTuple>(call->args_[1]); offsets && offsets->elements_.size() == 2) {
+      return {offsets->elements_[0], offsets->elements_[1]};
+    }
+  }
+  if ((IsOp(call, "buffer.extract") || IsOp(call, "buffer.insert")) && call->args_.size() >= 4) {
+    return {call->args_[1], call->args_[2]};
+  }
+  return {};
+}
+
 SyncFootprintResolver::SyncFootprintResolver(const FunctionPtr& owner, const SyncControlRangeProver* prover,
                                              bool run_scalar_layout_check, std::string target)
     : target_(std::move(target)) {
@@ -524,7 +539,7 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
     const auto dst_type = As<BufferType>(var->GetType());
     if (!parent || !parent->byte_hull || !multi || !dst_type || parent->root_id == 0) return;
     const auto& root = roots_[parent->root_id - 1];
-    const auto idx_range = prover_->LookupAtCut(assign.get(), call->args_[1]);
+    const auto idx_range = prover_->LookupAtCut(assign.get(), FootprintRangeOperands(call)[0]);
     if (!idx_range || idx_range->lo < 0 || idx_range->hi >= multi->slot_count_) {
       // Unproved slot index: leave unmapped (`Unknown`, byte_hull = std::nullopt) to preserve
       // workspace-separation refusals and Wildcard Domain 0 fallback.
@@ -612,8 +627,9 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
       const int64_t max_r = std::max<int64_t>(0, parent_type->shape_[0] - dst_type->shape_[0]);
       const int64_t max_c = std::max<int64_t>(0, parent_type->shape_[1] - dst_type->shape_[1]);
 
-      const auto r_opt = prover_->LookupAtCut(assign.get(), offsets->elements_[0]);
-      const auto c_opt = prover_->LookupAtCut(assign.get(), offsets->elements_[1]);
+      const auto [row, col] = FootprintRangeOperands(call);
+      const auto r_opt = prover_->LookupAtCut(assign.get(), row);
+      const auto c_opt = prover_->LookupAtCut(assign.get(), col);
       int64_t r_lo = 0, r_hi = max_r;
       int64_t c_lo = 0, c_hi = max_c;
       if (r_opt) {
@@ -891,8 +907,9 @@ ResolvedOperandFootprint SyncFootprintResolver::ResolveOperand(const Stmt* cut, 
     if (sub_type && sub_type->shape_.size() == 2 && sub_type->shape_[0] > 0 && sub_type->shape_[1] > 0) {
       int64_t sub_rows = sub_type->shape_[0];
       int64_t sub_cols = sub_type->shape_[1];
-      auto r_opt = prover_->LookupAtCut(cut, call->args_[1]);
-      auto c_opt = prover_->LookupAtCut(cut, call->args_[2]);
+      const auto [row, col] = FootprintRangeOperands(call);
+      auto r_opt = prover_->LookupAtCut(cut, row);
+      auto c_opt = prover_->LookupAtCut(cut, col);
       if (view->axis_swapped) {
         std::swap(sub_rows, sub_cols);
         std::swap(r_opt, c_opt);

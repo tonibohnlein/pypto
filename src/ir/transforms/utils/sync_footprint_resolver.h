@@ -37,6 +37,10 @@ namespace pypto::ir::sync {
 // Native scalar flattening needs actual inherited layout provenance.
 void RequireBufferSyncScalarLayout(const FunctionPtr& owner);
 
+// Coordinates whose ranges the footprint resolver may request at a call cut.
+// Null entries indicate that the call does not supply that coordinate.
+std::array<ExprPtr, 2> FootprintRangeOperands(const CallPtr& call);
+
 // Canonical storage root shared by Exact and Conservative engines.
 struct SyncCanonicalRoot {
   size_t id = 0;  // 1-based; 0 = space wildcard / unproved
