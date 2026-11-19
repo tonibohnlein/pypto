@@ -1873,7 +1873,11 @@ class Importer {
       auto sid = Storage(call->args_[0]), tid = Storage(call->args_[target]);
       const auto& s = result.storage[sid];
       const auto& t = result.storage[tid];
-      if (extract && s.space == MemorySpace::Vec && t.space == MemorySpace::Vec) {
+      if (!extract && implementation.Pipe() == PipeType::V) {
+        resolver->RequireVecCopyPlacement(operation);
+        whole(0, false);
+        whole(target, true);
+      } else if (extract && s.space == MemorySpace::Vec && t.space == MemorySpace::Vec) {
         auto row = Coordinate(call->args_[1], segment);
         auto column = Coordinate(call->args_[2], segment);
         CHECK(row.parameters.empty() && column.parameters.empty() && !row.block && !column.block)
@@ -1917,7 +1921,7 @@ class Importer {
         whole(target, true);
       } else {
         CHECK(s.space == MemorySpace::Mat && (t.space == MemorySpace::Left || t.space == MemorySpace::Right))
-            << "Only Mat to operand-buffer movement or Vec extract is qualified";
+            << "Only Mat to operand-buffer or Vec to Vec movement is qualified";
         auto row = extract ? Coordinate(call->args_[1], segment) : AffineCoordinate{};
         auto column = extract ? Coordinate(call->args_[2], segment) : AffineCoordinate{};
         CHECK(row.parameters.empty() && column.parameters.empty() && !row.block && !column.block)

@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -178,6 +179,7 @@ class SyncFootprintResolver {
 
   std::optional<backend::BufferSyncByteWindow> ByteHull(const ExprPtr& expr) const;
   std::optional<backend::BufferSyncByteWindow> ExactFullWindow(const ExprPtr& expr) const;
+  void RequireVecCopyPlacement(const backend::BufferSyncOperation& operation) const;
   void RequireWorkspaceSeparation(const backend::BufferSyncOperation& operation) const;
 
   ResolvedOperandFootprint ResolveOperand(const Stmt* cut, const CallPtr& call, size_t arg_idx,

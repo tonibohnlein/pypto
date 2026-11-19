@@ -59,10 +59,11 @@ def vec_fixture(count=None, visits=1, view="dense", operation="buffer.add", inpl
         definitions.append(ir.AssignStmt(var, call("buffer.alloc", [tup([]), ci(address)], ty), span))
         return var
 
-    root_shape = [4, 32] if view == "nested" else [2, 8]
+    payload_shape = [1, 8] if view == "row_window" else [2, 8]
+    root_shape = {"nested": [4, 32], "row_window": [2, 16]}.get(view, payload_shape)
     a = ir.Var("a", ir.TensorType(root_shape, fp), span)
-    b = ir.Var("b", ir.TensorType([2, 8], fp), span)
-    out = ir.Var("out", ir.TensorType([2, 8], fp), span)
+    b = ir.Var("b", ir.TensorType(payload_shape, fp), span)
+    out = ir.Var("out", ir.TensorType(payload_shape, fp), span)
     if view == "byte_root":
         raw = alloc("raw", [2, 32], 0, ir.DataType.UINT8)
         ty = ir.BufferType(root_shape, fp, ir.MemorySpace.Vec)
@@ -77,14 +78,19 @@ def vec_fixture(count=None, visits=1, view="dense", operation="buffer.add", inpl
             var = ir.Var(name, ty, span)
             definitions.append(ir.AssignStmt(var, call("buffer.subview", [x, tup(offsets)], ty), span))
             x = var
+    elif view == "row_window":
+        ty = ir.BufferType(payload_shape, fp, ir.MemorySpace.Vec)
+        x = ir.Var("row_window", ty, span)
+        subview = call("buffer.subview", [root, tup([1, 8]), tup(payload_shape)], ty)
+        definitions.append(ir.AssignStmt(x, subview, span))
     elif view == "reshape":
         for name, shape in [("flat", [1, 16]), ("restored", [2, 8])]:
             ty = ir.BufferType(shape, fp, ir.MemorySpace.Vec)
             var = ir.Var(name, ty, span)
             definitions.append(ir.AssignStmt(var, call("buffer.reshape", [x], ty), span))
             x = var
-    y = alloc("y", [2, 8], 32 if view == "overlap" else 1024)
-    z = x if inplace else alloc("z", [2, 8], 2048)
+    y = alloc("y", payload_shape, 32 if view == "overlap" else 1024)
+    z = x if inplace else alloc("z", payload_shape, 2048)
     body = list(definitions)
     for visit in range(visits):
         args = [x, y, z]
@@ -94,10 +100,10 @@ def vec_fixture(count=None, visits=1, view="dense", operation="buffer.add", inpl
             args = [x, ir.ConstFloat(2.0, fp, span), z]
         statements = [
             payload("buffer.load", [a, tup([0, 0]), tup(root_shape), root]),
-            payload("buffer.load", [b, tup([0, 0]), tup([2, 8]), y]),
+            payload("buffer.load", [b, tup([0, 0]), tup(payload_shape), y]),
             payload(operation, args),
             payload("buffer.abs", [z, z]),
-            payload("buffer.store", [z, tup([0, 0]), tup([2, 8]), out]),
+            payload("buffer.store", [z, tup([0, 0]), tup(payload_shape), out]),
         ]
         if view == "overlap":
             # The first contents are consumed before the overlapping DMA write.
@@ -459,22 +465,51 @@ def test_static_stage_membership_work_is_indexed(stages):
         validate(function, analysis)
 
 
-def test_broad_buffer_emission_does_not_imply_sync_variant_admission():
-    # Vec TMOV is an existing emission form, but the sync contract admits only
-    # Mat->Left/Right movement. Centralizing names must not conflate the two.
+def vec_copy_fixture(view="dense", dest_address=2048):
     class Copy(ir.IRMutator):
         def visit_call(self, op):
-            if op.op.name == ir.get_op("buffer.abs").name:
+            if op.op.name == ir.get_op("buffer.abs").name and not op.args[0].same_as(op.args[1]):
                 return ir.Call(ir.get_op("buffer.copy"), op.args, op.type, op.span)
             return op
 
-    original = Copy().visit_function(vec_fixture(operation="buffer.abs"))
-    text = codegen.PTOCodegen().generate(ir.Program([original], "VecCopy", original.span))
-    assert "pto.tmov" in text
-    with pytest.raises(ValueError, match="Only Mat to operand-buffer"):
+        def visit_assign_stmt(self, op):
+            if op.var.name_hint == "z" and dest_address != 2048:
+                addr = ir.ConstInt(dest_address, ir.DataType.INDEX, op.span)
+                assert isinstance(op.value, ir.Call)
+                call = ir.Call(op.value.op, [op.value.args[0], addr], op.value.type, op.value.span)
+                return ir.AssignStmt(op.var, call, op.span)
+            return super().visit_assign_stmt(op)
+
+    return Copy().visit_function(vec_fixture(operation="buffer.abs", view=view))
+
+
+@pytest.mark.parametrize("view", ["dense", "row_window"])
+def test_vec_copy_owned_with_physical_hazards(view):
+    original = vec_copy_fixture(view)
+    result, _, _, text = check(original, list(range(6)))
+    assert text.count("pto.tmov") == 1
+    assert result["barrier_sites"] > 0
+    emitted = apply_hybrid([original], autosync_policy="conservative_prefix")[original.name]
+    assert dict(emitted.attrs)[PYPTO_AUTOSYNC_ATTR]
+    run_physical(original, emitted, range(6))
+
+
+@pytest.mark.parametrize(
+    "view,address,reason",
+    [
+        ("nested", 2048, "aligned, static contiguous placed byte window"),
+        ("dense", 1, "aligned, static contiguous placed byte window"),
+        ("dense", 32, "physically disjoint source and destination windows"),
+        ("dense", 0, "physically disjoint source and destination windows"),
+    ],
+)
+def test_vec_copy_unqualified_placement_delegates(view, address, reason):
+    original = vec_copy_fixture(view, address)
+    with pytest.raises(ValueError, match=reason):
         testing.analyze_placed_sync(original, True)
-    delegated = apply_hybrid([original])[original.name]
+    delegated = apply_hybrid([original], autosync_policy="conservative_prefix")[original.name]
     assert not dict(delegated.attrs)[PYPTO_AUTOSYNC_ATTR]
+    assert reason in dict(delegated.attrs)[AUTOSYNC_FALLBACK_REASON_ATTR]
     ir.assert_structural_equal(original.body, delegated.body)
 
 

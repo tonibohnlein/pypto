@@ -118,12 +118,14 @@ def test_scalar_effect_does_not_prove_ready_value():
     assert not info["readiness_available"]
 
 
-def test_unsupported_native_variant_is_not_empty_effects():
+@pytest.mark.parametrize("shape,valid", [([2, 8], [1, 8]), ([2, 4], [2, 4])])
+def test_unsupported_native_variant_is_not_empty_effects(shape, valid):
     function = vec_fixture()
     call = _calls(function, ["buffer.add"])[0]
-    # Vec->Vec copy is valid Buffer IR but not in the selected native sync subset.
-    copy = ir.Call(ir.get_op("buffer.copy"), [call.args[0], call.args[2]], call.type, call.span)
-    with pytest.raises(ValueError, match="Only Mat to operand-buffer movement"):
+    descriptor = ir.BufferType(shape, ir.DataType.FP32, ir.MemorySpace.Vec, valid_shape=valid)
+    args = [ir.Var(arg, descriptor, call.span) for arg in ("src", "dst")]
+    copy = ir.Call(ir.get_op("buffer.copy"), args, call.type, call.span)
+    with pytest.raises(ValueError, match="full static dense A2/A3 AIV block-burst geometry"):
         testing.describe_buffer_sync_operation(copy, function.func_type)
 
 

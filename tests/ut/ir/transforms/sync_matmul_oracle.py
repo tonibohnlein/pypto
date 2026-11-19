@@ -307,7 +307,8 @@ def interpret(
                 if name == ir.get_op("buffer.extract").name
                 else None
             )
-            reads, writes, pipe = access(args[0], rect), access(dest), ir.PipeType.MTE1
+            pipe = ir.PipeType.V if dest.type.memory_space == ir.MemorySpace.Vec else ir.PipeType.MTE1
+            reads, writes = access(args[0], rect), access(dest)
         elif name in {
             ir.get_op("buffer.gather").name,
             ir.get_op("buffer.scatter").name,
