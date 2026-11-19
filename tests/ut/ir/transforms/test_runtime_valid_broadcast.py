@@ -123,6 +123,140 @@ def check_runtime_commands(logical, physical, parameters):
     return before, after
 
 
+@pytest.mark.parametrize(
+    "require_nonnegative,comparison,upper_endpoint,elided",
+    [
+        (True, "<", None, True),
+        (True, "<=", None, False),
+        (False, "<", None, False),
+        (True, "<=", 2**63 - 1, False),
+        (True, "<=", 2**63 - 2, False),
+    ],
+)
+def test_dominating_validity_preserves_partial_and_empty_rows(
+    require_nonnegative, comparison, upper_endpoint, elided
+):
+    upper = "stop" if upper_endpoint is None else f"pl.const({upper_endpoint}, pl.INDEX)"
+    difference = f"{upper} - start"
+    if upper_endpoint == 2**63 - 2:
+        difference = f"(pl.const({2**63 - 1}, pl.INDEX) - start) - 1"
+    guard = f"start {comparison} {upper}"
+    if require_nonnegative:
+        guard = f"start >= 0 and {guard}"
+    program, function = lower(
+        pl.parse_program(f"""
+@pl.program
+class BoundedRows:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, x: pl.Tensor[[8,16], pl.FP32], carrier: pl.Tensor[[1,16], pl.FP32],
+               start: pl.Scalar[pl.INDEX], stop: pl.Scalar[pl.INDEX],
+               out: pl.InOut[pl.Tensor[[8,16], pl.FP32]]) -> pl.Tensor[[8,16], pl.FP32]:
+        if {guard}:
+            rows = pl.min({difference}, 8)
+            source = pl.load(x, [0,0], [8,16], valid_shape=[rows,16])
+            scale = pl.load(carrier, [0,0], [1,16])
+            result = pl.col_expand_mul(source, scale)
+            out = pl.store(result, [0,0], out)
+        return out
+""")
+    )
+    pto = codegen.PTOCodegen().generate(program)
+    if elided:
+        # The original comparison proves the positivity of all native
+        # transfers and the axis operation without a second row guard.
+        assert pto.count("scf.if") == 1
+    else:
+        # Equality can give zero rows. An unbounded negative start also
+        # makes signed subtraction potentially wrap despite a strict order.
+        assert pto.count("scf.if") > 1
+    assert "pto.tload" in pto and "pto.tstore" in pto and "pto.tcolexpandmul" in pto
+    namespace = {}
+    exec(torch_codegen(function), namespace)  # noqa: S102
+    x = torch.arange(128, dtype=torch.float32).reshape(8, 16)
+    scale = torch.full((1, 16), 2.0)
+    if upper_endpoint is None:
+        samples = [(0, 0, 0), (1, 0, 0), (0, 1, 1), (2, 9, 7), (4, 100, 8)]
+    else:
+        samples = [(upper_endpoint, 0, 0), (upper_endpoint - 1, 0, 1), (0, 0, 8)]
+    for start, stop, rows in samples:
+        out = torch.full_like(x, -777)
+        namespace["kernel"](x, scale, start, stop, out)
+        expected = torch.full_like(x, -777)
+        expected[:rows] = x[:rows] * scale
+        torch.testing.assert_close(out, expected)
+
+
+@pytest.mark.parametrize(
+    "kind,transfers,guards", [("distinct", 2, 2), ("shared", 2, 3), ("signed_endpoint", 1, 2)]
+)
+def test_transfer_guard_requires_positivity_at_every_use(kind, transfers, guards):
+    def ci(value):
+        return ir.ConstInt(value, ir.DataType.INDEX, SPAN)
+
+    def call(name, args, typ):
+        return ir.Call(ir.get_op(name), args, typ, SPAN)
+
+    supplied = ir.Var("supplied", ir.ScalarType(ir.DataType.INDEX), SPAN)
+    rows = ir.Var("rows", supplied.type, SPAN) if kind == "signed_endpoint" else supplied
+    source = ir.Var("source", ir.TensorType([8, 16], ir.DataType.FP32), SPAN)
+    typ = ir.BufferType([8, 16], ir.DataType.FP32, ir.MemorySpace.Vec, valid_shape=[-1, -1])
+    tile = ir.Var("tile", typ, SPAN)
+    extents = ir.MakeTuple([rows, ci(16)], SPAN)
+    capacity = ir.MakeTuple([ci(8), ci(16)], SPAN)
+    allocation = ir.AssignStmt(tile, call("buffer.alloc", [capacity, ci(0)], typ), SPAN)
+    offsets = ir.MakeTuple([ci(0), ci(0)], SPAN)
+    transfer = call("buffer.load", [source, offsets, extents, tile], ir.VoidType())
+    setter = ir.EvalStmt(call("buffer.set_validshape", [tile, extents], ir.VoidType()), SPAN)
+    arm: list[ir.Stmt] = [setter, ir.EvalStmt(transfer, SPAN)]
+    tail: list[ir.Stmt] = [ir.ReturnStmt([], SPAN)]
+    if kind == "signed_endpoint":
+        # On a signed system MAX - MAX is representable and empty, even
+        # though the range analyzer also uses MAX as an infinity sentinel.
+        delta = ir.Sub(ci(2**63 - 1), supplied, ir.DataType.INDEX, SPAN)
+        value = ir.Min(delta, ci(8), ir.DataType.INDEX, SPAN)
+        arm.insert(0, ir.AssignStmt(rows, value, SPAN))
+        condition = ir.Ge(supplied, ci(0), ir.DataType.BOOL, SPAN)
+    else:
+        condition = ir.Gt(rows, ci(0), ir.DataType.BOOL, SPAN)
+        # A shared Call identity requires a witness at every occurrence.
+        outside = transfer if kind == "shared" else call("buffer.load", transfer.args, ir.VoidType())
+        tail[:0] = [setter, ir.EvalStmt(outside, SPAN)]
+    guarded = ir.IfStmt(condition, ir.SeqStmts(arm, SPAN), None, [], SPAN)
+    body = ir.SeqStmts([allocation, guarded, *tail], SPAN)
+    function = ir.Function(
+        "transfer",
+        [source, supplied],
+        [],
+        body,
+        SPAN,
+        ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    pto = codegen.PTOCodegen().generate(ir.Program([function], "Transfers", SPAN))
+    assert pto.count("pto.tload") == transfers
+    assert pto.count("scf.if") == guards
+    if kind == "signed_endpoint":
+        carrier_type = ir.BufferType([1, 16], ir.DataType.FP32, ir.MemorySpace.Vec)
+        carrier = ir.Var("carrier", carrier_type, SPAN)
+        carrier_alloc = ir.AssignStmt(
+            carrier, call("buffer.alloc", [ir.MakeTuple([], SPAN), ci(512)], carrier_type), SPAN
+        )
+        broadcast = ir.EvalStmt(call("buffer.col_expand_mul", [tile, carrier, tile], ir.VoidType()), SPAN)
+        unguarded = ir.IfStmt(condition, ir.SeqStmts([*arm, broadcast], SPAN), None, [], SPAN)
+        body = ir.SeqStmts([allocation, carrier_alloc, unguarded, *tail], SPAN)
+        function = ir.Function(
+            "transfer",
+            [source, supplied],
+            [],
+            body,
+            SPAN,
+            ir.FunctionType.AIV,
+            ir_stage=ir.FunctionIRStage.Buffer,
+        )
+        with pytest.raises(ValueError, match="requires a proved positive-row guard"):
+            codegen.PTOCodegen().generate(ir.Program([function], "Unguarded", SPAN))
+
+
 @pytest.mark.parametrize("visits,replay", [(1, 1), (3, 1), (3, 2)])
 def test_runtime_row_broadcast_preserves_payloads_and_closed_prefixes(visits, replay, tmp_path):
     program, original = lower(runtime_program(visits, replay))

@@ -53,6 +53,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/loop_step_qualification.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
@@ -429,8 +430,8 @@ class BufferEmissionPreflight : public ir::IRVisitor {
     if (backend::FindBufferConversionRecipe(call->op_->name_) ||
         backend::FindBufferIndexedRecipe(call->op_->name_) || ir::IsOp(call, "buffer.ci") ||
         ir::IsOp(call, "buffer.ci_workspace")) {
-      CHECK_SPAN(conversion_supported_, call->span_)
-          << "Direct Buffer cast/compare/select, sequence and indexed operations currently supports A2/A3 only";
+      CHECK_SPAN(conversion_supported_, call->span_) << "Direct Buffer cast/compare/select, sequence and "
+                                                        "indexed operations currently supports A2/A3 only";
     }
     if (const auto* axis = backend::FindBufferAxisRecipe(call->op_->name_); axis) {
       bool runtime_valid = false;
@@ -593,6 +594,8 @@ void PTOCodegen::GenerateBufferFunction(const ir::FunctionPtr& func) {
   fs_.buffer_ir = true;
   fs_.current_function = func;
   fs_.truncating_floor_div_mod = PrepareScalarFloorDivMod(func->body_, func->params_);
+  fs_.nonempty_buffer_transfers =
+      ir::BufferRuntimeValidAnalysis(func, /*collect_guards=*/true).NonEmptyTransfers();
   // Match PTOParam's existing GM ABI: tensor pointers precede scalar values,
   // regardless of IR parameter order. Dynamic shape symbols follow the user
   // payload in exactly the shared wrapper order, before runtime SPMD identities.
@@ -896,6 +899,7 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
     // reuse it without referring to a value defined only in this branch.
     const auto tensor_view = GetOrCreateTensorView(tensor);
     const bool guarded =
+        fs_.nonempty_buffer_transfers.count(call.get()) == 0 &&
         backend::pto_ops_detail::BeginNonEmptyRegion(extents->elements_, *this, extent_values);
     const std::string partition = backend::pto_ops_detail::EmitPartitionViewPTO(
         tensor->name_hint_, tensor_view, GetTensorViewTypeString(type.get()), partition_type, offset_values,

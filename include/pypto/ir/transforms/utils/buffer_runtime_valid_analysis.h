@@ -53,8 +53,8 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     CallPtr call;
     std::string message;
   };
-  explicit BufferRuntimeValidAnalysis(const FunctionPtr& function)
-      : analyzer_(std::make_shared<arith::Analyzer>()) {
+  explicit BufferRuntimeValidAnalysis(const FunctionPtr& function, bool collect_guards = false)
+      : analyzer_(std::make_shared<arith::Analyzer>()), collect_guards_(collect_guards) {
     if (function) {
       core_ = function->func_type_;
       BindBufferAccTrimParameters(function, *analyzer_, ready_);
@@ -62,6 +62,20 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     }
   }
   const std::optional<Issue>& issue() const { return issue_; }
+  bool HasElidableGuards() const {
+    return std::any_of(redundant_guards_.begin(), redundant_guards_.end(),
+                       [](const auto& entry) { return entry.second; });
+  }
+  bool Elides(const IfStmtPtr& branch) const {
+    const auto found = redundant_guards_.find(branch.get());
+    return found != redundant_guards_.end() && found->second;
+  }
+  std::unordered_set<const Call*> NonEmptyTransfers() const {
+    std::unordered_set<const Call*> proved;
+    for (const auto& [call, positive] : transfer_guards_)
+      if (positive) proved.insert(call);
+    return proved;
+  }
 
  protected:
   void VisitVarLike_(const VarPtr&) override {}
@@ -95,9 +109,7 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     }
     if (const auto scalar = As<ScalarType>(statement->var_->GetType());
         scalar && (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt())) {
-      const auto range = BoundBufferAccTrimScalar(
-          statement->value_, *analyzer_, [this](const VarPtr& var) { return ready_.count(var.get()) != 0; },
-          &bound_cache_);
+      const auto range = Bounds(statement->value_);
       if (range) {
         if (ready_.insert(statement->var_.get()).second) scalar_definitions_.push_back(statement->var_);
         analyzer_->const_int_bound.Update(statement->var_, *range);
@@ -110,9 +122,12 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
   }
   void VisitStmt_(const ForStmtPtr& loop) override {
     const auto checkpoint = scalar_definitions_.size();
-    // The original counted-loop coordinate is available in its body. This
-    // grants no count, sign or numerical bound and does not survive the exit.
-    if (ready_.insert(loop->loop_var_.get()).second) scalar_definitions_.push_back(loop->loop_var_);
+    const auto range = BoundBufferLoopCoordinate(
+        loop, *analyzer_, [this](const VarPtr& var) { return ready_.count(var.get()) != 0; }, bound_cache_);
+    if (ready_.insert(loop->loop_var_.get()).second) {
+      scalar_definitions_.push_back(loop->loop_var_);
+      if (range) analyzer_->const_int_bound.Update(loop->loop_var_, *range);
+    }
     ++epoch_;
     bound_cache_.clear();
     VisitStmt(loop->body_);
@@ -132,6 +147,11 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
   }
   void VisitStmt_(const IfStmtPtr& branch) override {
     const auto checkpoint = scalar_definitions_.size();
+    if (collect_guards_ && !branch->else_body_ && branch->return_vars_.empty() &&
+        branch->leading_comments_.empty()) {
+      auto [entry, inserted] = redundant_guards_.emplace(branch.get(), true);
+      if (entry->second) entry->second = ProvesValidityGuard(branch->condition_);
+    }
     bound_cache_.clear();
     {
       BufferAccTrimGuardScope constraint(branch->condition_, true, analyzer_, guard_aliases_);
@@ -163,6 +183,35 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     return type && (type->dtype_.IsSignedInt() || type->dtype_ == DataType::INDEX) &&
            (AsVarLike(expression) || As<ConstInt>(expression));
   }
+  std::optional<arith::ConstIntBound> Bounds(const ExprPtr& value) {
+    return BoundBufferAccTrimScalar(
+        value, *analyzer_, [this](const VarPtr& var) { return ready_.count(var.get()) != 0; }, &bound_cache_);
+  }
+  bool Positive(const ExprPtr& extent) {
+    if (AtomicInteger(extent) && analyzer_->const_int_bound(extent).min_value >= 1) return true;
+    const auto bound = Bounds(extent);
+    return bound && bound->min_value >= 1;
+  }
+  bool ProvesValidityGuard(const ExprPtr& predicate) {
+    // Follow only the conjunction of positive-extent comparisons emitted by
+    // Buffer lowering. The proof is about original SSA values at this cut.
+    std::vector<ExprPtr> pending{predicate};
+    std::unordered_set<const Expr*> seen;
+    while (!pending.empty()) {
+      const auto expr = std::move(pending.back());
+      pending.pop_back();
+      if (!seen.insert(expr.get()).second) continue;
+      if (const auto both = As<And>(expr)) {
+        pending.push_back(both->left_);
+        pending.push_back(both->right_);
+        continue;
+      }
+      const auto cmp = As<Gt>(expr);
+      const auto zero = cmp ? As<ConstInt>(cmp->right_) : nullptr;
+      if (!zero || zero->value_ != 0 || !Positive(cmp->left_)) return false;
+    }
+    return true;
+  }
   bool Equal(const ExprPtr& a, const ExprPtr& b) {
     // The predicate query includes the analyzer's guarded comparison facts;
     // CanProveEqual's subtraction-interval query alone loses SSA equalities.
@@ -190,6 +239,18 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     if (!issue_) issue_ = Issue{call, message};
   }
   void CheckCall(const CallPtr& call) {
+    if (collect_guards_ && (IsOp(call, "buffer.load") || IsOp(call, "buffer.store")) &&
+        call->args_.size() == 4) {
+      const auto extents = As<MakeTuple>(call->args_[2]);
+      if (extents && std::any_of(extents->elements_.begin(), extents->elements_.end(),
+                                 [](const ExprPtr& extent) { return !As<ConstInt>(extent); })) {
+        auto [entry, inserted] = transfer_guards_.emplace(call.get(), true);
+        if (entry->second) {
+          entry->second = std::all_of(extents->elements_.begin(), extents->elements_.end(),
+                                      [this](const ExprPtr& extent) { return Positive(extent); });
+        }
+      }
+    }
     // A dynamic Acc is a store-only metadata alias. No producer/carry/window
     // or unknown consumer inherits permission from its -1 descriptor fields.
     for (size_t i = 0; i < call->args_.size(); ++i) {
@@ -226,9 +287,7 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
           Refuse(call,
                  "Runtime Acc store requires restored rows and fixed full columns matching the GM partition");
         } else {
-          const auto range = BoundBufferAccTrimScalar(
-              (*extents)[0], *analyzer_, [this](const VarPtr& var) { return ready_.count(var.get()) != 0; },
-              &bound_cache_);
+          const auto range = Bounds((*extents)[0]);
           if (!range || range->min_value < 1 || range->max_value > type->shape_[0])
             Refuse(call,
                    "Runtime Acc store requires proved positive rows within physical capacity at this use");
@@ -328,7 +387,16 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
   std::unordered_set<const Var*> owners_;
   std::unordered_map<const Var*, State> states_;
   std::optional<Issue> issue_;
+  bool collect_guards_;
+  // The same immutable statement/call can be reused. Every occurrence must
+  // have the witness before a pointer-keyed rewrite or emission can use it.
+  std::unordered_map<const IfStmt*, bool> redundant_guards_;
+  std::unordered_map<const Call*, bool> transfer_guards_;
 };
+
+// Remove only validity guards whose exact predicates follow from original
+// lexical facts. An already placed Buffer input can share the same rewrite.
+FunctionPtr ElideDominatedValidityGuards(const FunctionPtr& function);
 
 // A selected descriptor's native runtime obligations apply equally to access
 // analysis, actual-token lowering, ownership and code generation.

@@ -557,6 +557,37 @@ class TestVarIdentity:
 
 
 class TestEdgeCases:
+    @pytest.mark.parametrize("dtype", [DataType.INT64, DataType.INDEX])
+    @pytest.mark.parametrize("op", [ir.Add, ir.Sub])
+    @pytest.mark.parametrize("sign", [-1, 1])
+    @pytest.mark.parametrize("gap", [0, 1])
+    def test_signed_endpoints_can_cancel_to_zero(self, dtype, op, sign, gap):
+        bounds = ConstIntBoundAnalyzer()
+        start = ir.Var("start", ir.ScalarType(dtype), S)
+        endpoint = sign * (INT64_MAX - gap)
+        if op is ir.Add:
+            endpoint = -endpoint
+        bounds.update(start, ConstIntBound(min(0, endpoint), max(0, endpoint)))
+        cap = ir.ConstInt(sign * INT64_MAX, dtype, S)
+        distance = op(cap, start, dtype, S)
+        trimmed = ir.Sub(distance, ir.ConstInt(sign * gap, dtype, S), dtype, S)
+        clip = ir.Min if sign > 0 else ir.Max
+        clipped = bounds(clip(trimmed, ir.ConstInt(sign * 8, dtype, S), dtype, S))
+        assert clipped.min_value <= 0
+        assert clipped.max_value >= 0
+        assert (clipped.max_value if sign > 0 else clipped.min_value) == sign * 8
+
+    def test_subtraction_does_not_negate_int64_min(self):
+        result = analyzer(ir.Sub(ci(INT64_MIN), ci(INT64_MIN), INT, S))
+        assert result.min_value == result.max_value == 0
+
+    def test_overflowing_subtraction_near_int64_min_has_no_range_proof(self):
+        bounds = ConstIntBoundAnalyzer()
+        start = make_var("start")
+        bounds.update(start, ConstIntBound(INT64_MIN, INT64_MIN + 1))
+        result = bounds(ir.Sub(start, ci(1), INT, S))
+        assert result.is_everything()
+
     def test_neg_int64_min(self):
         """Negating INT64_MIN should not cause UB — saturate to kPosInf."""
         b = analyzer(ir.Neg(ci(INT64_MIN), INT, S))

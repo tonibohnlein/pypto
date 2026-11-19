@@ -1343,6 +1343,7 @@ class PTOCodegen : public CodegenBase {
     size_t next_tile_alloc_scope = 0;
 
     ir::FunctionPtr current_function;
+    std::unordered_set<const ir::Call*> nonempty_buffer_transfers;
     ir::VarPtr current_result_var;
     std::string current_result_buf;
     std::shared_ptr<const ir::TileType> current_result_tile_type;
@@ -1454,6 +1455,7 @@ class PTOCodegen : public CodegenBase {
       tuple_element_index.clear();
       urma_get_destinations.clear();
       current_function.reset();
+      nonempty_buffer_transfers.clear();
       current_result_var.reset();
       current_result_buf.clear();
       current_result_tile_type = nullptr;

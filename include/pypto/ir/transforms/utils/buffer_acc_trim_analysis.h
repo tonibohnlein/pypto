@@ -29,6 +29,10 @@ using BufferAccTrimBoundCache = std::unordered_map<const Expr*, std::optional<ar
 std::optional<arith::ConstIntBound> BoundBufferAccTrimScalar(const ExprPtr& expr, arith::Analyzer& analyzer,
                                                              const std::function<bool(const VarPtr&)>& ready,
                                                              BufferAccTrimBoundCache* cache = nullptr);
+std::optional<arith::ConstIntBound> BoundBufferLoopCoordinate(const ForStmtPtr& loop,
+                                                              arith::Analyzer& analyzer,
+                                                              const std::function<bool(const VarPtr&)>& ready,
+                                                              BufferAccTrimBoundCache& cache);
 void BindBufferAccTrimParameters(const FunctionPtr& function, arith::Analyzer& analyzer,
                                  std::unordered_set<const Var*>& ready);
 

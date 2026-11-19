@@ -361,6 +361,11 @@ execute only when both valid extents are positive. Dynamic-valid subviews are
 materialized at their guarded consumers, so the empty path never constructs an
 empty native subview. Constant-empty operations are removed before constructing
 Buffer calls. Views never escape the guard, and no Buffer-valued phi is introduced.
+Lowering and PTO emission reuse dominating integer bounds when they prove the
+actual extents positive. A comparison such as `0 <= start < stop` can prove a
+clipped `stop - start` extent positive when the subtraction fits the scalar
+type and the clipping limit is positive. Metadata writes and payloads keep
+their original order.
 This does not initialize data when valid extents grow. Nonzero runtime extents
 must still fit the physical window, and reads must refer to initialized data.
 

@@ -48,6 +48,52 @@ bool Constant(const ExprPtr& expr, int64_t value) {
   const auto number = As<ConstInt>(expr);
   return number && number->value_ == value;
 }
+
+using Wide = __int128;
+
+std::pair<Wide, Wide> SignedLimits(const ExprPtr& expr) {
+  const auto dtype = GetScalarDtype(expr);
+  const auto bits = dtype == DataType::INDEX ? 64 : dtype.GetBit();
+  const Wide maximum = (Wide{1} << (bits - 1)) - 1;
+  return {-maximum - 1, maximum};
+}
+
+std::pair<Wide, Wide> MachineBounds(const ExprPtr& expr, const arith::ConstIntBound& bound) {
+  const auto [minimum, maximum] = SignedLimits(expr);
+  return {bound.min_value == arith::ConstIntBound::kNegInf ? minimum : Wide{bound.min_value},
+          bound.max_value == arith::ConstIntBound::kPosInf ? maximum : Wide{bound.max_value}};
+}
+
+std::optional<arith::ConstIntBound> BoundArithmetic(const ExprPtr& expr, const BinaryExprPtr& binary,
+                                                    const arith::ConstIntBound& a,
+                                                    const arith::ConstIntBound& b,
+                                                    arith::Analyzer& analyzer) {
+  const auto [lo_a, hi_a] = MachineBounds(binary->left_, a);
+  const auto [lo_b, hi_b] = MachineBounds(binary->right_, b);
+  Wide lo, hi;
+  if (As<Sub>(expr)) {
+    lo = lo_a - hi_b;
+    hi = hi_a - lo_b;
+    // Only a lexical comparison of the original SSA operands can refine
+    // this difference. A subtraction-based solver would reason about the
+    // very arithmetic whose machine range is not yet known.
+    if (AsVarLike(binary->left_) && AsVarLike(binary->right_)) {
+      const auto order = analyzer.transitive_cmp.TryCompare(binary->left_, binary->right_, false);
+      if (order == arith::CompareResult::kGT) lo = std::max(lo, Wide{1});
+      if (order == arith::CompareResult::kLT) hi = std::min(hi, Wide{-1});
+    }
+  } else if (As<Mul>(expr)) {
+    lo = std::min({lo_a * lo_b, lo_a * hi_b, hi_a * lo_b, hi_a * hi_b});
+    hi = std::max({lo_a * lo_b, lo_a * hi_b, hi_a * lo_b, hi_a * hi_b});
+  } else {
+    lo = lo_a + lo_b;
+    hi = hi_a + hi_b;
+  }
+  const auto [minimum, maximum] = SignedLimits(expr);
+  if (lo < minimum || hi > maximum || lo > hi || hi < arith::ConstIntBound::kNegInf) return std::nullopt;
+  return arith::ConstIntBound{static_cast<int64_t>(std::max(lo, Wide{arith::ConstIntBound::kNegInf})),
+                              static_cast<int64_t>(hi)};
+}
 bool StaticFull(const TileTypePtr& tile) {
   if (!tile || !Acc(tile) || tile->shape_.size() != 2) return false;
   const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
@@ -70,9 +116,8 @@ bool SameStorage(const TileTypePtr& source, const TileTypePtr& result) {
          structural_equal(a->byte_offset_, b->byte_offset_);
 }
 
-// Scalar facts are established at their original definition. Only min/max and
-// lossless same-type aliases propagate numerical bounds: machine arithmetic
-// cannot acquire an overflow premise merely because a solver simplifies it.
+// Scalar facts are established at their original definition. Machine
+// arithmetic must have a representable range even under dominating comparisons.
 class CandidateIndex : public IRVisitor {
  public:
   explicit CandidateIndex(const FunctionPtr& function) : analyzer_(std::make_shared<arith::Analyzer>()) {
@@ -354,13 +399,23 @@ std::optional<arith::ConstIntBound> BoundBufferAccTrimScalar(const ExprPtr& expr
       result = arith::ConstIntBound{constant->value_, constant->value_};
     } else if (const auto variable = AsVarLike(expr); variable && ready(variable)) {
       result = analyzer.const_int_bound(variable);
-    } else if (const auto binary = As<BinaryExpr>(expr); binary && (As<Min>(expr) || As<Max>(expr))) {
+    } else if (const auto call = As<Call>(expr);
+               call && IsOp(call, "buffer.get_block_idx") && call->args_.empty()) {
+      result = arith::ConstIntBound{0, arith::ConstIntBound::kPosInf};
+    } else if (const auto binary = As<BinaryExpr>(expr);
+               binary &&
+               (As<Min>(expr) || As<Max>(expr) || As<Add>(expr) || As<Sub>(expr) || As<Mul>(expr))) {
       const auto a = self(self, binary->left_), b = self(self, binary->right_);
       if (a && b) {
-        result = As<Min>(expr) ? arith::ConstIntBound{std::min(a->min_value, b->min_value),
-                                                      std::min(a->max_value, b->max_value)}
-                               : arith::ConstIntBound{std::max(a->min_value, b->min_value),
-                                                      std::max(a->max_value, b->max_value)};
+        if (As<Min>(expr)) {
+          result = arith::ConstIntBound{std::min(a->min_value, b->min_value),
+                                        std::min(a->max_value, b->max_value)};
+        } else if (As<Max>(expr)) {
+          result = arith::ConstIntBound{std::max(a->min_value, b->min_value),
+                                        std::max(a->max_value, b->max_value)};
+        } else {
+          result = BoundArithmetic(expr, binary, *a, *b, analyzer);
+        }
       }
     }
     // A narrow machine scalar must not inherit mathematical bounds through
@@ -374,6 +429,25 @@ std::optional<arith::ConstIntBound> BoundBufferAccTrimScalar(const ExprPtr& expr
     return result;
   };
   return visit(visit, expression);
+}
+
+std::optional<arith::ConstIntBound> BoundBufferLoopCoordinate(const ForStmtPtr& loop,
+                                                              arith::Analyzer& analyzer,
+                                                              const std::function<bool(const VarPtr&)>& ready,
+                                                              BufferAccTrimBoundCache& cache) {
+  if (loop->kind_ != ForKind::Sequential || !Integer(loop->loop_var_)) return std::nullopt;
+  const auto start = BoundBufferAccTrimScalar(loop->start_, analyzer, ready, &cache);
+  const auto stop = BoundBufferAccTrimScalar(loop->stop_, analyzer, ready, &cache);
+  const auto step = BoundBufferAccTrimScalar(loop->step_, analyzer, ready, &cache);
+  if (!start || !stop || !step || step->min_value <= 0) return std::nullopt;
+  const Wide last = static_cast<Wide>(stop->max_value) - 1;
+  const auto [minimum, maximum] = SignedLimits(loop->loop_var_);
+  // Every visited IV lies in [start, stop). Also ensure the exit update
+  // could not wrap in the original IV type and start a second sequence.
+  if (start->min_value <= arith::ConstIntBound::kNegInf || start->min_value < minimum ||
+      start->min_value > last || last + step->max_value > maximum)
+    return std::nullopt;
+  return arith::ConstIntBound{start->min_value, static_cast<int64_t>(last)};
 }
 
 void BindBufferAccTrimParameters(const FunctionPtr& function, arith::Analyzer& analyzer,

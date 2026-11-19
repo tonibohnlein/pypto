@@ -250,7 +250,10 @@ PYPTO 仅允许动态 allocation 与兼容的、覆盖完整容量的 typed root
 有效长度允许零：allocation metadata 仍更新，但 load/store/算术仅在两轴 valid
 均为正时执行。动态 valid 的 subview 在受 guard 保护的消费点物化，因此空路径
 不会构造空 native subview。常量空操作在创建 Buffer 调用前消除。view 不逃逸出
-分支，也不产生 Buffer-valued phi。扩大 valid 不初始化数据；非零动态长度仍须
+分支，也不产生 Buffer-valued phi。如果支配当前位置的整数范围能证明实际有效长度为正，
+降低和 PTO 发射会复用这一证明。例如，若减法不会超出标量类型的表示范围且裁剪上限为正，
+`0 <= start < stop` 可以证明裁剪后的 `stop - start` 为正。元数据写入与计算仍保持原有顺序。
+扩大 valid 不初始化数据；非零动态长度仍须
 满足物理窗口边界，读取区域须已初始化。
 
 `tests/st/runtime/ops/test_buffer_views.py::test_default_dynamic_buffer_windows`
