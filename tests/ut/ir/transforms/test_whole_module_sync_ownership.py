@@ -17,6 +17,7 @@ import pytest
 from pypto import codegen, ir, passes
 from pypto._function_attrs import AUTOSYNC_WHOLE_MODULE_ATTR, PYPTO_AUTOSYNC_ATTR
 from pypto.backend import pto_backend
+from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.backend._sync_ownership import (
     OWNED_PTO_MARKER,
     make_sync_ownership,
@@ -24,6 +25,7 @@ from pypto.backend._sync_ownership import (
     validate_sync_ownership,
 )
 from pypto.compile_profiling import StageRecord
+from pypto.ir.op import sync
 from pypto.pypto_core import ir as core_ir
 from pypto.runtime.debug import pto_rebuild
 
@@ -100,7 +102,7 @@ def test_whole_module_ownership_requires_native_runtime_metadata_proof(kind, rea
     assert ir.serialize(program) == before
 
 
-def barrier_program():
+def barrier_program(*, manual_before_fill=False):
     def ci(v):
         return ir.ConstInt(v, ir.DataType.INDEX, S)
 
@@ -114,16 +116,59 @@ def barrier_program():
     allocation = ir.AssignStmt(buffer, op("buffer.alloc", [ir.MakeTuple([], S), ci(0)], ty), S)
     full = ir.EvalStmt(op("buffer.full", [ir.ConstFloat(1.0, ir.DataType.FP32, S), buffer]), S)
     absolute = ir.EvalStmt(op("buffer.abs", [buffer, buffer]), S)
+    body = [allocation]
+    if manual_before_fill:
+        # Wait for work on an independent buffer before starting the fill.
+        # The storage hazard on the original buffer occurs later, before abs.
+        prior = ir.Var("prior", ty, S)
+        token = ir.Var("ready", ir.SyncTokenType(ir.PipeType.V), S)
+        body.extend(
+            [
+                ir.AssignStmt(prior, op("buffer.alloc", [ir.MakeTuple([], S), ci(4096)], ty), S),
+                ir.EvalStmt(op("buffer.full", [ir.ConstFloat(2.0, ir.DataType.FP32, S), prior]), S),
+                ir.AssignStmt(token, sync.record(ir.PipeType.V), S),
+                ir.EvalStmt(sync.wait(token, ir.PipeType.V), S),
+            ]
+        )
     original = ir.Function(
         "barrier_only",
         [],
         [],
-        ir.SeqStmts([allocation, full, absolute, ir.ReturnStmt([], S)], S),
+        ir.SeqStmts([*body, full, absolute, ir.ReturnStmt([], S)], S),
         S,
         ir.FunctionType.AIV,
         ir_stage=ir.FunctionIRStage.Buffer,
     )
     return original, ir.Program([original], "Barrier", S)
+
+
+def test_hybrid_lower_preserves_manual_barrier_before_independent_fill():
+    original, program = barrier_program(manual_before_fill=True)
+    with passes.PassContext([], enable_pypto_autosync=True, autosync_disjoint_gm=True):
+        lowered = passes.lower_sync()(program).get_function(original.name)
+    assert lowered is not None
+    assert dict(lowered.attrs)[PYPTO_AUTOSYNC_ATTR] is False
+    full, barrier, absolute = (ir.get_op(op).name for op in ("buffer.full", "system.bar_v", "buffer.abs"))
+    assert [op for op in calls(lowered) if op in {full, barrier, absolute}] == [full, barrier, full, absolute]
+
+
+@pytest.mark.ptoas_compile
+def test_ptoas_preserves_manual_barrier_and_orders_later_storage_hazard(tmp_path):
+    if find_ptoas_binary() is None:
+        pytest.skip("PTOAS is not available")
+    _, program = barrier_program(manual_before_fill=True)
+    with passes.PassContext([], enable_pypto_autosync=True, autosync_disjoint_gm=True):
+        lowered = passes.lower_sync()(program)
+
+    source = tmp_path / "barriers.pto"
+    source.write_text(codegen.PTOCodegen().generate(lowered, emit_tile_addr=True, emit_source_loc=False))
+    output = tmp_path / "barriers.cpp"
+    pto_backend._run_ptoas(
+        str(source), str(output), ["--pto-arch=a2", "--pto-level=level3", "--enable-insert-sync=true"]
+    )
+    _, between_fills, after_fills = output.read_text().split("TEXPANDS(")
+    assert "pipe_barrier(PIPE_V)" in between_fills
+    assert after_fills.index("pipe_barrier(PIPE_V)") < after_fills.index("TABS(")
 
 
 def test_barrier_only_module_keeps_actual_token_order_and_exit_completion():
@@ -151,9 +196,9 @@ def test_barrier_only_module_keeps_actual_token_order_and_exit_completion():
     assert delegated_lower is not None and delegated_realize is not None
     assert dict(delegated_lower.attrs)[PYPTO_AUTOSYNC_ATTR] is False
     assert dict(delegated_realize.attrs)[PYPTO_AUTOSYNC_ATTR] is False
-    assert ir.get_op("system.bar_v").name not in calls(delegated_lower)
+    assert ir.get_op("system.bar_v").name in calls(delegated_lower)
     assert "SyncToken" not in str(delegated_lower)
-    ir.assert_structural_equal(delegated_lower.body, delegated_realize.body)
+    ir.assert_structural_equal(original.body, delegated_realize.body)
 
 
 @pytest.mark.parametrize("realize", [False, True])

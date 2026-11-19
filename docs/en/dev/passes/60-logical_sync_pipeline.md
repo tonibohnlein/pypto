@@ -66,6 +66,11 @@ export. A capacity refusal is separate. Lowering does not reanalyze storage to
 replace manually supplied dependencies. Hand-authored supported programs and
 serialized programs use the same token interpretation.
 
+In default per-kernel mode, `LowerSync` keeps the barriers from a supplied
+barrier-only plan at their lowered positions. A caller can therefore order
+independent operations with a same-pipe wait while PTOAS adds synchronization
+for storage hazards elsewhere in the kernel.
+
 ## Finite validity argument and costs
 
 Within a straight-line invocation, each pipe's waits form an ordered chain.
