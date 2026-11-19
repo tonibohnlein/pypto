@@ -767,10 +767,16 @@ def _buffer_matmul(lhs, rhs, destination, accumulate, tf32_mode=None):
 
 def _buffer_load(tensor, offsets, valid, destination):
     data = _tile_load(tensor, offsets, valid)
+    # A rank-one GM transfer uses the columns of a single local Buffer row.
+    if tensor.ndim == 1:
+        data = data.unsqueeze(0)
     _buffer_write(destination, data)
 
 def _buffer_store(source, offsets, valid, tensor, atomic=0):
-    data = _buffer_read(source, valid)
+    if tensor.ndim == 1:
+        data = _buffer_read(source, (1, *valid)).squeeze(0)
+    else:
+        data = _buffer_read(source, valid)
     _tile_store(data, offsets, tensor, atomic=atomic)
 
 def _buffer_subview(source, offsets, shape, valid):
@@ -838,7 +844,11 @@ def _cast_tensor(tensor, dtype, mode=0):
         if mode == 1:
             return torch.round(tensor).to(dtype)
         if mode == 2:
-            return (torch.sign(tensor) * torch.floor(torch.abs(tensor) + 0.5)).to(dtype)
+            # Adding 0.5 before truncation can shift an already integral value
+            # or round a fraction below the halfway point up to it.
+            integral = torch.trunc(tensor)
+            step = (tensor - integral).abs() >= 0.5
+            return (integral + torch.sign(tensor) * step).to(dtype)
         if mode == 3:
             return torch.floor(tensor).to(dtype)
         if mode == 4:

@@ -14,6 +14,7 @@ import pytest
 import torch
 from pypto import ir, passes
 from pypto.debug import torch_codegen
+from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 from pypto.jit.decorator import jit
 from pypto.runtime.runner import RunConfig
 
@@ -172,6 +173,76 @@ def test_buffer_storage_views_alias_bytes_and_destination_writes():
     output = torch.empty_like(source)
     namespace["kernel"](source, output)
     torch.testing.assert_close(output, source * 2)
+
+
+@pytest.mark.usefixtures("ascend_backend")
+@pytest.mark.parametrize(
+    "valid, count, load_offset, store_offset",
+    [("32", 32, 0, 0), ("13", 13, 8, 16), ("n", 0, 8, 16), ("n", 1, 8, 16), ("n", 24, 8, 16)],
+    ids=["full", "static-partial", "runtime-empty", "runtime-single", "runtime-partial"],
+)
+def test_default_rank_one_buffer_transfer(valid, count, load_offset, store_offset):
+    program = pl.parse_program(f"""
+@pl.program
+class RankOneTransfer:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self, source: pl.Tensor[[64], pl.FP32], output: pl.Out[pl.Tensor[[64], pl.FP32]],
+        n: pl.Scalar[pl.INDEX],
+    ) -> pl.Tensor[[64], pl.FP32]:
+        tile = pl.load(source, [{load_offset}], [32], valid_shape=[{valid}])
+        return pl.store(tile, [{store_offset}], output)
+""")
+    lowered = PassManager(OptimizationStrategy.Default).run_passes(program)
+    kernel = lowered.get_function("kernel")
+    assert kernel is not None and kernel.ir_stage == ir.FunctionIRStage.Buffer
+    namespace = {}
+    exec(torch_codegen(lowered, check_shapes=True), namespace)  # noqa: S102
+    source = torch.arange(64, dtype=torch.float32)
+    output = torch.full_like(source, -1)
+    # The local row has capacity 32. Only the valid GM window may change.
+    expected = output.clone()
+    expected[store_offset : store_offset + count] = source[load_offset : load_offset + count]
+    namespace["kernel"](source, output, count)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.usefixtures("ascend_backend")
+@pytest.mark.parametrize("buffer_ir", [False, True], ids=["tile", "buffer"])
+@pytest.mark.parametrize(
+    "dtype, torch_dtype, large_integer, half_step",
+    [("FP16", torch.float16, 1025, 2**-12), ("FP32", torch.float32, 8388609, 2**-25)],
+    ids=["fp16", "fp32"],
+)
+def test_default_cast_round_away_from_zero(buffer_ir, dtype, torch_dtype, large_integer, half_step):
+    program = pl.parse_program(f"""
+@pl.program
+class RoundAway:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self, source: pl.Tensor[[2, 32], pl.{dtype}], output: pl.Out[pl.Tensor[[2, 32], pl.INT32]],
+    ) -> pl.Tensor[[2, 32], pl.INT32]:
+        tile = pl.load(source, [0, 0], [2, 32])
+        return pl.store(pl.cast(tile, pl.INT32, mode="round"), [0, 0], output)
+""")
+    with passes.PassContext([], enable_buffer_ir=buffer_ir):
+        lowered = PassManager(OptimizationStrategy.Default).run_passes(program)
+    expected_stage = ir.FunctionIRStage.Buffer if buffer_ir else ir.FunctionIRStage.Functional
+    kernel = lowered.get_function("kernel")
+    assert kernel is not None and kernel.ir_stage == expected_stage
+    namespace = {}
+    exec(torch_codegen(lowered, check_shapes=True), namespace)  # noqa: S102
+    # Adding 0.5 in the source dtype can change an odd integer or turn a
+    # fraction immediately below 0.5 into a value that rounds up.
+    below_half = 0.5 - half_step
+    source = torch.tensor(
+        [large_integer, -large_integer, 0.5, -0.5, 2.5, -2.5, below_half, -below_half] * 8,
+        dtype=torch_dtype,
+    ).reshape(2, 32)
+    expected = torch.tensor([large_integer, -large_integer, 1, -1, 3, -3, 0, 0] * 8, dtype=torch.int32)
+    output = torch.empty_like(source, dtype=torch.int32)
+    namespace["kernel"](source, output)
+    torch.testing.assert_close(output, expected.reshape(2, 32), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("storage", ["allocated", "addressed", "reshaped"])
