@@ -19,6 +19,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -34,6 +35,7 @@
 #include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/arith/analyzer.h"
+#include "pypto/ir/memref.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/base/mutator.h"
@@ -870,8 +872,38 @@ class Importer {
   // dependence clients construct storage effects and their selector evidence.
   Importer(bool recover_accesses, SyncExternalPolicy policy)
       : recover_accesses(recover_accesses),
-        readonly_external(policy == SyncExternalPolicy::ReadOnlyProjection) {}
-  const bool recover_accesses, readonly_external;
+        readonly_external(policy == SyncExternalPolicy::ReadOnlyProjection),
+        disjoint_readonly(policy == SyncExternalPolicy::DisjointReadOnlyProjection) {}
+  const bool recover_accesses, readonly_external, disjoint_readonly;
+
+  bool DeferredCoordinates() const { return readonly_external || disjoint_readonly; }
+
+  // Only original, nonaliasing formal roots are admitted for selective
+  // projection. Actual operand effects are checked separately at every site.
+  void RegisterExternalFormals(const FunctionPtr& owner) {
+    std::set<const Expr*> bases;
+    for (size_t i = 0; i < owner->params_.size(); ++i) {
+      const auto& var = owner->params_[i];
+      const auto tensor = As<TensorType>(var->GetType());
+      if (!tensor) {
+        continue;
+      }
+      const auto memref = tensor->memref_.value_or(nullptr);
+      const auto* base = memref ? memref->base_.get() : var.get();
+      CHECK(base && bases.insert(base).second)
+          << "Disjoint read-only projection requires distinct original GM bases";
+      external_formals.insert(var.get());
+      if (owner->param_directions_[i] == ParamDirection::In) {
+        projected_formals.insert(var.get());
+      }
+    }
+    CHECK(!projected_formals.empty()) << "Disjoint read-only projection has no original input roots";
+  }
+
+  bool ProjectsExternal(const ExprPtr& expr) const {
+    return readonly_external || projected_formals.count(expr.get()) != 0;
+  }
+  std::set<const Expr*> external_formals, projected_formals;
   std::set<const Var*> ready_scalars;
   std::set<const Expr*> external_roots;
   CompactSyncInput result;
@@ -950,11 +982,24 @@ class Importer {
       if (hi >= std::numeric_limits<int64_t>::max()) return;
       analyzer.const_int_bound.Update(frame.loop->loop_var_, {lo, static_cast<int64_t>(hi)});
     };
-    for (const auto& frame : segment.nested_frames) bind_frame(frame);
-    if (segment.original_loop) {
+    bool has_original_frame = false;
+    for (const auto& frame : segment.nested_frames) {
+      bind_frame(frame);
+      has_original_frame |= frame.loop == segment.original_loop;
+    }
+    // A structured leaf's original loop is already in nested_frames. Do not
+    // overwrite its proved symbolic start with the leaf's numerical origin.
+    if (segment.original_loop && !has_original_frame) {
       bind_frame({segment.original_loop, segment.count, segment.start, segment.step});
     }
   }
+  void QualifyBranchCondition(const ExprPtr& condition, const SyncSegment& segment) {
+    if (disjoint_readonly) {
+      const auto root = coordinates.Build(condition, segment, parameters, result);
+      coordinates.CheckScope(root, segment);
+    }
+  }
+
   std::optional<bool> EvaluateStaticBranchCondition(const ExprPtr& condition, const SyncSegment& segment) {
     if (!condition) return std::nullopt;
     arith::Analyzer analyzer;
@@ -1106,7 +1151,7 @@ class Importer {
     CHECK(!parameters.count(assign->var_.get()) && !coordinates.Defined(assign->var_) &&
           (!segment.original_loop || assign->var_ != segment.original_loop->loop_var_))
         << "Invocation and loop coordinates must retain their original single-assignment identities";
-    if (readonly_external) {
+    if (DeferredCoordinates()) {
       if (const auto call = As<Call>(assign->value_)) {
         const auto descriptor = backend::QualifyBufferSyncNonPayload(call, result.hardware_target);
         CHECK(descriptor && descriptor->SignalFree())
@@ -1118,7 +1163,7 @@ class Importer {
       ready_scalars.insert(assign->var_.get());
     }
     scalar_defs.emplace_back(assign->var_, assign->value_);
-    coordinates.Define(assign->var_, assign->value_, segment, parameters, result, readonly_external);
+    coordinates.Define(assign->var_, assign->value_, segment, parameters, result, DeferredCoordinates());
   }
   static bool ValidatePureScalarArm(const StmtPtr& stmt, size_t expected_yields) {
     auto stmts = Statements(stmt);
@@ -1148,7 +1193,9 @@ class Importer {
     class Substituter : public IRMutator {
       const std::map<const Var*, ExprPtr>& map_;
       ExprPtr VisitExpr_(const VarPtr& var) override {
-        if (const auto found = map_.find(var.get()); found != map_.end()) return found->second;
+        if (const auto found = map_.find(var.get()); found != map_.end()) {
+          return found->second;
+        }
         return var;
       }
 
@@ -1264,25 +1311,26 @@ class Importer {
       const auto scalar_type = As<ScalarType>(rv->GetType());
       CHECK(readonly_external || SyncCoordinateMaximum(rv) || scalar_type->dtype_ == DataType::BOOL)
           << "Unavailable scalar coordinate type";
-      if (readonly_external) {
+      if (DeferredCoordinates()) {
         ReadyScalar(value, segment);
         ready_scalars.insert(rv.get());
       }
       scalar_defs.emplace_back(rv, value);
-      coordinates.Define(rv, value, segment, parameters, result, readonly_external);
+      coordinates.Define(rv, value, segment, parameters, result, DeferredCoordinates());
     };
     auto define_select_result = [&](const VarPtr& rv, const ExprPtr& cond, const ExprPtr& then_val,
                                     const ExprPtr& else_val) {
       const auto scalar_type = As<ScalarType>(rv->GetType());
       CHECK(readonly_external || SyncCoordinateMaximum(rv) || scalar_type->dtype_ == DataType::BOOL)
           << "Unavailable scalar coordinate type";
-      if (readonly_external) {
+      if (DeferredCoordinates()) {
         ReadyScalar(cond, segment);
         ReadyScalar(then_val, segment);
         ReadyScalar(else_val, segment);
         ready_scalars.insert(rv.get());
       }
-      coordinates.DefineSelect(rv, cond, then_val, else_val, segment, parameters, result, readonly_external);
+      coordinates.DefineSelect(rv, cond, then_val, else_val, segment, parameters, result,
+                               DeferredCoordinates());
     };
 
     const auto verdict = EvaluateStaticBranchCondition(branch->condition_, segment);
@@ -1614,25 +1662,45 @@ class Importer {
     access.coordinate_frame = coordinate_frame;
     return access;
   }
+  void CheckExternalEffects(const backend::BufferSyncOperation& operation, const CallPtr& call) {
+    if (!DeferredCoordinates()) {
+      return;
+    }
+    for (size_t index = 0; index < operation.ArgumentEffects().size(); ++index) {
+      const auto effect = operation.ArgumentEffects()[index].data;
+      if (effect == BufferAccess::None) continue;
+      const auto type = call->args_[index]->GetType();
+      const auto buffer = As<BufferType>(type);
+      if (!As<TensorType>(type) && (!buffer || buffer->memory_space_ != MemorySpace::DDR)) continue;
+      const auto& operand = call->args_[index];
+      if (disjoint_readonly) {
+        CHECK(external_formals.count(operand.get()) &&
+              (IsOp(call, "buffer.load") || IsOp(call, "buffer.store")))
+            << "Disjoint read-only projection requires direct original GM operands on qualified DMA";
+      }
+      if (ProjectsExternal(operand)) {
+        CHECK(effect == BufferAccess::Read) << "Read-only external projection cannot omit an external write";
+        CHECK(!disjoint_readonly || IsOp(call, "buffer.load"))
+            << "Disjoint read-only projection requires a qualified DMA load";
+        if (external_roots.insert(operand.get()).second) {
+          result.projected_readonly_external_roots.push_back(operand);
+        }
+      }
+    }
+    for (const auto& effect : operation.Implementation().ImplicitEffects()) {
+      if (effect.space == MemorySpace::DDR) {
+        CHECK(!disjoint_readonly) << "Disjoint read-only projection requires explicit GM effects";
+        CHECK(effect.data == BufferAccess::Read)
+            << "Read-only external projection cannot omit an implicit external write";
+      }
+    }
+  }
+
   SyncSite Site(const CallPtr& call, const SyncSegment& segment) {
     const auto operation =
         backend::QualifyBufferSyncOperation(call, result.owner->func_type_, result.hardware_target);
     const auto& implementation = operation.Implementation();
-    if (readonly_external) {
-      for (size_t index = 0; index < operation.ArgumentEffects().size(); ++index) {
-        const auto effect = operation.ArgumentEffects()[index].data;
-        if (effect == BufferAccess::None) continue;
-        const auto type = call->args_[index]->GetType();
-        const auto buffer = As<BufferType>(type);
-        if (!As<TensorType>(type) && (!buffer || buffer->memory_space_ != MemorySpace::DDR)) continue;
-        CHECK(effect == BufferAccess::Read) << "Read-only external projection cannot omit an external write";
-        if (external_roots.insert(call->args_[index].get()).second)
-          result.projected_readonly_external_roots.push_back(call->args_[index]);
-      }
-      for (const auto& effect : implementation.ImplicitEffects())
-        CHECK(effect.space != MemorySpace::DDR || effect.data == BufferAccess::Read)
-            << "Read-only external projection cannot omit an implicit external write";
-    }
+    CheckExternalEffects(operation, call);
     SyncSite site{call, nullptr, implementation.Pipe(), {}};
     // Track modes by operand, not storage: in-place operands can share bytes
     // while retaining different registered read/write modes.
@@ -1675,6 +1743,7 @@ class Importer {
     if (IsOp(call, "buffer.load") || IsOp(call, "buffer.store")) {
       const bool load = IsOp(call, "buffer.load");
       const auto gm_arg = load ? 0 : 3;
+      const bool projected = ProjectsExternal(call->args_[gm_arg]);
       const auto gm_mode = operation.ArgumentEffects()[gm_arg].data;
       const bool gm_read = gm_mode == BufferAccess::Read || gm_mode == BufferAccess::ReadWrite;
       const bool gm_write = gm_mode == BufferAccess::Write || gm_mode == BufferAccess::ReadWrite;
@@ -1688,7 +1757,7 @@ class Importer {
           << "Synchronization DMA requires a rank-two rectangle or conservative rank-one transfer";
       if (rank1_gm) {
         if (!scalar_point) RequireIndex(offsets->elements_[0]);
-        if (readonly_external) {
+        if (projected) {
           CHECK(load && gm_read && !gm_write) << "Read-only external projection requires a read-only DMA";
           ReadyScalar(offsets->elements_[0], segment);
         } else {
@@ -1710,7 +1779,7 @@ class Importer {
         // evidence even when no dependence footprint is requested.
         RequireIndex(offsets->elements_[0]);
         RequireIndex(offsets->elements_[1]);
-        if (readonly_external) {
+        if (projected) {
           CHECK(load && gm_read && !gm_write) << "Read-only external projection requires a read-only DMA";
           ReadyScalar(offsets->elements_[0], segment);
           ReadyScalar(offsets->elements_[1], segment);
@@ -2117,6 +2186,7 @@ class Importer {
         segment.sites.push_back(Site(call, segment));
         preceding_matrix |= segment.sites.back().pipe == PipeType::M;
       } else if (auto branch = As<IfStmt>(s)) {
+        QualifyBranchCondition(branch->condition_, segment);
         if (!branch->return_vars_.empty() && TryPureScalarBranch(branch, segment)) continue;
         if (branch->return_vars_.empty() && !IsInitializationContinuationBranch(branch)) {
           if (const auto verdict = EvaluateStaticBranchCondition(branch->condition_, segment)) {
@@ -2347,6 +2417,7 @@ SyncRegion ImportStructuredBody(Importer& importer, const StmtPtr& statement,
       }
       parents.pop_back();
     } else if (auto branch = As<IfStmt>(child)) {
+      importer.QualifyBranchCondition(branch->condition_, finite);
       if (branch->return_vars_.empty() && !Importer::IsInitializationContinuationBranch(branch)) {
         if (const auto verdict = importer.EvaluateStaticBranchCondition(branch->condition_, finite)) {
           importer.result.static_branches[branch.get()] = *verdict;
@@ -2884,6 +2955,9 @@ static CompactSyncInput ImportQualifiedSync(
   }
   Importer importer(recover_accesses, external_policy);
   if (importer.readonly_external) importer.result.unavailable_storage_spaces.insert(MemorySpace::DDR);
+  if (importer.disjoint_readonly) {
+    importer.RegisterExternalFormals(function);
+  }
   importer.result.owner = function;
   importer.result.hardware_target = target;
   importer.result.parameter_bounds = parameter_bounds;
@@ -2915,7 +2989,7 @@ static CompactSyncInput ImportQualifiedSync(
   for (size_t index = 0; index < function->params_.size(); ++index) {
     const auto& param = function->params_[index];
     if (As<ScalarType>(param->GetType())) {
-      if (recover_accesses && !importer.readonly_external) {
+      if (recover_accesses && !importer.DeferredCoordinates()) {
         CHECK(SyncCoordinateMaximum(param)) << "Unavailable invocation coordinate type";
         CHECK(parameter_bounds.count(index)) << "Invocation coordinate has no established caller range";
       }
@@ -2924,7 +2998,7 @@ static CompactSyncInput ImportQualifiedSync(
   }
   for (const auto& param : function->params_) {
     if (As<ScalarType>(param->GetType())) continue;
-    if (importer.readonly_external) {
+    if (importer.ProjectsExternal(param)) {
       const auto type = As<TensorType>(param->GetType());
       CHECK(type && (type->shape_.size() == 1 || type->shape_.size() == 2) &&
             type->dtype_.GetBit() % 8 == 0 && !type->tensor_view_)
@@ -2934,7 +3008,11 @@ static CompactSyncInput ImportQualifiedSync(
           CHECK(Constant(dim) > 0) << "Projected external extent must remain positive";
         } else {
           RequireIndex(dim);
-          importer.ReadyScalar(dim, SyncSegment{});
+          if (importer.disjoint_readonly) {
+            CHECK(AsVarLike(dim)) << "Projected input extent must use a ready descriptor dimension";
+          } else {
+            importer.ReadyScalar(dim, SyncSegment{});
+          }
         }
       }
       importer.objects[param.get()] = importer.result.storage.size();
@@ -2943,7 +3021,7 @@ static CompactSyncInput ImportQualifiedSync(
       importer.result.storage.push_back(std::move(unavailable));
       continue;
     }
-    if (!recover_accesses) break;  // GM geometry is not token-order evidence.
+    if (!recover_accesses) continue;  // GM geometry is not token-order evidence.
     auto t = As<TensorType>(param->GetType());
     CHECK(t && t->shape_.size() == 2 && t->dtype_.GetBit() % 8 == 0 && !t->tensor_view_)
         << "Synchronization prototype requires unviewed ND tensor arguments";
@@ -2956,8 +3034,10 @@ static CompactSyncInput ImportQualifiedSync(
       auto bound = importer.parameters.find(t->shape_[0].get());
       CHECK(bound != importer.parameters.end())
           << "Dynamic allocation extent has no established caller range";
+      const auto extent = parameter_bounds.find(bound->second);
+      CHECK(extent != parameter_bounds.end()) << "Dynamic allocation extent has no established caller range";
       row_parameter = bound->second;
-      rows = parameter_bounds.at(*row_parameter).second;
+      rows = extent->second.second;
     }
     auto cols = Constant(t->shape_[1]);
     importer.objects[param.get()] = importer.result.storage.size();
@@ -3035,10 +3115,13 @@ static CompactSyncInput ImportQualifiedSync(
 CompactSyncInput ImportPlacedSync(const FunctionPtr& function, bool disjoint_gm, const std::string& target,
                                   const SyncParameterBounds& parameters,
                                   const std::optional<std::pair<int64_t, int64_t>>& blocks,
-                                  std::shared_ptr<const SyncInvocationCoordinate> coordinate) {
+                                  std::shared_ptr<const SyncInvocationCoordinate> coordinate,
+                                  SyncExternalPolicy external_policy) {
   CHECK(disjoint_gm)
       << "Disjoint GM argument contract must be explicitly supplied; may-alias import unavailable";
-  return ImportQualifiedSync(function, target, parameters, blocks, true, SyncExternalPolicy::Geometry,
+  INTERNAL_CHECK(external_policy == SyncExternalPolicy::Geometry ||
+                 external_policy == SyncExternalPolicy::DisjointReadOnlyProjection);
+  return ImportQualifiedSync(function, target, parameters, blocks, true, external_policy,
                              std::move(coordinate));
 }
 CompactSyncInput ImportSyncPayloads(const FunctionPtr& function, const std::string& target,

@@ -209,7 +209,9 @@ struct SyncStorageClass {
 // A qualified read-only external projection removes no internal conflict:
 // external memory is distinct from local spaces and every external effect reads.
 // It does not provide an exact external storage interface.
-enum class SyncExternalPolicy { Geometry, ReadOnlyProjection };
+// DisjointReadOnlyProjection omits only qualified input roots under the
+// supplied disjoint-GM contract. Geometry for every mutable root is retained.
+enum class SyncExternalPolicy { Geometry, ReadOnlyProjection, DisjointReadOnlyProjection };
 // Checked change of invocation coordinates. Only Qualify can construct this
 // owner; it retains original IR and independent launch-cardinality evidence.
 // Payload expressions and loop frames always remain in original coordinates.
@@ -267,10 +269,10 @@ CompactSyncInput ImportPlacedSync(
     const FunctionPtr& function, bool disjoint_gm, const std::string& target = "a2a3",
     const SyncParameterBounds& parameter_bounds = {},
     const std::optional<std::pair<int64_t, int64_t>>& block_bounds = std::nullopt,
-    std::shared_ptr<const SyncInvocationCoordinate> coordinate = nullptr);
+    std::shared_ptr<const SyncInvocationCoordinate> coordinate = nullptr,
+    SyncExternalPolicy external_policy = SyncExternalPolicy::Geometry);
 CompactSyncInput ImportReadonlyExternalSync(
-    const FunctionPtr& function, const std::string& target,
-    const SyncParameterBounds& parameter_bounds = {},
+    const FunctionPtr& function, const std::string& target, const SyncParameterBounds& parameter_bounds = {},
     const std::optional<std::pair<int64_t, int64_t>>& block_bounds = std::nullopt);
 
 using Occurrence = std::tuple<size_t, int64_t, size_t>;  // segment, visit, site
@@ -446,10 +448,11 @@ struct SyncInvocationAnalysis {
   size_t coordinate_nodes = 0, coordinate_pieces = 0;
   std::shared_ptr<const SyncInvocationCoordinate> coordinate;
 };
-SyncInvocationAnalysis AnalyzeSyncInvocation(const FunctionPtr& function, bool disjoint_gm,
-                                             const std::string& target, const SyncParameterBounds& parameters,
-                                             std::pair<int64_t, int64_t> block_bounds,
-                                             std::optional<int64_t> launch_count = std::nullopt);
+SyncInvocationAnalysis AnalyzeSyncInvocation(
+    const FunctionPtr& function, bool disjoint_gm, const std::string& target,
+    const SyncParameterBounds& parameters, std::pair<int64_t, int64_t> block_bounds,
+    std::optional<int64_t> launch_count = std::nullopt,
+    SyncExternalPolicy external_policy = SyncExternalPolicy::Geometry);
 struct LogicalSyncRealization {
   FunctionPtr function;
   size_t record_sites = 0, wait_sites = 0, guarded_wait_sites = 0, carried_tokens = 0;
@@ -521,10 +524,9 @@ class AssignedSyncPlan {
                    std::vector<std::tuple<PipeType, PipeType, int>> reservations,
                    std::shared_ptr<const ScopedSyncProtocol> protocol,
                    std::vector<AssignedScopedPalette> palettes);
-  friend PhysicalSyncRealization AllocateDirectSync(const CompactSyncInput&, std::vector<PhysicalSyncFamily>,
-                                                    const DirectSyncOrder&, const std::string&,
-                                                    const std::optional<std::vector<int>>&,
-                                                    const std::map<std::pair<PipeType, PipeType>, std::set<int>>&);
+  friend PhysicalSyncRealization AllocateDirectSync(
+      const CompactSyncInput&, std::vector<PhysicalSyncFamily>, const DirectSyncOrder&, const std::string&,
+      const std::optional<std::vector<int>>&, const std::map<std::pair<PipeType, PipeType>, std::set<int>>&);
 };
 // Immutable defaults for production; explicit overrides are diagnostic inputs
 // to the same compiler. Forced modes bypass profitability, never qualification
