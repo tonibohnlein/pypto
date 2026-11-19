@@ -349,14 +349,14 @@ def test_hf32_rounding_boundaries(mode):
 
 
 def test_tensor_cast():
-    """tensor.cast should emit .to(dtype)."""
+    """tensor.cast passes its requested dtype and rounding mode."""
     a = _tensor_var("a", [64])
     out = _tensor_var("out", [64])
     call = _op_call("tensor.cast", [a], {"target_type": DataType.FP16, "mode": 0})
     assign = ir.AssignStmt(out, call, _span())
     func = _simple_function("f", [a], assign)
     code = torch_codegen(func)
-    assert ".to(torch.float16)" in code
+    assert "out = _cast_tensor(a, torch.float16, 0)" in code
 
 
 def test_nested_call_arg_preserves_call_codegen():
@@ -371,8 +371,8 @@ def test_nested_call_arg_preserves_call_codegen():
     func = _simple_function("f", [hidden_states], assign)
     code = torch_codegen(func)
 
-    assert "_tensor_slice(hidden_states, (0, 0), (16, 512)).to(torch.float32)" in code
-    assert "(0, 0).to(torch.float32)" not in code
+    assert "out = _cast_tensor(_tensor_slice(hidden_states, (0, 0), (16, 512)), torch.float32, 2)" in code
+    assert "_cast_tensor((0, 0), torch.float32, 2)" not in code
 
 
 def test_tensor_row_reduction():

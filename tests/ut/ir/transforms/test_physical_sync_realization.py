@@ -57,7 +57,8 @@ def check(function, eligible=None):
 def test_original_matmuls(name):
     result, state, _, text = check(capture(name), list(range(6)))
     assert state.records and result["set_sites"] == result["wait_sites"]
-    assert "pto.set_flag[" in text
+    assert result["set_sites"] == text.count("pto.set_flag[") > 0
+    assert result["wait_sites"] == text.count("pto.wait_flag[")
 
 
 @pytest.mark.ptoas_compile

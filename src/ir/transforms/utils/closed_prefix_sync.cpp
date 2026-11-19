@@ -3,7 +3,7 @@
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
@@ -1065,7 +1065,8 @@ class Assignment {
             // never touched on the `then` path; retain its `else_body_` reachability.
           }
           for (const auto& te : tit->second) {
-            if (std::none_of(vec.begin(), vec.end(), [&](const ActiveId& e) { return e.id == te.id; })) {
+            if (std::none_of(vec.begin(), vec.end(),
+                             [&](const ActiveId& entry) { return entry.id == te.id; })) {
               // Freshly allocated in `then_body_` and untouched in `else_body_`.
               vec.push_back(te);
             }

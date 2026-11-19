@@ -3,7 +3,7 @@
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
@@ -17,6 +17,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "pypto/backend/common/backend_config.h"
@@ -39,11 +40,8 @@
 #include "src/ir/transforms/utils/sync_footprint_resolver.h"
 #include "src/ir/transforms/utils/sync_loop_trip_proof.h"
 
+namespace pypto::ir::sync {
 namespace {
-using namespace pypto;
-using namespace pypto::ir;
-using namespace pypto::ir::sync;
-
 const Span kSpan = Span::unknown();
 
 ConstIntPtr CI(int64_t val, DataType dtype = DataType::INDEX) {
@@ -1267,16 +1265,17 @@ void TestRound2AuditAndCleanupFixes() {
 }
 
 }  // namespace
+}  // namespace pypto::ir::sync
 
 int main() {
   pypto::backend::BackendConfig::SetBackendType(pypto::backend::BackendType::Ascend910);
-  TestB1SyncControlRangeProver();
-  TestB1PositiveTripCompletionAndRelay();
-  TestB2StridedVecAndMatStorageClasses();
-  TestB3IterationFiberRefinement();
-  TestB4InitGuardAndSubblockPromotion();
-  TestRound1AuditFixes();
-  TestRound2AuditAndCleanupFixes();
+  pypto::ir::sync::TestB1SyncControlRangeProver();
+  pypto::ir::sync::TestB1PositiveTripCompletionAndRelay();
+  pypto::ir::sync::TestB2StridedVecAndMatStorageClasses();
+  pypto::ir::sync::TestB3IterationFiberRefinement();
+  pypto::ir::sync::TestB4InitGuardAndSubblockPromotion();
+  pypto::ir::sync::TestRound1AuditFixes();
+  pypto::ir::sync::TestRound2AuditAndCleanupFixes();
   std::cout << "All refactor_b_test assertions passed!" << std::endl;
   return 0;
 }

@@ -2006,15 +2006,11 @@ class TorchCodegen(_ir.IRVisitor):
         elif isinstance(op, _ir.Abs):
             self._expr_result = f"abs({operand})"
         elif isinstance(op, _ir.Cast):
-            cast_dtype = getattr(op, "dtype", None)
-            if cast_dtype is None and isinstance(getattr(op, "type", None), _ir.ScalarType):
-                cast_dtype = op.type.dtype
+            result_type = op.type
+            assert isinstance(result_type, _ir.ScalarType)
+            cast_dtype = result_type.dtype
             if cast_dtype in (DataType.FP16, DataType.BF16, DataType.FP32):
-                self._expr_result = (
-                    f"float(torch.as_tensor({operand}).to({_torch_dtype(cast_dtype)}).item())"
-                )
-            elif hasattr(op, "dtype"):
-                self._expr_result = f"torch.as_tensor({operand}).to({_torch_dtype(op.dtype)})"
+                self._expr_result = f"float(torch.as_tensor({operand}).to({_torch_dtype(cast_dtype)}).item())"
             else:
                 self._expr_result = f"int({operand})"
         else:

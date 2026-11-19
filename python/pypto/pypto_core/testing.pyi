@@ -223,6 +223,8 @@ class PhysicalSyncRealization(TypedDict):
     wait_sites: int
     barrier_sites: int
     guard_sites: int
+    if_sites: int
+    case_sites: dict[str, int]
     constructed_guard_sites: int
     shared_guard_sites: int
     shared_composed_guard_sites: int
@@ -271,6 +273,9 @@ class CompactSyncAnalysis:
         Optional IDs restrict the catalog. Refuse unsupported realization,
         unproved compact allocation or proved finite fixed-plan scarcity.
         Uses the production logical insertion, optimization and lowering services.
+        SET, WAIT, local barrier and total if sites describe the emitted function.
+        Guard sites use construction accounting, and `case_sites` reports the
+        corresponding command and guard counts before final sharing.
         """
         ...
 
