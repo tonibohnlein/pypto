@@ -79,7 +79,8 @@ ExprPtr InvocationGroupGuard(const ExprPtr& block, std::pair<int64_t, int64_t> d
                              const Intervals& intervals, const Span& span);
 std::vector<InvocationScheduleGroup> GroupInvocationSchedules(
     const std::vector<PreparedSchedulePhase>& phases, const ExprPtr& block,
-    const std::vector<std::pair<int64_t, int64_t>>& domains, PhysicalSyncRealization& work);
+    const std::vector<std::pair<int64_t, int64_t>>& domains, PhysicalSyncRealization& work,
+    const std::vector<const Call*>& anchor_order = {});
 void PopulateCutDomains(const FunctionPtr& owner, CutInventory& cuts, PhysicalSyncRealization& work);
 BoundarySchedules PlanCommandBoundaries(const FunctionPtr& owner, CutInventory& cuts, bool enabled,
                                         PhysicalSyncRealization& work,

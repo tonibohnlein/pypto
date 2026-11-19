@@ -229,20 +229,28 @@ FunctionPtr AnalyzeRegionSync(
                                launch_count);
     }
     try {
-      const auto logical =
-          InsertLogicalSync(BindLaunchCount(function, launch_count), target, parameters, blocks, launch_count);
+      const auto logical = InsertLogicalSync(BindLaunchCount(function, launch_count), target, parameters,
+                                             blocks, launch_count);
       // Mirror RealizeSync's late lowering fallback so 3-pass InsertSync -> OptimizeSync -> LowerSync
       // switches to MixedCompose + Regional before committing an exact plan that cannot lower.
-      sync::LowerLogicalSync(sync::OptimizeLogicalSync(logical), target, std::nullopt, parameters, blocks,
-                             {}, sync::SyncExternalPolicy::Geometry, launch_count, {}, /*dry_run_only=*/true);
+      sync::LowerLogicalSync(sync::OptimizeLogicalSync(logical), target, std::nullopt, parameters, blocks, {},
+                             sync::SyncExternalPolicy::Geometry, launch_count, {}, /*dry_run_only=*/true);
       return logical;
     } catch (const pypto::ValueError&) {
       // Fall through to MixedCompose + Regional fallback.
     }
   }
   CHECK(allow_regional_fallback) << "Regional synchronization fallback is unavailable under exact policy";
-  return sync::InsertConservativePrefixes(
+  const auto regional = sync::InsertConservativePrefixes(
       sync::AnalyzeConservativeSync(function, target, {}, {}, false, true, true, parameters, blocks));
+  try {
+    sync::LowerLogicalSync(sync::OptimizeLogicalSync(regional), target, std::nullopt, parameters, blocks, {},
+                           sync::SyncExternalPolicy::Geometry, launch_count, {}, /*dry_run_only=*/true);
+    return regional;
+  } catch (const pypto::ValueError&) {
+    return sync::InsertConservativePrefixes(
+        sync::AnalyzeConservativeSync(function, target, {}, {}, false, false, true, parameters, blocks));
+  }
 }
 }  // namespace
 
@@ -448,10 +456,9 @@ Pass LowerSync(bool require_whole_module) {
                 const bool prefix = context->GetAutoSyncPolicy() == "conservative_prefix";
                 const auto auto_logical = AnalyzeRegionSync(stripped, target, true, prefix, parameters,
                                                             blocks, launch_count, {}, {});
-                const auto auto_lowered =
-                    sync::LowerLogicalSync(sync::OptimizeLogicalSync(auto_logical), target, std::nullopt,
-                                           parameters, blocks, {}, sync::SyncExternalPolicy::Geometry,
-                                           launch_count);
+                const auto auto_lowered = sync::LowerLogicalSync(
+                    sync::OptimizeLogicalSync(auto_logical), target, std::nullopt, parameters, blocks, {},
+                    sync::SyncExternalPolicy::Geometry, launch_count);
                 if (auto_lowered.physical_cases.size() == result.physical_cases.size()) {
                   storage_implied = true;
                   for (size_t i = 0; i < result.physical_cases.size(); ++i) {
@@ -465,12 +472,12 @@ Pass LowerSync(bool require_whole_module) {
               } catch (const pypto::ValueError&) {
                 storage_implied = false;
               }
-              function = storage_implied
-                             ? sync::SyncOutcome(stripped, false,
-                                                 "Candidate has no SET/WAIT marker; delegate the original kernel")
-                             : sync::SyncOutcome(
-                                   result.function, false,
-                                   "Candidate has no SET/WAIT marker; preserve manual barriers");
+              function =
+                  storage_implied
+                      ? sync::SyncOutcome(stripped, false,
+                                          "Candidate has no SET/WAIT marker; delegate the original kernel")
+                      : sync::SyncOutcome(result.function, false,
+                                          "Candidate has no SET/WAIT marker; preserve manual barriers");
             }
           } else {
             function = CompleteOwnedInvocation(result.function, target);
@@ -548,9 +555,15 @@ Pass RealizeSync(bool require_whole_module) {
           if (!prefix) throw;
         }
       }
-      const auto regional_logical = sync::InsertConservativePrefixes(
-          sync::AnalyzeConservativeSync(function, target, {}, {}, false, true, true, bounds, block_bounds));
-      return realize_logical(regional_logical);
+      try {
+        const auto regional_logical = sync::InsertConservativePrefixes(
+            sync::AnalyzeConservativeSync(function, target, {}, {}, false, true, true, bounds, block_bounds));
+        return realize_logical(regional_logical);
+      } catch (const pypto::ValueError&) {
+        const auto fallback_logical = sync::InsertConservativePrefixes(sync::AnalyzeConservativeSync(
+            function, target, {}, {}, false, false, true, bounds, block_bounds));
+        return realize_logical(fallback_logical);
+      }
     } catch (const pypto::ValueError& error) {
       return sync::SyncOutcome(function, false, error.what());
     }

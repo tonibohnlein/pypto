@@ -43,6 +43,7 @@
 #include "src/ir/transforms/utils/sync_footprint_resolver.h"
 #include "src/ir/transforms/utils/sync_loop_trip_proof.h"
 #include "src/ir/transforms/utils/sync_scalar_readiness.h"
+#include "src/ir/transforms/utils/sync_transform_common.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -132,6 +133,58 @@ class StorageClasses {
           continue;
         }
 
+        auto partition_and_emit = [&](size_t uniq_count, const std::vector<size_t>& member_gid,
+                                      const auto& may_overlap) {
+          std::vector<size_t> parent(uniq_count);
+          std::iota(parent.begin(), parent.end(), 0);
+          auto find_root = [&](size_t x) {
+            while (parent[x] != x) {
+              parent[x] = parent[parent[x]];
+              x = parent[x];
+            }
+            return x;
+          };
+          for (size_t i = 0; i < uniq_count; ++i) {
+            for (size_t j = i + 1; j < uniq_count; ++j) {
+              const size_t ri = find_root(i), rj = find_root(j);
+              if (ri != rj && may_overlap(i, j)) {
+                parent[rj] = ri;
+              }
+            }
+          }
+          std::map<size_t, std::vector<std::pair<size_t, size_t>>> comp_members;
+          std::map<size_t, size_t> comp_uniq_count;
+          std::map<size_t, backend::BufferSyncByteWindow> comp_hull;
+          for (size_t i = 0; i < uniq_count; ++i) {
+            ++comp_uniq_count[find_root(i)];
+          }
+          for (size_t idx = 0; idx < cluster.members.size(); ++idx) {
+            const size_t root = find_root(member_gid[idx]);
+            const auto [si, ei] = cluster.members[idx];
+            comp_members[root].push_back({si, ei});
+            const auto& enc = *sites[si][ei].enclosure;
+            auto it = comp_hull.find(root);
+            if (it == comp_hull.end()) {
+              comp_hull.emplace(root, enc);
+            } else {
+              it->second.begin = std::min(it->second.begin, enc.begin);
+              it->second.end = std::max(it->second.end, enc.end);
+            }
+          }
+          // Deterministic order by component hull (begin, end, root).
+          std::vector<size_t> comp_order;
+          comp_order.reserve(comp_members.size());
+          for (const auto& [root, _] : comp_members) comp_order.push_back(root);
+          std::sort(comp_order.begin(), comp_order.end(), [&](size_t a, size_t b) {
+            const auto& ha = comp_hull.at(a);
+            const auto& hb = comp_hull.at(b);
+            return std::tie(ha.begin, ha.end, a) < std::tie(hb.begin, hb.end, b);
+          });
+          for (const size_t root : comp_order) {
+            emit_single(comp_hull.at(root), comp_uniq_count.at(root) == 1, comp_members.at(root));
+          }
+        };
+
         if (space == MemorySpace::Vec) {
           bool all_have = true;
           std::vector<StridedByteFootprint> uniq;
@@ -159,54 +212,9 @@ class StorageClasses {
             emit_single(cluster.hull, all_have && uniq.size() == 1, cluster.members);
             continue;
           }
-          std::vector<size_t> parent(uniq.size());
-          std::iota(parent.begin(), parent.end(), 0);
-          auto find_root = [&](size_t x) {
-            while (parent[x] != x) {
-              parent[x] = parent[parent[x]];
-              x = parent[x];
-            }
-            return x;
-          };
-          for (size_t i = 0; i < uniq.size(); ++i) {
-            for (size_t j = i + 1; j < uniq.size(); ++j) {
-              const size_t ri = find_root(i), rj = find_root(j);
-              if (ri != rj && StridedByteFootprint::MayOverlap(uniq[i], uniq[j])) {
-                parent[rj] = ri;
-              }
-            }
-          }
-          std::map<size_t, std::vector<std::pair<size_t, size_t>>> comp_members;
-          std::map<size_t, size_t> comp_uniq_count;
-          std::map<size_t, backend::BufferSyncByteWindow> comp_hull;
-          for (size_t i = 0; i < uniq.size(); ++i) {
-            ++comp_uniq_count[find_root(i)];
-          }
-          for (size_t idx = 0; idx < cluster.members.size(); ++idx) {
-            const size_t root = find_root(member_gid[idx]);
-            const auto [si, ei] = cluster.members[idx];
-            comp_members[root].push_back({si, ei});
-            const auto& enc = *sites[si][ei].enclosure;
-            auto it = comp_hull.find(root);
-            if (it == comp_hull.end()) {
-              comp_hull.emplace(root, enc);
-            } else {
-              it->second.begin = std::min(it->second.begin, enc.begin);
-              it->second.end = std::max(it->second.end, enc.end);
-            }
-          }
-          // Deterministic order by component hull (begin, end).
-          std::vector<size_t> comp_order;
-          comp_order.reserve(comp_members.size());
-          for (const auto& [root, _] : comp_members) comp_order.push_back(root);
-          std::sort(comp_order.begin(), comp_order.end(), [&](size_t a, size_t b) {
-            const auto& ha = comp_hull.at(a);
-            const auto& hb = comp_hull.at(b);
-            return std::tie(ha.begin, ha.end) < std::tie(hb.begin, hb.end);
+          partition_and_emit(uniq.size(), member_gid, [&](size_t i, size_t j) {
+            return StridedByteFootprint::MayOverlap(uniq[i], uniq[j]);
           });
-          for (const size_t root : comp_order) {
-            emit_single(comp_hull.at(root), comp_uniq_count.at(root) == 1, comp_members.at(root));
-          }
         } else {
           // Mat / Left / Right / Acc: 2D MatrixBoxFootprint partitioning.
           bool all_have = true;
@@ -237,53 +245,9 @@ class StorageClasses {
             emit_single(cluster.hull, all_have && uniq.size() == 1, cluster.members);
             continue;
           }
-          std::vector<size_t> parent(uniq.size());
-          std::iota(parent.begin(), parent.end(), 0);
-          auto find_root = [&](size_t x) {
-            while (parent[x] != x) {
-              parent[x] = parent[parent[x]];
-              x = parent[x];
-            }
-            return x;
-          };
-          for (size_t i = 0; i < uniq.size(); ++i) {
-            for (size_t j = i + 1; j < uniq.size(); ++j) {
-              const size_t ri = find_root(i), rj = find_root(j);
-              if (ri != rj && MatrixBoxFootprint::MayOverlap(uniq[i], uniq[j], roots)) {
-                parent[rj] = ri;
-              }
-            }
-          }
-          std::map<size_t, std::vector<std::pair<size_t, size_t>>> comp_members;
-          std::map<size_t, size_t> comp_uniq_count;
-          std::map<size_t, backend::BufferSyncByteWindow> comp_hull;
-          for (size_t i = 0; i < uniq.size(); ++i) {
-            ++comp_uniq_count[find_root(i)];
-          }
-          for (size_t idx = 0; idx < cluster.members.size(); ++idx) {
-            const size_t root = find_root(member_gid[idx]);
-            const auto [si, ei] = cluster.members[idx];
-            comp_members[root].push_back({si, ei});
-            const auto& enc = *sites[si][ei].enclosure;
-            auto it = comp_hull.find(root);
-            if (it == comp_hull.end()) {
-              comp_hull.emplace(root, enc);
-            } else {
-              it->second.begin = std::min(it->second.begin, enc.begin);
-              it->second.end = std::max(it->second.end, enc.end);
-            }
-          }
-          std::vector<size_t> comp_order;
-          comp_order.reserve(comp_members.size());
-          for (const auto& [root, _] : comp_members) comp_order.push_back(root);
-          std::sort(comp_order.begin(), comp_order.end(), [&](size_t a, size_t b) {
-            const auto& ha = comp_hull.at(a);
-            const auto& hb = comp_hull.at(b);
-            return std::tie(ha.begin, ha.end) < std::tie(hb.begin, hb.end);
+          partition_and_emit(uniq.size(), member_gid, [&](size_t i, size_t j) {
+            return MatrixBoxFootprint::MayOverlap(uniq[i], uniq[j], roots);
           });
-          for (const size_t root : comp_order) {
-            emit_single(comp_hull.at(root), comp_uniq_count.at(root) == 1, comp_members.at(root));
-          }
         }
       }
     }
@@ -374,7 +338,8 @@ bool FibersConflict(const FiberKey& a, const FiberKey& b) {
   }
   if (a.kind == IterationFiber::Kind::AffineSlice && b.kind == IterationFiber::Kind::AffineSlice) {
     if (a.slice_axis != b.slice_axis || a.coeff != b.coeff) return true;
-    return std::max(a.offset, b.offset) < std::min(a.offset + a.extent, b.offset + b.extent);
+    return std::max<__int128>(a.offset, b.offset) <
+           std::min<__int128>(__int128(a.offset) + a.extent, __int128(b.offset) + b.extent);
   }
   return true;
 }
@@ -391,7 +356,8 @@ bool MustCoverFiber(const FiberKey& kill_fiber, const FiberKey& target_fiber) {
       target_fiber.kind == IterationFiber::Kind::AffineSlice) {
     return kill_fiber.slice_axis == target_fiber.slice_axis && kill_fiber.coeff == target_fiber.coeff &&
            kill_fiber.offset <= target_fiber.offset &&
-           (target_fiber.offset + target_fiber.extent) <= (kill_fiber.offset + kill_fiber.extent);
+           __int128(target_fiber.offset) + target_fiber.extent <=
+               __int128(kill_fiber.offset) + kill_fiber.extent;
   }
   return false;
 }
@@ -402,7 +368,7 @@ FiberKey TransformFiberOnBackedge(MemorySpace space, size_t domain, const FiberK
   if (f.kind == IterationFiber::Kind::CompletedPast) return f;
   if (f.kind == IterationFiber::Kind::ModularSlot && f.modulus > 0) {
     FiberKey next = f;
-    next.offset = ((f.offset - f.coeff) % f.modulus + f.modulus) % f.modulus;
+    next.offset = PositiveMod128(__int128(f.offset) - f.coeff, f.modulus);
     return next;
   }
   if (f.kind == IterationFiber::Kind::AffineSlice && f.coeff != 0) {
@@ -418,7 +384,8 @@ FiberKey TransformFiberOnBackedge(MemorySpace space, size_t domain, const FiberK
         return {IterationFiber::Kind::CompletedPast, loop, 0, 0, 0, 0, 0};
       }
     }
-    if (next_off < std::numeric_limits<int64_t>::min() || next_off > std::numeric_limits<int64_t>::max()) {
+    if (next_off < std::numeric_limits<int64_t>::min() || next_off > std::numeric_limits<int64_t>::max() ||
+        next_off + f.extent > std::numeric_limits<int64_t>::max()) {
       return FiberKey::Wildcard();
     }
     FiberKey next = f;
@@ -1024,8 +991,8 @@ class Builder {
         const bool unit_const = is_const_unit_trip(loop.get());
         const bool positive_trip =
             unit_const ||
-            (trip_prover && ((is_child_root && child_scope && trip_prover->IsPositiveTrip(child_scope)) ||
-                             trip_prover->IsPositiveTripCompatible(loop.get())));
+            (trip_prover && (is_child_root ? (child_scope && trip_prover->IsPositiveTrip(child_scope))
+                                           : trip_prover->IsPositiveTripCompatible(loop.get())));
         const bool exact_one_trip =
             is_child_root &&
             (unit_const || (trip_prover && child_scope && trip_prover->IsPositiveTrip(child_scope) &&
@@ -2053,8 +2020,13 @@ class Builder {
           }
         }
         if (g.valid && g.kind == IterationFiber::Kind::AffineSlice) {
-          g.min_b = std::min(g.min_b, effect.fiber.offset);
-          g.max_e = std::max(g.max_e, effect.fiber.offset + effect.fiber.extent);
+          const __int128 end = __int128(effect.fiber.offset) + effect.fiber.extent;
+          if (end > std::numeric_limits<int64_t>::max()) {
+            g.valid = false;
+          } else {
+            g.min_b = std::min(g.min_b, effect.fiber.offset);
+            g.max_e = std::max(g.max_e, static_cast<int64_t>(end));
+          }
         }
       }
     }

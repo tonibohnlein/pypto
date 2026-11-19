@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -420,16 +421,112 @@ void TestB4InitGuardAndSubblockPromotion() {
   const auto attempt = TryPrepareEventfulSyncChild(fn_init, inner_ko, "a2a3", bindings);
   assert(attempt.child != nullptr);
 
+  // End-to-end InsertSync + LowerSync on both StructuredTokenSync (single loop under projected k0)
+  // and ScopedTokenFamilies (nested kb/ko), including buffer.slot + YieldStmt inside arms.
+  {
+    struct ScopedPassCtx {
+      PassContext ctx;
+      ScopedPassCtx()
+          : ctx({}, VerificationLevel::Basic, DiagnosticPhase::PrePipeline, {}, MemoryPlanner::PyPTO, false,
+                kDefaultRuntimeKind, true, false, false, true, true, "conservative_prefix") {
+        ctx.EnterContext();
+      }
+      ~ScopedPassCtx() { ctx.ExitContext(); }
+    } scoped_ctx;
+
+    auto cond_k = MakeVar("cond_k", BoolType());
+    auto gm_a_t = MakeTensorType(16, 32, DataType::FP16);
+    auto gm_a = MakeVar("gm_a", gm_a_t);
+    auto mat_t = MatType(16, 32);
+    auto m_a = MakeVar("m_a", mat_t);
+    auto macc_t = std::make_shared<MultiBufferType>(acc_t, 1);
+    auto macc = MakeVar("macc", macc_t);
+    auto acc0 = MakeVar("acc0", acc_t);
+    auto acc1 = MakeVar("acc1", acc_t);
+    auto acc_out = MakeVar("acc_out", acc_t);
+    auto slot_arm0 = std::make_shared<SeqStmts>(
+        std::vector<StmtPtr>{BufferSlot(acc0, macc, CI(0), acc_t),
+                             EvalCall("buffer.matmul", {l_buf, r_buf, acc0}),
+                             std::make_shared<YieldStmt>(std::vector<ExprPtr>{}, kSpan)},
+        kSpan);
+    auto slot_arm1 = std::make_shared<SeqStmts>(
+        std::vector<StmtPtr>{BufferSlot(acc1, macc, CI(0), acc_t),
+                             EvalCall("buffer.matmul_acc", {l_buf, r_buf, acc1}),
+                             std::make_shared<YieldStmt>(std::vector<ExprPtr>{}, kSpan)},
+        kSpan);
+    auto slot_branch =
+        std::make_shared<IfStmt>(init_cond, slot_arm0, slot_arm1, std::vector<VarPtr>{}, kSpan);
+    auto inner_slot = SimpleFor(ko, CI(0), CI(2), CI(1),
+                                {EvalCall("buffer.load", {gm_a, ConstTup({0, 0}), ConstTup({16, 32}), m_a}),
+                                 EvalCall("buffer.copy", {m_a, l_buf}), slot_branch});
+
+    // Single-loop StructuredTokenSync child (with outer 1-trip kb + WhileStmt forcing child promotion).
+    auto dummy_w = std::make_shared<WhileStmt>(
+        cond_k, std::vector<IterArgPtr>{},
+        std::make_shared<SeqStmts>(
+            std::vector<StmtPtr>{std::make_shared<YieldStmt>(std::vector<ExprPtr>{}, kSpan)}, kSpan),
+        std::vector<VarPtr>{}, kSpan);
+    auto kb_1trip = SimpleFor(
+        kb, CI(0), CI(1), CI(1),
+        {dummy_w,
+         std::make_shared<AssignStmt>(k0, std::make_shared<Mul>(kb, CI(512), DataType::INDEX, kSpan), kSpan),
+         inner_slot});
+    auto fn_struct = MakeAicFn(
+        "b4_struct_e2e", {gm_a, gm_c, cond_k},
+        {ParamDirection::In, ParamDirection::InOut, ParamDirection::In},
+        {AllocBuf(m_a, 0, mat_t), AllocBuf(l_buf, 0, left_t), AllocBuf(r_buf, 0, right_t),
+         AllocBuf(macc, 0, macc_t, "buffer.alloc_multi"), kb_1trip, BufferSlot(acc_out, macc, CI(0), acc_t),
+         EvalCall("buffer.store", {acc_out, ConstTup({0, 0}), ConstTup({16, 256}), gm_c}),
+         std::make_shared<ReturnStmt>(std::vector<ExprPtr>{gm_c}, kSpan)},
+        FunctionType::AIC);
+    const auto cons_struct =
+        AnalyzeConservativeSync(fn_struct, "a2a3", {}, {}, false, /*automatic_children=*/true);
+    assert(cons_struct.ChildEntries().size() == 1);
+    const auto lowered_struct =
+        TryLowerClosedPrefixSync(InsertConservativePrefixes(cons_struct), "a2a3", std::nullopt);
+    assert(lowered_struct.has_value() && lowered_struct->set_sites > 0);
+
+    // Nested-loop ScopedTokenFamilies child (dummy_w outside kb_multi so kb_multi becomes promoted child).
+    auto kb_multi = SimpleFor(
+        kb, CI(0), CI(4), CI(1),
+        {std::make_shared<AssignStmt>(k0, std::make_shared<Mul>(kb, CI(512), DataType::INDEX, kSpan), kSpan),
+         inner_slot});
+    auto fn_scoped =
+        MakeAicFn("b4_scoped_e2e", {gm_a, gm_c, cond_k},
+                  {ParamDirection::In, ParamDirection::InOut, ParamDirection::In},
+                  {AllocBuf(m_a, 0, mat_t), AllocBuf(l_buf, 0, left_t), AllocBuf(r_buf, 0, right_t),
+                   AllocBuf(macc, 0, macc_t, "buffer.alloc_multi"), dummy_w, kb_multi,
+                   BufferSlot(acc_out, macc, CI(0), acc_t),
+                   EvalCall("buffer.store", {acc_out, ConstTup({0, 0}), ConstTup({16, 256}), gm_c}),
+                   std::make_shared<ReturnStmt>(std::vector<ExprPtr>{gm_c}, kSpan)},
+                  FunctionType::AIC);
+    const auto cons_scoped =
+        AnalyzeConservativeSync(fn_scoped, "a2a3", {}, {}, false, /*automatic_children=*/true);
+    assert(cons_scoped.ChildEntries().size() == 1);
+    const auto lowered_scoped =
+        TryLowerClosedPrefixSync(InsertConservativePrefixes(cons_scoped), "a2a3", std::nullopt);
+    assert(lowered_scoped.has_value() && lowered_scoped->set_sites > 0);
+  }
+
   // 2. Tier 2 Class B (InlineExactSubBlock) + subsequent EventfulSyncChild (64-bit reaching_child_dirs):
   // Inside a WhileStmt (preventing whole-fn Exact):
-  //   straight-line profitable slice: load x -> add(x -> y) -> add(y -> z)  [Class B!]
-  //   followed by ForStmt (MTE1+M or MTE2+V) [EventfulSyncChild]
+  //   straight-line profitable slice where Exact sharpens SyncFootprintResolver:
+  //   `sub_a` ([3, 8] in [3, 32]) and `sub_b` ([1, 24] at [0, 8] in reshaped [2, 48]) are
+  //   Exact-disjoint (false StridedByteFootprint::MayOverlap), while `x1 -> y1` emits MTE2 -> V.
   // Class B uses parent palette -> must NOT poison reaching_child_dirs for the following EventfulSyncChild!
   auto gm_v_t = MakeTensorType(16, 64, DataType::FP32);
   auto gm_v = MakeVar("gm_v", gm_v_t);
   auto out_v = MakeVar("out_v", gm_v_t);
   auto cond_w = MakeVar("cond_w", BoolType());
   auto vx_t = VecType(16, 64);
+  auto s_t = VecType(3, 32);
+  auto r_t = VecType(2, 48);
+  auto va_t = VecType(3, 8);
+  auto vb_t = VecType(1, 24);
+  auto p1 = MakeVar("p1", s_t);
+  auto r1 = MakeVar("r1", r_t);
+  auto sub_a = MakeVar("sub_a", va_t);
+  auto sub_b = MakeVar("sub_b", vb_t);
   auto x1 = MakeVar("x1", vx_t);
   auto y1 = MakeVar("y1", vx_t);
   auto z1 = MakeVar("z1", vx_t);
@@ -441,20 +538,25 @@ void TestB4InitGuardAndSubblockPromotion() {
                            {EvalCall("buffer.load", {gm_v, ConstTup({0, 0}), ConstTup({16, 64}), x2}),
                             EvalCall("buffer.add", {x2, x2, y2})});
   auto while_body = std::make_shared<SeqStmts>(
-      std::vector<StmtPtr>{EvalCall("buffer.load", {gm_v, ConstTup({0, 0}), ConstTup({16, 64}), x1}),
-                           EvalCall("buffer.add", {x1, x1, y1}), EvalCall("buffer.mul", {y1, y1, z1}),
+      std::vector<StmtPtr>{BufferReshape(r1, p1, r_t), BufferSubview(sub_a, p1, CI(0), CI(0), va_t),
+                           BufferSubview(sub_b, r1, CI(0), CI(8), vb_t),
+                           EvalCall("buffer.load", {gm_v, ConstTup({0, 0}), ConstTup({3, 8}), sub_a}),
+                           EvalCall("buffer.load", {gm_v, ConstTup({0, 0}), ConstTup({16, 64}), x1}),
+                           EvalCall("buffer.add", {x1, x1, y1}),
+                           EvalCall("buffer.add", {sub_b, sub_b, sub_b}),
                            std::make_shared<YieldStmt>(std::vector<ExprPtr>{}, kSpan)},
       kSpan);
   auto while_stmt = std::make_shared<WhileStmt>(cond_w, std::vector<IterArgPtr>{}, while_body,
                                                 std::vector<VarPtr>{}, kSpan);
 
-  auto fn_sub = MakeAicFn("class_b_and_64bit_rearm", {gm_v, out_v, cond_w},
-                          {ParamDirection::In, ParamDirection::InOut, ParamDirection::In},
-                          {AllocBuf(x1, 0, vx_t), AllocBuf(y1, 4096, vx_t), AllocBuf(z1, 8192, vx_t),
-                           AllocBuf(x2, 12288, w_t), AllocBuf(y2, 16384, w_t), while_stmt, child_c,
-                           EvalCall("buffer.store", {y2, ConstTup({0, 0}), ConstTup({16, 64}), out_v}),
-                           std::make_shared<ReturnStmt>(std::vector<ExprPtr>{out_v}, kSpan)},
-                          FunctionType::AIV);
+  auto fn_sub =
+      MakeAicFn("class_b_and_64bit_rearm", {gm_v, out_v, cond_w},
+                {ParamDirection::In, ParamDirection::InOut, ParamDirection::In},
+                {AllocBuf(p1, 0, s_t), AllocBuf(x1, 4096, vx_t), AllocBuf(y1, 8192, vx_t),
+                 AllocBuf(z1, 12288, vx_t), AllocBuf(x2, 16384, w_t), AllocBuf(y2, 20480, w_t), while_stmt,
+                 child_c, EvalCall("buffer.store", {y2, ConstTup({0, 0}), ConstTup({16, 64}), out_v}),
+                 std::make_shared<ReturnStmt>(std::vector<ExprPtr>{out_v}, kSpan)},
+                FunctionType::AIV);
 
   struct ScopedPassCtx {
     PassContext ctx;
@@ -780,6 +882,18 @@ void TestRound1AuditFixes() {
     auto gm_out = MakeVar("gm_out", gm_t);
     auto cond = MakeVar("cond", BoolType());
     auto buf_t = VecType(16, 64);
+    auto s_t = VecType(3, 32);
+    auto r_t = VecType(2, 48);
+    auto va_t = VecType(3, 8);
+    auto vb_t = VecType(1, 24);
+    auto p1 = MakeVar("p1", s_t);
+    auto r1 = MakeVar("r1", r_t);
+    auto sa1 = MakeVar("sa1", va_t);
+    auto sb1 = MakeVar("sb1", vb_t);
+    auto p2 = MakeVar("p2", s_t);
+    auto r2 = MakeVar("r2", r_t);
+    auto sa2 = MakeVar("sa2", va_t);
+    auto sb2 = MakeVar("sb2", vb_t);
     auto a1 = MakeVar("a1", buf_t);
     auto a2 = MakeVar("a2", buf_t);
     auto a3 = MakeVar("a3", buf_t);
@@ -790,24 +904,33 @@ void TestRound1AuditFixes() {
     auto w1 = std::make_shared<WhileStmt>(
         cond, std::vector<IterArgPtr>{},
         std::make_shared<SeqStmts>(
-            std::vector<StmtPtr>{EvalCall("buffer.add", {a1, a1, a2}), EvalCall("buffer.add", {a1, a2, a3}),
+            std::vector<StmtPtr>{BufferReshape(r1, p1, r_t), BufferSubview(sa1, p1, CI(0), CI(0), va_t),
+                                 BufferSubview(sb1, r1, CI(0), CI(8), vb_t),
+                                 EvalCall("buffer.load", {gm_in, ConstTup({0, 0}), ConstTup({3, 8}), sa1}),
+                                 EvalCall("buffer.add", {a1, a1, a2}), EvalCall("buffer.add", {a1, a2, a3}),
                                  EvalCall("buffer.mul", {a2, a3, a1}),
+                                 EvalCall("buffer.add", {sb1, sb1, sb1}),
                                  std::make_shared<YieldStmt>(std::vector<ExprPtr>{}, kSpan)},
             kSpan),
         std::vector<VarPtr>{}, kSpan);
     auto w2 = std::make_shared<WhileStmt>(
         cond, std::vector<IterArgPtr>{},
         std::make_shared<SeqStmts>(
-            std::vector<StmtPtr>{EvalCall("buffer.load", {gm_in, ConstTup({0, 0}), ConstTup({16, 64}), b1}),
+            std::vector<StmtPtr>{BufferReshape(r2, p2, r_t), BufferSubview(sa2, p2, CI(0), CI(0), va_t),
+                                 BufferSubview(sb2, r2, CI(0), CI(8), vb_t),
+                                 EvalCall("buffer.load", {gm_in, ConstTup({0, 0}), ConstTup({3, 8}), sa2}),
+                                 EvalCall("buffer.load", {gm_in, ConstTup({0, 0}), ConstTup({16, 64}), b1}),
                                  EvalCall("buffer.add", {b1, b1, b2}), EvalCall("buffer.mul", {b2, b2, b3}),
+                                 EvalCall("buffer.add", {sb2, sb2, sb2}),
                                  std::make_shared<YieldStmt>(std::vector<ExprPtr>{}, kSpan)},
             kSpan),
         std::vector<VarPtr>{}, kSpan);
     auto fn = MakeAicFn("bug6b_multi_inline_subblock_and_same_pipe_dedup", {gm_in, gm_out, cond},
                         {ParamDirection::In, ParamDirection::InOut, ParamDirection::In},
-                        {AllocBuf(a1, 0, buf_t), AllocBuf(a2, 4096, buf_t), AllocBuf(a3, 8192, buf_t),
-                         AllocBuf(b1, 12288, buf_t), AllocBuf(b2, 16384, buf_t), AllocBuf(b3, 20480, buf_t),
-                         w1, w2, EvalCall("buffer.store", {b3, ConstTup({0, 0}), ConstTup({16, 64}), gm_out}),
+                        {AllocBuf(p1, 0, s_t), AllocBuf(a1, 4096, buf_t), AllocBuf(a2, 8192, buf_t),
+                         AllocBuf(a3, 12288, buf_t), AllocBuf(p2, 16384, s_t), AllocBuf(b1, 20480, buf_t),
+                         AllocBuf(b2, 24576, buf_t), AllocBuf(b3, 28672, buf_t), w1, w2,
+                         EvalCall("buffer.store", {b3, ConstTup({0, 0}), ConstTup({16, 64}), gm_out}),
                          std::make_shared<ReturnStmt>(std::vector<ExprPtr>{gm_out}, kSpan)},
                         FunctionType::AIV);
 
@@ -834,6 +957,315 @@ void TestRound1AuditFixes() {
   }
 }
 
+void TestRound2AuditAndCleanupFixes() {
+  struct ScopedPassCtx {
+    PassContext ctx;
+    ScopedPassCtx()
+        : ctx({}, VerificationLevel::Basic, DiagnosticPhase::PrePipeline, {}, MemoryPlanner::PyPTO, false,
+              kDefaultRuntimeKind, true, false, false, true, true, "conservative_prefix") {
+      ctx.EnterContext();
+    }
+    ~ScopedPassCtx() { ctx.ExitContext(); }
+  } scoped_ctx;
+
+  auto gm_t = MakeTensorType(16, 64, DataType::FP32);
+  auto gm_in = MakeVar("gm_in", gm_t);
+  auto gm_out = MakeVar("gm_out", gm_t);
+  auto cond = MakeVar("cond", BoolType());
+
+  // [B-P1.1] parent_static_origin requires parent->vec_lattice && width == cols * elem_bytes.
+  {
+    auto buf_t = VecType(4, 32);
+    auto col_sub_t = VecType(4, 16);
+    auto row_sub_t = VecType(2, 16);
+    auto buf = MakeVar("buf", buf_t);
+    auto col_off = MakeVar("col_off", IndexType());
+    auto sub_move = MakeVar("sub_move", col_sub_t);
+    auto r0 = MakeVar("r0", row_sub_t);
+    auto r2 = MakeVar("r2", row_sub_t);
+    auto fn = MakeAicFn("bp1_1", {col_off}, {ParamDirection::In},
+                        {AllocBuf(buf, 0, buf_t), BufferSubview(sub_move, buf, CI(0), col_off, col_sub_t),
+                         BufferSubview(r0, sub_move, CI(0), CI(0), row_sub_t),
+                         BufferSubview(r2, sub_move, CI(2), CI(0), row_sub_t),
+                         std::make_shared<ReturnStmt>(std::vector<ExprPtr>{}, kSpan)},
+                        FunctionType::AIV);
+    SyncFootprintResolver resolver(fn);
+    assert(resolver.ViewOf(sub_move) && resolver.ViewOf(sub_move)->vec_lattice &&
+           resolver.ViewOf(sub_move)->vec_lattice->width == 32 * 4);
+    assert(resolver.ViewOf(r0) && !resolver.ViewOf(r0)->vec_lattice &&
+           resolver.ViewOf(r0)->byte_hull->end == 4 * 32 * 4);
+    assert(resolver.ViewOf(r2) && !resolver.ViewOf(r2)->vec_lattice &&
+           resolver.ViewOf(r2)->byte_hull->end == 4 * 32 * 4);
+  }
+
+  // [B-P1.2] Chained column subview preserves parent column spread in vec_lattice->width.
+  {
+    auto buf_t = VecType(4, 32);
+    auto sub8_t = VecType(4, 8);
+    auto sub4_t = VecType(4, 4);
+    auto buf = MakeVar("buf", buf_t);
+    auto c_var = MakeVar("c_var", IndexType());
+    auto sub_move = MakeVar("sub_move", sub8_t);
+    auto c0 = MakeVar("c0", sub4_t);
+    auto c1 = MakeVar("c1", sub4_t);
+    auto c_cond = std::make_shared<And>(std::make_shared<Ge>(c_var, CI(0), DataType::BOOL, kSpan),
+                                        std::make_shared<Le>(c_var, CI(1), DataType::BOOL, kSpan),
+                                        DataType::BOOL, kSpan);
+    auto inner_seq = std::make_shared<SeqStmts>(
+        std::vector<StmtPtr>{BufferSubview(sub_move, buf, CI(0), c_var, sub8_t),
+                             BufferSubview(c0, sub_move, CI(0), CI(0), sub4_t),
+                             BufferSubview(c1, sub_move, CI(0), CI(4), sub4_t),
+                             std::make_shared<YieldStmt>(std::vector<ExprPtr>{}, kSpan)},
+        kSpan);
+    auto br = std::make_shared<IfStmt>(c_cond, inner_seq, std::nullopt, std::vector<VarPtr>{}, kSpan);
+    auto fn =
+        MakeAicFn("bp1_2", {c_var}, {ParamDirection::In},
+                  {AllocBuf(buf, 0, buf_t), br, std::make_shared<ReturnStmt>(std::vector<ExprPtr>{}, kSpan)},
+                  FunctionType::AIV);
+    SyncFootprintResolver resolver(fn);
+    assert(resolver.ViewOf(c0) && resolver.ViewOf(c0)->vec_lattice);
+    assert(resolver.ViewOf(c1) && resolver.ViewOf(c1)->vec_lattice);
+    assert(StridedByteFootprint::MayOverlap(*resolver.ViewOf(c0)->vec_lattice,
+                                            *resolver.ViewOf(c1)->vec_lattice));
+  }
+
+  // [B-P1.3] Unproved orthogonal coordinate must NOT yield AffineSlice fiber.
+  {
+    auto buf_t = VecType(4, 32);
+    auto sub_t = VecType(1, 8);
+    auto buf = MakeVar("buf", buf_t);
+    auto iv = MakeVar("i", IndexType());
+    auto c_unproved = MakeVar("c_unproved", IndexType());
+    auto sub = MakeVar("sub", sub_t);
+    auto loop = SimpleFor(iv, CI(0), CI(4), CI(1),
+                          {BufferSubview(sub, buf, iv, c_unproved, sub_t),
+                           EvalCall("buffer.load", {gm_in, ConstTup({0, 0}), ConstTup({1, 8}), sub})});
+    auto fn = MakeAicFn(
+        "bp1_3", {gm_in, c_unproved}, {ParamDirection::In, ParamDirection::In},
+        {AllocBuf(buf, 0, buf_t), loop, std::make_shared<ReturnStmt>(std::vector<ExprPtr>{}, kSpan)},
+        FunctionType::AIV);
+    SyncFootprintResolver resolver(fn);
+    assert(resolver.ViewOf(sub) && resolver.ViewOf(sub)->fiber.kind == IterationFiber::Kind::Wildcard);
+  }
+
+  // [B-P1.4] Overflowing AssignStmt (`0 - unbounded`) must not become ready_ for prover.
+  {
+    auto p_unb = MakeVar("p_unb", IndexType());
+    auto neg_p = MakeVar("neg_p", IndexType());
+    auto zero_c = MakeVar("zero_c", IndexType());
+    auto iv = MakeVar("i", IndexType());
+    auto assign_neg = std::make_shared<AssignStmt>(neg_p, MakeSub(CI(0), p_unb), kSpan);
+    auto assign_sum = std::make_shared<AssignStmt>(zero_c, MakeAdd(neg_p, p_unb), kSpan);
+    auto loop = SimpleFor(iv, CI(0), MakeAdd(zero_c, CI(1)), CI(1), {});
+    auto fn =
+        MakeAicFn("bp1_4", {p_unb}, {ParamDirection::In},
+                  {assign_neg, assign_sum, loop, std::make_shared<ReturnStmt>(std::vector<ExprPtr>{}, kSpan)},
+                  FunctionType::AIV);
+    SyncControlRangeProver prover(fn);
+    assert(!prover.IsPositiveTrip(loop.get()));
+  }
+
+  // [B-P1.5] AffineSlice near INT64_MAX stays Wildcard rather than wrapping int64_t.
+  {
+    const int64_t kHuge = std::numeric_limits<int64_t>::max() - 10;
+    auto buf_t = VecType(4, 64);
+    auto sub_t = VecType(1, 64);
+    auto buf = MakeVar("buf", buf_t);
+    auto iv = MakeVar("i", IndexType());
+    auto sub = MakeVar("sub", sub_t);
+    auto loop =
+        SimpleFor(iv, CI(0), CI(2), CI(1), {BufferSubview(sub, buf, MakeAdd(iv, CI(kHuge)), CI(0), sub_t)});
+    auto fn = MakeAicFn(
+        "bp1_5", {}, {},
+        {AllocBuf(buf, 0, buf_t), loop, std::make_shared<ReturnStmt>(std::vector<ExprPtr>{}, kSpan)},
+        FunctionType::AIV);
+    SyncFootprintResolver resolver(fn);
+    assert(resolver.ViewOf(sub) && resolver.ViewOf(sub)->fiber.kind == IterationFiber::Kind::Wildcard);
+  }
+
+  // [B-P1.6 R2] <= 1-trip non-const-start loop allows first-visit closed child through LowerSync.
+  {
+    auto vx_t = VecType(16, 64);
+    auto x = MakeVar("x", vx_t);
+    auto y = MakeVar("y", vx_t);
+    auto iv_outer = MakeVar("ib", IndexType());
+    auto iv_inner = MakeVar("ii", IndexType());
+    auto bidx = TypedCall("buffer.get_block_idx", {}, IndexType());
+    auto b_var = MakeVar("bidx", IndexType());
+    auto inner = SimpleFor(iv_inner, CI(0), CI(2), CI(1),
+                           {EvalCall("buffer.load", {gm_in, ConstTup({0, 0}), ConstTup({16, 64}), x}),
+                            EvalCall("buffer.add", {x, x, y})});
+    auto outer = SimpleFor(iv_outer, b_var, CI(2), CI(2), {inner});
+    auto fn = MakeAicFn(
+        "bp1_6_r2", {gm_in, gm_out}, {ParamDirection::In, ParamDirection::InOut},
+        {std::make_shared<AssignStmt>(b_var, bidx, kSpan), AllocBuf(x, 0, vx_t), AllocBuf(y, 4096, vx_t),
+         outer, EvalCall("buffer.store", {y, ConstTup({0, 0}), ConstTup({16, 64}), gm_out}),
+         std::make_shared<ReturnStmt>(std::vector<ExprPtr>{gm_out}, kSpan)},
+        FunctionType::AIV);
+    const auto cons =
+        AnalyzeConservativeSync(fn, "a2a3", {}, {}, false, /*automatic_children=*/true,
+                                /*enable_refresh_kill=*/true, {}, std::make_pair(int64_t{0}, int64_t{1}));
+    assert(cons.ChildEntries().size() == 1);
+    const auto logical = InsertConservativePrefixes(cons);
+    const auto lowered = TryLowerClosedPrefixSync(logical, "a2a3", std::nullopt, {}, {},
+                                                  std::make_pair(int64_t{0}, int64_t{1}));
+    assert(lowered.has_value());
+  }
+
+  // [B-P2.8 R3 (a)&(c)] Non-sharpening slice is skipped; >4 simultaneous in-flight per dir is declined.
+  {
+    auto vx_t = VecType(16, 64);
+    auto x1 = MakeVar("x1", vx_t);
+    auto y1 = MakeVar("y1", vx_t);
+    auto z1 = MakeVar("z1", vx_t);
+    auto w_ns = std::make_shared<WhileStmt>(
+        cond, std::vector<IterArgPtr>{},
+        std::make_shared<SeqStmts>(
+            std::vector<StmtPtr>{EvalCall("buffer.load", {gm_in, ConstTup({0, 0}), ConstTup({16, 64}), x1}),
+                                 EvalCall("buffer.add", {x1, x1, y1}), EvalCall("buffer.mul", {y1, y1, z1}),
+                                 std::make_shared<YieldStmt>(std::vector<ExprPtr>{}, kSpan)},
+            kSpan),
+        std::vector<VarPtr>{}, kSpan);
+    auto fn_ns = MakeAicFn("bp2_8_non_sharp", {gm_in, gm_out, cond},
+                           {ParamDirection::In, ParamDirection::InOut, ParamDirection::In},
+                           {AllocBuf(x1, 0, vx_t), AllocBuf(y1, 4096, vx_t), AllocBuf(z1, 8192, vx_t), w_ns,
+                            EvalCall("buffer.store", {z1, ConstTup({0, 0}), ConstTup({16, 64}), gm_out}),
+                            std::make_shared<ReturnStmt>(std::vector<ExprPtr>{gm_out}, kSpan)},
+                           FunctionType::AIV);
+    auto auto_ns = PrepareAutomaticSyncChildren(fn_ns, "a2a3");
+    assert(auto_ns.inline_subblocks.empty());
+
+    // 5 simultaneous in-flight (MTE2 -> V) pairs + sharpening subview -> declined (<= 4 cap).
+    auto s_t = VecType(3, 32);
+    auto r_t = VecType(2, 48);
+    auto va_t = VecType(3, 8);
+    auto vb_t = VecType(1, 24);
+    auto p1 = MakeVar("p1", s_t);
+    auto r1 = MakeVar("r1", r_t);
+    auto sa = MakeVar("sa", va_t);
+    auto sb = MakeVar("sb", vb_t);
+    std::vector<VarPtr> u_bufs, v_bufs;
+    std::vector<StmtPtr> allocs, body;
+    allocs.push_back(AllocBuf(p1, 0, s_t));
+    for (int idx = 0; idx < 5; ++idx) {
+      auto ub = MakeVar("u" + std::to_string(idx), vx_t);
+      auto vb = MakeVar("v" + std::to_string(idx), vx_t);
+      u_bufs.push_back(ub);
+      v_bufs.push_back(vb);
+      allocs.push_back(AllocBuf(ub, 4096 + idx * 8192, vx_t));
+      allocs.push_back(AllocBuf(vb, 8192 + idx * 8192, vx_t));
+    }
+    body.push_back(BufferReshape(r1, p1, r_t));
+    body.push_back(BufferSubview(sa, p1, CI(0), CI(0), va_t));
+    body.push_back(BufferSubview(sb, r1, CI(0), CI(8), vb_t));
+    body.push_back(EvalCall("buffer.load", {gm_in, ConstTup({0, 0}), ConstTup({3, 8}), sa}));
+    for (int idx = 0; idx < 5; ++idx) {
+      body.push_back(EvalCall("buffer.load", {gm_in, ConstTup({0, 0}), ConstTup({16, 64}), u_bufs[idx]}));
+    }
+    body.push_back(EvalCall("buffer.add", {sb, sb, sb}));
+    for (int idx = 0; idx < 5; ++idx) {
+      body.push_back(EvalCall("buffer.add", {u_bufs[idx], u_bufs[idx], v_bufs[idx]}));
+    }
+    body.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{}, kSpan));
+    auto w_cap = std::make_shared<WhileStmt>(cond, std::vector<IterArgPtr>{},
+                                             std::make_shared<SeqStmts>(std::move(body), kSpan),
+                                             std::vector<VarPtr>{}, kSpan);
+    allocs.push_back(w_cap);
+    allocs.push_back(EvalCall("buffer.store", {v_bufs.back(), ConstTup({0, 0}), ConstTup({16, 64}), gm_out}));
+    allocs.push_back(std::make_shared<ReturnStmt>(std::vector<ExprPtr>{gm_out}, kSpan));
+    auto fn_cap = MakeAicFn("bp2_8_cap5", {gm_in, gm_out, cond},
+                            {ParamDirection::In, ParamDirection::InOut, ParamDirection::In},
+                            std::move(allocs), FunctionType::AIV);
+    auto auto_cap = PrepareAutomaticSyncChildren(fn_cap, "a2a3");
+    assert(auto_cap.inline_subblocks.empty());
+  }
+
+  // [B-P2.9] ANF SSA-bound FloorMod produces ModularSlot fiber.
+  {
+    auto mvec_t = MultiVecType(4, 16, 64);
+    auto vec_t = VecType(16, 64);
+    auto pool = MakeVar("pool", mvec_t);
+    auto rem0 = MakeVar("rem0", IndexType());
+    auto s0 = MakeVar("s0", vec_t);
+    auto iv = MakeVar("i", IndexType());
+    auto assign_rem = std::make_shared<AssignStmt>(rem0, MakeFloorMod(MakeMul(CI(2), iv), CI(4)), kSpan);
+    auto slot0 = BufferSlot(s0, pool, rem0, vec_t);
+    auto loop = SimpleFor(
+        iv, CI(0), CI(8), CI(1),
+        {assign_rem, slot0, EvalCall("buffer.load", {gm_in, ConstTup({0, 0}), ConstTup({16, 64}), s0})});
+    auto fn = MakeAicFn("bp2_9_anf_mod", {gm_in}, {ParamDirection::In},
+                        {AllocBuf(pool, 0, mvec_t, "buffer.alloc_multi"), loop,
+                         std::make_shared<ReturnStmt>(std::vector<ExprPtr>{}, kSpan)},
+                        FunctionType::AIV);
+    SyncFootprintResolver resolver(fn);
+    assert(resolver.ViewOf(s0) && resolver.ViewOf(s0)->fiber.kind == IterationFiber::Kind::ModularSlot);
+    assert(resolver.ViewOf(s0)->fiber.modulus == 4 && resolver.ViewOf(s0)->fiber.coeff == 2);
+  }
+
+  // Sequential ForStmts with Class-B InlineExactSubBlock reuse (MTE2 -> V) IDs after loop exit to scope 0.
+  {
+    auto vx_t = VecType(16, 64);
+    auto s_t = VecType(3, 32);
+    auto r_t = VecType(2, 48);
+    auto va_t = VecType(3, 8);
+    auto vb_t = VecType(1, 24);
+    std::vector<StmtPtr> allocs;
+    int64_t next_off = 0;
+    auto mk_loop = [&](const std::string& pfx, int n_pairs) -> StmtPtr {
+      auto p = MakeVar(pfx + "_p", s_t);
+      auto r = MakeVar(pfx + "_r", r_t);
+      auto sa = MakeVar(pfx + "_sa", va_t);
+      auto sb = MakeVar(pfx + "_sb", vb_t);
+      allocs.push_back(AllocBuf(p, next_off, s_t));
+      next_off += 4096;
+      std::vector<VarPtr> us, vs;
+      for (int idx = 0; idx < n_pairs; ++idx) {
+        auto u = MakeVar(pfx + "_u" + std::to_string(idx), vx_t);
+        auto v = MakeVar(pfx + "_v" + std::to_string(idx), vx_t);
+        us.push_back(u);
+        vs.push_back(v);
+        allocs.push_back(AllocBuf(u, next_off, vx_t));
+        next_off += 4096;
+        allocs.push_back(AllocBuf(v, next_off, vx_t));
+        next_off += 4096;
+      }
+      std::vector<StmtPtr> wbody{BufferReshape(r, p, r_t), BufferSubview(sa, p, CI(0), CI(0), va_t),
+                                 BufferSubview(sb, r, CI(0), CI(8), vb_t),
+                                 EvalCall("buffer.load", {gm_in, ConstTup({0, 0}), ConstTup({3, 8}), sa})};
+      for (int idx = 0; idx < n_pairs; ++idx) {
+        wbody.push_back(EvalCall("buffer.load", {gm_in, ConstTup({0, 0}), ConstTup({16, 64}), us[idx]}));
+      }
+      wbody.push_back(EvalCall("buffer.add", {sb, sb, sb}));
+      for (int idx = 0; idx < n_pairs; ++idx) {
+        wbody.push_back(EvalCall("buffer.add", {us[idx], us[idx], vs[idx]}));
+      }
+      wbody.push_back(std::make_shared<YieldStmt>(std::vector<ExprPtr>{}, kSpan));
+      auto w = std::make_shared<WhileStmt>(cond, std::vector<IterArgPtr>{},
+                                           std::make_shared<SeqStmts>(std::move(wbody), kSpan),
+                                           std::vector<VarPtr>{}, kSpan);
+      auto iv = MakeVar(pfx + "_i", IndexType());
+      return SimpleFor(iv, CI(0), CI(2), CI(1), {w});
+    };
+    auto z_end = MakeVar("z_end", vx_t);
+    allocs.push_back(AllocBuf(z_end, next_off, vx_t));
+    auto l0 = mk_loop("l0", 4);
+    auto l1 = mk_loop("l1", 4);
+    auto l2 = mk_loop("l2", 1);
+    allocs.push_back(l0);
+    allocs.push_back(l1);
+    allocs.push_back(l2);
+    allocs.push_back(EvalCall("buffer.store", {z_end, ConstTup({0, 0}), ConstTup({16, 64}), gm_out}));
+    allocs.push_back(std::make_shared<ReturnStmt>(std::vector<ExprPtr>{gm_out}, kSpan));
+    auto fn = MakeAicFn("rmsnorm_seq_reuse", {gm_in, gm_out, cond},
+                        {ParamDirection::In, ParamDirection::InOut, ParamDirection::In}, std::move(allocs),
+                        FunctionType::AIV);
+    const auto cons = AnalyzeConservativeSync(fn, "a2a3", {}, {}, false, /*automatic_children=*/true);
+    const auto logical = InsertConservativePrefixes(cons);
+    const auto lowered = TryLowerClosedPrefixSync(logical, "a2a3", std::nullopt);
+    assert(lowered.has_value() && lowered->set_sites > 0);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -844,6 +1276,7 @@ int main() {
   TestB3IterationFiberRefinement();
   TestB4InitGuardAndSubblockPromotion();
   TestRound1AuditFixes();
+  TestRound2AuditAndCleanupFixes();
   std::cout << "All refactor_b_test assertions passed!" << std::endl;
   return 0;
 }

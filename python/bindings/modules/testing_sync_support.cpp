@@ -304,10 +304,12 @@ ControlPtr ImportCommandsImpl(const StmtPtr& stmt, PhysicalSyncRealization& work
         branch->else_body_
             ? std::optional<ControlPtr>(ImportCommandsImpl(*branch->else_body_, work, arena, loop_vars))
             : std::nullopt;
-    // Validate predicate syntax & qualification first.
+    // Validate predicate syntax & qualification first without double-charging descriptor count.
+    const size_t saved_descriptors = work.control_descriptors;
     auto opaque = ControlBranch(branch->condition_, then_ctrl, else_ctrl, stmt->span_, work);
     if (opaque->predicate_qualified) {
       if (const auto lifted = TryLiftExprToRadixGuard(branch->condition_, arena, loop_vars)) {
+        work.control_descriptors = saved_descriptors;
         return ControlBranch(*lifted, then_ctrl, else_ctrl, stmt->span_, work);
       }
     }

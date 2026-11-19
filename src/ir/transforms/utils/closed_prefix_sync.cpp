@@ -40,6 +40,7 @@
 #include "src/ir/transforms/utils/retained_sync_child.h"
 #include "src/ir/transforms/utils/sync_loop_trip_proof.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
+#include "src/ir/transforms/utils/sync_transform_common.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
 
 namespace pypto::ir::sync {
@@ -96,13 +97,6 @@ RelayMatrix ComputeChildLoopRelayMatrix(const StmtPtr& root, const SyncControlRa
   using TokenMap = std::unordered_map<const Var*, std::vector<TokenSource>>;
   TokenMap tokens;
 
-  auto find_pipe_kwarg = [](const CallPtr& call, const char* key) -> std::optional<PipeType> {
-    for (const auto& [name, val] : call->kwargs_) {
-      if (name == key) return static_cast<PipeType>(pypto::AnyCast<int>(val, name));
-    }
-    return std::nullopt;
-  };
-
   std::function<RelayMatrix(const StmtPtr&, RelayMatrix)> walk = [&](const StmtPtr& stmt,
                                                                      RelayMatrix cur) -> RelayMatrix {
     if (!stmt) return cur;
@@ -135,7 +129,7 @@ RelayMatrix ComputeChildLoopRelayMatrix(const StmtPtr& root, const SyncControlRa
           tokens[assign->var_.get()] = found == tokens.end() ? std::vector<TokenSource>{} : found->second;
         } else if (const auto call = As<Call>(assign->value_)) {
           if (IsOp(call, "sync.record")) {
-            if (const auto p = find_pipe_kwarg(call, "pipe")) {
+            if (const auto p = TryGetSyncPipeKwarg(call, "pipe")) {
               tokens[assign->var_.get()] = {{RelayPipeBit(*p), cur}};
             }
           } else if (IsOp(call, "sync.completed")) {
@@ -159,7 +153,7 @@ RelayMatrix ComputeChildLoopRelayMatrix(const StmtPtr& root, const SyncControlRa
       if (const auto call = As<Call>(eval->expr_); call && IsOp(call, "sync.wait") && !call->args_.empty()) {
         const auto v = AsVarLike(call->args_[0]);
         const auto found = v ? tokens.find(v.get()) : tokens.end();
-        const auto dst = find_pipe_kwarg(call, "dst_pipe");
+        const auto dst = TryGetSyncPipeKwarg(call, "dst_pipe");
         if (found != tokens.end() && dst) {
           const RelayMask dm = RelayPipeBit(*dst);
           if (dm != 0) {
@@ -180,11 +174,7 @@ RelayMatrix ComputeChildLoopRelayMatrix(const StmtPtr& root, const SyncControlRa
 }
 
 PipeType Pipe(const CallPtr& operation, const char* key) {
-  for (const auto& [name, value] : operation->kwargs_) {
-    if (name == key) return static_cast<PipeType>(pypto::AnyCast<int>(value, name));
-  }
-  INTERNAL_CHECK(false) << "Internal error: missing pipeline attribute";
-  return PipeType::S;
+  return RequireSyncPipeKwarg(operation, key, "Internal error: missing pipeline attribute");
 }
 
 CallPtr SyncRecord(const StmtPtr& statement) {
@@ -227,21 +217,11 @@ struct OneWayTransaction {
   size_t wait_idx = 0;
 };
 
-bool ContainsSyncTokenType(const TypePtr& type) {
-  if (!type) return false;
-  if (As<SyncTokenType>(type)) return true;
-  if (const auto tup = As<TupleType>(type)) {
-    for (const auto& elem : tup->types_) {
-      if (ContainsSyncTokenType(elem)) return true;
-    }
-  }
-  return false;
-}
-
 class Discover : public IRVisitor {
  public:
-  explicit Discover(FunctionPtr owner = nullptr, std::string target = "")
-      : owner_(std::move(owner)), target_(std::move(target)) {}
+  explicit Discover(FunctionPtr owner = nullptr, std::string target = "",
+                    const SyncControlRangeProver* prover = nullptr)
+      : owner_(std::move(owner)), target_(std::move(target)), prover_(prover) {}
   std::vector<LocalCompletion> local;
   std::vector<OneWayTransaction> one_way;
   std::vector<StmtPtr> erased_waits;
@@ -274,7 +254,7 @@ class Discover : public IRVisitor {
     if (const auto call = As<Call>(eval->expr_)) {
       if (GetLogicalSyncKind(call->op_) != LogicalSyncKind::None) {
         unsupported_syntax = true;
-      } else if (!IsNonPayloadCall(call)) {
+      } else if (!IsSyncNonPayloadCall(call)) {
         has_payload = true;
       }
     }
@@ -289,7 +269,7 @@ class Discover : public IRVisitor {
     if (const auto call = As<Call>(assign->value_)) {
       if (GetLogicalSyncKind(call->op_) != LogicalSyncKind::None) {
         unsupported_syntax = true;
-      } else if (!IsNonPayloadCall(call)) {
+      } else if (!IsSyncNonPayloadCall(call)) {
         has_payload = true;
       }
     }
@@ -329,7 +309,7 @@ class Discover : public IRVisitor {
               const PipeType dst = Pipe(call, "dst_pipe");
               if (tok->pipe_ != dst) mask |= SyncDirectionBit(tok->pipe_, dst);
             }
-          } else if (GetLogicalSyncKind(call->op_) == LogicalSyncKind::None && !IsNonPayloadCall(call) &&
+          } else if (GetLogicalSyncKind(call->op_) == LogicalSyncKind::None && !IsSyncNonPayloadCall(call) &&
                      !target.empty() && !backend::QualifyBufferSyncNonPayload(call, target)) {
             calls.push_back(call);
           }
@@ -344,7 +324,7 @@ class Discover : public IRVisitor {
           if (dir.first != dir.second) dirs |= SyncDirectionBit(dir.first, dir.second);
         }
       }
-      if (loop->HasAttr(kClosedSyncChildFirstVisitAttr)) {
+      if (prover_ && loop->HasAttr(kClosedSyncChildFirstVisitAttr)) {
         CHECK(loop_stack_.empty() && (prior_child_dirs_ & dirs) == 0)
             << "First-visit closed child cannot appear inside a multi-trip loop or after an earlier child";
       }
@@ -361,7 +341,8 @@ class Discover : public IRVisitor {
       if (ContainsSyncTokenType(rv->GetType())) unsupported_syntax = true;
     }
     has_for = true;
-    if (IsSpmdAtMostOneTripFor(loop, ssa_defs_)) {
+    if (IsSpmdAtMostOneTripFor(loop, ssa_defs_) ||
+        (prover_ && !As<ConstInt>(loop->start_) && prover_->IsAtMostOneTrip(loop.get()))) {
       spmd_one_trip_loops.insert(loop.get());
       control_stack_.push_back(loop.get());
       const uint64_t before = prior_child_dirs_;
@@ -520,12 +501,6 @@ class Discover : public IRVisitor {
   }
 
  private:
-  static bool IsNonPayloadCall(const CallPtr& call) {
-    return IsOp(call, "buffer.get_block_idx") || IsOp(call, "buffer.get_block_num") ||
-           IsOp(call, "buffer.get_subblock_idx") || IsOp(call, "buffer.alloc") ||
-           IsOp(call, "buffer.alloc_multi") || IsOp(call, "buffer.subview") || IsOp(call, "buffer.reshape") ||
-           IsOp(call, "buffer.slot") || IsOp(call, "buffer.set_validshape");
-  }
   struct PendingRecord {
     PipeType pipe;
     StmtPtr stmt;
@@ -536,6 +511,7 @@ class Discover : public IRVisitor {
   };
   FunctionPtr owner_;
   std::string target_;
+  const SyncControlRangeProver* prover_ = nullptr;
   std::set<const Var*> completed_tokens_;
   std::unordered_map<const Var*, PendingRecord> pending_records_;
   std::unordered_map<const Var*, ExprPtr> ssa_defs_;
@@ -671,12 +647,10 @@ class Assignment {
  public:
   Assignment(const FunctionPtr& owner, Discover& discovered, const NativeOperations& native_ops,
              const std::string& target, const std::optional<std::vector<int>>& eligible,
-             const SyncNativeReservations& extra_reservations, const SyncParameterBounds& parameters,
-             const std::optional<std::pair<int64_t, int64_t>>& blocks) {
+             const SyncNativeReservations& extra_reservations, const SyncControlRangeProver& prover) {
     const auto& native = backend::RequireLocalSyncExecutionContract(target);
     CHECK(native.set_completes_source_prefix && native.wait_consumes_before_advance)
         << "Closed prefix protocols require ordered consuming event commands";
-    SyncControlRangeProver prover(owner, parameters, blocks);
     reservations_ = SyncNativeClaims(owner, native_ops.all_native_payloads, target);
     for (const auto& [direction, ids] : reservations_)
       for (int id : ids) native_claimed_.emplace_back(direction.first, direction.second, id);
@@ -1108,53 +1082,70 @@ class Assignment {
         return;
       }
       if (const auto loop = As<ForStmt>(stmt)) {
-        if (!loop->HasAttr(kClosedSyncChildAttr)) {
-          const bool positive_trip = prover.IsPositiveTrip(loop.get());
-          const bool at_most_one = prover.IsAtMostOneTrip(loop.get());
-          if (positive_trip && at_most_one) {
-            allocate_walk(loop->body_);
-            return;
-          }
-          if (discovered.spmd_one_trip_loops.count(loop.get()) || (!positive_trip && at_most_one)) {
-            auto saved = active_by_dir;
-            allocate_walk(loop->body_);
+        if (loop->HasAttr(kClosedSyncChildAttr)) {
+          if (prover.IsPositiveTripCompatible(loop.get())) {
+            const RelayMatrix child_relay = ComputeChildLoopRelayMatrix(loop->body_, prover);
+            const uint64_t seq_now = next_seq++;
             for (auto& [dir, vec] : active_by_dir) {
-              const auto sit = saved.find(dir);
-              if (sit == saved.end()) {
-                // Freshly allocated inside a <=1-trip loop; untouched on 0-trip path.
-                continue;
-              }
               for (auto& entry : vec) {
-                const ActiveId* matched_se = nullptr;
-                for (const auto& se : sit->second) {
-                  if (se.id == entry.id) {
-                    matched_se = &se;
-                    break;
-                  }
+                if (entry.in_flight) continue;
+                RelayMask extra = 0;
+                for (size_t p = 0; p < kRelayPipeCount; ++p) {
+                  if ((entry.reach_from_dst & (RelayMask{1} << p)) != 0) extra |= child_relay[p];
                 }
-                if (matched_se) {
-                  entry.in_flight = entry.in_flight || matched_se->in_flight;
-                  entry.IntersectReach(*matched_se);
-                  entry.acyclic = entry.acyclic && matched_se->acyclic;
-                  entry.loop_pre_reach &= matched_se->loop_pre_reach;
-                  entry.loop_post_reach &= matched_se->loop_post_reach;
-                  entry.wait_seq = std::max(entry.wait_seq, matched_se->wait_seq);
+                for (size_t q = 0; q < kRelayPipeCount; ++q) {
+                  if ((extra & (RelayMask{1} << q)) != 0) entry.AddReach(static_cast<PipeType>(q), seq_now);
                 }
-                // If `!matched_se`, freshly allocated inside a <=1-trip loop; untouched on 0-trip path.
               }
             }
-            return;
           }
-          const uint32_t outer_scope_id = walk_loop_scopes.back();
-          const uint32_t this_scope_id = discovered.loop_scope_ids.at(loop.get());
-          auto saved = active_by_dir;
-          ++loop_depth;
-          walk_loop_scopes.push_back(this_scope_id);
-          allocate_walk(loop->body_);
-          walk_loop_scopes.pop_back();
-          --loop_depth;
-          merge_loop_exit(saved, outer_scope_id, this_scope_id, positive_trip);
+          return;
         }
+        const bool positive_trip = prover.IsPositiveTrip(loop.get());
+        const bool at_most_one = prover.IsAtMostOneTrip(loop.get());
+        if (positive_trip && at_most_one) {
+          allocate_walk(loop->body_);
+          return;
+        }
+        if (discovered.spmd_one_trip_loops.count(loop.get()) || (!positive_trip && at_most_one)) {
+          auto saved = active_by_dir;
+          allocate_walk(loop->body_);
+          for (auto& [dir, vec] : active_by_dir) {
+            const auto sit = saved.find(dir);
+            if (sit == saved.end()) {
+              // Freshly allocated inside a <=1-trip loop; untouched on 0-trip path.
+              continue;
+            }
+            for (auto& entry : vec) {
+              const ActiveId* matched_se = nullptr;
+              for (const auto& se : sit->second) {
+                if (se.id == entry.id) {
+                  matched_se = &se;
+                  break;
+                }
+              }
+              if (matched_se) {
+                entry.in_flight = entry.in_flight || matched_se->in_flight;
+                entry.IntersectReach(*matched_se);
+                entry.acyclic = entry.acyclic && matched_se->acyclic;
+                entry.loop_pre_reach &= matched_se->loop_pre_reach;
+                entry.loop_post_reach &= matched_se->loop_post_reach;
+                entry.wait_seq = std::max(entry.wait_seq, matched_se->wait_seq);
+              }
+              // If `!matched_se`, freshly allocated inside a <=1-trip loop; untouched on 0-trip path.
+            }
+          }
+          return;
+        }
+        const uint32_t outer_scope_id = walk_loop_scopes.back();
+        const uint32_t this_scope_id = discovered.loop_scope_ids.at(loop.get());
+        auto saved = active_by_dir;
+        ++loop_depth;
+        walk_loop_scopes.push_back(this_scope_id);
+        allocate_walk(loop->body_);
+        walk_loop_scopes.pop_back();
+        --loop_depth;
+        merge_loop_exit(saved, outer_scope_id, this_scope_id, positive_trip);
         return;
       }
       if (const auto loop = As<WhileStmt>(stmt)) {
@@ -1181,7 +1172,7 @@ class Assignment {
           if (ow.loop_scope_id != 0 && entry.is_ack) continue;
           if ((entry.reach_from_dst & RelayPipeBit(ow.source)) == 0) continue;
           if (entry.loop_scope_id != ow.loop_scope_id && entry.loop_scope_id != 0) continue;
-          const bool acyclic_reuse = may_reuse && entry.acyclic;
+          const bool acyclic_reuse = (may_reuse || entry.loop_scope_id == 0) && entry.acyclic;
           const bool loop_closed_reuse = ow.loop_scope_id != 0 && entry.loop_scope_id == ow.loop_scope_id &&
                                          (entry.loop_post_reach & ow.loop_pre_reach) != 0 &&
                                          (ow.loop_post_reach & entry.loop_pre_reach) != 0;
@@ -1599,7 +1590,8 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     const FunctionPtr& function, const std::string& target,
     const std::optional<std::vector<int>>& eligible_ids, const SyncNativeReservations& extra_reservations,
     const SyncParameterBounds& parameters, const std::optional<std::pair<int64_t, int64_t>>& blocks) {
-  Discover discovered(function, target);
+  const SyncControlRangeProver prover(function, parameters, blocks);
+  Discover discovered(function, target, &prover);
   discovered.VisitFunction(function);
   if (!HasMatchingClosedPrefixUses(function, discovered)) return std::nullopt;
   CHECK(!function->requires_runtime_binding_ && !function->HasAttr(kAttrExternalSource) &&
@@ -1608,14 +1600,14 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
 
   NativeOperations native(function->func_type_, target, /*track_payload_pipes=*/true);
   native.VisitFunction(function);
-  const Assignment assignment(function, discovered, native, target, eligible_ids, extra_reservations,
-                              parameters, blocks);
+  const Assignment assignment(function, discovered, native, target, eligible_ids, extra_reservations, prover);
 
   std::map<const ForStmt*, StmtPtr> children;
   size_t child_sets = 0, child_waits = 0, child_barriers = 0, child_lanes = 0;
-  const auto bindings = discovered.children.empty()
-                            ? std::optional<SyncRegionBindings>{}
-                            : std::optional<SyncRegionBindings>{std::in_place, function, target};
+  const auto bindings =
+      discovered.children.empty()
+          ? std::optional<SyncRegionBindings>{}
+          : std::optional<SyncRegionBindings>{std::in_place, function, target, parameters, blocks};
   const auto* ctx = PassContext::Current();
   const bool disjoint_gm = ctx && ctx->GetAutoSyncDisjointGM();
   for (const auto& child : discovered.children) {
@@ -1648,27 +1640,9 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
       (void)ids;
       if (dir.first != dir.second) required_rearm.emplace(dir.second, dir.first);
     }
-    class ChildFlagDirections : public IRVisitor {
-     public:
-      std::set<SyncDirection>& required;
-      explicit ChildFlagDirections(std::set<SyncDirection>& out) : required(out) {}
-      void VisitExpr(const ExprPtr& expression) override {
-        if (expression && seen_.insert(expression.get()).second) IRVisitor::VisitExpr(expression);
-      }
-      void VisitExpr_(const CallPtr& call) override {
-        if (IsOp(call, "sync.wait") && !call->args_.empty()) {
-          if (const auto tok = As<SyncTokenType>(call->args_[0]->GetType())) {
-            const auto dst = Pipe(call, "dst_pipe");
-            if (tok->pipe_ != dst) required.emplace(dst, tok->pipe_);
-          }
-        }
-        IRVisitor::VisitExpr_(call);
-      }
-
-     private:
-      std::unordered_set<const Expr*> seen_;
-    } child_flag_dirs(required_rearm);
-    child_flag_dirs.VisitFunction(context.binding_owner);
+    for (const auto& [src, dst] : CollectSyncWaitDirections(context.binding_owner->body_)) {
+      required_rearm.emplace(dst, src);
+    }
     const auto entry = discovered.entries.find(child.get());
     CHECK(entry != discovered.entries.end()) << "Closed child lacks an original entry protocol cut";
     if (!child->HasAttr(kClosedSyncChildFirstVisitAttr)) {
@@ -1707,7 +1681,8 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     actual->body_ = replace.VisitStmt(context.binding_owner->body_);
     // Unified per-direction resource management: forward `eligible_ids` along
     // with per-direction parent reservations instead of a flat global subtraction.
-    const auto child_bounds = ProjectSyncParameterBounds(function, actual, parameters);
+    auto child_bounds = ProjectSyncParameterBounds(function, actual, parameters);
+    child_bounds = ProjectEnclosingLoopBounds(context, bindings->Prover(), child, child_bounds);
     auto lowered = LowerLogicalSync(actual, target, eligible_ids, child_bounds, blocks, {}, external_policy,
                                     std::nullopt, assignment.Reservations());
     const auto original_body = As<SeqStmts>(actual->body_);

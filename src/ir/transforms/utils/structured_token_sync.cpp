@@ -21,7 +21,6 @@
 #include <utility>
 #include <vector>
 
-#include "pypto/core/any_cast.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/sync.h"
@@ -33,6 +32,7 @@
 #include "src/ir/transforms/utils/sync_boundary_graph.h"
 #include "src/ir/transforms/utils/sync_invocation_domains.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
+#include "src/ir/transforms/utils/sync_transform_common.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
 
 namespace pypto::ir::sync {
@@ -52,12 +52,6 @@ ExprPtr TokenYield(StmtPtr body) {
   if (!yield || yield->value_.size() != 1 || !As<SyncTokenType>(yield->value_.front()->GetType()))
     return nullptr;
   return yield->value_.front();
-}
-PipeType Pipe(const CallPtr& call, const char* key) {
-  for (const auto& [name, value] : call->kwargs_)
-    if (name == key) return static_cast<PipeType>(AnyCast<int>(value, name));
-  CHECK(false) << "Missing logical synchronization pipe";
-  return PipeType::ALL;
 }
 // The erased function is used for shared payload/native import and, only after
 // the parser certifies all actual token cuts, for shared direct-cut emission.
@@ -287,18 +281,6 @@ class Parse {
     }
     return binding;
   }
-  CallPtr Payload(const StmtPtr& stmt) const {
-    if (auto eval = As<EvalStmt>(stmt)) return As<Call>(eval->expr_);
-    if (auto branch = As<IfStmt>(stmt)) {
-      auto first = branch->then_body_;
-      if (auto seq = As<SeqStmts>(first)) {
-        if (seq->stmts_.size() != 1) return nullptr;
-        first = seq->stmts_.front();
-      }
-      if (auto eval = As<EvalStmt>(first)) return As<Call>(eval->expr_);
-    }
-    return nullptr;
-  }
   void Waits(const StmtPtr& stmt, Guard guard, Cursor& cursor, int64_t lag = 0, int64_t visit = 0) {
     if (auto seq = As<SeqStmts>(stmt)) {
       for (const auto& child : seq->stmts_) Waits(child, guard, cursor, lag, visit);
@@ -307,7 +289,7 @@ class Parse {
     auto eval = As<EvalStmt>(stmt);
     auto call = eval ? As<Call>(eval->expr_) : nullptr;
     CHECK(IsOp(call, "sync.wait")) << "Unsupported conditional token operation";
-    cursor.pending.push_back({call->args_.at(0), Pipe(call, "dst_pipe"), guard, lag, visit});
+    cursor.pending.push_back({call->args_.at(0), RequireSyncPipeKwarg(call, "dst_pipe"), guard, lag, visit});
     cursor.last.reset();
   }
   bool HasSiteOrWait(const StmtPtr& stmt) const {
@@ -317,8 +299,7 @@ class Parse {
                          [&](const StmtPtr& child) { return HasSiteOrWait(child); });
     }
     if (const auto branch = As<IfStmt>(stmt)) {
-      return HasSiteOrWait(branch->then_body_) ||
-             (branch->else_body_ && HasSiteOrWait(*branch->else_body_));
+      return HasSiteOrWait(branch->then_body_) || (branch->else_body_ && HasSiteOrWait(*branch->else_body_));
     }
     if (const auto loop = As<ForStmt>(stmt)) return HasSiteOrWait(loop->body_);
     if (const auto eval = As<EvalStmt>(stmt)) {
@@ -334,7 +315,24 @@ class Parse {
       return;
     }
     CHECK(!cursor.returned && !cursor.yield) << "Unreachable structured token cut";
-    auto call = Payload(stmt);
+    if (const auto branch = As<IfStmt>(stmt); branch && branch->return_vars_.empty()) {
+      if (const auto resolved = input_.static_branches.find(branch.get());
+          resolved != input_.static_branches.end()) {
+        if (resolved->second) {
+          Read(branch->then_body_, cursor);
+        } else if (branch->else_body_) {
+          Read(*branch->else_body_, cursor);
+        }
+        return;
+      }
+    }
+    CallPtr call = nullptr;
+    if (const auto eval = As<EvalStmt>(stmt)) {
+      call = As<Call>(eval->expr_);
+    } else if (const auto branch = As<IfStmt>(stmt); branch && branch->return_vars_.empty()) {
+      call = FindSiteCallInStmt(branch->then_body_, sites_);
+      if (!call && branch->else_body_) call = FindSiteCallInStmt(*branch->else_body_, sites_);
+    }
     const auto payload = sites_.find(call.get());
     if (payload != sites_.end()) {
       const auto site = payload->second;
@@ -413,7 +411,7 @@ class Parse {
         if (IsOp(token, "sync.record")) {
           CHECK(cursor.last && cursor.pending.empty()) << "Token record is not at a direct payload cut";
           const auto [r, s] = *cursor.last;
-          CHECK(Pipe(token, "pipe") == input_.segments[r].sites[s].pipe)
+          CHECK(RequireSyncPipeKwarg(token, "pipe") == input_.segments[r].sites[s].pipe)
               << "Record pipe differs from its direct payload";
           bindings_.emplace(assign->var_.get(), Binding{BindingKind::Current, {r, s}});
         } else if (IsOp(token, "sync.completed")) {
@@ -542,15 +540,11 @@ StrippedLogicalSync StripStructuredLogicalSync(const FunctionPtr& function, bool
   stripped->body_ = erase.VisitStmt(function->body_);
   return {std::move(stripped), std::move(erase.loops)};
 }
-LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const std::string& target,
-                                              const std::optional<std::vector<int>>& eligible,
-                                              const SyncParameterBounds& parameters,
-                                              std::optional<std::pair<int64_t, int64_t>> blocks,
-                                              const SyncSchedulePolicy& policy,
-                                              SyncExternalPolicy external_policy,
-                                              std::optional<int64_t> launch_count,
-                                              const SyncNativeReservations& extra_reservations,
-                                              bool dry_run_only) {
+LoweredLogicalSync LowerStructuredLogicalSync(
+    const FunctionPtr& function, const std::string& target, const std::optional<std::vector<int>>& eligible,
+    const SyncParameterBounds& parameters, std::optional<std::pair<int64_t, int64_t>> blocks,
+    const SyncSchedulePolicy& policy, SyncExternalPolicy external_policy, std::optional<int64_t> launch_count,
+    const SyncNativeReservations& extra_reservations, bool dry_run_only) {
   auto stripped = StripStructuredLogicalSync(function, true);
   if (blocks) {
     const auto partition = PartitionSyncInvocation(stripped.function, parameters, *blocks, launch_count);
@@ -566,12 +560,13 @@ LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const
         auto families = ParseScopedTokenProtocol(function, std::move(input), stripped.loops);
         owners.push_back(PrepareScopedTokenOrder(std::move(families)));
         const auto& order = *owners.back();
-        plans.push_back(
-            AllocateDirectSync(order.Input(), order.Families(), order.View(), target, eligible, extra_reservations));
+        plans.push_back(AllocateDirectSync(order.Input(), order.Families(), order.View(), target, eligible,
+                                           extra_reservations));
         cases.push_back({&order.Input(), plans.back().assignment, &plans.back()});
       }
-      result.function = dry_run_only ? stripped.function
-                                     : EmitAssignedSyncCases(stripped.function, parameters, *blocks, cases, policy);
+      result.function = dry_run_only
+                            ? stripped.function
+                            : EmitAssignedSyncCases(stripped.function, parameters, *blocks, cases, policy);
       for (const auto& plan : plans) {
         result.set_sites += plan.set_sites;
         result.wait_sites += plan.wait_sites;
@@ -587,20 +582,18 @@ LoweredLogicalSync LowerStructuredLogicalSync(const FunctionPtr& function, const
     const auto& order = *prepared;
     // The callbacks borrow this owner until shared allocation/emission finishes.
     // An unavailable proof refuses; it never substitutes a new demand analysis.
-    auto result = dry_run_only
-                      ? AllocateDirectSync(order.Input(), order.Families(), order.View(), target, eligible,
-                                           extra_reservations)
-                      : RealizeDirectSync(order.Input(), order.Families(), order.View(), target, eligible, policy,
-                                          extra_reservations);
+    auto result = dry_run_only ? AllocateDirectSync(order.Input(), order.Families(), order.View(), target,
+                                                    eligible, extra_reservations)
+                               : RealizeDirectSync(order.Input(), order.Families(), order.View(), target,
+                                                   eligible, policy, extra_reservations);
     return {result.function, result.set_sites, result.wait_sites, {std::move(result)}};
   }
   auto families = Parse(function, input, stripped.loops).Run();
   Order order(input, families);
-  auto result = dry_run_only
-                    ? AllocateDirectSync(input, std::move(families), order.View(), target, eligible,
-                                         extra_reservations)
-                    : RealizeDirectSync(input, std::move(families), order.View(), target, eligible, policy,
-                                        extra_reservations);
+  auto result = dry_run_only ? AllocateDirectSync(input, std::move(families), order.View(), target, eligible,
+                                                  extra_reservations)
+                             : RealizeDirectSync(input, std::move(families), order.View(), target, eligible,
+                                                 policy, extra_reservations);
   return {result.function, result.set_sites, result.wait_sites, {std::move(result)}};
 }
 }  // namespace pypto::ir::sync

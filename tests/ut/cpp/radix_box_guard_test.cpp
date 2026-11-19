@@ -747,6 +747,169 @@ void TestLaunchBlockCommutationFence() {
   }
 }
 
+void TestRefactorAAuditFixes() {
+  PhysicalSyncRealization work;
+  auto set0 =
+      ControlCommand(MakeFlag("system.set_flag", PipeType::MTE2, PipeType::V, 0), Span::unknown(), work);
+  auto set1 =
+      ControlCommand(MakeFlag("system.set_flag", PipeType::MTE2, PipeType::M, 1), Span::unknown(), work);
+  auto wait0 =
+      ControlCommand(MakeFlag("system.wait_flag", PipeType::MTE2, PipeType::V, 0), Span::unknown(), work);
+
+  // [A-P1.1] NormalizeNodes Step 7A: 3-way partition where prefix stripping empties 1 arm
+  // must NOT turn the remaining 2nd non-empty arm into an unconditional else.
+  {
+    auto arena = std::make_shared<GuardDomainArena>();
+    auto li = MakeTestLoop("i", 0, 3, 1);
+    AxisId ai = arena->RegisterLoopFrame(SyncLoopFrame{li, 3, 0, 1, nullptr});
+    auto mk_arm = [&](int64_t val, std::vector<ControlPtr> cmds) {
+      RadixBox bx;
+      bx.constraints.push_back(AxisConstraint{ai, AxisAP{val, val + 1, 1}});
+      ControlForest cf(cmds.begin(), cmds.end());
+      return ControlBranch(RadixBoxGuard::FromBox(arena, bx),
+                           ControlSequence(std::move(cf), Span::unknown(), work), std::nullopt,
+                           Span::unknown(), work);
+    };
+    ControlForest out = ShareCommandGuards(
+        ControlForest{mk_arm(0, {set0, set1}), mk_arm(1, {set0}), mk_arm(2, {set0, wait0})}, work, false,
+        true);
+    auto frozen = FreezeCommandForest(out, work);
+    assert(frozen != nullptr);
+    size_t branch_count = 0;
+    for (const auto& cmd : frozen->commands) {
+      if (cmd.body && !cmd.body->commands.empty()) {
+        ++branch_count;
+        assert(cmd.condition_expr != nullptr);
+        assert(!cmd.alternative || cmd.alternative->commands.empty());
+      }
+    }
+    assert(branch_count == 2);
+  }
+
+  // [A-P1.2] CoalesceBoxes with ranks preserves exact union truth table.
+  {
+    auto arena = std::make_shared<GuardDomainArena>();
+    auto li = MakeTestLoop("i", 0, 8, 1);
+    AxisId ai = arena->RegisterLoopFrame(SyncLoopFrame{li, 8, 0, 1, nullptr});
+    ResidueMask mask(2);
+    mask.Set(0);
+    RankCongruence rc{2, 0, {RankTerm{ai, 0, 1, 1}}, mask};
+    RadixBox b_even;
+    b_even.constraints.push_back(AxisConstraint{ai, *AxisAP::MakeCanonical(0, 5, 2, 8)});
+    b_even.ranks.push_back(rc);
+    RadixBox b_odd;
+    b_odd.constraints.push_back(AxisConstraint{ai, *AxisAP::MakeCanonical(1, 6, 2, 8)});
+    b_odd.ranks.push_back(rc);
+    std::vector<RadixBox> boxes{b_even, b_odd};
+    CoalesceBoxes(boxes, *arena);
+    auto g = RadixBoxGuard::FromBoxes(arena, std::move(boxes));
+    for (int64_t d = 0; d < 8; ++d) {
+      bool expected = (d <= 5) && ((d % 2) == 0);
+      assert(GuardContains(g, ai, d, ai, d, *arena) == expected);
+    }
+  }
+
+  // [A-P1.3] SubtractBox uses eff_ap = CRTIntersect(s_ap, g_ap) and avoids int64 overflow at INT64_MAX.
+  {
+    auto arena = std::make_shared<GuardDomainArena>();
+    auto li = MakeTestLoop("i", 0, 8, 1);
+    AxisId ai = arena->RegisterLoopFrame(SyncLoopFrame{li, 8, 0, 1, nullptr});
+    RadixBox s_box, g_box;
+    s_box.constraints.push_back(AxisConstraint{ai, *AxisAP::MakeCanonical(0, 5, 2, 8)});  // {0, 2, 4}
+    g_box.constraints.push_back(AxisConstraint{ai, *AxisAP::MakeCanonical(2, 6, 3, 8)});  // {2, 5} -> eff={2}
+    auto diff = SubtractBox(s_box, g_box, *arena);
+    assert(diff.has_value());
+    for (int64_t d = 0; d < 8; ++d) {
+      bool in_diff = false;
+      for (const auto& bx : *diff) {
+        if (BoxContains(bx, ai, d, ai, d, *arena)) in_diff = true;
+      }
+      assert(in_diff == (d == 0 || d == 4));
+    }
+
+    auto arena_max = std::make_shared<GuardDomainArena>();
+    auto l_max = MakeTestLoop("imax", 0, INT64_MAX, 1);
+    AxisId am = arena_max->RegisterLoopFrame(SyncLoopFrame{l_max, INT64_MAX, 0, 1, nullptr});
+    RadixBox s_max, g_max;
+    s_max.constraints.push_back(
+        AxisConstraint{am, *AxisAP::MakeCanonical(INT64_MAX - 5, INT64_MAX, 2, INT64_MAX)});
+    g_max.constraints.push_back(
+        AxisConstraint{am, *AxisAP::MakeCanonical(INT64_MAX - 3, INT64_MAX, 2, INT64_MAX)});
+    auto diff_max = SubtractBox(s_max, g_max, *arena_max);
+    assert(diff_max.has_value() && diff_max->size() == 1);
+    assert(BoxContains((*diff_max)[0], am, INT64_MAX - 5, am, INT64_MAX - 5, *arena_max));
+    assert(!BoxContains((*diff_max)[0], am, INT64_MAX - 3, am, INT64_MAX - 3, *arena_max));
+  }
+
+  // [A-P2.5] RadixBoxGuard::FromBox canonicalizes dead rank arms to False(), tightens 1-term rank hull,
+  // and BoxCardinality normalizes negative rc.base.
+  {
+    auto arena = std::make_shared<GuardDomainArena>();
+    auto li = MakeTestLoop("i", 0, 8, 1);
+    AxisId ai = arena->RegisterLoopFrame(SyncLoopFrame{li, 8, 0, 1, nullptr});
+
+    ResidueMask m23(4);
+    m23.Set(2);
+    m23.Set(3);
+    RadixBox dead_box;
+    dead_box.constraints.push_back(AxisConstraint{ai, *AxisAP::MakeCanonical(0, 2, 1, 8)});  // d in {0, 1}
+    dead_box.ranks.push_back(RankCongruence{4, 0, {RankTerm{ai, 0, 1, 1}}, m23});
+    assert(RadixBoxGuard::FromBox(arena, dead_box).IsEmpty());
+
+    ResidueMask m01(4);
+    m01.Set(0);
+    m01.Set(1);
+    RadixBox hull_box;
+    hull_box.ranks.push_back(RankCongruence{4, 0, {RankTerm{ai, 0, 1, 1}}, m01});  // active: {0, 1, 4, 5}
+    auto g_hull = RadixBoxGuard::FromBox(arena, hull_box);
+    assert(g_hull.Boxes().size() == 1);
+    assert(g_hull.Boxes()[0].AxisRange(ai, *arena).Last() == 5);
+
+    auto lj = MakeTestLoop("j", 0, 4, 1);
+    AxisId aj = arena->RegisterLoopFrame(SyncLoopFrame{lj, 4, 0, 1, nullptr});
+    ResidueMask m_zero(3);
+    m_zero.Set(0);
+    RadixBox neg_base_box;
+    neg_base_box.ranks.push_back(
+        RankCongruence{3, -1, {RankTerm{ai, 0, 1, 1}, RankTerm{aj, 0, 1, 1}}, m_zero});
+    auto card = BoxCardinality(neg_base_box, {ai, aj}, *arena);
+    unsigned __int128 bf = 0;
+    for (int64_t d0 = 0; d0 < 8; ++d0) {
+      for (int64_t d1 = 0; d1 < 4; ++d1) {
+        if (FloorModI(-1 + d0 + d1, 3) == 0) ++bf;
+      }
+    }
+    assert(card.has_value() && *card == bf);
+  }
+
+  // [A-P2.6] LowerBoxToSplitPredicates returns {} on singleton axis matching outer scope.
+  {
+    auto arena = std::make_shared<GuardDomainArena>();
+    auto li = MakeTestLoop("i", 0, 6, 1);
+    AxisId ai = arena->RegisterLoopFrame(SyncLoopFrame{li, 6, 0, 1, nullptr});
+    RadixBox b_single;
+    b_single.constraints.push_back(AxisConstraint{ai, AxisAP{2, 3, 1}});
+    auto g_single = RadixBoxGuard::FromBox(arena, b_single);
+    assert(LowerBoxToSplitPredicates(b_single, g_single, *arena, Span::unknown()).empty());
+  }
+
+  // [A-P2.8] OriginalBoundary handles negative-start loop directly without subtracting negative start.
+  {
+    auto arena = std::make_shared<GuardDomainArena>();
+    auto lneg = MakeTestLoop("neg", -4, 4, 2);  // values: -4, -2, 0, 2 (digits 0..3)
+    AxisId an = arena->RegisterLoopFrame(SyncLoopFrame{lneg, 4, -4, 2, nullptr});
+    RadixBox bx;
+    bx.constraints.push_back(AxisConstraint{an, *AxisAP::MakeCanonical(1, 4, 1, 4)});  // d >= 1 <=> neg >= -2
+    auto g = RadixBoxGuard::FromBox(arena, bx);
+    ExprPtr lowered = LowerRadixGuardToExpr(g, RadixBoxGuard::True(), Span::unknown());
+    assert(lowered != nullptr);
+    for (int64_t d = 0; d < 4; ++d) {
+      std::map<const Var*, int64_t> env{{lneg->loop_var_.get(), -4 + d * 2}};
+      assert(EvalBoolExpr(lowered, env) == (d >= 1));
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -757,5 +920,6 @@ int main() {
   TestNormalizeNodesLatentBugAndNonAdjacent();
   TestScheduleCasesAndHashing();
   TestLaunchBlockCommutationFence();
+  TestRefactorAAuditFixes();
   return 0;
 }

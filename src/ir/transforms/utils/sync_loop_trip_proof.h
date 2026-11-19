@@ -65,8 +65,6 @@ class SyncControlRangeProver {
   bool IsPositiveTrip(const ForStmt* loop) const;
   // True iff `loop` is proved to execute <= 1 iteration on every entry (0 or 1 trip).
   bool IsAtMostOneTrip(const ForStmt* loop) const;
-  // Exact constant trip count if proved.
-  std::optional<int64_t> ExactTripCount(const ForStmt* loop) const;
 
   // Matches `loop` directly or, when `loop` is a realization clone, an original
   // ForStmt with identical loop_var_ and structurally equal bounds.
@@ -75,7 +73,6 @@ class SyncControlRangeProver {
   // Query bounds + affine decomposition of `expr` under the dominating constraints
   // at `cut` (or function-level bounds if `cut == nullptr`).
   std::optional<SymbolicIntRange> LookupAtCut(const Stmt* cut, const ExprPtr& expr) const;
-  std::optional<SymbolicIntRange> BoundScalar(const ExprPtr& expr) const;
 
  private:
   class Impl;

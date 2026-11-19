@@ -100,7 +100,6 @@ struct AxisConstraint {
 class ResidueMask {
  public:
   explicit ResidueMask(int64_t modulus = 1, uint64_t bits = 0);
-  int64_t Modulus() const { return modulus_; }
   bool Empty() const;
   bool Full() const;
   size_t PopCount() const;
@@ -311,8 +310,8 @@ using CutInventory = std::map<const Call*, std::shared_ptr<PhysicalCuts>>;
 
 bool SameControl(const IRNodePtr& left, const IRNodePtr& right);
 bool SameControl(const ControlPtr& left, const ControlPtr& right);
-bool CommandValueCandidate(const ExprPtr& expression);
-bool PureCommandExpression(const ExprPtr& expression, size_t* inspections);
+std::optional<int64_t> OriginalLoopBoundary(const ForStmtPtr& loop, int64_t start, int64_t step,
+                                            int64_t count, const ExprPtr& start_expr, int64_t digit);
 ControlPtr ControlSequence(ControlForest body, const Span& span, PhysicalSyncRealization& work);
 ControlPtr ControlBranch(RadixBoxGuard guard, ControlPtr body, std::optional<ControlPtr> alternative,
                          const Span& span, PhysicalSyncRealization& work);
@@ -329,7 +328,6 @@ ControlForest ShareCommandGuards(const ControlForest& commands, PhysicalSyncReal
 void AppendCase(std::vector<CaseCommands>& cases, std::pair<int64_t, int64_t> blocks,
                 const ControlForest& commands, const Span& span, PhysicalSyncRealization& work);
 Intervals SubtractIntervals(const Intervals& domain, const Intervals& absent);
-bool DomainIntersects(const Intervals& domain, int64_t lo, int64_t hi);
 ControlForest ScheduleCommandCases(const ExprPtr& block, const Intervals& possible,
                                    const std::vector<CaseCommands>& source, PhysicalSyncRealization& work,
                                    const Span& span, const std::set<const Var*>& uniform_variables,
@@ -343,11 +341,8 @@ struct CaseCodeSize {
   void Visit(const ControlPtr& node, const RadixBoxGuard& scope);
 };
 
-// Shared guard inspection helpers for scheduling and hashing.
-void VisitControlGuardExpressions(const RadixBoxGuard& guard, IRVisitor& visitor);
+// Shared guard hashing helper for scheduling.
 size_t HashRadixBoxGuard(const RadixBoxGuard& guard);
-std::vector<const Var*> GuardPredicateInputs(const RadixBoxGuard& guard, PhysicalSyncRealization& work,
-                                             bool& qualified);
 
 }  // namespace pypto::ir::sync::physical
 

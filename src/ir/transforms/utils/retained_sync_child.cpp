@@ -32,6 +32,7 @@
 #include "pypto/ir/sync.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/parent_stmt_analysis.h"
 #include "pypto/ir/transforms/utils/signature_symbols.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
@@ -39,7 +40,9 @@
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/conservative_sync_dataflow.h"
 #include "src/ir/transforms/utils/numerical_sync_merge.h"
+#include "src/ir/transforms/utils/sync_footprint_resolver.h"
 #include "src/ir/transforms/utils/sync_scalar_readiness.h"
+#include "src/ir/transforms/utils/sync_transform_common.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -754,34 +757,9 @@ void FinalizeEventfulSyncChild(const FunctionPtr& owner, const ForStmtPtr& scope
     recipe.push_back(marked);
     auto logical_recipe = std::make_shared<SeqStmts>(recipe, scope->span_);
     std::set<SyncDirection> rearm_dirs;
-    class CollectRearms : public IRVisitor {
-     public:
-      explicit CollectRearms(std::set<SyncDirection>& out) : out_(out) {}
-
-     protected:
-      void VisitExpr(const ExprPtr& expression) override {
-        if (expression && seen_.insert(expression.get()).second) IRVisitor::VisitExpr(expression);
-      }
-      void VisitExpr_(const CallPtr& call) override {
-        if (IsOp(call, "sync.wait") && !call->args_.empty()) {
-          if (const auto tok = As<SyncTokenType>(call->args_[0]->GetType())) {
-            for (const auto& [name, value] : call->kwargs_) {
-              if (name == "dst_pipe") {
-                const auto dst = static_cast<PipeType>(AnyCast<int>(value, name));
-                if (tok->pipe_ != dst) out_.emplace(dst, tok->pipe_);
-                break;
-              }
-            }
-          }
-        }
-        IRVisitor::VisitExpr_(call);
-      }
-
-     private:
-      std::set<SyncDirection>& out_;
-      std::unordered_set<const Expr*> seen_;
-    } collector(rearm_dirs);
-    collector.VisitStmt(logical_recipe);
+    for (const auto& [src, dst] : CollectSyncWaitDirections(logical_recipe)) {
+      rearm_dirs.emplace(dst, src);
+    }
     for (const auto& [dir, ids] : SyncNativeClaims(mathematics.State().input, target)) {
       (void)ids;
       if (dir.first != dir.second) rearm_dirs.emplace(dir.second, dir.first);
@@ -883,7 +861,9 @@ struct SlicePrescreenSummary {
 std::optional<InlineExactSubBlock> TryPrepareInlineExactSubBlock(
     const FunctionPtr& owner, const SeqStmtsPtr& seq, size_t win_a, size_t win_b, const std::string& target,
     const SyncRegionBindings& bindings, const SyncParameterBounds& parameters,
-    const std::optional<std::pair<int64_t, int64_t>>& blocks, bool disjoint_gm) {
+    const std::optional<std::pair<int64_t, int64_t>>& blocks, bool disjoint_gm,
+    const std::function<const SyncFootprintResolver&()>& ensure_resolver,
+    std::map<SyncDirection, size_t>* scope_dir_peak) {
   try {
     const auto policy = HasReadonlyExternalSyncEffectsInSlice(seq, win_a, win_b, owner->func_type_, target,
                                                               nullptr, disjoint_gm)
@@ -932,80 +912,225 @@ std::optional<InlineExactSubBlock> TryPrepareInlineExactSubBlock(
     }
 
     // Keep intra-body (distance == 0) demands; unit-trip segment (`count == 1`) skips `distance >= 1`.
-    std::vector<DemandFamily> active_demands;
+    // Compute Exact's latest producer statement `u_exact_max` per `(v_stmt, pipe_u)`.
+    struct ExactFrontier {
+      size_t u_stmt = 0;
+      PipeType pipe_v = PipeType::ALL;
+    };
+    std::map<std::pair<size_t, PipeType>, ExactFrontier> exact_max;
     for (const auto& demand : cseg.demands) {
-      if (demand.distance == 0) active_demands.push_back(demand);
+      if (demand.distance != 0) continue;
+      if (demand.source >= demand.target || demand.target >= seg.sites.size()) return std::nullopt;
+      const size_t u_stmt = site_to_stmt[demand.source];
+      const size_t v_stmt = site_to_stmt[demand.target];
+      if (u_stmt >= v_stmt) return std::nullopt;
+      const PipeType pipe_u = seg.sites[demand.source].pipe;
+      const PipeType pipe_v = seg.sites[demand.target].pipe;
+      auto [it, ins] = exact_max.emplace(std::make_pair(v_stmt, pipe_u), ExactFrontier{u_stmt, pipe_v});
+      if (!ins && u_stmt > it->second.u_stmt) {
+        it->second.u_stmt = u_stmt;
+        it->second.pipe_v = pipe_v;
+      }
     }
-    std::sort(active_demands.begin(), active_demands.end(), [](const auto& a, const auto& b) {
-      if (a.target != b.target) return a.target < b.target;
-      return a.source < b.source;
-    });
 
-    // Profitability gate: accept iff Exact has >= 1 internal demand OR Conservative would
-    // hit >= 1 intra-slice write hazard (shared storage / overlapping physical window).
-    const size_t record_sites = active_demands.size();
-    if (record_sites == 0) {
-      auto conservative_conflict = [&]() -> bool {
-        const auto& storages = input.storage;
-        auto access_overlaps = [&](const SyncAccess& a, const SyncAccess& b) {
-          if (!a.write && !b.write) return false;
-          if (a.storage == b.storage) return true;
-          if (a.storage >= storages.size() || b.storage >= storages.size()) return true;
-          const auto& sa = storages[a.storage];
-          const auto& sb = storages[b.storage];
-          if (sa.space != sb.space) return false;
-          if (sa.space == MemorySpace::DDR) return !disjoint_gm;
-          if (sa.bytes <= 0 || sb.bytes <= 0) return true;
-          const __int128 a_end = __int128(sa.address) + sa.bytes;
-          const __int128 b_end = __int128(sb.address) + sb.bytes;
-          return __int128(sa.address) < b_end && __int128(sb.address) < a_end;
-        };
-        for (size_t i = 0; i < seg.sites.size(); ++i) {
-          for (size_t j = i + 1; j < seg.sites.size(); ++j) {
-            for (const auto& aa : seg.sites[i].accesses) {
-              for (const auto& ab : seg.sites[j].accesses) {
-                if (access_overlaps(aa, ab)) return true;
-              }
+    // Sharpening profitability gate [R3]: compare Exact against parent `SyncFootprintResolver`.
+    // Accept iff there is at least one `(v_stmt, pipe_u)` where Conservative has an un-killed hazard
+    // at a strictly later `u_stmt` than `exact_max(v_stmt, pipe_u)` (or where `exact_max` has none).
+    const SyncFootprintResolver& resolver = ensure_resolver();
+    struct SiteAccess {
+      ResolvedOperandFootprint fp;
+      bool implicit = false;
+    };
+    std::vector<PipeType> site_pipes(seg.sites.size());
+    std::vector<std::vector<SiteAccess>> site_accesses(seg.sites.size());
+    for (size_t s = 0; s < seg.sites.size(); ++s) {
+      const CallPtr& call = seg.sites[s].original;
+      const Stmt* cut = seq->stmts_[win_a + site_to_stmt[s]].get();
+      const auto op = backend::QualifyBufferSyncOperation(call, owner->func_type_, target);
+      site_pipes[s] = op.Implementation().Pipe();
+      for (size_t arg_idx = 0; arg_idx < op.ArgumentEffects().size(); ++arg_idx) {
+        const auto mode = op.ArgumentEffects()[arg_idx].data;
+        if (mode == BufferAccess::None) continue;
+        const auto arg_type = call->args_[arg_idx]->GetType();
+        MemorySpace space = MemorySpace::DDR;
+        if (const auto buf = As<BufferType>(arg_type)) space = buf->memory_space_;
+        site_accesses[s].push_back({resolver.ResolveOperand(cut, call, arg_idx, mode, space,
+                                                            /*enable_refresh_kill=*/true, disjoint_gm),
+                                    false});
+      }
+      for (const auto& eff : op.Implementation().ImplicitEffects()) {
+        ResolvedOperandFootprint fp;
+        fp.space = eff.space;
+        fp.read = (eff.data == BufferAccess::Read || eff.data == BufferAccess::ReadWrite);
+        fp.write = (eff.data == BufferAccess::Write || eff.data == BufferAccess::ReadWrite);
+        site_accesses[s].push_back({std::move(fp), true});
+      }
+    }
+
+    auto access_conflicts = [&](const SiteAccess& sa, const SiteAccess& sb) -> bool {
+      const auto& a = sa.fp;
+      const auto& b = sb.fp;
+      if (!a.write && !b.write) return false;
+      if (a.space != b.space) return false;
+      if (a.space == MemorySpace::DDR) {
+        if (disjoint_gm && a.gm_root && b.gm_root) return a.gm_root.get() == b.gm_root.get();
+        return true;
+      }
+      if (sa.implicit || sb.implicit || !a.byte_hull || !b.byte_hull) return true;
+      if (__int128(a.byte_hull->begin) >= __int128(b.byte_hull->end) ||
+          __int128(b.byte_hull->begin) >= __int128(a.byte_hull->end)) {
+        return false;
+      }
+      if (a.space == MemorySpace::Vec && a.vec_lattice && b.vec_lattice &&
+          !StridedByteFootprint::MayOverlap(*a.vec_lattice, *b.vec_lattice)) {
+        return false;
+      }
+      if (a.space != MemorySpace::Vec && a.matrix_box && b.matrix_box &&
+          !MatrixBoxFootprint::MayOverlap(*a.matrix_box, *b.matrix_box, resolver.Roots())) {
+        return false;
+      }
+      if (a.fiber.kind == IterationFiber::Kind::ModularSlot &&
+          b.fiber.kind == IterationFiber::Kind::ModularSlot && a.fiber.frame == b.fiber.frame &&
+          a.fiber.modulus > 0 && a.fiber.modulus == b.fiber.modulus && a.fiber.coeff == b.fiber.coeff &&
+          a.fiber.offset != b.fiber.offset) {
+        return false;
+      }
+      if (a.fiber.kind == IterationFiber::Kind::AffineSlice &&
+          b.fiber.kind == IterationFiber::Kind::AffineSlice && a.fiber.frame == b.fiber.frame &&
+          a.fiber.slice_axis == b.fiber.slice_axis && a.fiber.coeff == b.fiber.coeff) {
+        bool same_sym = (!a.fiber.symbolic_base && !b.fiber.symbolic_base);
+        if (!same_sym && a.fiber.symbolic_base && b.fiber.symbolic_base) {
+          if (a.fiber.symbolic_base.get() == b.fiber.symbolic_base.get()) {
+            same_sym = true;
+          } else {
+            try {
+              same_sym = structural_equal(a.fiber.symbolic_base, b.fiber.symbolic_base, false);
+            } catch (const StructuralComparisonUnsupported&) {
+              same_sym = false;
             }
           }
         }
-        return false;
-      };
-      if (!conservative_conflict()) return std::nullopt;
-    }
+        if (same_sym) {
+          const __int128 a_end = __int128(a.fiber.offset) + a.fiber.extent;
+          const __int128 b_end = __int128(b.fiber.offset) + b.fiber.extent;
+          if (a_end <= b.fiber.offset || b_end <= a.fiber.offset) return false;
+        }
+      }
+      return true;
+    };
 
-    // Splice 1-to-1 zero-fanout logical tokens directly from `active_demands`.
+    auto killed_between = [&](size_t i, size_t j, const SiteAccess& sa) -> bool {
+      if (sa.implicit || sa.fp.space == MemorySpace::DDR || sa.fp.root_id == 0 || !sa.fp.byte_hull) {
+        return false;
+      }
+      for (size_t k = i + 1; k < j; ++k) {
+        for (const auto& sk : site_accesses[k]) {
+          if (sk.implicit || !sk.fp.candidate_full_overwrite || !sk.fp.write || sk.fp.read) continue;
+          if (sk.fp.space != sa.fp.space || sk.fp.root_id != sa.fp.root_id || !sk.fp.byte_hull) continue;
+          if (sk.fp.byte_hull->begin <= sa.fp.byte_hull->begin &&
+              sk.fp.byte_hull->end >= sa.fp.byte_hull->end && access_conflicts(sa, sk)) {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
+    bool sharpens = false;
+    for (size_t j = 1; j < seg.sites.size() && !sharpens; ++j) {
+      const size_t vj = site_to_stmt[j];
+      for (size_t i = 0; i < j && !sharpens; ++i) {
+        const size_t ui = site_to_stmt[i];
+        if (ui >= vj) continue;
+        const auto ex_it = exact_max.find({vj, site_pipes[i]});
+        if (ex_it != exact_max.end() && ui <= ex_it->second.u_stmt) continue;
+        for (const auto& sa : site_accesses[i]) {
+          bool pair_conflicts = false;
+          for (const auto& sb : site_accesses[j]) {
+            if (access_conflicts(sa, sb)) {
+              pair_conflicts = true;
+              break;
+            }
+          }
+          if (pair_conflicts && !killed_between(i, j, sa)) {
+            sharpens = true;
+            break;
+          }
+        }
+      }
+    }
+    if (!sharpens) return std::nullopt;
+
+    // Coalesce per `(v_stmt, pipe_u)` to `u_max`, then drop transitively dominated `(u, v)`
+    // along the same `(pipe_u, pipe_v)` lane pair using hardware FIFO ordering on both pipes.
+    std::map<SyncDirection, std::vector<std::pair<size_t, size_t>>> by_dir;
+    for (const auto& [vp, front] : exact_max) {
+      by_dir[{vp.second, front.pipe_v}].emplace_back(vp.first, front.u_stmt);
+    }
+    struct CoalescedEdge {
+      PipeType pipe_u;
+      size_t u_stmt;
+      PipeType pipe_v;
+      size_t v_stmt;
+    };
+    std::vector<CoalescedEdge> kept_edges;
+    for (auto& [dir, edges] : by_dir) {
+      std::sort(edges.begin(), edges.end(), [](const auto& a, const auto& b) {
+        return a.first != b.first ? a.first < b.first : a.second > b.second;
+      });
+      ssize_t max_u_waited = -1;
+      for (const auto& [v_stmt, u_stmt] : edges) {
+        if (max_u_waited >= 0 && static_cast<size_t>(max_u_waited) >= u_stmt) continue;
+        kept_edges.push_back({dir.first, u_stmt, dir.second, v_stmt});
+        if (dir.first == dir.second) {
+          max_u_waited = std::max<ssize_t>(max_u_waited, static_cast<ssize_t>(v_stmt) - 1);
+        } else {
+          max_u_waited = std::max<ssize_t>(max_u_waited, static_cast<ssize_t>(u_stmt));
+        }
+      }
+    }
+    std::sort(kept_edges.begin(), kept_edges.end(), [](const CoalescedEdge& a, const CoalescedEdge& b) {
+      return std::tie(a.v_stmt, a.u_stmt, a.pipe_u, a.pipe_v) <
+             std::tie(b.v_stmt, b.u_stmt, b.pipe_u, b.pipe_v);
+    });
+
+    // Splice reduced 1-to-1 zero-fanout logical tokens and check peak cross-pipe budget (<= 4 / dir).
     const size_t len = win_b - win_a;
     std::vector<std::vector<StmtPtr>> pre_stmts(len), post_stmts(len);
-    std::set<std::pair<size_t, PipeType>> seen_same_pipe_bar;
+    std::vector<std::vector<SyncDirection>> pre_cross_dirs(len), post_cross_dirs(len);
     size_t tok_idx = 0;
-    for (const auto& demand : active_demands) {
-      if (demand.source >= demand.target || demand.target >= seg.sites.size()) {
-        return std::nullopt;
-      }
-      const PipeType pipe_u = seg.sites[demand.source].pipe;
-      const PipeType pipe_v = seg.sites[demand.target].pipe;
-      const size_t u_stmt = site_to_stmt[demand.source];
-      const size_t v_stmt = site_to_stmt[demand.target];
-      if (pipe_u == pipe_v && !seen_same_pipe_bar.emplace(v_stmt, pipe_v).second) {
-        continue;
-      }
-      auto rec_call =
-          OpRegistry::GetInstance().Create("sync.record", {}, {{"pipe", static_cast<int>(pipe_u)}}, span);
+    for (const auto& edge : kept_edges) {
+      auto rec_call = OpRegistry::GetInstance().Create("sync.record", {},
+                                                       {{"pipe", static_cast<int>(edge.pipe_u)}}, span);
       auto tok =
           std::make_shared<Var>("_sync_tok_sub_" + std::to_string(tok_idx++), rec_call->GetType(), span);
       auto wait_call = OpRegistry::GetInstance().Create("sync.wait", {tok},
-                                                        {{"dst_pipe", static_cast<int>(pipe_v)}}, span);
+                                                        {{"dst_pipe", static_cast<int>(edge.pipe_v)}}, span);
       auto rec_stmt = std::make_shared<AssignStmt>(tok, rec_call, span);
       auto wait_stmt = std::make_shared<EvalStmt>(wait_call, span);
-      if (pipe_u == pipe_v) {
-        // Adjacent same-pipe pair immediately before consumer stmt `v_stmt`.
-        pre_stmts[v_stmt].push_back(std::move(rec_stmt));
-        pre_stmts[v_stmt].push_back(std::move(wait_stmt));
+      if (edge.pipe_u == edge.pipe_v) {
+        pre_stmts[edge.v_stmt].push_back(std::move(rec_stmt));
+        pre_stmts[edge.v_stmt].push_back(std::move(wait_stmt));
       } else {
-        post_stmts[u_stmt].push_back(std::move(rec_stmt));
-        pre_stmts[v_stmt].push_back(std::move(wait_stmt));
+        post_stmts[edge.u_stmt].push_back(std::move(rec_stmt));
+        pre_stmts[edge.v_stmt].push_back(std::move(wait_stmt));
+        post_cross_dirs[edge.u_stmt].emplace_back(edge.pipe_u, edge.pipe_v);
+        pre_cross_dirs[edge.v_stmt].emplace_back(edge.pipe_u, edge.pipe_v);
       }
+    }
+
+    constexpr size_t kMaxInlineCrossPipeTokensPerDir = 4;
+    std::map<SyncDirection, size_t> open_dir, subblock_peak;
+    for (size_t i = 0; i < len; ++i) {
+      for (const auto& dir : pre_cross_dirs[i]) --open_dir[dir];
+      for (const auto& dir : post_cross_dirs[i]) {
+        const size_t cur = ++open_dir[dir];
+        subblock_peak[dir] = std::max(subblock_peak[dir], cur);
+      }
+    }
+    for (const auto& [dir, pk] : subblock_peak) {
+      const size_t used = (scope_dir_peak && scope_dir_peak->count(dir)) ? scope_dir_peak->at(dir) : 0;
+      if (used + pk > kMaxInlineCrossPipeTokensPerDir) return std::nullopt;
     }
 
     std::vector<StmtPtr> spliced;
@@ -1018,6 +1143,9 @@ std::optional<InlineExactSubBlock> TryPrepareInlineExactSubBlock(
     auto spliced_seq = std::make_shared<SeqStmts>(std::move(spliced), span);
     const CompletionSummary completion =
         SummarizeStraightLineLogicalCompletion(spliced_seq, owner->func_type_, target);
+    if (scope_dir_peak) {
+      for (const auto& [dir, pk] : subblock_peak) (*scope_dir_peak)[dir] += pk;
+    }
     return InlineExactSubBlock{seq, win_a, win_b, mathematics, spliced_seq, tok_idx, tok_idx, completion};
   } catch (const pypto::ValueError&) {
     return std::nullopt;
@@ -1180,13 +1308,24 @@ AutomaticSyncChildren PrepareAutomaticSyncChildren(const FunctionPtr& owner, con
     return *bindings;
   };
 
+  std::optional<SyncFootprintResolver> resolver;
+  auto ensure_resolver = [&]() -> const SyncFootprintResolver& {
+    if (!resolver) {
+      resolver.emplace(owner, &ensure_bindings().Prover(), /*run_scalar_layout_check=*/false, target);
+    }
+    return *resolver;
+  };
+  std::unordered_map<const Stmt*, std::map<SyncDirection, size_t>> scope_dir_peaks;
+
   auto has_var_use_after = [](const SeqStmtsPtr& seq, size_t win_b, const VarPtr& var) {
     var_collectors::VarDefUseCollector collector;
     for (size_t i = win_b; i < seq->stmts_.size(); ++i) collector.VisitStmt(seq->stmts_[i]);
     return collector.var_uses.count(var.get()) != 0;
   };
 
-  std::function<void(const StmtPtr&, bool)> discover = [&](const StmtPtr& statement, bool inside_unpromoted) {
+  std::function<void(const StmtPtr&, bool, const Stmt*)> discover = [&](const StmtPtr& statement,
+                                                                        bool inside_unpromoted,
+                                                                        const Stmt* scope_key) {
     if (!statement) return;
     ++result.discovery_nodes;
     if (const auto seq = As<SeqStmts>(statement)) {
@@ -1221,7 +1360,7 @@ AutomaticSyncChildren PrepareAutomaticSyncChildren(const FunctionPtr& owner, con
             if (promoted) return;
           }
         }
-        discover(loop->body_, true);
+        discover(loop->body_, true, loop.get());
       };
 
       auto process_clean_slice = [&](auto& self, size_t a, size_t b) -> void {
@@ -1305,8 +1444,9 @@ AutomaticSyncChildren PrepareAutomaticSyncChildren(const FunctionPtr& owner, con
 
         // Pure straight-line slice: Class B (`InlineExactSubBlock`).
         if (num_payloads >= 2) {
-          if (auto inline_block = TryPrepareInlineExactSubBlock(owner, seq, a, b, target, ensure_bindings(),
-                                                                parameters, blocks, disjoint_gm)) {
+          if (auto inline_block = TryPrepareInlineExactSubBlock(
+                  owner, seq, a, b, target, ensure_bindings(), parameters, blocks, disjoint_gm,
+                  ensure_resolver, &scope_dir_peaks[scope_key])) {
             result.inline_subblocks.push_back(std::move(*inline_block));
           }
         }
@@ -1321,13 +1461,13 @@ AutomaticSyncChildren PrepareAutomaticSyncChildren(const FunctionPtr& owner, con
           process_clean_slice(process_clean_slice, idx, end);
           idx = end;
         } else {
-          discover(seq->stmts_[idx], inside_unpromoted);
+          discover(seq->stmts_[idx], inside_unpromoted, scope_key);
           ++idx;
         }
       }
     } else if (const auto branch = As<IfStmt>(statement)) {
-      discover(branch->then_body_, true);
-      if (branch->else_body_) discover(*branch->else_body_, true);
+      discover(branch->then_body_, true, scope_key);
+      if (branch->else_body_) discover(*branch->else_body_, true, scope_key);
     } else if (const auto loop = As<ForStmt>(statement)) {
       if (loop->kind_ == ForKind::Sequential) {
         const auto it = stmt_summaries.find(loop.get());
@@ -1348,12 +1488,12 @@ AutomaticSyncChildren PrepareAutomaticSyncChildren(const FunctionPtr& owner, con
           }
         }
       }
-      discover(loop->body_, true);
+      discover(loop->body_, true, loop.get());
     } else if (const auto loop = As<WhileStmt>(statement)) {
-      discover(loop->body_, true);
+      discover(loop->body_, true, loop.get());
     }
   };
-  discover(owner->body_, false);
+  discover(owner->body_, false, owner->body_.get());
   return result;
 }
 
@@ -1388,8 +1528,7 @@ bool IsProvablyNonNegativeExpr(const ExprPtr& expr, const std::unordered_map<con
     return ok;
   }
   if (const auto call = As<Call>(expr)) {
-    return IsOp(call, "buffer.get_block_idx") || IsOp(call, "buffer.get_block_num") ||
-           IsOp(call, "buffer.get_subblock_idx");
+    return IsPureBlockQueryCall(call);
   }
   if (const auto add = As<Add>(expr)) {
     return IsProvablyNonNegativeExpr(add->left_, ssa_defs, visiting) &&

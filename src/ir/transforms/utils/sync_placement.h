@@ -21,6 +21,7 @@
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
+#include "src/ir/transforms/utils/sync_transform_common.h"
 
 namespace pypto::ir::sync {
 using SyncSiteKey = std::pair<size_t, size_t>;
@@ -75,19 +76,15 @@ class SyncPlacement : public IRMutator {
     return Wrap(op, it->second);
   }
   StmtPtr VisitStmt_(const IfStmtPtr& op) override {
-    if (const auto resolved = input_.static_branches.find(op.get()); resolved != input_.static_branches.end()) {
+    if (const auto resolved = input_.static_branches.find(op.get());
+        resolved != input_.static_branches.end()) {
       if (resolved->second) return VisitStmt(op->then_body_);
       if (op->else_body_) return VisitStmt(*op->else_body_);
       return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, op->span_);
     }
-    StmtPtr first = op->then_body_;
-    if (auto seq = As<SeqStmts>(first)) {
-      INTERNAL_CHECK(seq->stmts_.size() == 1) << "Changed admitted initialization branch";
-      first = seq->stmts_.front();
-    }
-    auto eval = As<EvalStmt>(first);
-    INTERNAL_CHECK(eval) << "Missing initialization payload";
-    auto call = As<Call>(eval->expr_);
+    auto call = FindSiteCallInStmt(op->then_body_, anchors_);
+    if (!call && op->else_body_) call = FindSiteCallInStmt(*op->else_body_, anchors_);
+    INTERNAL_CHECK(call) << "Missing initialization payload";
     auto it = anchors_.find(call.get());
     INTERNAL_CHECK(it != anchors_.end() && Payload(it->second).continuation) << "Unqualified original branch";
     return Wrap(op, it->second);

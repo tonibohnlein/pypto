@@ -33,6 +33,7 @@
 #include "src/ir/transforms/utils/sync_invocation_domains.h"
 #include "src/ir/transforms/utils/sync_placement.h"
 #include "src/ir/transforms/utils/sync_token_names.h"
+#include "src/ir/transforms/utils/sync_transform_common.h"
 
 namespace pypto::ir::sync {
 namespace physical {
@@ -588,16 +589,9 @@ class AssignedCommandLowering {
   std::map<const SyncEndpointDomain*, ScopedDomainEntry> scoped_domains_;
 
   static bool FitsOriginalBoundary(const SyncLoopFrame& frame, int64_t digit) {
-    const auto start = As<ConstInt>(frame.loop->start_), step = As<ConstInt>(frame.loop->step_);
-    if (!start || !step || frame.start_expression || frame.step <= 0 || frame.count <= 0 ||
-        start->value_ != frame.start || step->value_ != frame.step || digit < 0 || digit >= frame.count)
-      return false;
-    const auto extent = __int128(frame.count - 1) * frame.step;
-    const auto last = __int128(frame.start) + extent;
-    const auto bound = __int128(frame.start) + __int128(digit) * frame.step;
-    return extent <= std::numeric_limits<int64_t>::max() && last <= std::numeric_limits<int64_t>::max() &&
-           last >= std::numeric_limits<int64_t>::min() && bound <= std::numeric_limits<int64_t>::max() &&
-           bound >= std::numeric_limits<int64_t>::min();
+    return OriginalLoopBoundary(frame.loop, frame.start, frame.step, frame.count, frame.start_expression,
+                                digit)
+        .has_value();
   }
 
   ScopedDomainEntry ResolveScopedDomain(const SyncEndpointDomain& domain) {
@@ -830,11 +824,11 @@ class AssignedCommandLowering {
           INTERNAL_CHECK(static_cast<__int128>(modulus) * (modulus - 1) <=
                          std::numeric_limits<int64_t>::max())
               << "Directional palette is too large for bounded modular INDEX arithmetic";
-          template_rc.base = ((endpoint.rank->rank_base % modulus) + modulus) % modulus;
+          template_rc.base = PositiveMod64(endpoint.rank->rank_base, modulus);
           const auto& src_digits = endpoint.rank->source;
           const auto& digits = publish ? endpoint.rank->source : endpoint.rank->target;
           for (size_t i = 0; i < endpoint.rank->rank_coefficients.size(); ++i) {
-            const int64_t coefficient = ((endpoint.rank->rank_coefficients[i] % modulus) + modulus) % modulus;
+            const int64_t coefficient = PositiveMod64(endpoint.rank->rank_coefficients[i], modulus);
             INTERNAL_CHECK(i < src_digits.size()) << "Rank coefficient out of source bounds";
             if (!coefficient || src_digits[i].count == 1) continue;
             INTERNAL_CHECK(i < digits.size() && i < endpoint.domain->frame->loops.size() &&
@@ -844,7 +838,7 @@ class AssignedCommandLowering {
                 RankTerm{region_axes[i], digits[i].first, digits[i].step, coefficient});
           }
         } else {
-          template_rc.base = (((-first) % modulus) + modulus) % modulus;
+          template_rc.base = PositiveMod64(-first, modulus);
           const auto& seg = input_.segments[r];
           if (seg.nested_frames.empty()) {
             if (seg.original_loop) template_rc.terms.push_back(RankTerm{region_axes[0], 0, 1, 1 % modulus});
@@ -928,8 +922,11 @@ CutInventory LowerScheduleCuts(const AssignedRegionSchedule& schedule, const Cut
     AssignedCommandLowering(schedule, c, work, phase)
         .AppendCuts(cuts, schedule.cases[c].input->block_bounds.value_or(blocks), selected[c]);
   std::set<const PhysicalCuts*> seen;
-  for (const auto& [anchor, cut] : cuts) {
-    if (!seen.insert(cut.get()).second) continue;
+  for (const auto& sc : schedule.cuts) {
+    const Call* anchor = sc.original.get();
+    const auto it = cuts.find(anchor);
+    if (it == cuts.end() || !seen.insert(it->second.get()).second) continue;
+    const auto& cut = it->second;
     const auto& facts = *domains.at(anchor);
     INTERNAL_CHECK(facts.predicate_scope && facts.predicate_scope->owner == schedule.owner)
         << "Missing original-cut predicate qualification";
@@ -1317,7 +1314,8 @@ class InvocationCasePartition {
 };
 std::vector<InvocationScheduleGroup> GroupInvocationSchedules(
     const std::vector<PreparedSchedulePhase>& phases, const ExprPtr& block,
-    const std::vector<std::pair<int64_t, int64_t>>& domains, PhysicalSyncRealization& work) {
+    const std::vector<std::pair<int64_t, int64_t>>& domains, PhysicalSyncRealization& work,
+    const std::vector<const Call*>& anchor_order) {
   if (domains.size() < 2) return {};
   if (!block) return {};
   std::vector<std::vector<ControlPtr>> signatures(domains.size());
@@ -1325,8 +1323,8 @@ std::vector<InvocationScheduleGroup> GroupInvocationSchedules(
   for (const auto& phase : phases)
     for (const auto& inventory : phase.visits) {
       std::set<const PhysicalCuts*> seen;
-      for (const auto& [anchor, cut] : inventory) {
-        if (!seen.insert(cut.get()).second) continue;
+      auto append_cut = [&](const std::shared_ptr<PhysicalCuts>& cut) {
+        if (!seen.insert(cut.get()).second) return;
         for (size_t c = 0; c < domains.size(); ++c) {
           const auto domain = domains[c];
           const auto before_leaf = CaseLeaf(cut->before_cases, domain);
@@ -1334,7 +1332,13 @@ std::vector<InvocationScheduleGroup> GroupInvocationSchedules(
           signatures[c].push_back(before_leaf);
           signatures[c].push_back(after_leaf);
         }
+      };
+      if (!anchor_order.empty()) {
+        for (const Call* anchor : anchor_order) {
+          if (const auto it = inventory.find(anchor); it != inventory.end()) append_cut(it->second);
+        }
       }
+      for (const auto& [anchor, cut] : inventory) append_cut(cut);
     }
   std::vector<InvocationScheduleGroup> groups;
   std::map<size_t, std::vector<size_t>> buckets;
@@ -1863,61 +1867,68 @@ class ScheduleCostModel {
     }
     Intervals yes;
     const auto condition = Evaluate(command.condition_expr);
+    const bool is_split_wrapper =
+        command.body && command.body->commands.size() == 1 && command.body->commands[0].original == node;
     if (condition && condition->lo == condition->hi) {
       if (condition->lo) yes = active;
-    } else if (!node->guard.IsOpaque() && !node->guard.IsEmpty() && !node->guard.IsTautology() &&
-               node->guard.Arena() && partition_) {
-      const auto& arena = node->guard.Arena();
-      std::optional<AxisId> loop_ax;
-      for (AxisId ax : ReferencedAxes(node->guard)) {
-        const auto& info = arena->Axis(ax);
-        if (info.kind == AxisKind::LoopFrame && info.loop == loop_.loop) {
-          loop_ax = ax;
-          break;
-        }
-      }
-      RadixBoxGuard specialized = node->guard;
-      if (loop_ax) {
-        const auto phase_ap = AxisAP::MakeCanonical(first_, last_ + 1, stride_, arena->Axis(*loop_ax).count);
-        if (!phase_ap) {
-          profile.valid = false;
-          return;
-        }
-        specialized = RestrictGuardAxis(node->guard, *loop_ax, *phase_ap, arena);
-      }
-      bool only_block = true;
-      for (AxisId ax : ReferencedAxes(specialized)) {
-        if (arena->Axis(ax).kind != AxisKind::LaunchBlock) {
-          only_block = false;
-          break;
-        }
-      }
-      if (!only_block) {
-        profile.valid = false;
-        return;
-      }
-      if (specialized.IsTautology()) {
-        yes = active;
-      } else if (!specialized.IsEmpty()) {
-        const ExprPtr block_expr = LowerRadixGuardToExpr(specialized, RadixBoxGuard::True(), node->span);
-        const auto before = work_.invocation_schedule_visits;
-        const auto partition = partition_->Partition(block_expr);
-        work_.schedule_inspected_descriptors += work_.invocation_schedule_visits - before;
-        if (!partition) {
-          profile.valid = false;
-          return;
-        }
-        yes = InvocationCasePartition::Intersection(active, partition->yes);
-      }
     } else {
-      const auto before = work_.invocation_schedule_visits;
-      const auto partition = partition_ ? partition_->Partition(command.condition_expr) : std::nullopt;
-      work_.schedule_inspected_descriptors += work_.invocation_schedule_visits - before;
-      if (!partition) {
+      std::optional<InvocationCasePartition::Decision> direct_partition;
+      if (partition_) {
+        const auto before = work_.invocation_schedule_visits;
+        direct_partition = partition_->Partition(command.condition_expr);
+        work_.schedule_inspected_descriptors += work_.invocation_schedule_visits - before;
+      }
+      if (direct_partition) {
+        yes = InvocationCasePartition::Intersection(active, direct_partition->yes);
+      } else if (!is_split_wrapper && !node->guard.IsOpaque() && !node->guard.IsEmpty() &&
+                 !node->guard.IsTautology() && node->guard.Arena() && partition_) {
+        const auto& arena = node->guard.Arena();
+        std::optional<AxisId> loop_ax;
+        for (AxisId ax : ReferencedAxes(node->guard)) {
+          const auto& info = arena->Axis(ax);
+          if (info.kind == AxisKind::LoopFrame && info.loop == loop_.loop) {
+            loop_ax = ax;
+            break;
+          }
+        }
+        RadixBoxGuard specialized = node->guard;
+        if (loop_ax) {
+          const auto phase_ap =
+              AxisAP::MakeCanonical(first_, last_ + 1, stride_, arena->Axis(*loop_ax).count);
+          if (!phase_ap) {
+            profile.valid = false;
+            return;
+          }
+          specialized = RestrictGuardAxis(node->guard, *loop_ax, *phase_ap, arena);
+        }
+        bool only_block = true;
+        for (AxisId ax : ReferencedAxes(specialized)) {
+          if (arena->Axis(ax).kind != AxisKind::LaunchBlock) {
+            only_block = false;
+            break;
+          }
+        }
+        if (!only_block) {
+          profile.valid = false;
+          return;
+        }
+        if (specialized.IsTautology()) {
+          yes = active;
+        } else if (!specialized.IsEmpty()) {
+          const ExprPtr block_expr = LowerRadixGuardToExpr(specialized, RadixBoxGuard::True(), node->span);
+          const auto before = work_.invocation_schedule_visits;
+          const auto partition = partition_->Partition(block_expr);
+          work_.schedule_inspected_descriptors += work_.invocation_schedule_visits - before;
+          if (!partition) {
+            profile.valid = false;
+            return;
+          }
+          yes = InvocationCasePartition::Intersection(active, partition->yes);
+        }
+      } else {
         profile.valid = false;
         return;
       }
-      yes = InvocationCasePartition::Intersection(active, partition->yes);
     }
     ScheduleCost local;
     for (size_t i = 0; i < command.scalar_cost.size(); ++i) local.value[i] = weight * command.scalar_cost[i];
@@ -1975,7 +1986,11 @@ CandidateSchedule PrepareCandidate(const RegularLoopSchedule& loop, unsigned mod
   if (mode & 1) {
     std::vector<std::pair<int64_t, int64_t>> domains;
     for (const auto& item : assigned.cases) domains.push_back(*item.input->block_bounds);
-    candidate.plan.groups = GroupInvocationSchedules(phases, assigned.block, domains, candidate.work);
+    std::vector<const Call*> anchor_order;
+    anchor_order.reserve(assigned.cuts.size());
+    for (const auto& sc : assigned.cuts) anchor_order.push_back(sc.original.get());
+    candidate.plan.groups =
+        GroupInvocationSchedules(phases, assigned.block, domains, candidate.work, anchor_order);
   }
   const auto versions = std::max<size_t>(1, candidate.plan.groups.size());
   for (size_t v = 0; v < versions; ++v) {
