@@ -38,11 +38,13 @@
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/sync.h"
+#include "src/ir/transforms/utils/closed_prefix_sync.h"
 #include "src/ir/transforms/utils/conservative_sync_dataflow.h"
 #include "src/ir/transforms/utils/numerical_sync_merge.h"
 #include "src/ir/transforms/utils/sync_footprint_resolver.h"
 #include "src/ir/transforms/utils/sync_scalar_readiness.h"
 #include "src/ir/transforms/utils/sync_transform_common.h"
+#include "src/ir/transforms/utils/token_sync_lowering.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -656,12 +658,15 @@ SyncParameterBounds ProjectEnclosingLoopBounds(const SyncRegionContext& context,
 }
 
 struct RetainedSyncChildDetail {
-  static std::shared_ptr<const EventfulSyncChild> Make(
-      SyncRegionContext context, CompactSyncResult mathematics, StmtPtr logical_recipe, std::string target,
-      std::vector<SyncDirection> rearm_dirs, SeqStmtsPtr window_seq, size_t window_begin, size_t window_end) {
+  static std::shared_ptr<const EventfulSyncChild> Make(SyncRegionContext context,
+                                                       CompactSyncResult mathematics, StmtPtr logical_recipe,
+                                                       std::string target,
+                                                       std::vector<SyncDirection> resource_dirs,
+                                                       SeqStmtsPtr window_seq, size_t window_begin,
+                                                       size_t window_end) {
     return std::shared_ptr<const EventfulSyncChild>(new EventfulSyncChild(
         std::move(context), std::move(mathematics), std::move(logical_recipe), std::move(target),
-        std::move(rearm_dirs), std::move(window_seq), window_begin, window_end));
+        std::move(resource_dirs), std::move(window_seq), window_begin, window_end));
   }
 };
 namespace {
@@ -756,17 +761,24 @@ void FinalizeEventfulSyncChild(const FunctionPtr& owner, const ForStmtPtr& scope
     }
     recipe.push_back(marked);
     auto logical_recipe = std::make_shared<SeqStmts>(recipe, scope->span_);
-    std::set<SyncDirection> rearm_dirs;
-    for (const auto& [src, dst] : CollectSyncWaitDirections(logical_recipe)) {
-      rearm_dirs.emplace(dst, src);
-    }
+    // Parent insertion always uses the conservative-prefix policy. Plan the
+    // standalone, unmarked recipe after the same token optimization that runs
+    // before physical lowering, since removing a relay can change loop closure.
+    const auto optimized = OptimizeLogicalSync(logical_context.binding_owner);
+    const auto logical_bounds = ProjectSyncParameterBounds(context.binding_owner, optimized, child_bounds);
+    auto prefix_dirs = PlanClosedPrefixEventDirections(optimized, logical_bounds, blocks);
+    // Structured lowering assigns flags to the token waits' source and
+    // destination pipes. Its lane allocator only changes IDs within those pools.
+    auto resource_dirs = prefix_dirs ? std::move(*prefix_dirs) : CollectSyncWaitDirections(optimized->body_);
     for (const auto& [dir, ids] : SyncNativeClaims(mathematics.State().input, target)) {
       (void)ids;
-      if (dir.first != dir.second) rearm_dirs.emplace(dir.second, dir.first);
+      if (dir.first != dir.second) {
+        resource_dirs.insert(dir);
+      }
     }
     attempt.child =
         RetainedSyncChildDetail::Make(std::move(context), mathematics, logical_recipe, target,
-                                      std::vector<SyncDirection>(rearm_dirs.begin(), rearm_dirs.end()),
+                                      std::vector<SyncDirection>(resource_dirs.begin(), resource_dirs.end()),
                                       std::move(window_seq), window_begin, window_end);
     enter_phase(EventfulSyncChildStage::Ready);
   } catch (const pypto::ValueError& error) {

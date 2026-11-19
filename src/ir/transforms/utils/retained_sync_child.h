@@ -160,7 +160,9 @@ class EventfulSyncChild {
   size_t WindowEnd() const { return window_end_; }
   bool IsSubblock() const { return static_cast<bool>(window_seq_); }
   const StmtPtr& LogicalRecipe() const { return logical_recipe_; }
-  const std::vector<SyncDirection>& RearmDirections() const { return rearm_dirs_; }
+  // All directional event resources that the child's physical protocol may
+  // claim, including native payload reservations and synthesized ACKs.
+  const std::vector<SyncDirection>& ResourceDirections() const { return resource_dirs_; }
   std::map<std::string, size_t> Describe() const;
   void ValidateFor(const FunctionPtr& owner, const std::string& target) const;
 
@@ -171,18 +173,18 @@ class EventfulSyncChild {
   CompactSyncResult mathematics_;
   StmtPtr logical_recipe_;
   std::string target_;
-  std::vector<SyncDirection> rearm_dirs_;
+  std::vector<SyncDirection> resource_dirs_;
   SeqStmtsPtr window_seq_;
   size_t window_begin_ = 0;
   size_t window_end_ = 0;
   EventfulSyncChild(SyncRegionContext context, CompactSyncResult mathematics, StmtPtr logical_recipe,
-                    std::string target, std::vector<SyncDirection> rearm_dirs,
+                    std::string target, std::vector<SyncDirection> resource_dirs,
                     SeqStmtsPtr window_seq = nullptr, size_t window_begin = 0, size_t window_end = 0)
       : context_(std::move(context)),
         mathematics_(std::move(mathematics)),
         logical_recipe_(std::move(logical_recipe)),
         target_(std::move(target)),
-        rearm_dirs_(std::move(rearm_dirs)),
+        resource_dirs_(std::move(resource_dirs)),
         window_seq_(std::move(window_seq)),
         window_begin_(window_begin),
         window_end_(window_end) {}
