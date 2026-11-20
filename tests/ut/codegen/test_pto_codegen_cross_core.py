@@ -33,11 +33,15 @@ from textwrap import indent
 
 import pypto.language as pl
 import pytest
+import torch
 from pypto import backend, codegen, ir, passes, testing
 from pypto.backend import BackendType
 from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.backend.pto_backend import _build_group_mapping
+from pypto.debug import torch_codegen
 from pypto.runtime import RunConfig
+
+from tests.ut.codegen.peer_native_order_oracle import NativeReceiveReplay
 
 
 def _extract_func_section(mlir_code: str, func_name: str) -> str:
@@ -101,30 +105,48 @@ return pl.store(combined, [0, 0], out)
 
 
 def _paired_receive_program(
-    local_depth: int, producer: str, consumer: str, *, slot_bytes: int = 1024, ring_depth: int = 2
+    local_depth: int,
+    producer: str,
+    consumer: str,
+    *,
+    slot_bytes: int = 1024,
+    ring_depth: int = 2,
+    kernel_names: tuple[str, str] = ("cube", "vector"),
+    second_pipe: bool = False,
 ) -> ir.Program:
+    cube, vector = kernel_names
+    second_sender = second_receiver = ""
+    if second_pipe:
+        second_sender = f"""
+        peer_two = pl.import_peer_buffer(name="peer_c2v_two", peer_func={vector!r})
+        pl.aic_initialize_pipe(peer_two, pl.const(0, pl.INT32), dir_mask=1, slot_size={slot_bytes},
+                               slot_num={ring_depth}, local_slot_num={local_depth}, id=1)"""
+        second_receiver = f"""
+        fifo_two = pl.reserve_buffer(name="peer_c2v_two", size={slot_bytes * local_depth}, base=8192)
+        pl.aiv_initialize_pipe(fifo_two, pl.const(0, pl.INT32), dir_mask=1, slot_size={slot_bytes},
+                               slot_num={ring_depth}, local_slot_num={local_depth}, id=1)"""
     return pl.parse_program(f"""
 @pl.program
 class PairedConsumer:
     @pl.function(type=pl.FunctionType.AIC)
-    def cube(self, x: pl.Tensor[[32, 16], pl.FP16]):
-        peer = pl.import_peer_buffer(name="peer_c2v", peer_func="vector")
+    def {cube}(self, x: pl.Tensor[[32, 16], pl.FP16]):
+        peer = pl.import_peer_buffer(name="peer_c2v", peer_func={vector!r})
         pl.aic_initialize_pipe(peer, pl.const(0, pl.INT32), dir_mask=1, slot_size={slot_bytes},
-                               slot_num={ring_depth}, local_slot_num={local_depth})
+                               slot_num={ring_depth}, local_slot_num={local_depth}){second_sender}
 {indent(producer.strip(), "        ")}
 
     @pl.function(type=pl.FunctionType.AIV)
-    def vector(self, out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
+    def {vector}(self, out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
         fifo = pl.reserve_buffer(name="peer_c2v", size={slot_bytes * local_depth}, base=4096)
         pl.aiv_initialize_pipe(fifo, pl.const(0, pl.INT32), dir_mask=1, slot_size={slot_bytes},
-                               slot_num={ring_depth}, local_slot_num={local_depth})
+                               slot_num={ring_depth}, local_slot_num={local_depth}){second_receiver}
 {indent(consumer.strip(), "        ")}
 
     @pl.function(type=pl.FunctionType.Group)
     def paired(self, x: pl.Tensor[[32, 16], pl.FP16],
                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
-        self.cube(x)
-        return self.vector(out)
+        self.{cube}(x)
+        return self.{vector}(out)
 
     @pl.function(type=pl.FunctionType.Orchestration)
     def main(self, x: pl.Tensor[[32, 16], pl.FP16],
@@ -134,7 +156,16 @@ class PairedConsumer:
 
 
 def _mat_receive_epilogue(
-    width, dtype, ring_depth, *, sends=4, loop=None, two_readers=False, work_items=None, work_stride="workers"
+    width,
+    dtype,
+    ring_depth,
+    *,
+    sends=4,
+    loop=None,
+    two_readers=False,
+    work_items=None,
+    work_stride="workers",
+    pad=None,
 ):
     """Each new pop overwrites the Mat slot read two transfers earlier."""
     stride = 16 * width * 4
@@ -144,7 +175,8 @@ def _mat_receive_epilogue(
         extra = [f"{rhs} = pl.move(r{visit}, target_memory=pl.Mem.Right)"] if two_readers else []
         return "\n".join(
             [
-                f"r{visit}: pl.Tile[[16, {width}], pl.{dtype}, pl.Mem.Mat] = pl.tpop_from_aiv(split=0)",
+                f"r{visit}: pl.Tile[[16, {width}], pl.{dtype}, pl.Mem.Mat{pad_view}]"
+                " = pl.tpop_from_aiv(split=0)",
                 f"l{visit} = pl.move(r{visit}, target_memory=pl.Mem.Left)",
                 *extra,
                 f"pl.tfree_to_aiv(r{visit})",
@@ -153,6 +185,7 @@ def _mat_receive_epilogue(
             ]
         )
 
+    pad_view = f", pl.TileView(pad=pl.PadValue.{pad})" if pad else ""
     if loop is None:
         pops = [visit_ops(i, 16 * i) for i in range(4)]
     else:
@@ -218,55 +251,33 @@ class MatReceiver:
 
 
 def _check_mat_receive_schedule(body):
-    # Replay explicit SET/WAIT prefix transfer in the emitted cube function.
-    # Recording the last reader's completion on MTE2 is essential at wrap.
-    known = {}
-    pending = {}
-    received = {}
-    slots: list[int | None] = [None, None]
-    reads = 0
-    for cut, line in enumerate(body.splitlines()):
-        flag = re.search(r"(set|wait)_flag\(PIPE_(\w+), PIPE_(\w+), EVENT_ID(\d+)\)", line)
-        if flag:
-            kind, src, dst, idx = flag.groups()
-            key = (src, dst, idx)
-            if kind == "set":
-                assert key not in pending
-                pending[key] = set(known.get(src, ()))
-            else:
-                known.setdefault(dst, set()).update(pending.pop(key))
-        elif "TPOP<TPipe<" in line:
-            target = re.search(r", (v\d+)\);$", line)
-            assert target is not None, line
-            name = target[1]
-            slot = len(received) % 2
-            if slots[slot] is not None:
-                assert slots[slot] in known["MTE2"], "receive slot reused before MTE1 read completed"
-            known.setdefault("MTE2", set()).add(cut)
-            received[name] = (cut, slot)
-        elif move := re.search(r"TMOV\(v\d+, (v\d+)\);", line):
-            if move[1] in received:
-                pop, slot = received[move[1]]
-                assert pop in known["MTE1"], "Mat read issued before TPOP completed"
-                known["MTE1"].add(cut)
-                slots[slot] = cut
-                reads += 1
-    assert len(received) == reads == 4
-    assert not pending
+    replay = NativeReceiveReplay(body)
+    assert len(replay.pops) == 4 and all(replay.readers)
+    missing, _, unsafe_reuse = replay.compare()
+    assert not missing, f"receive slot reused or read without local completion: {missing}"
+    assert not unsafe_reuse, f"physical event reused before consumption: {unsafe_reuse}"
 
 
 @pytest.mark.ptoas_compile
 @pytest.mark.usefixtures("ascend_backend")
 @pytest.mark.parametrize(
     "mat_geometry",
-    [None, (16, "FP16", 4), (128, "BF16", 2)],
-    ids=["vec-receiver", "mat-slot-epilogue", "prefill-mat-slot-geometry"],
+    [None, (16, "FP16", 4, None), (128, "BF16", 2, None), (128, "BF16", 2, "min")],
+    ids=["vec-receiver", "mat-slot-epilogue", "prefill-mat-slot-geometry", "prefill-minimum-pad-tag"],
 )
 def test_complete_group_owns_both_native_endpoints(tmp_path, mat_geometry):
     cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
-    program = _mat_receive_epilogue(*mat_geometry) if mat_geometry else _paired_consumer(2)
+    program = (
+        _mat_receive_epilogue(*mat_geometry[:3], pad=mat_geometry[3]) if mat_geometry else _paired_consumer(2)
+    )
+    stages = []
+
+    def capture(transform, current):
+        if transform.get_name() == "LowerTileToBuffer":
+            stages.extend(current.get_function(name).ir_stage for name in ("cube", "vector"))
+
     with passes.PassContext(
-        [],
+        [passes.CallbackInstrument(after_pass=capture)],
         memory_planner=passes.MemoryPlanner.PYPTO,
         enable_buffer_ir=True,
         enable_pypto_autosync=True,
@@ -274,6 +285,7 @@ def test_complete_group_owns_both_native_endpoints(tmp_path, mat_geometry):
         autosync_disjoint_gm=True,
     ):
         ir.compile(program, **cfg.compile_kwargs())
+    assert stages == [ir.FunctionIRStage.Buffer, ir.FunctionIRStage.Buffer]
     info = json.loads((tmp_path / "ptoas" / "paired.sync.json").read_text())
     assert info["owned"] and not info["ptoas_insert_sync"], info
     assert "--enable-insert-sync=false" in info["compile_flags"]
@@ -282,9 +294,64 @@ def test_complete_group_owns_both_native_endpoints(tmp_path, mat_geometry):
         native = (tmp_path / "ptoas" / "paired.cpp").read_text().split("AICORE void cube(", 1)[1]
         cube = native.split("AICORE void ", 1)[0]
         _check_mat_receive_schedule(cube)
+        if mat_geometry[3] == "min":
+            receives = [line for line in cube.splitlines() if "TPOP<" in line]
+            assert all("TileType::Mat, bfloat16_t, 16, 128" in line for line in receives)
+            assert all("PadValue::Min" in line for line in receives)
+            assert re.search(r"Tile<TileType::Left, bfloat16_t, 16, 128,[^>]*PadValue::Min", cube)
         without_releases = re.sub(r"^.*(?:set|wait)_flag\(PIPE_MTE1, PIPE_MTE2,.*$", "", cube, flags=re.M)
         with pytest.raises(AssertionError, match="receive slot reused"):
             _check_mat_receive_schedule(without_releases)
+
+
+@pytest.mark.usefixtures("ascend_backend")
+@pytest.mark.parametrize("dtype,pad", [("BF16", "max"), ("FP16", "min")])
+def test_unqualified_matrix_pad_keeps_functional_unit(dtype, pad):
+    program = _mat_receive_epilogue(128, dtype, 2, pad=pad)
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO, enable_buffer_ir=True):
+        lowered = ir.PassManager(ir.OptimizationStrategy.Default).run_passes(program)
+    assert all(
+        lowered.get_function(name).ir_stage == ir.FunctionIRStage.Functional for name in ("cube", "vector")
+    )
+
+
+@pytest.mark.usefixtures("ascend_backend")
+def test_buffer_selection_checks_every_device_member_of_peer_emission_unit():
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO, enable_buffer_ir=True):
+        manager = ir.PassManager(ir.OptimizationStrategy.Default)
+        boundary = manager.get_pass_names().index("SelectBufferIRFunctions")
+        program = _paired_consumer(2)
+        for transform in manager.passes[:boundary]:
+            program = transform(program)
+        selector = passes.select_buffer_ir_functions()
+        original = selector(program)
+        assert all(original.get_function(name).attrs["buffer_ir_selected"] for name in ("cube", "vector"))
+
+        group = program.get_function("paired")
+        span = group.span
+        extra = ir.Function("extra", [], [], ir.ReturnStmt([], span), span, ir.FunctionType.AIV)
+        call = ir.EvalStmt(ir.Call(ir.GlobalVar("extra"), [], ir.VoidType(), span), span)
+        group_body = group.body.stmts
+        assert isinstance(group_body[-1], ir.ReturnStmt)
+        updated = ir.Function(
+            group.name,
+            list(zip(group.params, group.param_directions, strict=True)),
+            group.return_types,
+            ir.SeqStmts([*group_body[:-1], call, group_body[-1]], span),
+            span,
+            ir.FunctionType.Group,
+            attrs=group.attrs,
+        )
+        functions = [updated if fn.name == group.name else fn for fn in program.functions.values()]
+        program = ir.Program([*functions, extra], program.name, program.span)
+        groups, _ = _build_group_mapping(program)
+        assert {fn.name for fn in groups[group.name]} == {"cube", "vector", "extra"}
+        selected = selector(program)
+
+    assert selected.get_function("extra").attrs["buffer_admission_property"] == "load_or_fill_and_store"
+    for name in ("cube", "vector"):
+        refusal = selected.get_function(name).attrs["buffer_admission_property"]
+        assert refusal == "delegated_peer_compilation_unit"
 
 
 @pytest.mark.ptoas_compile
@@ -363,9 +430,15 @@ def test_peer_event_pressure_is_atomic(tmp_path, count):
     receiver.extend(f"s{i} = pl.add(s{i - 1}, t{i})" for i in range(1, count))
     receiver.append(f"return pl.store(s{count - 1}, [0, 0], out)")
     program = _paired_receive_program(16, producer, "\n".join(receiver), ring_depth=16)
+    stages = []
+
+    def capture(transform, current):
+        if transform.get_name() == "LowerTileToBuffer":
+            stages.extend(current.get_function(name).ir_stage for name in ("cube", "vector"))
+
     cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
     with passes.PassContext(
-        [],
+        [passes.CallbackInstrument(after_pass=capture)],
         memory_planner=passes.MemoryPlanner.PYPTO,
         enable_buffer_ir=True,
         enable_pypto_autosync=True,
@@ -373,6 +446,7 @@ def test_peer_event_pressure_is_atomic(tmp_path, count):
         autosync_disjoint_gm=True,
     ):
         ir.compile(program, **cfg.compile_kwargs())
+    assert stages == [ir.FunctionIRStage.Buffer, ir.FunctionIRStage.Buffer]
     info = json.loads((tmp_path / "ptoas" / "paired.sync.json").read_text())
     assert info["owned"] == (count == 3)
     assert {d["owned"] for d in info["domains"]} == {count == 3}
@@ -464,6 +538,248 @@ def test_explicit_peer_preserves_authored_handoff(tmp_path: Path):
     between_pops = native[first_pop:second_pop]
     assert "pipe_barrier(PIPE_ALL);" not in between_pops
     assert between_pops.index("TADD(") < between_pops.index("wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);")
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.usefixtures("ascend_backend")
+@pytest.mark.parametrize(
+    "authored_waits", [False, True], ids=["buffer-delegated", "functional-unit-fallback"]
+)
+def test_delegated_peer_unit_uses_shared_workspace_and_reuse_fence(tmp_path, authored_waits):
+    # The next pop wraps to the slot still being read by the first add.
+    program = _paired_consumer(1, read_after_wrap=False, free_before_wrap=True, authored_waits=authored_waits)
+    lowered = []
+
+    def capture(transform, current):
+        if transform.get_name() == "LowerTileToBuffer":
+            lowered.append(current)
+
+    cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
+    with passes.PassContext(
+        [passes.CallbackInstrument(after_pass=capture)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=False,
+    ):
+        ir.compile(program, **cfg.compile_kwargs())
+    expected = ir.FunctionIRStage.Functional if authored_waits else ir.FunctionIRStage.Buffer
+    assert {lowered[0].get_function(name).ir_stage for name in ("cube", "vector")} == {expected}
+    manifest = json.loads((tmp_path / "ptoas" / "paired.sync.json").read_text())
+    assert manifest["ptoas_insert_sync"] and {domain["owned"] for domain in manifest["domains"]} == {False}
+    emitted = (tmp_path / "ptoas" / "paired.pto").read_text()
+    for name in ("cube", "vector"):
+        body = _extract_func_section(emitted, name)
+        workspace = re.search(r"gm_slot_buffer = (%arg\d+) : !pto.ptr<f32>", body)
+        assert workspace and f"pto.make_tensor_view {workspace[1]}" not in body
+    native = (tmp_path / "ptoas" / "paired.cpp").read_text()
+    pops = [match.start() for match in re.finditer(r"\bTPOP<", native)]
+    assert len(pops) == 4 and native.count("TFREE<") == 4 and native.count("TPUSH<") == 2
+    cut = native[pops[0] : pops[1]]
+    fence = "wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);" if authored_waits else "pipe_barrier(PIPE_ALL);"
+    assert cut.index("TADD(") < cut.index(fence)
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.usefixtures("ascend_backend")
+def test_delegated_buffer_peers_bind_each_pipe_workspace(tmp_path):
+    program = _paired_receive_program(
+        1,
+        """
+tile = pl.load(x, [0, 0], [16, 16])
+packet = pl.matmul(tile, tile)
+pl.tpush_to_aiv(packet, split=0)
+pl.tpush_to_aiv(packet, split=0, id=1)
+""",
+        """
+first: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+left = pl.add(first, first)
+pl.tfree_to_aic(first)
+second: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0, id=1)
+total = pl.add(left, second)
+pl.tfree_to_aic(second, id=1)
+return pl.store(total, [0, 0], out)
+""",
+        second_pipe=True,
+    )
+    lowered = []
+
+    def capture(transform, current):
+        if transform.get_name() == "LowerTileToBuffer":
+            lowered.append(current)
+
+    cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
+    with passes.PassContext(
+        [passes.CallbackInstrument(after_pass=capture)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=False,
+    ):
+        ir.compile(program, **cfg.compile_kwargs())
+    emitted = (tmp_path / "ptoas" / "paired.pto").read_text()
+    for name in ("cube", "vector"):
+        assert lowered[0].get_function(name).ir_stage == ir.FunctionIRStage.Buffer
+        body = _extract_func_section(emitted, name)
+        root = re.search(r"gm_slot_buffer = (%arg\d+) : !pto.ptr<f32>", body)
+        offset = re.search(r"(%\w+) = arith.constant 512 : index", body)
+        assert root and offset
+        shifted = re.search(rf"(%\w+) = pto.addptr {root[1]}[^\n]*{offset[1]}", body)
+        assert shifted and f"gm_slot_buffer = {shifted[1]} : !pto.ptr<f32>" in body
+        assert f"pto.make_tensor_view {root[1]}" not in body
+    manifest = json.loads((tmp_path / "ptoas" / "paired.sync.json").read_text())
+    assert manifest["ptoas_insert_sync"] and {domain["owned"] for domain in manifest["domains"]} == {False}
+
+    class CorruptBorrow(ir.IRMutator):
+        def __init__(self, mode):
+            super().__init__()
+            self.mode = mode
+            self.first = None
+            self.reserve = None
+            self.released = False
+
+        def visit_call(self, op):
+            if op.op.name == "buffer.peer_pop":
+                if self.reserve is None:
+                    self.reserve = op.args[0]
+                elif self.mode == "swap" and self.reserve.name_hint != op.args[0].name_hint:
+                    args = [self.reserve, *op.args[1:]]
+                    return ir.Call(op.op, args, dict(op.kwargs), dict(op.attrs), op.type, op.span)
+            if op.op.name == "buffer.peer_free" and self.first is None:
+                self.first = op.args[0]
+                self.released = True
+            if op.op.name == "buffer.add" and self.released and self.mode == "released":
+                self.released = False
+                args = [self.first, op.args[1], op.args[2]]
+                return ir.Call(op.op, args, dict(op.kwargs), dict(op.attrs), op.type, op.span)
+            return super().visit_call(op)
+
+    properties = passes.IRPropertySet()
+    properties.insert(passes.IRProperty.BufferIR)
+    for mode, error in [
+        ("swap", "reserve must match the dominating initializer"),
+        ("released", "borrow is used after release"),
+    ]:
+        corrupt = CorruptBorrow(mode).visit_program(lowered[0])
+        diagnostics = passes.PropertyVerifierRegistry.verify(properties, corrupt)
+        messages = [diagnostic.message for diagnostic in diagnostics]
+        assert any(error in message for message in messages), (mode, messages)
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.usefixtures("ascend_backend")
+def test_two_slot_receive_keeps_other_reader_unordered(tmp_path):
+    stages = []
+
+    def capture(transform, current):
+        if transform.get_name() == "LowerTileToBuffer":
+            stages.extend(current.get_function(name).ir_stage for name in ("cube", "vector"))
+
+    program = _paired_receive_program(
+        2,
+        """
+value = pl.load(x, [0, 0], [16, 16])
+packet = pl.matmul(value, value)
+pl.tpush_to_aiv(packet, split=0)
+pl.tpush_to_aiv(packet, split=0)
+pl.tpush_to_aiv(packet, split=0)
+""",
+        """
+first: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+slot0_reader = pl.add(first, first)
+pl.tfree_to_aic(first)
+second: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+slot1_independent_reader = pl.add(second, second)
+pl.tfree_to_aic(second)
+slot0_overwrite: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+third_reader = pl.add(slot0_overwrite, slot0_overwrite)
+pl.tfree_to_aic(slot0_overwrite)
+return pl.store(pl.add(pl.add(slot0_reader, slot1_independent_reader), third_reader), [0, 0], out)
+""",
+        slot_bytes=2048,
+        ring_depth=4,
+    )
+    cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
+    with passes.PassContext(
+        [passes.CallbackInstrument(after_pass=capture)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+        autosync_disjoint_gm=True,
+    ):
+        ir.compile(program, **cfg.compile_kwargs())
+    manifest = json.loads((tmp_path / "ptoas" / "paired.sync.json").read_text())
+    assert manifest["owned"] and not manifest["ptoas_insert_sync"]
+    assert stages == [ir.FunctionIRStage.Buffer, ir.FunctionIRStage.Buffer]
+    native = (tmp_path / "ptoas" / "paired.cpp").read_text()
+    active = native.split("AICORE void vector(", 1)[1].split("} else {", 1)[0]
+
+    def replay_body(body):
+        return NativeReceiveReplay(body, whole_vec_body=True)
+
+    replay = replay_body(active)
+    assert replay.geometry[:3] == (2048, 4, 2)
+    assert len(replay.pops) == 3 and all(replay.readers)
+    missing, extra, premature_reuse = replay.compare()
+    assert not missing and not premature_reuse, (missing, premature_reuse)
+    native_extra = sorted(extra)
+    independent = ("read_1_0", "pop_2")
+    assert independent not in extra, sorted(extra)
+    pops = list(re.finditer(r"^ +TPOP<", active, flags=re.M))
+    before_wrap = pops[2].start()
+    drained = active[:before_wrap] + "pipe_barrier(PIPE_ALL);\n" + active[before_wrap:]
+    missing, extra, premature_reuse = replay_body(drained).compare()
+    assert not missing and not premature_reuse and independent in extra, sorted(extra)
+    (tmp_path / "native-order.json").write_text(
+        json.dumps(
+            {
+                "occurrences": {"read_1_0": "slot1_independent_reader", "pop_2": "slot0_overwrite"},
+                "native_extra_completion_to_start_pairs": native_extra,
+                "full_drain_extra_completion_to_start_pairs": sorted(extra),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    missing_handoff = re.sub(r"^ *[a-z]+_flag\(PIPE_V, PIPE_MTE2, .*\n", "", active, flags=re.M)
+    assert ("read_0_0", "pop_2") in replay_body(missing_handoff).compare()[0]
+    without_store_ready = re.sub(r"^ *[a-z]+_flag\(PIPE_V, PIPE_MTE3, .*\n", "", active, flags=re.M)
+    assert ("ordinary_1", "store") in replay_body(without_store_ready).compare()[0]
+    missing_wait, removed = re.subn(r"^ *wait_flag\(PIPE_V, PIPE_MTE2, .*\n", "", active, count=1, flags=re.M)
+    assert removed == 1
+    with pytest.raises(AssertionError, match="unconsumed"):
+        replay_body(missing_wait)
+    renumbered = re.sub(r"EVENT_ID(\d+)", lambda m: f"EVENT_ID{(int(m[1]) + 3) % 8}", active)
+    assert replay_body(renumbered).compare() == replay.compare()
+
+
+@pytest.mark.usefixtures("ascend_backend")
+def test_buffer_peer_subview_and_reference_execution():
+    program = _paired_receive_program(
+        2,
+        """
+value = pl.load(x, [0, 0], [16, 16])
+packet = pl.matmul(value, value)
+pl.tpush_to_aiv(packet, split=0)
+""",
+        """
+received: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+lower_rows = pl.slice(received, [8, 16], [8, 0])
+result = pl.add(lower_rows, lower_rows)
+pl.tfree_to_aic(received)
+return pl.store(result, [8, 0], out)
+""",
+        kernel_names=("paired_aic", "paired_aiv"),
+    )
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO, enable_buffer_ir=True):
+        lowered = ir.PassManager(ir.OptimizationStrategy.Default).run_passes(program)
+    assert lowered.get_function("paired_aic").ir_stage == ir.FunctionIRStage.Buffer
+    assert lowered.get_function("paired_aiv").ir_stage == ir.FunctionIRStage.Buffer
+    namespace = {}
+    exec(torch_codegen(lowered), namespace)  # noqa: S102
+    x = torch.cat((torch.eye(16, dtype=torch.float16), torch.zeros((16, 16), dtype=torch.float16)))
+    output = namespace["main"](x, torch.full((16, 16), -1.0))
+    expected = torch.cat((torch.full((8, 16), -1.0), 2 * torch.eye(16)[8:]))
+    torch.testing.assert_close(output, expected)
 
 
 @pytest.mark.ptoas_compile

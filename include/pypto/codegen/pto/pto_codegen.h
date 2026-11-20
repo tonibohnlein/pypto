@@ -1000,6 +1000,8 @@ class PTOCodegen : public CodegenBase {
    * @brief Generate PTO-ISA MLIR for a single function
    */
   void GenerateFunction(const ir::FunctionPtr& func);
+  void PrepareFunctionEmission(const ir::FunctionPtr& func);
+  bool BindGMPipeWorkspace(const ir::VarPtr& parameter);
 
   // Experimental direct emission for explicitly constructed Buffer IR. This
   // path never enters Tile/MemRef allocation or handle discovery.

@@ -1255,13 +1255,7 @@ void PTOCodegen::EmitUrmaTransferAdapterDeclarations() {
   }
 }
 
-void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
-  if (!simt_functions_.empty()) SimtTileProvenanceChecker().Check(func->body_);
-  parameter_backed_tile_bases_.clear();
-  if (UsesBufferIR(func)) {
-    GenerateBufferFunction(func);
-    return;
-  }
+void PTOCodegen::PrepareFunctionEmission(const FunctionPtr& func) {
   fs_.Reset();
   fs_.current_function = func;
   fs_.truncating_floor_div_mod = PrepareScalarFloorDivMod(func->body_, func->params_);
@@ -1270,6 +1264,26 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
     // Skew and pipeline lowering can move or clone pops. Find the conflicting
     // cuts on the final body shared by stock and delegated AutoSync codegen.
     fs_.c2v_slot_reuse_fences = ir::cross_core_pipe::FindC2VSlotReuseFences(func);
+  }
+}
+
+bool PTOCodegen::BindGMPipeWorkspace(const VarPtr& parameter) {
+  if (!IsGMPipeWorkspaceParameter(parameter)) {
+    return false;
+  }
+  const auto type = ir::AsTensorTypeLike(parameter->GetType());
+  INTERNAL_CHECK_SPAN(type, parameter->span_) << "GM pipe workspace must be a tensor parameter";
+  RecordGMSlotBufferSSA(GetVarName(parameter), type->dtype_);
+  return true;
+}
+
+void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
+  if (!simt_functions_.empty()) SimtTileProvenanceChecker().Check(func->body_);
+  parameter_backed_tile_bases_.clear();
+  PrepareFunctionEmission(func);
+  if (UsesBufferIR(func)) {
+    GenerateBufferFunction(func);
+    return;
   }
 
   // Index every `<var> = <tuple>[i]` binding once. A multi-output op's Call does
@@ -1351,7 +1365,7 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   const bool uses_l2_cache_offset =
       collector.UsesL2BypassLoad() && backend_->GetHandler()->GetPtoTargetArch() == "a2a3";
   const auto& ffts_workspace_vars = collector.GetFFTSWorkspaceVars();
-  const auto tensor_views = PrepareTensorParameterViews(*func, /*buffer_ir=*/false, ffts_workspace_vars);
+  const auto tensor_views = PrepareTensorParameterViews(*func, ffts_workspace_vars);
   if (uses_sdma_workspace) {
     fs_.used_ssa_names.insert("arg" + std::to_string(func->params_.size() + dyn_vars.size()));
   }
@@ -1607,8 +1621,7 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   for (const auto& var : func->params_) {
     if (auto tensor_type = ir::AsTensorTypeLike(var->GetType())) {
       // Skip tensor view for GM slot buffer workspace parameter (raw pointer, no view needed)
-      if (var->name_hint_ == "__gm_pipe_buffer") {
-        RecordGMSlotBufferSSA(GetVarName(var), tensor_type->dtype_);
+      if (BindGMPipeWorkspace(var)) {
         continue;
       }
       if (ffts_workspace_vars.count(var.get()) > 0) continue;

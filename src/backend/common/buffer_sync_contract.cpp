@@ -41,6 +41,7 @@ const char* BufferNativeOperation(const ir::CallPtr& call) {
   using ir::IsOp;
   if (IsOp(call, "buffer.load")) return "pto.tload";
   if (IsOp(call, "buffer.store")) return "pto.tstore";
+  if (IsOp(call, "buffer.gm_read")) return "pto.load";
   if (IsOp(call, "buffer.read")) return "pto.tgetval";
   if (IsOp(call, "buffer.write")) return "pto.tsetval";
   if (IsOp(call, "buffer.copy")) return "pto.tmov";
@@ -87,7 +88,16 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
   std::transform(macro.begin(), macro.end(), macro.begin(),
                  [](unsigned char c) { return c == '.' ? '_' : std::toupper(c); });
   BufferSyncImplementation result{PipeType::ALL, "pto::" + macro, core, target};
-  if (IsOp(call, "buffer.read") || IsOp(call, "buffer.write")) {
+  if (IsOp(call, "buffer.gm_read")) {
+    CHECK(core == FunctionType::AIC && target == "a2a3")
+        << "Blocking GM scalar access is qualified only for A2/A3 AIC";
+    // PTOAS lowers pto.load on the raw pointer to a cacheable blocking
+    // dereference. The invocation must exclude writes to that storage.
+    result.pipe_ = PipeType::S;
+    result.produces_ready_scalar_ = true;
+    result.requires_read_only_gm_ = true;
+    result.audited_signal_free_variant_ = true;
+  } else if (IsOp(call, "buffer.read") || IsOp(call, "buffer.write")) {
     CHECK(core == FunctionType::AIV && target == "a2a3")
         << "Blocking local scalar access is qualified only for A2/A3 AIV Vec storage";
     // TGETVAL/TSETVAL select Tile::GetValue/SetValue: synchronous typed UB
@@ -274,7 +284,8 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
                   result.pipe_ == PipeType::V ||
                   (result.pipe_ == PipeType::S && (IsOp(call, "buffer.read") || IsOp(call, "buffer.write"))))
                : (result.pipe_ == PipeType::MTE2 || result.pipe_ == PipeType::MTE1 ||
-                  result.pipe_ == PipeType::M || result.pipe_ == PipeType::FIX))
+                  result.pipe_ == PipeType::M || result.pipe_ == PipeType::FIX ||
+                  (result.pipe_ == PipeType::S && result.RequiresReadOnlyGM())))
       << "Payload pipe is unavailable on the owning synchronization core";
   return result;
 }
@@ -300,10 +311,12 @@ void RequireBufferSyncWorkspaceSeparation(
 }
 
 BufferSyncOperation QualifyBufferSyncOperation(const ir::CallPtr& call, ir::FunctionType core,
-                                               const std::string& target) {
+                                               const std::string& target, bool verify_readonly_gm_in_unit) {
   auto& registry = ir::OpRegistry::GetInstance();
   registry.ValidateBufferCall(call);
   auto implementation = SelectBufferSyncImplementation(call, core, target);
+  CHECK_SPAN(!implementation.RequiresReadOnlyGM() || verify_readonly_gm_in_unit, call->span_)
+      << "Cached Buffer GM scalar read requires invocation-wide read-only alias evidence";
   const auto& entry = registry.GetEntry(call->op_->name_);
   std::vector<ir::BufferArgEffect> effects;
   effects.reserve(call->args_.size());

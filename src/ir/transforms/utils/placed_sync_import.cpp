@@ -1469,7 +1469,7 @@ class Importer {
     // major order. This does not admit general column-major matrices or views.
     CHECK(type->shape_ == type->valid_shape_ &&
           (backend::DenseBufferBytes(type) || backend::IsColumnVectorBuffer(type) ||
-           backend::IsFullZeroPaddedVec(type)))
+           backend::IsFullPaddedVec(type)))
         << "Synchronization Vec views require static full-valid dense descriptors";
     const auto end =
         Checked(__int128(view.address) + view.last_displacement + __int128(type->shape_[0] - 1) * view.pitch +
@@ -1555,7 +1555,10 @@ class Importer {
     const auto slot_count = multi ? multi->slot_count_ : 1;
     CHECK(t && t->shape_.size() == 2 && t->shape_ == t->valid_shape_ && t->dtype_.GetBit() % 8 == 0)
         << "Synchronization import needs fully valid byte-addressable rank-two buffers";
-    CHECK(t->compact_ == CompactMode::null && t->pad_ == PadValue::null)
+    CHECK(t->compact_ == CompactMode::null &&
+          (t->pad_ == PadValue::null ||
+           (!multi && (backend::IsFullPaddedVec(t) ||
+                       backend::SupportsMatrixBufferPadding(t->memory_space_, t->dtype_, t->pad_, true)))))
         << "Packed/padded buffer interpretation is not qualified";
     auto valid = As<MakeTuple>(c->args_[0]);
     CHECK(valid && valid->elements_.empty()) << "Dynamic valid extents are not qualified";
@@ -2028,7 +2031,7 @@ class Importer {
              recipe->kind == backend::BufferConversionKind::FillPad))
           << "Synchronization conversion import requires a qualified AIV cast or fillpad";
       if (recipe->kind == backend::BufferConversionKind::FillPad) {
-        // TFillPad copies the live source rows, then writes zeros across the
+        // TFillPad copies the live source rows, then initializes the
         // trailing rows. The source allocation encloses the native reads.
         enclosure(0, false);
       } else {
@@ -2712,13 +2715,19 @@ class InvocationBounds : public IRVisitor {
       auto found = functions_.find(global->name_);
       if (found != functions_.end()) {
         std::optional<Bound> launch, count_range;
+        ExprPtr launch_count;
         if (found->second->func_type_ == FunctionType::Spmd) {
           auto count = call->GetAttr<ExprPtr>(kAttrCoreNum, nullptr);
           if (count) {
             auto bound = Range(count);
-            if (bound && bound->first > 0) {
+            if (bound && bound->second > 0) {
+              // The launch contributes worker invocations only on its
+              // nonempty path. This remains true before the launch pass
+              // materializes the corresponding host guard.
+              bound->first = std::max<int64_t>(1, bound->first);
               launch = Bound{0, bound->second - 1};
               count_range = bound;
+              launch_count = count;
             }
           } else if (auto constant = As<ConstInt>(found->second->GetAttr<ExprPtr>(kAttrCoreNum, nullptr));
                      constant && constant->value_ > 0) {
@@ -2756,6 +2765,9 @@ class InvocationBounds : public IRVisitor {
           if (!As<ScalarType>(params[i]->GetType())) continue;
           auto argument = transform_utils::CallerSuppliedArg(call, found->second, i);
           auto bound = argument ? Range(argument) : std::nullopt;
+          if (launch_count && launch_count == argument) {
+            bound = count_range;
+          }
           auto [it, inserted] = callee.emplace(i, bound);
           if (!inserted) {
             if (!it->second || !bound) {

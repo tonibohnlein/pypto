@@ -895,8 +895,8 @@ static std::string MakeTileWriteCodegenPTO(const CallPtr& op, codegen::CodegenBa
   return "";
 }
 
-static std::string MakeTensorReadCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
-  auto& codegen = AsPto(codegen_base);
+void pto_ops_detail::EmitScalarTensorRead(const CallPtr& op, codegen::PTOCodegen& codegen,
+                                          const std::string& result) {
   INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
       << "tensor.read requires 2 arguments, but got " << op->args_.size();
 
@@ -913,22 +913,14 @@ static std::string MakeTensorReadCodegenPTO(const CallPtr& op, codegen::CodegenB
   // pto.store/pto.load need the base !pto.ptr; resolve via the tensor var
   // even after a slice-assign rebound it to a tensor_view (issue #1493).
   std::string src = codegen.GetTensorBasePtr(AsVarLike(op->args_[0]));
-  std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
-  std::string result = codegen.GetCurrentResultTarget();
-
-  if (src_type.empty()) {
-    src_type = "!pto.ptr<" + codegen.GetTypeString(tensor_type_ptr->dtype_) + ">";
-  }
-
+  const auto src_type = "!pto.ptr<" + codegen.GetTypeString(tensor_type_ptr->dtype_) + ">";
   std::string off = GetFlatOffsetSSA(indices_tuple, tensor_type_ptr->shape_, codegen);
+  codegen.Emit(result + " = pto.load " + src + "[" + off + "] : " + src_type + ", index -> " + scalar_type);
+}
 
-  std::ostringstream oss;
-  oss << result << " = pto.load " << src << "[" << off << "]";
-  if (!src_type.empty()) {
-    oss << " : " << src_type;
-  }
-  oss << ", index -> " << scalar_type;
-  codegen.Emit(oss.str());
+static std::string MakeTensorReadCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  pto_ops_detail::EmitScalarTensorRead(op, codegen, codegen.GetCurrentResultTarget());
   return "";
 }
 

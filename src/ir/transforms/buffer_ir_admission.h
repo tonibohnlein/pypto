@@ -51,6 +51,8 @@ enum class BufferAdmissionProperty {
   CanonicalSlots,
   DynamicValidRecipe,
   KernelShape,
+  PeerTransport,
+  PeerCompilationUnit,
 };
 inline const char* BufferAdmissionPropertyName(BufferAdmissionProperty property) {
   switch (property) {
@@ -110,6 +112,10 @@ inline const char* BufferAdmissionPropertyName(BufferAdmissionProperty property)
       return "dynamic_valid_recipe";
     case BufferAdmissionProperty::KernelShape:
       return "load_or_fill_and_store";
+    case BufferAdmissionProperty::PeerTransport:
+      return "delegated_peer_transport";
+    case BufferAdmissionProperty::PeerCompilationUnit:
+      return "delegated_peer_compilation_unit";
   }
   INTERNAL_UNREACHABLE << "Internal error: unknown Buffer admission property";
 }

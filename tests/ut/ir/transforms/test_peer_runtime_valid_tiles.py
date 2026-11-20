@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Validate bounded Tile validity in placed peer endpoints."""
+"""Validate actual descriptor state and bounds in placed peer endpoints."""
 
 import json
 import re
@@ -28,13 +28,8 @@ from tests.ut.codegen.test_pto_codegen_cross_core import _paired_receive_program
         pytest.param(8, "", None, id="bounded"),
         pytest.param(16, "", "no positive in-capacity bound", id="exceeds-capacity"),
         pytest.param(0, "", "no positive in-capacity bound", id="can-be-empty"),
-        pytest.param(8, "stale", "stale native tile valid metadata", id="stale-alias"),
-        pytest.param(
-            8,
-            "alias-after",
-            "Peer Tile alias cannot preserve updated native tile valid metadata",
-            id="alias-after-update",
-        ),
+        pytest.param(8, "stale", None, id="restored-old-alias"),
+        pytest.param(8, "alias-after", None, id="restored-full-alias"),
     ],
 )
 def test_runtime_valid_vec_effects(tmp_path, width_base, variant, reason):
@@ -43,8 +38,8 @@ def test_runtime_valid_vec_effects(tmp_path, width_base, variant, reason):
         payload = """out = pl.store(pl.exp(copied), [0, 0], out)
     result = pl.exp(trim)"""
     elif variant == "alias-after":
-        # A bare addressed Tile assignment can have its own native descriptor.
-        # Restoring validity through that alias does not restore copied's descriptor.
+        # Restoring the alias and using the original name exercise two SSA
+        # versions of the same Buffer allocation's mutable native descriptor.
         payload = """alias = trim
     restored = pl.tile.set_validshape(alias, 16, 16)
     wide = pl.exp(copied)
@@ -84,21 +79,28 @@ return out""",
     else:
         assert manifest["owned"] and not manifest["ptoas_insert_sync"], manifest
         source = (tmp_path / "ptoas" / "paired.pto").read_text()
-        setter = re.search(r"pto\.set_validshape (%\w+), (%\w+), (%\w+) :", source)
-        assert setter
-        tile, rows, columns = setter.groups()
-        active = source[setter.end() :]
-        exp = re.search(rf"pto\.texp ins\({tile} : [^\n]+ outs\((%\w+) :", active)
-        assert exp
-        result = exp.group(1)
-        alloc_pattern = rf"{result} = pto\.alloc_tile [^\n]+ valid_row = {rows} valid_col = (%\w+) :"
-        alloc = re.search(alloc_pattern, active)
-        assert alloc and alloc.end() < exp.start()
-        transfer = active[exp.end() : active.index(f"pto.tstore ins({result} :")]
-        partition = re.search(rf"pto\.partition_view [^\n]+ sizes = \[{rows}, (%\w+)\]", transfer)
-        assert partition
-        # Tile emission can re-materialize an index expression at each use.
-        additions = dict(re.findall(r"(%\w+) = arith\.addi (%\w+, %\w+) : index", source))
-        assert additions[columns] == additions[alloc.group(1)] == additions[partition.group(1)]
-        assert 'pto.wait_flag["PIPE_V", "PIPE_MTE3"' in transfer
+        vector = source.split("func.func @vector(", 1)[1]
+        dimensions = dict(re.findall(r"(%\w+) = arith\.constant (\d+) : index", vector))
+        additions = re.findall(r"(%\w+) = arith\.addi (%\w+), (%\w+) : index", source)
+        dynamic_columns = {name for name, _, rhs in additions if dimensions.get(rhs) == "8"}
+
+        def extent(name):
+            return "dynamic" if name in dynamic_columns else dimensions[name]
+
+        def restored(tile, cut):
+            setters = re.findall(rf"pto\.set_validshape {tile}, (%\w+), (%\w+) :", vector[:cut])
+            return tuple(extent(x) for x in setters[-1])
+
+        exp = list(re.finditer(r"pto\.texp ins\((%\w+) : [^\n]+ outs\((%\w+) :", vector))
+        expected = [("16", "dynamic")] if not variant else [("16", "16")]
+        if variant == "stale":
+            expected.append(("16", "dynamic"))
+        assert [restored(call[1], call.start()) for call in exp] == expected
+        assert [restored(call[2], call.start()) for call in exp] == expected
+        partitions = re.findall(r"pto\.partition_view [^\n]+ sizes = \[(%\w+), (%\w+)\]", vector)
+        assert [tuple(extent(x) for x in region) for region in partitions] == expected
+        stores = list(re.finditer(r"pto\.tstore ins\((%\w+) :", vector))
+        assert [restored(call[1], call.start()) for call in stores] == expected
+        for producer, store in zip(exp, stores, strict=True):
+            assert 'pto.wait_flag["PIPE_V", "PIPE_MTE3"' in vector[producer.end() : store.start()]
         assert {"cube", "vector"} == {domain["function"] for domain in manifest["domains"] if domain["owned"]}

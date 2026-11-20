@@ -55,6 +55,7 @@
 #include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
+#include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/loop_step_qualification.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/slot_index_qualification.h"
@@ -82,11 +83,11 @@ std::string BufferTypeString(const ir::BufferTypePtr& type, const ir::Span& span
   const auto space = type->memory_space_;
   if (backend::IsMatrixBufferSpace(space)) {
     CHECK_SPAN(type->shape_.size() == 2 && backend::IsMatrixBufferDtype(space, type->dtype_) &&
-                   type->pad_ == ir::PadValue::null,
+                   backend::SupportsMatrixBufferPadding(space, type->dtype_, type->pad_,
+                                                        type->shape_ == type->valid_shape_),
                span)
-        << "Direct Buffer IR codegen requires unpadded rank-2 FP16/BF16/FP32/INT8 cube operands or "
-           "FP32/INT32 "
-           "accumulators in "
+        << "Direct Buffer IR codegen requires qualified rank-2 cube operand or accumulator padding and dtype "
+           "in "
         << ir::MemorySpaceToString(space);
   } else if (!backend::IsColumnVectorBufferGeometry(type)) {
     CHECK_SPAN(space == ir::MemorySpace::Vec &&
@@ -94,13 +95,13 @@ std::string BufferTypeString(const ir::BufferTypePtr& type, const ir::Span& span
                     type->dtype_ == DataType::INT16 || type->dtype_ == DataType::UINT32) &&
                    type->blayout_ == ir::TileLayout::row_major &&
                    type->slayout_ == ir::TileLayout::none_box && type->fractal_ == 512 &&
-                   (type->pad_ == ir::PadValue::null || backend::IsFullZeroPaddedVec(type)) &&
+                   (type->pad_ == ir::PadValue::null || backend::IsFullPaddedVec(type)) &&
                    type->compact_ == ir::CompactMode::null,
                span)
         << "Direct Buffer IR codegen currently requires dense row-major Vec "
            "FP16/BF16/FP32/INT32/INT16/UINT8/UINT32 "
            "buffers "
-           "with fractal=512, no compact mode, and null or full-valid zero padding";
+           "with fractal=512, no compact mode, and qualified full-valid padding";
   }
   const bool vector = type->shape_.size() == 1;
   const int64_t rows = vector ? 1 : type->shape_[0];
@@ -243,7 +244,12 @@ class BufferEmissionPreflight : public ir::IRVisitor {
   bool uses_l2_bypass_load = false;
   explicit BufferEmissionPreflight(ir::FunctionPtr function, bool conversion_supported,
                                    const backend::Backend* backend)
-      : function_(std::move(function)), conversion_supported_(conversion_supported), backend_(backend) {
+      : function_(std::move(function)),
+        lane_returns_(ir::cross_core_pipe::TerminalPeerLaneReturns(function_)),
+        conversion_supported_(conversion_supported),
+        backend_(backend) {
+    step_proof_.BindCallerParameters(
+        function_, function_->GetAttr<std::vector<int>>(ir::kAttrBufferPositiveStepParameters, {}));
     for (size_t i = 0; i < function_->params_.size(); ++i) {
       if (auto tensor = As<ir::TensorType>(function_->params_[i]->GetType())) {
         CheckBufferTensorParameter(tensor, function_->params_[i]->span_);
@@ -257,7 +263,7 @@ class BufferEmissionPreflight : public ir::IRVisitor {
   }
 
   void CheckReturns() const {
-    CHECK_SPAN(function_->return_types_.empty() || returned_, function_->span_)
+    CHECK_SPAN(function_->return_types_.empty() || returned_ || lane_returns_.first, function_->span_)
         << "Direct Buffer IR function results require a final normalized GM tensor return";
   }
 
@@ -307,7 +313,11 @@ class BufferEmissionPreflight : public ir::IRVisitor {
             << "Expression '" << expr->TypeName() << "' is not supported by direct Buffer IR codegen";
     }
     if (auto type = As<ir::BufferType>(expr->GetType())) {
-      if (descriptors_.insert(type.get()).second) BufferTypeString(type, expr->span_);
+      const bool reserve = ir::IsOp(As<ir::Call>(expr), "buffer.peer_reserve") ||
+                           peer_reserves_.count(ir::AsVarLike(expr).get());
+      if (!reserve && descriptors_.insert(type.get()).second) {
+        CheckDescriptor(type, expr->span_);
+      }
     }
     if (auto multi = As<ir::MultiBufferType>(expr->GetType())) {
       const auto space = multi->element_type_->memory_space_;
@@ -315,7 +325,7 @@ class BufferEmissionPreflight : public ir::IRVisitor {
           multi->slot_count_ <= 16 && (space == ir::MemorySpace::Vec || backend::IsMatrixBufferSpace(space)),
           expr->span_)
           << "Direct Buffer multi-buffer emission requires at most 16 slots in Vec or matrix memory";
-      BufferTypeString(multi->element_type_, expr->span_);
+      CheckDescriptor(multi->element_type_, expr->span_);
       const auto bytes = backend::PhysicalBufferBytes(multi->element_type_);
       const auto alignment = backend_->GetMemAlignment(space);
       CHECK_SPAN(multi->slot_count_ == 1 || (bytes && alignment > 0 && *bytes % alignment == 0), expr->span_)
@@ -324,6 +334,12 @@ class BufferEmissionPreflight : public ir::IRVisitor {
     CHECK_SPAN(!As<ir::Submit>(expr) && !As<ir::TupleGetItemExpr>(expr), expr->span_)
         << "Direct Buffer IR codegen does not yet support task submissions or tuple projections";
     IRVisitor::VisitExpr(expr);
+  }
+
+  void CheckDescriptor(const ir::BufferTypePtr& type, const ir::Span& span) const {
+    CHECK_SPAN(conversion_supported_ || type->pad_ != ir::PadValue::min, span)
+        << "Direct Buffer minimum padding requires A2/A3";
+    BufferTypeString(type, span);
   }
 
   void VisitStmt(const ir::StmtPtr& stmt) override {
@@ -335,7 +351,8 @@ class BufferEmissionPreflight : public ir::IRVisitor {
                stmt->span_)
         << "Statement '" << stmt->TypeName() << "' is not supported by direct Buffer IR codegen";
     if (auto ret = As<ir::ReturnStmt>(stmt)) {
-      CHECK_SPAN(depth_ == 0, ret->span_) << "Direct Buffer IR codegen supports only a final function return";
+      CHECK_SPAN(depth_ == 0 || ret == lane_returns_.first || ret == lane_returns_.second, ret->span_)
+          << "Direct Buffer IR codegen supports only final function or peer lane returns";
       CHECK_SPAN(ret->value_.size() == function_->return_types_.size(), ret->span_)
           << "Direct Buffer IR return values must match the declared GM tensor results";
       for (size_t i = 0; i < ret->value_.size(); ++i) {
@@ -346,9 +363,12 @@ class BufferEmissionPreflight : public ir::IRVisitor {
                    ret->span_)
             << "Direct Buffer IR returns must be normalized GM tensor parameters";
       }
-      returned_ = true;
+      returned_ = depth_ == 0;
     }
     if (auto assign = As<ir::AssignStmt>(stmt)) {
+      if (ir::IsOp(As<ir::Call>(assign->value_), "buffer.peer_reserve")) {
+        peer_reserves_.insert(assign->var_.get());
+      }
       if (As<ir::ScalarType>(assign->var_->GetType())) step_proof_.Define(assign->var_, assign->value_);
       CHECK_SPAN(As<ir::BufferType>(assign->var_->GetType()) ||
                      As<ir::MultiBufferType>(assign->var_->GetType()) ||
@@ -415,6 +435,11 @@ class BufferEmissionPreflight : public ir::IRVisitor {
   }
 
   void VisitExpr_(const ir::CallPtr& call) override {
+    if (ir::cross_core_pipe::IsPeerPipeSetup(call) || ir::cross_core_pipe::IsBufferPeerTransport(call)) {
+      CHECK_SPAN(conversion_supported_, call->span_) << "Direct Buffer peer transport requires A2/A3";
+      IRVisitor::VisitExpr_(call);
+      return;
+    }
     // Physical synchronization has no Tile/MemRef operands. Admit the existing
     // operations here and let the ordinary backend validate/emit them; Buffer
     // IR must not need a second flag emitter or reconstruct logical Tile IR.
@@ -428,6 +453,12 @@ class BufferEmissionPreflight : public ir::IRVisitor {
     }
     uses_spmd_blocks |= ir::IsOp(call, "buffer.get_block_idx") || ir::IsOp(call, "buffer.get_block_num");
     uses_spmd_subblock |= ir::IsOp(call, "buffer.get_subblock_idx");
+    if (ir::IsOp(call, "buffer.gm_read")) {
+      CHECK_SPAN(conversion_supported_ && function_->func_type_ == ir::FunctionType::AIC, call->span_)
+          << "Direct Buffer GM scalar read requires A2/A3 AIC";
+      IRVisitor::VisitExpr_(call);
+      return;
+    }
     if (backend::FindBufferConversionRecipe(call->op_->name_) ||
         backend::FindBufferIndexedRecipe(call->op_->name_) || ir::IsOp(call, "buffer.ci") ||
         ir::IsOp(call, "buffer.ci_workspace")) {
@@ -554,10 +585,12 @@ class BufferEmissionPreflight : public ir::IRVisitor {
   std::vector<std::unordered_map<const ir::Var*, ir::ExprPtr>> loop_slots_;
   ir::PositiveLoopStepProof step_proof_;
   ir::FunctionPtr function_;
+  std::pair<ir::ReturnStmtPtr, ir::ReturnStmtPtr> lane_returns_;
   bool conversion_supported_;
   const backend::Backend* backend_;
   std::unordered_map<const ir::Var*, ir::ParamDirection> tensor_parameters_;
   std::unordered_set<const ir::BufferType*> descriptors_;
+  std::unordered_set<const ir::Var*> peer_reserves_;
 };
 
 }  // namespace
@@ -587,19 +620,16 @@ void PTOCodegen::GenerateBufferFunction(const ir::FunctionPtr& func) {
   BufferEmissionPreflight preflight(func, GetBackendHandler()->GetPtoTargetArch() == "a2a3", backend_);
   preflight.VisitFunction(func);
   preflight.CheckReturns();
-  const auto tensor_views = PrepareTensorParameterViews(*func, /*buffer_ir=*/true, {});
+  const auto tensor_views = PrepareTensorParameterViews(*func, {});
 
   ir::CanonicalSlotCollector canonical_slots;
   canonical_slots.VisitFunction(func);
   CHECK_SPAN(func->GetAttr<bool>(ir::kAttrPyptoAutosync) || canonical_slots.unsupported_bases.empty(),
              func->span_)
       << "Direct Buffer delegated slot selection requires a qualified nonnegative canonical modulo";
-  fs_.Reset();
   fs_.unsigned_slot_remainders = std::move(canonical_slots.remainders);
   fs_.normalized_slot_indices = std::move(canonical_slots.normalized_indices);
   fs_.buffer_ir = true;
-  fs_.current_function = func;
-  fs_.truncating_floor_div_mod = PrepareScalarFloorDivMod(func->body_, func->params_);
   fs_.nonempty_buffer_transfers =
       ir::BufferRuntimeValidAnalysis(func, /*collect_guards=*/true).NonEmptyTransfers();
   // Match PTOParam's existing GM ABI: tensor pointers precede scalar values,
@@ -621,7 +651,9 @@ void PTOCodegen::GenerateBufferFunction(const ir::FunctionPtr& func) {
     stream_ << name << ": ";
     if (auto tensor = As<ir::TensorType>(parameters[i]->GetType())) {
       stream_ << "!pto.ptr<" << GetTypeString(tensor->dtype_) << ">";
-      RegisterBasePtr(parameters[i], name);
+      if (!BindGMPipeWorkspace(parameters[i])) {
+        RegisterBasePtr(parameters[i], name);
+      }
     } else {
       stream_ << GetTypeString(As<ir::ScalarType>(parameters[i]->GetType())->dtype_);
     }
@@ -663,7 +695,7 @@ void PTOCodegen::GenerateBufferFunction(const ir::FunctionPtr& func) {
   }
   // Reserve every ABI name before assigning view names.
   for (const auto& param : parameters) {
-    if (As<ir::TensorType>(param->GetType())) {
+    if (As<ir::TensorType>(param->GetType()) && !IsGMPipeWorkspaceParameter(param)) {
       BindTensorView(param, NewNamedTemp(param->name_hint_ + "_view"));
     }
   }
@@ -749,8 +781,32 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
     return false;
   }
   SpanScope call_loc(this, &call->span_);
-  if (ir::IsOp(call, "buffer.get_block_idx") || ir::IsOp(call, "buffer.get_block_num") ||
-      ir::IsOp(call, "buffer.get_subblock_idx")) {
+  if (ir::IsOp(call, "buffer.peer_reserve") || ir::IsOp(call, "buffer.peer_pop")) {
+    INTERNAL_CHECK_SPAN(result, call->span_) << "Buffer receive storage requires an SSA result";
+    const auto name = NewNamedTemp(result->name_hint_);
+    BindVarToMlir(result, name);
+    fs_.current_result_buf = name;
+    if (ir::IsOp(call, "buffer.peer_reserve")) {
+      backend::pto_ops_detail::EmitPeerReserve(call, *this);
+    } else {
+      const auto type = As<ir::BufferType>(result->GetType());
+      RegisterTileBufType(name, BufferTypeString(type, call->span_));
+      std::pair<std::string, std::string> valid;
+      if (type->valid_shape_ != type->shape_) {
+        const auto extents = As<ir::MakeTuple>(call->args_[1]);
+        valid.first = EmitBufferIntegerOperand(extents->elements_[0], DataType::INDEX);
+        valid.second = EmitBufferIntegerOperand(extents->elements_[1], DataType::INDEX);
+      }
+      backend::pto_ops_detail::EmitBufferPeerTransport(call, *this, valid);
+    }
+    fs_.current_result_buf.clear();
+  } else if (ir::IsOp(call, "buffer.peer_reserve_addr")) {
+    INTERNAL_CHECK_SPAN(result, call->span_) << "Buffer reserve address requires an SSA result";
+    BindVarToMlir(result, GetExprAsCode(call->args_[0]));
+  } else if (ir::cross_core_pipe::IsBufferPeerTransport(call)) {
+    backend::pto_ops_detail::EmitBufferPeerTransport(call, *this);
+  } else if (ir::IsOp(call, "buffer.get_block_idx") || ir::IsOp(call, "buffer.get_block_num") ||
+             ir::IsOp(call, "buffer.get_subblock_idx")) {
     INTERNAL_CHECK_SPAN(result, call->span_) << "Internal error: Buffer SPMD query needs an SSA result";
     const std::string argument = ir::IsOp(call, "buffer.get_block_idx")   ? GetSpmdBlockIdxArgSSA()
                                  : ir::IsOp(call, "buffer.get_block_num") ? GetSpmdBlockNumArgSSA()
@@ -759,6 +815,12 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
         << "Internal error: Buffer SPMD query requires a kernel ABI parameter";
     const auto name = NewNamedTemp(result->name_hint_);
     Emit(name + " = arith.index_cast " + argument + " : i32 to index");
+    BindVarToMlir(result, name);
+  } else if (ir::IsOp(call, "buffer.gm_read")) {
+    INTERNAL_CHECK_SPAN(result, call->span_) << "Buffer GM scalar read requires an SSA result";
+    registry.ValidateBufferCall(call);
+    const auto name = NewNamedTemp(result->name_hint_);
+    backend::pto_ops_detail::EmitScalarTensorRead(call, *this, name);
     BindVarToMlir(result, name);
   } else if (ir::IsOp(call, "buffer.read") || ir::IsOp(call, "buffer.write")) {
     // Registry validation proves dense layout and constant active coordinates.

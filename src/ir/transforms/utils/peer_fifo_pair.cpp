@@ -65,8 +65,15 @@ struct Endpoint {
       const auto assign = As<AssignStmt>(stmt);
       const auto decl = GetCallFromStmt(stmt);
       if (!assign || !decl) continue;
-      if (IsOp(decl, "system.reserve_buffer")) {
+      if (IsOp(decl, "system.reserve_buffer") || IsOp(decl, "buffer.peer_reserve")) {
         if (!reserve_names.insert(decl->GetKwarg<std::string>("name", "")).second) return false;
+      } else if (IsOp(decl, "buffer.peer_reserve_addr") && decl->args_.size() == 1) {
+        const auto reserve = Declaration(decl->args_[0]);
+        if (!IsOp(reserve, "buffer.peer_reserve")) {
+          return false;
+        }
+        declarations.emplace(assign->var_.get(), reserve);
+        continue;
       } else if (!IsOp(decl, "system.import_peer_buffer")) {
         continue;
       }
@@ -86,7 +93,8 @@ bool Linked(const Endpoint& writer, const PeerPipeBinding& outgoing, const Endpo
   const auto import = writer.Declaration(outgoing.initializer->args_[direction]);
   const auto reserve = reader.Declaration(incoming.initializer->args_[direction]);
   return import && reserve && IsOp(import, "system.import_peer_buffer") &&
-         IsOp(reserve, "system.reserve_buffer") && !reserve->GetKwarg<std::string>("name", "").empty() &&
+         (IsOp(reserve, "system.reserve_buffer") || IsOp(reserve, "buffer.peer_reserve")) &&
+         !reserve->GetKwarg<std::string>("name", "").empty() &&
          import->GetKwarg<std::string>("name", "") == reserve->GetKwarg<std::string>("name", "") &&
          import->GetKwarg<std::string>("peer_func", "") == reader.call.inner_callee->name_;
 }
@@ -145,8 +153,11 @@ class ProjectStreams {
       // slot untouched: native emission can widen a narrow column extent.
       if (subblock_ && !cube_ && site.kind == PeerTransportKind::Push) {
         const auto rows = site.descriptor->valid_shape_.front();
-        if (rows < 0) return Fail("AIV push has a dynamic valid row extent");
-        shape = rows == 0 ? "empty" : "writes";
+        const auto call = GetCallFromStmt(site.statement);
+        if (!cross_core_pipe::IsBufferPeerTransport(call) && rows < 0) {
+          return Fail("AIV push has a dynamic valid row extent");
+        }
+        shape = site.empty_payload ? "empty" : "writes";
       }
       const Stream wire{site.pipe_id, dir};
       Step message{StepKind::Message, wire, shape};
@@ -238,11 +249,13 @@ class ProjectStreams {
   }
   std::string Bound(const ExprPtr& value) const {
     if (auto integer = transform_utils::EvalConstInt(value)) return std::to_string(*integer);
-    if (const auto call = As<Call>(value); call && IsOp(call, "tile.get_block_idx")) {
+    if (const auto call = As<Call>(value);
+        IsOp(call, "tile.get_block_idx") || IsOp(call, "buffer.get_block_idx")) {
       return "block";
     }
     if (subblock_) {
-      if (const auto call = As<Call>(value); call && IsOp(call, "tile.get_subblock_idx")) {
+      if (const auto call = As<Call>(value);
+          IsOp(call, "tile.get_subblock_idx") || IsOp(call, "buffer.get_subblock_idx")) {
         return "subblock";
       }
     }
@@ -523,8 +536,10 @@ FunctionPtr PlanLocalEndpoint(const WrapperCallInfo& call, const FunctionPtr& gr
   CHECK(transport.pipes.size() == 1) << "local FIFO workspace requires one qualified native pipe";
   const auto storage = ValidateWorkspace(layout, group, transport.pipes);
   CHECK(storage.empty()) << storage;
-  const auto borrow = AnalyzePeerBorrowUses(fn, transport);
-  CHECK(borrow.unavailable.empty()) << borrow.unavailable;
+  if (fn->ir_stage_ == FunctionIRStage::Functional) {
+    const auto borrow = AnalyzePeerBorrowUses(fn, transport);
+    CHECK(borrow.unavailable.empty()) << borrow.unavailable;
+  }
 
   const auto parameters = invocation.parameters.find(fn->name_);
   const auto local = ImportPeerLocalEffects(

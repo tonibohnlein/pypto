@@ -149,6 +149,10 @@ struct SyncResolvedView {
   bool axis_swapped = false;         // True when handle views `root_id` through NZ <-> ZN transpose
   bool valid_matrix_coords = false;  // True when handle coordinates map to canonical root_id rows/cols
   bool static_full_valid = false;    // Full static valid_shape & untouched by buffer.set_validshape
+  // Within-slot geometry for a receive starts at the reserve's first slot.
+  // A transport consumer must rebase it using the captured pop occurrence.
+  const Var* peer_borrow = nullptr;
+  std::optional<backend::BufferSyncByteWindow> peer_reserve;
   std::optional<StridedByteFootprint> vec_lattice;
   std::optional<MatrixBoxFootprint> matrix_box;
   IterationFiber fiber;
@@ -174,7 +178,8 @@ struct ResolvedOperandFootprint {
 class SyncFootprintResolver {
  public:
   explicit SyncFootprintResolver(const FunctionPtr& owner, const SyncControlRangeProver* prover = nullptr,
-                                 bool run_scalar_layout_check = true, std::string target = "");
+                                 bool run_scalar_layout_check = true, std::string target = "",
+                                 bool resolve_peer_slots = false);
 
   const std::vector<SyncCanonicalRoot>& Roots() const { return roots_; }
   const SyncCanonicalRoot* Root(size_t root_id) const;
@@ -188,7 +193,8 @@ class SyncFootprintResolver {
 
   ResolvedOperandFootprint ResolveOperand(const Stmt* cut, const CallPtr& call, size_t arg_idx,
                                           BufferAccess mode, MemorySpace space,
-                                          bool enable_refresh_kill = true, bool disjoint_gm = false) const;
+                                          bool enable_refresh_kill = true, bool disjoint_gm = false,
+                                          bool peer_slot_relative = false) const;
 
   bool OverlapsDynamicValid(MemorySpace space, const backend::BufferSyncByteWindow& window) const;
   const SyncControlRangeProver& Prover() const { return *prover_; }
@@ -203,10 +209,12 @@ class SyncFootprintResolver {
   std::unique_ptr<SyncControlRangeProver> owned_prover_;
   const SyncControlRangeProver* prover_ = nullptr;
   std::string target_;
+  bool resolve_peer_slots_;
 
   std::vector<SyncCanonicalRoot> roots_;
   std::unordered_map<const Expr*, SyncResolvedView> views_;
   std::unordered_map<const Expr*, ExprPtr> gm_roots_;
+  std::unordered_map<const Expr*, backend::BufferSyncByteWindow> peer_reserves_;
   std::unordered_set<const Expr*> dynamic_valid_targets_;
   std::unordered_set<MemorySpace> dynamic_valid_unbounded_spaces_;
   std::vector<std::pair<MemorySpace, backend::BufferSyncByteWindow>> dynamic_valid_windows_;

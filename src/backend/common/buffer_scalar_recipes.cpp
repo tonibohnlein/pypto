@@ -88,6 +88,35 @@ ir::MakeTuplePtr MakeBufferScalarGMExtent(const ir::TensorType& tensor, const ir
   return std::make_shared<ir::MakeTuple>(std::vector<ir::ExprPtr>(tensor.shape_.size(), one), span);
 }
 
+bool SupportsBufferGMRead(const std::vector<ir::ExprPtr>& args) {
+  if (args.size() != 2 || !ir::AsVarLike(args[0])) return false;
+  const auto source = ir::As<ir::TensorType>(args[0]->GetType());
+  const auto indices = ir::As<ir::MakeTuple>(args[1]);
+  if (!IsBufferScalarGMSource(source) || source->tensor_view_ || !indices ||
+      indices->elements_.size() != source->shape_.size()) {
+    return false;
+  }
+  const auto last = ir::As<ir::ConstInt>(indices->elements_.back());
+  const auto first = ir::As<ir::ConstInt>(indices->elements_.front());
+  if (first && last) {
+    __int128 offset = first->value_;
+    if (source->shape_.size() == 2) {
+      offset = offset * ir::As<ir::ConstInt>(source->shape_[1])->value_ + last->value_;
+    }
+    if (offset >= std::numeric_limits<int64_t>::max() / source->dtype_.GetByte()) return false;
+  }
+  for (size_t axis = 0; axis < source->shape_.size(); ++axis) {
+    const auto& index = indices->elements_[axis];
+    const auto type = index ? ir::As<ir::ScalarType>(index->GetType()) : nullptr;
+    if (!type || (type->dtype_ != DataType::INDEX && !type->dtype_.IsSignedInt())) return false;
+    const auto coordinate = ir::As<ir::ConstInt>(index);
+    const auto length = ir::As<ir::ConstInt>(source->shape_[axis]);
+    if (coordinate && (coordinate->value_ < 0 || (length && coordinate->value_ >= length->value_)))
+      return false;
+  }
+  return true;
+}
+
 bool SupportsBufferScalarTransfer(const std::vector<ir::ExprPtr>& args, bool load) {
   if (args.size() != 4) return false;
   for (const auto& arg : args)

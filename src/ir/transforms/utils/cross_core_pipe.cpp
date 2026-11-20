@@ -55,6 +55,51 @@ namespace pypto {
 namespace ir {
 namespace cross_core_pipe {
 
+bool IsPeerReserveDescriptor(const BufferTypePtr& type) {
+  return type && type->shape_.size() == 1 && type->valid_shape_ == type->shape_ &&
+         type->dtype_ == DataType::UINT8 &&
+         (type->memory_space_ == MemorySpace::Vec || type->memory_space_ == MemorySpace::Mat) &&
+         type->blayout_ == TileLayout::row_major && type->slayout_ == TileLayout::none_box &&
+         type->fractal_ == 1 && type->pad_ == PadValue::null && type->compact_ == CompactMode::null;
+}
+
+BufferTypePtr MakePeerReserveDescriptor(int64_t bytes, MemorySpace space) {
+  return std::make_shared<BufferType>(std::vector<int64_t>{bytes}, DataType::UINT8, space,
+                                      std::vector<int64_t>{bytes}, TileLayout::row_major,
+                                      TileLayout::none_box, 1);
+}
+
+bool IsPeerPipeSetup(const CallPtr& call) {
+  return op_predicates::IsInitializePipe(call) || IsOp(call, "system.reserve_buffer") ||
+         IsOp(call, "system.import_peer_buffer") || IsOp(call, "buffer.peer_reserve") ||
+         IsOp(call, "buffer.peer_reserve_addr");
+}
+
+bool IsBufferPeerTransport(const CallPtr& call) {
+  return IsOp(call, "buffer.peer_push") || IsOp(call, "buffer.peer_pop") || IsOp(call, "buffer.peer_free");
+}
+
+std::pair<ReturnStmtPtr, ReturnStmtPtr> TerminalPeerLaneReturns(const FunctionPtr& function) {
+  if (function->func_type_ != FunctionType::AIV || !function->GetAttr<bool>(kAttrDualAivDispatch)) {
+    return {};
+  }
+  const auto statements = transform_utils::FlattenToStmts(function->body_);
+  const auto branch = statements.empty() ? nullptr : As<IfStmt>(statements.back());
+  if (!branch || !branch->else_body_ || !branch->return_vars_.empty()) {
+    return {};
+  }
+  const auto tail_return = [](const StmtPtr& arm) -> ReturnStmtPtr {
+    const auto body = transform_utils::FlattenToStmts(arm);
+    return body.empty() ? nullptr : As<ReturnStmt>(body.back());
+  };
+  const auto then_return = tail_return(branch->then_body_);
+  const auto else_return = tail_return(*branch->else_body_);
+  if (!then_return || !else_return || then_return->value_ != else_return->value_) {
+    return {};
+  }
+  return {then_return, else_return};
+}
+
 namespace {
 
 const auto& FlattenBody = transform_utils::FlattenToStmts;
@@ -73,7 +118,28 @@ int IncomingDirection(core_affinity::CoreSide side) {
   return side == core_affinity::CoreSide::AIC ? core_affinity::kDirMaskV2C : core_affinity::kDirMaskC2V;
 }
 
-using ReserveDeclarations = std::unordered_map<const Var*, CallPtr>;
+struct ReserveDeclaration {
+  VarPtr storage;
+  CallPtr call;
+};
+using ReserveDeclarations = std::unordered_map<const Var*, ReserveDeclaration>;
+
+void RecordReserve(const StmtPtr& stmt, const CallPtr& call, ReserveDeclarations& reserves) {
+  const auto assign = As<AssignStmt>(stmt);
+  if (!assign) {
+    return;
+  }
+  if (IsOp(call, "system.reserve_buffer") || IsOp(call, "buffer.peer_reserve")) {
+    reserves.emplace(assign->var_.get(), ReserveDeclaration{assign->var_, call});
+  } else if (IsOp(call, "buffer.peer_reserve_addr") && call->args_.size() == 1) {
+    const auto reserve = AsVarLike(call->args_[0]);
+    const auto source = reserves.find(reserve.get());
+    if (source != reserves.end() && IsOp(source->second.call, "buffer.peer_reserve")) {
+      const auto declaration = source->second;
+      reserves.emplace(assign->var_.get(), declaration);
+    }
+  }
+}
 
 // Tile TPOP on A2/A3 issues TLOAD on MTE2, with the local slot offset based
 // on SLOT_SIZE even when its payload is shorter (TPush.hpp: Consumer::pop).
@@ -96,16 +162,25 @@ std::optional<ConsumerReceiveStorage> BindConsumerStorage(const CallPtr& setup, 
   if (declaration == reserves.end()) {
     return std::nullopt;
   }
-  const int64_t size = declaration->second->GetKwarg<int>("size", 0);
+  const int64_t size = declaration->second.call->GetKwarg<int>("size", 0);
   // All operands are widened from i32. The depth-stride product and the
   // reserve's placed end therefore fit i64 before performing the arithmetic.
   if (size < local * stride) {
     return std::nullopt;
   }
-  const int64_t base = declaration->second->GetKwarg<int>("base", kAutoBufferBase);
-  return ConsumerReceiveStorage{
-      reserve, cube ? MemorySpace::Mat : MemorySpace::Vec,    PipeType::MTE2, local, stride,
-      size,    base >= 0 ? std::optional{base} : std::nullopt};
+  const int64_t base = declaration->second.call->GetKwarg<int>("base", kAutoBufferBase);
+  const auto space = cube ? MemorySpace::Mat : MemorySpace::Vec;
+  if (const auto type = As<BufferType>(declaration->second.storage->GetType());
+      type && (type->memory_space_ != space || declaration->second.storage == reserve)) {
+    return std::nullopt;
+  }
+  return ConsumerReceiveStorage{declaration->second.storage,
+                                space,
+                                PipeType::MTE2,
+                                local,
+                                stride,
+                                size,
+                                base >= 0 ? std::optional{base} : std::nullopt};
 }
 
 // Each nested body closes its own borrows without popping an inherited queue
@@ -151,7 +226,7 @@ class ConsumerFifo {
       }
       if (op_predicates::IsTPop(call)) {
         const auto assign = As<AssignStmt>(stmt);
-        CHECK_SPAN(assign && IsOp(call, pop_), stmt->span_)
+        CHECK_SPAN(assign && (IsOp(call, pop_) || IsOp(call, "buffer.peer_pop")), stmt->span_)
             << "Cross-core FIFO requires a tpop result on its consumer core";
         const int id = established_pipe_ids_ ? call->GetKwarg<int>("id", 0) : 0;
         CHECK_SPAN(active_.emplace(assign->var_.get(), Borrow{id, scope}).second, stmt->span_)
@@ -163,7 +238,9 @@ class ConsumerFifo {
       } else if (op_predicates::IsTFree(call)) {
         const auto tile = call->args_.empty() ? nullptr : AsVarLike(call->args_[0]);
         const auto borrow = active_.find(tile.get());
-        CHECK_SPAN(IsOp(call, free_) && borrow != active_.end() && borrow->second.scope == scope, stmt->span_)
+        CHECK_SPAN((IsOp(call, free_) || IsOp(call, "buffer.peer_free")) && borrow != active_.end() &&
+                       borrow->second.scope == scope,
+                   stmt->span_)
             << "Cross-core FIFO cannot match tfree with an outstanding tpop in the same scope";
         const int id = borrow->second.id;
         auto& queue = queues_.at(id);
@@ -350,16 +427,14 @@ class C2VReceiveSites : public IRVisitor {
     const auto call = transform_utils::GetCallFromStmt(stmt);
     if (IsOp(call, "system.aiv_initialize_pipe")) {
       RecordRing(call);
-    } else if (IsOp(call, "tile.tpop_from_aic")) {
+    } else if (IsOp(call, "tile.tpop_from_aic") || IsOp(call, "buffer.peer_pop")) {
       RecordPop(stmt, call);
-    } else if (IsOp(call, "system.reserve_buffer")) {
-      if (const auto assign = As<AssignStmt>(stmt)) {
-        reserve_declarations.emplace(assign->var_.get(), call);
-      }
     } else if (IsOp(call, "system.wait_flag")) {
       has_explicit_wait = true;
     } else if (loop_ && (As<BreakStmt>(stmt) || As<ContinueStmt>(stmt) || As<ReturnStmt>(stmt))) {
       early_exit_loops.insert(loop_);
+    } else {
+      RecordReserve(stmt, call, reserve_declarations);
     }
     IRVisitor::VisitStmt(stmt);
   }
@@ -409,6 +484,14 @@ class C2VReceiveSites : public IRVisitor {
 
   void RecordPop(const StmtPtr& stmt, const CallPtr& call) {
     const auto assign = As<AssignStmt>(stmt);
+    if (IsOp(call, "buffer.peer_pop") && assign && call->args_.size() == 2) {
+      const auto type = As<BufferType>(assign->var_->GetType());
+      const auto valid = As<MakeTuple>(call->args_[1]);
+      const auto rows = valid && valid->elements_.size() == 2 ? As<ConstInt>(valid->elements_[0]) : nullptr;
+      sites.push_back({stmt.get(), call->GetKwarg<int>("id", 0), loop_, unconditional_,
+                       !rows || rows->value_ != 0, backend::PhysicalBufferBytes(type)});
+      return;
+    }
     const auto tile = assign ? As<TileType>(assign->var_->GetType()) : nullptr;
     if (!tile || tile->memory_space_ != MemorySpace::Vec) {
       return;
@@ -771,23 +854,49 @@ PeerTransportSite BindNativeSite(const StmtPtr& stmt, int id, core_affinity::Cor
   const auto call = transform_utils::GetCallFromStmt(stmt);
   const bool push = op_predicates::IsTPush(call);
   const bool pop = op_predicates::IsTPop(call);
-  CHECK(!push || IsOp(call, core_side_ops::TPushOp(side))) << "Peer push belongs to the other core";
+  const bool buffer_stage = IsBufferPeerTransport(call);
+  CHECK(!push || buffer_stage || IsOp(call, core_side_ops::TPushOp(side)))
+      << "Peer push belongs to the other core";
   CHECK(call->GetKwarg<int>("split", push ? -1 : kSplitNone) == kSplitNone)
       << "Peer FIFO requires no-split tile transfer";
   const bool cube = side == core_affinity::CoreSide::AIC;
   const int direction = (push == cube) ? core_affinity::kDirMaskC2V : core_affinity::kDirMaskV2C;
   CHECK(pipe.direction_mask & direction) << "Peer FIFO transport direction is disabled on its initializer";
-  CHECK(call->args_.size() == (pop ? 0 : 1)) << "Peer FIFO requires unary tile transport";
+  const size_t arguments = buffer_stage ? (pop || push ? 2 : 1) : (pop ? 0 : 1);
+  CHECK(call->args_.size() == arguments) << "Peer FIFO transfer has invalid operands";
   const auto tile = pop ? As<AssignStmt>(stmt)->var_ : AsVarLike(call->args_[0]);
-  const auto type = tile ? As<TileType>(tile->GetType()) : nullptr;
   const auto space = cube ? (push ? MemorySpace::Acc : MemorySpace::Mat) : MemorySpace::Vec;
-  CHECK(type && type->memory_space_ == space) << "Peer FIFO tile has no qualified native memory space";
-  const auto buffer = backend::DescribePeerTransferBuffer(type);
-  CHECK(buffer && buffer->capacity_bytes <= pipe.slot_bytes) << "Peer FIFO cannot enclose tile in one slot";
+  CHECK(tile) << "Peer FIFO transfer needs a named payload";
+  BufferTypePtr descriptor;
+  if (buffer_stage) {
+    descriptor = As<BufferType>(tile->GetType());
+    if (pop) {
+      CHECK(pipe.receive && call->args_[0] == pipe.receive->reserve)
+          << "Peer pop reserve must match the dominating initializer for its pipe";
+    }
+  } else if (const auto buffer = backend::DescribePeerTransferBuffer(As<TileType>(tile->GetType()))) {
+    descriptor = buffer->descriptor;
+  }
+  const auto bytes = backend::PhysicalBufferBytes(descriptor);
+  CHECK(descriptor && descriptor->memory_space_ == space && descriptor->shape_.size() == 2 && bytes &&
+        *bytes <= static_cast<uint64_t>(pipe.slot_bytes))
+      << "Peer FIFO cannot enclose tile in one slot of the native memory space";
+  bool empty = (pop || push) && EmptyReceive(descriptor);
+  if (buffer_stage && (pop || push)) {
+    const auto valid = As<MakeTuple>(call->args_[1]);
+    CHECK(valid && valid->elements_.size() == 2) << "Peer FIFO requires explicit native valid extents";
+    const auto rows = As<ConstInt>(valid->elements_[0]);
+    const auto cols = As<ConstInt>(valid->elements_[1]);
+    empty = space == MemorySpace::Vec && rows && cols && rows->value_ == 0 && cols->value_ == 0;
+    CHECK(empty ||
+          (rows && cols && rows->value_ == descriptor->shape_[0] && cols->value_ == descriptor->shape_[1]))
+        << "Peer Buffer FIFO requires a full native box or an empty Vec transfer";
+  }
   const int ready = pipe.direction_mask == 3 && direction == core_affinity::kDirMaskV2C ? 2 : 0;
   const auto data = push ? (cube ? PipeType::FIX : PipeType::MTE3) : PipeType::MTE2;
   const auto kind = push ? PeerTransportKind::Push : pop ? PeerTransportKind::Pop : PeerTransportKind::Free;
-  return {stmt, kind, id, tile, space, data, buffer->capacity_bytes, buffer->descriptor, ready, ready + 1};
+  return {stmt,       kind,  id,    tile,     space, data, static_cast<int64_t>(*bytes),
+          descriptor, empty, ready, ready + 1};
 }
 
 ConsumerFifoEvidence InspectConsumerFifo(const FunctionPtr& function, PeerTransportEffects* effects) {
@@ -811,9 +920,7 @@ ConsumerFifoEvidence InspectConsumerFifo(const FunctionPtr& function, PeerTransp
       const auto& stmt = stmts[i];
       const auto call = transform_utils::GetCallFromStmt(stmt);
       if (!call) continue;
-      if (IsOp(call, "system.reserve_buffer")) {
-        if (const auto assign = As<AssignStmt>(stmt)) reserves.emplace(assign->var_.get(), call);
-      } else if (IsOp(call, initialize)) {
+      if (IsOp(call, initialize)) {
         prologue_initializers.insert(call.get());
         const auto id = call->GetKwarg<int>("id", 0);
         const auto receive = BindConsumerStorage(call, side, reserves);
@@ -825,6 +932,8 @@ ConsumerFifoEvidence InspectConsumerFifo(const FunctionPtr& function, PeerTransp
           const bool unique = effects->pipes.emplace(id, BindNativePipe(call, side, receive)).second;
           CHECK(unique && id >= 0) << "Peer FIFO requires a unique nonnegative logical pipe id";
         }
+      } else {
+        RecordReserve(stmt, call, reserves);
       }
     }
     PeerCutVerifier(prologue_initializers).VisitStmt(function->body_);
@@ -878,6 +987,11 @@ PeerTransportEffects AnalyzePeerTransportEffects(const FunctionPtr& function) {
   return effects;
 }
 
+std::string VerifyBufferPeerTransport(const FunctionPtr& function) {
+  PeerTransportEffects effects;
+  return InspectConsumerFifo(function, &effects).unavailable;
+}
+
 namespace {
 
 // Each borrow lives entirely in a linear statement sequence. The enclosing
@@ -919,7 +1033,7 @@ class BorrowReaders : public IRVisitor {
         aliases_[site.tile.get()] = borrows.size();
         birth_.push_back(++ordinal);
         ++active_;
-        const bool empty = EmptyReceive(site.descriptor);
+        const bool empty = site.empty_payload;
         borrows.push_back({stmt, site.pipe_id, pipes_.at(site.pipe_id).receive->local_slots, empty, {}});
         return;
       }

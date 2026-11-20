@@ -122,6 +122,16 @@ struct ConsumerReceiveStorage {
   std::optional<int64_t> placed_base;
 };
 
+/// A byte-addressed local reserve used only by the FIFO's Buffer operations.
+bool IsPeerReserveDescriptor(const BufferTypePtr& type);
+BufferTypePtr MakePeerReserveDescriptor(int64_t bytes, MemorySpace space);
+
+bool IsPeerPipeSetup(const CallPtr& call);
+bool IsBufferPeerTransport(const CallPtr& call);
+
+/// Return sites in both arms of a terminal dual-AIV dispatch branch.
+std::pair<ReturnStmtPtr, ReturnStmtPtr> TerminalPeerLaneReturns(const FunctionPtr& function);
+
 struct ConsumerPipeCapacity {
   size_t required;
   ConsumerReceiveStorage storage;
@@ -163,6 +173,8 @@ struct PeerTransportSite {
   PipeType data_pipe;
   int64_t capacity_bytes;
   BufferTypePtr descriptor;
+  // Zero-row Vec transfers move no bytes but still execute the protocol.
+  bool empty_payload;
   // Group IDs relative to the physical base allocated by PTOAS. Push waits
   // for batched credit and posts ready; Pop waits ready and posts batched
   // credit. Free issues neither signal. No-split still signals in both AIV lanes.
@@ -180,6 +192,7 @@ struct PeerTransportEffects {
 /// and local capacity alone do not prove matching peer control, local
 /// consumer completion before reuse, or ownership of ordinary payloads.
 PeerTransportEffects AnalyzePeerTransportEffects(const FunctionPtr& function);
+std::string VerifyBufferPeerTransport(const FunctionPtr& function);
 
 struct PeerReaderCuts {
   StmtPtr first;

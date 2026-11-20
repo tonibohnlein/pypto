@@ -71,6 +71,15 @@ inline bool SupportsBufferAccRowTrimCapacity(int64_t rows, int64_t columns) {
   return rows > 0 && rows <= 8192 && columns > 0 && columns <= 4095;
 }
 
+// The A2/A3 full-box BF16 ND-to-NZ receive, Mat-to-Left move and cube
+// multiply preserve this tag on their descriptors. Their active byte
+// geometry covers the entire box and does not synthesize padding.
+inline bool SupportsMatrixBufferPadding(ir::MemorySpace space, DataType dtype, ir::PadValue pad,
+                                        bool full_valid) {
+  return pad == ir::PadValue::null || (full_valid && dtype == DataType::BF16 && pad == ir::PadValue::min &&
+                                       (space == ir::MemorySpace::Mat || space == ir::MemorySpace::Left));
+}
+
 /// Runtime Acc row-store metadata keeps the static NZ physical pitch. This
 /// descriptor predicate proves no runtime equality/range/availability; those
 /// are checked at the actual store by BufferRuntimeValidAnalysis.
@@ -135,16 +144,21 @@ inline bool IsAlignedDenseVecBuffer(const ir::BufferTypePtr& type) {
   return IsAlignedDenseVecBufferGeometry(type) && type->valid_shape_[0] > 0 && type->valid_shape_[1] > 0;
 }
 
-// The zero pad tag carries the instruction's fill value. Once full-valid, it
-// does not change Vec storage geometry and can survive a conversion or store.
-inline bool IsFullZeroPaddedVec(const ir::BufferTypePtr& type) {
-  return IsAlignedDenseVecBufferGeometry(type, ir::PadValue::zero) &&
-         IsDenseBufferTransferDtype(type->dtype_) && type->valid_shape_ == type->shape_;
+inline bool IsBufferVecFillValue(ir::PadValue pad, DataType dtype) {
+  return pad == ir::PadValue::zero || (pad == ir::PadValue::min && dtype == DataType::FP32);
 }
 
-inline bool IsFullZeroPaddedVec(const ir::TileTypePtr& tile, const ir::TileView& view) {
+// The pad tag selects the fill value. On a full-valid Vec descriptor it
+// has no effect on physical storage geometry.
+inline bool IsFullPaddedVec(const ir::BufferTypePtr& type) {
+  return type && IsBufferVecFillValue(type->pad_, type->dtype_) &&
+         IsAlignedDenseVecBufferGeometry(type, type->pad_) && IsDenseBufferTransferDtype(type->dtype_) &&
+         type->valid_shape_ == type->shape_;
+}
+
+inline bool IsFullPaddedVec(const ir::TileTypePtr& tile, const ir::TileView& view) {
   if (tile->shape_.size() != 2 || !IsDenseBufferTransferDtype(tile->dtype_) ||
-      !IsDenseVecBufferTile(tile, view, ir::PadValue::zero))
+      !IsBufferVecFillValue(view.pad, tile->dtype_) || !IsDenseVecBufferTile(tile, view, view.pad))
     return false;
   if (view.valid_shape.empty()) return true;
   if (view.valid_shape.size() != tile->shape_.size()) return false;
@@ -154,6 +168,10 @@ inline bool IsFullZeroPaddedVec(const ir::TileTypePtr& tile, const ir::TileView&
     if (!full || !valid || full->value_ != valid->value_) return false;
   }
   return true;
+}
+
+inline bool IsFullZeroPaddedVec(const ir::BufferTypePtr& type) {
+  return IsFullPaddedVec(type) && type->pad_ == ir::PadValue::zero;
 }
 
 /// Native dense tiles represent a logical vector as one row. Apply the same
@@ -180,13 +198,12 @@ inline std::vector<int64_t> MutableBufferValidShape(const std::vector<ir::ExprPt
 /// Physical descriptor projection shared by native operation recipes. The
 /// returned full-shape valid fields describe capacity only, never the actual
 /// active domain; a caller must separately certify original valid metadata.
-inline ir::BufferTypePtr PhysicalLogicalVecDescriptor(const ir::TypePtr& type,
-                                                      bool allow_full_zero_pad = false) {
+inline ir::BufferTypePtr PhysicalLogicalVecDescriptor(const ir::TypePtr& type, bool allow_full_pad = false) {
   const auto tile = ir::As<ir::TileType>(type);
   if (!tile || (tile->shape_.size() != 1 && tile->shape_.size() != 2)) return nullptr;
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
   if (!IsDenseVecBufferTile(tile, view) && !IsColumnVectorBufferTile(tile, view) &&
-      !(allow_full_zero_pad && IsFullZeroPaddedVec(tile, view)))
+      !(allow_full_pad && IsFullPaddedVec(tile, view)))
     return nullptr;
   const auto offset = ir::As<ir::ConstInt>(view.start_offset);
   if (view.start_offset && (!offset || offset->value_ != 0)) return nullptr;
@@ -217,9 +234,8 @@ inline ir::BufferTypePtr PhysicalLogicalVecDescriptor(const ir::TypePtr& type,
 }
 
 /// Static positive-valid logical descriptors shared by heterogeneous recipes.
-inline ir::BufferTypePtr StaticLogicalBufferDescriptor(const ir::TypePtr& type,
-                                                       bool allow_full_zero_pad = false) {
-  const auto physical = PhysicalLogicalVecDescriptor(type, allow_full_zero_pad);
+inline ir::BufferTypePtr StaticLogicalBufferDescriptor(const ir::TypePtr& type, bool allow_full_pad = false) {
+  const auto physical = PhysicalLogicalVecDescriptor(type, allow_full_pad);
   const auto tile = ir::As<ir::TileType>(type);
   if (!physical || !tile) return nullptr;
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);

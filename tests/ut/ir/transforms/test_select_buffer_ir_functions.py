@@ -816,6 +816,45 @@ def test_fillpad_defines_zero_suffix_before_cast_and_store(planner):
         torch.testing.assert_close(output, expected)
 
 
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize("width", [5, None], ids=["static-prefix", "unproved-runtime-prefix"])
+def test_minimum_fillpad_before_row_max(width, tmp_path):
+    extent = "cols" if width is None else str(width)
+    program = pl.parse_program(f"""
+@pl.program
+class MinPad:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, source: pl.Tensor[[16, 32], pl.FP32], cols: pl.Scalar[pl.INDEX],
+               output: pl.Out[pl.Tensor[[16, 1], pl.FP32]]) -> pl.Tensor[[16, 1], pl.FP32]:
+        src = pl.load(source, [0, 0], [16, 32])
+        prefix = pl.set_validshape(src, 16, {extent})
+        padded = pl.fillpad(prefix, pad_value=pl.PadValue.min)
+        scratch = pl.tile.create([16, 32], dtype=pl.FP32)
+        maximum = pl.row_max(padded, scratch)
+        return pl.store(maximum, [0, 0], output)
+""")
+    if width is None:
+        assert _kernel(_lower(program, passes.MemoryPlanner.PYPTO)).ir_stage == ir.FunctionIRStage.Functional
+        return
+    lowered = _run_autosync(program)
+    pto = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True, emit_source_loc=False)
+    assert "pto.tfillpad" in pto and "pad=3" in pto and "pto.trowmax" in pto
+    pto_path = tmp_path / "min_pad.pto"
+    pto_path.write_text(pto)
+    _run_ptoas(
+        str(pto_path),
+        str(tmp_path / "min_pad.cpp"),
+        ["--pto-arch=a2", "--pto-level=level3", "--enable-insert-sync=false"],
+    )
+    namespace = {}
+    exec(torch_codegen(lowered), namespace)  # noqa: S102
+    source = -torch.arange(1, 513, dtype=torch.float32).reshape(16, 32)
+    source[:, width:] = 1
+    output = torch.empty(16, 1)
+    namespace["kernel"](source, width, output)
+    torch.testing.assert_close(output, source[:, :width].amax(dim=1, keepdim=True))
+
+
 @pytest.mark.parametrize("planner", _PLANNERS)
 @pytest.mark.parametrize("dynamic", ["offset", "valid"])
 def test_dynamic_window_forms_select_buffer(planner, dynamic):

@@ -66,8 +66,10 @@
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_tuple_results.h"
 #include "pypto/ir/transforms/utils/buffer_valid_analysis.h"
+#include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/normalize_stmt_structure.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/slot_index_qualification.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/property_verifier_registry.h"
@@ -88,7 +90,7 @@ std::vector<int64_t> StaticExtents(const std::vector<ExprPtr>& extents, const Sp
 }
 
 void CheckDenseVecTile(const TileTypePtr& tile, const TileView& view, const Span& span) {
-  CHECK_SPAN(backend::IsDenseVecBufferTile(tile, view) || backend::IsFullZeroPaddedVec(tile, view), span)
+  CHECK_SPAN(backend::IsDenseVecBufferTile(tile, view) || backend::IsFullPaddedVec(tile, view), span)
       << "LowerTileToBuffer: this recipe requires dense rank-1 or rank-2 Vec tiles with a supported "
          "storage dtype";
 }
@@ -151,11 +153,14 @@ bool HasDynamicValid(const BufferTypePtr& type) {
 BufferTypePtr MatrixDescriptor(const TileTypePtr& tile, MemorySpace space, const Span& span,
                                const BufferAccTrimAnalysis* acc_trims) {
   const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
+  const bool full_valid = view.valid_shape.empty() ||
+                          tile_view_semantics::ShapeExprListsEquivalent(view.valid_shape, tile->shape_);
   CHECK_SPAN(tile->shape_.size() == 2 && backend::IsMatrixBufferDtype(space, tile->dtype_) &&
-                 view.pad == PadValue::null && view.stride.empty(),
+                 backend::SupportsMatrixBufferPadding(space, tile->dtype_, view.pad, full_valid) &&
+                 view.stride.empty(),
              span)
       << "LowerTileToBuffer: " << MemorySpaceToString(space)
-      << " recipes require unpadded rank-2 FP16/BF16/FP32/INT8 cube operands or FP32/INT32 accumulators, got "
+      << " recipes require qualified rank-2 cube operand or accumulator padding and dtype, got "
       << tile->dtype_.ToString() << " rank " << tile->shape_.size();
   const auto view_offset = As<ConstInt>(view.start_offset);
   CHECK_SPAN(!view.start_offset || (view_offset && view_offset->value_ == 0), span)
@@ -263,7 +268,7 @@ class StorageIndex : public IRVisitor {
   bool IsWindowDefinition(const ExprPtr& value) const {
     auto source = AsVarLike(value);
     if (auto call = As<Call>(value)) {
-      if (IsOp(call, "tile.slice")) return true;
+      if (IsOp(call, "tile.slice") || op_predicates::IsTPop(call)) return true;
       if (!IsOp(call, "tile.reshape") && !IsOp(call, "tile.reinterpret_view") &&
           !IsOp(call, "tile.set_validshape")) {
         return false;
@@ -363,15 +368,15 @@ class StorageIndex : public IRVisitor {
     const bool has_column = std::any_of(
         storage.members.begin(), storage.members.end(),
         [](const auto& member) { return backend::IsColumnVectorBufferGeometry(member.descriptor); });
-    const bool has_zero_pad =
-        std::any_of(storage.members.begin(), storage.members.end(),
-                    [](const auto& member) { return backend::IsFullZeroPaddedVec(member.descriptor); });
+    const bool has_pad = std::any_of(storage.members.begin(), storage.members.end(), [](const auto& member) {
+      return backend::IsFullPaddedVec(member.descriptor);
+    });
     const auto gather_workspace =
         std::find_if(storage.members.begin(), storage.members.end(),
                      [&](const auto& member) { return gather_workspaces_.count(member.tile.get()) != 0; });
     // Aliases and reuse can give scratch different descriptors over one allocation.
     // The native mask prefix must view the workspace directly, never a reshape.
-    if (backend::IsMatrixBufferSpace(*memory_space) || has_column || has_zero_pad ||
+    if (backend::IsMatrixBufferSpace(*memory_space) || has_column || has_pad ||
         gather_workspace != storage.members.end()) {
       // Addressless typed storage allocates its first member and reshapes other
       // interpretations. A backing tile may precede its workspace reshape, so
@@ -758,10 +763,12 @@ class LocalAccumulatorIndex : public IRVisitor {
 class TileToBufferMutator : public IRMutator {
  public:
   TileToBufferMutator(const StorageIndex& storage, bool guarded_valid,
-                      const LocalAccumulatorIndex* local_accumulators, const StmtPtr& body, FunctionType core)
+                      const LocalAccumulatorIndex* local_accumulators, const StmtPtr& body, FunctionType core,
+                      const cross_core_pipe::PeerTransportEffects& transport)
       : storage_(storage),
         guarded_valid_(guarded_valid),
         core_(core),
+        transport_(transport),
         local_accumulators_(local_accumulators),
         indexed_(body),
         tuples_(body) {
@@ -837,6 +844,10 @@ class TileToBufferMutator : public IRMutator {
     if (As<TileType>(assign->var_->GetType())) {
       auto source = AsVarLike(assign->value_);
       if (source) {
+        if (const auto borrow = peer_borrows_.find(source.get()); borrow != peer_borrows_.end()) {
+          peer_borrows_.emplace(assign->var_.get(), borrow->second);
+          return Empty(assign->span_);
+        }
         const auto recipe = window_recipes_.find(As<TileType>(source->GetType()).get());
         if (recipe != window_recipes_.end()) {
           window_recipes_[As<TileType>(assign->var_->GetType()).get()] = recipe->second;
@@ -1006,6 +1017,9 @@ class TileToBufferMutator : public IRMutator {
   VarPtr Handle(const ExprPtr& value) {
     auto tile = As<TileType>(value->GetType());
     INTERNAL_CHECK_SPAN(tile, value->span_) << "Internal error: Buffer conversion expected a Tile operand";
+    if (const auto borrow = peer_borrows_.find(AsVarLike(value).get()); borrow != peer_borrows_.end()) {
+      return borrow->second;
+    }
     if (auto slot = storage_.slots.find(tile.get()); slot != storage_.slots.end()) {
       const auto& selection = slot->second;
       // Selection is rebuilt at its actual use, where original loop coordinates
@@ -1083,6 +1097,10 @@ class TileToBufferMutator : public IRMutator {
   }
 
   StmtPtr LowerDefinition(const CallPtr& call, const VarPtr& result) {
+    if (cross_core_pipe::IsPeerPipeSetup(call) || op_predicates::IsTPush(call) ||
+        op_predicates::IsTPop(call) || op_predicates::IsTFree(call)) {
+      return LowerPeerDefinition(call, result);
+    }
     if (IsOp(call, "tile.read") || IsOp(call, "tile.write")) {
       auto states = RestoreDataOperands(call);
       use_windows_.clear();
@@ -1232,6 +1250,44 @@ class TileToBufferMutator : public IRMutator {
                                       span);
   }
 
+  StmtPtr LowerPeerDefinition(const CallPtr& call, const VarPtr& result) {
+    if (IsOp(call, "system.reserve_buffer")) {
+      const auto space = core_ == FunctionType::AIC ? MemorySpace::Mat : MemorySpace::Vec;
+      const auto type = cross_core_pipe::MakePeerReserveDescriptor(call->GetKwarg<int>("size"), space);
+      const auto reserve = std::make_shared<Var>(result->name_hint_, type, result->span_);
+      peer_reserves_.emplace(result.get(), reserve);
+      const auto& registry = OpRegistry::GetInstance();
+      auto declaration = registry.CreateInternal("buffer.peer_reserve", {}, call->kwargs_, type, call->span_);
+      auto address = registry.CreateInternal("buffer.peer_reserve_addr", {reserve}, {}, call->span_);
+      return SeqStmts::Flatten({std::make_shared<AssignStmt>(reserve, declaration, call->span_),
+                                std::make_shared<AssignStmt>(result, address, call->span_)},
+                               call->span_);
+    }
+    if (IsOp(call, "system.import_peer_buffer") || op_predicates::IsInitializePipe(call)) {
+      // The address above has the same i32 identity at the authored ABI cut.
+      return result ? StmtPtr(std::make_shared<AssignStmt>(result, call, call->span_))
+                    : StmtPtr(std::make_shared<EvalStmt>(call, call->span_));
+    }
+    if (op_predicates::IsTPop(call)) {
+      const auto& pipe = transport_.pipes.at(call->GetKwarg<int>("id", 0));
+      const auto& reserve = peer_reserves_.at(pipe.receive->reserve.get());
+      const auto type = StorageDescriptor(As<TileType>(result->GetType()), result->span_);
+      const auto borrowed = std::make_shared<Var>(result->name_hint_, type, result->span_);
+      peer_borrows_.emplace(result.get(), borrowed);
+      const auto pop = OpRegistry::GetInstance().CreateInternal("buffer.peer_pop", {reserve, Valid(result)},
+                                                                call->kwargs_, type, call->span_);
+      return std::make_shared<AssignStmt>(borrowed, pop, call->span_);
+    }
+    const auto payload = Handle(call->args_.front());
+    if (op_predicates::IsTFree(call)) {
+      return Operation("buffer.peer_free", {payload}, call->span_, call->kwargs_);
+    }
+    auto statements = RestoreDataOperands(call);
+    statements.push_back(
+        Operation("buffer.peer_push", {payload, Valid(call->args_[0])}, call->span_, call->kwargs_));
+    return SeqStmts::Flatten(std::move(statements), call->span_);
+  }
+
   StmtPtr LowerCall(const CallPtr& call, const VarPtr& result) {
     INTERNAL_CHECK_SPAN(call->op_, call->span_) << "Internal error: device call has no operator";
     // Pipeline membership only constrains storage planning, whose result is
@@ -1239,6 +1295,14 @@ class TileToBufferMutator : public IRMutator {
     // it). Every other attribute still needs an explicit conversion contract.
     CHECK_SPAN(StripAttr(call->attrs_, kPipelineMembershipAttr).empty(), call->span_)
         << "LowerTileToBuffer: device-call attributes require an explicit conversion contract";
+    if (IsOp(call, "tensor.read")) {
+      CHECK_SPAN(result && core_ == FunctionType::AIC && backend::SupportsBufferGMRead(call->args_),
+                 call->span_)
+          << "LowerTileToBuffer: GM scalar read needs a qualified A2/A3 AIC pointer";
+      auto value = OpRegistry::GetInstance().CreateInternal(
+          "buffer.gm_read", {VisitExpr(call->args_[0]), VisitExpr(call->args_[1])}, {}, call->span_);
+      return std::make_shared<AssignStmt>(result, value, call->span_);
+    }
     if (IsOp(call, "tile.read") || IsOp(call, "tile.write")) {
       const auto* context = PassContext::Current();
       const bool scalar_target =
@@ -1786,6 +1850,9 @@ class TileToBufferMutator : public IRMutator {
   CanonicalSlotCollector canonical_slots_;
   bool guarded_valid_;
   FunctionType core_;
+  const cross_core_pipe::PeerTransportEffects& transport_;
+  std::unordered_map<const Var*, VarPtr> peer_reserves_;
+  std::unordered_map<const Var*, VarPtr> peer_borrows_;
   std::unordered_map<const TileType*, CallPtr> window_recipes_;
   std::unordered_map<const TileType*, std::pair<CallPtr, VarPtr>> deferred_windows_;
   std::map<std::pair<const Var*, uint64_t>, std::vector<std::pair<ExprPtr, VarPtr>>> slot_handles_;
@@ -1838,9 +1905,10 @@ ProgramPtr TransformProgram(const ProgramPtr& program) {
       local_accumulators.emplace(function->body_);
       local_accumulators->VisitStmt(function->body_);
     }
+    const auto transport = cross_core_pipe::AnalyzePeerTransportEffects(function);
     TileToBufferMutator mutator(storage, function->GetAttr<bool>(kAttrBufferIrSelected, false),
                                 local_accumulators ? &*local_accumulators : nullptr, function->body_,
-                                function->func_type_);
+                                function->func_type_, transport);
     auto lowered = std::make_shared<Function>(*function);
     lowered->body_ = mutator.VisitStmt(function->body_);
     lowered->ir_stage_ = FunctionIRStage::Buffer;

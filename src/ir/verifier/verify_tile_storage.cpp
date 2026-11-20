@@ -38,6 +38,7 @@
 #include "pypto/ir/transforms/utils/buffer_ir_selection.h"
 #include "pypto/ir/transforms/utils/buffer_tuple_results.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/verifier.h"
@@ -121,6 +122,13 @@ class TileStorageVisitor : public IRVisitor {
 
   void VisitStmt_(const AssignStmtPtr& statement) override {
     auto call = As<Call>(statement->value_);
+    const auto result_tile = As<TileType>(statement->var_->GetType());
+    if (result_tile && !result_tile->memref_.value_or(nullptr)) {
+      const auto source = AsVarLike(op_predicates::GetBufferAliasSource(statement->value_));
+      if (op_predicates::IsTPop(call) || (source && peer_borrows_.count(source.get()))) {
+        peer_borrows_.insert(statement->var_.get());
+      }
+    }
     if (const auto result = tuples_.Get(statement->var_)) {
       std::vector<TileTypePtr> simultaneous;
       for (const auto& value : {call->args_[0], call->args_[2]}) {
@@ -163,6 +171,12 @@ class TileStorageVisitor : public IRVisitor {
     }
     auto tile = As<TileType>(value->GetType());
     if (!tile) return nullptr;
+    if (const auto var = AsVarLike(value); var && peer_borrows_.count(var.get())) {
+      // The FIFO owns this storage. A pop names the selected slot without
+      // introducing a separate Tile allocation. Buffer verification checks
+      // the explicit reserve binding and the borrow after conversion.
+      return nullptr;
+    }
     if (!tile->memref_.has_value() || !*tile->memref_ || !(*tile->memref_)->base_ ||
         !tile->GetMemorySpace().has_value() || !(*tile->memref_)->byte_offset_ ||
         (*tile->memref_)->size_ == 0) {
@@ -266,6 +280,7 @@ class TileStorageVisitor : public IRVisitor {
   BufferTupleResults tuples_;
   std::string function_name_;
   std::unordered_set<const Var*> checked_;
+  std::unordered_set<const Var*> peer_borrows_;
   std::unordered_map<const Type*, bool> contains_tile_;
 };
 

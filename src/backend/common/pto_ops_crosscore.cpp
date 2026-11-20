@@ -276,8 +276,8 @@ static std::string MakeTpushCodegenPTO(const char* target, const CallPtr& op,
   auto& codegen = AsPto(codegen_base);
   const std::string op_name = std::string("tpush_to_") + target;
 
-  INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
-      << op_name << " requires 1 argument (tile), got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == (ir::IsOp(op, "buffer.peer_push") ? 2 : 1), op->span_)
+      << op_name << " requires a payload and, for Buffer IR, its valid extents";
   auto tile = AsVarLike(op->args_[0]);
   INTERNAL_CHECK_SPAN(tile, op->span_) << op_name << " first argument must be a Var or IterArg";
 
@@ -322,13 +322,14 @@ static std::string MakeTpushCodegenPTO(const char* target, const CallPtr& op,
 
 // tile.tpop_from_{aic,aiv}: Pop a tile another core pushed. `target` is "aic"
 // (from Cube into Vector) or "aiv" (from Vector into Cube).
-static std::string MakeTpopCodegenPTO(const char* target, const CallPtr& op,
-                                      codegen::CodegenBase& codegen_base) {
+static std::string MakeTpopCodegenPTO(
+    const char* target, const CallPtr& op, codegen::CodegenBase& codegen_base,
+    const std::optional<std::pair<std::string, std::string>>& buffer_valid = std::nullopt) {
   auto& codegen = AsPto(codegen_base);
   const std::string op_name = std::string("tpop_from_") + target;
 
-  INTERNAL_CHECK_SPAN(op->args_.size() == 0, op->span_)
-      << op_name << " takes no arguments, got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == (buffer_valid ? 2 : 0), op->span_)
+      << op_name << " has invalid logical or Buffer operands";
 
   if (std::string_view(target) == "aic") {
     if (auto dtype = codegen.GetC2VPipeDtype(op->GetKwarg<int>("id", 0))) {
@@ -352,7 +353,8 @@ static std::string MakeTpopCodegenPTO(const char* target, const CallPtr& op,
   std::string result_buf = codegen.GetCurrentResultTarget();
   INTERNAL_CHECK_SPAN(!result_buf.empty(), op->span_) << op_name << " requires assignment target (tile_buf)";
   std::string result_type = codegen.GetCurrentResultTileBufTypeString();
-  auto [logical_row, logical_col] = codegen.GetCurrentResultTpopValidShapeOperands();
+  auto [logical_row, logical_col] =
+      buffer_valid ? *buffer_valid : codegen.GetCurrentResultTpopValidShapeOperands();
 
   // The Cube->Vector producer transports the physical column box, while the
   // a2a3 FIFO pop derives its GM row pitch from runtime validCol (twice
@@ -627,6 +629,61 @@ static std::string MakeSetFFTSCodegenPTO(const CallPtr& op, codegen::CodegenBase
   return "";
 }
 
+void pto_ops_detail::EmitPeerReserve(const CallPtr& op, codegen::PTOCodegen& codegen) {
+  INTERNAL_CHECK_SPAN(op->args_.size() == 0, op->span_)
+      << "reserve_buffer takes no arguments, got " << op->args_.size();
+
+  const auto name = op->GetKwarg<std::string>("name");
+  const int size = op->GetKwarg<int>("size", -1);
+  const int base = op->GetKwarg<int>("base", -1);
+  // Under memory_planner=PtoAS, AllocateMemoryAddr is skipped and ptoas PlanMemory places the
+  // reserved region itself (`auto = true`, base absent — ptoas rejects both being present).
+  const bool auto_alloc = !codegen.EmitTileAddr();
+  CHECK(!name.empty()) << "reserve_buffer requires 'name' attribute";
+  CHECK(size > 0) << "reserve_buffer requires positive 'size' attribute, got " << size;
+  INTERNAL_CHECK_SPAN(auto_alloc || base >= 0, op->span_)
+      << "reserve_buffer requires AllocateMemoryAddr to resolve 'base' before PTO emission, got " << base;
+  CheckSafeIdentifier(name, "reserve_buffer 'name'");
+
+  std::string ssa_name = codegen.GetCurrentResultTarget();
+  if (ssa_name.empty()) {
+    // EvalStmt context — derive SSA name from buffer name hint
+    ssa_name = codegen.NewNamedTemp(name);
+  }
+
+  std::string location;
+  if (codegen.IsAICFunction()) {
+    location = "mat";
+  } else if (codegen.IsAIVFunction()) {
+    location = "vec";
+    if (!auto_alloc) codegen.RecordVecReservation(ssa_name, base, size);
+  } else {
+    location = "undefined";
+  }
+
+  std::ostringstream oss;
+  oss << ssa_name << " = pto.reserve_buffer {name = \"" << name << "\", size = " << size
+      << ", location = #pto.address_space<" << location << ">, auto = " << (auto_alloc ? "true" : "false");
+  if (!auto_alloc) {
+    oss << ", base = " << base;
+  }
+  oss << "} -> i32";
+  codegen.Emit(oss.str());
+}
+
+void pto_ops_detail::EmitBufferPeerTransport(const CallPtr& op, codegen::PTOCodegen& codegen,
+                                             const std::pair<std::string, std::string>& valid) {
+  const char* peer = codegen.IsAICFunction() ? "aiv" : "aic";
+  if (ir::IsOp(op, "buffer.peer_pop")) {
+    MakeTpopCodegenPTO(peer, op, codegen, valid);
+  } else if (ir::IsOp(op, "buffer.peer_push")) {
+    MakeTpushCodegenPTO(peer, op, codegen);
+  } else {
+    INTERNAL_CHECK_SPAN(ir::IsOp(op, "buffer.peer_free"), op->span_) << "Unknown Buffer peer operation";
+    MakeTfreeCodegenPTO(peer, op, codegen);
+  }
+}
+
 void RegisterCrossCoreOps(Backend& backend, const std::unordered_set<std::string>& exclude_ops) {
   // Register ops with custom codegen logic
   auto reg = [&](const char* op_name, BackendCodegenFunc fn) {
@@ -694,48 +751,8 @@ void RegisterCrossCoreOps(Backend& backend, const std::unordered_set<std::string
     return MakeSetFFTSCodegenPTO(op, codegen);
   });
 
-  reg("system.reserve_buffer", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
-    auto& codegen = AsPto(codegen_base);
-    INTERNAL_CHECK_SPAN(op->args_.size() == 0, op->span_)
-        << "reserve_buffer takes no arguments, got " << op->args_.size();
-
-    const auto name = op->GetKwarg<std::string>("name");
-    const int size = op->GetKwarg<int>("size", -1);
-    const int base = op->GetKwarg<int>("base", -1);
-    // Under memory_planner=PtoAS, AllocateMemoryAddr is skipped and ptoas PlanMemory places the
-    // reserved region itself (`auto = true`, base absent — ptoas rejects both being present).
-    const bool auto_alloc = !codegen.EmitTileAddr();
-    CHECK(!name.empty()) << "reserve_buffer requires 'name' attribute";
-    CHECK(size > 0) << "reserve_buffer requires positive 'size' attribute, got " << size;
-    INTERNAL_CHECK_SPAN(auto_alloc || base >= 0, op->span_)
-        << "reserve_buffer requires AllocateMemoryAddr to resolve 'base' before PTO emission, got " << base;
-    CheckSafeIdentifier(name, "reserve_buffer 'name'");
-
-    std::string ssa_name = codegen.GetCurrentResultTarget();
-    if (ssa_name.empty()) {
-      // EvalStmt context — derive SSA name from buffer name hint
-      ssa_name = codegen.NewNamedTemp(name);
-    }
-
-    std::string location;
-    if (codegen.IsAICFunction()) {
-      location = "mat";
-    } else if (codegen.IsAIVFunction()) {
-      location = "vec";
-      if (!auto_alloc) codegen.RecordVecReservation(ssa_name, base, size);
-    } else {
-      location = "undefined";
-    }
-
-    std::ostringstream oss;
-    oss << ssa_name << " = pto.reserve_buffer {name = \"" << name << "\", size = " << size
-        << ", location = #pto.address_space<" << location << ">, auto = " << (auto_alloc ? "true" : "false");
-    if (!auto_alloc) {
-      oss << ", base = " << base;
-    }
-    oss << "} -> i32";
-    codegen.Emit(oss.str());
-
+  reg("system.reserve_buffer", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    pto_ops_detail::EmitPeerReserve(op, AsPto(codegen));
     return std::string("");
   });
 

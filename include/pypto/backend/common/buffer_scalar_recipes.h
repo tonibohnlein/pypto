@@ -28,6 +28,10 @@ bool SupportsLogicalBufferScalar(const ir::CallPtr& call);
 // Packed rank-one or rank-two ABI for point staging. This proves geometry, not input
 // address validity, external publication, alias disjointness or scalar readiness.
 bool IsBufferScalarGMSource(const ir::TensorTypePtr& tensor);
+// Uncached behavior is not assumed. The native AIC pointer read retains the
+// original caller's validity precondition and needs read-only alias evidence
+// over the invocation before PyPTO may own local synchronization.
+bool SupportsBufferGMRead(const std::vector<ir::ExprPtr>& args);
 ir::MakeTuplePtr MakeBufferScalarGMExtent(const ir::TensorType& tensor, const ir::Span& span);
 // Direction is part of the contract: load reads four GM bytes; store writes
 // exactly four GM bytes. Both retain a complete aligned 32-byte local carrier.
