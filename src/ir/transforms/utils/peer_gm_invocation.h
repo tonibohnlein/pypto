@@ -22,6 +22,7 @@
 namespace pypto::ir::sync {
 
 struct SyncInvocationEvidence;
+struct PeerGmEffects;
 
 // Checks each endpoint's separation from its compiler-allocated FIFO workspace.
 // Ordinary tensor arguments may alias one another. Index caller edges once and inspect only relevant root
@@ -33,6 +34,7 @@ class PeerInvocationGmEvidence {
 
   const std::set<std::string>& CallersOf(const std::string& callee) const;
   void Check(const FunctionPtr& group, const std::set<size_t>& ordinary_formals, size_t workspace_formal);
+  void CheckScalarReads(const FunctionPtr& group, const PeerGmEffects& effects, bool disjoint_gm) const;
 
  private:
   struct State;

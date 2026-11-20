@@ -28,6 +28,7 @@
 #include "pypto/codegen/gm_pipe_layout_evidence.h"
 #include "pypto/core/error.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/wrapper_call_utils.h"
@@ -505,7 +506,7 @@ class DistinctIssueCuts : public SyncStatementMutator {
 
 FunctionPtr PlanLocalEndpoint(const WrapperCallInfo& call, const FunctionPtr& group,
                               const SyncInvocationEvidence& invocation, PeerInvocationGmEvidence& gm,
-                              codegen::gm_pipe::LayoutEvidence& layout) {
+                              codegen::gm_pipe::LayoutEvidence& layout, PeerGmEffects& group_effects) {
   const auto fn = DistinctIssueCuts().Run(call.inner_callee);
   CHECK(!fn->requires_runtime_binding_ && !fn->HasAttr(kAttrExternalSource) &&
         !fn->HasAttr(kAttrBuiltinTemplateDir))
@@ -536,12 +537,18 @@ FunctionPtr PlanLocalEndpoint(const WrapperCallInfo& call, const FunctionPtr& gr
   std::unordered_map<const Var*, size_t> positions;
   for (size_t i = 0; i < group->params_.size(); ++i) positions.emplace(group->params_[i].get(), i);
   std::set<size_t> touched;
-  for (const auto index : local.gm_formals) {
+  for (const auto index : local.gm.formals) {
     const auto root = AsVarLike(call.inner_call->args_.at(index));
     const auto pos = positions.find(root.get());
     CHECK(pos != positions.end() && root != *workspace)
         << "peer GM access lacks an original Group tensor separate from the workspace";
     touched.insert(pos->second);
+    if (local.gm.scalar_reads.count(index)) {
+      group_effects.scalar_reads.insert(pos->second);
+    }
+    if (local.gm.writes.count(index)) {
+      group_effects.writes.insert(pos->second);
+    }
   }
   gm.Check(group, touched, static_cast<size_t>(workspace - group->params_.begin()));
   return RealizePeerLocalPlan(local);
@@ -556,6 +563,8 @@ std::vector<PeerLocalDecision> PlanPeerLocalUnits(const ProgramPtr& program,
   if (dispatches.empty()) return decisions;
   codegen::gm_pipe::LayoutEvidence layout(program);
   PeerInvocationGmEvidence gm(program, invocation);
+  const auto* context = PassContext::Current();
+  const bool disjoint_gm = context && context->GetAutoSyncDisjointGM();
   for (const auto& dispatch : dispatches) {
     if (dispatch.endpoints.empty()) {
       for (const auto& fn : dispatch.functions)
@@ -565,14 +574,22 @@ std::vector<PeerLocalDecision> PlanPeerLocalUnits(const ProgramPtr& program,
 
     std::vector<PeerLocalDecision> local;
     std::string failures;
+    PeerGmEffects effects;
     for (const auto& endpoint : dispatch.endpoints) {
       try {
-        local.push_back({PlanLocalEndpoint(endpoint, dispatch.group, invocation, gm, layout), {}});
+        local.push_back({PlanLocalEndpoint(endpoint, dispatch.group, invocation, gm, layout, effects), {}});
       } catch (const ValueError& error) {
         auto detail = "local planning for " + endpoint.inner_callee->name_ + ": " + error.what();
         if (!failures.empty()) failures += "; ";
         failures += detail;
         local.push_back({endpoint.inner_callee, std::move(detail)});
+      }
+    }
+    if (failures.empty()) {
+      try {
+        gm.CheckScalarReads(dispatch.group, effects, disjoint_gm);
+      } catch (const ValueError& error) {
+        failures = error.what();
       }
     }
     for (size_t i = 0; i < local.size(); ++i) {

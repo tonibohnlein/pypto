@@ -383,6 +383,14 @@ It checks event consumption before reuse and drains the endpoint before an
 explicit return or at the end of a void path. Each arm of a terminal AIV
 subblock branch drains independently.
 
+For qualified AIV Vec operations, physical tile capacity may be static while
+the valid rows or columns are computed at runtime. The importer proves that
+each runtime extent is available at the original operation and stays positive
+and within capacity. It encloses the data access in the whole placed tile.
+A validity update must use an ordinary allocation in its defining sequence
+of statements, with no separate view or ambiguous alias. A later operand
+must describe the current native validity of that handle.
+
 The importer represents each FIFO as rotating physical storage. In a sequential
 loop with `p` pops per visit, visit `v` starts at slot
 `(entry_ordinal + v * p) % local_depth`. At exit the ordinal advances by
@@ -413,6 +421,21 @@ placement, the conservative-prefix policy, and a qualified native FIFO
 workspace. The actual launch must bind the sized workspace separately from
 ordinary GM tensors. Ordinary tensors can alias and share a conservative
 local GM storage domain.
+
+An AIC endpoint can keep a direct scalar `tensor.read` of a plain rank-one or
+rank-two INT32 or FP32 tensor. For rank two, the inner extent must be static.
+The coordinates must be ready at the original statement and the flattened
+byte address must fit the native signed offset under the original in-bounds
+access precondition. The original cacheable pointer load produces the scalar
+synchronously. The caller still supplies valid storage and the required GM
+publication before dispatch.
+
+The launch proof traces the scalar source and every GM write in both
+endpoints through their Group and root bindings. The source must be separate
+from the managed FIFO workspace. A write to the same root always causes
+fallback. Writes to distinct roots require the explicit
+`autosync_disjoint_gm` contract. With this proof, the unchanged read has no
+local event demand.
 
 PTOAS has one local insertion switch per emitted unit. The compiler prepares
 each endpoint's plan independently. If all plans verify, the driver emits them

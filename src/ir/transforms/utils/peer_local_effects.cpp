@@ -44,6 +44,7 @@
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/l0c_footprint.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
+#include "src/ir/transforms/utils/sync_loop_trip_proof.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -52,12 +53,24 @@ using cross_core_pipe::PeerTransportKind;
 using cross_core_pipe::PeerTransportSite;
 using transform_utils::GetCallFromStmt;
 
+// Project the original Tile operations onto their native payload contracts.
+// Runtime validity needs a scalar proof at the original cut, while each data
+// effect conservatively encloses the whole placed allocation.
+
+bool HasRuntimeExtents(const std::vector<ExprPtr>& extents) {
+  return std::any_of(extents.begin(), extents.end(),
+                     [](const auto& extent) { return !As<ConstInt>(extent); });
+}
+
 struct TileWindow {
   MemorySpace space;
   int64_t begin;
   int64_t end;
   // A view inherits its original borrow and its lifetime.
   const PeerTransportSite* pop = nullptr;
+  // Ordinary alloc-backed handles may be updated in their defining segment.
+  const Var* mutable_handle = nullptr;
+  size_t definition_segment = 0;
 };
 
 std::vector<int64_t> StaticExtents(const std::vector<ExprPtr>& expressions, const Span& span) {
@@ -77,9 +90,14 @@ BufferTypePtr DescribeTile(const TileTypePtr& tile, const Span& span) {
   const auto space = *tile->memory_space_;
   const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
   const auto shape = StaticExtents(tile->shape_, span);
-  const auto valid = StaticExtents(view.valid_shape, span);
-  CHECK_SPAN(
-      shape[0] > 0 && shape[1] > 0 && valid.size() == 2 && valid[0] <= shape[0] && valid[1] <= shape[1], span)
+  CHECK_SPAN(shape[0] > 0 && shape[1] > 0 && view.valid_shape.size() == 2, span)
+      << "Peer local planning requires a two-dimensional tile valid shape and positive capacity";
+  const bool runtime = HasRuntimeExtents(view.valid_shape);
+  CHECK_SPAN(!runtime || space == MemorySpace::Vec, span)
+      << "Peer runtime valid extents require ordinary Vec storage";
+  const auto valid =
+      runtime ? backend::MutableBufferValidShape(view.valid_shape) : StaticExtents(view.valid_shape, span);
+  CHECK_SPAN(valid[0] <= shape[0] && valid[1] <= shape[1], span)
       << "Peer local tile valid extent exceeds its capacity";
   if (space == MemorySpace::Vec) {
     CHECK_SPAN(backend::PhysicalLogicalVecDescriptor(tile, /*allow_full_zero_pad=*/true), span)
@@ -97,8 +115,50 @@ BufferTypePtr DescribeTile(const TileTypePtr& tile, const Span& span) {
                span)
         << "Peer local planning requires a complete native matrix allocation";
   }
-  return std::make_shared<BufferType>(shape, tile->dtype_, space, valid, view.blayout, view.slayout,
-                                      view.fractal, view.pad, view.compact);
+  const auto descriptor = std::make_shared<BufferType>(shape, tile->dtype_, space, valid, view.blayout,
+                                                       view.slayout, view.fractal, view.pad, view.compact);
+  CHECK_SPAN(!runtime || backend::IsAlignedDenseVecBufferGeometry(descriptor), span)
+      << "Peer runtime valid extents require aligned dense Vec storage";
+  return descriptor;
+}
+
+std::vector<ExprPtr> ValidExtents(const TileTypePtr& type) {
+  return tile_view_semantics::GetEffectiveTileView(*type).valid_shape;
+}
+
+std::vector<ExprPtr> RuntimeValidOperands(const StmtPtr& stmt, const CallPtr& call) {
+  if (!IsOp(call, "tile.set_validshape") && !IsOp(call, "tile.load") && !IsOp(call, "tile.store") &&
+      !backend::FindLogicalBufferElementwiseRecipe(call)) {
+    return {};
+  }
+  std::vector<ExprPtr> expressions;
+  const auto append = [&expressions](const ExprPtr& value) {
+    if (const auto tile = As<TileType>(value->GetType())) {
+      for (const auto& extent : ValidExtents(tile)) {
+        if (!As<ConstInt>(extent)) {
+          expressions.push_back(extent);
+        }
+      }
+    }
+  };
+  if (const auto assign = As<AssignStmt>(stmt)) {
+    append(assign->var_);
+  }
+  if (!IsOp(call, "tile.set_validshape")) {
+    for (const auto& arg : call->args_) {
+      append(arg);
+    }
+  }
+  return expressions;
+}
+
+bool SameExtents(const std::vector<ExprPtr>& a, const std::vector<ExprPtr>& b) {
+  return a.size() == b.size() &&
+         std::equal(a.begin(), a.end(), b.begin(), [](const auto& lhs, const auto& rhs) {
+           const auto left = As<ConstInt>(lhs);
+           const auto right = As<ConstInt>(rhs);
+           return left && right ? left->value_ == right->value_ : structural_equal(lhs, rhs);
+         });
 }
 
 bool IsSubblockQuery(const CallPtr& call) {
@@ -154,8 +214,8 @@ std::vector<std::vector<StmtPtr>> LaneStatements(const FunctionPtr& function) {
 class LaneImporter {
  public:
   LaneImporter(const FunctionPtr& function, const PeerTransportEffects& transport, const std::string& target,
-               const SyncParameterBounds& parameters, std::set<size_t>& gm_formals)
-      : transport_(transport), backend_(*backend::BackendConfig::GetBackend()), gm_formals_(gm_formals) {
+               const SyncParameterBounds& parameters, PeerGmEffects& gm, const SyncControlRangeProver& ranges)
+      : transport_(transport), backend_(*backend::BackendConfig::GetBackend()), gm_(gm), ranges_(ranges) {
     result_.input.owner = function;
     result_.input.hardware_target = target;
     result_.input.segments.emplace_back();
@@ -224,7 +284,8 @@ class LaneImporter {
   const PeerTransportEffects& transport_;
   const backend::Backend& backend_;
   MemoryAllocatorPolicyPtr placement_;
-  std::set<size_t>& gm_formals_;
+  PeerGmEffects& gm_;
+  const SyncControlRangeProver& ranges_;
   PeerLocalLane result_;
   std::unordered_map<const Stmt*, const PeerTransportSite*> sites_;
   std::unordered_set<const Call*> initializers_, payload_calls_;
@@ -240,6 +301,8 @@ class LaneImporter {
   std::unordered_map<const Var*, CoordinateBounds> coordinate_bounds_;
   mutable std::unordered_set<const Expr*> ready_expressions_;
   std::unordered_map<const Var*, TileWindow> local_;
+  std::unordered_map<const Var*, std::vector<ExprPtr>> current_valid_extents_;
+  std::unordered_set<const Var*> ambiguous_metadata_handles_;
   std::unordered_map<const Var*, size_t> gm_roots_;
   std::map<MemorySpace, size_t> storage_;
 
@@ -341,8 +404,77 @@ class LaneImporter {
   void GmAccess(SyncSite& site, const StmtPtr& statement, const ExprPtr& value, bool write) {
     const auto it = gm_roots_.find(AsVarLike(value).get());
     CHECK_SPAN(it != gm_roots_.end(), statement->span_) << "Peer GM transfer has no original formal root";
-    gm_formals_.insert(it->second);
+    gm_.formals.insert(it->second);
+    if (write) {
+      gm_.writes.insert(it->second);
+    }
     Access(site, {MemorySpace::DDR, 0, 1}, write);
+  }
+
+  int64_t ScalarGmIndexMaximum(const ExprPtr& index, const ExprPtr& extent, const Span& span) const {
+    const auto maximum = SyncCoordinateMaximum(index);
+    const auto type = As<ScalarType>(index->GetType());
+    const auto literal = As<ConstInt>(index);
+    CHECK_SPAN(maximum && type && (type->dtype_ == DataType::INDEX || type->dtype_.IsSignedInt()) &&
+                   (!literal || (literal->value_ >= 0 && literal->value_ <= *maximum)),
+               span)
+        << "Peer scalar GM address requires a signed index with a representable value";
+    const auto bound = Bounds(index);
+    const auto length = As<ConstInt>(extent);
+    CHECK_SPAN(!length || !bound || bound->first < length->value_, span)
+        << "Peer scalar GM address is outside the source extent";
+    const auto upper = bound ? bound->second : *maximum;
+    // As for the original tensor.read, only in-bounds executions are defined.
+    return length ? std::min(upper, length->value_ - 1) : upper;
+  }
+
+  void QualifyScalarGmAddress(const TensorType& tensor, const MakeTuple& indices, const Span& span) const {
+    const auto rank = tensor.shape_.size();
+    const auto columns = rank == 2 ? As<ConstInt>(tensor.shape_.back()) : nullptr;
+    CHECK_SPAN(indices.elements_.size() == rank && (rank == 1 || columns), span)
+        << "Peer scalar GM address requires a ready coordinate tuple and a static inner extent";
+    __int128 maximum = ScalarGmIndexMaximum(indices.elements_.front(), tensor.shape_.front(), span);
+    if (columns) {
+      maximum = maximum * columns->value_ +
+                ScalarGmIndexMaximum(indices.elements_.back(), tensor.shape_.back(), span);
+    }
+    // PTOAS emits a signed int64 INDEX for the flattened typed pointer
+    // subscript. Check its enclosing byte extent before relying on address
+    // arithmetic. The original caller still supplies valid backing storage.
+    CHECK_SPAN(maximum < std::numeric_limits<int64_t>::max() / tensor.dtype_.GetByte(), span)
+        << "Peer scalar GM address may exceed the signed native byte offset";
+  }
+
+  void ImportScalarGmRead(const CallPtr& call, const VarPtr& result) {
+    const auto& owner = result_.input.owner;
+    CHECK_SPAN(owner->func_type_ == FunctionType::AIC && result_.input.hardware_target == "a2a3" && result &&
+                   call->args_.size() == 2 && call->kwargs_.empty(),
+               call->span_)
+        << "Peer scalar GM read requires a direct A2/A3 AIC scalar definition";
+    const auto tensor = As<TensorType>(call->args_[0]->GetType());
+    const auto root = gm_roots_.find(AsVarLike(call->args_[0]).get());
+    CHECK_SPAN(root != gm_roots_.end() && tensor && !tensor->tensor_view_ &&
+                   backend::IsBufferTensorShape(tensor->shape_),
+               call->span_)
+        << "Peer scalar GM read requires a plain rank-one or rank-two formal or alias";
+    const auto formal = As<TensorType>(owner->params_[root->second]->GetType());
+    const auto scalar = As<ScalarType>(result->GetType());
+    const auto expression = As<ScalarType>(call->GetType());
+    CHECK_SPAN(formal && !formal->tensor_view_ && formal->dtype_ == tensor->dtype_ &&
+                   tile_view_semantics::ShapeExprListsEquivalent(formal->shape_, tensor->shape_) &&
+                   (tensor->dtype_ == DataType::INT32 || tensor->dtype_ == DataType::FP32) && scalar &&
+                   expression && scalar->dtype_ == tensor->dtype_ && scalar->dtype_ == expression->dtype_,
+               call->span_)
+        << "Peer scalar GM read must preserve its original packed pointer and scalar dtype";
+    RequireReadyTuple(call->args_[1], call->span_);
+    QualifyScalarGmAddress(*tensor, *As<MakeTuple>(call->args_[1]), call->span_);
+    gm_.formals.insert(root->second);
+    gm_.scalar_reads.insert(root->second);
+    CHECK_SPAN(ready_.insert(result.get()).second, call->span_) << "Peer scalar GM result is defined twice";
+    // The retained native read is a cacheable, blocking pointer dereference.
+    // There is no asynchronous issue or cache-maintenance event to model.
+    // Publication at invocation entry remains an original caller obligation.
+    // The Group certificate must exclude all aliased writes during execution.
   }
 
   TileWindow Window(const ExprPtr& value, const Span& span) const {
@@ -356,6 +488,11 @@ class LaneImporter {
                  span)
           << "Peer local operation uses a released or overwritten receive tile";
     }
+    const auto current = current_valid_extents_.find(window.mutable_handle);
+    CHECK_SPAN(current == current_valid_extents_.end() ||
+                   SameExtents(current->second, ValidExtents(As<TileType>(value->GetType()))),
+               span)
+        << "Peer local operand has stale native tile valid metadata";
     return window;
   }
 
@@ -377,7 +514,13 @@ class LaneImporter {
             placement_->AlignAddress(address->value_, space) == static_cast<uint64_t>(address->value_),
         var->span_)
         << "Peer local result has no aligned, bounded physical allocation";
-    const TileWindow window{space, address->value_, address->value_ + static_cast<int64_t>(memref->size_)};
+    const bool ordinary = memref->slot_count_ == 1 && !memref->slot_index_;
+    const TileWindow window{space,
+                            address->value_,
+                            address->value_ + static_cast<int64_t>(memref->size_),
+                            nullptr,
+                            ordinary ? var.get() : nullptr,
+                            result_.input.segments.size()};
     if (const auto found = reserves_.find(space); found != reserves_.end()) {
       const auto next = found->second.lower_bound(window.end);
       CHECK_SPAN(next == found->second.begin() || std::prev(next)->second <= window.begin, var->span_)
@@ -389,6 +532,30 @@ class LaneImporter {
   static ExprPtr BufferOperand(const ExprPtr& value) {
     return std::make_shared<Var>("", DescribeTile(As<TileType>(value->GetType()), value->span_),
                                  value->span_);
+  }
+
+  void RequireRuntimeValid(const StmtPtr& statement, const ExprPtr& value) const {
+    const auto type = As<TileType>(value->GetType());
+    if (!type) {
+      return;
+    }
+    const auto valid = ValidExtents(type);
+    if (!HasRuntimeExtents(valid)) {
+      return;
+    }
+    CHECK_SPAN(result_.input.owner->func_type_ == FunctionType::AIV, statement->span_)
+        << "Peer runtime tile valid extents require an AIV endpoint";
+    for (size_t axis = 0; axis < valid.size(); ++axis) {
+      const auto& extent = valid[axis];
+      const auto capacity = As<ConstInt>(type->shape_[axis]);
+      const auto literal = As<ConstInt>(extent);
+      const auto bounds = literal ? std::optional{std::pair{literal->value_, literal->value_}}
+                                  : ranges_.LookupScalarBounds(statement.get(), extent.get());
+      CHECK_SPAN(
+          Ready(extent) && capacity && bounds && bounds->first > 0 && bounds->second <= capacity->value_,
+          statement->span_)
+          << "Peer runtime tile valid extent has no positive in-capacity bound";
+    }
   }
 
   void AddSite(SyncSite site) {
@@ -419,6 +586,7 @@ class LaneImporter {
         if (read) GmAccess(site, statement, operands[index], false);
         if (write) GmAccess(site, statement, operands[index], true);
       } else {
+        RequireRuntimeValid(statement, operands[index]);
         const auto window = Window(operands[index], original->span_);
         if (read) Access(site, window, false);
         if (write) Access(site, window, true);
@@ -453,6 +621,10 @@ class LaneImporter {
                                   tile_view_semantics::GetEffectiveTileView(*type).valid_shape, call->span_);
     RequireReadyTuple(offsets, call->span_);
     RequireReadyTuple(valid, call->span_);
+    const auto tile_extents = ValidExtents(type);
+    CHECK_SPAN(!HasRuntimeExtents(tile_extents) || SameExtents(As<MakeTuple>(valid)->elements_, tile_extents),
+               call->span_)
+        << "Peer local transfer does not match its tile valid metadata";
     for (const auto& [name, value] : call->kwargs_) {
       CHECK_SPAN(load ? name == "target_memory" : name == "atomic" || name == "cache" || name == "st_phase",
                  call->span_)
@@ -518,6 +690,7 @@ class LaneImporter {
           << "Unqualified native peer elementwise recipe " << call->op_->name_;
       op = recipe->buffer_op;
       kwargs = call->kwargs_;
+      const auto output_extents = ValidExtents(As<TileType>(result->GetType()));
       for (const auto& input : recipe->inputs) {
         const auto& value = call->args_[input.logical_index];
         operands.push_back(value);
@@ -528,6 +701,11 @@ class LaneImporter {
         } else {
           CHECK_SPAN(input.kind == backend::BufferElementwiseOperandKind::Buffer, call->span_)
               << "Peer local elementwise requires an audited workspace-free variant";
+          const auto input_extents = ValidExtents(As<TileType>(value->GetType()));
+          CHECK_SPAN((!HasRuntimeExtents(input_extents) && !HasRuntimeExtents(output_extents)) ||
+                         SameExtents(input_extents, output_extents),
+                     call->span_)
+              << "Peer local elementwise requires matching native tile valid metadata";
           const bool may_alias =
               recipe->destination_alias == backend::BufferDestinationAliasPolicy::ExactOrDisjoint;
           RequirePayloadAliasing(value, result, may_alias, call->span_);
@@ -591,14 +769,56 @@ class LaneImporter {
     AddSite(std::move(site));
   }
 
+  void ImportValidShape(const StmtPtr& statement, const CallPtr& call, const VarPtr& result) {
+    CHECK_SPAN(result_.input.owner->func_type_ == FunctionType::AIV && result && call->args_.size() == 3 &&
+                   call->kwargs_.empty(),
+               call->span_)
+        << "Peer tile.set_validshape requires an ordinary AIV Vec handle";
+    const auto& source = call->args_[0];
+    const auto window = Window(source, call->span_);
+    const auto from = backend::PhysicalLogicalVecDescriptor(source->GetType());
+    const auto to = backend::PhysicalLogicalVecDescriptor(result->GetType());
+    CHECK_SPAN(window.mutable_handle && !ambiguous_metadata_handles_.count(window.mutable_handle) &&
+                   window.definition_segment == result_.input.segments.size() &&
+                   backend::IsAlignedDenseVecBufferGeometry(from) && to && structural_equal(from, to),
+               call->span_)
+        << "Peer tile.set_validshape requires an aligned dense Vec allocation in its defining region";
+    const auto valid = ValidExtents(As<TileType>(result->GetType()));
+    CHECK_SPAN(SameExtents(valid, {call->args_[1], call->args_[2]}) && Ready(call->args_[1]) &&
+                   Ready(call->args_[2]),
+               call->span_)
+        << "Peer tile.set_validshape result does not match ready native metadata";
+    const auto placed = Place(result);
+    CHECK_SPAN(placed.begin == window.begin && placed.end == window.end, call->span_)
+        << "Peer tile.set_validshape must retain the original placed allocation";
+    RequireRuntimeValid(statement, result);
+    current_valid_extents_.insert_or_assign(window.mutable_handle, valid);
+    CHECK_SPAN(local_.emplace(result.get(), window).second, call->span_)
+        << "Peer tile.set_validshape result is assigned more than once";
+  }
+
   void BindAlias(const VarPtr& destination, const ExprPtr& source, bool reshape = false) {
     const auto var = AsVarLike(source);
     if (var && local_.count(var.get())) {
-      const auto window = Window(var, destination->span_);
-      const auto from = DescribeTile(As<TileType>(var->GetType()), destination->span_);
+      auto window = Window(var, destination->span_);
+      if (window.mutable_handle) {
+        // Addressed and unaddressed lowering can choose different descriptor
+        // identity for plain assignments and reshapes with shared storage.
+        CHECK_SPAN(!current_valid_extents_.count(window.mutable_handle), destination->span_)
+            << "Peer Tile alias cannot preserve updated native tile valid metadata";
+        ambiguous_metadata_handles_.insert(window.mutable_handle);
+        window.mutable_handle = nullptr;
+      }
+      const auto source_type = As<TileType>(var->GetType());
+      const auto from = DescribeTile(source_type, destination->span_);
       const auto dest_type = As<TileType>(destination->GetType());
       const auto to = DescribeTile(dest_type, destination->span_);
-      CHECK_SPAN(structural_equal(from, to) ||
+      const auto from_extents = ValidExtents(source_type);
+      const auto to_extents = ValidExtents(dest_type);
+      CHECK_SPAN(!reshape || (!HasRuntimeExtents(from_extents) && !HasRuntimeExtents(to_extents)),
+                 destination->span_)
+          << "Peer Tile reshape requires static valid metadata";
+      CHECK_SPAN((structural_equal(from, to) && SameExtents(from_extents, to_extents)) ||
                      (reshape && from->memory_space_ == MemorySpace::Vec &&
                       to->memory_space_ == MemorySpace::Vec && backend::IsContiguousVectorReshape(from, to)),
                  destination->span_)
@@ -792,10 +1012,14 @@ class LaneImporter {
                      local_.emplace(result.get(), Place(result)).second,
                  call->span_)
           << "Peer tile.create requires a zero-row replay allocation";
+    } else if (IsOp(call, "tile.set_validshape")) {
+      ImportValidShape(statement, call, result);
     } else if (IsOp(call, "tile.reshape")) {
       CHECK_SPAN(result && call->args_.size() == 2, call->span_) << "Unqualified peer Tile reshape";
       RequireReadyTuple(call->args_[1], call->span_);
       BindAlias(result, call->args_[0], /*reshape=*/true);
+    } else if (IsOp(call, "tensor.read")) {
+      ImportScalarGmRead(call, result);
     } else if (IsOp(call, "tile.store")) {
       ImportTransfer(statement, call, result, false);
     } else {
@@ -813,9 +1037,12 @@ PeerLocalEffects ImportPeerLocalEffects(const FunctionPtr& function, const PeerT
         transport.unavailable.empty() && !transport.sites.empty())
       << "Peer local planning requires a native Tile endpoint and its qualified transport effects";
   auto paths = LaneStatements(function);
+  const SyncControlRangeProver ranges(
+      function, parameters, std::nullopt,
+      function->func_type_ == FunctionType::AIV ? RuntimeValidOperands : nullptr);
   PeerLocalEffects result;
   for (const auto& path : paths) {
-    LaneImporter importer(function, transport, target, parameters, result.gm_formals);
+    LaneImporter importer(function, transport, target, parameters, result.gm, ranges);
     result.lanes.push_back(importer.Run(path));
   }
   return result;
