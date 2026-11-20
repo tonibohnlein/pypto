@@ -2940,6 +2940,7 @@ SyncInvocationEvidence CollectSyncInvocationEvidence(const ProgramPtr& program, 
       if (!--incoming.at(callee)) ready.insert(callee);
   }
   SyncInvocationEvidence result;
+  result.callees = std::move(edges);
   for (const auto& [name, params] : evidence)
     for (const auto& [index, bound] : params)
       if (bound && processed.count(name)) result.parameters[name].emplace(index, *bound);

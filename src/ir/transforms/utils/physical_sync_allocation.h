@@ -49,6 +49,11 @@ struct DirectSyncOrder {
   // One complete directional protocol with typed refusal and construction work.
   // The caller supplies existing eligible capacity, never a new resource pool.
   std::function<ScopedPaletteResult(PipeType, PipeType, int64_t)> scoped_palette;
+  // Some native endpoint cuts are Tile operations. Their importer has already
+  // collected every local claim using the selected target implementation.
+  const SyncNativeReservations* imported_native_claims = nullptr;
+  // A conservative plan may complete intervening issues on the same pipe.
+  bool allow_stronger_barriers = false;
 };
 PhysicalSyncRealization RealizeDirectSync(const CompactSyncInput& input,
                                           std::vector<PhysicalSyncFamily> families,

@@ -31,6 +31,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/sync/isa_macro_resources.h"
 #include "pypto/sync/resource_catalog.h"
+#include "src/ir/transforms/utils/closed_prefix_sync.h"
 #include "src/ir/transforms/utils/scoped_sync_palette.h"
 #include "src/ir/transforms/utils/scoped_token_families.h"
 #include "src/ir/transforms/utils/sync_footprint_resolver.h"
@@ -105,7 +106,8 @@ class Allocator {
         order_(order),
         catalog_(pypto::sync::FindResourceCatalog(target)),
         restricted_(restricted),
-        claimed_(SyncNativeClaims(input, target)) {
+        claimed_(order.imported_native_claims ? *order.imported_native_claims
+                                              : SyncNativeClaims(input, target)) {
     for (const auto& [direction, ids] : extra_reservations)
       claimed_[direction].insert(ids.begin(), ids.end());
     families_ = std::move(families);
@@ -292,7 +294,9 @@ class Allocator {
       auto [src, dst] = SyncFamilyPipes(input_, f);
       if (src != dst) continue;
       CHECK(dst != PipeType::S) << "Scalar barriers are forbidden; require qualified native scalar order";
-      CHECK(dst == PipeType::M || dst == PipeType::V) << "Unavailable same-pipe barrier mechanism";
+      CHECK((order_.allow_stronger_barriers || dst == PipeType::M || dst == PipeType::V) &&
+            RequireLocalSyncBarrier(dst, input_.owner->func_type_))
+          << "Unavailable same-pipe barrier mechanism";
       for (int64_t offset : std::set<int64_t>{0, f.count - 1}) {
         auto [r, v, s] = Target(f, offset);
         std::optional<Occurrence> pred;
@@ -302,7 +306,9 @@ class Allocator {
           pred = Occurrence{r, v - 1, *last[r][dst]};
         else
           pred = before[r][dst];
-        CHECK(pred && Reaches(*pred, Target(f, offset)))
+        CHECK(pred &&
+              (order_.allow_stronger_barriers ? order_.reference_before(Source(f, offset), Target(f, offset))
+                                              : Reaches(*pred, Target(f, offset))))
             << "Unavailable order-equal same-pipe barrier placement";
       }
     }

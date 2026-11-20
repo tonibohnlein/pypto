@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -26,13 +27,18 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/backend_handler.h"
+#include "pypto/backend/common/buffer_elementwise_recipes.h"
+#include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/acc_push_epilogue.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memref.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
@@ -124,10 +130,13 @@ std::optional<ConsumerReceiveStorage> BindConsumerStorage(const CallPtr& setup, 
 // Independent pipe IDs have independent slots and can release in either order.
 class ConsumerFifo {
  public:
-  ConsumerFifo(core_affinity::CoreSide side, bool established_pipe_ids)
+  using TransportCuts = std::vector<std::pair<StmtPtr, int>>;
+
+  ConsumerFifo(core_affinity::CoreSide side, bool established_pipe_ids, TransportCuts* cuts = nullptr)
       : pop_(core_side_ops::TPopOp(side)),
         free_(core_side_ops::TFreeOp(side)),
-        established_pipe_ids_(established_pipe_ids) {}
+        established_pipe_ids_(established_pipe_ids),
+        cuts_(cuts) {}
 
   ConsumerFifoResult Run(const std::vector<StmtPtr>& stmts) {
     result_.first_transport = stmts.size();
@@ -155,6 +164,7 @@ class ConsumerFifo {
       if (IsPeerTransport(call)) {
         result_.first_transport = std::min(result_.first_transport, root_index_);
         result_.unsupported_control |= parallel;
+        if (cuts_ && !op_predicates::IsTFree(call)) cuts_->emplace_back(stmt, call->GetKwarg<int>("id", 0));
       }
       if (op_predicates::IsTPop(call)) {
         const auto assign = As<AssignStmt>(stmt);
@@ -180,6 +190,7 @@ class ConsumerFifo {
             << "Cross-core pipe requires FIFO release order within each pipe; a retained earlier tile "
                "must be consumed before a later gathered tile is released.";
         queue.pop_front();
+        if (cuts_) cuts_->emplace_back(stmt, id);
         active_.erase(borrow);
       }
     }
@@ -206,6 +217,7 @@ class ConsumerFifo {
   std::string pop_;
   std::string free_;
   bool established_pipe_ids_;
+  TransportCuts* cuts_;
   std::unordered_map<const Var*, Borrow> active_;
   std::unordered_map<int, std::deque<const Var*>> queues_;
   ConsumerFifoResult result_;
@@ -260,27 +272,6 @@ class PeerCutVerifier : public IRVisitor {
   std::unordered_set<const Expr*> seen_values_;
 };
 
-std::optional<std::pair<int64_t, int64_t>> FullVecShape(const TypePtr& value) {
-  const auto type = As<TileType>(value);
-  if (!type || type->memory_space_ != MemorySpace::Vec || type->dtype_ != DataType::FP32 ||
-      type->shape_.size() != 2)
-    return std::nullopt;
-  const auto view = tile_view_semantics::GetEffectiveTileView(*type);
-  if (view.blayout != TileLayout::row_major || view.slayout != TileLayout::none_box ||
-      view.pad != PadValue::null || view.compact != CompactMode::null || view.valid_shape.size() != 2)
-    return std::nullopt;
-  const auto rows = TryGetNonNegativeConstInt(type->shape_[0]);
-  const auto cols = TryGetNonNegativeConstInt(type->shape_[1]);
-  if ((view.start_offset && TryGetNonNegativeConstInt(view.start_offset) != 0) || !rows || !cols ||
-      *rows == 0 || *cols == 0 || *cols % 8 != 0 || rows != TryGetNonNegativeConstInt(view.valid_shape[0]) ||
-      cols != TryGetNonNegativeConstInt(view.valid_shape[1]))
-    return std::nullopt;
-  if (!view.stride.empty() && (view.stride.size() != 2 || TryGetNonNegativeConstInt(view.stride[0]) != cols ||
-                               TryGetNonNegativeConstInt(view.stride[1]) != 1))
-    return std::nullopt;
-  return std::pair{*rows, *cols};
-}
-
 std::optional<Span> FindOverwrittenConsumer(const std::vector<StmtPtr>& stmts, size_t begin, int id,
                                             const ConsumerReceiveStorage& storage) {
   std::vector<std::pair<const Var*, int64_t>> prior_slots;
@@ -301,10 +292,14 @@ std::optional<Span> FindOverwrittenConsumer(const std::vector<StmtPtr>& stmts, s
       if (!assign) {
         return std::nullopt;
       }
-      const auto shape = FullVecShape(assign->var_->GetType());
-      const auto elements = shape && call->GetKwarg<int>("split", 0) == kSplitNone &&
-                                    shape->first <= (storage.slot_bytes / 4) / shape->second
-                                ? shape->first * shape->second
+      const auto tile = backend::DescribePeerTransferBuffer(As<TileType>(assign->var_->GetType()));
+      const auto type = tile ? tile->descriptor : nullptr;
+      const bool full_vec = type && type->memory_space_ == MemorySpace::Vec &&
+                            type->dtype_ == DataType::FP32 && type->pad_ == PadValue::null &&
+                            type->valid_shape_ == type->shape_;
+      const auto elements = full_vec && call->GetKwarg<int>("split", 0) == kSplitNone &&
+                                    tile->capacity_bytes <= storage.slot_bytes
+                                ? tile->capacity_bytes / 4
                                 : 0;
       const auto current = std::pair{assign->var_.get(), elements};
       if (slot < prior_slots.size()) {
@@ -358,6 +353,13 @@ struct C2VReceiveSite {
   bool may_write;
   std::optional<uint64_t> tile_bytes;
 };
+
+// A no-split Vec TPOP with zero valid rows passes nBurst=0 to TLOAD.
+// Restrict the proof to this identified no-data case; a zero column alone
+// is a separate native width/padding case. Both still advance the FIFO.
+bool EmptyReceive(const BufferTypePtr& type) {
+  return type->memory_space_ == MemorySpace::Vec && type->valid_shape_.front() == 0;
+}
 
 class C2VReceiveSites : public IRVisitor {
  public:
@@ -428,6 +430,15 @@ class C2VReceiveSites : public IRVisitor {
     if (!tile || tile->memory_space_ != MemorySpace::Vec) {
       return;
     }
+    if (const auto buffer = backend::DescribePeerTransferBuffer(tile);
+        buffer && call->GetKwarg<int>("split", kSplitNone) == kSplitNone) {
+      const bool empty = EmptyReceive(buffer->descriptor);
+      sites.push_back({stmt.get(), call->GetKwarg<int>("id", 0), loop_, unconditional_, !empty,
+                       static_cast<uint64_t>(buffer->capacity_bytes)});
+      return;
+    }
+    // Delegated variants outside the native transport contract retain their
+    // conservative fence when placement or payload geometry is unknown.
     const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
     const bool empty = std::any_of(view.valid_shape.begin(), view.valid_shape.end(),
                                    [](const ExprPtr& dim) { return TryGetNonNegativeConstInt(dim) == 0; });
@@ -825,14 +836,59 @@ CrossCorePipeMetadata CollectDominatingPipeSetupMetadata(const std::vector<StmtP
   return metadata;
 }
 
-ConsumerFifoEvidence AnalyzeConsumerFifo(const FunctionPtr& function) {
+namespace {
+
+PeerPipeBinding BindNativePipe(const CallPtr& call, core_affinity::CoreSide side,
+                               const std::optional<ConsumerReceiveStorage>& receive) {
+  const int mask = call->GetKwarg<int>("dir_mask", 0);
+  const int depth = call->GetKwarg<int>("slot_num", GetPtoasImplicitSlotNum(mask));
+  const int64_t stride = call->GetKwarg<int>("slot_size", 0);
+  CHECK(mask >= 1 && mask <= 3 && call->args_.size() == 2 && depth > 0 && stride > 0)
+      << "Unqualified tile FIFO direction or ring geometry";
+  CHECK(!call->HasKwarg("c2v_dtype") && !call->GetKwarg<bool>("pre_relu", false))
+      << "Peer FIFO requires ordinary A2/A3 tile transport";
+  // The pinned TPipe computes its bidirectional GM partition in int and
+  // computes its tile-offset products before widening to a GM address.
+  CHECK(stride * depth <= std::numeric_limits<int32_t>::max())
+      << "Peer FIFO ring exceeds native offset range";
+  CHECK(!(mask & IncomingDirection(side)) || receive)
+      << "Peer FIFO receive ring has no local storage binding";
+  return {call, mask, depth, stride, receive};
+}
+
+PeerTransportSite BindNativeSite(const StmtPtr& stmt, int id, core_affinity::CoreSide side,
+                                 const PeerPipeBinding& pipe) {
+  const auto call = transform_utils::GetCallFromStmt(stmt);
+  const bool push = op_predicates::IsTPush(call);
+  const bool pop = op_predicates::IsTPop(call);
+  CHECK(!push || IsOp(call, core_side_ops::TPushOp(side))) << "Peer push belongs to the other core";
+  CHECK(call->GetKwarg<int>("split", push ? -1 : kSplitNone) == kSplitNone)
+      << "Peer FIFO requires no-split tile transfer";
+  const bool cube = side == core_affinity::CoreSide::AIC;
+  const int direction = (push == cube) ? core_affinity::kDirMaskC2V : core_affinity::kDirMaskV2C;
+  CHECK(pipe.direction_mask & direction) << "Peer FIFO transport direction is disabled on its initializer";
+  CHECK(call->args_.size() == (pop ? 0 : 1)) << "Peer FIFO requires unary tile transport";
+  const auto tile = pop ? As<AssignStmt>(stmt)->var_ : AsVarLike(call->args_[0]);
+  const auto type = tile ? As<TileType>(tile->GetType()) : nullptr;
+  const auto space = cube ? (push ? MemorySpace::Acc : MemorySpace::Mat) : MemorySpace::Vec;
+  CHECK(type && type->memory_space_ == space) << "Peer FIFO tile has no qualified native memory space";
+  const auto buffer = backend::DescribePeerTransferBuffer(type);
+  CHECK(buffer && buffer->capacity_bytes <= pipe.slot_bytes) << "Peer FIFO cannot enclose tile in one slot";
+  const int ready = pipe.direction_mask == 3 && direction == core_affinity::kDirMaskV2C ? 2 : 0;
+  const auto data = push ? (cube ? PipeType::FIX : PipeType::MTE3) : PipeType::MTE2;
+  const auto kind = push ? PeerTransportKind::Push : pop ? PeerTransportKind::Pop : PeerTransportKind::Free;
+  return {stmt, kind, id, tile, space, data, buffer->capacity_bytes, buffer->descriptor, ready, ready + 1};
+}
+
+ConsumerFifoEvidence InspectConsumerFifo(const FunctionPtr& function, PeerTransportEffects* effects) {
   if (function->func_type_ != FunctionType::AIC && function->func_type_ != FunctionType::AIV) return {};
   const auto side =
       function->func_type_ == FunctionType::AIC ? core_affinity::CoreSide::AIC : core_affinity::CoreSide::AIV;
   const auto stmts = FlattenBody(function->body_);
   ConsumerFifoEvidence evidence;
   try {
-    const auto fifo = ConsumerFifo(side, true).Run(stmts);
+    ConsumerFifo::TransportCuts cuts;
+    const auto fifo = ConsumerFifo(side, true, effects ? &cuts : nullptr).Run(stmts);
     if (fifo.first_transport == stmts.size()) return {};
     evidence.has_transport = true;
     CHECK(!fifo.unsupported_control)
@@ -849,10 +905,15 @@ ConsumerFifoEvidence AnalyzeConsumerFifo(const FunctionPtr& function) {
         if (const auto assign = As<AssignStmt>(stmt)) reserves.emplace(assign->var_.get(), call);
       } else if (IsOp(call, initialize)) {
         prologue_initializers.insert(call.get());
+        const auto id = call->GetKwarg<int>("id", 0);
+        const auto receive = BindConsumerStorage(call, side, reserves);
         if (call->GetKwarg<int>("dir_mask", 0) & IncomingDirection(side)) {
-          const auto id = call->GetKwarg<int>("id", 0);
-          const bool unique = local_storage.emplace(id, BindConsumerStorage(call, side, reserves)).second;
+          const bool unique = local_storage.emplace(id, receive).second;
           CHECK(unique) << "More than one dominating consumer initializer uses the same peer pipe id";
+        }
+        if (effects) {
+          const bool unique = effects->pipes.emplace(id, BindNativePipe(call, side, receive)).second;
+          CHECK(unique && id >= 0) << "Peer FIFO requires a unique nonnegative logical pipe id";
         }
       }
     }
@@ -865,16 +926,226 @@ ConsumerFifoEvidence AnalyzeConsumerFifo(const FunctionPtr& function) {
       evidence.capacities.emplace(id, ConsumerPipeCapacity{required, *storage});
       const bool can_prove_slot_reuse =
           side == core_affinity::CoreSide::AIV && prologue_initializers.size() == 1;
+      if (effects) {
+        CHECK(required <= static_cast<size_t>(storage->local_slots))
+            << "Peer FIFO outstanding borrows exceed its local slot count";
+      }
       if (can_prove_slot_reuse) {
         if (const auto overwritten = FindOverwrittenConsumer(stmts, fifo.first_transport, id, *storage)) {
           evidence.overwritten_input.emplace(*overwritten);
         }
       }
     }
+    if (effects) {
+      CHECK(!evidence.overwritten_input) << "Peer FIFO has a native read of an overwritten receive slot";
+      for (const auto& [stmt, id] : cuts) {
+        const auto binding = effects->pipes.find(id);
+        CHECK(binding != effects->pipes.end()) << "No dominating initializer for peer pipe id " << id;
+        effects->sites.push_back(BindNativeSite(stmt, id, side, binding->second));
+      }
+    }
   } catch (const pypto::ValueError& error) {
     return {true, {}, error.what(), std::nullopt};
   }
   return evidence;
+}
+
+}  // namespace
+
+ConsumerFifoEvidence AnalyzeConsumerFifo(const FunctionPtr& function) {
+  return InspectConsumerFifo(function, nullptr);
+}
+
+PeerTransportEffects AnalyzePeerTransportEffects(const FunctionPtr& function) {
+  if (!backend::BackendConfig::IsConfigured() ||
+      backend::BackendConfig::GetBackend()->GetHandler()->GetPtoTargetArch() != "a2a3") {
+    return {"Native tile FIFO effects require the A2/A3 transport", {}, {}};
+  }
+  PeerTransportEffects effects;
+  const auto fifo = InspectConsumerFifo(function, &effects);
+  if (!fifo.unavailable.empty()) return {fifo.unavailable, {}, {}};
+  if (!fifo.has_transport) return {"No native tile FIFO operations", {}, {}};
+  return effects;
+}
+
+namespace {
+
+// Each borrow lives entirely in a linear statement sequence. The enclosing
+// sequence may execute conditionally or repeatedly. Ordinal differences
+// inside a borrow then remain exact, irrespective of its entry slot phase.
+class BorrowReaders : public IRVisitor {
+ public:
+  explicit BorrowReaders(const PeerTransportEffects& effects) : pipes_(effects.pipes) {
+    for (const auto& site : effects.sites) {
+      const bool unique = sites_.emplace(site.statement.get(), &site).second;
+      CHECK(unique) << "Shared peer statement has no unique borrow cut";
+    }
+    for (const auto& [id, pipe] : pipes_) {
+      if (!pipe.receive) continue;
+      const auto& ring = *pipe.receive;
+      CHECK(ring.placed_base) << "Local borrow cuts require a placed receive reserve";
+      const auto base = *ring.placed_base;
+      CHECK(reserves_[ring.space].emplace(base, base + ring.reserve_bytes).second)
+          << "Overlapping peer reserves have no independent local cursor";
+    }
+    for (const auto& [space, intervals] : reserves_) {
+      int64_t prior_end = 0;
+      for (const auto& [base, end] : intervals) {
+        CHECK(prior_end <= base) << "Overlapping peer reserves have no independent local cursor";
+        prior_end = end;
+      }
+    }
+  }
+
+  std::vector<PeerBorrowUse> borrows;
+
+  void VisitStmt(const StmtPtr& stmt) override {
+    const auto assign = As<AssignStmt>(stmt);
+    if (const auto it = sites_.find(stmt.get()); it != sites_.end()) {
+      const auto& site = *it->second;
+      if (site.kind == PeerTransportKind::Pop) {
+        auto& ordinal = ordinals_[site.pipe_id];
+        CHECK(!aliases_.count(site.tile.get())) << "Repeated SSA binding for receive borrow";
+        aliases_[site.tile.get()] = borrows.size();
+        birth_.push_back(++ordinal);
+        ++active_;
+        const bool empty = EmptyReceive(site.descriptor);
+        borrows.push_back({stmt, site.pipe_id, pipes_.at(site.pipe_id).receive->local_slots, empty, {}});
+        return;
+      }
+      if (site.kind == PeerTransportKind::Free) {
+        closed_.insert(aliases_.at(site.tile.get()));
+        --active_;
+        return;
+      }
+      if (auto use = Lookup(site.tile))
+        Record(*use, stmt, site.data_pipe);
+      else
+        CheckPlacement(site.tile);
+      return;
+    }
+    if (auto call = transform_utils::GetCallFromStmt(stmt)) {
+      for (size_t index = 0; index < call->args_.size(); ++index) {
+        const auto use = Lookup(AsVarLike(call->args_[index]));
+        if (!use) {
+          VisitExpr(call->args_[index]);
+          continue;
+        }
+        const auto entry = LookupOpEntry(call->op_);
+        CHECK(entry) << "Borrow consumed by an unregistered or outlined operation";
+        if (assign && entry->GetExecutionMemoryAccessEvidence() == ExecutionMemoryAccessEvidence::NoAccess &&
+            op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size()) == index) {
+          BindAlias(assign->var_, *use);
+        } else {
+          Record(*use, stmt, ReaderPipe(call, index));
+        }
+      }
+      for (const auto& [key, attribute] : call->attrs_) {
+        ForEachAttrExpr(attribute, [this](const ExprPtr& value) { VisitExpr(value); });
+      }
+      if (assign && !Lookup(assign->var_)) CheckPlacement(assign->var_);
+      return;
+    }
+    if (assign) {
+      if (auto use = Lookup(AsVarLike(assign->value_))) {
+        BindAlias(assign->var_, *use);
+        return;
+      }
+      CheckPlacement(assign->var_);
+      VisitExpr(assign->value_);
+      return;
+    }
+    if (!As<SeqStmts>(stmt)) CHECK(!active_) << "Receive borrow crosses a control-flow boundary";
+    IRVisitor::VisitStmt(stmt);
+  }
+
+  void VisitExpr(const ExprPtr& expr) override {
+    if (const auto var = AsVarLike(expr)) {
+      CHECK(!Lookup(var)) << "Receive borrow escapes through a nested expression or control operand";
+      CheckPlacement(var);
+    }
+    // Scalar expression DAGs cannot contain an accepted borrow directly.
+    // Still inspect their leaves (e.g. an embedded tile.read) once.
+    if (seen_.insert(expr.get()).second) IRVisitor::VisitExpr(expr);
+  }
+
+ private:
+  std::optional<size_t> Lookup(const VarPtr& var) const {
+    auto it = aliases_.find(var.get());
+    return it == aliases_.end() ? std::nullopt : std::optional{it->second};
+  }
+
+  void BindAlias(const VarPtr& alias, size_t use) {
+    const auto type = As<TileType>(alias->GetType());
+    CHECK(!closed_.count(use) && type && !type->memref_)
+        << "Receive view must preserve its live native slot handle";
+    CHECK(aliases_.emplace(alias.get(), use).second) << "Repeated receive view binding";
+  }
+
+  void CheckPlacement(const VarPtr& value) {
+    const auto type = As<TileType>(value->GetType());
+    if (!type || !type->memory_space_ || !reserves_.count(*type->memory_space_)) return;
+    if (!checked_.insert(type.get()).second) return;
+    CHECK(type->memref_) << "Unbound local tile could alias a native receive reserve";
+    const auto& memref = *type->memref_;
+    const auto base = TryGetNonNegativeConstInt(memref->byte_offset_);
+    CHECK(base && memref->size_ > 0 && memref->size_ <= static_cast<uint64_t>(INT64_MAX - *base))
+        << "Local tile has no bounded placed interval for peer alias analysis";
+    const auto& intervals = reserves_.at(*type->memory_space_);
+    const auto next = intervals.lower_bound(*base + static_cast<int64_t>(memref->size_));
+    CHECK(next == intervals.begin() || std::prev(next)->second <= *base)
+        << "Placed local tile overlaps a native receive reserve";
+  }
+
+  PipeType ReaderPipe(const CallPtr& call, size_t index) const {
+    // Only single-pipe implementations whose selected operand is ordinary
+    // read-only data can close a borrow. A workspace or a multi-pipe macro
+    // needs its own completion contract.
+    const auto pipe = backend::BackendConfig::GetBackend()->TryInferPipe(call);
+    if (IsOp(call, "tile.move") && pipe == PipeType::MTE1 && index == 0) return *pipe;
+    const auto* recipe = backend::FindLogicalBufferElementwiseRecipe(call);
+    if (recipe && pipe == PipeType::V && backend::SupportsLogicalBufferElementwise(*recipe, call)) {
+      const auto read = std::find_if(recipe->inputs.begin(), recipe->inputs.end(), [index](const auto& arg) {
+        return arg.logical_index == index && arg.kind == backend::BufferElementwiseOperandKind::Buffer;
+      });
+      if (read != recipe->inputs.end()) return *pipe;
+    }
+    CHECK(false) << "Receive reader lacks a selected single-pipe read contract: " << call->op_->name_;
+    return PipeType::ALL;
+  }
+
+  void Record(size_t use, const StmtPtr& stmt, PipeType pipe) {
+    auto& borrow = borrows[use];
+    CHECK(!closed_.count(use)) << "Native read after logical release of a receive borrow";
+    CHECK(ordinals_.at(borrow.pipe_id) - birth_[use] < static_cast<size_t>(borrow.reuse_distance))
+        << "Receive slot is overwritten before a named reader";
+    auto& cuts = borrow.readers.try_emplace(pipe, PeerReaderCuts{stmt, stmt}).first->second;
+    cuts.last = stmt;
+  }
+
+  const std::map<int, PeerPipeBinding>& pipes_;
+  std::unordered_map<const Stmt*, const PeerTransportSite*> sites_;
+  std::unordered_map<const Var*, size_t> aliases_;
+  std::map<MemorySpace, std::map<int64_t, int64_t>> reserves_;
+  std::unordered_set<const TileType*> checked_;
+  std::unordered_set<const Expr*> seen_;
+  std::unordered_set<size_t> closed_;
+  std::unordered_map<int, size_t> ordinals_;
+  std::vector<size_t> birth_;
+  size_t active_ = 0;
+};
+
+}  // namespace
+
+PeerBorrowUsePlan AnalyzePeerBorrowUses(const FunctionPtr& function, const PeerTransportEffects& effects) {
+  if (!effects.unavailable.empty()) return {effects.unavailable, {}};
+  try {
+    BorrowReaders readers(effects);
+    readers.VisitFunction(function);
+    return {{}, std::move(readers.borrows)};
+  } catch (const pypto::ValueError& error) {
+    return {error.what(), {}};
+  }
 }
 
 std::unordered_set<const Stmt*> FindC2VSlotReuseFences(const FunctionPtr& function) {

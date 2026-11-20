@@ -121,6 +121,10 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/numerical_sync_order.cpp
     src/ir/transforms/utils/placed_sync_import.cpp
     src/ir/transforms/utils/invocation_sync_analysis.cpp
+    src/ir/transforms/utils/peer_gm_invocation.cpp
+    src/ir/transforms/utils/peer_local_effects.cpp
+    src/ir/transforms/utils/peer_local_plan.cpp
+    src/ir/transforms/utils/peer_fifo_pair.cpp
     src/ir/transforms/token_sync.cpp
     src/ir/transforms/utils/structured_token_sync.cpp
     src/ir/transforms/utils/sync_boundary_graph.cpp

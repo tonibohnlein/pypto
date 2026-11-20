@@ -169,6 +169,72 @@ struct ConsumerFifoEvidence {
 /// ownership. An overwritten input is a concrete straight-line native read.
 ConsumerFifoEvidence AnalyzeConsumerFifo(const FunctionPtr& function);
 
+enum class PeerTransportKind { Push, Pop, Free };
+
+struct PeerPipeBinding {
+  CallPtr initializer;
+  int direction_mask;
+  int transport_slots;
+  int64_t slot_bytes;
+  std::optional<ConsumerReceiveStorage> receive;
+
+  // A2/A3 TPipe batches free notifications and waits over this many transfers.
+  int CreditPeriod() const { return transport_slots <= 2 ? transport_slots : transport_slots / 2; }
+};
+
+struct PeerTransportSite {
+  StmtPtr statement;
+  PeerTransportKind kind;
+  int pipe_id;
+  VarPtr tile;  // source, borrowed result, or released result, respectively
+  MemorySpace memory_space;
+  // Push reads on FIX/MTE3; Pop writes on MTE2. A Free is a logical
+  // marker with no issue or completion and carries its borrow's data pipe.
+  PipeType data_pipe;
+  int64_t capacity_bytes;
+  BufferTypePtr descriptor;
+  // Group IDs relative to the physical base allocated by PTOAS. Push waits
+  // for batched credit and posts ready; Pop waits ready and posts batched
+  // credit. Free issues neither signal. No-split still signals in both AIV lanes.
+  int ready_offset;
+  int credit_offset;
+};
+
+struct PeerTransportEffects {
+  std::string unavailable;
+  std::map<int, PeerPipeBinding> pipes;
+  std::vector<PeerTransportSite> sites;
+};
+
+/// Per-occurrence native tile FIFO effects on A2/A3. Logical FIFO nesting
+/// and local capacity alone do not prove matching peer control, local
+/// consumer completion before reuse, or ownership of ordinary payloads.
+PeerTransportEffects AnalyzePeerTransportEffects(const FunctionPtr& function);
+
+struct PeerReaderCuts {
+  StmtPtr first;
+  StmtPtr last;
+};
+
+/// For pop ordinal n the physical byte range is reused by pops n+k*distance.
+/// Readiness precedes the first read on each local pipe; its last read must
+/// complete before the next nonempty write of that same slot. These cuts
+/// describe named borrow uses, with the enclosing control kept on each cut.
+struct PeerBorrowUse {
+  StmtPtr pop;
+  int pipe_id;
+  int reuse_distance;
+  bool empty;
+  std::map<PipeType, PeerReaderCuts> readers;
+};
+
+struct PeerBorrowUsePlan {
+  std::string unavailable;
+  std::vector<PeerBorrowUse> borrows;
+};
+
+PeerBorrowUsePlan AnalyzePeerBorrowUses(const FunctionPtr& function, const PeerTransportEffects& effects);
+
 /// Find A2/A3 C2V tile receive sites that may overwrite the same local
 /// bytes as a different native TPOP. Run on the final native emission order.
 std::unordered_set<const Stmt*> FindC2VSlotReuseFences(const FunctionPtr& function);

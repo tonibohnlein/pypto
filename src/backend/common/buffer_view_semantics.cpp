@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -54,6 +55,59 @@ std::optional<uint64_t> PhysicalBufferBytes(const ir::BufferTypePtr& type) {
     bytes *= static_cast<uint64_t>(extent);
   }
   return bytes;
+}
+
+std::optional<PeerTransferBuffer> DescribePeerTransferBuffer(const ir::TileTypePtr& tile) {
+  if (!tile || tile->shape_.size() != 2) return std::nullopt;
+  const auto space = tile->GetMemorySpace();
+  const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
+  const auto rows = ir::As<ir::ConstInt>(tile->shape_[0]);
+  const auto cols = ir::As<ir::ConstInt>(tile->shape_[1]);
+  const auto offset = ir::As<ir::ConstInt>(view.start_offset);
+  if (!rows || !cols || rows->value_ <= 0 || cols->value_ <= 0 || view.valid_shape.size() != 2 ||
+      (view.start_offset && (!offset || offset->value_ != 0)) || view.compact != ir::CompactMode::null) {
+    return std::nullopt;
+  }
+  if (space == ir::MemorySpace::Vec) {
+    if (!IsDenseBufferTransferDtype(tile->dtype_) || !IsDenseVecBufferTile(tile, view, view.pad) ||
+        cols->value_ % (32 / static_cast<int64_t>(tile->dtype_.GetByte())) != 0) {
+      return std::nullopt;
+    }
+    if (!view.stride.empty()) {
+      if (view.stride.size() != 2) return std::nullopt;
+      const auto pitch = ir::As<ir::ConstInt>(view.stride[0]);
+      const auto unit = ir::As<ir::ConstInt>(view.stride[1]);
+      if (!pitch || !unit || pitch->value_ != cols->value_ || unit->value_ != 1) return std::nullopt;
+    }
+  } else {
+    // The byte product is a physical capacity only for complete native boxes.
+    // INT32 accumulators have a target-specific L0C M pitch; keep those out
+    // until the selected transport accounts for that additional alignment.
+    if ((space != ir::MemorySpace::Acc && space != ir::MemorySpace::Mat) || !view.stride.empty() ||
+        (space == ir::MemorySpace::Acc && tile->dtype_ != DataType::FP32) ||
+        !IsMatrixBufferDtype(*space, tile->dtype_) || view.blayout != ir::TileLayout::col_major ||
+        view.slayout != ir::TileLayout::row_major ||
+        view.fractal != ir::tile_view_semantics::GetImplicitFractal(space)) {
+      return std::nullopt;
+    }
+    const auto box = ir::tile_view_semantics::GetBoxedTileAlignment(view, tile->dtype_);
+    if (!box || rows->value_ % box->rows != 0 || cols->value_ % box->cols != 0) return std::nullopt;
+  }
+  const std::vector<int64_t> shape{rows->value_, cols->value_};
+  std::vector<int64_t> valid;
+  for (size_t axis = 0; axis < shape.size(); ++axis) {
+    const auto& extent = view.valid_shape[axis];
+    const auto type = extent ? ir::As<ir::ScalarType>(extent->GetType()) : nullptr;
+    if (!type || (!type->dtype_.IsInt() && type->dtype_ != DataType::INDEX)) return std::nullopt;
+    const auto constant = ir::As<ir::ConstInt>(extent);
+    if (constant && (constant->value_ < 0 || constant->value_ > shape[axis])) return std::nullopt;
+    valid.push_back(constant ? constant->value_ : -1);
+  }
+  auto descriptor = std::make_shared<ir::BufferType>(shape, tile->dtype_, *space, valid, view.blayout,
+                                                     view.slayout, view.fractal, view.pad, view.compact);
+  const auto bytes = PhysicalBufferBytes(descriptor);
+  if (!bytes || *bytes > std::numeric_limits<int64_t>::max()) return std::nullopt;
+  return PeerTransferBuffer{std::move(descriptor), static_cast<int64_t>(*bytes)};
 }
 
 bool IsContiguousVectorReshape(const ir::BufferTypePtr& source, const ir::BufferTypePtr& destination) {

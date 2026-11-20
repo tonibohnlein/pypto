@@ -39,6 +39,8 @@ struct SyncParameterWork {
   size_t call_graph_nodes = 0, call_graph_edges = 0, processed_functions = 0;
 };
 struct SyncInvocationEvidence {
+  // Original Call and Submit edges, shared with mixed-unit ownership qualification.
+  std::map<std::string, std::set<std::string>> callees;
   std::map<std::string, SyncParameterBounds> parameters;
   // Inclusive logical block-index hull, proved from every incoming SPMD launch.
   // Separate from formal ABI positions; absence is an unavailable launch proof.

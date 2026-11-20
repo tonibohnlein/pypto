@@ -32,6 +32,12 @@ from .ir import (
 )
 from .passes import EventfulSyncChild, NativeSyncChild
 
+def inspect_peer_fifo_protocols(program: Program) -> dict[str, str]:
+    """Inspect authored FIFO protocols independently of single-core AutoSync."""
+
+def analyze_peer_transport_effects(function: Function) -> dict[str, Any]:
+    """Local native group flag offsets, tile storage and transfer pipes in statement order."""
+
 def normalize_buffer_active_domains(function: Function) -> dict[str, Any]:
     """Inspect the existing prefix candidate/work without whole Buffer admission.
 

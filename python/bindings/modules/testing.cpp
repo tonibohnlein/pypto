@@ -58,6 +58,7 @@
 #include "pypto/ir/transforms/utils/buffer_active_domain_analysis.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
+#include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/finite_sync_analysis.h"
 #include "pypto/ir/transforms/utils/parent_stmt_analysis.h"
 #include "pypto/ir/type.h"
@@ -65,6 +66,7 @@
 #include "python/bindings/modules/testing_sync_support.h"
 #include "src/ir/transforms/utils/compact_sync_builder.h"
 #include "src/ir/transforms/utils/conservative_sync_dataflow.h"
+#include "src/ir/transforms/utils/peer_fifo_pair.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/physical_sync_commands.h"
 #include "src/ir/transforms/utils/retained_sync_child.h"
@@ -977,6 +979,45 @@ void BindTesting(nb::module_& m) {
       },
       nb::arg("function"),
       "Inspect the existing prefix normalization candidate and work; this is not whole Buffer admission");
+  testing.def("inspect_peer_fifo_protocols", &ir::sync::InspectPeerFifoProtocols, nb::arg("program"),
+              "Inspect authored FIFO protocols independently of single-core AutoSync");
+  testing.def(
+      "analyze_peer_transport_effects",
+      [](const ir::FunctionPtr& function) {
+        namespace peer = ir::cross_core_pipe;
+        const auto effects = peer::AnalyzePeerTransportEffects(function);
+        nb::dict result, pipes;
+        nb::list sites;
+        for (const auto& [id, pipe] : effects.pipes) {
+          pipes[nb::int_(id)] =
+              nb::make_tuple(pipe.direction_mask, pipe.transport_slots, pipe.slot_bytes, pipe.CreditPeriod(),
+                             pipe.receive ? pipe.receive->local_slots : 0);
+        }
+        for (const auto& site : effects.sites) {
+          const char* kind = site.kind == peer::PeerTransportKind::Push  ? "push"
+                             : site.kind == peer::PeerTransportKind::Pop ? "pop"
+                                                                         : "free";
+          sites.append(nb::make_tuple(kind, site.pipe_id, ir::MemorySpaceToString(site.memory_space),
+                                      ir::PipeTypeToString(site.data_pipe), site.capacity_bytes,
+                                      site.ready_offset, site.credit_offset));
+        }
+        result["unavailable"] = effects.unavailable;
+        result["pipes"] = pipes;
+        result["sites"] = sites;
+        const auto local = peer::AnalyzePeerBorrowUses(function, effects);
+        result["borrow_unavailable"] = local.unavailable;
+        nb::list borrows;
+        for (const auto& borrow : local.borrows) {
+          nb::dict readers;
+          for (const auto& [pipe, cuts] : borrow.readers) {
+            readers[nb::str(ir::PipeTypeToString(pipe).c_str())] = nb::make_tuple(cuts.first, cuts.last);
+          }
+          borrows.append(nb::make_tuple(borrow.pipe_id, borrow.reuse_distance, borrow.empty, readers));
+        }
+        result["borrows"] = borrows;
+        return result;
+      },
+      nb::arg("function"), "Inspect per-statement native A2/A3 tile FIFO effects");
   nb::class_<ir::sync::SyncSchedulePolicy>(testing, "SyncSchedulePolicy")
       .def(
           "__init__",

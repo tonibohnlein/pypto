@@ -362,5 +362,53 @@ slot overwrite in the original active lane. The proof requires a single
 dominating consumer setup, an unconditional sequence of fully valid dense FP32
 Vec pops, and a direct registered tile data read of an older outstanding value
 after its slot wraps. Unknown shapes, early exits and alias reads remain
-outside this rejection. PTOAS retains grouped synchronization ownership and the
-original native peer epochs, including the zero-valid handshake lane.
+outside this rejection. Native peer epochs, including the zero-valid handshake
+lane, remain in their original order.
+
+## Single-core AutoSync for native FIFO endpoints on A2/A3
+
+The programmer or upstream lowering specifies the communication operations.
+The native FIFO implements the ready and credit signals. AutoSync preserves
+the communication sequence and plans storage dependencies on the executing core.
+
+For a receive with ordinal `k`, the local slot begins at
+`reserve + (k % local_depth) * slot_bytes`. The transfer descriptor bounds
+its byte extent. A pop writes that slot on MTE2. A subsequent TMOV reads the
+same bytes on MTE1, or a vector operation reads them on V. TFREE releases a
+logical borrow. The physical reader still has to finish before a later pop
+overwrites those bytes. A push reads its local source tile on its selected
+pipe. The local planner imports all of these effects alongside ordinary
+payloads and uses the same dependency analysis and local event allocator.
+It checks event consumption before reuse and drains the endpoint at return.
+
+The importer represents each FIFO as rotating physical storage. In a sequential
+loop with `p` pops per visit, visit `v` starts at slot
+`(entry_ordinal + v * p) % local_depth`. At exit the ordinal advances by
+`trip_count * p`. The regional dependence analysis carries the last writer
+and outstanding readers of each slot into the next region. An epilogue pop
+can therefore depend on a reader from an earlier visit, including when one
+visit advances only part of the ring.
+
+Supported control includes straight-line code, statically bounded sequential
+loops with a fixed receive count per visit, and a terminal AIV subblock branch
+with independently qualified arms. The local borrow must close inside its
+region. Nested or runtime-bounded loops require further qualification.
+The importer requires explicit
+placement, the conservative-prefix policy, and a qualified native FIFO
+workspace. The actual launch must bind the sized workspace separately from
+ordinary GM tensors. Ordinary tensors can alias and share a conservative
+local GM storage domain.
+
+PTOAS has one local insertion switch per emitted unit. The compiler prepares
+each endpoint's plan independently. If all plans verify, the driver emits them
+and disables downstream local insertion. Otherwise it preserves the original
+bodies and enables PTOAS local insertion for the unit. The fallback report
+identifies which endpoint failed and which verified but shared its invocation.
+This choice leaves the programmer's cross-core protocol in effect in both modes.
+
+The optional host diagnostic `testing.inspect_peer_fifo_protocols(program)`
+compares send and receive streams, writer multiplicity and ready/credit
+progress. It runs only when explicitly requested. Local AutoSync ownership
+certifies single-core storage ordering. For example, a compile-only regression
+retains five authored sends and four receives while verifying both local Mat
+slot overwrites. Such a protocol can stall on a device.

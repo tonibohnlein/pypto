@@ -33,7 +33,7 @@ from textwrap import indent
 
 import pypto.language as pl
 import pytest
-from pypto import backend, codegen, ir, passes
+from pypto import backend, codegen, ir, passes, testing
 from pypto.backend import BackendType
 from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.backend.pto_backend import _build_group_mapping
@@ -101,7 +101,7 @@ return pl.store(combined, [0, 0], out)
 
 
 def _paired_receive_program(
-    local_depth: int, producer: str, consumer: str, *, slot_bytes: int = 1024
+    local_depth: int, producer: str, consumer: str, *, slot_bytes: int = 1024, ring_depth: int = 2
 ) -> ir.Program:
     return pl.parse_program(f"""
 @pl.program
@@ -110,14 +110,14 @@ class PairedConsumer:
     def cube(self, x: pl.Tensor[[32, 16], pl.FP16]):
         peer = pl.import_peer_buffer(name="peer_c2v", peer_func="vector")
         pl.aic_initialize_pipe(peer, pl.const(0, pl.INT32), dir_mask=1, slot_size={slot_bytes},
-                               slot_num=2, local_slot_num={local_depth})
+                               slot_num={ring_depth}, local_slot_num={local_depth})
 {indent(producer.strip(), "        ")}
 
     @pl.function(type=pl.FunctionType.AIV)
     def vector(self, out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
         fifo = pl.reserve_buffer(name="peer_c2v", size={slot_bytes * local_depth}, base=4096)
         pl.aiv_initialize_pipe(fifo, pl.const(0, pl.INT32), dir_mask=1, slot_size={slot_bytes},
-                               slot_num=2, local_slot_num={local_depth})
+                               slot_num={ring_depth}, local_slot_num={local_depth})
 {indent(consumer.strip(), "        ")}
 
     @pl.function(type=pl.FunctionType.Group)
@@ -131,6 +131,236 @@ class PairedConsumer:
              out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
         return self.paired(x, out)
 """)
+
+
+def _mat_receive_epilogue(width, dtype, ring_depth, *, sends=4, loop=None, two_readers=False):
+    """Each new pop overwrites the Mat slot read two transfers earlier."""
+    stride = 16 * width * 4
+
+    def visit_ops(visit, row):
+        rhs = f"right{visit}" if two_readers else "right"
+        extra = [f"{rhs} = pl.move(r{visit}, target_memory=pl.Mem.Right)"] if two_readers else []
+        return "\n".join(
+            [
+                f"r{visit}: pl.Tile[[16, {width}], pl.{dtype}, pl.Mem.Mat] = pl.tpop_from_aiv(split=0)",
+                f"l{visit} = pl.move(r{visit}, target_memory=pl.Mem.Left)",
+                *extra,
+                f"pl.tfree_to_aiv(r{visit})",
+                f"product{visit} = pl.matmul(l{visit}, {rhs})",
+                f"out = pl.store(product{visit}, [{row}, 0], out)",
+            ]
+        )
+
+    if loop is None:
+        pops = [visit_ops(i, 16 * i) for i in range(4)]
+    else:
+        trips, per_trip = loop
+        body = "\n".join(visit_ops(i, 16 * i) for i in range(per_trip))
+        pops = [f"for i in pl.range({trips}):\n" + indent(body, "    ")]
+        pops.extend(visit_ops(f"tail{i}", 16 * (i + 2)) for i in range(2))
+        sends = trips * per_trip + 2
+    return pl.parse_program(f"""
+@pl.program
+class MatReceiver:
+    @pl.function(type=pl.FunctionType.AIC)
+    def cube(self, rhs: pl.Tensor[[{width}, 16], pl.{dtype}],
+             out: pl.Out[pl.Tensor[[64, 16], pl.FP32]]) -> pl.Tensor[[64, 16], pl.FP32]:
+        fifo = pl.reserve_buffer(name="inbox", size={2 * stride}, base=0)
+        pl.aic_initialize_pipe(pl.const(0, pl.INT32), fifo, dir_mask=2, slot_size={stride},
+                               slot_num={ring_depth}, local_slot_num=2)
+        matrix = pl.load(rhs, [0, 0], [{width}, 16], target_memory=pl.Mem.Mat)
+        right = pl.move(matrix, target_memory=pl.Mem.Right)
+{indent(chr(10).join(pops), "        ")}
+        return out
+
+    @pl.function(type=pl.FunctionType.AIV)
+    def vector(self, x: pl.Tensor[[16, {width}], pl.{dtype}]):
+        peer = pl.import_peer_buffer(name="inbox", peer_func="cube")
+        pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer, dir_mask=2, slot_size={stride},
+                               slot_num={ring_depth}, local_slot_num=2)
+        data = pl.load(x, [0, 0], [16, {width}], target_memory=pl.Mem.Vec)
+{indent(chr(10).join(["pl.tpush_to_aic(data, split=0)"] * sends), "        ")}
+
+    @pl.function(type=pl.FunctionType.Group)
+    def paired(self, rhs: pl.Tensor[[{width}, 16], pl.{dtype}], x: pl.Tensor[[16, {width}], pl.{dtype}],
+               out: pl.Out[pl.Tensor[[64, 16], pl.FP32]]) -> pl.Tensor[[64, 16], pl.FP32]:
+        self.vector(x)
+        return self.cube(rhs, out)
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(self, rhs: pl.Tensor[[{width}, 16], pl.{dtype}], x: pl.Tensor[[16, {width}], pl.{dtype}],
+             out: pl.Out[pl.Tensor[[64, 16], pl.FP32]]) -> pl.Tensor[[64, 16], pl.FP32]:
+        return self.paired(rhs, x, out)
+""")
+
+
+def _check_mat_receive_schedule(body):
+    # Replay explicit SET/WAIT prefix transfer in the emitted cube function.
+    # Recording the last reader's completion on MTE2 is essential at wrap.
+    known = {}
+    pending = {}
+    received = {}
+    slots: list[int | None] = [None, None]
+    reads = 0
+    for cut, line in enumerate(body.splitlines()):
+        flag = re.search(r"(set|wait)_flag\(PIPE_(\w+), PIPE_(\w+), EVENT_ID(\d+)\)", line)
+        if flag:
+            kind, src, dst, idx = flag.groups()
+            key = (src, dst, idx)
+            if kind == "set":
+                assert key not in pending
+                pending[key] = set(known.get(src, ()))
+            else:
+                known.setdefault(dst, set()).update(pending.pop(key))
+        elif "TPOP<TPipe<" in line:
+            target = re.search(r", (v\d+)\);$", line)
+            assert target is not None, line
+            name = target[1]
+            slot = len(received) % 2
+            if slots[slot] is not None:
+                assert slots[slot] in known["MTE2"], "receive slot reused before MTE1 read completed"
+            known.setdefault("MTE2", set()).add(cut)
+            received[name] = (cut, slot)
+        elif move := re.search(r"TMOV\(v\d+, (v\d+)\);", line):
+            if move[1] in received:
+                pop, slot = received[move[1]]
+                assert pop in known["MTE1"], "Mat read issued before TPOP completed"
+                known["MTE1"].add(cut)
+                slots[slot] = cut
+                reads += 1
+    assert len(received) == reads == 4
+    assert not pending
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.usefixtures("ascend_backend")
+@pytest.mark.parametrize(
+    "mat_geometry",
+    [None, (16, "FP16", 4), (128, "BF16", 2)],
+    ids=["vec-receiver", "mat-slot-epilogue", "prefill-mat-slot-geometry"],
+)
+def test_complete_group_owns_both_native_endpoints(tmp_path, mat_geometry):
+    cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
+    program = _mat_receive_epilogue(*mat_geometry) if mat_geometry else _paired_consumer(2)
+    with passes.PassContext(
+        [],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+        autosync_disjoint_gm=True,
+    ):
+        ir.compile(program, **cfg.compile_kwargs())
+    info = json.loads((tmp_path / "ptoas" / "paired.sync.json").read_text())
+    assert info["owned"] and not info["ptoas_insert_sync"], info
+    assert "--enable-insert-sync=false" in info["compile_flags"]
+    assert {d["function"] for d in info["domains"] if d["owned"]} == {"cube", "vector"}
+    if mat_geometry:
+        native = (tmp_path / "ptoas" / "paired.cpp").read_text().split("AICORE void cube(", 1)[1]
+        cube = native.split("AICORE void ", 1)[0]
+        _check_mat_receive_schedule(cube)
+        without_releases = re.sub(r"^.*(?:set|wait)_flag\(PIPE_MTE1, PIPE_MTE2,.*$", "", cube, flags=re.M)
+        with pytest.raises(AssertionError, match="receive slot reused"):
+            _check_mat_receive_schedule(without_releases)
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.usefixtures("ascend_backend")
+def test_single_core_autosync_preserves_an_unbalanced_authored_protocol(tmp_path):
+    # Compile only. The extra authored send makes the communication protocol
+    # unbalanced. All four local Mat receives still require valid slot ordering.
+    snapshots = []
+
+    def capture(transform, program):
+        if transform.get_name() == "RealizeSync":
+            snapshots.append(program)
+
+    program = _mat_receive_epilogue(128, "BF16", 2, sends=5)
+    cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
+    with passes.PassContext(
+        [passes.CallbackInstrument(before_pass=capture, after_pass=capture)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+        autosync_disjoint_gm=False,
+    ):
+        ir.compile(program, **cfg.compile_kwargs())
+    before, after = snapshots
+    assert "stream counts" in testing.inspect_peer_fifo_protocols(before)["paired"]
+
+    class Payloads(ir.IRVisitor):
+        def __init__(self):
+            super().__init__()
+            self.original_calls = []
+
+        def visit_call(self, op):
+            if not (
+                op.op.name.startswith("system.bar_")
+                or op.op.name in {ir.get_op("system.set_flag").name, ir.get_op("system.wait_flag").name}
+            ):
+                self.original_calls.append(op)
+            super().visit_call(op)
+
+    for name in ("cube", "vector"):
+        old, new = Payloads(), Payloads()
+        old.visit_function(before.get_function(name))
+        new.visit_function(after.get_function(name))
+        assert old.original_calls and new.original_calls == old.original_calls
+
+    manifest = json.loads((tmp_path / "ptoas" / "paired.sync.json").read_text())
+    assert manifest["owned"] and not manifest["ptoas_insert_sync"]
+    native = (tmp_path / "ptoas" / "paired.cpp").read_text()
+    cube = native.split("AICORE void cube(", 1)[1].split("AICORE void ", 1)[0]
+    _check_mat_receive_schedule(cube)
+    # Both active and empty Vec lanes keep the five original sends.
+    assert native.count("TPUSH<") == 10
+    assert cube.count("TPOP<") == 4
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.usefixtures("ascend_backend")
+@pytest.mark.parametrize("count", [3, 9])
+def test_peer_event_pressure_is_atomic(tmp_path, count):
+    # Distinct live values force a fresh MTE2 -> V completion per receive.
+    # Their GM stores come later, so no reverse service permits early ID reuse.
+    producer = "\n".join(
+        ["a = pl.load(x, [0, 0], [16, 16])", "m = pl.matmul(a, a)"] + ["pl.tpush_to_aiv(m, split=0)"] * count
+    )
+    receiver = []
+    for i in range(count):
+        receiver.extend(
+            [
+                f"v{i}: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)",
+                f"t{i} = pl.add(v{i}, v{i})",
+                f"pl.tfree_to_aic(v{i})",
+            ]
+        )
+    receiver.append("s0 = t0")
+    receiver.extend(f"s{i} = pl.add(s{i - 1}, t{i})" for i in range(1, count))
+    receiver.append(f"return pl.store(s{count - 1}, [0, 0], out)")
+    program = _paired_receive_program(16, producer, "\n".join(receiver), ring_depth=16)
+    cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
+    with passes.PassContext(
+        [],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+        autosync_disjoint_gm=True,
+    ):
+        ir.compile(program, **cfg.compile_kwargs())
+    info = json.loads((tmp_path / "ptoas" / "paired.sync.json").read_text())
+    assert info["owned"] == (count == 3)
+    assert {d["owned"] for d in info["domains"]} == {count == 3}
+    if count == 9:
+        reasons = json.loads((tmp_path / "report" / "autosync.json").read_text())["kernels"]
+        per_core = {k["function"]: k["reason"] for k in reasons}
+        assert per_core["cube"].startswith("local plan verified; shared PTOAS invocation")
+        assert per_core["vector"].startswith("local planning for vector")
+        assert all("required_at_least=9 eligible=8" in reason for reason in per_core.values())
+        source = (tmp_path / "ptoas" / "paired.pto").read_text()
+        assert "pto.set_flag" not in source and "pto.wait_flag" not in source
 
 
 @pytest.mark.usefixtures("ascend_backend")
@@ -176,18 +406,26 @@ def test_explicit_peer_orders_physical_slot_reuse(
     first_pop, second_pop, replay_first, _ = (match.start() for match in re.finditer(r"\bTPOP<", native))
     between_pops = native[first_pop:second_pop]
     barrier = "pipe_barrier(PIPE_ALL);"
-    if depth == 1:
-        # Hardware TFREE for a GM-backed tile pop does not wait for the vector
-        # read. The same physical slot needs this fence in both lexical forms.
+    owned = enable_autosync and (depth > 1 or free_before_wrap)
+    if depth == 1 and owned:
+        read_suffix = between_pops.split("TADD(", 1)[1]
+        release = re.search(r"set_flag\(PIPE_V, PIPE_MTE2, (EVENT_ID\d+)\);", read_suffix)
+        assert release
+        assert f"wait_flag(PIPE_V, PIPE_MTE2, {release[1]});" in read_suffix[release.end() :]
+        assert barrier not in between_pops
+    elif depth == 1:
         assert between_pops.index("TADD(") < between_pops.index(barrier)
     else:
         assert barrier not in between_pops
-    assert barrier not in native[replay_first:]
-    # Read readiness still comes from PTOAS on both routes.
+    if not owned:
+        assert barrier not in native[replay_first:]
+    else:
+        # Each local return drains its own lane, including the handshake lane.
+        assert barrier not in native[replay_first : native.index("TPOP<", replay_first + 1)]
     assert "wait_flag(PIPE_MTE2, PIPE_V," in native[second_pop:replay_first]
     ownership = json.loads((tmp_path / "ptoas" / "paired.sync.json").read_text())
-    assert ownership["ptoas_insert_sync"]
-    assert not any(domain["owned"] for domain in ownership["domains"])
+    assert ownership["ptoas_insert_sync"] == (not owned)
+    assert {domain["owned"] for domain in ownership["domains"]} == {owned}
 
 
 @pytest.mark.ptoas_compile
@@ -333,6 +571,23 @@ class IndependentFifos:
         ir.assert_structural_equal(before.body, after.body)
 
 
+def _peer_transport_effects(program: ir.Program, name: str):
+    function = program.get_function(name)
+    assert function is not None, name
+    return testing.analyze_peer_transport_effects(function)
+
+
+class _SharePopExpression(ir.IRMutator):
+    pop = None
+
+    def visit_call(self, op):
+        if op.op.name != ir.get_op("tile.tpop_from_aiv").name:
+            return super().visit_call(op)
+        if self.pop is None:
+            self.pop = op
+        return self.pop
+
+
 @pytest.mark.usefixtures("ascend_backend")
 def test_peer_fifo_counts_each_statement_with_a_shared_pop_expression():
     source = pl.parse_program("""
@@ -348,19 +603,9 @@ class RepeatedPopExpression:
         pl.tfree_to_aiv(second)
 """)
 
-    class SharePopExpression(ir.IRMutator):
-        pop = None
-
-        def visit_call(self, op):
-            if op.op.name != ir.get_op("tile.tpop_from_aiv").name:
-                return super().visit_call(op)
-            if self.pop is None:
-                self.pop = op
-            return self.pop
-
     # A loop unroller can reuse a nullary TPOP expression while allocating a
     # distinct SSA result for each cloned statement. Both borrows are live here.
-    source = SharePopExpression().visit_program(source)
+    source = _SharePopExpression().visit_program(source)
     with passes.PassContext([], enable_pypto_autosync=True, autosync_policy="conservative_prefix"):
         result = passes.realize_sync()(source)
     cube = result.get_function("cube")
@@ -371,6 +616,128 @@ class RepeatedPopExpression:
         "pipe id 0 has peak marker depth 2, declared local capacity 2, "
         "512-byte slot stride in Mat via MTE2, reserve bytes [0, 1024)"
     ) in why
+    sites = _peer_transport_effects(source, "cube")["sites"]
+    assert [site[0] for site in sites] == ["pop", "pop", "free", "free"]
+
+
+@pytest.mark.usefixtures("ascend_backend")
+@pytest.mark.parametrize("split,slot_bytes", [(0, 1024), (1, 1024), (0, 128)])
+def test_native_peer_transport_effects(split: int, slot_bytes: int):
+    source = pl.parse_program(f"""
+@pl.program
+class Exchange:
+    @pl.function(type=pl.FunctionType.AIC)
+    def cube(self, acc: pl.Tile[[16, 16], pl.FP32, pl.Mem.Acc]):
+        mat = pl.reserve_buffer(name="mat", size=2048, base=8192)
+        peer = pl.import_peer_buffer(name="vec", peer_func="vector")
+        pl.aic_initialize_pipe(peer, mat, dir_mask=3, slot_size={slot_bytes},
+                               slot_num=6, local_slot_num=2, id=7)
+        pl.tpush_to_aiv(acc, split={split}, id=7)
+        x: pl.Tile[[16, 16], pl.FP16, pl.Mem.Mat] = pl.tpop_from_aiv(split={split}, id=7)
+        pl.tfree_to_aiv(x, id=7)
+
+    @pl.function(type=pl.FunctionType.AIV)
+    def vector(self, source: pl.Tile[[16, 16], pl.FP16, pl.Mem.Vec]):
+        vec = pl.reserve_buffer(name="vec", size=2048, base=4096)
+        peer = pl.import_peer_buffer(name="mat", peer_func="cube")
+        pl.aiv_initialize_pipe(vec, peer, dir_mask=3, slot_size={slot_bytes},
+                               slot_num=6, local_slot_num=2, id=7)
+        x: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split={split}, id=7)
+        pl.tfree_to_aic(x, id=7)
+        pl.tpush_to_aic(source, split={split}, id=7)
+""")
+    cube, vector = (_peer_transport_effects(source, s) for s in ("cube", "vector"))
+    if split or slot_bytes < 1024:
+        for side in (cube, vector):
+            assert side["unavailable"] and not side["sites"] and not side["pipes"]
+        return
+    assert cube["unavailable"] == vector["unavailable"] == ""
+    assert cube["pipes"] == vector["pipes"] == {7: (3, 6, 1024, 3, 2)}
+    # Relative group flags depend on direction, even with a nonzero logical
+    # pipe id. A free marker names the same borrowed storage as its pop.
+    assert cube["sites"] == [
+        ("push", 7, "Acc", "FIX", 1024, 0, 1),
+        ("pop", 7, "Mat", "MTE2", 512, 2, 3),
+        ("free", 7, "Mat", "MTE2", 512, 2, 3),
+    ]
+    assert vector["sites"] == [
+        ("pop", 7, "Vec", "MTE2", 1024, 0, 1),
+        ("free", 7, "Vec", "MTE2", 1024, 0, 1),
+        ("push", 7, "Vec", "MTE3", 512, 2, 3),
+    ]
+
+
+@pytest.mark.usefixtures("ascend_backend")
+@pytest.mark.parametrize("early_free,output_base", [(False, 2048), (True, 2048), (False, 128)])
+def test_native_receive_borrow_reader_cuts(early_free: bool, output_base: int):
+    release = "pl.tfree_to_aic(received)"
+    source = pl.parse_program(f"""
+@pl.program
+class ReadBorrow:
+    @pl.function(type=pl.FunctionType.AIV)
+    def vector(self):
+        reserve = pl.reserve_buffer(name="ring", size=2048, base=0)
+        pl.aiv_initialize_pipe(reserve, pl.const(0, pl.INT32), dir_mask=1, slot_size=1024, slot_num=2)
+        allocation: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 1024)
+        for i in pl.range(8):
+            received: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+            alias: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tile.set_validshape(received, 16, 16)
+            first: pl.Tile[[16, 16], pl.FP32, pl.MemRef(allocation, {output_base}, 1024), pl.Mem.Vec] = (
+                pl.mul(alias, 2.0)
+            )
+            {release if early_free else ""}
+            last: pl.Tile[[16, 16], pl.FP32, pl.MemRef(allocation, {output_base}, 1024), pl.Mem.Vec] = (
+                pl.mul(alias, 3.0)
+            )
+            {"" if early_free else release}
+""")
+    evidence = _peer_transport_effects(source, "vector")
+    assert evidence["unavailable"] == ""
+    if early_free:
+        assert "after logical release" in evidence["borrow_unavailable"]
+    elif output_base < 2048:
+        assert "overlaps a native receive reserve" in evidence["borrow_unavailable"]
+    else:
+        assert evidence["borrow_unavailable"] == ""
+        [(pipe_id, distance, empty, readers)] = evidence["borrows"]
+        assert (pipe_id, distance, empty) == (0, 2, False)
+        assert list(readers) == ["V"]
+        assert [cut.var.name_hint for cut in readers["V"]] == ["first", "last"]
+
+
+@pytest.mark.usefixtures("ascend_backend")
+def test_native_receive_matrix_move_and_empty_vector_lane():
+    source = pl.parse_program("""
+@pl.program
+class PeerUses:
+    @pl.function(type=pl.FunctionType.AIC)
+    def cube(self):
+        ring = pl.reserve_buffer(name="mat", size=8192, base=0)
+        pl.aic_initialize_pipe(pl.const(0, pl.INT32), ring, dir_mask=2, slot_size=4096, slot_num=2)
+        for i in pl.range(8):
+            mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tpop_from_aiv(split=0)
+            left: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.move(mat, target_memory=pl.Mem.Left)
+            pl.tfree_to_aiv(mat)
+
+    @pl.function(type=pl.FunctionType.AIV)
+    def shadow(self):
+        ring = pl.reserve_buffer(name="vec", size=16384, base=0)
+        pl.aiv_initialize_pipe(ring, pl.const(0, pl.INT32), dir_mask=1, slot_size=8192, slot_num=2)
+        for i in pl.range(8):
+            empty: pl.Tile[[16, 128], pl.FP32, pl.Mem.Vec, pl.TileView(valid_shape=[0, 0])] = (
+                pl.tpop_from_aic(split=0)
+            )
+            pl.tfree_to_aic(empty)
+""")
+    cube = _peer_transport_effects(source, "cube")
+    shadow = _peer_transport_effects(source, "shadow")
+    assert cube["borrow_unavailable"] == shadow["borrow_unavailable"] == ""
+    [(pipe_id, distance, empty, readers)] = cube["borrows"]
+    assert (pipe_id, distance, empty) == (0, 2, False)
+    assert list(readers) == ["MTE1"]
+    assert [cut.var.name_hint for cut in readers["MTE1"]] == ["left", "left"]
+    assert shadow["borrows"] == [(0, 2, True, {})]
+    assert [site[0] for site in shadow["sites"]] == ["pop", "free"]
 
 
 # ============================================================================
