@@ -58,6 +58,7 @@
 #include "pypto/ir/transforms/utils/buffer_active_domain_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_indexed_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_ir_selection.h"
+#include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_scalar_staging.h"
 #include "pypto/ir/transforms/utils/buffer_tuple_results.h"
 #include "pypto/ir/transforms/utils/buffer_valid_analysis.h"
@@ -85,6 +86,7 @@ class BufferKernelSupport : public IRVisitor {
   explicit BufferKernelSupport(const FunctionPtr& function, const BufferAccTrimAnalysis& acc_trims,
                                const std::vector<int>& positive_formals)
       : acc_trims_(acc_trims),
+        function_(function),
         core_(function->func_type_),
         body_(function->body_),
         lane_returns_(cross_core_pipe::TerminalPeerLaneReturns(function)),
@@ -174,7 +176,7 @@ class BufferKernelSupport : public IRVisitor {
                                     ConstantEquals(view.stride[1], rows)),
             BufferAdmissionProperty::TypeLayout);
       } else {
-        const bool padded = backend::IsFullPaddedVec(tile, view);
+        const bool padded = backend::IsFullPaddedVec(tile, view) || backend::IsEmptyPaddedVec(tile, view);
         const auto* context = PassContext::Current();
         // Pad mode belongs to a native tile object. Only placed plans can
         // declare independent metadata objects for reused padded storage.
@@ -261,7 +263,8 @@ class BufferKernelSupport : public IRVisitor {
     // actual operands still go through ordinary type admission.
     const auto call = As<Call>(expr);
     if (!op_predicates::IsInitializePipe(call) && !op_predicates::IsTPush(call) &&
-        !op_predicates::IsTPop(call) && !op_predicates::IsTFree(call)) {
+        !op_predicates::IsTPop(call) && !op_predicates::IsTFree(call) &&
+        !cross_core_pipe::IsHardMixedSyncAll(call)) {
       CheckType(physical_result == assigned_slot_types_.end() ? expr->GetType() : physical_result->second);
     }
     if (const auto var = AsVarLike(expr)) {
@@ -334,6 +337,14 @@ class BufferKernelSupport : public IRVisitor {
   }
 
   void VisitStmt_(const AssignStmtPtr& assign) override {
+    if (IsIdentityTileSlice(assign)) {
+      const auto source = As<Call>(assign->value_)->args_[0];
+      VisitExpr(assign->var_);
+      VisitExpr(source);
+      const auto alias = StableAlias(source);
+      matrix_aliases_.emplace(assign->var_.get(), alias ? alias : assign->var_);
+      return;
+    }
     if (As<TupleType>(assign->var_->GetType())) {
       const auto result = tuples_.Get(assign->var_);
       admission.Require(result && result->call == assign->value_, BufferAdmissionProperty::StatementForm);
@@ -564,7 +575,9 @@ class BufferKernelSupport : public IRVisitor {
       admission.Require(false, BufferAdmissionProperty::OperationRecipe);
       return;
     }
-    if (cross_core_pipe::IsPeerPipeSetup(call)) {
+    if (cross_core_pipe::IsHardMixedSyncAll(call)) {
+      admission.Require(scalar_definition_ != call.get(), BufferAdmissionProperty::OperationRecipe);
+    } else if (cross_core_pipe::IsPeerPipeSetup(call)) {
       has_peer_setup = true;
       if (IsOp(call, "system.reserve_buffer") || IsOp(call, "system.import_peer_buffer")) {
         admission.Require(scalar_definition_ == call.get(), BufferAdmissionProperty::PeerTransport);
@@ -709,6 +722,15 @@ class BufferKernelSupport : public IRVisitor {
           backend::SupportsLogicalBufferConversion(*conversion, call) &&
               (conversion->kind != backend::BufferConversionKind::FillPad || core_ == FunctionType::AIV),
           BufferAdmissionProperty::OperationRecipe);
+      if (admission.supported() && conversion->kind == backend::BufferConversionKind::FillPad &&
+          call->GetKwarg<PadValue>("pad_value", PadValue::zero) == PadValue::min &&
+          NeedsRuntimeBufferValid(call->args_[0]->GetType())) {
+        if (!logical_validity_) {
+          logical_validity_.emplace(function_, false, false, required_positive_formals);
+        }
+        admission.Require(logical_validity_->ProvesLogicalMinimumFillPad(call),
+                          BufferAdmissionProperty::DynamicValidRecipe);
+      }
       for (const auto& arg : call->args_)
         admission.Require(!views_.IsWindow(arg), BufferAdmissionProperty::OperationRecipe);
     } else if (IsOp(call, "tile.transpose")) {
@@ -1149,6 +1171,8 @@ class BufferKernelSupport : public IRVisitor {
   }
 
   const BufferAccTrimAnalysis& acc_trims_;
+  const FunctionPtr& function_;
+  std::optional<BufferRuntimeValidAnalysis> logical_validity_;
   FunctionType core_;
   StmtPtr body_;
   std::pair<ReturnStmtPtr, ReturnStmtPtr> lane_returns_;

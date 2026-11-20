@@ -414,8 +414,14 @@ and outstanding readers of each slot into the next region. An epilogue pop
 can therefore depend on a reader from an earlier visit, including when one
 visit advances only part of the ring.
 
-A lane can also contain one sequential work loop whose trip count depends on
-the launch. The planner must prove that its bounds are nonnegative, its stride
+A lane can contain one launch-dependent sequential work loop per region.
+An authored, standalone hard MIX `syncall` outside loops delimits a region.
+The A2/A3 implementation drains the local pipes before the rendezvous, so
+prior waits finish before the next region can reuse their event IDs. The
+original call and transport sequence stay in place. All receive borrows must
+be closed at the cut, and the transport counters continue across it.
+
+The planner must prove that the work-loop bounds are nonnegative, its stride
 is positive, and advancing the induction variable fits its type. A work item
 can contain statically bounded loops with a fixed receive count per visit.
 Each local borrow closes within its region. Loop-carried tensor handles must

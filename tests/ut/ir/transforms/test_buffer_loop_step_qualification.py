@@ -147,7 +147,7 @@ def test_effective_spmd_launch_proves_only_its_stride(caller, accepted):
         stride_index = next(i for i, param in enumerate(kernel.params) if param.name_hint.startswith("step"))
         other_index = next(i for i, param in enumerate(kernel.params) if param.name_hint.startswith("count"))
         # Another positive scalar reaches the kernel but does not supply any step.
-        invocation_args = list(outer_args)
+        invocation_args: list[ir.Expr] = list(outer_args)
         invocation_args[other_index] = ir.ConstInt(4, DataType.INT64, span)
         invocation_args[stride_index] = (
             ir.Cast(count, DataType.INT64, span)
@@ -156,7 +156,7 @@ def test_effective_spmd_launch_proves_only_its_stride(caller, accepted):
         )
         # Share the same typed SSA value between sizing and forwarding.
         launch_size = ir.Var("launch_size", invocation_args[stride_index].type, span)
-        statements = [
+        statements: list[ir.Stmt] = [
             count_assignment,
             ir.AssignStmt(launch_size, ir.Cast(count, DataType.INT64, span), span),
         ]

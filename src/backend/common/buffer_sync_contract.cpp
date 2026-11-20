@@ -271,7 +271,10 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
     // reuse <=30 repeats, within the same 8KiB range. This is an enclosure of native scratch, not its exact
     // used-byte footprint. Internal fill->use barriers do not discharge the next call's overwrite. pto-isa
     // 5487a6b0: common/constants.hpp and npu/a2a3/TRowExpandBinOp.hpp.
-    result.implicit_effects_.push_back({MemorySpace::Vec, 184 * 1024, 192 * 1024, ir::BufferAccess::ReadWrite,
+    constexpr int64_t kVecPhysicalBytes = 192 * 1024;
+    constexpr int64_t kRowBroadcastScratchBytes = 8 * 1024;
+    result.implicit_effects_.push_back({MemorySpace::Vec, kVecPhysicalBytes - kRowBroadcastScratchBytes,
+                                        kVecPhysicalBytes, ir::BufferAccess::ReadWrite,
                                         "a2a3-row-broadcast-mode1-implicit-scratch", false});
     // These six selected wrappers and their shared Mode1 helper contain
     // PIPE_V barriers, but no SET/WAIT or compiler-allocated event operations.

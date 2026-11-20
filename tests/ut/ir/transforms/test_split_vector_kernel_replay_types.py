@@ -147,10 +147,12 @@ class Before:
     def main_aiv(self, out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
         pl.func_attr({{"dual_aiv_dispatch": True}})
         slot = pl.reserve_buffer(name="c2v_slot_buffer", size=4096, base=0x1000)
-        pl.aiv_initialize_pipe(dir_mask=1, slot_size=512, c2v_consumer_buf=slot)
+        peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="main_aic")
+        pl.aiv_initialize_pipe(dir_mask=3, slot_size=1024, c2v_consumer_buf=slot, v2c_consumer_buf=peer)
         tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
         tmp = pl.tile.create([16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
         remainder = pl.tile.{op}(tile, 16.0{", tmp" if op == "rems" else ""})
+        pl.tpush_to_aic(remainder, split=0)
         pl.tfree_to_aic(tile)
         updated = pl.store(remainder, [0, 0], out)
         return updated
@@ -185,13 +187,15 @@ class Before:
                  out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
         pl.func_attr({{"dual_aiv_dispatch": True}})
         slot = pl.reserve_buffer(name="c2v_slot_buffer", size=4096, base=0x1000)
-        pl.aiv_initialize_pipe(dir_mask=1, slot_size=512, c2v_consumer_buf=slot)
+        peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="main_aic")
+        pl.aiv_initialize_pipe(dir_mask=3, slot_size=1024, c2v_consumer_buf=slot, v2c_consumer_buf=peer)
         tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
         if flag:
             {inner}
         else:
             alias = pl.mul(tile, 3.0)
         result = pl.mul(alias, 4.0)
+        pl.tpush_to_aic(result, split=0)
         pl.tfree_to_aic(tile)
         updated = pl.store(result, [0, 0], out)
         return updated

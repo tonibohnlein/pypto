@@ -95,7 +95,8 @@ std::string BufferTypeString(const ir::BufferTypePtr& type, const ir::Span& span
                     type->dtype_ == DataType::INT16 || type->dtype_ == DataType::UINT32) &&
                    type->blayout_ == ir::TileLayout::row_major &&
                    type->slayout_ == ir::TileLayout::none_box && type->fractal_ == 512 &&
-                   (type->pad_ == ir::PadValue::null || backend::IsFullPaddedVec(type)) &&
+                   (type->pad_ == ir::PadValue::null || backend::IsFullPaddedVec(type) ||
+                    backend::IsEmptyPaddedVec(type)) &&
                    type->compact_ == ir::CompactMode::null,
                span)
         << "Direct Buffer IR codegen currently requires dense row-major Vec "
@@ -106,8 +107,9 @@ std::string BufferTypeString(const ir::BufferTypePtr& type, const ir::Span& span
   const bool vector = type->shape_.size() == 1;
   const int64_t rows = vector ? 1 : type->shape_[0];
   const int64_t cols = type->shape_.back();
-  const int64_t valid_rows = vector ? 1 : type->valid_shape_[0];
-  const int64_t valid_cols = type->valid_shape_.back();
+  const bool empty_padded = backend::IsEmptyPaddedVec(type);
+  const int64_t valid_rows = empty_padded ? -1 : (vector ? 1 : type->valid_shape_[0]);
+  const int64_t valid_cols = empty_padded ? -1 : type->valid_shape_.back();
   TileTypeComponents components;
   components.rows = rows;
   components.cols = cols;
@@ -435,7 +437,8 @@ class BufferEmissionPreflight : public ir::IRVisitor {
   }
 
   void VisitExpr_(const ir::CallPtr& call) override {
-    if (ir::cross_core_pipe::IsPeerPipeSetup(call) || ir::cross_core_pipe::IsBufferPeerTransport(call)) {
+    if (ir::cross_core_pipe::IsPeerPipeSetup(call) || ir::cross_core_pipe::IsBufferPeerTransport(call) ||
+        ir::cross_core_pipe::IsHardMixedSyncAll(call)) {
       CHECK_SPAN(conversion_supported_, call->span_) << "Direct Buffer peer transport requires A2/A3";
       IRVisitor::VisitExpr_(call);
       return;
@@ -895,10 +898,15 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
     std::vector<std::string> dimensions(2);
     size_t dynamic = 0;
     const size_t first_native_axis = 2 - type->shape_.size();
+    const bool empty_padded = backend::IsEmptyPaddedVec(type);
     for (size_t axis = 0; axis < type->valid_shape_.size(); ++axis) {
       if (type->valid_shape_[axis] == -1) {
         dimensions[first_native_axis + axis] =
             EmitBufferIntegerOperand(valid->elements_[dynamic++], DataType::INDEX);
+      } else if (empty_padded) {
+        // PTO-ISA has no static-zero valid-extent overload. Initialize the
+        // native dynamic descriptor from the immutable logical zero.
+        dimensions[first_native_axis + axis] = GetOrEmitConstant(int64_t{0}, DataType::INDEX);
       }
     }
     const std::string address =

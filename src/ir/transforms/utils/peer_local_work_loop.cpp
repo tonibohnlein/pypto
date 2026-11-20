@@ -20,6 +20,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -45,11 +46,11 @@ struct Effect {
 // of gcd(depth, pops/item). Fixed residues still distinguish disjoint slots,
 // including the phase-neutral case. A varying residue in a finite child loop
 // uses the whole orbit so crossing analysis never enumerates loop trips.
-void CollectEffects(const PeerLocalLane& lane, PeerWorkRange range, bool following,
-                    std::vector<Effect>& effects) {
-  const auto& advance = lane.work_loop->ring_advance;
+void CollectEffects(const CompactSyncInput& input, const PeerLocalWorkLoop& loop, PeerWorkRange range,
+                    bool following, std::vector<Effect>& effects) {
+  const auto& advance = loop.ring_advance;
   for (size_t r = range.first; r < range.second; ++r) {
-    const auto& segment = lane.input.segments[r];
+    const auto& segment = input.segments[r];
     if (!segment.count) {
       continue;
     }
@@ -57,7 +58,7 @@ void CollectEffects(const PeerLocalLane& lane, PeerWorkRange range, bool followi
       for (const auto& access : site.accesses) {
         INTERNAL_CHECK(access.row == 0 && access.rows == 1 && !access.row_step && !access.column_step &&
                        access.column >= 0 && access.columns > 0);
-        const auto& storage = lane.input.storage[access.storage];
+        const auto& storage = input.storage[access.storage];
         INTERNAL_CHECK(access.column <= storage.columns && access.columns <= storage.columns - access.column);
         const auto pop = advance.find(access.storage);
         const auto modulus = std::gcd(storage.slot_count, pop == advance.end() ? 0 : pop->second);
@@ -136,25 +137,27 @@ void AppendSeam(std::vector<StmtPtr>& stmts, const PeerWorkPairs& pairs, const P
 
 class WorkLoopSeams : public SyncStatementMutator {
  public:
-  WorkLoopSeams(const PeerLocalWorkLoop& loop, const PeerWorkPairs& entry, const PeerWorkPairs& exit,
-                const PeerWorkSeamIds& ids, FunctionType type)
-      : loop_(loop), entry_(entry), exit_(exit), ids_(ids), type_(type) {}
+  WorkLoopSeams(const std::vector<PeerWorkPlacement>& placements, const PeerWorkSeamIds& ids,
+                FunctionType type)
+      : ids_(ids), type_(type) {
+    for (const auto& placement : placements) {
+      INTERNAL_CHECK(placements_.emplace(placement.loop->original->loop_var_.get(), &placement).second)
+          << "Duplicate original runtime work-loop cut";
+    }
+  }
 
   StmtPtr Run(const StmtPtr& body) {
     auto result = VisitStmt(body);
-    INTERNAL_CHECK(found_) << "Original runtime work-loop cut was lost during local planning";
+    INTERNAL_CHECK(placements_.empty()) << "Original runtime work-loop cut was lost during local planning";
     return result;
   }
 
  private:
-  const PeerLocalWorkLoop& loop_;
-  const PeerWorkPairs& entry_;
-  const PeerWorkPairs& exit_;
+  std::unordered_map<const Var*, const PeerWorkPlacement*> placements_;
   const PeerWorkSeamIds& ids_;
   const FunctionType type_;
-  bool found_ = false;
 
-  StmtPtr CompleteItem(const StmtPtr& original, const Span& span) const {
+  StmtPtr CompleteItem(const StmtPtr& original, const PeerWorkPairs& exit, const Span& span) const {
     auto flattened = original;
     if (const auto seq = As<SeqStmts>(original)) {
       // A terminal yield can sit under arbitrarily nested transparent
@@ -167,7 +170,7 @@ class WorkLoopSeams : public SyncStatementMutator {
       yield = body.back();
       body.pop_back();
     }
-    AppendSeam(body, exit_, ids_, type_, span);
+    AppendSeam(body, exit, ids_, type_, span);
     if (yield) {
       body.push_back(std::move(yield));
     }
@@ -175,19 +178,20 @@ class WorkLoopSeams : public SyncStatementMutator {
   }
 
   StmtPtr VisitStmt_(const ForStmtPtr& loop) override {
-    if (loop->loop_var_ != loop_.original->loop_var_) {
+    const auto found = placements_.find(loop->loop_var_.get());
+    if (found == placements_.end()) {
       return SyncStatementMutator::VisitStmt_(loop);
     }
-    INTERNAL_CHECK(!found_);
-    found_ = true;
+    const auto& placement = *found->second;
+    placements_.erase(found);
     StmtPtr updated = loop;
-    if (!exit_.empty()) {
+    if (!placement.exit.empty()) {
       auto with_exit = MutableCopy(loop);
-      with_exit->body_ = CompleteItem(loop->body_, loop->span_);
+      with_exit->body_ = CompleteItem(loop->body_, placement.exit, loop->span_);
       updated = std::move(with_exit);
     }
     std::vector<StmtPtr> stmts;
-    AppendSeam(stmts, entry_, ids_, type_, loop->span_);
+    AppendSeam(stmts, placement.entry, ids_, type_, loop->span_);
     stmts.push_back(std::move(updated));
     return SeqStmts::Flatten(std::move(stmts), loop->span_);
   }
@@ -195,11 +199,11 @@ class WorkLoopSeams : public SyncStatementMutator {
 
 }  // namespace
 
-void AddPeerWorkConflicts(const PeerLocalLane& lane, PeerWorkRange earlier, PeerWorkRange later,
-                          PeerWorkPairs& pairs) {
+void AddPeerWorkConflicts(const CompactSyncInput& input, const PeerLocalWorkLoop& loop, PeerWorkRange earlier,
+                          PeerWorkRange later, PeerWorkPairs& pairs) {
   std::vector<Effect> effects;
-  CollectEffects(lane, earlier, false, effects);
-  CollectEffects(lane, later, true, effects);
+  CollectEffects(input, loop, earlier, false, effects);
+  CollectEffects(input, loop, later, true, effects);
   std::sort(effects.begin(), effects.end(), [](const auto& a, const auto& b) {
     return std::tie(a.storage, a.begin) < std::tie(b.storage, b.begin);
   });
@@ -219,11 +223,10 @@ void AddPeerWorkConflicts(const PeerLocalLane& lane, PeerWorkRange earlier, Peer
   }
 }
 
-FunctionPtr AddPeerWorkSeams(const FunctionPtr& function, const PeerLocalWorkLoop& loop,
-                             const PeerWorkPairs& entry, const PeerWorkPairs& exit,
+FunctionPtr AddPeerWorkSeams(const FunctionPtr& function, const std::vector<PeerWorkPlacement>& placements,
                              const PeerWorkSeamIds& ids) {
   auto result = MutableCopy(function);
-  result->body_ = WorkLoopSeams(loop, entry, exit, ids, function->func_type_).Run(function->body_);
+  result->body_ = WorkLoopSeams(placements, ids, function->func_type_).Run(function->body_);
   return result;
 }
 

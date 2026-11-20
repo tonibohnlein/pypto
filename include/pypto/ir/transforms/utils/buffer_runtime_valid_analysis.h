@@ -32,6 +32,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/buffer_acc_trim_analysis.h"
@@ -55,17 +56,22 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     std::string message;
   };
   explicit BufferRuntimeValidAnalysis(const FunctionPtr& function, bool collect_guards = false,
-                                      bool check_payload_capacity = false)
+                                      bool check_payload_capacity = false,
+                                      const std::vector<int>& positive_loop_parameters = {})
       : analyzer_(std::make_shared<arith::Analyzer>()),
         collect_guards_(collect_guards),
         check_payload_capacity_(check_payload_capacity) {
     if (function) {
       core_ = function->func_type_;
-      BindBufferAccTrimParameters(function, *analyzer_, ready_);
+      BindBufferAccTrimParameters(function, *analyzer_, ready_, positive_loop_parameters);
       if (function->body_) VisitStmt(function->body_);
     }
   }
   const std::optional<Issue>& issue() const { return issue_; }
+  bool ProvesLogicalMinimumFillPad(const CallPtr& call) const {
+    const auto found = logical_minimum_padding_.find(call.get());
+    return found != logical_minimum_padding_.end() && found->second;
+  }
   bool HasElidableGuards() const {
     return std::any_of(redundant_guards_.begin(), redundant_guards_.end(),
                        [](const auto& entry) { return entry.second; });
@@ -299,6 +305,25 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     }
   }
   void CheckCall(const CallPtr& call) {
+    if (IsOp(call, "tile.fillpad") && call->args_.size() == 1 &&
+        call->GetKwarg<PadValue>("pad_value", PadValue::zero) == PadValue::min) {
+      auto [entry, inserted] = logical_minimum_padding_.emplace(call.get(), true);
+      if (entry->second) {
+        const auto type = As<TileType>(call->args_[0]->GetType());
+        entry->second = type && type->shape_.size() == 2;
+        if (entry->second) {
+          const auto valid = tile_view_semantics::GetEffectiveTileView(*type).valid_shape;
+          entry->second = valid.size() == 2;
+          for (size_t axis = 0; axis < 2 && entry->second; ++axis) {
+            const auto capacity = As<ConstInt>(type->shape_[axis]);
+            const auto range = Bounds(valid[axis]);
+            entry->second =
+                capacity && range && range->min_value >= 1 && range->max_value <= capacity->value_;
+          }
+        }
+      }
+      return;
+    }
     const bool load = IsOp(call, "buffer.load");
     if ((load || IsOp(call, "buffer.store")) && call->args_.size() == 4) {
       const auto extents = As<MakeTuple>(call->args_[2]);
@@ -483,6 +508,7 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
   std::unordered_map<const Var*, State> states_;
   std::unordered_map<const Var*, std::array<ExprPtr, 2>> immutable_rank_one_extents_;
   std::optional<Issue> issue_;
+  std::unordered_map<const Call*, bool> logical_minimum_padding_;
   bool collect_guards_;
   bool check_payload_capacity_;
   // The same immutable statement/call can be reused. Every occurrence must

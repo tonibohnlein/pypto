@@ -12,6 +12,7 @@
 #ifndef PYPTO_IR_TRANSFORMS_UTILS_DEAD_CODE_ELIMINATION_H_
 #define PYPTO_IR_TRANSFORMS_UTILS_DEAD_CODE_ELIMINATION_H_
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -40,6 +41,11 @@ void CollectAllAssignStmts(const std::vector<StmtPtr>& stmts,
 /// Dead statements are those whose defined variable is not transitively
 /// used by any return, yield, or side-effect statement.
 std::vector<StmtPtr> EliminateDeadCode(const std::vector<StmtPtr>& stmts);
+
+/// Use caller-proven removability and the same structured SSA liveness as DCE.
+/// Every statement outside the proposed set is retained and its uses stay live.
+std::vector<StmtPtr> EliminateDeadCode(const std::vector<StmtPtr>& stmts,
+                                       const std::function<bool(const StmtPtr&)>& can_remove);
 
 /// Conservative scalar-only DCE.
 ///

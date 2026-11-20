@@ -355,12 +355,8 @@ class TestSplitVectorKernelNoSplitA2A3:
                     pl.tpush_to_aic(sliced, split=0)
                     return out
                 else:
-                    # Both the load and the slice collapse to empty creates; the
-                    # slice result is a dynamic-valid empty [16, 8] tile, never a
-                    # static v_row=0 / v_col=0 subview.
-                    loaded_lane1: pl.Tile[
-                        [16, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView(valid_shape=[0, 0])
-                    ] = pl.tile.create([16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                    # Keep only the empty [16, 8] FIFO carrier. The load's
+                    # placeholder has no users after replacing the slice.
                     sliced_lane1: pl.Tile[
                         [16, 8], pl.FP32, pl.MemorySpace.Vec, pl.TileView(valid_shape=[0, 0])
                     ] = pl.tile.create([16, 8], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
@@ -425,9 +421,6 @@ class TestSplitVectorKernelNoSplitA2A3:
                 else:
                     # Lane 1 keeps no transpose at all -- the hazard the rewrite
                     # avoids -- and its empty tile carries the TRANSPOSED shape.
-                    loaded_lane1: pl.Tile[
-                        [16, 8], pl.FP32, pl.MemorySpace.Vec, pl.TileView(valid_shape=[0, 0])
-                    ] = pl.tile.create([16, 8], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
                     transposed_lane1: pl.Tile[
                         [8, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView(valid_shape=[0, 0])
                     ] = pl.tile.create([8, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
@@ -491,12 +484,6 @@ class TestSplitVectorKernelNoSplitA2A3:
                     pl.tpush_to_aic(product, split=0)
                     return out
                 else:
-                    loaded_lane1: pl.Tile[
-                        [16, 8], pl.FP32, pl.MemorySpace.Vec, pl.TileView(valid_shape=[0, 0])
-                    ] = pl.tile.create([16, 8], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-                    scratch_lane1: pl.Tile[
-                        [16, 8], pl.FP32, pl.MemorySpace.Vec, pl.TileView(valid_shape=[0, 0])
-                    ] = pl.tile.create([16, 8], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
                     reduced_lane1: pl.Tile[
                         [16, 1],
                         pl.FP32,
@@ -659,9 +646,6 @@ class TestSplitVectorKernelNoSplitA2A3:
                     z_vec_lane1: pl.Tile[
                         [16, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView(valid_shape=[0, 0])
                     ] = pl.tpop_from_aic(split=0)
-                    incremented_lane1: pl.Tile[
-                        [16, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView(valid_shape=[0, 0])
-                    ] = pl.add(z_vec_lane1, 1.0)
                     pl.tfree_to_aic(z_vec_lane1)
                     updated_lane1: pl.Tensor[[16, 16], pl.FP32] = out
                     return out
@@ -732,9 +716,6 @@ class TestSplitVectorKernelNoSplitA2A3:
                         acc_final_lane1: pl.Tile[
                             [16, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView(valid_shape=[0, 0])
                         ] = pl.yield_(next_acc_lane1)
-                    incremented_lane1: pl.Tile[
-                        [16, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView(valid_shape=[0, 0])
-                    ] = pl.add(acc_final_lane1, 1.0)
                     updated_lane1: pl.Tensor[[16, 16], pl.FP32] = out
                     return out
 
@@ -787,11 +768,9 @@ class TestSplitVectorKernelNoSplitA2A3:
         )
         assert "pl.while_(init_values=(acc__ssa_v0, count__ssa_v0))" not in lane1
         assert re.search(r"pl.cond\(count_iter_\d+ < 4\)", lane1)
-        assert re.search(
-            r"incremented__ssa_v0_\d+: pl.Tile\[\[16, 16\], pl.FP32, pl.Mem.Vec, "
-            r"pl.TileView\(valid_shape=\[0, 0\]\)\]",
-            lane1,
-        )
+        assert "pl.tile.tpop_from_aic(split=0)" in lane1
+        assert "pl.system.tfree_to_aic(" in lane1
+        assert "incremented__ssa_v0" not in lane1
 
 
 def _count_op_calls(stmt, op_name: str) -> int:
@@ -1151,6 +1130,54 @@ class Program:
     text = python_print(transformed)
     for operation in ("tile.tpop_from_aic", "tile.tpush_to_aic", "system.tfree_to_aic"):
         assert text.count(f"pl.{operation}(") == 2, text
+
+
+@pytest.mark.parametrize("mutates_input", [False, True])
+def test_empty_replay_preserves_minimum_pad_and_mutating_producers(mutates_input):
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910)
+    operation = "tile.fillpad_inplace" if mutates_input else "tile.maximum"
+    arguments = "prefix, pad_value=pl.PadValue.min" if mutates_input else "padded, padded"
+    program = pl.parse(f"""
+@pl.program
+class Program:
+    @pl.function(type=pl.FunctionType.AIV)
+    def main_aiv(self, source: pl.Tensor[[16, 16], pl.FP32]):
+        pl.func_attr({{"dual_aiv_dispatch": True}})
+        peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="main_aic")
+        pl.aiv_initialize_pipe(dir_mask=2, slot_size=1024, v2c_consumer_buf=peer)
+        loaded = pl.tile.load(source, [0, 0], [16, 16], target_memory=pl.MemorySpace.Vec)
+        prefix = pl.tile.set_validshape(loaded, 16, 8)
+        padded = pl.tile.fillpad(prefix, pad_value=pl.PadValue.min)
+        result = pl.{operation}({arguments})
+        unused_source = pl.tile.create([32, 8], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        unused_sum = pl.tile.add(unused_source, unused_source)
+        pl.tpush_to_aic(result, split=0)
+""")
+    transformed = _run_split_vector_kernel(program)
+    function = transformed.get_function("main_aiv")
+    assert function is not None and isinstance(function.body, ir.SeqStmts)
+    branch = next(stmt for stmt in function.body.stmts if isinstance(stmt, ir.IfStmt))
+    assert isinstance(branch.else_body, ir.SeqStmts)
+    replay_result = next(
+        stmt.value
+        for stmt in branch.else_body.stmts
+        if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint.startswith("result")
+    )
+    expected = operation if mutates_input else "tile.create"
+    assert isinstance(replay_result, ir.Call) and isinstance(replay_result.type, ir.TileType)
+    assert replay_result.op.name == expected, python_print(transformed)
+    view = replay_result.type.tile_view
+    assert view is not None and view.pad == pl.PadValue.min
+    assert len(view.valid_shape) == 2
+    assert all(isinstance(dim, ir.ConstInt) and dim.value == 0 for dim in view.valid_shape)
+    assert all(
+        not stmt.var.name_hint.startswith("unused_")
+        for stmt in branch.else_body.stmts
+        if isinstance(stmt, ir.AssignStmt)
+    )
+    text = python_print(transformed)
+    assert text.count("pl.tile.tpush_to_aic(") == 2, text
 
 
 if __name__ == "__main__":

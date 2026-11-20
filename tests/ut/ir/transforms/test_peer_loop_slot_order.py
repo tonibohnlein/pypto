@@ -22,6 +22,7 @@ from pypto.runtime import RunConfig
 from tests.ut.codegen.test_pto_codegen_cross_core import (
     _mat_receive_epilogue,
     _paired_consumer,
+    _paired_receive_program,
     _SharePopExpression,
 )
 
@@ -53,6 +54,7 @@ class MatSlotCommands(ClosedCommands):
         self.buffer_accesses = []
         self.rings = {}
         self.borrow_results = set()
+        self.rendezvous = []
 
     def issue_payload(self, call, pipe):
         issue = ("issue", len(self.calls))
@@ -167,6 +169,16 @@ class MatSlotCommands(ClosedCommands):
 
     def evaluate(self, statement, env):
         call = statement.expr
+        if call.op.name == opname("system.syncall"):
+            # The original hard MIX call drains the local queues but leaves
+            # the receive cursor and flag inventory untouched.
+            assert call.kwargs.get("mode", "hard") == "hard"
+            assert call.kwargs.get("core_type", "mix") == "mix"
+            assert not self.live
+            self.complete_all()
+            self.last_all = None
+            self.rendezvous.append(len(self.pops))
+            return
         if call.op.name == opname("system.aic_initialize_pipe"):
             depth = call.kwargs["slot_num"]
             self.rings[call.kwargs.get("id", 0)] = (
@@ -306,6 +318,140 @@ def test_runtime_work_loop_composes_slot_releases(tmp_path, inner_trips):
     mutant.execute(ir.SeqStmts([*stmts[:start], *stmts[cut:]], cube.body.span), dict(mutant.env))
     broken = closure(mutant.vertices, mutant.edges)
     assert (mutant.readers[0], ("issue", mutant.pops[-1][1])) not in broken
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.usefixtures("ascend_backend")
+def test_hard_mix_syncall_separates_runtime_work_regions(tmp_path):
+    snapshots = []
+
+    def capture(transform, program):
+        if transform.get_name() == "RealizeSync":
+            snapshots.append(program)
+
+    mixed_cut = "pl.system.syncall(core_type=pl.KernelType.MIX)"
+    source = _mat_receive_epilogue(
+        128, "BF16", 2, loop=(1, 1), work_items=5, region_boundaries=(mixed_cut,) * 2
+    )
+    cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
+    with passes.PassContext(
+        [passes.CallbackInstrument(after_pass=capture)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+    ):
+        ir.compile(source, **cfg.compile_kwargs())
+
+    manifest = json.loads((tmp_path / "ptoas" / "paired.sync.json").read_text())
+    assert manifest["owned"] and not manifest["ptoas_insert_sync"], manifest
+    cube = snapshots[0].get_function("cube")
+    for core, workers in [(5, 6), (4, 6), (0, 2)]:
+        state = MatSlotCommands(cube, 2, core=core, workers=workers)
+        order = state.run()
+        # Replay zero, one and many visits. Odd receive counts make some
+        # regions start with a rotated slot, including the zero-trip path.
+        per_region = 3 + len(range(core, 5, workers)) * 3
+        assert state.rendezvous == [per_region, 2 * per_region]
+        assert len(state.pops) == len(state.readers) == 3 * per_region
+        assert all(state.readers)
+        assert state.reuses
+        assert all(edge in order for edge in state.order_checks + state.local_checks + state.gm_checks)
+
+
+@pytest.mark.usefixtures("ascend_backend")
+@pytest.mark.parametrize(
+    ("boundary", "reason"),
+    [
+        ("", "at most one outer runtime work loop per region"),
+        ("pl.system.syncall(core_type=pl.KernelType.AIC)", "authored hard MIX SYNCALL"),
+    ],
+)
+def test_runtime_work_regions_require_hard_mix_syncall(boundary, reason):
+    source = _mat_receive_epilogue(
+        128,
+        "BF16",
+        2,
+        loop=(1, 1),
+        work_items=5,
+        region_boundaries=(boundary,),
+    )
+    _check_peer_region_fallback(source, reason)
+
+
+@pytest.mark.usefixtures("ascend_backend")
+def test_hard_mix_syncall_rejects_live_receive_borrow():
+    source = _paired_receive_program(
+        2,
+        """values = pl.load(x, [0, 0], [16, 16])
+result = pl.matmul(values, values)
+pl.tpush_to_aiv(result, split=0)
+pl.system.syncall(core_type=pl.KernelType.MIX)""",
+        """received: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+pl.system.syncall(core_type=pl.KernelType.MIX)
+result = pl.add(received, received)
+pl.tfree_to_aic(received)
+return pl.store(result, [0, 0], out)""",
+    )
+    _check_peer_region_fallback(source, "A live FIFO handle crosses a hard MIX SYNCALL")
+
+
+@pytest.mark.usefixtures("ascend_backend")
+def test_hard_mix_region_without_receive_work_preserves_ring_cursor():
+    source = _paired_receive_program(
+        2,
+        """values = pl.load(x, [0, 0], [16, 16])
+result = pl.matmul(values, values)
+core = pl.tile.get_block_idx()
+workers = pl.tile.get_block_num()
+for work in pl.range(core, 3, workers):
+    pl.tpush_to_aiv(result, split=0)
+pl.system.syncall(core_type=pl.KernelType.MIX)""",
+        """core = pl.tile.get_block_idx()
+workers = pl.tile.get_block_num()
+for work in pl.range(core, 3, workers):
+    received: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+    copied = pl.add(received, received)
+    pl.tfree_to_aic(received)
+    out = pl.store(copied, [0, 0], out)
+pl.system.syncall(core_type=pl.KernelType.MIX)
+for work in pl.range(core, 3, workers):
+    loaded = pl.load(out, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
+    out = pl.store(pl.add(loaded, loaded), [0, 0], out)
+return out""",
+    )
+    with passes.PassContext(
+        [],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+    ):
+        result = PassManager(ir.OptimizationStrategy.Default).run_passes(source)
+    for name in ("cube", "vector"):
+        endpoint = result.get_function(name)
+        assert endpoint is not None
+        assert endpoint.attrs.get(PYPTO_AUTOSYNC_ATTR), endpoint.attrs
+
+
+def _check_peer_region_fallback(source, reason):
+    with passes.PassContext(
+        [],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+        autosync_disjoint_gm=True,
+    ):
+        result = PassManager(ir.OptimizationStrategy.Default).run_passes(source)
+    cube = result.get_function("cube")
+    vector = result.get_function("vector")
+    assert cube is not None and vector is not None
+    endpoints = [cube, vector]
+    assert all(not fn.attrs.get(PYPTO_AUTOSYNC_ATTR) for fn in endpoints)
+    assert any(reason in fn.attrs.get("autosync_fallback_reason", "") for fn in endpoints), [
+        fn.attrs for fn in endpoints
+    ]
 
 
 @pytest.mark.usefixtures("ascend_backend")

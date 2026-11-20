@@ -642,7 +642,7 @@ def test_tpop_view_initializes_dynamic_validity(view_op, valid_shape, emit_tile_
 @pytest.mark.parametrize("program", [TpopReshapeView, TpopTransposeView])
 @pytest.mark.parametrize("planner", list(passes.MemoryPlanner), ids=lambda planner: planner.name)
 def test_tpop_view_replay_compiles(tmp_path, program, planner):
-    """Replay initializes allocation-free views while preserving FIFO handshakes."""
+    """Dead local results in lane 1 leave its three FIFO handshakes intact."""
     consumer = program.get_function("vector_consumer")
     assert consumer is not None
     replay_consumer = ir.Function(
@@ -684,10 +684,13 @@ class Producer:
     body = _function_body(mlir, "vector_consumer")
     assert body.count("pto.tpop_from_aic") == 2, body
     assert body.count("pto.tfree_from_aic") == 2, body
-    # Both lanes retain their views; only the replay views need runtime-zero metadata.
+    # The active lane keeps its dataflow. The stores are suppressed on lane 1,
+    # so no command consumes its views after the receive.
     view_count = 2 if program is TpopReshapeView else 1
-    assert body.count("pto.treshape") == 2 * view_count, body
-    assert body.count("pto.set_validshape") == view_count, body
+    assert body.count("pto.treshape") == view_count, body
+    assert body.count("pto.tpush_to_aic") == 2, body
+    assert body.count("pto.texp") == body.count("pto.tstore") == 1, body
+    assert "pto.set_validshape" not in body, body
     if find_ptoas_binary() is not None:
         pto_backend._compile_pto_module(mlir, "vector_consumer", str(tmp_path), memory_planner=planner)
 

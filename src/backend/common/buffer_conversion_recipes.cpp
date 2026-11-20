@@ -127,7 +127,8 @@ const char* OperandError(const BufferConversionRecipe& recipe, const std::vector
     constexpr uint64_t kVecCapacityBytes = 192 * 1024;
     const auto bytes = PhysicalBufferBytes(dst);
     const bool min_pad = dst && dst->pad_ == ir::PadValue::min;
-    return IsAlignedDenseVecBufferGeometry(src) && IsFullPaddedVec(dst) && src->shape_ == dst->shape_ &&
+    return IsAlignedDenseVecBufferGeometry(src) && IsFullPaddedVec(dst) &&
+                   IsBufferVecFillValue(dst->pad_, dst->dtype_) && src->shape_ == dst->shape_ &&
                    src->dtype_ == dst->dtype_ &&
                    (src->valid_shape_[1] == src->shape_[1] || src->valid_shape_[1] == -1 ||
                     (min_pad && src->valid_shape_[1] > 0 && src->valid_shape_[1] < src->shape_[1])) &&
@@ -148,11 +149,15 @@ const char* OperandError(const BufferConversionRecipe& recipe, const std::vector
       return "requires runtime BF16/FP32 native uint16 row strides and uint32 element offsets";
   }
   const bool runtime_cast = has_runtime_shape && RuntimeBfloatGeometry(types[0], types[1]);
+  const bool full_float_pair = recipe.kind == K::Cast && types[0] && types[1] &&
+                               ((types[0]->dtype_ == DataType::FP32 && types[1]->dtype_ == DataType::BF16) ||
+                                (types[0]->dtype_ == DataType::BF16 && types[1]->dtype_ == DataType::FP32));
   for (size_t i = 0; i < types.size(); ++i) {
     if (static_cast<int>(i) != recipe.scalar_index &&
         !(runtime_cast ? IsAlignedDenseVecBufferGeometry(types[i])
                        : IsAlignedDenseVecBuffer(types[i]) ||
-                             (recipe.kind == K::Cast && IsFullZeroPaddedVec(types[i])))) {
+                             (recipe.kind == K::Cast && IsFullZeroPaddedVec(types[i])) ||
+                             (full_float_pair && IsFullPaddedVec(types[i])))) {
       return "requires aligned dense rank-2 Vec buffers with positive static valid extents";
     }
   }
@@ -276,9 +281,16 @@ bool SupportsLogicalBufferConversion(const BufferConversionRecipe& recipe, const
     const auto pad = call->GetKwarg<ir::PadValue>("pad_value", ir::PadValue::zero);
     if (!target || target->pad_ != pad) return false;
     if (pad == ir::PadValue::min) {
-      // A positive, in-capacity prefix qualifies the native copy and both
-      // tails. The existing empty-source legalization materializes zero.
-      return OperandError(recipe, {StaticLogicalBufferDescriptor(tile), target}, {}) == nullptr;
+      if (ir::As<ir::ConstInt>(valid[1])) {
+        return OperandError(recipe, {StaticLogicalBufferDescriptor(tile), target}, {}) == nullptr;
+      }
+      // Runtime columns use the same native tail. Ordinary admission and
+      // placed validity analysis both require a positive in-capacity width.
+      const auto rows = ir::As<ir::ConstInt>(valid[0]);
+      const auto capacity = ir::As<ir::ConstInt>(tile->shape_[0]);
+      return rows && capacity && rows->value_ > 0 && rows->value_ <= capacity->value_ &&
+             ir::AsVarLike(valid[1]) &&
+             OperandError(recipe, {PhysicalLogicalVecDescriptor(tile), target}, {}) == nullptr;
     }
     return ir::structural_equal(valid[1], tile->shape_[1]) &&
            (ir::AsVarLike(valid[0]) || ir::As<ir::ConstInt>(valid[0])) &&

@@ -24,10 +24,58 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto::ir {
+
+/// A full zero-offset slice is an SSA alias when it describes exactly the source's
+/// static native view and storage. Keep the authored call until placement so
+/// memory planning can still see its original pipeline membership.
+inline bool IsIdentityTileSlice(const AssignStmtPtr& assign) {
+  const auto call = As<Call>(assign->value_);
+  if (!IsOp(call, "tile.slice") || call->args_.size() != 3 || !call->kwargs_.empty() ||
+      !StripAttr(call->attrs_, kPipelineMembershipAttr).empty() || !AsVarLike(call->args_[0])) {
+    return false;
+  }
+  const auto source = As<TileType>(call->args_[0]->GetType());
+  const auto result = As<TileType>(assign->var_->GetType());
+  const auto expression = As<TileType>(call->GetType());
+  if (!source || !result || !expression || source->dtype_ != result->dtype_ ||
+      source->dtype_ != expression->dtype_) {
+    return false;
+  }
+  const auto space = source->GetMemorySpace();
+  if ((space != MemorySpace::Acc && space != MemorySpace::Vec) || result->GetMemorySpace() != space ||
+      expression->GetMemorySpace() != space) {
+    return false;
+  }
+  using tile_view_semantics::GetEffectiveTileView;
+  using tile_view_semantics::ShapeExprListsEquivalent;
+  const auto shape = As<MakeTuple>(call->args_[1]);
+  const auto offset = As<MakeTuple>(call->args_[2]);
+  const auto view = GetEffectiveTileView(*source);
+  if (!shape || !offset || source->shape_.size() != 2 || offset->elements_.size() != 2 ||
+      !ShapeExprListsEquivalent(shape->elements_, source->shape_) ||
+      !ShapeExprListsEquivalent(result->shape_, source->shape_) ||
+      !ShapeExprListsEquivalent(expression->shape_, source->shape_) ||
+      !ShapeExprListsEquivalent(view.valid_shape, source->shape_) || view != GetEffectiveTileView(*result) ||
+      view != GetEffectiveTileView(*expression)) {
+    return false;
+  }
+  for (size_t axis = 0; axis < 2; ++axis) {
+    const auto extent = As<ConstInt>(source->shape_[axis]);
+    const auto zero = As<ConstInt>(offset->elements_[axis]);
+    if (!extent || extent->value_ <= 0 || !zero || zero->value_ != 0) return false;
+  }
+  const auto from = source->memref_.value_or(nullptr);
+  const auto to = result->memref_.value_or(nullptr);
+  return from && to && from->size_ == to->size_ && from->slot_count_ == 1 && to->slot_count_ == 1 &&
+         !from->slot_index_ && !to->slot_index_ && CompareBaseAddress(from, to) == AddressRelation::kSame;
+}
 
 /// Lexical SSA provenance for Vec windows. Inherited pitch is not recoverable
 /// from a slice's TileType: its physical shape describes only the window.
@@ -57,9 +105,7 @@ class BufferViewAnalysis : public IRVisitor {
 
   bool IsWindow(const ExprPtr& value) const { return Get(value).window; }
 
-  bool IsContiguousColumnRelabel(const ExprPtr& value) const {
-    return Get(value).contiguous_column_relabel;
-  }
+  bool IsContiguousColumnRelabel(const ExprPtr& value) const { return Get(value).contiguous_column_relabel; }
 
   bool HasDenseRowPitch(const ExprPtr& value) const {
     const auto tile = As<TileType>(value->GetType());
@@ -79,7 +125,9 @@ class BufferViewAnalysis : public IRVisitor {
     if (AsVarLike(assign->value_)) {
       view = Get(assign->value_);
     } else if (const auto call = As<Call>(assign->value_); call && !call->args_.empty()) {
-      if (IsOp(call, "tile.slice")) {
+      if (IsIdentityTileSlice(assign)) {
+        view = Get(call->args_[0]);
+      } else if (IsOp(call, "tile.slice")) {
         view = Get(call->args_[0]);
         view.window = true;
         view.slice = call;

@@ -148,17 +148,21 @@ inline bool IsBufferVecFillValue(ir::PadValue pad, DataType dtype) {
   return pad == ir::PadValue::zero || (pad == ir::PadValue::min && dtype == DataType::FP32);
 }
 
+inline bool IsBufferMaterializedVecPad(ir::PadValue pad, DataType dtype) {
+  return IsBufferVecFillValue(pad, dtype) || (pad == ir::PadValue::min && dtype == DataType::BF16);
+}
+
 // The pad tag selects the fill value. On a full-valid Vec descriptor it
 // has no effect on physical storage geometry.
 inline bool IsFullPaddedVec(const ir::BufferTypePtr& type) {
-  return type && IsBufferVecFillValue(type->pad_, type->dtype_) &&
+  return type && IsBufferMaterializedVecPad(type->pad_, type->dtype_) &&
          IsAlignedDenseVecBufferGeometry(type, type->pad_) && IsDenseBufferTransferDtype(type->dtype_) &&
          type->valid_shape_ == type->shape_;
 }
 
 inline bool IsFullPaddedVec(const ir::TileTypePtr& tile, const ir::TileView& view) {
   if (tile->shape_.size() != 2 || !IsDenseBufferTransferDtype(tile->dtype_) ||
-      !IsBufferVecFillValue(view.pad, tile->dtype_) || !IsDenseVecBufferTile(tile, view, view.pad))
+      !IsBufferMaterializedVecPad(view.pad, tile->dtype_) || !IsDenseVecBufferTile(tile, view, view.pad))
     return false;
   if (view.valid_shape.empty()) return true;
   if (view.valid_shape.size() != tile->shape_.size()) return false;
@@ -172,6 +176,26 @@ inline bool IsFullPaddedVec(const ir::TileTypePtr& tile, const ir::TileView& vie
 
 inline bool IsFullZeroPaddedVec(const ir::BufferTypePtr& type) {
   return IsFullPaddedVec(type) && type->pad_ == ir::PadValue::zero;
+}
+
+// Replay carriers preserve the transport type while supplying zero bytes.
+// Keep their logical validity immutable to distinguish them from active
+// dynamic descriptors in the ordinary operation contracts.
+inline bool IsEmptyPaddedVec(const ir::BufferTypePtr& type) {
+  return IsAlignedDenseVecBufferGeometry(type, ir::PadValue::min) &&
+         IsBufferMaterializedVecPad(type->pad_, type->dtype_) &&
+         type->valid_shape_ == std::vector<int64_t>{0, 0};
+}
+
+inline bool IsEmptyPaddedVec(const ir::TileTypePtr& tile, const ir::TileView& view) {
+  if (tile->shape_.size() != 2 || view.pad != ir::PadValue::min ||
+      !IsBufferMaterializedVecPad(view.pad, tile->dtype_) || !IsDenseVecBufferTile(tile, view, view.pad) ||
+      view.valid_shape.size() != 2) {
+    return false;
+  }
+  const auto rows = ir::As<ir::ConstInt>(view.valid_shape[0]);
+  const auto cols = ir::As<ir::ConstInt>(view.valid_shape[1]);
+  return rows && cols && rows->value_ == 0 && cols->value_ == 0;
 }
 
 /// Native dense tiles represent a logical vector as one row. Apply the same

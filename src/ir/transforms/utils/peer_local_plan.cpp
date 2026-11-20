@@ -36,6 +36,7 @@ namespace {
 
 struct PeerPhase {
   size_t first;
+  size_t region;
   CompactSyncResult math;
   std::set<SyncDirection> events;
   PeerWorkPairs seam;
@@ -53,14 +54,14 @@ SyncDirection SeamPair(PipeType source, PipeType target) {
 // Finite regions still use the ordinary rotating/static demand provider.
 // A runtime item is one invocation of that finite model. Keep original visit
 // ordinals and call cuts, offsetting only the phase's segment indices.
-PeerPhase AnalyzePeerPhase(const CompactSyncInput& input, PeerWorkRange range, bool scalar_serial,
-                           std::vector<PhysicalSyncFamily>& families) {
+PeerPhase AnalyzePeerPhase(const CompactSyncInput& input, PeerWorkRange range, size_t region,
+                           bool scalar_serial, std::vector<PhysicalSyncFamily>& families) {
   CompactSyncInput finite;
   finite.owner = input.owner;
   finite.hardware_target = input.hardware_target;
   finite.storage = input.storage;
   finite.segments.assign(input.segments.begin() + range.first, input.segments.begin() + range.second);
-  PeerPhase phase{range.first, AnalyzeCompactSync(std::move(finite)), {}, {}};
+  PeerPhase phase{range.first, region, AnalyzeCompactSync(std::move(finite)), {}, {}};
   const auto append = [&](PhysicalSyncFamily family) {
     const auto [source, target] = SyncFamilyPipes(input, family);
     if (source != PipeType::S || target != source || !scalar_serial) {
@@ -115,51 +116,65 @@ PeerWorkSeamIds ReserveWorkSeams(const PeerLocalLane& lane, const std::vector<Pe
   return ids;
 }
 
-std::vector<PeerPhase> AnalyzePeerLane(const PeerLocalLane& lane, bool scalar_serial,
-                                       std::vector<PhysicalSyncFamily>& families) {
-  const auto end = lane.input.segments.size();
-  if (!lane.work_loop) {
-    return {AnalyzePeerPhase(lane.input, {0, end}, scalar_serial, families)};
-  }
-  const PeerWorkRange prefix{0, lane.work_loop->first}, item{lane.work_loop->first, lane.work_loop->end},
-      suffix{lane.work_loop->end, end};
-  std::vector<PeerPhase> phases;
-  for (const auto& range : {prefix, item, suffix}) {
-    phases.push_back(AnalyzePeerPhase(lane.input, range, scalar_serial, families));
-  }
-  AddPeerWorkConflicts(lane, prefix, item, phases[0].seam);
+void AnalyzePeerWorkSeams(const CompactSyncInput& input, const PeerLocalRegion& region, PeerPhase& before,
+                          PeerPhase& body, const PeerPhase& after) {
+  const auto& work = *region.work_loop;
+  const PeerWorkRange prefix{region.first, work.first}, item{work.first, work.end},
+      suffix{work.end, region.end};
+  AddPeerWorkConflicts(input, work, prefix, item, before.seam);
   // A zero-trip path goes directly from prefix to suffix. Even on a nonempty
   // path a disjoint item may leave a prefix hazard live until that suffix.
-  AddPeerWorkConflicts(lane, prefix, suffix, phases[0].seam);
-  AddPeerWorkConflicts(lane, item, item, phases[1].seam);
-  AddPeerWorkConflicts(lane, item, suffix, phases[1].seam);
-  for (const auto& [source, target] : phases[0].events) {
-    if (phases[1].events.count({source, target}) || phases[2].events.count({source, target})) {
-      phases[0].seam.insert(SeamPair(source, target));
+  AddPeerWorkConflicts(input, work, prefix, suffix, before.seam);
+  AddPeerWorkConflicts(input, work, item, item, body.seam);
+  AddPeerWorkConflicts(input, work, item, suffix, body.seam);
+  for (const auto& direction : before.events) {
+    if (body.events.count(direction) || after.events.count(direction)) {
+      before.seam.insert(SeamPair(direction.first, direction.second));
     }
   }
   // Within-item allocations are proved in the finite model. Its last WAIT
   // must also precede the first SET of the next item on that event bank.
-  for (const auto& [source, target] : phases[1].events) {
-    phases[1].seam.insert(SeamPair(source, target));
+  for (const auto& [source, target] : body.events) {
+    body.seam.insert(SeamPair(source, target));
   }
-  return phases;
 }
 
 FunctionPtr PlanLane(const PeerLocalLane& lane, const backend::LocalSyncExecutionContract& execution) {
   const auto& input = lane.input;
   std::vector<PhysicalSyncFamily> families;
-  auto phases = AnalyzePeerLane(lane, execution.scalar_prefix_serialized, families);
-  const auto phase_index = [&](size_t r) -> size_t {
-    return !lane.work_loop || r < lane.work_loop->first ? 0 : r < lane.work_loop->end ? 1 : 2;
+  std::vector<PeerPhase> phases;
+  std::vector<size_t> phase_by_segment(input.segments.size());
+  std::vector<PeerWorkPlacement> placements;
+  const auto add_phase = [&](PeerWorkRange range, size_t region) {
+    std::fill(phase_by_segment.begin() + range.first, phase_by_segment.begin() + range.second, phases.size());
+    phases.push_back(AnalyzePeerPhase(input, range, region, execution.scalar_prefix_serialized, families));
   };
+  for (size_t i = 0; i < lane.regions.size(); ++i) {
+    const auto& region = lane.regions[i];
+    if (!region.work_loop) {
+      add_phase({region.first, region.end}, i);
+      continue;
+    }
+    const auto& work = *region.work_loop;
+    const auto first = phases.size();
+    add_phase({region.first, work.first}, i);
+    add_phase({work.first, work.end}, i);
+    add_phase({work.end, region.end}, i);
+    AnalyzePeerWorkSeams(input, region, phases[first], phases[first + 1], phases[first + 2]);
+    placements.push_back({&work, phases[first].seam, phases[first + 1].seam});
+  }
   DirectSyncOrder order;
   order.precedes = [&](const Occurrence& a, const Occurrence& b) {
     const auto ar = std::get<0>(a), br = std::get<0>(b);
-    const auto i = phase_index(ar), j = phase_index(br);
+    const auto i = phase_by_segment[ar], j = phase_by_segment[br];
     const auto& phase = phases[i];
     if (i == j) {
       return phase.math.Precedes(phase.Local(a), true, phase.Local(b), false);
+    }
+    if (phase.region != phases[j].region) {
+      // The authored hard MIX SYNCALL drains both directions. Any earlier
+      // event WAIT has completed when a later region can issue its SET.
+      return i < j;
     }
     // Reuse queries compare WAIT and SET cuts on the same directional bank.
     // The earlier phase's seam consumes waits on the destination queue
@@ -169,12 +184,12 @@ FunctionPtr PlanLane(const PeerLocalLane& lane, const backend::LocalSyncExecutio
     return i < j && phase.seam.count(pair) != 0;
   };
   order.reference_before = [&](const Occurrence& a, const Occurrence& b) {
-    const auto i = phase_index(std::get<0>(a)), j = phase_index(std::get<0>(b));
+    const auto i = phase_by_segment[std::get<0>(a)], j = phase_by_segment[std::get<0>(b)];
     const auto& phase = phases[i];
     return i == j ? phase.math.ReferenceBefore(phase.Local(a), phase.Local(b)) : i < j;
   };
   order.threshold = [&](size_t r, size_t a, size_t b) {
-    const auto& phase = phases[phase_index(r)];
+    const auto& phase = phases[phase_by_segment[r]];
     return phase.math.State().segments.at(r - phase.first).Threshold(a, true, b, false);
   };
   order.allow_stronger_barriers = true;
@@ -183,15 +198,15 @@ FunctionPtr PlanLane(const PeerLocalLane& lane, const backend::LocalSyncExecutio
   SyncNativeReservations seam_reservations;
   const auto ids = ReserveWorkSeams(lane, phases, seam_reservations);
   SyncSchedulePolicy policy;
-  if (lane.work_loop) {
+  if (!placements.empty() || lane.regions.size() > 1) {
     // Every call, descriptor and FIFO operation stays at its authored cut.
     policy.mode = "guarded";
     policy.boundary_motion = false;
   }
   auto realized = RealizeDirectSync(input, std::move(families), order, input.hardware_target, std::nullopt,
                                     policy, seam_reservations);
-  if (lane.work_loop) {
-    return AddPeerWorkSeams(realized.function, *lane.work_loop, phases[0].seam, phases[1].seam, ids);
+  if (!placements.empty()) {
+    return AddPeerWorkSeams(realized.function, placements, ids);
   }
   return realized.function;
 }

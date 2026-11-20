@@ -16,8 +16,11 @@ These checks prove selected-model behavior, not native instruction footprints.
 import pytest
 import torch
 from pypto import Error, ir, passes, testing
-from pypto._function_attrs import AUTOSYNC_FALLBACK_REASON_ATTR
+from pypto._function_attrs import AUTOSYNC_FALLBACK_REASON_ATTR, PYPTO_AUTOSYNC_ATTR
 from pypto.debug import torch_codegen
+from pypto.ir.pass_manager import PassManager
+
+from tests.ut.codegen.test_pto_codegen_cross_core import _paired_receive_program
 
 from .sync_matmul_oracle import interpret, validate
 from .test_autosync_switch import clone
@@ -28,6 +31,87 @@ from .test_select_buffer_ir_functions import _PLANNERS, _compile_dynamic_state_n
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
 SCRATCH = (184 * 1024, 192 * 1024)
+
+
+def test_peer_scratch_preserves_hazards_and_ordinary_placement_limits():
+    placed = []
+
+    class EvalCalls(ir.IRVisitor):
+        def __init__(self, function):
+            super().__init__()
+            self.calls = []
+            self.visit_stmt(function.body)
+
+        def visit_eval_stmt(self, op):
+            if isinstance(op.expr, ir.Call):
+                self.calls.append(op.expr)
+
+    def capture(transform, program):
+        if transform.get_name() == "RealizeSync":
+            placed.append(program)
+
+    source = _paired_receive_program(
+        2,
+        """values = pl.load(x, [0, 0], [16, 16])
+result = pl.matmul(values, values)
+pl.tpush_to_aiv(result, split=0)""",
+        """incoming: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+copied = pl.mul(incoming, 2.0)
+pl.tfree_to_aic(incoming)
+tmp = pl.tile.create([16, 16], dtype=pl.FP32)
+reduced = pl.row_sum(copied, tmp)
+shifted = pl.row_expand_sub(copied, reduced)
+scaled = pl.row_expand_div(copied, reduced)
+return pl.store(pl.add(shifted, scaled), [0, 0], out)""",
+    )
+    with passes.PassContext(
+        [passes.CallbackInstrument(before_pass=capture)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+    ):
+        result = PassManager(ir.OptimizationStrategy.Default).run_passes(source)
+        vector = result.get_function("vector")
+        assert vector is not None
+        assert vector.attrs.get(PYPTO_AUTOSYNC_ATTR), vector.attrs
+        assert vector.ir_stage == ir.FunctionIRStage.Buffer
+        effects = EvalCalls(vector).calls
+        names = [call.op.name for call in effects]
+        sub = names.index(ir.get_op("buffer.row_expand_sub").name)
+        div = names.index(ir.get_op("buffer.row_expand_div").name)
+        # Both operations read the same input and write separate tiles. The
+        # native scratch is the shared written storage that needs a barrier.
+        assert effects[sub].args[:2] == effects[div].args[:2]
+        assert effects[sub].args[2] is not effects[div].args[2]
+        assert ir.get_op("system.bar_v").name in names[sub + 1 : div]
+
+        early_vector = placed[0].get_function("vector")
+        assert early_vector is not None
+        copied = next(
+            call.args[-1]
+            for call in EvalCalls(early_vector).calls
+            if call.op.name == ir.get_op("buffer.muls").name
+        )
+
+        class PlaceOrdinaryBufferInScratch(ir.IRMutator):
+            def visit_assign_stmt(self, op):
+                if op.var is copied:
+                    alloc = op.value
+                    assert isinstance(alloc, ir.Call) and alloc.op.name == ir.get_op("buffer.alloc").name
+                    address = ir.ConstInt(SCRATCH[0], ir.DataType.INDEX, alloc.span)
+                    moved = ir.Call(alloc.op, [alloc.args[0], address], alloc.type, alloc.span)
+                    return ir.AssignStmt(op.var, moved, op.span)
+                return super().visit_assign_stmt(op)
+
+        invalid = PlaceOrdinaryBufferInScratch().visit_program(placed[0])
+        rejected = passes.realize_sync()(invalid).get_function("vector")
+        assert rejected is not None
+        assert not rejected.attrs.get(PYPTO_AUTOSYNC_ATTR)
+        assert (
+            "Ordinary Buffer footprint has no bounded physical placement"
+            in rejected.attrs[AUTOSYNC_FALLBACK_REASON_ATTR]
+        )
 
 
 def independent_broadcasts(

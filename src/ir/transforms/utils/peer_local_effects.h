@@ -34,10 +34,17 @@ struct PeerLocalWorkLoop {
   std::map<size_t, int64_t> ring_advance;
 };
 
+// One lexical region delimited by an authored hard MIX SYNCALL, which
+// completes every local pipe. FIFO storage and counters span regions.
+struct PeerLocalRegion {
+  size_t first, end;
+  std::optional<PeerLocalWorkLoop> work_loop;
+};
+
 struct PeerLocalLane {
   CompactSyncInput input;
   SyncNativeReservations reservations;
-  std::optional<PeerLocalWorkLoop> work_loop;
+  std::vector<PeerLocalRegion> regions;
 };
 
 struct PeerGmEffects {

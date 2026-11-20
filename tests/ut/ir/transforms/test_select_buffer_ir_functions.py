@@ -818,8 +818,14 @@ def test_fillpad_defines_zero_suffix_before_cast_and_store(planner):
 
 @pytest.mark.ptoas_compile
 @pytest.mark.parametrize("width", [5, None], ids=["static-prefix", "unproved-runtime-prefix"])
-def test_minimum_fillpad_before_row_max(width, tmp_path):
+@pytest.mark.parametrize("convert", [False, True])
+def test_minimum_fillpad_before_row_max(width, convert, tmp_path):
     extent = "cols" if width is None else str(width)
+    conversion = (
+        "expanded = pl.exp(padded)\n        observed = pl.cast(pl.cast(expanded, pl.BF16), pl.FP32)"
+        if convert
+        else "observed = padded"
+    )
     program = pl.parse_program(f"""
 @pl.program
 class MinPad:
@@ -829,8 +835,9 @@ class MinPad:
         src = pl.load(source, [0, 0], [16, 32])
         prefix = pl.set_validshape(src, 16, {extent})
         padded = pl.fillpad(prefix, pad_value=pl.PadValue.min)
+        {conversion}
         scratch = pl.tile.create([16, 32], dtype=pl.FP32)
-        maximum = pl.row_max(padded, scratch)
+        maximum = pl.row_max(observed, scratch)
         return pl.store(maximum, [0, 0], output)
 """)
     if width is None:
@@ -839,6 +846,9 @@ class MinPad:
     lowered = _run_autosync(program)
     pto = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True, emit_source_loc=False)
     assert "pto.tfillpad" in pto and "pad=3" in pto and "pto.trowmax" in pto
+    if convert:
+        assert pto.count("pto.tcvt") == 2 and "pto.texp " in pto
+        assert any("dtype=bf16" in line and "pad=3" in line for line in pto.splitlines())
     pto_path = tmp_path / "min_pad.pto"
     pto_path.write_text(pto)
     _run_ptoas(
@@ -852,7 +862,172 @@ class MinPad:
     source[:, width:] = 1
     output = torch.empty(16, 1)
     namespace["kernel"](source, width, output)
-    torch.testing.assert_close(output, source[:, :width].amax(dim=1, keepdim=True))
+    expected = source[:, :width].amax(dim=1, keepdim=True)
+    if convert:
+        expected = expected.exp().bfloat16().float()
+    torch.testing.assert_close(output, expected)
+
+
+def test_bf16_transport_pad_tag_does_not_qualify_minimum_fillpad():
+    program = pl.parse_program("""
+@pl.program
+class BfloatMinPad:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, source: pl.Tensor[[16, 32], pl.BF16],
+               destination: pl.Out[pl.Tensor[[16, 32], pl.BF16]]) -> pl.Tensor[[16, 32], pl.BF16]:
+        loaded = pl.load(source, [0, 0], [16, 32])
+        prefix = pl.set_validshape(loaded, 16, 16)
+        padded = pl.fillpad(prefix, pad_value=pl.PadValue.min)
+        return pl.store(padded, [0, 0], destination)
+""")
+    assert _kernel(_lower(program, passes.MemoryPlanner.PYPTO)).ir_stage == ir.FunctionIRStage.Functional
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize(
+    "adjust,unknown_stride,selected",
+    [(8, False, True), (0, False, False), (9, False, False), (8, True, False)],
+)
+def test_minimum_fillpad_checks_runtime_column_prefix(adjust, unknown_stride, selected, tmp_path):
+    step = "unproved" if unknown_stride else "pl.tile.get_block_num()"
+    program = pl.parse_program(f"""
+@pl.program
+class MinimumPrefix:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, source: pl.Tensor[[16, 32], pl.FP32], unproved: pl.Scalar[pl.INDEX],
+               output: pl.InOut[pl.Tensor[[16, 1], pl.FP32]]) -> pl.Tensor[[16, 1], pl.FP32]:
+        for work in pl.range(pl.tile.get_block_idx(), 32, {step}):
+            columns = (work // 8) * 8 + {adjust}
+            src = pl.load(source, [0, 0], [16, 32])
+            prefix = pl.set_validshape(src, 16, columns)
+            padded = pl.fillpad(prefix, pad_value=pl.PadValue.min)
+            scratch = pl.tile.create([16, 32], dtype=pl.FP32)
+            maximum = pl.row_max(padded, scratch)
+            output = pl.store(maximum, [0, 0], output)
+        return output
+""")
+    lowered = _lower(program, passes.MemoryPlanner.PYPTO)
+    actual = _kernel(lowered)
+    assert (actual.ir_stage == ir.FunctionIRStage.Buffer) is selected
+    if selected:
+        text = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True, emit_source_loc=False)
+        assert "pto.tfillpad" in text and "pad=3" in text and "pto.set_validshape" in text
+        _compile_dynamic_state_native(lowered, tmp_path, passes.MemoryPlanner.PYPTO)
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize("planner", _PLANNERS)
+@pytest.mark.parametrize("window", ["identity", "offset", "valid"])
+def test_acc_slice_reuses_only_an_identical_buffer(planner, window, tmp_path):
+    parent_rows = 32 if window == "offset" else 16
+    offset = 16 if window == "offset" else 0
+    validity = ", valid_shape=[8, 16]" if window == "valid" else ""
+    program = pl.parse_program(f"""
+@pl.program
+class AccWindow:
+    @pl.function(type=pl.FunctionType.AIC)
+    def kernel(self, lhs: pl.Tensor[[{parent_rows}, 32], pl.FP16], rhs: pl.Tensor[[32, 16], pl.FP16],
+               out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
+        x = pl.load(lhs, [0, 0], [{parent_rows}, 32], target_memory=pl.Mem.Mat)
+        y = pl.load(rhs, [0, 0], [32, 16], target_memory=pl.Mem.Mat)
+        product = pl.matmul(x, y)
+        result = pl.slice(product, [16, 16], [{offset}, 0]{validity})
+        return pl.store(result, [0, 0], out)
+""")
+    lowered = _lower(program, planner)
+    actual = _kernel(lowered)
+    if window != "identity":
+        assert actual.ir_stage == ir.FunctionIRStage.Functional
+        return
+    assert actual.ir_stage == ir.FunctionIRStage.Buffer
+    text = codegen.PTOCodegen().generate(lowered, emit_source_loc=False)
+    assert "pto.subview" not in text
+    product = next(line for line in text.splitlines() if "pto.tmatmul " in line)
+    buffer = product.split("outs(", 1)[1].split(" :", 1)[0]
+    assert f"pto.tstore ins({buffer} " in text
+    _compile_dynamic_state_native(lowered, tmp_path, planner)
+    namespace = {}
+    exec(torch_codegen(lowered), namespace)  # noqa: S102
+    lhs = torch.arange(512, dtype=torch.float16).reshape(16, 32) / 512
+    rhs = torch.ones((32, 16), dtype=torch.float16)
+    out = torch.empty((16, 16))
+    namespace["kernel"](lhs, rhs, out)
+    torch.testing.assert_close(out, lhs.float() @ rhs.float())
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize("planner", _PLANNERS)
+@pytest.mark.parametrize("column", [False, True], ids=["row-major", "column-major"])
+def test_full_vec_slice_keeps_the_source_buffer(planner, column, tmp_path):
+    cols = 1 if column else 16
+    producer = (
+        "scratch = pl.tile.create([16, 16], dtype=pl.FP32)\n        data = pl.row_sum(loaded, scratch)"
+        if column
+        else "data = pl.add(loaded, loaded)"
+    )
+    program = pl.parse_program(f"""
+@pl.program
+class VecWindow:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, source: pl.Tensor[[16, 16], pl.FP32],
+               out: pl.Out[pl.Tensor[[16, {cols}], pl.FP32]]) -> pl.Tensor[[16, {cols}], pl.FP32]:
+        loaded = pl.load(source, [0, 0], [16, 16])
+        {producer}
+        full = pl.slice(data, [16, {cols}], [0, 0])
+        return pl.store(full, [0, 0], out)
+""")
+    lowered = _lower(program, planner)
+    assert _kernel(lowered).ir_stage == ir.FunctionIRStage.Buffer
+    text = codegen.PTOCodegen().generate(lowered, emit_source_loc=False)
+    assert "pto.subview" not in text
+    op = "pto.trowsum" if column else "pto.tadd"
+    producer_line = next(line for line in text.splitlines() if op in line)
+    buffer = producer_line.split("outs(", 1)[1].split(" :", 1)[0]
+    assert f"pto.tstore ins({buffer} " in text
+    _compile_dynamic_state_native(lowered, tmp_path, planner)
+    namespace = {}
+    exec(torch_codegen(lowered), namespace)  # noqa: S102
+    source = torch.arange(256, dtype=torch.float32).reshape(16, 16)
+    out = torch.empty((16, cols))
+    namespace["kernel"](source, out)
+    torch.testing.assert_close(out, source.sum(dim=1, keepdim=True) if column else source * 2)
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize("strided_parent", [False, True], ids=["dense-window", "strided-window"])
+def test_static_dense_window_reshape_in_kernel_with_runtime_validity(strided_parent, tmp_path):
+    columns = 64 if strided_parent else 32
+    program = pl.parse_program(f"""
+@pl.program
+class DenseWindow:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, source: pl.Tensor[[16, {columns}], pl.BF16],
+               partial: pl.InOut[pl.Tensor[[16, {columns}], pl.BF16]],
+               destination: pl.InOut[pl.Tensor[[1, 160], pl.BF16]]) -> pl.Tensor[[1, 160], pl.BF16]:
+        loaded = pl.load(source, [0, 0], [16, {columns}])
+        for rows in pl.range(5, 9):
+            prefix = pl.set_validshape(loaded, rows, {columns})
+            partial = pl.store(prefix, [0, 0], partial)
+            window = pl.slice(loaded, [5, 32], [0, 0])
+            flattened = pl.reshape(window, [1, 160])
+            destination = pl.store(flattened, [0, 0], destination)
+        return destination
+""")
+    lowered = _lower(program, passes.MemoryPlanner.PYPTO)
+    if strided_parent:
+        assert _kernel(lowered).ir_stage == ir.FunctionIRStage.Functional
+        return
+    assert _kernel(lowered).ir_stage == ir.FunctionIRStage.Buffer
+    text = codegen.PTOCodegen().generate(lowered, emit_source_loc=False)
+    assert "pto.subview" in text and "pto.treshape" in text and "pto.set_validshape" in text
+    _compile_dynamic_state_native(lowered, tmp_path, passes.MemoryPlanner.PYPTO)
+    namespace = {}
+    exec(torch_codegen(lowered), namespace)  # noqa: S102
+    source = torch.arange(512, dtype=torch.bfloat16).reshape(16, 32)
+    partial = torch.zeros_like(source)
+    destination = torch.empty((1, 160), dtype=torch.bfloat16)
+    namespace["kernel"](source, partial, destination)
+    torch.testing.assert_close(destination, source[:5].reshape(1, 160))
 
 
 @pytest.mark.parametrize("planner", _PLANNERS)

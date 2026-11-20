@@ -237,6 +237,9 @@ class LaneImporter {
     for (const auto& [id, binding] : transport.pipes) {
       initializers_.insert(binding.initializer.get());
       if (!binding.receive) continue;
+      // The invocation starts with a distinct cursor for each receive pipe.
+      // A phase without a pop must still preserve those symbolic origins.
+      ordinals_.emplace(id, 0);
       const auto& ring = *binding.receive;
       const auto capacity = backend_.GetHandler()->GetCapacityBytes(ring.space);
       CHECK(ring.placed_base && *ring.placed_base >= 0 && ring.reserve_bytes > 0 &&
@@ -282,12 +285,17 @@ class LaneImporter {
                owner->span_)
         << "Peer local path with results requires a terminal return";
     for (size_t i = 0; i < statements.size(); ++i) {
-      if (const auto loop = As<ForStmt>(statements[i]))
+      const auto& statement = statements[i];
+      if (IsOp(GetCallFromStmt(statement), "system.syncall")) {
+        ImportSyncAll(statement);
+      } else if (const auto loop = As<ForStmt>(statement)) {
         ImportLoop(loop);
-      else
-        Import(statements[i], i + 1 == statements.size());
+      } else {
+        Import(statement, i + 1 == statements.size());
+      }
     }
     CHECK(closed_.size() == births_.size()) << "Peer endpoint exits with an outstanding receive borrow";
+    result_.regions.push_back({region_start_, result_.input.segments.size(), std::move(work_loop_)});
     return std::move(result_);
   }
 
@@ -299,6 +307,8 @@ class LaneImporter {
   const SyncControlRangeProver& ranges_;
   const SyncFootprintResolver* footprint_;
   PeerLocalLane result_;
+  size_t region_start_ = 0;
+  std::optional<PeerLocalWorkLoop> work_loop_;
   std::unordered_map<const Stmt*, const PeerTransportSite*> sites_;
   std::unordered_set<const Call*> initializers_, payload_calls_;
   std::map<MemorySpace, std::map<int64_t, int64_t>> reserves_;
@@ -317,6 +327,21 @@ class LaneImporter {
   std::unordered_set<const Var*> ambiguous_metadata_handles_;
   std::unordered_map<const Var*, size_t> gm_roots_;
   std::map<MemorySpace, size_t> storage_;
+
+  void ImportSyncAll(const StmtPtr& statement) {
+    const auto call = GetCallFromStmt(statement);
+    CHECK_SPAN(IsA<EvalStmt>(statement) && cross_core_pipe::IsHardMixedSyncAll(call), statement->span_)
+        << "Peer local region requires an authored hard MIX SYNCALL";
+    CHECK_SPAN(births_.size() == closed_.size(), statement->span_)
+        << "A live FIFO handle crosses a hard MIX SYNCALL";
+    // The pinned A2/A3 hard MIX implementation drains all local pipes before
+    // reaching the cross-core rendezvous. Keep the call in place and preserve
+    // the FIFO state: completion does not rewind any transport counter.
+    const auto end = result_.input.segments.size();
+    result_.regions.push_back({region_start_, end, std::exchange(work_loop_, std::nullopt)});
+    region_start_ = end;
+    result_.input.segments.emplace_back();
+  }
 
   // The lane's immutable SSA definitions only add ready scalar values.
   // Cache positive results so a shared expression DAG is walked once. A
@@ -581,16 +606,20 @@ class LaneImporter {
     result_.input.segments.back().sites.push_back(std::move(site));
   }
 
+  void CheckReceiveReserveSeparation(const TileWindow& window, const Span& span) const {
+    if (const auto found = reserves_.find(window.space); found != reserves_.end()) {
+      const auto next = found->second.lower_bound(window.end);
+      CHECK_SPAN(next == found->second.begin() || std::prev(next)->second <= window.begin, span)
+          << "Buffer footprint intersects a live receive reserve";
+    }
+  }
+
   void CheckOrdinaryPlacement(const TileWindow& window, const Span& span) const {
     const auto capacity = backend_.GetHandler()->GetCapacityBytes(window.space);
     CHECK_SPAN(
         window.begin >= 0 && window.begin < window.end && static_cast<uint64_t>(window.end) <= capacity, span)
         << "Ordinary Buffer footprint has no bounded physical placement";
-    if (const auto found = reserves_.find(window.space); found != reserves_.end()) {
-      const auto next = found->second.lower_bound(window.end);
-      CHECK_SPAN(next == found->second.begin() || std::prev(next)->second <= window.begin, span)
-          << "Ordinary Buffer footprint intersects a live receive reserve";
-    }
+    CheckReceiveReserveSeparation(window, span);
   }
 
   TileWindow ResolveBufferWindow(const StmtPtr& statement, const ExprPtr& operand,
@@ -669,7 +698,12 @@ class LaneImporter {
     }
     for (const auto& implicit : implementation.ImplicitEffects()) {
       const TileWindow window{implicit.space, implicit.begin, implicit.end};
-      CheckOrdinaryPlacement(window, statement->span_);
+      // The selected native contract supplies physical bounds for its own
+      // scratch. It can use ISA-reserved bytes outside the allocation limit.
+      INTERNAL_CHECK_SPAN(window.space != MemorySpace::DDR && window.begin >= 0 && window.begin < window.end,
+                          statement->span_)
+          << "Invalid physical bounds for qualified native scratch";
+      CheckReceiveReserveSeparation(window, statement->span_);
       if (implicit.data == BufferAccess::Read || implicit.data == BufferAccess::ReadWrite) {
         Access(site, window, false, implicit.exact_footprint);
       }
@@ -1024,8 +1058,8 @@ class LaneImporter {
 
   void ImportWorkLoop(const ForStmtPtr& loop, bool allow_runtime, const std::vector<StmtPtr>& body,
                       const YieldStmtPtr& yield) {
-    CHECK_SPAN(allow_runtime && !result_.work_loop, loop->span_)
-        << "Peer local planning requires at most one outer runtime work loop per lane";
+    CHECK_SPAN(allow_runtime && !work_loop_, loop->span_)
+        << "Peer local planning requires at most one outer runtime work loop per region";
     QualifyWorkLoop(loop);
     const auto entry = ordinals_;
     auto& segments = result_.input.segments;
@@ -1041,15 +1075,15 @@ class LaneImporter {
     BindLoopResults(loop, yield);
     std::map<size_t, int64_t> advance;
     for (const auto& [id, domain] : ring_domains_) {
-      const auto found = entry.find(id);
-      const auto initial = found == entry.end() ? 0 : found->second;
-      advance.emplace(domain, (ordinals_.at(id) - initial) % result_.input.storage[domain].slot_count);
+      advance.emplace(domain, (ordinals_.at(id) - entry.at(id)) % result_.input.storage[domain].slot_count);
     }
     // Rebase the suffix to the same ring origin as the item. Its actual origin
     // can differ by any number of item advances; only seam analysis uses that
-    // uncertainty. A common rotation preserves all aliases within a phase.
+    // uncertainty. A later region can keep this representative origin because
+    // only closed borrows reach the cut. Each region's physical aliases are
+    // invariant under a common rotation.
     ordinals_ = entry;
-    result_.work_loop = PeerLocalWorkLoop{loop, first, segments.size(), std::move(advance)};
+    work_loop_ = PeerLocalWorkLoop{loop, first, segments.size(), std::move(advance)};
     segments.emplace_back();
   }
 
@@ -1124,6 +1158,8 @@ class LaneImporter {
       return;
     }
     CHECK_SPAN(!As<GlobalVar>(call->op_), statement->span_) << "Unqualified outlined peer payload";
+    CHECK_SPAN(!IsOp(call, "system.syncall"), statement->span_)
+        << "Peer local hard MIX SYNCALL must be outside loops";
     CHECK_SPAN(call->attrs_.empty(), statement->span_)
         << "Peer local planning requires qualified native call attributes";
     if (initializers_.count(call.get())) {
