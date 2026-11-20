@@ -40,10 +40,16 @@ struct PeerLocalLane {
   std::optional<PeerLocalWorkLoop> work_loop;
 };
 
+struct PeerGmEffects {
+  std::set<size_t> formals;
+  std::set<size_t> scalar_reads;
+  std::set<size_t> writes;
+};
+
 struct PeerLocalEffects {
   // One common path, or the then and else paths of the original AIV subblock branch.
   std::vector<PeerLocalLane> lanes;
-  std::set<size_t> gm_formals;
+  PeerGmEffects gm;
 };
 
 // Recover the native physical effects at their original statement cuts. Throws

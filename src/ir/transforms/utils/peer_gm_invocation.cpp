@@ -21,11 +21,13 @@
 #include <vector>
 
 #include "pypto/core/logging.h"
+#include "pypto/ir/memref.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/alloc_batching.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
+#include "src/ir/transforms/utils/peer_local_effects.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -70,6 +72,12 @@ struct Site {
   std::vector<Origin> arguments;
 };
 
+const Expr* GmIdentity(const Origin& origin) {
+  const auto tensor = As<TensorType>(origin.value->GetType());
+  const auto memref = tensor->memref_.value_or(nullptr);
+  return memref && memref->base_ ? memref->base_.get() : origin.value;
+}
+
 // A root inventory is cached across the prospective Groups it invokes. Allow
 // explicitly scoped tensor.create bindings to dominate later calls in the same
 // scope. Control outside this admitted form is still walked to find calls, so
@@ -96,6 +104,23 @@ class RootInventory final : public IRVisitor {
       CHECK_SPAN(site.qualified && site.arguments.size() == group->params_.size(), site.span)
           << "Peer Group GM proof requires a direct root invocation with explicit tensor actuals";
       CheckSite(program, group, site, ordinary_formals, workspace_formal);
+    }
+  }
+
+  // Check after both endpoint imports and their ordinary GM provenance checks.
+  // These sets are projected through the actual bindings of every launch.
+  void CheckScalarReads(const FunctionPtr& group, const PeerGmEffects& effects, bool disjoint_gm) const {
+    for (const auto& site : calls_.at(group->name_)) {
+      std::unordered_set<const Expr*> write_roots;
+      for (const auto formal : effects.writes) {
+        write_roots.insert(GmIdentity(site.arguments[formal]));
+      }
+      for (const auto formal : effects.scalar_reads) {
+        CHECK_SPAN(!write_roots.count(GmIdentity(site.arguments[formal])), site.span)
+            << "Peer scalar GM read aliases a GM write in the mixed dispatch";
+      }
+      CHECK_SPAN(disjoint_gm || write_roots.empty(), site.span)
+          << "Peer scalar GM read may alias a GM write without a disjoint GM contract";
     }
   }
 
@@ -295,6 +320,16 @@ void PeerInvocationGmEvidence::Check(const FunctionPtr& group, const std::set<si
       inventory = std::make_unique<RootInventory>(root, state_->groups);
     }
     inventory->Check(state_->program, group, ordinary_formals, workspace_formal);
+  }
+}
+
+void PeerInvocationGmEvidence::CheckScalarReads(const FunctionPtr& group, const PeerGmEffects& effects,
+                                                bool disjoint_gm) const {
+  if (effects.scalar_reads.empty() || effects.writes.empty()) {
+    return;
+  }
+  for (const auto& caller : CallersOf(group->name_)) {
+    state_->roots.at(caller)->CheckScalarReads(group, effects, disjoint_gm);
   }
 }
 

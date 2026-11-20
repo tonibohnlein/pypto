@@ -92,8 +92,11 @@ ExprPtr MakeConstInt(int64_t val, DataType dtype, const Span& span = Span::unkno
 class SyncControlRangeProver::Impl {
  public:
   Impl(const FunctionPtr& function, const SyncParameterBounds& parameters,
-       const std::optional<std::pair<int64_t, int64_t>>& blocks)
-      : function_(function), parameters_(parameters), blocks_(blocks) {
+       const std::optional<std::pair<int64_t, int64_t>>& blocks, ScalarBoundOperands scalar_bound_operands)
+      : function_(function),
+        parameters_(parameters),
+        blocks_(blocks),
+        scalar_bound_operands_(scalar_bound_operands) {
     if (!function || !function->body_) return;
     analyzer_ = std::make_shared<arith::Analyzer>();
     InitParametersAndScopes();
@@ -103,6 +106,18 @@ class SyncControlRangeProver::Impl {
     auto work = work_;
     work.fallback_definitions = fallback_definitions_.load(std::memory_order_relaxed);
     return work;
+  }
+
+  std::optional<std::pair<int64_t, int64_t>> LookupScalarBounds(const Stmt* cut, const Expr* expr) const {
+    const auto site = scalar_bounds_.find(cut);
+    if (site == scalar_bounds_.end() || ambiguous_cuts_.count(cut)) {
+      return std::nullopt;
+    }
+    const auto found = site->second.find(expr);
+    if (found == site->second.end() || !found->second) {
+      return std::nullopt;
+    }
+    return std::pair{static_cast<int64_t>(found->second->lo), static_cast<int64_t>(found->second->hi)};
   }
 
   bool IsPositiveTrip(const ForStmt* loop) const {
@@ -278,6 +293,7 @@ class SyncControlRangeProver::Impl {
   FunctionPtr function_;
   SyncParameterBounds parameters_;
   std::optional<std::pair<int64_t, int64_t>> blocks_;
+  ScalarBoundOperands scalar_bound_operands_;
 
   arith::AnalyzerPtr analyzer_;
   std::unordered_set<const Var*> ready_;
@@ -294,6 +310,7 @@ class SyncControlRangeProver::Impl {
   std::unordered_map<const Stmt*, Cut> cuts_;
   std::unordered_set<const Stmt*> ambiguous_cuts_;
   std::unordered_map<const Stmt*, std::array<RangeResult, 2>> footprint_ranges_;
+  std::unordered_map<const Stmt*, std::unordered_map<const Expr*, std::optional<Bound128>>> scalar_bounds_;
   std::unordered_map<const ForStmt*, LoopProof> loop_proofs_;
   std::unordered_map<const Var*, std::vector<const ForStmt*>> loops_by_var_;
   std::unordered_map<const Var*, size_t> var_def_scope_;
@@ -1059,6 +1076,25 @@ class SyncControlRangeProver::Impl {
     }
   }
 
+  void RecordScalarBounds(const StmtPtr& stmt, const CallPtr& call) {
+    if (!scalar_bound_operands_ || !call) {
+      return;
+    }
+    const auto operands = scalar_bound_operands_(stmt, call);
+    if (operands.empty()) {
+      return;
+    }
+    std::unordered_map<const Expr*, std::optional<Bound128>> cache;
+    auto& bounds = scalar_bounds_[stmt.get()];
+    for (const auto& operand : operands) {
+      auto [entry, fresh] = bounds.try_emplace(operand.get());
+      if (fresh) {
+        entry->second = BoundNonOverflowingScalar(operand, *analyzer_, ready_, cache);
+        ++work_.scalar_bound_queries;
+      }
+    }
+  }
+
   void RecordDef(size_t scope_id, DefRecord def) {
     def.position = clock_++;
     auto& definitions = scopes_[scope_id].defs;
@@ -1125,6 +1161,7 @@ class SyncControlRangeProver::Impl {
       var_def_scope_[assign->var_.get()] = scope_id;
       const auto call = As<Call>(assign->value_);
       RecordFootprintRanges(stmt.get(), call);
+      RecordScalarBounds(stmt, call);
       const auto scalar = As<ScalarType>(assign->var_->GetType());
       if (scalar && scalar->dtype_ == DataType::BOOL && !call) {
         guard_aliases_.emplace(assign->var_.get(), assign->value_);
@@ -1148,7 +1185,9 @@ class SyncControlRangeProver::Impl {
     }
 
     if (const auto evaluate = As<EvalStmt>(stmt)) {
-      RecordFootprintRanges(stmt.get(), As<Call>(evaluate->expr_));
+      const auto call = As<Call>(evaluate->expr_);
+      RecordFootprintRanges(stmt.get(), call);
+      RecordScalarBounds(stmt, call);
       return;
     }
 
@@ -1356,8 +1395,9 @@ class SyncControlRangeProver::Impl {
 
 SyncControlRangeProver::SyncControlRangeProver(const FunctionPtr& function,
                                                const SyncParameterBounds& parameters,
-                                               const std::optional<std::pair<int64_t, int64_t>>& blocks)
-    : impl_(std::make_unique<Impl>(function, parameters, blocks)) {}
+                                               const std::optional<std::pair<int64_t, int64_t>>& blocks,
+                                               ScalarBoundOperands scalar_bound_operands)
+    : impl_(std::make_unique<Impl>(function, parameters, blocks, scalar_bound_operands)) {}
 
 SyncControlRangeProver::~SyncControlRangeProver() = default;
 SyncControlRangeProver::SyncControlRangeProver(SyncControlRangeProver&&) noexcept = default;
@@ -1382,6 +1422,11 @@ bool SyncControlRangeProver::IsPositiveTripCompatible(const ForStmt* loop) const
 std::optional<SymbolicIntRange> SyncControlRangeProver::LookupAtCut(const Stmt* cut,
                                                                     const ExprPtr& expr) const {
   return impl_ ? impl_->LookupAtCut(cut, expr) : std::nullopt;
+}
+
+std::optional<std::pair<int64_t, int64_t>> SyncControlRangeProver::LookupScalarBounds(
+    const Stmt* cut, const Expr* expr) const {
+  return impl_ ? impl_->LookupScalarBounds(cut, expr) : std::nullopt;
 }
 
 }  // namespace pypto::ir::sync

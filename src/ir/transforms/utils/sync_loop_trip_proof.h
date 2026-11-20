@@ -17,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <utility>
+#include <vector>
 
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
@@ -47,6 +48,7 @@ struct SymbolicIntRange {
 struct SyncControlRangeWork {
   size_t indexed_definitions = 0;
   size_t footprint_queries = 0;
+  size_t scalar_bound_queries = 0;
   size_t fallback_definitions = 0;
 };
 
@@ -61,8 +63,11 @@ struct SyncControlRangeWork {
 // - Unbounded formal scalar parameters receive NO synthetic > 0 assumption.
 class SyncControlRangeProver {
  public:
+  using ScalarBoundOperands = std::vector<ExprPtr> (*)(const StmtPtr&, const CallPtr&);
+
   explicit SyncControlRangeProver(const FunctionPtr& function, const SyncParameterBounds& parameters = {},
-                                  const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt);
+                                  const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt,
+                                  ScalarBoundOperands scalar_bound_operands = nullptr);
   ~SyncControlRangeProver();
   SyncControlRangeProver(SyncControlRangeProver&&) noexcept;
   SyncControlRangeProver& operator=(SyncControlRangeProver&&) noexcept;
@@ -81,6 +86,9 @@ class SyncControlRangeProver {
   // Query bounds + affine decomposition of `expr` under the dominating constraints
   // at `cut` (or function-level bounds if `cut == nullptr`).
   std::optional<SymbolicIntRange> LookupAtCut(const Stmt* cut, const ExprPtr& expr) const;
+  // Bounds-only clients select their original scalar operands before the walk.
+  // Reading that index never replays definitions or performs affine extraction.
+  std::optional<std::pair<int64_t, int64_t>> LookupScalarBounds(const Stmt* cut, const Expr* expr) const;
   SyncControlRangeWork Work() const;
 
  private:

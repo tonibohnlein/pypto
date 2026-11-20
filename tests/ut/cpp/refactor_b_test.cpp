@@ -307,7 +307,29 @@ void TestB1RangeUseCuts() {
     assert(in_then && in_then->lo == 0 && in_then->hi == 0);
   }
   assert(prover.Work().footprint_queries == 2 * (kSharedGuardViews + 1));
+  assert(prover.Work().scalar_bound_queries == 0);
   assert(prover.Work().fallback_definitions == 0);
+
+  // The optional bounds-only index stores each selected expression once per
+  // original cut. Sharing the same expression at distinct cuts preserves
+  // local guards, while lookups never replay the shared guard definitions.
+  const auto selected = [](const StmtPtr&, const CallPtr& call) -> std::vector<ExprPtr> {
+    if (!IsOp(call, "buffer.subview")) {
+      return {};
+    }
+    const auto offsets = As<MakeTuple>(call->args_[1]);
+    return {offsets->elements_[0], offsets->elements_[0]};
+  };
+  const SyncControlRangeProver indexed(fn, {}, std::nullopt, selected);
+  assert((indexed.LookupScalarBounds(else_view.get(), iv.get()) == std::pair<int64_t, int64_t>{1, 1}));
+  for (size_t i = 1; i < then_stmts.size(); ++i) {
+    assert((indexed.LookupScalarBounds(then_stmts[i].get(), iv.get()) == std::pair<int64_t, int64_t>{0, 0}));
+  }
+  assert(!indexed.LookupScalarBounds(then_stmts.back().get(), shadow.get()));
+  assert(!indexed.LookupScalarBounds(branch.get(), iv.get()));
+  assert(indexed.Work().scalar_bound_queries == kSharedGuardViews + 1);
+  assert(indexed.Work().indexed_definitions == prover.Work().indexed_definitions);
+  assert(indexed.Work().fallback_definitions == 0);
 
   const auto at_branch = prover.LookupAtCut(branch.get(), iv);
   assert(at_branch && at_branch->lo == 0 && at_branch->hi == 1);
