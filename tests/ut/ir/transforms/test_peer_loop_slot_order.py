@@ -35,16 +35,50 @@ class MatSlotCommands(ClosedCommands):
     def __init__(self, fn, depth, *, drop_releases=False, core=0, workers=1):
         super().__init__(fn, {}, range(8))
         self.env.update({param: 0 for param in fn.params})
-        self.coordinates = {opname("tile.get_block_idx"): core, opname("tile.get_block_num"): workers}
+        self.coordinates = {
+            opname(f"{stage}.{op}"): result
+            for stage in ("tile", "buffer")
+            for op, result in (("get_block_idx", core), ("get_block_num", workers))
+        }
         self.depth = depth
         self.drop_releases = drop_releases
         self.pops = []
         self.readers = []
+        self.all_readers = []
         self.order_checks = []
         self.local_accesses = defaultdict(list)
         self.local_checks = []
         self.gm_writers = {}
         self.gm_checks = []
+        self.buffer_accesses = []
+        self.rings = {}
+        self.borrow_results = set()
+
+    def issue_payload(self, call, pipe):
+        issue = ("issue", len(self.calls))
+        done = ("done", len(self.calls))
+        self.calls.append(call)
+        self.issue(pipe, issue)
+        self.vertices.add(done)
+        self.edge(issue, done)
+        self.edge(self.last_payload.get(pipe), done)
+        self.last_payload[pipe] = done
+        return issue, done
+
+    def record_pop(self, result, issue, done, env):
+        visit = len(self.pops)
+        if visit >= self.depth:
+            self.order_checks.extend((reader, issue) for reader in self.all_readers[visit - self.depth])
+        self.pops.append(done)
+        self.readers.append(None)
+        self.all_readers.append([])
+        env[result] = visit
+        self.borrow_results.add(result)
+
+    def record_read(self, visit, issue, done):
+        self.order_checks.append((self.pops[visit], issue))
+        self.readers[visit] = done
+        self.all_readers[visit].append(done)
 
     def assign(self, statement, env):
         call = statement.value
@@ -54,6 +88,31 @@ class MatSlotCommands(ClosedCommands):
         if name in self.coordinates:
             env[statement.var] = self.coordinates[name]
             return
+        if name == opname("buffer.peer_reserve"):
+            env[statement.var] = (call.kwargs["base"], call.kwargs["size"])
+            return
+        if name == opname("buffer.peer_reserve_addr"):
+            env[statement.var] = env[call.args[0]]
+            return
+        if name == opname("buffer.peer_pop"):
+            base, capacity = env[call.args[0]]
+            stride, local_depth = self.rings[call.kwargs.get("id", 0)]
+            slot = len(self.pops) % local_depth
+            kind = statement.var.type
+            byte_count = kind.shape[0] * kind.shape[1] * kind.dtype.get_byte()
+            assert local_depth == self.depth and byte_count <= stride and local_depth * stride <= capacity
+            self.storage[statement.var] = (
+                kind.memory_space,
+                base + slot * stride,
+                *kind.shape,
+                kind.dtype.get_byte(),
+            )
+            self.layouts[statement.var] = kind
+            issue, done = self.issue_payload(call, ir.PipeType.MTE2)
+            self.record_pop(statement.var, issue, done, env)
+            return
+        if name == opname("buffer.alloc"):
+            return super().assign(statement, env)
         if name in (
             ir.get_op("tile.alloc").name,
             ir.get_op("system.reserve_buffer").name,
@@ -69,14 +128,7 @@ class MatSlotCommands(ClosedCommands):
             ir.get_op("tile.store").name: ir.PipeType.FIX,
             ir.get_op("tile.load").name: ir.PipeType.MTE2,
         }[name]
-        issue = ("issue", len(self.calls))
-        done = ("done", len(self.calls))
-        self.calls.append(call)
-        self.issue(pipe, issue)
-        self.vertices.add(done)
-        self.edge(issue, done)
-        self.edge(self.last_payload.get(pipe), done)
-        self.last_payload[pipe] = done
+        issue, done = self.issue_payload(call, pipe)
         # All Left, Right and Acc accesses in this fixture use complete tiles.
         # Compare physical addresses even if different SSA names reuse a tile.
         for operand, write in [(arg, False) for arg in call.args] + [(statement.var, True)]:
@@ -106,25 +158,25 @@ class MatSlotCommands(ClosedCommands):
                 self.gm_checks.append((self.gm_writers[offsets], issue))
             self.gm_writers[offsets] = done
         if name == ir.get_op("tile.tpop_from_aiv").name:
-            visit = len(self.pops)
-            if visit >= self.depth:
-                self.order_checks.append((self.readers[visit - self.depth], issue))
-            self.pops.append(done)
-            self.readers.append(None)
-            env[statement.var] = visit
+            self.record_pop(statement.var, issue, done, env)
         elif name == ir.get_op("tile.move").name and call.args[0] in env and env[call.args[0]] is not None:
-            visit = env[call.args[0]]
-            self.order_checks.append((self.pops[visit], issue))
-            self.readers[visit] = done
+            self.record_read(env[call.args[0]], issue, done)
             env[statement.var] = None
         else:
             env[statement.var] = None
 
     def evaluate(self, statement, env):
         call = statement.expr
+        if call.op.name == opname("system.aic_initialize_pipe"):
+            depth = call.kwargs["slot_num"]
+            self.rings[call.kwargs.get("id", 0)] = (
+                call.kwargs["slot_size"],
+                call.kwargs.get("local_slot_num", depth),
+            )
+            return
         if call.op.name in (
             ir.get_op("system.tfree_to_aiv").name,
-            ir.get_op("system.aic_initialize_pipe").name,
+            opname("buffer.peer_free"),
         ):
             return
         if self.drop_releases and call.op.name in (
@@ -137,6 +189,20 @@ class MatSlotCommands(ClosedCommands):
             ):
                 return
         return super().evaluate(statement, env)
+
+    def payload(self, call, env):
+        pipe, reads, writes, _, _ = self.memory_footprint(call, env) or self.compute_footprint(call, env)
+        issue, done = self.issue_payload(call, pipe)
+        for argument in set(call.args):
+            if argument in self.borrow_results:
+                self.record_read(env[argument], issue, done)
+        for previous_pipe, previous_reads, previous_writes, previous_done in self.buffer_accesses:
+            cells = (previous_writes & (reads | writes)) | (previous_reads & writes)
+            if any(space == "gm" for space, _ in cells):
+                self.gm_checks.append((previous_done, issue))
+            if previous_pipe != pipe and any(space != "gm" for space, _ in cells):
+                self.local_checks.append((previous_done, issue))
+        self.buffer_accesses.append((pipe, reads, writes, done))
 
 
 @pytest.mark.ptoas_compile
@@ -173,7 +239,7 @@ def test_last_reader_reaches_epilogue(tmp_path, trips, per_trip, two_readers):
     count = trips * per_trip + 2
     assert len(state.readers) == len(state.pops) == count
     assert all(reader is not None for reader in state.readers)
-    assert len(state.order_checks) == count * (1 + two_readers) + max(0, count - 2)
+    assert len(state.order_checks) == (count + max(0, count - 2)) * (1 + two_readers)
     assert all(edge in order for edge in state.order_checks)
     if trips == 3 and per_trip == 2:
         mutant = MatSlotCommands(snapshots[0], 2, drop_releases=True)
@@ -279,10 +345,23 @@ class PeerSenderCommands(ClosedCommands):
 
     def __init__(self, fn, subblock, *, core=0, workers=1):
         super().__init__(fn, {}, range(8))
+        pipe = ir.PipeType.FIX if fn.func_type == ir.FunctionType.AIC else ir.PipeType.MTE3
+        self.push_pipes = {**type(self).push_pipes, opname("buffer.peer_push"): pipe}
+        self.payload_pipes = {
+            **type(self).payload_pipes,
+            **self.push_pipes,
+            opname("buffer.load"): ir.PipeType.MTE2,
+            opname("buffer.copy"): ir.PipeType.MTE1,
+            opname("buffer.matmul"): ir.PipeType.M,
+        }
         self.coordinates = {
-            opname("tile.get_subblock_idx"): subblock,
-            opname("tile.get_block_idx"): core,
-            opname("tile.get_block_num"): workers,
+            opname(f"{stage}.{op}"): result
+            for stage in ("tile", "buffer")
+            for op, result in (
+                ("get_subblock_idx", subblock),
+                ("get_block_idx", core),
+                ("get_block_num", workers),
+            )
         }
 
     def assign(self, statement, env):
@@ -292,7 +371,14 @@ class PeerSenderCommands(ClosedCommands):
             if name in self.coordinates:
                 env[statement.var] = self.coordinates[name]
                 return
-            if name in (opname("tile.alloc"), opname("tile.create"), opname("system.import_peer_buffer")):
+            if name in (
+                opname("tile.alloc"),
+                opname("tile.create"),
+                opname("system.import_peer_buffer"),
+                opname("buffer.alloc"),
+                opname("buffer.peer_reserve"),
+                opname("buffer.peer_reserve_addr"),
+            ):
                 return
             if name in self.payload_pipes:
                 self.payload(call, env)
@@ -303,6 +389,7 @@ class PeerSenderCommands(ClosedCommands):
         if statement.expr.op.name in (
             opname("system.aic_initialize_pipe"),
             opname("system.aiv_initialize_pipe"),
+            opname("buffer.set_validshape"),
         ):
             return
         super().evaluate(statement, env)

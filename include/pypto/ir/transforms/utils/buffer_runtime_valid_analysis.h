@@ -54,8 +54,11 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     CallPtr call;
     std::string message;
   };
-  explicit BufferRuntimeValidAnalysis(const FunctionPtr& function, bool collect_guards = false)
-      : analyzer_(std::make_shared<arith::Analyzer>()), collect_guards_(collect_guards) {
+  explicit BufferRuntimeValidAnalysis(const FunctionPtr& function, bool collect_guards = false,
+                                      bool check_payload_capacity = false)
+      : analyzer_(std::make_shared<arith::Analyzer>()),
+        collect_guards_(collect_guards),
+        check_payload_capacity_(check_payload_capacity) {
     if (function) {
       core_ = function->func_type_;
       BindBufferAccTrimParameters(function, *analyzer_, ready_);
@@ -106,6 +109,11 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
         }
         states_[statement->var_.get()] = std::move(state);
       }
+    } else if (call && type && IsOp(call, "buffer.peer_pop") && call->args_.size() == 2) {
+      const auto valid = As<MakeTuple>(call->args_[1]);
+      if (valid && valid->elements_.size() == 2) {
+        states_[statement->var_.get()] = State{epoch_, {valid->elements_[0], valid->elements_[1]}};
+      }
     } else if (call && type && type->shape_.size() == 2 && type->shape_[0] == 1 &&
                type->valid_shape_[1] == -1 && IsOp(call, "buffer.subview") && call->args_.size() == 3) {
       // A view's valid tuple belongs to the view itself, even if the parent
@@ -130,7 +138,12 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
         analyzer_->const_int_bound.Update(statement->var_, *range);
       }
     }
-    if (call) CheckCall(call);
+    if (call) {
+      if (check_payload_capacity_ && type && IsOp(call, "buffer.alloc") && call->args_.size() >= 1) {
+        CheckCapacity(call, type, As<MakeTuple>(call->args_[0]), /*dynamic_only=*/true);
+      }
+      CheckCall(call);
+    }
   }
   void VisitStmt_(const EvalStmtPtr& statement) override {
     if (const auto call = As<Call>(statement->expr_)) CheckCall(call);
@@ -259,6 +272,32 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
   void Refuse(const CallPtr& call, const std::string& message) {
     if (!issue_) issue_ = Issue{call, message};
   }
+  void CheckCapacity(const CallPtr& call, const BufferTypePtr& type, const MakeTuplePtr& extents,
+                     bool dynamic_only = false) {
+    if (!type || !extents || issue_) {
+      return;
+    }
+    size_t operand = 0;
+    for (size_t axis = 0; axis < type->shape_.size(); ++axis) {
+      if (dynamic_only && type->valid_shape_[axis] >= 0) {
+        continue;
+      }
+      if (operand >= extents->elements_.size()) {
+        return;  // Arity belongs to the Buffer operation's schema.
+      }
+      const auto& extent = extents->elements_[operand++];
+      if (const auto literal = As<ConstInt>(extent)) {
+        if (literal->value_ < 0 || literal->value_ > type->shape_[axis]) {
+          Refuse(call, "Buffer valid extent exceeds its physical capacity");
+        }
+        continue;
+      }
+      const auto bound = Bounds(extent);
+      if (!bound || bound->min_value <= 0 || bound->max_value > type->shape_[axis]) {
+        Refuse(call, "Buffer runtime valid extent has no positive in-capacity bound");
+      }
+    }
+  }
   void CheckCall(const CallPtr& call) {
     const bool load = IsOp(call, "buffer.load");
     if ((load || IsOp(call, "buffer.store")) && call->args_.size() == 4) {
@@ -335,6 +374,9 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
       const auto handle = AsVarLike(call->args_[0]);
       immutable_rank_one_extents_.erase(handle.get());
       const auto values = As<MakeTuple>(call->args_[1]);
+      if (check_payload_capacity_) {
+        CheckCapacity(call, As<BufferType>(call->args_[0]->GetType()), values);
+      }
       if (handle && owners_.count(handle.get()) && values && values->elements_.size() == 2) {
         states_[handle.get()] = {epoch_, {values->elements_[0], values->elements_[1]}};
       } else {
@@ -346,9 +388,17 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     }
     if (IsOp(call, "buffer.fillpad") && call->args_.size() == 2) {
       const auto type = As<BufferType>(call->args_[0]->GetType());
+      const auto target = As<BufferType>(call->args_[1]->GetType());
       const auto extents = Extents(call->args_[0]);
-      if (!type || !extents || !Equal((*extents)[1], Constant(type->shape_[1], call->span_)) ||
-          !AtomicInteger((*extents)[0]) || !analyzer_->CanProveGreaterEqual((*extents)[0], 1)) {
+      if (type && target && target->pad_ == PadValue::min && extents) {
+        for (size_t axis = 0; axis < 2; ++axis) {
+          const auto bounded = Bounds((*extents)[axis]);
+          if (!bounded || bounded->min_value < 1 || bounded->max_value > type->shape_[axis]) {
+            Refuse(call, "Minimum FillPad requires positive source extents within physical capacity");
+          }
+        }
+      } else if (!type || !extents || !Equal((*extents)[1], Constant(type->shape_[1], call->span_)) ||
+                 !AtomicInteger((*extents)[0]) || !analyzer_->CanProveGreaterEqual((*extents)[0], 1)) {
         Refuse(call, "FillPad requires a positive source row guard and fixed full columns");
       }
       return;
@@ -434,6 +484,7 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
   std::unordered_map<const Var*, std::array<ExprPtr, 2>> immutable_rank_one_extents_;
   std::optional<Issue> issue_;
   bool collect_guards_;
+  bool check_payload_capacity_;
   // The same immutable statement/call can be reused. Every occurrence must
   // have the witness before a pointer-keyed rewrite or emission can use it.
   std::unordered_map<const IfStmt*, bool> redundant_guards_;

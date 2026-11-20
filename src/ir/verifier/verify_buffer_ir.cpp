@@ -40,6 +40,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/buffer_ir_selection.h"
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
+#include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/type_metadata.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/expression_use_cache.h"
@@ -77,6 +78,12 @@ class BufferIRVisitor : public IRVisitor {
     VisitValues(function->params_);
     CheckAttrs(function->attrs_, "Function attribute");
     if (function->body_) VisitStmt(function->body_);
+    if (has_peer_transport_ && !malformed_structure_) {
+      const auto issue = cross_core_pipe::VerifyBufferPeerTransport(function);
+      if (!issue.empty()) {
+        Error(issue, function->span_);
+      }
+    }
   }
 
   void VisitStmt(const StmtPtr& stmt) override {
@@ -150,6 +157,27 @@ class BufferIRVisitor : public IRVisitor {
           window.bytes = *bytes * static_cast<uint64_t>(multi->slot_count_);
         }
       }
+    } else if (IsOp(call, "buffer.peer_reserve") && valid_calls_.count(call.get())) {
+      const auto base = call->GetKwarg<int>("base", cross_core_pipe::kAutoBufferBase);
+      reserve_handles_.insert(op->var_.get());
+      allocations_[op->var_.get()] = Allocation{
+          base < 0, base < 0 ? nullptr : std::make_shared<ConstInt>(base, DataType::INT64, call->span_)};
+    } else if (IsOp(call, "buffer.peer_pop") && valid_calls_.count(call.get())) {
+      const auto reserve = AsVarLike(call->args_[0]);
+      if (reserve_handles_.count(reserve.get())) {
+        RegisterWindow(op->var_, reserve.get(), 0);
+        const auto found = windows_.find(op->var_.get());
+        if (found == windows_.end()) {
+          Error("Peer FIFO borrow requires representable physical payload bytes", call->span_);
+          return;
+        }
+        auto& window = found->second;
+        // Every dynamic execution captures one slot. Until a cursor occurrence
+        // is available, only use the reserve's enclosure to prove disjointness.
+        window.known_offset = false;
+        window.bytes = static_cast<uint64_t>(As<BufferType>(reserve->GetType())->shape_[0]);
+        window.borrow = op->var_.get();
+      }
     } else if (call && valid_calls_.count(call.get()) &&
                (IsOp(call, "buffer.subview") || IsOp(call, "buffer.reshape"))) {
       const auto source = AsVarLike(call->args_[0]);
@@ -201,6 +229,8 @@ class BufferIRVisitor : public IRVisitor {
         // recreating it would hide malformed result types from the verifier.
         registry.ValidateBufferCall(op);
         valid_calls_.insert(op.get());
+        has_peer_transport_ |= cross_core_pipe::IsBufferPeerTransport(op);
+        CheckPeerOperands(op);
         if (const auto* recipe = backend::FindBufferElementwiseRecipe(name)) CheckRecipeWindows(op, *recipe);
         if (IsOp(op, "buffer.read") || IsOp(op, "buffer.write")) {
           // GetValue/SetValue flatten with the descriptor's column count. A
@@ -409,7 +439,36 @@ class BufferIRVisitor : public IRVisitor {
     uint64_t bytes;
     uint64_t row_pitch;
     bool known_offset;
+    const Var* borrow = nullptr;
   };
+
+  void CheckPeerOperands(const CallPtr& call) {
+    const bool pop = IsOp(call, "buffer.peer_pop");
+    const bool address = IsOp(call, "buffer.peer_reserve_addr");
+    const bool release = IsOp(call, "buffer.peer_free");
+    for (size_t i = 0; i < call->args_.size(); ++i) {
+      const auto& arg = call->args_[i];
+      const auto variable = AsVarLike(arg);
+      if (i == 0 && (pop || address)) {
+        if (!reserve_handles_.count(variable.get())) {
+          Error("Peer FIFO operand requires a dominating buffer.peer_reserve declaration", call->span_);
+        }
+      } else if (reserve_handles_.count(variable.get())) {
+        Error("A peer reserve may only supply an initializer address or a receive borrow", call->span_);
+      }
+      const auto window = windows_.find(variable.get());
+      const auto* borrow = window == windows_.end() ? nullptr : window->second.borrow;
+      if (release && i == 0 && (!borrow || borrow != variable.get())) {
+        Error("Peer FIFO release requires the original pop result", call->span_);
+      }
+      if (borrow && released_borrows_.count(borrow)) {
+        Error("Peer FIFO borrow is used after release", call->span_);
+      }
+      if (release && borrow) {
+        released_borrows_.insert(borrow);
+      }
+    }
+  }
 
   std::optional<uint64_t> PhysicalBytes(const BufferTypePtr& type) {
     const auto [entry, inserted] = byte_sizes_.try_emplace(type.get(), std::nullopt);
@@ -438,7 +497,9 @@ class BufferIRVisitor : public IRVisitor {
         source_window.offset + static_cast<uint64_t>(row->value_) * pitch +
             static_cast<uint64_t>(col->value_) * element,
         static_cast<uint64_t>(view->shape_[0] - 1) * pitch + static_cast<uint64_t>(view->shape_[1]) * element,
-        pitch, true};
+        pitch,
+        true,
+        source_window.borrow};
   }
 
   void RegisterWindow(const VarPtr& variable, const Var* root, uint64_t offset,
@@ -452,7 +513,8 @@ class BufferIRVisitor : public IRVisitor {
       // runtime-offset view. Keep its conservative bounds through relabels.
       const bool known_offset = !source_window || source_window->known_offset;
       const auto extent = known_offset ? *bytes : source_window->bytes;
-      windows_[variable.get()] = Window{root, offset, extent, pitch, known_offset};
+      windows_[variable.get()] =
+          Window{root, offset, extent, pitch, known_offset, source_window ? source_window->borrow : nullptr};
     }
   }
 
@@ -712,6 +774,9 @@ class BufferIRVisitor : public IRVisitor {
   std::unordered_map<const Expr*, ConstIntPtr> constants_;
   std::unordered_map<const BufferType*, std::optional<uint64_t>> byte_sizes_;
   std::unordered_set<const Call*> valid_calls_;
+  std::unordered_set<const Var*> reserve_handles_;
+  std::unordered_set<const Var*> released_borrows_;
+  bool has_peer_transport_ = false;
   const Call* statement_call_ = nullptr;
   bool statement_assigns_result_ = false;
   std::string attribute_context_;

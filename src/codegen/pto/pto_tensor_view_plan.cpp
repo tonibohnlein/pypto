@@ -75,8 +75,12 @@ TensorParameterView PrepareTensorParameterView(const ir::VarPtr& parameter, cons
 
 }  // namespace
 
+bool IsGMPipeWorkspaceParameter(const ir::VarPtr& parameter) {
+  return parameter->name_hint_ == "__gm_pipe_buffer";
+}
+
 std::vector<TensorParameterView> PrepareTensorParameterViews(
-    const ir::Function& func, bool buffer_ir, const std::set<const ir::Var*>& ffts_workspaces) {
+    const ir::Function& func, const std::set<const ir::Var*>& ffts_workspaces) {
   ir::var_collectors::VarDefUseCollector body_vars;
   if (func.body_) body_vars.VisitStmt(func.body_);
 
@@ -86,8 +90,7 @@ std::vector<TensorParameterView> PrepareTensorParameterViews(
     if (!type || body_vars.var_uses.count(parameter.get()) == 0) continue;
     // Outlining shares a public signature across cores. Unused parameters need
     // no view, and PTOAS cannot infer some unused layouts (e.g. MX).
-    if ((!buffer_ir && parameter->name_hint_ == "__gm_pipe_buffer") ||
-        ffts_workspaces.count(parameter.get())) {
+    if (IsGMPipeWorkspaceParameter(parameter) || ffts_workspaces.count(parameter.get())) {
       continue;
     }
     views.push_back(PrepareTensorParameterView(parameter, type));

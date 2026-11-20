@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -36,6 +37,8 @@
 #include "pypto/backend/common/buffer_transpose_recipe.h"
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
+#include "pypto/codegen/gm_pipe_layout_evidence.h"
+#include "pypto/core/error.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -54,12 +57,16 @@
 #include "pypto/ir/transforms/utils/buffer_acc_trim_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_active_domain_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_indexed_analysis.h"
+#include "pypto/ir/transforms/utils/buffer_ir_selection.h"
 #include "pypto/ir/transforms/utils/buffer_scalar_staging.h"
 #include "pypto/ir/transforms/utils/buffer_tuple_results.h"
 #include "pypto/ir/transforms/utils/buffer_valid_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_view_analysis.h"
+#include "pypto/ir/transforms/utils/compact_sync_analysis.h"
+#include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/loop_step_qualification.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/slot_index_qualification.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
@@ -75,14 +82,17 @@ namespace {
 // is interpreted as an unsupported capability: malformed selected IR must fail.
 class BufferKernelSupport : public IRVisitor {
  public:
-  explicit BufferKernelSupport(const FunctionPtr& function, const BufferAccTrimAnalysis& acc_trims)
+  explicit BufferKernelSupport(const FunctionPtr& function, const BufferAccTrimAnalysis& acc_trims,
+                               const std::vector<int>& positive_formals)
       : acc_trims_(acc_trims),
         core_(function->func_type_),
         body_(function->body_),
+        lane_returns_(cross_core_pipe::TerminalPeerLaneReturns(function)),
         return_types_(function->return_types_),
         views_(function->body_),
         indexed_(function->body_),
         tuples_(function->body_) {
+    step_proof_.BindCallerParameters(function, positive_formals);
     for (size_t i = 0; i < function->params_.size(); ++i) {
       const auto& param = function->params_[i];
       if (As<TensorType>(param->GetType())) {
@@ -97,6 +107,9 @@ class BufferKernelSupport : public IRVisitor {
   bool has_fill = false;
   bool has_store = false;
   bool has_scalar_write = false;
+  bool has_peer_setup = false;
+  bool has_peer_payload = false;
+  std::vector<int> required_positive_formals;
 
   static bool ConstantEquals(const ExprPtr& value, int64_t expected) {
     const auto constant = As<ConstInt>(value);
@@ -143,11 +156,13 @@ class BufferKernelSupport : public IRVisitor {
       }
       if (space && backend::IsMatrixBufferSpace(*space)) {
         const auto box = tile_view_semantics::GetBoxedTileAlignment(view, tile->dtype_);
+        const bool full_valid = view.valid_shape.empty() || SameShape(view.valid_shape, tile->shape_);
         admission.Require(
             backend::IsMatrixBufferDtype(*space, tile->dtype_) && box &&
                 (view.fractal == (*space == MemorySpace::Acc ? 1024 : 512)) &&
                 (view.blayout == TileLayout::row_major || view.blayout == TileLayout::col_major) &&
-                view.pad == PadValue::null && view.compact == CompactMode::null && view.stride.empty(),
+                backend::SupportsMatrixBufferPadding(*space, tile->dtype_, view.pad, full_valid) &&
+                view.compact == CompactMode::null && view.stride.empty(),
             BufferAdmissionProperty::TypeLayout);
         if (box)
           admission.Require(As<ConstInt>(tile->shape_[0])->value_ % box->rows == 0 && cols % box->cols == 0,
@@ -159,13 +174,13 @@ class BufferKernelSupport : public IRVisitor {
                                     ConstantEquals(view.stride[1], rows)),
             BufferAdmissionProperty::TypeLayout);
       } else {
-        const bool zero_pad = backend::IsFullZeroPaddedVec(tile, view);
+        const bool padded = backend::IsFullPaddedVec(tile, view);
         const auto* context = PassContext::Current();
         // Pad mode belongs to a native tile object. Only placed plans can
         // declare independent metadata objects for reused padded storage.
-        admission.Require(!zero_pad || !context || context->GetMemoryPlanner() != MemoryPlanner::PtoAS,
+        admission.Require(!padded || !context || context->GetMemoryPlanner() != MemoryPlanner::PtoAS,
                           BufferAdmissionProperty::TypeLayout);
-        admission.Require((zero_pad || backend::IsDenseVecBufferTile(tile, view)) &&
+        admission.Require((padded || backend::IsDenseVecBufferTile(tile, view)) &&
                               cols % (256 / tile->dtype_.GetBit()) == 0,
                           BufferAdmissionProperty::TypeLayout);
         admission.Require(view.stride.empty() ||
@@ -242,7 +257,13 @@ class BufferKernelSupport : public IRVisitor {
       return;
     }
     const auto physical_result = assigned_slot_types_.find(expr.get());
-    CheckType(physical_result == assigned_slot_types_.end() ? expr->GetType() : physical_result->second);
+    // The authored operations carry legacy UnknownType; assignments and
+    // actual operands still go through ordinary type admission.
+    const auto call = As<Call>(expr);
+    if (!op_predicates::IsInitializePipe(call) && !op_predicates::IsTPush(call) &&
+        !op_predicates::IsTPop(call) && !op_predicates::IsTFree(call)) {
+      CheckType(physical_result == assigned_slot_types_.end() ? expr->GetType() : physical_result->second);
+    }
     if (const auto var = AsVarLike(expr)) {
       if (As<TupleType>(var->GetType())) {
         admission.Require(false, BufferAdmissionProperty::ExpressionForm);
@@ -432,7 +453,8 @@ class BufferKernelSupport : public IRVisitor {
     // Buffer lowering erases store-result and plain GM aliases. Its codegen ABI
     // requires the resulting parameter type to match the declared result,
     // including TensorView metadata introduced by earlier frontend passes.
-    if (region_ || ret->value_.size() != return_types_.size()) {
+    if ((region_ && ret != lane_returns_.first && ret != lane_returns_.second) ||
+        ret->value_.size() != return_types_.size()) {
       admission.Require(false, BufferAdmissionProperty::OperationRecipe);
       return;
     }
@@ -502,6 +524,9 @@ class BufferKernelSupport : public IRVisitor {
     // a numerical trip count. In particular get_block_num is positive by its
     // operation contract. Unknown signed scalar steps remain unqualified.
     admission.Require(step_proof_.IsPositive(loop->step_), BufferAdmissionProperty::LoopStep);
+    if (const auto formal = step_proof_.CallerParameter(loop->step_)) {
+      required_positive_formals.push_back(*formal);
+    }
     loop_slots_.emplace_back();
     CheckLoop(loop);
     loop_slots_.pop_back();
@@ -539,7 +564,18 @@ class BufferKernelSupport : public IRVisitor {
       admission.Require(false, BufferAdmissionProperty::OperationRecipe);
       return;
     }
-    if (IsOp(call, "tile.load")) {
+    if (cross_core_pipe::IsPeerPipeSetup(call)) {
+      has_peer_setup = true;
+      if (IsOp(call, "system.reserve_buffer") || IsOp(call, "system.import_peer_buffer")) {
+        admission.Require(scalar_definition_ == call.get(), BufferAdmissionProperty::PeerTransport);
+      }
+    } else if (op_predicates::IsTPush(call) || op_predicates::IsTPop(call) || op_predicates::IsTFree(call)) {
+      has_peer_payload = true;
+      admission.Require(
+          call->GetKwarg<int>("split", op_predicates::IsTPop(call) ? kSplitNone : -1) == kSplitNone &&
+              !call->HasKwarg("lane_stride"),
+          BufferAdmissionProperty::PeerTransport);
+    } else if (IsOp(call, "tile.load")) {
       has_load = true;
       const auto tile = As<TileType>(call->GetType());
       admission.Require(!tile || tile_view_semantics::GetEffectiveTileView(*tile).pad == PadValue::null,
@@ -636,6 +672,13 @@ class BufferKernelSupport : public IRVisitor {
                IsOp(call, "tile.get_subblock_idx")) {
       admission.Require(call->args_.empty() && call->kwargs_.empty(),
                         BufferAdmissionProperty::OperationRecipe);
+    } else if (IsOp(call, "tensor.read")) {
+      const auto scalar = As<ScalarType>(call->GetType());
+      admission.Require(core_ == FunctionType::AIC && scalar_definition_ == call.get() &&
+                            backend::SupportsBufferGMRead(call->args_) && call->kwargs_.empty() && scalar &&
+                            scalar->dtype_ == As<TensorType>(call->args_[0]->GetType())->dtype_,
+                        BufferAdmissionProperty::OperationRecipe);
+      if (admission.supported()) CheckTransferParameter(call, 0, /*load=*/true);
     } else if (IsOp(call, "tile.read") || IsOp(call, "tile.write")) {
       const auto* context = PassContext::Current();
       const bool scalar_target =
@@ -1108,6 +1151,7 @@ class BufferKernelSupport : public IRVisitor {
   const BufferAccTrimAnalysis& acc_trims_;
   FunctionType core_;
   StmtPtr body_;
+  std::pair<ReturnStmtPtr, ReturnStmtPtr> lane_returns_;
   std::optional<std::map<VarPtr, TypePtr>> accumulator_plan_;
 
   VarPtr StableAlias(const ExprPtr& value) {
@@ -1202,7 +1246,27 @@ class BufferKernelSupport : public IRVisitor {
   const Call* scalar_definition_ = nullptr;
 };
 
-FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper) {
+bool SupportsDelegatedPeerTransport(const FunctionPtr& function) {
+  const auto* context = PassContext::Current();
+  if (context && context->GetMemoryPlanner() == MemoryPlanner::PtoAS) {
+    return false;
+  }
+  const auto transport = cross_core_pipe::AnalyzePeerTransportEffects(function);
+  if (!transport.unavailable.empty() || transport.sites.empty()) {
+    return false;
+  }
+  // Full boxes and empty Vec lanes have the same transport encoding before
+  // and after conversion. Partial logical variants can request a separate
+  // native transport box and metadata rebind and require their own recipe.
+  return std::all_of(transport.sites.begin(), transport.sites.end(), [](const auto& site) {
+    const auto& type = site.descriptor;
+    return type->valid_shape_ == type->shape_ || (type->memory_space_ == MemorySpace::Vec &&
+                                                  type->valid_shape_[0] == 0 && type->valid_shape_[1] == 0);
+  });
+}
+
+FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper,
+                                 const sync::SyncParameterBounds* invocation_bounds) {
   if (!IsInCoreType(original->func_type_) || original->ir_stage_ == FunctionIRStage::Buffer ||
       original->HasAttr(kAttrBufferIrSelected)) {
     return original;
@@ -1224,7 +1288,20 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper
   }
   const BufferAccTrimAnalysis acc_trims(function,
                                         !context || context->GetMemoryPlanner() != MemoryPlanner::PtoAS);
-  BufferKernelSupport support(function, acc_trims);
+  std::vector<int> positive_formals;
+  if (invocation_bounds) {
+    for (const auto& [index, range] : *invocation_bounds) {
+      if (index >= function->params_.size() || index > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+          range.first <= 0) {
+        continue;
+      }
+      const auto scalar = As<ScalarType>(function->params_[index]->GetType());
+      if (scalar && (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt())) {
+        positive_formals.push_back(static_cast<int>(index));
+      }
+    }
+  }
+  BufferKernelSupport support(function, acc_trims, positive_formals);
   auto function_context = support.admission.At(function.get());
   support.admission.Require(!device_helper, BufferAdmissionProperty::DeviceHelper);
   support.admission.Require(!context || context->GetEnableBufferIR(), BufferAdmissionProperty::Disabled);
@@ -1261,10 +1338,23 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper
                                                   : function.get());
     support.admission.Require(valid.supported(), BufferAdmissionProperty::DynamicValidRecipe);
   }
-  support.admission.Require(
-      (support.has_load || support.has_fill || support.has_scalar_write) && support.has_store,
-      BufferAdmissionProperty::KernelShape);
+  if (support.has_peer_setup || support.has_peer_payload) {
+    if (support.admission.supported()) {
+      support.admission.Require(SupportsDelegatedPeerTransport(function),
+                                BufferAdmissionProperty::PeerTransport);
+    }
+  } else {
+    support.admission.Require(
+        (support.has_load || support.has_fill || support.has_scalar_write) && support.has_store,
+        BufferAdmissionProperty::KernelShape);
+  }
   auto selected = std::make_shared<Function>(support.admission.supported() ? *function : *original);
+  auto& step_formals = support.required_positive_formals;
+  if (support.admission.supported() && !step_formals.empty()) {
+    std::sort(step_formals.begin(), step_formals.end());
+    step_formals.erase(std::unique(step_formals.begin(), step_formals.end()), step_formals.end());
+    selected->attrs_.emplace_back(kAttrBufferPositiveStepParameters, std::move(step_formals));
+  }
   selected->attrs_.emplace_back(kAttrBufferIrSelected, support.admission.supported());
   support.admission.AppendTo(*selected);
   return selected;
@@ -1275,10 +1365,19 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper
 class DeviceHelperCollector : public IRVisitor {
  public:
   std::unordered_set<std::string> callees;
+  std::unordered_set<std::string> imported_peers;
+  bool has_peer = false;
 
  protected:
   void VisitVarLike_(const VarPtr&) override {}
-  void VisitExpr_(const CallPtr& call) override { Collect(call); }
+  void VisitExpr_(const CallPtr& call) override {
+    has_peer |= cross_core_pipe::IsPeerPipeSetup(call) || op_predicates::IsTPush(call) ||
+                op_predicates::IsTPop(call) || op_predicates::IsTFree(call);
+    if (IsOp(call, "system.import_peer_buffer")) {
+      imported_peers.insert(call->GetKwarg<std::string>("peer_func", ""));
+    }
+    Collect(call);
+  }
   void VisitExpr_(const SubmitPtr& submit) override {
     Collect(submit);
     for (const auto& dep : submit->deps_) VisitExpr(dep);
@@ -1292,15 +1391,139 @@ class DeviceHelperCollector : public IRVisitor {
   }
 };
 
+using Selection = std::map<std::string, FunctionPtr>;
+
+void RefuseCompilationMember(const FunctionPtr& original, Selection& selected) {
+  auto& candidate = selected.at(original->name_);
+  if (candidate->ir_stage_ == FunctionIRStage::Buffer || !IsBufferIRSelected(candidate)) {
+    return;
+  }
+  auto delegated = std::make_shared<Function>(*original);
+  BufferAdmission admission;
+  auto context = admission.At(original.get());
+  admission.Require(false, BufferAdmissionProperty::PeerCompilationUnit);
+  delegated->attrs_.emplace_back(kAttrBufferIrSelected, false);
+  admission.AppendTo(*delegated);
+  candidate = delegated;
+}
+
+void QualifyPeerCompilationUnits(const ProgramPtr& program,
+                                 const std::map<std::string, DeviceHelperCollector>& inventories,
+                                 Selection& selected) {
+  std::map<std::string, std::vector<std::string>> peers;
+  std::unordered_set<std::string> refused;
+  codegen::gm_pipe::LayoutEvidence workspace(program);
+  const auto link = [&](const std::string& a, const std::string& b) {
+    peers[a].push_back(b);
+    peers[b].push_back(a);
+  };
+  const auto uses_buffer = [](const FunctionPtr& candidate) {
+    return candidate->ir_stage_ == FunctionIRStage::Buffer || IsBufferIRSelected(candidate);
+  };
+  for (const auto& [name, inventory] : inventories) {
+    const auto original = program->GetFunction(name);
+    if (original->func_type_ == FunctionType::Group) {
+      const bool peer_unit =
+          std::any_of(inventory.callees.begin(), inventory.callees.end(), [&](const auto& member) {
+            const auto found = inventories.find(member);
+            return found != inventories.end() && found->second.has_peer;
+          });
+      if (!peer_unit) {
+        continue;
+      }
+      for (const auto& member : inventory.callees) {
+        const auto entry = selected.find(member);
+        if (entry != selected.end() && IsInCoreType(entry->second->func_type_)) {
+          link(name, member);
+          if (!uses_buffer(entry->second)) {
+            refused.insert(member);
+          }
+        }
+      }
+      try {
+        if (!workspace.BindRoot(original)) {
+          refused.insert(name);
+        }
+      } catch (const pypto::ValueError&) {
+        // Workspace inference is optional evidence for this selection. The
+        // original delegated path retains its existing diagnostics and ABI.
+        refused.insert(name);
+      }
+    } else if (inventory.has_peer) {
+      if (!uses_buffer(selected.at(name))) {
+        refused.insert(name);
+      }
+      for (const auto& peer : inventory.imported_peers) {
+        const auto entry = selected.find(peer);
+        if (entry != selected.end() && IsInCoreType(entry->second->func_type_)) {
+          link(name, peer);
+          if (!uses_buffer(entry->second)) {
+            refused.insert(peer);
+          }
+        } else {
+          refused.insert(name);
+        }
+      }
+    }
+  }
+  std::vector<std::string> work(refused.begin(), refused.end());
+  while (!work.empty()) {
+    const auto name = work.back();
+    work.pop_back();
+    const auto original = program->GetFunction(name);
+    if (IsInCoreType(original->func_type_)) {
+      RefuseCompilationMember(original, selected);
+    }
+    for (const auto& peer : peers[name]) {
+      if (refused.insert(peer).second) {
+        work.push_back(peer);
+      }
+    }
+  }
+}
+
 ProgramPtr SelectBufferFunctions(const ProgramPtr& program) {
-  DeviceHelperCollector helpers;
+  std::map<std::string, DeviceHelperCollector> inventories;
+  std::unordered_set<std::string> helpers;
+  bool has_peer = false;
   for (const auto& [global, function] : program->functions_) {
-    if (IsInCoreType(function->func_type_)) helpers.VisitStmt(function->body_);
+    const bool device = IsInCoreType(function->func_type_);
+    if (!device && function->func_type_ != FunctionType::Group) {
+      continue;
+    }
+    auto& inventory = inventories[function->name_];
+    inventory.VisitStmt(function->body_);
+    has_peer |= inventory.has_peer;
+    if (device) {
+      helpers.insert(inventory.callees.begin(), inventory.callees.end());
+    }
+  }
+  Selection selected;
+  std::optional<sync::SyncInvocationEvidence> invocation;
+  for (const auto& [global, function] : program->functions_) {
+    const bool device_helper = helpers.count(function->name_) != 0;
+    auto candidate = SelectBufferFunction(function, device_helper, nullptr);
+    if (candidate->GetAttr<std::string>(kAttrBufferAdmissionProperty, "") ==
+        BufferAdmissionPropertyName(BufferAdmissionProperty::LoopStep)) {
+      // A plain local proof covers ordinary loops. Compute all caller bounds
+      // once only when a real admission reaches a step it cannot prove.
+      if (!invocation) {
+        invocation.emplace(sync::CollectSyncInvocationEvidence(program));
+      }
+      const auto bounds = invocation->parameters.find(function->name_);
+      if (bounds != invocation->parameters.end()) {
+        candidate = SelectBufferFunction(function, device_helper, &bounds->second);
+      }
+    }
+    selected.emplace(function->name_, std::move(candidate));
+  }
+  if (has_peer) {
+    QualifyPeerCompilationUnits(program, inventories, selected);
   }
   std::vector<FunctionPtr> functions;
   functions.reserve(program->functions_.size());
   for (const auto& [global, function] : program->functions_) {
-    functions.push_back(SelectBufferFunction(function, helpers.callees.count(function->name_) != 0));
+    functions.push_back(selected.at(function->name_));
   }
   return std::make_shared<Program>(functions, program->name_, program->span_);
 }

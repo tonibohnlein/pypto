@@ -51,6 +51,7 @@ class BufferSyncImplementation {
   // Only a selected blocking scalar instruction may publish its SSA result
   // after the protected payload cut. NoAccess or Value alone proves readiness.
   bool ProducesReadyScalar() const { return produces_ready_scalar_; }
+  bool RequiresReadOnlyGM() const { return requires_read_only_gm_; }
   std::vector<sync::IsaResourceClaim> Claims() const;
   const std::vector<BufferSyncImplicitEffect>& ImplicitEffects() const { return implicit_effects_; }
 
@@ -65,6 +66,7 @@ class BufferSyncImplementation {
   std::string target_;
   bool accumulator_size_eligible_ = false;
   bool produces_ready_scalar_ = false;
+  bool requires_read_only_gm_ = false;
   bool mat_to_operand_extract_ = false;
   bool acc_to_mat_insert_ = false;
   bool vec_fillpad_non_byte_ = false;
@@ -105,7 +107,7 @@ class BufferSyncOperation {
 
  private:
   friend BufferSyncOperation QualifyBufferSyncOperation(const ir::CallPtr&, ir::FunctionType,
-                                                        const std::string&);
+                                                        const std::string&, bool);
   friend std::optional<BufferSyncOperation> QualifyBufferSyncNonPayload(const ir::CallPtr&,
                                                                         const std::string&);
   BufferSyncOperation(ir::CallPtr operation, std::optional<BufferSyncImplementation> implementation,
@@ -126,7 +128,8 @@ class BufferSyncOperation {
 // refuse; malformed IR/registration errors propagate. Allocations and views are
 // not payloads and retain their existing result/alias/metadata interpretation.
 BufferSyncOperation QualifyBufferSyncOperation(const ir::CallPtr& call, ir::FunctionType core,
-                                               const std::string& target);
+                                               const std::string& target,
+                                               bool verify_readonly_gm_in_unit = false);
 
 // Placement evidence is separate from selected instruction semantics. A supplied
 // half-open hull must enclose every admitted address of this operand; absence

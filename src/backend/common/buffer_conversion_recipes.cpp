@@ -126,14 +126,16 @@ const char* OperandError(const BufferConversionRecipe& recipe, const std::vector
     constexpr int64_t kMaxStrideBlocks = 255;
     constexpr uint64_t kVecCapacityBytes = 192 * 1024;
     const auto bytes = PhysicalBufferBytes(dst);
-    return IsAlignedDenseVecBufferGeometry(src) && IsFullZeroPaddedVec(dst) && src->shape_ == dst->shape_ &&
+    const bool min_pad = dst && dst->pad_ == ir::PadValue::min;
+    return IsAlignedDenseVecBufferGeometry(src) && IsFullPaddedVec(dst) && src->shape_ == dst->shape_ &&
                    src->dtype_ == dst->dtype_ &&
-                   (src->valid_shape_[1] == src->shape_[1] || src->valid_shape_[1] == -1) &&
+                   (src->valid_shape_[1] == src->shape_[1] || src->valid_shape_[1] == -1 ||
+                    (min_pad && src->valid_shape_[1] > 0 && src->valid_shape_[1] < src->shape_[1])) &&
                    src->shape_[0] <= kMaxRowRepeat &&
                    src->shape_[1] <= kMaxStrideBlocks * 32 / src->dtype_.GetByte() && bytes &&
                    *bytes <= kVecCapacityBytes
                ? nullptr
-               : "requires aligned equal-shaped Vec buffers, full source columns and a full zero-padded "
+               : "requires aligned equal-shaped Vec buffers, qualified source columns and a full padded "
                  "destination";
   }
   const bool has_runtime_shape =
@@ -226,7 +228,7 @@ bool Attributes(const BufferConversionRecipe& recipe,
     if (kwargs.empty()) return true;
     const auto pad = std::any_cast<ir::PadValue>(&kwargs.front().second);
     return logical && kwargs.size() == 1 && kwargs.front().first == "pad_value" && pad &&
-           *pad == ir::PadValue::zero;
+           (*pad == ir::PadValue::zero || *pad == ir::PadValue::min);
   }
   int mode = 0;
   int saturation = 0;
@@ -269,13 +271,18 @@ bool SupportsLogicalBufferConversion(const BufferConversionRecipe& recipe, const
     if (!tile || tile->shape_.size() != 2) return false;
     const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
     const auto& valid = view.valid_shape.empty() ? tile->shape_ : view.valid_shape;
-    if (valid.size() != 2 || !ir::structural_equal(valid[1], tile->shape_[1]) ||
-        (!ir::AsVarLike(valid[0]) && !ir::As<ir::ConstInt>(valid[0])))
-      return false;
-    return OperandError(
-               recipe,
-               {PhysicalLogicalVecDescriptor(tile), StaticLogicalBufferDescriptor(call->GetType(), true)},
-               {}) == nullptr;
+    if (valid.size() != 2) return false;
+    const auto target = StaticLogicalBufferDescriptor(call->GetType(), true);
+    const auto pad = call->GetKwarg<ir::PadValue>("pad_value", ir::PadValue::zero);
+    if (!target || target->pad_ != pad) return false;
+    if (pad == ir::PadValue::min) {
+      // A positive, in-capacity prefix qualifies the native copy and both
+      // tails. The existing empty-source legalization materializes zero.
+      return OperandError(recipe, {StaticLogicalBufferDescriptor(tile), target}, {}) == nullptr;
+    }
+    return ir::structural_equal(valid[1], tile->shape_[1]) &&
+           (ir::AsVarLike(valid[0]) || ir::As<ir::ConstInt>(valid[0])) &&
+           OperandError(recipe, {PhysicalLogicalVecDescriptor(tile), target}, {}) == nullptr;
   }
   const bool permit_zero_pad = recipe.kind == K::Cast;
   std::vector<ir::BufferTypePtr> types;

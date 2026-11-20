@@ -190,8 +190,9 @@ const char* OperandError(const BufferAxisRecipe& recipe, const std::vector<ir::B
     } else if (!type || type->shape_.size() != 2 || type->dtype_ != DataType::FP32 ||
                type->memory_space_ != ir::MemorySpace::Vec || type->blayout_ != ir::TileLayout::row_major ||
                type->slayout_ != ir::TileLayout::none_box || type->fractal_ != 512 ||
-               type->pad_ != ir::PadValue::null || type->compact_ != ir::CompactMode::null ||
-               type->shape_[1] % 8 != 0) {
+               (type->pad_ != ir::PadValue::null &&
+                !((i == 0 || (!recipe.reduction && i == 2)) && IsFullPaddedVec(type))) ||
+               type->compact_ != ir::CompactMode::null || type->shape_[1] % 8 != 0) {
       return "requires aligned rank-2 row-major Vec FP32 operands";
     }
     const bool supports_dynamic =
@@ -355,8 +356,8 @@ bool SupportsLogicalBufferAxis(const BufferAxisRecipe& recipe, const ir::CallPtr
     return A2A3ColumnBroadcastEncodingError(dst->dtype_, dst->shape_[0], dst->shape_[1], dst->shape_[0],
                                             /*native_valid_cols=*/-1, dst->shape_[1]) == nullptr;
   } else {
-    for (const auto& arg : call->args_) types.push_back(StaticLogicalBufferDescriptor(arg->GetType()));
-    types.push_back(StaticLogicalBufferDescriptor(call->GetType()));
+    for (const auto& arg : call->args_) types.push_back(StaticLogicalBufferDescriptor(arg->GetType(), true));
+    types.push_back(StaticLogicalBufferDescriptor(call->GetType(), true));
     if (OperandError(recipe, types) == nullptr) {
       // Whole-function Buffer admission is A2/A3-only. Ordinary Functional
       // allocations use mutable native validity and may safely run in count mode.

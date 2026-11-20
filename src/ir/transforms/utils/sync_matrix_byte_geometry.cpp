@@ -23,6 +23,7 @@
 #include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/buffer_sync_contract.h"
+#include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/transforms/pass_context.h"
 
@@ -63,7 +64,7 @@ ByteLayout QualifyByteLayout(const SyncStorage& storage) {
   CHECK(storage.slot_count == 1 && alignment && storage.address >= 0 &&
         static_cast<uint64_t>(storage.address) % alignment == 0 && type && storage.rows > 0 &&
         storage.columns > 0 && type->valid_shape_ == type->shape_ && type->compact_ == CompactMode::null &&
-        type->pad_ == PadValue::null)
+        backend::SupportsMatrixBufferPadding(storage.space, type->dtype_, type->pad_, true))
       << "Overlapping placed buffers need an aligned, fully valid single-slot partition";
   CHECK(type->blayout_ == TileLayout::col_major || type->blayout_ == TileLayout::row_major)
       << "Overlapping placed buffers have an unsupported outer layout";

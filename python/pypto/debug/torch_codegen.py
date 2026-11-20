@@ -690,12 +690,24 @@ def _buffer_write(buffer, data):
 def _buffer_active(buffer):
     return _buffer_read(buffer, buffer._pypto_valid_shape)
 
+def _buffer_peer_send(buffer, valid):
+    payload = _buffer_read(buffer, valid)
+    payload._pypto_full_shape = tuple(buffer.shape)
+    return _buffer_set_valid(payload, valid)
+
+def _buffer_peer_receive(payload, buffer, valid):
+    # Reference queues already snapshot the sent data. Materialize its local
+    # descriptor for ordinary Buffer operations, including boxed Mat storage.
+    _buffer_write(buffer, _buffer_read(payload, valid))
+    return _buffer_set_valid(buffer, valid)
+
 def _buffer_copy(source, destination):
     _buffer_write(destination, _buffer_active(source))
 
-def _buffer_fillpad(source, destination):
-    destination.zero_()
-    _buffer_copy(source, destination)
+def _buffer_fillpad(source, destination, pad_mode):
+    live = _buffer_active(source).clone()
+    destination.fill_(_pad_scalar(destination, pad_mode))
+    _buffer_write(destination, live)
 
 def _buffer_gather(source, indices, destination):
     index = _buffer_active(indices).to(torch.int64)
@@ -1193,6 +1205,8 @@ _CROSS_CORE_SPLIT_OPS = {
     _ir.get_op("tile.tpush_to_aic").name,
     _ir.get_op("tile.tpop_from_aic").name,
     _ir.get_op("tile.tpop_from_aiv").name,
+    _ir.get_op("buffer.peer_push").name,
+    _ir.get_op("buffer.peer_pop").name,
 }
 
 
@@ -1484,6 +1498,7 @@ def _register_ops() -> None:  # noqa: PLR0915
     m["tensor.full"] = _handle_full
     m["tensor.slice"] = _handle_slice
     m["tensor.read"] = lambda a, _kw: f"{a[0]}[{a[1]}]"
+    m["buffer.gm_read"] = m["tensor.read"]
     m["tensor.write"] = lambda a, _kw: f"_write_and_return({a[0]}, {a[1]}, {a[2]})"
 
     # --- Tile-only ops ---
@@ -1596,7 +1611,6 @@ def _register_ops() -> None:  # noqa: PLR0915
     )
     m["buffer.gather"] = lambda a, _kw: f"_buffer_gather({a[0]}, {a[1]}, {a[3]})"
     m["buffer.scatter"] = lambda a, _kw: f"_buffer_scatter({a[0]}, {a[1]}, {a[2]})"
-    m["buffer.fillpad"] = lambda a, _kw: f"_buffer_fillpad({a[0]}, {a[1]})"
     m["buffer.cast"] = lambda a, kw: (
         f"_buffer_write({a[1]}, _cast_tensor(_buffer_active({a[0]}), {a[1]}.dtype, {int(kw.get('mode', 0))}))"
     )
@@ -1794,6 +1808,7 @@ class TorchCodegen(_ir.IRVisitor):
         if backend_type is not None:
             handler = _backend.get_backend_instance(backend_type).get_handler()
             self._hardware_c2v_split = handler.splits_cube_to_vector_transport_in_hardware()
+        self._function_type = _ir.FunctionType.InCore
 
     # -- helpers --
 
@@ -1936,6 +1951,7 @@ class TorchCodegen(_ir.IRVisitor):
                 self._emit(f"{name} = {param_name}.shape[{axis}]")
 
     def visit_function(self, func: _ir.Function) -> None:
+        self._function_type = func.func_type
         for param in func.params:
             _validate_reference_type(param.type)
         for result_type in func.return_types:
@@ -2071,6 +2087,35 @@ class TorchCodegen(_ir.IRVisitor):
             f"{descriptor.slayout == _ir.TileLayout.row_major}, {descriptor.fractal}"
         )
 
+    def _visit_buffer_peer_call(self, op: _ir.Call, args: list[str], kwargs: dict[str, Any]) -> bool:
+        op_name = op.op.name
+        cube = self._function_type == _ir.FunctionType.AIC
+        if op_name == _ir.get_op("buffer.peer_push").name:
+            handler = _handle_tpush_to_aiv if cube else _handle_tpush_to_aic
+            self._expr_result = handler([f"_buffer_peer_send({args[0]}, {args[1]})"], kwargs)
+        elif op_name == _ir.get_op("buffer.peer_pop").name:
+            handler = _handle_tpop_from_aiv if cube else _handle_tpop_from_aic
+            descriptor = self._buffer_descriptor(op)
+            if cube:
+                buffer = (
+                    f"_matrix_alloc({{}}, {descriptor.memory_space.value}, None, "
+                    f"{self._matrix_descriptor_args(descriptor)})"
+                )
+            else:
+                buffer = (
+                    f"torch.empty({tuple(descriptor.shape)!r}, dtype={_torch_buffer_dtype(descriptor.dtype)})"
+                )
+            self._expr_result = f"_buffer_peer_receive({handler([], kwargs)}, {buffer}, {args[1]})"
+        elif op_name in (
+            _ir.get_op("buffer.peer_reserve").name,
+            _ir.get_op("buffer.peer_reserve_addr").name,
+            _ir.get_op("buffer.peer_free").name,
+        ):
+            self._expr_result = "None"
+        else:
+            return False
+        return True
+
     def _visit_buffer_call(self, op: _ir.Call, arg_strs: list[str]) -> bool:
         op_name = op.op.name
         if op_name == _ir.get_op("buffer.alloc").name:
@@ -2104,6 +2149,11 @@ class TorchCodegen(_ir.IRVisitor):
                 self._expr_result = (
                     f"_matrix_reshape({arg_strs[0]}, {self._matrix_descriptor_args(descriptor)})"
                 )
+        elif op_name == _ir.get_op("buffer.fillpad").name:
+            descriptor = op.args[1].type
+            assert isinstance(descriptor, _ir.BufferType)
+            mode = "min" if descriptor.pad == _ir.PadValue.min else "zero"
+            self._expr_result = f"_buffer_fillpad({arg_strs[0]}, {arg_strs[1]}, {mode!r})"
         else:
             return False
         return True
@@ -2129,7 +2179,7 @@ class TorchCodegen(_ir.IRVisitor):
         arg_strs = [self._visit_expr_str(a) for a in op.args]
         kw = dict(op.kwargs) if op.kwargs else {}
 
-        if self._visit_buffer_call(op, arg_strs):
+        if self._visit_buffer_call(op, arg_strs) or self._visit_buffer_peer_call(op, arg_strs, kw):
             return
         if op_name == _ir.get_op("tensor.view").name:
             if len(arg_strs) >= 4:

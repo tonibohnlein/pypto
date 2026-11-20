@@ -110,5 +110,71 @@ def test_selection_and_emission_share_machine_step_qualification(kind, accepted)
                 codegen.PTOCodegen().generate(placed, emit_tile_addr=True)
 
 
+@pytest.mark.parametrize("caller,accepted", [("same", True), ("unrelated", False), ("second", False)])
+def test_effective_spmd_launch_proves_only_its_stride(caller, accepted):
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
+        manager = PassManager(OptimizationStrategy.Default)
+        boundary = manager.get_pass_names().index("SelectBufferIRFunctions")
+        program = _control_flow_program("for", step="step")
+        for transform in manager.passes[:boundary]:
+            program = transform(program)
+        kernel = _kernel(program)
+        span = kernel.span
+
+        def formals(prefix):
+            return [ir.Var(f"{prefix}{i}", p.type, span) for i, p in enumerate(kernel.params)]
+
+        def call(name, arguments, attrs=None):
+            result_type = ir.TupleType(kernel.return_types)
+            return ir.EvalStmt(
+                ir.Call(ir.GlobalVar(name), arguments, {}, attrs or {}, result_type, span), span
+            )
+
+        worker_args = formals("wrapper_arg")
+        wrapper = ir.Function(
+            "launch",
+            worker_args,
+            kernel.return_types,
+            call("kernel", worker_args),
+            span,
+            ir.FunctionType.Spmd,
+        )
+        outer_args = formals("outer_arg")
+        count_type = ir.ScalarType(DataType.INT32)
+        count = ir.Var("count", count_type, span)
+        get_capacity = ir.Call(ir.get_op("system.available_cluster_count"), [], count_type, span)
+        count_assignment = ir.AssignStmt(count, get_capacity, span)
+        stride_index = next(i for i, param in enumerate(kernel.params) if param.name_hint.startswith("step"))
+        other_index = next(i for i, param in enumerate(kernel.params) if param.name_hint.startswith("count"))
+        # Another positive scalar reaches the kernel but does not supply any step.
+        invocation_args = list(outer_args)
+        invocation_args[other_index] = ir.ConstInt(4, DataType.INT64, span)
+        invocation_args[stride_index] = (
+            ir.Cast(count, DataType.INT64, span)
+            if caller != "unrelated"
+            else ir.Cast(get_capacity, DataType.INT64, span)
+        )
+        # Share the same typed SSA value between sizing and forwarding.
+        launch_size = ir.Var("launch_size", invocation_args[stride_index].type, span)
+        statements = [
+            count_assignment,
+            ir.AssignStmt(launch_size, ir.Cast(count, DataType.INT64, span), span),
+        ]
+        if caller != "unrelated":
+            invocation_args[stride_index] = launch_size
+        statements.append(call("launch", invocation_args, {"core_num": launch_size}))
+        if caller == "second":
+            statements.append(call("launch", outer_args, {"core_num": launch_size}))
+        outer = ir.Function(
+            "main", outer_args, [], ir.SeqStmts(statements, span), span, ir.FunctionType.Orchestration
+        )
+        selected = passes.select_buffer_ir_functions()(
+            ir.Program([kernel, wrapper, outer], "CallerStep", span)
+        )
+    actual = _kernel(selected)
+    assert actual.attrs["buffer_ir_selected"] is accepted
+    assert actual.attrs.get("buffer_positive_step_parameters", []) == ([stride_index] if accepted else [])
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

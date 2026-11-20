@@ -30,7 +30,10 @@
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/core_affinity.h"
+#include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
@@ -117,6 +120,15 @@ void ValidateSlot(const std::vector<ExprPtr>& args, const TypePtr& result_type) 
   }
   // Dynamic range is an execution precondition, not established by the type.
   // Consumers requiring a proof (including autosync) must qualify it separately.
+}
+
+void ValidatePeerTile(const ExprPtr& arg) {
+  CHECK(AsVarLike(arg)) << "Peer Buffer transfer requires an SSA handle";
+  const auto type = As<BufferType>(arg->GetType());
+  CHECK(type && type->shape_.size() == 2 &&
+        (type->memory_space_ == MemorySpace::Acc || type->memory_space_ == MemorySpace::Mat ||
+         type->memory_space_ == MemorySpace::Vec))
+      << "Peer Buffer transfer requires a rank-2 Vec, Mat or Acc payload";
 }
 
 TypePtr DeduceSetValidShape(const std::vector<ExprPtr>& args) {
@@ -305,6 +317,141 @@ REGISTER_OP("buffer.set_validshape")
       return DeduceSetValidShape(args);
     });
 
+// A typed declaration of the same allocation emitted as pto.reserve_buffer.
+// The address operation below supplies its native i32 SSA operand to the
+// authored pipe initializer without creating a second storage object.
+REGISTER_OP("buffer.peer_reserve")
+    .set_description("Declare the byte storage backing a local peer FIFO")
+    .set_op_category("BufferOp")
+    .set_ir_stage(OpIRStage::Buffer)
+    .set_internal_only()
+    .no_argument()
+    .set_attr<std::string>("name")
+    .set_attr<int>("size")
+    .set_attr<int>("base")
+    .set_output_arity(1)
+    .set_buffer_result_behavior(BufferResultBehavior::Allocate)
+    .f_validate_explicit_type([](const std::vector<ExprPtr>& args,
+                                 const std::vector<std::pair<std::string, std::any>>& kwargs,
+                                 const TypePtr& result) {
+      const auto type = As<BufferType>(result);
+      const auto bytes = GetIntKwarg(kwargs, "size", 0);
+      CHECK(args.empty() && cross_core_pipe::IsPeerReserveDescriptor(type) && bytes == type->shape_[0] &&
+            GetIntKwarg(kwargs, "base", cross_core_pipe::kAutoBufferBase) >= -1 &&
+            !GetKwargOr<std::string>(kwargs, "name", "").empty())
+          << "buffer.peer_reserve requires a named byte descriptor matching its native reservation";
+    });
+
+REGISTER_OP("buffer.peer_reserve_addr")
+    .set_description("Expose a local peer reserve as the native initializer's i32 handle")
+    .set_op_category("BufferOp")
+    .set_ir_stage(OpIRStage::Buffer)
+    .set_internal_only()
+    .add_argument("reserve", "Local peer receive storage")
+    .set_output_arity(1)
+    .set_buffer_arg_effect(0, BufferAccess::None, BufferAccess::Read)
+    .set_buffer_result_behavior(BufferResultBehavior::Value)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>&) {
+      CHECK(args.size() == 1 && AsVarLike(args[0]) &&
+            cross_core_pipe::IsPeerReserveDescriptor(As<BufferType>(args[0]->GetType())))
+          << "buffer.peer_reserve_addr requires a peer reserve handle";
+      return std::make_shared<ScalarType>(DataType::INT32);
+    });
+
+REGISTER_OP("buffer.peer_pop")
+    .set_description("Advance a peer receive FIFO and borrow the captured local slot")
+    .set_op_category("BufferOp")
+    .set_ir_stage(OpIRStage::Buffer)
+    .set_internal_only()
+    .set_cross_core_role(core_affinity::CrossCoreRole::TPop)
+    .add_argument("reserve", "Backing reserve of the selected receive pipe")
+    .add_argument("valid", "Logical valid row and column extents on this receive")
+    .set_attr<int>("id")
+    .set_attr<int>("split")
+    .set_output_arity(1)
+    .set_buffer_arg_effect(0, BufferAccess::Write, BufferAccess::Read)
+    .set_buffer_non_memory_arg(1)
+    .set_buffer_result_behavior(BufferResultBehavior::Borrow, 0)
+    .f_validate_explicit_type([](const std::vector<ExprPtr>& args,
+                                 const std::vector<std::pair<std::string, std::any>>& kwargs,
+                                 const TypePtr& result) {
+      CHECK(args.size() == 2 && AsVarLike(args[0]) && args[1])
+          << "buffer.peer_pop requires an explicit reserve and valid extents";
+      const auto reserve = As<BufferType>(args[0]->GetType());
+      const auto type = As<BufferType>(result);
+      const auto valid = As<MakeTuple>(args[1]);
+      CHECK(cross_core_pipe::IsPeerReserveDescriptor(reserve) && type && type->shape_.size() == 2 &&
+            type->memory_space_ == reserve->memory_space_ && valid && valid->elements_.size() == 2 &&
+            GetIntKwarg(kwargs, "id", 0) >= 0 && GetIntKwarg(kwargs, "split", 0) == kSplitNone)
+          << "buffer.peer_pop requires a no-split receive into the reserve's memory space";
+      CHECK(type->memory_space_ == MemorySpace::Vec ||
+            backend::SupportsMatrixBufferPadding(type->memory_space_, type->dtype_, type->pad_,
+                                                 type->shape_ == type->valid_shape_))
+          << "buffer.peer_pop requires qualified padding on the full Mat receive descriptor";
+      for (size_t axis = 0; axis < type->shape_.size(); ++axis) {
+        const auto& extent = valid->elements_[axis];
+        CheckValidExtent(extent, type->shape_[axis], axis, "buffer.peer_pop");
+        const auto constant = As<ConstInt>(extent);
+        CHECK(type->valid_shape_[axis] < 0 || (constant && constant->value_ == type->valid_shape_[axis]))
+            << "buffer.peer_pop valid operands must agree with the result descriptor";
+      }
+    });
+
+REGISTER_OP("buffer.peer_push")
+    .set_description("Send a Buffer payload using the authored peer FIFO")
+    .set_op_category("BufferOp")
+    .set_ir_stage(OpIRStage::Buffer)
+    .set_internal_only()
+    .set_cross_core_role(core_affinity::CrossCoreRole::TPush)
+    .add_argument("payload", "Placed tile read by the native push")
+    .add_argument("valid", "Logical valid row and column extents on this send")
+    .set_attr<int>("id")
+    .set_attr<int>("split")
+    .set_output_arity(0)
+    .set_buffer_arg_effect(0, BufferAccess::Read, BufferAccess::Read)
+    .set_buffer_non_memory_arg(1)
+    .set_buffer_result_behavior(BufferResultBehavior::None)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      CHECK(args.size() == 2 && GetIntKwarg(kwargs, "id", 0) >= 0 &&
+            GetIntKwarg(kwargs, "split", 0) == kSplitNone)
+          << "buffer.peer_push requires one no-split payload";
+      ValidatePeerTile(args[0]);
+      const auto type = As<BufferType>(args[0]->GetType());
+      const auto valid = As<MakeTuple>(args[1]);
+      CHECK(valid && valid->elements_.size() == 2) << "buffer.peer_push needs native valid extents";
+      for (size_t axis = 0; axis < type->shape_.size(); ++axis) {
+        const auto& extent = valid->elements_[axis];
+        CheckValidExtent(extent, type->shape_[axis], axis, "buffer.peer_push");
+        const auto constant = As<ConstInt>(extent);
+        CHECK(type->valid_shape_[axis] < 0 || (constant && constant->value_ == type->valid_shape_[axis]))
+            << "buffer.peer_push valid operands must agree with its payload descriptor";
+      }
+      return std::make_shared<VoidType>();
+    });
+
+REGISTER_OP("buffer.peer_free")
+    .set_description("End the lexical lifetime of a peer receive borrow")
+    .set_op_category("BufferOp")
+    .set_ir_stage(OpIRStage::Buffer)
+    .set_internal_only()
+    .set_cross_core_role(core_affinity::CrossCoreRole::TFree)
+    .add_argument("borrow", "The original peer pop result")
+    .set_attr<int>("id")
+    .set_attr<int>("split")
+    .set_output_arity(0)
+    .set_buffer_arg_effect(0, BufferAccess::None, BufferAccess::Read)
+    .set_buffer_result_behavior(BufferResultBehavior::None)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      CHECK(args.size() == 1 && GetIntKwarg(kwargs, "id", 0) >= 0 &&
+            GetIntKwarg(kwargs, "split", -1) == kSplitNone)
+          << "buffer.peer_free requires the original no-split pop result";
+      ValidatePeerTile(args[0]);
+      return std::make_shared<VoidType>();
+    });
+
 // Transfers expose their complete GM window and do not change valid metadata.
 // Dynamic extents must match the buffer's current metadata at execution time;
 // bounds not statically provable remain lowering/runtime preconditions. Like
@@ -367,6 +514,24 @@ REGISTER_OP("buffer.store")
                                              source->dtype_, destination->dtype_))
           << "buffer.store atomic Add requires FP32 Acc to FP32 GM";
       return result;
+    });
+
+REGISTER_OP("buffer.gm_read")
+    .set_description("Read one scalar from a packed GM tensor through its base pointer")
+    .set_op_category("BufferOp")
+    .set_ir_stage(OpIRStage::Buffer)
+    .set_internal_only()
+    .add_argument("src", "Source GM tensor")
+    .add_argument("indices", "Signed coordinate tuple")
+    .set_output_arity(1)
+    .set_buffer_arg_effect(0, BufferAccess::Read, BufferAccess::Read)
+    .set_buffer_non_memory_arg(1)
+    .set_buffer_result_behavior(BufferResultBehavior::Value)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      CHECK(kwargs.empty() && backend::SupportsBufferGMRead(args))
+          << "buffer.gm_read requires packed rank-one or rank-two GM and a signed coordinate tuple";
+      return std::make_shared<ScalarType>(As<TensorType>(args[0]->GetType())->dtype_);
     });
 
 // These are real synchronous scalar payloads, not descriptor queries. Their

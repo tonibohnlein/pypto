@@ -83,11 +83,11 @@ class PeerScalarRead:
 """)
 
 
-def _context(disjoint: bool) -> passes.PassContext:
+def _context(disjoint: bool, instruments=(), enable_buffer_ir=True) -> passes.PassContext:
     return passes.PassContext(
-        [],
+        list(instruments),
         memory_planner=passes.MemoryPlanner.PYPTO,
-        enable_buffer_ir=True,
+        enable_buffer_ir=enable_buffer_ir,
         enable_pypto_autosync=True,
         autosync_policy="conservative_prefix",
         autosync_disjoint_gm=disjoint,
@@ -137,9 +137,16 @@ def test_original_peer_scalar_load_delegates_without_qualification(options, disj
     ],
 )
 def test_owned_peer_scalar_read_emits_original_native_load(tmp_path, options, disjoint):
+    stages = []
+
+    def capture(transform, current):
+        if transform.get_name() == "RealizeSync":
+            stages.extend(current.get_function(name).ir_stage for name in ("cube", "vector"))
+
     config = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
-    with _context(disjoint):
+    with _context(disjoint, [passes.CallbackInstrument(before_pass=capture)]):
         ir.compile(_program(**options), **config.compile_kwargs())
+    assert stages == [ir.FunctionIRStage.Buffer, ir.FunctionIRStage.Buffer]
 
     manifest = json.loads((tmp_path / "ptoas" / "paired.sync.json").read_text())
     assert manifest["owned"] and not manifest["ptoas_insert_sync"], manifest
@@ -154,3 +161,21 @@ def test_owned_peer_scalar_read_emits_original_native_load(tmp_path, options, di
     body = native[cube.end() :].split("\n}", 1)[0]
     assert re.search(rf"= \(?{re.escape(cube[1])}\)?\[[^\]\n]+\];", body), body
     assert "dcci(" not in body and "PTOAS__DCCI" not in body
+
+
+def test_realize_sync_keeps_placed_functional_peer_compatibility():
+    placed = []
+
+    def capture(transform, current):
+        if transform.get_name() == "RealizeSync":
+            placed.append(current)
+
+    instrument = passes.CallbackInstrument(before_pass=capture)
+    with _context(False, [instrument], enable_buffer_ir=False):
+        PassManager(ir.OptimizationStrategy.Default).run_passes(_program())
+    with _context(False):
+        owned = passes.realize_sync()(placed[0])
+    for name in ("cube", "vector"):
+        endpoint = owned.get_function(name)
+        assert endpoint.ir_stage == ir.FunctionIRStage.Functional
+        assert endpoint.attrs[PYPTO_AUTOSYNC_ATTR], endpoint.attrs

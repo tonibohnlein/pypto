@@ -42,9 +42,13 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/transforms/utils/l0c_footprint.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
+#include "src/ir/transforms/utils/sync_footprint_resolver.h"
 #include "src/ir/transforms/utils/sync_loop_trip_proof.h"
+#include "src/ir/transforms/utils/sync_scalar_readiness.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -162,7 +166,8 @@ bool SameExtents(const std::vector<ExprPtr>& a, const std::vector<ExprPtr>& b) {
 }
 
 bool IsSubblockQuery(const CallPtr& call) {
-  return IsOp(call, "tile.get_subblock_idx") && call->args_.empty() && call->kwargs_.empty();
+  return (IsOp(call, "tile.get_subblock_idx") || IsOp(call, "buffer.get_subblock_idx")) &&
+         call->args_.empty() && call->kwargs_.empty();
 }
 
 void Flatten(const StmtPtr& statement, std::vector<StmtPtr>& into) {
@@ -214,8 +219,13 @@ std::vector<std::vector<StmtPtr>> LaneStatements(const FunctionPtr& function) {
 class LaneImporter {
  public:
   LaneImporter(const FunctionPtr& function, const PeerTransportEffects& transport, const std::string& target,
-               const SyncParameterBounds& parameters, PeerGmEffects& gm, const SyncControlRangeProver& ranges)
-      : transport_(transport), backend_(*backend::BackendConfig::GetBackend()), gm_(gm), ranges_(ranges) {
+               const SyncParameterBounds& parameters, PeerGmEffects& gm, const SyncControlRangeProver& ranges,
+               const SyncFootprintResolver* footprint)
+      : transport_(transport),
+        backend_(*backend::BackendConfig::GetBackend()),
+        gm_(gm),
+        ranges_(ranges),
+        footprint_(footprint) {
     result_.input.owner = function;
     result_.input.hardware_target = target;
     result_.input.segments.emplace_back();
@@ -259,6 +269,7 @@ class LaneImporter {
         }
       } else if (As<TensorType>(parameter->GetType())) {
         gm_roots_.emplace(parameter.get(), formal);
+        ready_.insert(parameter.get());
       } else {
         CHECK_SPAN(false, parameter->span_) << "Unqualified peer endpoint parameter type";
       }
@@ -286,6 +297,7 @@ class LaneImporter {
   MemoryAllocatorPolicyPtr placement_;
   PeerGmEffects& gm_;
   const SyncControlRangeProver& ranges_;
+  const SyncFootprintResolver* footprint_;
   PeerLocalLane result_;
   std::unordered_map<const Stmt*, const PeerTransportSite*> sites_;
   std::unordered_set<const Call*> initializers_, payload_calls_;
@@ -369,7 +381,7 @@ class LaneImporter {
     return entry->second;
   }
 
-  void Access(SyncSite& site, const TileWindow& window, bool write) {
+  void Access(SyncSite& site, const TileWindow& window, bool write, bool exact = false) {
     if (window.begin == window.end) return;
     if (window.pop) {
       const auto id = window.pop->pipe_id;
@@ -389,8 +401,13 @@ class LaneImporter {
         domain.slot_bytes = ring.slot_bytes;
         storage.push_back(std::move(domain));
       }
-      SyncAccess access{it->second, write, 0, 0, 0, 0, 1, window.end - window.begin, false, false};
-      access.slot_first = (births_.at(window.pop) - 1) % ring.local_slots;
+      const auto slot = (births_.at(window.pop) - 1) % ring.local_slots;
+      const auto origin = *ring.placed_base + slot * ring.slot_bytes;
+      CHECK(window.begin >= origin && window.end <= origin + ring.slot_bytes)
+          << "Peer local footprint escapes its captured slot";
+      SyncAccess access{it->second, write, 0, window.begin - origin, 0, 0, 1, window.end - window.begin,
+                        false,      exact};
+      access.slot_first = slot;
       const auto repeated = pops_per_visit_.find(id);
       access.slot_step = repeated == pops_per_visit_.end() ? 0 : repeated->second % ring.local_slots;
       if (access.slot_step) access.slot_coordinate_frame = result_.input.segments.back().original_loop;
@@ -398,7 +415,7 @@ class LaneImporter {
       return;
     }
     site.accesses.push_back({Storage(window.space, window.end), write, 0, window.begin, 0, 0, 1,
-                             window.end - window.begin, false, false});
+                             window.end - window.begin, false, exact});
   }
 
   void GmAccess(SyncSite& site, const StmtPtr& statement, const ExprPtr& value, bool write) {
@@ -564,6 +581,130 @@ class LaneImporter {
     result_.input.segments.back().sites.push_back(std::move(site));
   }
 
+  void CheckOrdinaryPlacement(const TileWindow& window, const Span& span) const {
+    const auto capacity = backend_.GetHandler()->GetCapacityBytes(window.space);
+    CHECK_SPAN(
+        window.begin >= 0 && window.begin < window.end && static_cast<uint64_t>(window.end) <= capacity, span)
+        << "Ordinary Buffer footprint has no bounded physical placement";
+    if (const auto found = reserves_.find(window.space); found != reserves_.end()) {
+      const auto next = found->second.lower_bound(window.end);
+      CHECK_SPAN(next == found->second.begin() || std::prev(next)->second <= window.begin, span)
+          << "Ordinary Buffer footprint intersects a live receive reserve";
+    }
+  }
+
+  TileWindow ResolveBufferWindow(const StmtPtr& statement, const ExprPtr& operand,
+                                 const ResolvedOperandFootprint& resolved) const {
+    CHECK_SPAN(resolved.byte_hull, statement->span_) << "Peer payload has no placed Buffer footprint";
+    const auto& bytes = *resolved.byte_hull;
+    TileWindow window{resolved.space, bytes.begin, bytes.end};
+    const auto view = footprint_->ViewOf(operand);
+    if (view && view->peer_borrow) {
+      const auto found = local_.find(view->peer_borrow);
+      CHECK_SPAN(found != local_.end() && found->second.pop, statement->span_)
+          << "Peer Buffer footprint has no executed pop binding";
+      const auto& captured = found->second;
+      window.pop = captured.pop;
+      const auto id = window.pop->pipe_id;
+      const auto& ring = *transport_.pipes.at(id).receive;
+      CHECK_SPAN(!closed_.count(window.pop) && ordinals_.at(id) - births_.at(window.pop) < ring.local_slots &&
+                     !window.pop->empty_payload && bytes.begin >= *ring.placed_base &&
+                     bytes.end - *ring.placed_base <= window.pop->capacity_bytes,
+                 statement->span_)
+          << "Peer Buffer footprint uses an empty, released or overwritten receive slot";
+      const auto offset = captured.begin - *ring.placed_base;
+      window.begin += offset;
+      window.end += offset;
+    } else {
+      CheckOrdinaryPlacement(window, statement->span_);
+    }
+    return window;
+  }
+
+  void ImportBufferPayload(const StmtPtr& statement, const CallPtr& call, const VarPtr& result) {
+    const auto operation = backend::QualifyBufferSyncOperation(call, result_.input.owner->func_type_,
+                                                               result_.input.hardware_target, true);
+    const auto& implementation = operation.Implementation();
+    if (implementation.RequiresReadOnlyGM()) {
+      // The unit resolves the original Group roots and proves that the
+      // operand remains read-only before publishing either local plan.
+      ImportScalarGmRead(call, result);
+      return;
+    }
+    footprint_->RequireVecCopyPlacement(operation);
+    footprint_->RequireWorkspaceSeparation(operation);
+    for (const auto& claim : implementation.Claims()) {
+      auto& reserved = result_.reservations[{claim.pool.src, claim.pool.dst}];
+      for (const auto id : claim.ids) {
+        reserved.insert(static_cast<int>(id));
+      }
+    }
+    SyncSite site{call, nullptr, implementation.Pipe(), {}};
+    for (size_t i = 0; i < operation.ArgumentEffects().size(); ++i) {
+      const auto mode = operation.ArgumentEffects()[i].data;
+      if (mode == BufferAccess::None) {
+        continue;
+      }
+      const auto& operand = call->args_[i];
+      const auto type = As<BufferType>(operand->GetType());
+      const auto space = type ? type->memory_space_ : MemorySpace::DDR;
+      const auto resolved = footprint_->ResolveOperand(statement.get(), call, i, mode, space, true, false,
+                                                       /*peer_slot_relative=*/true);
+      if (space == MemorySpace::DDR) {
+        if (resolved.read) {
+          GmAccess(site, statement, operand, false);
+        }
+        if (resolved.write) {
+          GmAccess(site, statement, operand, true);
+        }
+      } else {
+        const auto window = ResolveBufferWindow(statement, operand, resolved);
+        if (resolved.read) {
+          Access(site, window, false);
+        }
+        if (resolved.write) {
+          Access(site, window, true, resolved.candidate_full_overwrite);
+        }
+      }
+    }
+    for (const auto& implicit : implementation.ImplicitEffects()) {
+      const TileWindow window{implicit.space, implicit.begin, implicit.end};
+      CheckOrdinaryPlacement(window, statement->span_);
+      if (implicit.data == BufferAccess::Read || implicit.data == BufferAccess::ReadWrite) {
+        Access(site, window, false, implicit.exact_footprint);
+      }
+      if (implicit.data == BufferAccess::Write || implicit.data == BufferAccess::ReadWrite) {
+        Access(site, window, true, implicit.exact_footprint);
+      }
+    }
+    CHECK_SPAN(static_cast<bool>(result) == implementation.ProducesReadyScalar(), call->span_)
+        << "Peer Buffer payload result has no selected scalar completion contract";
+    if (result) {
+      ready_.insert(result.get());
+    }
+    AddSite(std::move(site));
+  }
+
+  void ImportBufferDefinition(const StmtPtr& statement, const CallPtr& call, const VarPtr& result) {
+    for (const auto& operand : call->args_) {
+      CheckSyncScalarReadiness(operand, [this](const VarPtr& var) { return ready_.count(var.get()) != 0; });
+    }
+    if (auto descriptor = backend::QualifyBufferSyncNonPayload(call, result_.input.hardware_target)) {
+      CHECK_SPAN(static_cast<bool>(result) == (descriptor->Result().behavior != BufferResultBehavior::None),
+                 call->span_)
+          << "Peer Buffer descriptor requires its declared result binding";
+      if (result) {
+        ready_.insert(result.get());
+        if (IsOp(call, "buffer.get_block_idx") || IsOp(call, "buffer.get_block_num")) {
+          coordinate_bounds_.emplace(result.get(),
+                                     CoordinateBounds{IsOp(call, "buffer.get_block_num") ? 1 : 0, INT32_MAX});
+        }
+      }
+    } else {
+      ImportBufferPayload(statement, call, result);
+    }
+  }
+
   void AddOperation(const StmtPtr& statement, const CallPtr& original, const CallPtr& qualified,
                     const std::vector<ExprPtr>& operands) {
     const auto operation = backend::QualifyBufferSyncOperation(qualified, result_.input.owner->func_type_,
@@ -726,8 +867,9 @@ class LaneImporter {
 
   void ImportPeer(const CallPtr& call, const PeerTransportSite& transfer) {
     const auto& binding = transport_.pipes.at(transfer.pipe_id);
-    CHECK_SPAN(std::all_of(transfer.descriptor->valid_shape_.begin(), transfer.descriptor->valid_shape_.end(),
-                           [](int64_t extent) { return extent >= 0; }),
+    CHECK_SPAN(footprint_ || std::all_of(transfer.descriptor->valid_shape_.begin(),
+                                         transfer.descriptor->valid_shape_.end(),
+                                         [](int64_t extent) { return extent >= 0; }),
                call->span_)
         << "Peer local planning needs a statically bounded native valid extent";
     if (transfer.kind == PeerTransportKind::Free) {
@@ -749,22 +891,28 @@ class LaneImporter {
       // No-split C2V may widen a nonempty logical payload to the physical box.
       // With zero rows the pinned Vec receive issues no local bytes, but the
       // call still waits, returns credit and advances the local slot cursor.
-      const bool empty =
-          transfer.memory_space == MemorySpace::Vec && transfer.descriptor->valid_shape_[0] == 0;
       const TileWindow window{ring.space, begin, begin + transfer.capacity_bytes, &transfer};
       CHECK_SPAN(local_.emplace(transfer.tile.get(), window).second, call->span_)
           << "Peer TPOP result is assigned more than once";
       births_.emplace(&transfer, ordinal);
-      if (!empty) Access(site, window, true);
+      ready_.insert(transfer.tile.get());
+      if (!transfer.empty_payload) {
+        Access(site, window, true, transfer.descriptor->valid_shape_ == transfer.descriptor->shape_);
+      }
     } else {
-      const auto window = Window(transfer.tile, call->span_);
-      CHECK_SPAN(
-          window.space == transfer.memory_space && window.end - window.begin >= transfer.capacity_bytes,
-          call->span_)
-          << "Peer TPUSH source exceeds its placed tile";
-      const bool empty =
-          transfer.memory_space == MemorySpace::Vec && transfer.descriptor->valid_shape_[0] == 0;
-      if (!empty) Access(site, window, false);
+      if (!transfer.empty_payload) {
+        const auto window =
+            footprint_ ? ResolveBufferWindow(
+                             transfer.statement, transfer.tile,
+                             footprint_->ResolveOperand(transfer.statement.get(), call, 0, BufferAccess::Read,
+                                                        transfer.memory_space, false, false, true))
+                       : Window(transfer.tile, call->span_);
+        CHECK_SPAN(
+            window.space == transfer.memory_space && window.end - window.begin >= transfer.capacity_bytes,
+            call->span_)
+            << "Peer TPUSH source exceeds its placed tile";
+        Access(site, window, false);
+      }
     }
     AddSite(std::move(site));
   }
@@ -985,6 +1133,18 @@ class LaneImporter {
           << "Peer pipe initializer has an unqualified descriptor operand";
       return;
     }
+    if (footprint_) {
+      if (cross_core_pipe::IsPeerPipeSetup(call)) {
+        CHECK_SPAN(result, call->span_) << "Peer reserve or imported address requires its SSA result";
+        for (const auto& arg : call->args_) {
+          CheckSyncScalarReadiness(arg, [this](const VarPtr& var) { return ready_.count(var.get()) != 0; });
+        }
+        ready_.insert(result.get());
+      } else {
+        ImportBufferDefinition(statement, call, result);
+      }
+      return;
+    }
     if (IsOp(call, "tile.alloc") || IsOp(call, "system.reserve_buffer") ||
         IsOp(call, "system.import_peer_buffer") || IsSubblockQuery(call) ||
         IsOp(call, "tile.get_block_idx") || IsOp(call, "tile.get_block_num")) {
@@ -1032,17 +1192,28 @@ class LaneImporter {
 PeerLocalEffects ImportPeerLocalEffects(const FunctionPtr& function, const PeerTransportEffects& transport,
                                         const std::string& target, const SyncParameterBounds& parameters) {
   backend::RequireLocalSyncExecutionContract(target);
-  CHECK(function && function->ir_stage_ == FunctionIRStage::Functional &&
+  CHECK(function &&
         (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV) &&
         transport.unavailable.empty() && !transport.sites.empty())
-      << "Peer local planning requires a native Tile endpoint and its qualified transport effects";
+      << "Peer local planning requires a device endpoint and its qualified transport effects";
   auto paths = LaneStatements(function);
+  const bool buffer_ir = function->ir_stage_ == FunctionIRStage::Buffer;
+  if (buffer_ir) {
+    const BufferRuntimeValidAnalysis valid(function, /*collect_guards=*/false,
+                                           /*check_payload_capacity=*/true);
+    if (const auto& issue = valid.issue()) {
+      CHECK_SPAN(false, issue->call->span_) << issue->message;
+    }
+  }
   const SyncControlRangeProver ranges(
       function, parameters, std::nullopt,
-      function->func_type_ == FunctionType::AIV ? RuntimeValidOperands : nullptr);
+      !buffer_ir && function->func_type_ == FunctionType::AIV ? RuntimeValidOperands : nullptr);
+  const auto footprint = buffer_ir ? std::make_unique<SyncFootprintResolver>(function, &ranges, true, target,
+                                                                             /*resolve_peer_slots=*/true)
+                                   : nullptr;
   PeerLocalEffects result;
   for (const auto& path : paths) {
-    LaneImporter importer(function, transport, target, parameters, result.gm, ranges);
+    LaneImporter importer(function, transport, target, parameters, result.gm, ranges, footprint.get());
     result.lanes.push_back(importer.Run(path));
   }
   return result;

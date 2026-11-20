@@ -76,6 +76,10 @@ extern const std::vector<std::string> mask_patterns;
 codegen::PTOCodegen& AsPto(codegen::CodegenBase& codegen_base);
 void CheckArity(const ir::CallPtr& op, std::string_view pto_op_name, size_t arity);
 void CheckSafeIdentifier(const std::string& value, const std::string& attr_name);
+void EmitPeerReserve(const ir::CallPtr& op, codegen::PTOCodegen& codegen);
+void EmitScalarTensorRead(const ir::CallPtr& op, codegen::PTOCodegen& codegen, const std::string& result);
+void EmitBufferPeerTransport(const ir::CallPtr& op, codegen::PTOCodegen& codegen,
+                             const std::pair<std::string, std::string>& valid = {});
 std::string MakePartitionTensorViewType(const std::vector<std::string>& dims, const std::string& dtype_str);
 std::vector<std::string> GetIndexOffsetCodes(const std::vector<ir::ExprPtr>& exprs,
                                              codegen::PTOCodegen& codegen);

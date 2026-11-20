@@ -230,8 +230,9 @@ std::array<ExprPtr, 2> FootprintRangeOperands(const CallPtr& call) {
 }
 
 SyncFootprintResolver::SyncFootprintResolver(const FunctionPtr& owner, const SyncControlRangeProver* prover,
-                                             bool run_scalar_layout_check, std::string target)
-    : target_(std::move(target)) {
+                                             bool run_scalar_layout_check, std::string target,
+                                             bool resolve_peer_slots)
+    : target_(std::move(target)), resolve_peer_slots_(resolve_peer_slots) {
   if (run_scalar_layout_check) RequireBufferSyncScalarLayout(owner);
   if (prover) {
     prover_ = prover;
@@ -285,7 +286,7 @@ const SyncResolvedView* SyncFootprintResolver::ViewOf(const Expr* expr) const {
 
 std::optional<backend::BufferSyncByteWindow> SyncFootprintResolver::ByteHull(const ExprPtr& expr) const {
   const auto* v = ViewOf(expr);
-  return v ? v->byte_hull : std::nullopt;
+  return v ? (v->peer_borrow ? v->peer_reserve : v->byte_hull) : std::nullopt;
 }
 
 bool SyncFootprintResolver::IsDynamicValidTouched(const Expr* expr) const {
@@ -307,7 +308,7 @@ std::optional<backend::BufferSyncByteWindow> SyncFootprintResolver::ExactFullWin
     const ExprPtr& expr) const {
   if (!expr || IsDynamicValidTouched(expr.get())) return std::nullopt;
   const auto* v = ViewOf(expr);
-  if (!v || !v->byte_hull || !v->static_full_valid) return std::nullopt;
+  if (!v || v->peer_borrow || !v->byte_hull || !v->static_full_valid) return std::nullopt;
   if (v->slot_selector && !v->slot_selector->is_const()) return std::nullopt;
   if (v->kind == SyncViewKind::VecSubview && v->vec_lattice) {
     // A strided subview (width < pitch && rows > 1) is NOT a contiguous full-window overwrite,
@@ -442,13 +443,35 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
     return;
   }
 
-  if (IsOp(call, "buffer.alloc") || IsOp(call, "buffer.alloc_multi")) {
+  if (resolve_peer_slots_ && IsOp(call, "buffer.peer_reserve")) {
+    const auto base = call->GetKwarg<int>("base", -1);
+    const auto size = call->GetKwarg<int>("size", 0);
+    if (base >= 0 && size > 0) {
+      peer_reserves_.emplace(var.get(), backend::BufferSyncByteWindow{base, int64_t{base} + size});
+    }
+    return;
+  }
+
+  const bool peer_pop = resolve_peer_slots_ && IsOp(call, "buffer.peer_pop");
+  if (peer_pop || IsOp(call, "buffer.alloc") || IsOp(call, "buffer.alloc_multi")) {
     if (call->args_.size() != 2) return;
-    const auto address = As<ConstInt>(call->args_[1]);
+    std::optional<int64_t> address;
+    std::optional<backend::BufferSyncByteWindow> peer_reserve;
+    if (peer_pop) {
+      if (const auto found = peer_reserves_.find(call->args_[0].get()); found != peer_reserves_.end()) {
+        address = found->second.begin;
+        peer_reserve = found->second;
+      }
+    } else if (const auto placed = As<ConstInt>(call->args_[1])) {
+      address = placed->value_;
+    }
     const auto multi = As<MultiBufferType>(var->GetType());
     const auto elem_type = multi ? multi->element_type_ : As<BufferType>(var->GetType());
     const auto slot_bytes_opt = backend::PhysicalBufferBytes(elem_type);
-    if (!address || address->value_ < 0 || !slot_bytes_opt || !elem_type) return;
+    if (!address || *address < 0 || !slot_bytes_opt || !elem_type ||
+        *slot_bytes_opt > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+      return;
+    }
 
     const int64_t slot_count = multi ? multi->slot_count_ : 1;
     const int64_t slot_bytes = *slot_bytes_opt;
@@ -460,7 +483,7 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
       if (!alignment || slot_bytes % alignment != 0) return;
     }
     const __int128 total_bytes = __int128(slot_bytes) * slot_count;
-    const __int128 end = __int128(address->value_) + total_bytes;
+    const __int128 end = __int128(*address) + total_bytes;
     if (end > std::numeric_limits<int64_t>::max()) return;
 
     const int64_t rows = elem_type->shape_.size() >= 1 ? elem_type->shape_[0] : 0;
@@ -471,7 +494,7 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
     bool axis_swapped = false;
     if (IsMatrixSpace(elem_type->memory_space_)) {
       for (const auto& root : roots_) {
-        if (!root.placed || root.address != address->value_ || root.bytes != total_bytes ||
+        if (!root.placed || root.address != *address || root.bytes != total_bytes ||
             root.slot_count != slot_count)
           continue;
         if (IsIdenticalMatLayout(root, elem_type)) {
@@ -492,7 +515,7 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
       root.id = root_id;
       root.space = elem_type->memory_space_;
       root.placed = true;
-      root.address = address->value_;
+      root.address = *address;
       root.bytes = static_cast<int64_t>(total_bytes);
       root.slot_count = slot_count;
       root.slot_bytes = slot_bytes;
@@ -507,8 +530,10 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
     view.space = elem_type->memory_space_;
     view.root_id = root_id;
     view.type = elem_type;
-    view.byte_hull = backend::BufferSyncByteWindow{address->value_, static_cast<int64_t>(end)};
-    view.base_byte_offset = address->value_;
+    view.byte_hull = backend::BufferSyncByteWindow{*address, static_cast<int64_t>(end)};
+    view.base_byte_offset = *address;
+    view.peer_borrow = peer_pop ? var.get() : nullptr;
+    view.peer_reserve = peer_reserve;
     view.axis_swapped = axis_swapped;
     view.valid_matrix_coords = IsMatrixSpace(elem_type->memory_space_);
     view.static_full_valid =
@@ -517,12 +542,12 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
     if (elem_type->memory_space_ == MemorySpace::Vec && elem_type->shape_.size() == 2 && rows > 0 &&
         cols > 0 && elem_type->dtype_.GetBit() % 8 == 0 &&
         (backend::DenseBufferBytes(elem_type) || backend::IsColumnVectorBuffer(elem_type) ||
-         backend::IsFullZeroPaddedVec(elem_type))) {
+         backend::IsFullPaddedVec(elem_type))) {
       const int64_t elem_bytes = elem_type->dtype_.GetByte();
       view.row_pitch_bytes = cols * elem_bytes;
       if (!multi) {
-        view.vec_lattice = StridedByteFootprint{address->value_, view.row_pitch_bytes, rows,
-                                                cols * elem_bytes, view.static_full_valid};
+        view.vec_lattice = StridedByteFootprint{*address, view.row_pitch_bytes, rows, cols * elem_bytes,
+                                                view.static_full_valid};
       }
     } else if (!multi && IsMatrixSpace(elem_type->memory_space_)) {
       const auto& root = roots_[root_id - 1];
@@ -616,6 +641,8 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
     view.row_pitch_bytes = parent->row_pitch_bytes;
     view.slot_selector = parent->slot_selector;
     view.raw_slot_expr = parent->raw_slot_expr;
+    view.peer_borrow = parent->peer_borrow;
+    view.peer_reserve = parent->peer_reserve;
     view.axis_swapped = parent->axis_swapped;
     view.static_full_valid = false;
 
@@ -851,7 +878,8 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
 ResolvedOperandFootprint SyncFootprintResolver::ResolveOperand(const Stmt* cut, const CallPtr& call,
                                                                size_t arg_idx, BufferAccess mode,
                                                                MemorySpace space, bool enable_refresh_kill,
-                                                               bool disjoint_gm) const {
+                                                               bool disjoint_gm,
+                                                               bool peer_slot_relative) const {
   ResolvedOperandFootprint out;
   out.space = space;
   out.read = (mode == BufferAccess::Read || mode == BufferAccess::ReadWrite);
@@ -870,6 +898,10 @@ ResolvedOperandFootprint SyncFootprintResolver::ResolveOperand(const Stmt* cut, 
 
   const auto* view = ViewOf(operand);
   if (!view) return out;
+  if (view->peer_borrow && !peer_slot_relative) {
+    out.byte_hull = view->peer_reserve;
+    return out;
+  }
   out.root_id = view->root_id;
   out.byte_hull = view->byte_hull;
   out.fiber = view->fiber;

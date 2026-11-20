@@ -371,25 +371,40 @@ The programmer or upstream lowering specifies the communication operations.
 The native FIFO implements the ready and credit signals. AutoSync preserves
 the communication sequence and plans storage dependencies on the executing core.
 
+Qualified mixed units can enter Buffer IR independently of AutoSync. Both
+endpoints must admit delegated emission from the same launch workspace. The
+native initializer receives the raw GM pointer with its per-pipe offset, and
+the stock receive-slot fences use the final scheduled body. A later local
+planning refusal preserves both Buffer bodies and enables PTOAS insertion for
+the complete unit.
+
 For a receive with ordinal `k`, the local slot begins at
 `reserve + (k % local_depth) * slot_bytes`. The transfer descriptor bounds
 its byte extent. A pop writes that slot on MTE2. A subsequent TMOV reads the
 same bytes on MTE1, or a vector operation reads them on V. TFREE releases a
 logical borrow. The physical reader still has to finish before a later pop
-overwrites those bytes. A push reads its local source tile on its selected
-pipe. The local planner imports all of these effects alongside ordinary
-payloads and uses the same dependency analysis and local event allocator.
-It checks event consumption before reuse and drains the endpoint before an
+overwrites those bytes. In Buffer IR, `buffer.peer_pop` borrows the slot from
+the declared reserve used by its initializer. A subview inherits that captured
+slot. A zero-row Vec receive advances the ordinal without writing data. A push
+reads its local source on its selected pipe. Ordinary operations supply their
+registered Buffer effects, backend pipe, and shared placed footprints. The
+FIFO adapter supplies the receive cursor and transport lifetime. The planner
+checks event consumption before reuse and drains the endpoint before an
 explicit return or at the end of a void path. Each arm of a terminal AIV
 subblock branch drains independently.
+
+With Buffer IR enabled, RealizeSync can still receive placed Functional units
+that did not convert. Its Tile-to-Buffer projection remains on that
+compatibility route. Disabling Buffer IR delegates automatic synchronization
+to PTOAS.
 
 For qualified AIV Vec operations, physical tile capacity may be static while
 the valid rows or columns are computed at runtime. The importer proves that
 each runtime extent is available at the original operation and stays positive
 and within capacity. It encloses the data access in the whole placed tile.
-A validity update must use an ordinary allocation in its defining sequence
-of statements, with no separate view or ambiguous alias. A later operand
-must describe the current native validity of that handle.
+In Buffer IR, ordinary lowering restores the validity observed by each
+consumer. On the Functional route, the importer checks that each later
+operand describes the current native validity of its allocation.
 
 The importer represents each FIFO as rotating physical storage. In a sequential
 loop with `p` pops per visit, visit `v` starts at slot
