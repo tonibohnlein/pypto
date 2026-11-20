@@ -223,9 +223,7 @@ class ProjectStreams {
     if (call && (IsOp(call, "system.set_flag") || IsOp(call, "system.wait_flag")))
       return Fail("authored event constraints require joint planning");
     if (call && IsOp(call, "system.syncall")) {
-      if (call->GetKwarg<std::string>("mode", "hard") != "hard" ||
-          call->GetKwarg<std::string>("core_type", "mix") != "mix")
-        return Fail("unmodeled peer rendezvous");
+      if (!cross_core_pipe::IsHardMixedSyncAll(call)) return Fail("unmodeled peer rendezvous");
       return {{kIssueOrder, {{StepKind::Rendezvous, {}, {}}}}};
     }
     if (auto assignment = As<AssignStmt>(stmt)) {

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -282,7 +283,11 @@ bool SupportsLogicalBufferElementwise(const BufferElementwiseRecipe& recipe, con
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*destination);
   // Column-vector descriptors are admitted only by their row recipes. Do not
   // broaden every existing arithmetic recipe when default type support grows.
-  if (!IsDenseVecBufferTile(destination, view)) return false;
+  // A2/A3 TEXP derives its vector mask and strides from the full valid
+  // geometry. A materialized pad value is already data in that geometry.
+  const bool padded_exp =
+      std::string_view(recipe.buffer_op) == "buffer.exp" && IsFullPaddedVec(destination, view);
+  if (!IsDenseVecBufferTile(destination, view) && !padded_exp) return false;
   const auto& valid = view.valid_shape.empty() ? destination->shape_ : view.valid_shape;
   for (const auto& input : recipe.inputs) {
     if (input.logical_index >= call->args_.size()) return false;
@@ -313,6 +318,7 @@ bool SupportsLogicalBufferElementwise(const BufferElementwiseRecipe& recipe, con
         if (!ir::structural_equal(tile->shape_[i], destination->shape_[i])) return false;
       }
       const auto source_view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
+      if (padded_exp && source_view != view) return false;
       const auto& source_valid = source_view.valid_shape.empty() ? tile->shape_ : source_view.valid_shape;
       if (valid.size() != source_valid.size()) return false;
       for (size_t i = 0; i < valid.size(); ++i) {
@@ -406,6 +412,7 @@ void ValidateBufferElementwiseOperands(const BufferElementwiseRecipe& recipe,
           descriptor->blayout_ == ir::TileLayout::row_major &&
           descriptor->slayout_ == ir::TileLayout::none_box && descriptor->fractal_ == 512 &&
           (descriptor->pad_ == ir::PadValue::null ||
+           (std::string_view(recipe.buffer_op) == "buffer.exp" && IsFullPaddedVec(descriptor)) ||
            (recipe.types == BufferElementwiseTypePolicy::DenseFillVec && IsFullZeroPaddedVec(descriptor))) &&
           descriptor->compact_ == ir::CompactMode::null)
         << recipe.buffer_op

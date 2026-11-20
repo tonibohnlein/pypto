@@ -79,6 +79,15 @@ bool IsPeerPipeSetup(const CallPtr& call) {
          IsOp(call, "buffer.peer_reserve_addr");
 }
 
+bool IsHardMixedSyncAll(const CallPtr& call) {
+  return IsOp(call, "system.syncall") && call->args_.empty() && call->attrs_.empty() &&
+         std::all_of(
+             call->kwargs_.begin(), call->kwargs_.end(),
+             [](const auto& option) { return option.first == "mode" || option.first == "core_type"; }) &&
+         call->GetKwarg<std::string>("mode", "hard") == "hard" &&
+         call->GetKwarg<std::string>("core_type", "mix") == "mix";
+}
+
 bool IsBufferPeerTransport(const CallPtr& call) {
   return IsOp(call, "buffer.peer_push") || IsOp(call, "buffer.peer_pop") || IsOp(call, "buffer.peer_free");
 }

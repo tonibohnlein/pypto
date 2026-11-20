@@ -16,6 +16,7 @@
 #include <map>
 #include <set>
 #include <utility>
+#include <vector>
 
 #include "src/ir/transforms/utils/peer_local_effects.h"
 
@@ -27,10 +28,14 @@ using PeerWorkPairs = std::set<SyncDirection>;
 using PeerWorkRange = std::pair<size_t, size_t>;
 using PeerWorkSeamIds = std::map<SyncDirection, int>;
 
-void AddPeerWorkConflicts(const PeerLocalLane& lane, PeerWorkRange earlier, PeerWorkRange later,
-                          PeerWorkPairs& pairs);
-FunctionPtr AddPeerWorkSeams(const FunctionPtr& function, const PeerLocalWorkLoop& loop,
-                             const PeerWorkPairs& entry, const PeerWorkPairs& exit,
+struct PeerWorkPlacement {
+  const PeerLocalWorkLoop* loop;
+  PeerWorkPairs entry, exit;
+};
+
+void AddPeerWorkConflicts(const CompactSyncInput& input, const PeerLocalWorkLoop& loop, PeerWorkRange earlier,
+                          PeerWorkRange later, PeerWorkPairs& pairs);
+FunctionPtr AddPeerWorkSeams(const FunctionPtr& function, const std::vector<PeerWorkPlacement>& placements,
                              const PeerWorkSeamIds& ids);
 
 }  // namespace pypto::ir::sync

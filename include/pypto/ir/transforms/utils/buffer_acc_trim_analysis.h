@@ -34,7 +34,8 @@ std::optional<arith::ConstIntBound> BoundBufferLoopCoordinate(const ForStmtPtr& 
                                                               const std::function<bool(const VarPtr&)>& ready,
                                                               BufferAccTrimBoundCache& cache);
 void BindBufferAccTrimParameters(const FunctionPtr& function, arith::Analyzer& analyzer,
-                                 std::unordered_set<const Var*>& ready);
+                                 std::unordered_set<const Var*>& ready,
+                                 const std::vector<int>& positive_loop_parameters = {});
 
 // Enter only distinct atomic integer comparison facts, with De Morgan handling
 // for false disjunctions. General Boolean DAGs are never sent to the recursive

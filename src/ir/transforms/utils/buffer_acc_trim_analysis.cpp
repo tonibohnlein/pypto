@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <any>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -32,6 +33,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/loop_step_qualification.h"
 #include "pypto/ir/transforms/utils/type_metadata.h"
 
 namespace pypto::ir {
@@ -399,12 +401,21 @@ std::optional<arith::ConstIntBound> BoundBufferAccTrimScalar(const ExprPtr& expr
       result = arith::ConstIntBound{constant->value_, constant->value_};
     } else if (const auto variable = AsVarLike(expr); variable && ready(variable)) {
       result = analyzer.const_int_bound(variable);
-    } else if (const auto call = As<Call>(expr);
-               call && IsOp(call, "buffer.get_block_idx") && call->args_.empty()) {
-      result = arith::ConstIntBound{0, arith::ConstIntBound::kPosInf};
+    } else if (const auto cast = As<Cast>(expr)) {
+      if (const auto bound = self(self, cast->operand_)) {
+        const auto [lo, hi] = MachineBounds(cast->operand_, *bound);
+        const auto [min, max] = SignedLimits(expr);
+        if (lo >= min && hi <= max) result = *bound;
+      }
+    } else if (const auto call = As<Call>(expr); call && call->args_.empty()) {
+      if (IsOp(call, "buffer.get_block_idx") || IsOp(call, "tile.get_block_idx")) {
+        result = arith::ConstIntBound{0, std::numeric_limits<int32_t>::max()};
+      } else if (IsOp(call, "buffer.get_block_num") || IsOp(call, "tile.get_block_num")) {
+        result = arith::ConstIntBound{1, std::numeric_limits<int32_t>::max()};
+      }
     } else if (const auto binary = As<BinaryExpr>(expr);
-               binary &&
-               (As<Min>(expr) || As<Max>(expr) || As<Add>(expr) || As<Sub>(expr) || As<Mul>(expr))) {
+               binary && (As<Min>(expr) || As<Max>(expr) || As<Add>(expr) || As<Sub>(expr) || As<Mul>(expr) ||
+                          As<FloorDiv>(expr) || As<FloorMod>(expr))) {
       const auto a = self(self, binary->left_), b = self(self, binary->right_);
       if (a && b) {
         if (As<Min>(expr)) {
@@ -413,6 +424,13 @@ std::optional<arith::ConstIntBound> BoundBufferAccTrimScalar(const ExprPtr& expr
         } else if (As<Max>(expr)) {
           result = arith::ConstIntBound{std::max(a->min_value, b->min_value),
                                         std::max(a->max_value, b->max_value)};
+        } else if (As<FloorDiv>(expr) || As<FloorMod>(expr)) {
+          if (a->min_value >= 0 && a->max_value < arith::ConstIntBound::kPosInf && b->is_const() &&
+              b->min_value > 0) {
+            const auto divisor = b->min_value;
+            result = As<FloorDiv>(expr) ? arith::ConstIntBound{a->min_value / divisor, a->max_value / divisor}
+                                        : arith::ConstIntBound{0, std::min(a->max_value, divisor - 1)};
+          }
         } else {
           result = BoundArithmetic(expr, binary, *a, *b, analyzer);
         }
@@ -440,7 +458,10 @@ std::optional<arith::ConstIntBound> BoundBufferLoopCoordinate(const ForStmtPtr& 
   const auto stop = BoundBufferAccTrimScalar(loop->stop_, analyzer, ready, &cache);
   const auto step = BoundBufferAccTrimScalar(loop->step_, analyzer, ready, &cache);
   if (!start || !stop || !step || step->min_value <= 0) return std::nullopt;
-  const Wide last = static_cast<Wide>(stop->max_value) - 1;
+  Wide last = static_cast<Wide>(stop->max_value) - 1;
+  if (start->is_const() && step->is_const() && last >= start->min_value) {
+    last -= (last - start->min_value) % step->min_value;
+  }
   const auto [minimum, maximum] = SignedLimits(loop->loop_var_);
   // Every visited IV lies in [start, stop). Also ensure the exit update
   // could not wrap in the original IV type and start a second sequence.
@@ -451,7 +472,8 @@ std::optional<arith::ConstIntBound> BoundBufferLoopCoordinate(const ForStmtPtr& 
 }
 
 void BindBufferAccTrimParameters(const FunctionPtr& function, arith::Analyzer& analyzer,
-                                 std::unordered_set<const Var*>& ready) {
+                                 std::unordered_set<const Var*>& ready,
+                                 const std::vector<int>& positive_loop_parameters) {
   std::unordered_set<const Var*> shape_variables;
   for (const auto& parameter : function->params_) {
     if (Integer(parameter)) ready.insert(parameter.get());
@@ -467,6 +489,20 @@ void BindBufferAccTrimParameters(const FunctionPtr& function, arith::Analyzer& a
       }
     }
   }
+  const auto bind_positive = [&](const std::vector<int>& indices) {
+    for (const int index : indices) {
+      if (index < 0 || static_cast<size_t>(index) >= function->params_.size()) continue;
+      const auto& parameter = function->params_[index];
+      if (!Integer(parameter)) continue;
+      const auto max = SignedLimits(parameter).second;
+      analyzer.const_int_bound.Update(
+          parameter, {1, static_cast<int64_t>(std::min(Wide{arith::ConstIntBound::kPosInf}, max))});
+    }
+  };
+  if (function->ir_stage_ == FunctionIRStage::Buffer) {
+    bind_positive(function->GetAttr<std::vector<int>>(kAttrBufferPositiveStepParameters, {}));
+  }
+  bind_positive(positive_loop_parameters);
 }
 
 bool IsBufferAccTrimTargetQualified() {

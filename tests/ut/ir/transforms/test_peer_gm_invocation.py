@@ -15,18 +15,34 @@ import pypto.language as pl
 import pytest
 from pypto import ir, passes
 from pypto._function_attrs import AUTOSYNC_FALLBACK_REASON_ATTR, PYPTO_AUTOSYNC_ATTR
+from pypto.backend import BackendType
 from pypto.ir.pass_manager import PassManager
+from pypto.runtime import RunConfig
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
 
 
-def _peer_program(root_call: str, *, rhs_rows: int = 16) -> ir.Program:
+def _peer_program(
+    root_call: str, *, rhs_rows: int = 16, spmd: bool = False, uses_block_index: bool = True
+) -> ir.Program:
+    out_rows = 64 if spmd else 16
+    row = "pl.get_block_idx() * 16" if spmd and uses_block_index else "0"
+    wrapper = (
+        f"""
+    @pl.function(type=pl.FunctionType.Spmd)
+    def grid(self, rhs: pl.Tensor[[16, 16], pl.FP16], x: pl.Tensor[[16, 16], pl.FP16],
+             out: pl.Out[pl.Tensor[[{out_rows}, 16], pl.FP32]]) -> pl.Tensor[[{out_rows}, 16], pl.FP32]:
+        return self.paired(rhs, x, out)
+"""
+        if spmd
+        else ""
+    )
     return pl.parse_program(f"""
 @pl.program
 class PeerInvocations:
     @pl.function(type=pl.FunctionType.AIC)
     def cube(self, rhs: pl.Tensor[[16, 16], pl.FP16],
-             out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
+             out: pl.Out[pl.Tensor[[{out_rows}, 16], pl.FP32]]) -> pl.Tensor[[{out_rows}, 16], pl.FP32]:
         fifo = pl.reserve_buffer(name="inbox", size=2048, base=0)
         pl.aic_initialize_pipe(pl.const(0, pl.INT32), fifo, dir_mask=2, slot_size=1024, slot_num=2)
         matrix = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
@@ -35,7 +51,7 @@ class PeerInvocations:
         left = pl.move(received, target_memory=pl.Mem.Left)
         pl.tfree_to_aiv(received)
         product = pl.matmul(left, right)
-        return pl.store(product, [0, 0], out)
+        return pl.store(product, [{row}, 0], out)
 
     @pl.function(type=pl.FunctionType.AIV)
     def vector(self, x: pl.Tensor[[16, 16], pl.FP16]):
@@ -46,14 +62,14 @@ class PeerInvocations:
 
     @pl.function(type=pl.FunctionType.Group)
     def paired(self, rhs: pl.Tensor[[16, 16], pl.FP16], x: pl.Tensor[[16, 16], pl.FP16],
-               out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
+               out: pl.Out[pl.Tensor[[{out_rows}, 16], pl.FP32]]) -> pl.Tensor[[{out_rows}, 16], pl.FP32]:
         result = self.cube(rhs, out)
         self.vector(x)
         return result
-
+{wrapper}
     @pl.function(type=pl.FunctionType.Orchestration)
     def main(self, rhs: pl.Tensor[[{rhs_rows}, 16], pl.FP16], x: pl.Tensor[[16, 16], pl.FP16],
-             out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
+             out: pl.Out[pl.Tensor[[{out_rows}, 16], pl.FP32]]) -> pl.Tensor[[{out_rows}, 16], pl.FP32]:
 {indent(root_call, "        ")}
 """)
 
@@ -71,8 +87,24 @@ class PeerInvocations:
         pytest.param(
             "first = self.paired(rhs, x, out)\nreturn self.paired(x, x, first)",
             16,
+            None,
+            id="explicit-writeback-in-second-invocation",
+        ),
+        pytest.param(
+            "carried = out\nfor _ in pl.range(3):\n"
+            "    carried = self.paired(rhs, x, carried)\nreturn carried",
+            16,
+            None,
+            id="same-root-loop-backedge",
+        ),
+        pytest.param(
+            "carried = out\nfor _ in pl.range(3):\n"
+            "    self.paired(rhs, x, carried)\n"
+            "    carried = pl.create_tensor([16, 16], dtype=pl.FP32)\n"
+            "return carried",
+            16,
             "GM tensor must forward an original root formal",
-            id="opaque-return-in-second-invocation",
+            id="conflicting-loop-backedge",
         ),
         pytest.param(
             "sub = pl.slice(rhs, [16, 16], [0, 0])\nreturn self.paired(sub, x, out)",
@@ -87,6 +119,52 @@ def test_peer_group_checks_root_invocation(root_call: str, rhs_rows: int, refusa
     with _autosync_context([]):
         lowered = PassManager(ir.OptimizationStrategy.Default).run_passes(original)
     _assert_outcome(lowered, refusal)
+
+
+@pytest.mark.parametrize(
+    "count,uses_block_index,refusal",
+    [
+        pytest.param(4, True, None, id="sharded"),
+        pytest.param(4, False, "no bounded, nonoverlapping native partition", id="unsharded"),
+        pytest.param(2**30, True, "no bounded, nonoverlapping native partition", id="shape-overflow"),
+    ],
+)
+def test_peer_group_workspace_follows_spmd_launch(
+    count: int, uses_block_index: bool, refusal: str | None
+) -> None:
+    # The root allocation is sized for the whole dispatch. The managed
+    # workspace formal reaches the paired endpoints through the SPMD wrapper.
+    original = _peer_program(
+        "with pl.manual_scope():\n"
+        f"    result, _ = pl.spmd_submit(self.grid, rhs, x, out, core_num={count})\n"
+        "return result",
+        spmd=True,
+        uses_block_index=uses_block_index,
+    )
+    with _autosync_context([]):
+        lowered = PassManager(ir.OptimizationStrategy.Default).run_passes(original)
+    _assert_outcome(lowered, refusal)
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize("uses_block_index", [True, False])
+def test_peer_group_workspace_native_partition(tmp_path, uses_block_index: bool) -> None:
+    original = _peer_program(
+        "with pl.manual_scope():\n"
+        "    result, _ = pl.spmd_submit(self.grid, rhs, x, out, core_num=4)\n"
+        "return result",
+        spmd=True,
+        uses_block_index=uses_block_index,
+    )
+    config = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
+    with _autosync_context([]):
+        ir.compile(original, **config.compile_kwargs())
+    (orchestration,) = (tmp_path / "orchestration").glob("*.cpp")
+    # Two 1024-byte slots / four bytes per element, replicated four times.
+    assert "static_cast<uint32_t>((512) * (4))" in orchestration.read_text()
+    for side, kernel in (("aic", "cube"), ("aiv", "vector")):
+        native = (tmp_path / "kernels" / side / f"{kernel}.cpp").read_text()
+        assert ("__pypto_gm_block_offset" in native) == uses_block_index
 
 
 def _autosync_context(instruments: list[passes.PassInstrument]) -> passes.PassContext:

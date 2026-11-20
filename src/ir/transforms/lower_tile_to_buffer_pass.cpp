@@ -66,6 +66,7 @@
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_tuple_results.h"
 #include "pypto/ir/transforms/utils/buffer_valid_analysis.h"
+#include "pypto/ir/transforms/utils/buffer_view_analysis.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/normalize_stmt_structure.h"
@@ -91,7 +92,9 @@ std::vector<int64_t> StaticExtents(const std::vector<ExprPtr>& extents, const Sp
 }
 
 void CheckDenseVecTile(const TileTypePtr& tile, const TileView& view, const Span& span) {
-  CHECK_SPAN(backend::IsDenseVecBufferTile(tile, view) || backend::IsFullPaddedVec(tile, view), span)
+  CHECK_SPAN(backend::IsDenseVecBufferTile(tile, view) || backend::IsFullPaddedVec(tile, view) ||
+                 backend::IsEmptyPaddedVec(tile, view),
+             span)
       << "LowerTileToBuffer: this recipe requires dense rank-1 or rank-2 Vec tiles with a supported "
          "storage dtype";
 }
@@ -121,8 +124,9 @@ BufferTypePtr DenseDescriptor(const TileTypePtr& tile, const Span& span) {
   const auto fixed_column = logical_valid.size() == 2 ? As<ConstInt>(logical_valid[1]) : nullptr;
   CHECK_SPAN(!column || (fixed_column && fixed_column->value_ == 1), span)
       << "LowerTileToBuffer: contiguous column vectors require a fixed valid column of one";
-  return std::make_shared<BufferType>(shape, tile->dtype_, MemorySpace::Vec,
-                                      backend::MutableBufferValidShape(logical_valid), view.blayout,
+  auto valid = backend::IsEmptyPaddedVec(tile, view) ? std::vector<int64_t>{0, 0}
+                                                     : backend::MutableBufferValidShape(logical_valid);
+  return std::make_shared<BufferType>(shape, tile->dtype_, MemorySpace::Vec, std::move(valid), view.blayout,
                                       view.slayout, view.fractal, view.pad, view.compact);
 }
 
@@ -248,11 +252,12 @@ class StorageIndex : public IRVisitor {
     if (auto call = As<Call>(assign->value_); call && IsOp(call, "tile.matmul_acc")) {
       IndexProductView(call, assign->var_);
     }
-    if (IsWindowDefinition(assign->value_)) {
+    const bool identity_slice = IsIdentityTileSlice(assign);
+    if (!identity_slice && IsWindowDefinition(assign->value_)) {
       if (auto tile = As<TileType>(assign->var_->GetType())) windows.insert(tile.get());
     }
     if (auto call = As<Call>(assign->value_);
-        call && (IsOp(call, "tile.slice") || IsOp(call, "tile.assemble"))) {
+        call && ((!identity_slice && IsOp(call, "tile.slice")) || IsOp(call, "tile.assemble"))) {
       const auto& source = IsOp(call, "tile.slice") ? call->args_[0] : ExprPtr(assign->var_);
       if (auto tile = As<TileType>(source->GetType())) window_sources_.insert(tile.get());
     }
@@ -370,7 +375,7 @@ class StorageIndex : public IRVisitor {
         storage.members.begin(), storage.members.end(),
         [](const auto& member) { return backend::IsColumnVectorBufferGeometry(member.descriptor); });
     const bool has_pad = std::any_of(storage.members.begin(), storage.members.end(), [](const auto& member) {
-      return backend::IsFullPaddedVec(member.descriptor);
+      return backend::IsFullPaddedVec(member.descriptor) || backend::IsEmptyPaddedVec(member.descriptor);
     });
     const auto gather_workspace =
         std::find_if(storage.members.begin(), storage.members.end(),
@@ -840,6 +845,11 @@ class TileToBufferMutator : public IRMutator {
     // names for those same planned storage windows.
     if (tuples_.IsProjection(assign)) return Empty(assign->span_);
     if (auto call = As<Call>(assign->value_)) {
+      if (IsIdentityTileSlice(assign)) {
+        CHECK_SPAN(Handle(assign->var_) == Handle(call->args_[0]), assign->span_)
+            << "LowerTileToBuffer: an identity slice must share the source buffer";
+        return Empty(assign->span_);
+      }
       return LowerDefinition(call, assign->var_);
     }
     if (As<TileType>(assign->var_->GetType())) {
@@ -1098,6 +1108,10 @@ class TileToBufferMutator : public IRMutator {
   }
 
   StmtPtr LowerDefinition(const CallPtr& call, const VarPtr& result) {
+    if (cross_core_pipe::IsHardMixedSyncAll(call)) {
+      CHECK_SPAN(!result, call->span_) << "A hard MIX barrier has no result";
+      return std::make_shared<EvalStmt>(call, call->span_);
+    }
     if (cross_core_pipe::IsPeerPipeSetup(call) || op_predicates::IsTPush(call) ||
         op_predicates::IsTPop(call) || op_predicates::IsTFree(call)) {
       return LowerPeerDefinition(call, result);

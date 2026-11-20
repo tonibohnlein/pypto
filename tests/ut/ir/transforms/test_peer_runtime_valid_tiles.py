@@ -87,20 +87,56 @@ return out""",
         def extent(name):
             return "dynamic" if name in dynamic_columns else dimensions[name]
 
-        def restored(tile, cut):
-            setters = re.findall(rf"pto\.set_validshape {tile}, (%\w+), (%\w+) :", vector[:cut])
+        def subview(tile, cut):
+            return re.search(
+                rf"{tile} = pto\.subview (%\w+)\[(%\w+), (%\w+)\] sizes \[16, 16\] valid \[(%\w+), (%\w+)\]",
+                vector[:cut],
+            )
+
+        def restored(tile, descriptor, cut):
+            valid_shape = re.search(r"v_row=(\d+|\?), v_col=(\d+|\?)", descriptor)
+            assert valid_shape is not None, descriptor
+            rows_cols = valid_shape.groups()
+            preceding = vector[:cut]
+            view = subview(tile, cut)
+            if view:
+                base, row_offset, col_offset, rows, cols = view.groups()
+                assert (extent(row_offset), extent(col_offset)) == ("0", "0")
+                assert (extent(rows), extent(cols)) == rows_cols
+                preceding = vector[: view.start()]
+                tile = base
+            elif "?" not in rows_cols:
+                assert re.search(rf"{tile} = pto\.alloc_tile[^\n]*{re.escape(descriptor)}", preceding)
+                return rows_cols
+            setters = re.findall(rf"pto\.set_validshape {tile}, (%\w+), (%\w+) :", preceding)
+            assert setters, preceding
             return tuple(extent(x) for x in setters[-1])
 
-        exp = list(re.finditer(r"pto\.texp ins\((%\w+) : [^\n]+ outs\((%\w+) :", vector))
+        operand = r"(%\w+) : (!pto\.tile_buf<[^>]*>)"
+        exp = list(re.finditer(rf"pto\.texp ins\({operand}\) outs\({operand}\)", vector))
         expected = [("16", "dynamic")] if not variant else [("16", "16")]
         if variant == "stale":
             expected.append(("16", "dynamic"))
-        assert [restored(call[1], call.start()) for call in exp] == expected
-        assert [restored(call[2], call.start()) for call in exp] == expected
+        assert [restored(call[1], call[2], call.start()) for call in exp] == expected
+        assert [restored(call[3], call[4], call.start()) for call in exp] == expected
         partitions = re.findall(r"pto\.partition_view [^\n]+ sizes = \[(%\w+), (%\w+)\]", vector)
         assert [tuple(extent(x) for x in region) for region in partitions] == expected
-        stores = list(re.finditer(r"pto\.tstore ins\((%\w+) :", vector))
-        assert [restored(call[1], call.start()) for call in stores] == expected
-        for producer, store in zip(exp, stores, strict=True):
+        stores = list(re.finditer(rf"pto\.tstore ins\({operand}\)", vector))
+        assert [restored(call[1], call[2], call.start()) for call in stores] == expected
+        writers = [(call, call[3]) for call in exp]
+        if variant == "alias-after":
+            adds = re.finditer(rf"pto\.tadd ins\((%\w+), (%\w+) : ([^\n]+) outs\({operand}\)", vector)
+            addition = next(call for call in adds if call[1] == exp[0][3])
+            lhs, rhs = re.findall(r"!pto\.tile_buf<[^>]*>", addition[3])
+            assert restored(addition[1], lhs, addition.start()) == ("16", "16")
+            assert restored(addition[2], rhs, addition.start()) == ("16", "16")
+            assert restored(addition[4], addition[5], addition.start()) == ("16", "16")
+            writers = [(addition, addition[4])]
+        for (producer, written), store in zip(writers, stores, strict=True):
+            produced_view = subview(written, producer.start())
+            stored_view = subview(store[1], store.start())
+            assert (produced_view[1] if produced_view else written) == (
+                stored_view[1] if stored_view else store[1]
+            )
             assert 'pto.wait_flag["PIPE_V", "PIPE_MTE3"' in vector[producer.end() : store.start()]
         assert {"cube", "vector"} == {domain["function"] for domain in manifest["domains"] if domain["owned"]}

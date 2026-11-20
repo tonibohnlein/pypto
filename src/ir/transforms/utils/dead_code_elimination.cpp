@@ -847,6 +847,11 @@ std::vector<StmtPtr> EliminateDeadCode(const std::vector<StmtPtr>& stmts) {
   return EliminateDeadCodeCore(stmts, IsRemovableForDefaultDce);
 }
 
+std::vector<StmtPtr> EliminateDeadCode(const std::vector<StmtPtr>& stmts,
+                                       const std::function<bool(const StmtPtr&)>& can_remove) {
+  return EliminateDeadCodeCore(stmts, can_remove);
+}
+
 std::vector<StmtPtr> EliminateDeadScalarAssignments(const std::vector<StmtPtr>& stmts) {
   return EliminateDeadCodeCore(stmts, IsRemovableScalarAssign);
 }

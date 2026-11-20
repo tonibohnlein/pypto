@@ -22,6 +22,7 @@
 #include "pypto/backend/common/buffer_axis_recipes.h"
 #include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_indexed_recipes.h"
+#include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
@@ -115,10 +116,10 @@ class BufferValidAnalysis : public IRVisitor {
       if (identity && (views_.IsWindow(call->args_[0]) || !views_.HasDenseRowPitch(call->args_[0])))
         vector_reshape = false;
     }
-    if ((IsOp(call, "tile.reshape") && !vector_reshape) || IsOp(call, "tile.reinterpret_view") ||
-        IsOp(call, "tile.assemble") || IsOp(call, "tile.move") || IsOp(call, "tile.extract") ||
-        IsOp(call, "tile.transpose_view") || IsOp(call, "tile.matmul") || IsOp(call, "tile.matmul_acc") ||
-        IsOp(call, "tile.transpose")) {
+    if ((IsOp(call, "tile.reshape") && !vector_reshape && !HasIndependentStaticReshape(call)) ||
+        IsOp(call, "tile.reinterpret_view") || IsOp(call, "tile.assemble") || IsOp(call, "tile.move") ||
+        IsOp(call, "tile.extract") || IsOp(call, "tile.transpose_view") || IsOp(call, "tile.matmul") ||
+        IsOp(call, "tile.matmul_acc") || IsOp(call, "tile.transpose")) {
       restricted_ = true;
     }
     if (restricted_ && !restricted_operation_) {
@@ -139,6 +140,25 @@ class BufferValidAnalysis : public IRVisitor {
   }
 
  private:
+  bool HasIndependentStaticReshape(const CallPtr& call) const {
+    if (call->args_.size() != 2 || !call->kwargs_.empty()) return false;
+    const auto& source = call->args_[0];
+    const auto window = views_.Get(source);
+    if (!views_.HasDenseRowPitch(source) ||
+        (window.window &&
+         (!window.root || !window.offsets || NeedsRuntimeBufferValid(window.root->GetType())))) {
+      return false;
+    }
+    const auto from = backend::StaticLogicalBufferDescriptor(source->GetType());
+    const auto to = backend::StaticLogicalBufferDescriptor(call->GetType());
+    const auto bytes = backend::DenseBufferBytes(from);
+    // Full static view metadata is independent of dynamic extents elsewhere.
+    // A view of a runtime-valid parent can be guarded, and still needs the
+    // conservative path until reshape can carry that guard.
+    return bytes && to && from->dtype_ == to->dtype_ && from->valid_shape_ == from->shape_ &&
+           to->valid_shape_ == to->shape_ && bytes == backend::DenseBufferBytes(to);
+  }
+
   void RecordObligation(const ExprPtr& expression) {
     if (!supported() && !first_obligation_) {
       first_obligation_ = valid_ && restricted_operation_ ? restricted_operation_ : expression;

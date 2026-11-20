@@ -34,6 +34,10 @@ def _pair(
     vector_depth = depth if vector_depth is None else vector_depth
     push = "\n".join(["pl.tpush_to_aiv(result, split=0)"] * sends)
     barrier_stmt = "pl.system.syncall(core_type=pl.KernelType.MIX)"
+    if collective == "default":
+        barrier_stmt = 'pl._dump.call("system.syncall", [], pl._dump.Unknown)'
+    if collective == "soft":
+        barrier_stmt = "pl.system.syncall(mode=pl.SyncAllMode.SOFT, gm_workspace=workspace, used_cores=3)"
     cube_body = (
         push
         + """
@@ -55,7 +59,7 @@ for j in pl.range(2):
             + "\nelse:\n"
             + indent(shadow, "    ")
         )
-    if collective == "loop":
+    if collective in ("loop", "default", "soft"):
         cube_body += "\n" + barrier_stmt
         vector_body += "\n" + barrier_stmt
     if symbolic:
@@ -69,6 +73,9 @@ for j in pl.range(2):
         vector_body = barrier_stmt + "\n" + vector_body
     params = ", n: pl.Scalar[pl.INDEX], m: pl.Scalar[pl.INDEX]" if symbolic else ""
     args = "x, n, m" if symbolic else "x"
+    if collective == "soft":
+        params += ", workspace: pl.Tensor[[16], pl.INT32]"
+        args += ", workspace"
     calls = f"self.cube({args})\nself.vector({args})" if group_calls is None else group_calls
     return pl.parse_program(f"""
 @pl.program
@@ -116,6 +123,8 @@ class PeerExample:
         ({"symbolic": True}, "FIFO ready/credit progress proved"),
         ({"symbolic": True, "same_bounds": False}, "stream counts, loop domains or message types differ"),
         ({"symbolic": True, "collective": "loop"}, "MIX rendezvous in a symbolic loop"),
+        ({"collective": "default"}, "FIFO ready/credit progress proved"),
+        ({"collective": "soft"}, "unmodeled peer rendezvous"),
         ({"collective": "mismatched"}, "FIFO ready/credit or rendezvous cycle"),
         (
             {"group_calls": "self.cube(x)\nself.vector(x)\nself.vector(x)"},

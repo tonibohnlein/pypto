@@ -40,9 +40,11 @@
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
+#include "pypto/ir/transforms/utils/dead_code_elimination.h"
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
 #include "pypto/ir/transforms/utils/loop_state_repair.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/return_lineage_utils.h"
 #include "pypto/ir/transforms/utils/split_axis_utils.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
@@ -205,6 +207,52 @@ StmtPtr SubstituteStmtIfNeeded(const StmtPtr& stmt, const ExprReplacementMap& re
   return transform_utils::Substitute(stmt, replacements);
 }
 
+bool IsReplayTileProducer(const CallPtr& call, bool remove_unused) {
+  const auto* entry = LookupOpEntry(call->op_);
+  if (!entry || entry->GetIRStage() != OpIRStage::Functional || entry->GetOpCategory() != "TileOp" ||
+      entry->IsNoDuplicate() || entry->GetCrossCoreRole() || entry->GetOutputReusesInputArg()) {
+    return false;
+  }
+  // Out-of-place FillPad has one source and a fresh result. Other producers must
+  // claim functional access, or have no accesses and an unused result.
+  const auto evidence = entry->GetExecutionMemoryAccessEvidence();
+  if (!IsOp(call, "tile.fillpad") && evidence != ExecutionMemoryAccessEvidence::Functional &&
+      !(remove_unused && evidence == ExecutionMemoryAccessEvidence::NoAccess)) {
+    return false;
+  }
+  for (size_t i = 0; i < call->args_.size(); ++i) {
+    const auto& arg = call->args_[i];
+    const auto tuple = As<MakeTuple>(arg);
+    const bool shape = evidence == ExecutionMemoryAccessEvidence::NoAccess && tuple &&
+                       std::all_of(tuple->elements_.begin(), tuple->elements_.end(),
+                                   [](const auto& dim) { return As<ConstInt>(dim) || AsVarLike(dim); });
+    if ((!AsVarLike(arg) && !As<ConstInt>(arg) && !As<ConstFloat>(arg) && !As<ConstBool>(arg) && !shape) ||
+        entry->IsLaneInvariantArg(i) || entry->GetArgEffect(i, call->kwargs_) != ArgEffect::Read) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool CanReplaceMinimumPadWithEmptyTile(const CallPtr& call, const TileTypePtr& result) {
+  return result && result->GetMemorySpace() == MemorySpace::Vec &&
+         tile_view_semantics::GetEffectiveTileView(*result).pad == PadValue::min &&
+         !op_predicates::OutputInheritsSourceBuffer(call->op_->name_) && IsReplayTileProducer(call, false);
+}
+
+bool CanRemoveUnusedEmptyReplayTile(const StmtPtr& stmt) {
+  const auto assign = As<AssignStmt>(stmt);
+  const auto result = As<TileType>(assign ? assign->var_->GetType() : nullptr);
+  const auto call = As<Call>(assign ? assign->value_ : nullptr);
+  if (!result || !call || result->GetMemorySpace() != MemorySpace::Vec || dce::IsSideEffectOp(stmt))
+    return false;
+  const auto valid = tile_view_semantics::GetEffectiveTileView(*result).valid_shape;
+  return !valid.empty() && std::all_of(valid.begin(), valid.end(), [](const auto& extent) {
+    const auto constant = As<ConstInt>(extent);
+    return constant && constant->value_ == 0;
+  }) && IsReplayTileProducer(call, true);
+}
+
 CallPtr RebuildLane1CallWithZeroValidShape(const CallPtr& call, const ExprReplacementMap& replacements) {
   auto replay_type = SubstituteExprIfNeeded(call, replacements)->GetType();
   std::vector<ExprPtr> new_args;
@@ -215,7 +263,6 @@ CallPtr RebuildLane1CallWithZeroValidShape(const CallPtr& call, const ExprReplac
     args_changed = args_changed || (new_arg != arg);
     new_args.push_back(new_arg);
   }
-
   if (IsOp(call, "tile.load") && new_args.size() >= 3) {
     auto new_type = WithZeroValidShape(replay_type, call->span_);
     auto tile_type = std::dynamic_pointer_cast<const TileType>(new_type);
@@ -258,7 +305,8 @@ CallPtr RebuildLane1CallWithZeroValidShape(const CallPtr& call, const ExprReplac
                                   call->span_);
   } else if (IsOp(call, "tile.transpose") || IsOp(call, "tile.fmods") || IsOp(call, "tile.rems") ||
              IsOp(call, "tile.row_max") || IsOp(call, "tile.row_min") || IsOp(call, "tile.row_sum") ||
-             IsOp(call, "tile.row_prod")) {
+             IsOp(call, "tile.row_prod") ||
+             CanReplaceMinimumPadWithEmptyTile(call, As<TileType>(replay_type))) {
     // Metadata-only reshape/reinterpret/transpose views use the generic rebuild
     // below: they must keep aliasing FIFO storage, even when their valid area is
     // empty. Replacing them with tile.create allocates a full discarded payload.
@@ -680,7 +728,8 @@ FunctionPtr ProcessNoSplitDualAivFunction(const FunctionPtr& func) {
 
   ExprReplacementMap lane1_replacements;
   auto lane1_stmts = BuildNoSplitLane1ReplayStmts(hoisted_prefix.branch_stmts, lane1_replacements);
-  auto lane1_body = loop_repair::MakeBody(lane1_stmts, func->span_);
+  auto lane1_body =
+      loop_repair::MakeBody(dce::EliminateDeadCode(lane1_stmts, CanRemoveUnusedEmptyReplayTile), func->span_);
   auto [lane1_cloned_body, lane1_clone_map_unused] = DeepClone(lane1_body);
   (void)lane1_clone_map_unused;
   lane1_body = lane1_cloned_body;

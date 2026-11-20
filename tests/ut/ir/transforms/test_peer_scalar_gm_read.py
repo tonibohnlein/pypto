@@ -31,6 +31,7 @@ def _program(
     writer: bool = False,
     alias: str = "",
     columns: str = "16",
+    fresh_writer: bool = False,
 ) -> ir.Program:
     source = f"pl.Tensor[[16, {columns}], pl.FP32]" if rank_two else "pl.Tensor[[length], pl.INT32]"
     coordinates = f"[{coordinate}, 0]" if rank_two else f"[{coordinate}]"
@@ -41,7 +42,8 @@ def _program(
         else ""
     )
     vector_actual = "table" if alias == "group" else "out"
-    group_actual = "table" if alias == "root" else "out"
+    group_actual = "table" if alias == "root" else "scratch" if fresh_writer else "out"
+    allocation = "scratch = pl.create_tensor([16, 16], dtype=pl.FP32)" if fresh_writer else ""
     return pl.parse_program(f"""
 length = pl.dynamic("length")
 
@@ -79,6 +81,7 @@ class PeerScalarRead:
     def main(self, table: {source}, rhs: pl.Tensor[[32, 16], pl.FP16],
              x: pl.Tensor[[16, 16], pl.FP16], out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
              position: pl.Scalar[pl.{position_type}]):
+        {allocation}
         self.paired(table, rhs, x, {group_actual}, position)
 """)
 
@@ -132,6 +135,7 @@ def test_original_peer_scalar_load_delegates_without_qualification(options, disj
     "options,disjoint",
     [
         pytest.param({}, False, id="read-only-dispatch"),
+        pytest.param({"writer": True, "fresh_writer": True}, False, id="fresh-writer-under-may-alias"),
         pytest.param({"writer": True}, True, id="rank-one-read-with-disjoint-writer"),
         pytest.param({"writer": True, "rank_two": True}, True, id="rank-two-read-with-disjoint-writer"),
     ],
@@ -163,6 +167,59 @@ def test_owned_peer_scalar_read_emits_original_native_load(tmp_path, options, di
     assert "dcci(" not in body and "PTOAS__DCCI" not in body
 
 
+def test_known_external_base_alias_overrides_disjoint_contract():
+    snapshots = []
+
+    def capture(transform, current):
+        if transform.get_name() == "RealizeSync":
+            snapshots.append(current)
+
+    with _context(True, [passes.CallbackInstrument(before_pass=capture)]):
+        PassManager(ir.OptimizationStrategy.Default).run_passes(_program(writer=True, rank_two=True))
+    (program,) = snapshots
+    main = program.get_function("main")
+    assert main is not None
+    table, _, _, out, *_ = main.params
+    assert table.type.memref is not None
+    shared = ir.Var(
+        out.name_hint,
+        ir.TensorType(out.type.shape, out.type.dtype, table.type.memref, out.type.tensor_view),
+        out.span,
+    )
+
+    class Rebind(ir.IRMutator):
+        def visit_var(self, op):
+            return shared if op.same_as(out) else op
+
+    patched = ir.Function(
+        main.name,
+        [
+            (shared if var.same_as(out) else var, direction)
+            for var, direction in zip(main.params, main.param_directions, strict=True)
+        ],
+        main.return_types,
+        Rebind().visit_stmt(main.body),
+        main.span,
+        main.func_type,
+        main.level,
+        main.role,
+        main.attrs,
+        main.requires_runtime_binding,
+        main.ir_stage,
+    )
+    forged = ir.Program(
+        [patched if f.name == main.name else f for f in program.functions.values()],
+        program.name,
+        program.span,
+    )
+    with _context(True):
+        lowered = passes.realize_sync()(forged)
+    for name in ("cube", "vector"):
+        endpoint = lowered.get_function(name)
+        assert endpoint is not None and not endpoint.attrs[PYPTO_AUTOSYNC_ATTR]
+        assert "aliases a GM write" in endpoint.attrs[AUTOSYNC_FALLBACK_REASON_ATTR]
+
+
 def test_realize_sync_keeps_placed_functional_peer_compatibility():
     placed = []
 
@@ -177,5 +234,6 @@ def test_realize_sync_keeps_placed_functional_peer_compatibility():
         owned = passes.realize_sync()(placed[0])
     for name in ("cube", "vector"):
         endpoint = owned.get_function(name)
+        assert endpoint is not None
         assert endpoint.ir_stage == ir.FunctionIRStage.Functional
         assert endpoint.attrs[PYPTO_AUTOSYNC_ATTR], endpoint.attrs

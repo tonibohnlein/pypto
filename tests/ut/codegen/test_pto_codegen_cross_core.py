@@ -43,6 +43,10 @@ from pypto.runtime import RunConfig
 
 from tests.ut.codegen.peer_native_order_oracle import NativeReceiveReplay
 
+_BUFFER_PEER_POP = ir.get_op("buffer.peer_pop").name
+_BUFFER_PEER_FREE = ir.get_op("buffer.peer_free").name
+_BUFFER_ADD = ir.get_op("buffer.add").name
+
 
 def _extract_func_section(mlir_code: str, func_name: str) -> str:
     """Return the MLIR slice for a single func.func body."""
@@ -165,6 +169,7 @@ def _mat_receive_epilogue(
     two_readers=False,
     work_items=None,
     work_stride="workers",
+    region_boundaries=(),
     pad=None,
 ):
     """Each new pop overwrites the Mat slot read two transfers earlier."""
@@ -214,6 +219,8 @@ def _mat_receive_epilogue(
     # The suffix overwrites the first prefix slot even when this core has no work.
     receiver = work_loop(pops, [visit_ops("prefix0", 0), visit_ops("prefix1", 16)], [visit_ops("suffix", 32)])
     sender = work_loop([push] * sends, [push, push], [push])
+    receiver = "\n".join([receiver, *(f"{boundary}\n{receiver}" for boundary in region_boundaries)])
+    sender = "\n".join([sender, *(f"{boundary}\n{sender}" for boundary in region_boundaries)])
 
     return pl.parse_program(f"""
 @pl.program
@@ -310,9 +317,9 @@ def test_unqualified_matrix_pad_keeps_functional_unit(dtype, pad):
     program = _mat_receive_epilogue(128, dtype, 2, pad=pad)
     with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO, enable_buffer_ir=True):
         lowered = ir.PassManager(ir.OptimizationStrategy.Default).run_passes(program)
-    assert all(
-        lowered.get_function(name).ir_stage == ir.FunctionIRStage.Functional for name in ("cube", "vector")
-    )
+    for name in ("cube", "vector"):
+        endpoint = lowered.get_function(name)
+        assert endpoint is not None and endpoint.ir_stage == ir.FunctionIRStage.Functional
 
 
 @pytest.mark.usefixtures("ascend_backend")
@@ -325,9 +332,12 @@ def test_buffer_selection_checks_every_device_member_of_peer_emission_unit():
             program = transform(program)
         selector = passes.select_buffer_ir_functions()
         original = selector(program)
-        assert all(original.get_function(name).attrs["buffer_ir_selected"] for name in ("cube", "vector"))
+        for name in ("cube", "vector"):
+            endpoint = original.get_function(name)
+            assert endpoint is not None and endpoint.attrs["buffer_ir_selected"]
 
         group = program.get_function("paired")
+        assert group is not None and isinstance(group.body, ir.SeqStmts)
         span = group.span
         extra = ir.Function("extra", [], [], ir.ReturnStmt([], span), span, ir.FunctionType.AIV)
         call = ir.EvalStmt(ir.Call(ir.GlobalVar("extra"), [], ir.VoidType(), span), span)
@@ -348,9 +358,12 @@ def test_buffer_selection_checks_every_device_member_of_peer_emission_unit():
         assert {fn.name for fn in groups[group.name]} == {"cube", "vector", "extra"}
         selected = selector(program)
 
-    assert selected.get_function("extra").attrs["buffer_admission_property"] == "load_or_fill_and_store"
+    extra = selected.get_function("extra")
+    assert extra is not None and extra.attrs["buffer_admission_property"] == "load_or_fill_and_store"
     for name in ("cube", "vector"):
-        refusal = selected.get_function(name).attrs["buffer_admission_property"]
+        endpoint = selected.get_function(name)
+        assert endpoint is not None
+        refusal = endpoint.attrs["buffer_admission_property"]
         assert refusal == "delegated_peer_compilation_unit"
 
 
@@ -637,17 +650,20 @@ return pl.store(total, [0, 0], out)
             self.released = False
 
         def visit_call(self, op):
-            if op.op.name == "buffer.peer_pop":
+            if op.op.name == _BUFFER_PEER_POP:
+                reserve = op.args[0]
+                assert isinstance(reserve, ir.Var)
                 if self.reserve is None:
-                    self.reserve = op.args[0]
-                elif self.mode == "swap" and self.reserve.name_hint != op.args[0].name_hint:
+                    self.reserve = reserve
+                elif self.mode == "swap" and self.reserve.name_hint != reserve.name_hint:
                     args = [self.reserve, *op.args[1:]]
                     return ir.Call(op.op, args, dict(op.kwargs), dict(op.attrs), op.type, op.span)
-            if op.op.name == "buffer.peer_free" and self.first is None:
+            if op.op.name == _BUFFER_PEER_FREE and self.first is None:
                 self.first = op.args[0]
                 self.released = True
-            if op.op.name == "buffer.add" and self.released and self.mode == "released":
+            if op.op.name == _BUFFER_ADD and self.released and self.mode == "released":
                 self.released = False
+                assert self.first is not None
                 args = [self.first, op.args[1], op.args[2]]
                 return ir.Call(op.op, args, dict(op.kwargs), dict(op.attrs), op.type, op.span)
             return super().visit_call(op)
@@ -717,6 +733,7 @@ return pl.store(pl.add(pl.add(slot0_reader, slot1_independent_reader), third_rea
         return NativeReceiveReplay(body, whole_vec_body=True)
 
     replay = replay_body(active)
+    assert replay.geometry is not None
     assert replay.geometry[:3] == (2048, 4, 2)
     assert len(replay.pops) == 3 and all(replay.readers)
     missing, extra, premature_reuse = replay.compare()
@@ -772,8 +789,9 @@ return pl.store(result, [8, 0], out)
     )
     with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO, enable_buffer_ir=True):
         lowered = ir.PassManager(ir.OptimizationStrategy.Default).run_passes(program)
-    assert lowered.get_function("paired_aic").ir_stage == ir.FunctionIRStage.Buffer
-    assert lowered.get_function("paired_aiv").ir_stage == ir.FunctionIRStage.Buffer
+    for name in ("paired_aic", "paired_aiv"):
+        endpoint = lowered.get_function(name)
+        assert endpoint is not None and endpoint.ir_stage == ir.FunctionIRStage.Buffer
     namespace = {}
     exec(torch_codegen(lowered), namespace)  # noqa: S102
     x = torch.cat((torch.eye(16, dtype=torch.float16), torch.zeros((16, 16), dtype=torch.float16)))

@@ -157,6 +157,8 @@ bool IsPeerReserveDescriptor(const BufferTypePtr& type);
 BufferTypePtr MakePeerReserveDescriptor(int64_t bytes, MemorySpace space);
 
 bool IsPeerPipeSetup(const CallPtr& call);
+// Existing no-argument hard MIX barrier. It is emitted at the original cut.
+bool IsHardMixedSyncAll(const CallPtr& call);
 bool IsBufferPeerTransport(const CallPtr& call);
 
 /// Return sites in both arms of a terminal dual-AIV dispatch branch.
