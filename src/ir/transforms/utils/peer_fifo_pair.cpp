@@ -525,7 +525,10 @@ FunctionPtr PlanLocalEndpoint(const WrapperCallInfo& call, const FunctionPtr& gr
   const auto borrow = AnalyzePeerBorrowUses(fn, transport);
   CHECK(borrow.unavailable.empty()) << borrow.unavailable;
 
-  const auto local = ImportPeerLocalEffects(fn, transport, "a2a3");
+  const auto parameters = invocation.parameters.find(fn->name_);
+  const auto local = ImportPeerLocalEffects(
+      fn, transport, "a2a3",
+      parameters == invocation.parameters.end() ? SyncParameterBounds{} : parameters->second);
   const auto workspace = std::find_if(group->params_.begin(), group->params_.end(), [](const VarPtr& formal) {
     return formal->name_hint_ == "__gm_pipe_buffer";
   });

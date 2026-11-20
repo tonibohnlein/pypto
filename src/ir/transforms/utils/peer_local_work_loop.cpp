@@ -1,0 +1,230 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include "src/ir/transforms/utils/peer_local_work_loop.h"
+
+#include <algorithm>
+#include <array>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <numeric>
+#include <set>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include "pypto/core/logging.h"
+#include "pypto/ir/op_registry.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
+#include "src/ir/transforms/utils/closed_prefix_sync.h"
+#include "src/ir/transforms/utils/sync_statement_rewrite.h"
+
+namespace pypto::ir::sync {
+namespace {
+
+constexpr int64_t kMovingSlot = -1, kAllSlots = -2;
+struct Effect {
+  size_t storage;
+  int64_t slot, begin, end;
+  PipeType pipe;
+  bool write, following;
+};
+
+// All access coordinates of a runtime work item have the same incoming ring
+// rotation. After any number of items the difference in origin is a multiple
+// of gcd(depth, pops/item). Fixed residues still distinguish disjoint slots,
+// including the phase-neutral case. A varying residue in a finite child loop
+// uses the whole orbit so crossing analysis never enumerates loop trips.
+void CollectEffects(const PeerLocalLane& lane, PeerWorkRange range, bool following,
+                    std::vector<Effect>& effects) {
+  const auto& advance = lane.work_loop->ring_advance;
+  for (size_t r = range.first; r < range.second; ++r) {
+    const auto& segment = lane.input.segments[r];
+    if (!segment.count) {
+      continue;
+    }
+    for (const auto& site : segment.sites) {
+      for (const auto& access : site.accesses) {
+        INTERNAL_CHECK(access.row == 0 && access.rows == 1 && !access.row_step && !access.column_step &&
+                       access.column >= 0 && access.columns > 0);
+        const auto& storage = lane.input.storage[access.storage];
+        INTERNAL_CHECK(access.column <= storage.columns && access.columns <= storage.columns - access.column);
+        const auto pop = advance.find(access.storage);
+        const auto modulus = std::gcd(storage.slot_count, pop == advance.end() ? 0 : pop->second);
+        const auto slot =
+            segment.count > 1 && access.slot_step % modulus ? kMovingSlot : access.slot_first % modulus;
+        effects.push_back({access.storage, slot, access.column, access.column + access.columns, site.pipe,
+                           access.write, following});
+      }
+    }
+  }
+}
+
+using EffectKey = std::pair<size_t, int64_t>;
+using PipeEnds = std::array<int64_t, kPipeCount>;
+using PrefixEnds = std::array<std::array<PipeEnds, 2>, 2>;
+
+void AddOverlaps(const PrefixEnds& ends, const Effect& effect, PeerWorkPairs& result) {
+  const auto& other = ends[!effect.following];
+  for (size_t p = 0; p < kPipeCount; ++p) {
+    if (other[true][p] > effect.begin || (effect.write && other[false][p] > effect.begin)) {
+      const auto pipe = static_cast<PipeType>(p);
+      if (effect.pipe != PipeType::S || pipe != PipeType::S) {
+        result.emplace(std::min(pipe, effect.pipe), std::max(pipe, effect.pipe));
+      }
+    }
+  }
+}
+
+void Remember(PrefixEnds& ends, const Effect& effect) {
+  auto& end = ends[effect.following][effect.write][static_cast<size_t>(effect.pipe)];
+  end = std::max(end, effect.end);
+}
+
+StmtPtr MakeFlag(const char* op, SyncDirection pipes, int id, const std::string& core, const Span& span) {
+  const auto call = OpRegistry::GetInstance().Create(op, {},
+                                                     {{"src_pipe", static_cast<int>(pipes.first)},
+                                                      {"dst_pipe", static_cast<int>(pipes.second)},
+                                                      {"event_id", id},
+                                                      {"core_type", core}},
+                                                     span);
+  return std::make_shared<EvalStmt>(call, span);
+}
+
+// A seam transaction on A and B covers both directions. A sets, B consumes
+// and acknowledges, then A consumes the acknowledgement. The next A set is
+// queued after that acknowledgement wait, and the next B acknowledgement
+// follows the next A set. This closes each ID even when the loop repeats and
+// a queue can run ahead. Each unordered pair keeps one orientation and
+// dedicated IDs, so other pairs and interior schedules cannot rearm them.
+void AppendSeam(std::vector<StmtPtr>& stmts, const PeerWorkPairs& pairs, const PeerWorkSeamIds& ids,
+                FunctionType type, const Span& span) {
+  const std::string core = type == FunctionType::AIV ? "aiv" : "aic";
+  std::set<PipeType> already_completed;
+  for (const auto& [source, target] : pairs) {
+    if (source == target) {
+      continue;
+    }
+    const SyncDirection forward{source, target}, reverse{target, source};
+    stmts.push_back(MakeFlag("system.set_flag", forward, ids.at(forward), core, span));
+    stmts.push_back(MakeFlag("system.wait_flag", forward, ids.at(forward), core, span));
+    stmts.push_back(MakeFlag("system.set_flag", reverse, ids.at(reverse), core, span));
+    stmts.push_back(MakeFlag("system.wait_flag", reverse, ids.at(reverse), core, span));
+    // Only A consumes an acknowledgement of its own prefix. The first wait
+    // on B gates its future payloads on A's prefix, not its own.
+    already_completed.insert(source);
+  }
+  for (const auto& [source, target] : pairs) {
+    if (source == target && !already_completed.count(source)) {
+      const auto op = RequireLocalSyncBarrier(source, type);
+      INTERNAL_CHECK(op) << "Peer work-item seam must not request an explicit scalar barrier";
+      const auto call = OpRegistry::GetInstance().Create(op, {}, {{"core_type", core}}, span);
+      stmts.push_back(std::make_shared<EvalStmt>(call, span));
+    }
+  }
+}
+
+class WorkLoopSeams : public SyncStatementMutator {
+ public:
+  WorkLoopSeams(const PeerLocalWorkLoop& loop, const PeerWorkPairs& entry, const PeerWorkPairs& exit,
+                const PeerWorkSeamIds& ids, FunctionType type)
+      : loop_(loop), entry_(entry), exit_(exit), ids_(ids), type_(type) {}
+
+  StmtPtr Run(const StmtPtr& body) {
+    auto result = VisitStmt(body);
+    INTERNAL_CHECK(found_) << "Original runtime work-loop cut was lost during local planning";
+    return result;
+  }
+
+ private:
+  const PeerLocalWorkLoop& loop_;
+  const PeerWorkPairs& entry_;
+  const PeerWorkPairs& exit_;
+  const PeerWorkSeamIds& ids_;
+  const FunctionType type_;
+  bool found_ = false;
+
+  StmtPtr CompleteItem(const StmtPtr& original, const Span& span) const {
+    auto flattened = original;
+    if (const auto seq = As<SeqStmts>(original)) {
+      // A terminal yield can sit under arbitrarily nested transparent
+      // sequences. Do not enter child loops: they own their own yield.
+      flattened = RewriteSyncSequence(seq, [](const StmtPtr& stmt) { return stmt; });
+    }
+    auto body = transform_utils::FlattenToStmts(flattened);
+    StmtPtr yield;
+    if (!body.empty() && IsA<YieldStmt>(body.back())) {
+      yield = body.back();
+      body.pop_back();
+    }
+    AppendSeam(body, exit_, ids_, type_, span);
+    if (yield) {
+      body.push_back(std::move(yield));
+    }
+    return SeqStmts::Flatten(std::move(body), original->span_);
+  }
+
+  StmtPtr VisitStmt_(const ForStmtPtr& loop) override {
+    if (loop->loop_var_ != loop_.original->loop_var_) {
+      return SyncStatementMutator::VisitStmt_(loop);
+    }
+    INTERNAL_CHECK(!found_);
+    found_ = true;
+    StmtPtr updated = loop;
+    if (!exit_.empty()) {
+      auto with_exit = MutableCopy(loop);
+      with_exit->body_ = CompleteItem(loop->body_, loop->span_);
+      updated = std::move(with_exit);
+    }
+    std::vector<StmtPtr> stmts;
+    AppendSeam(stmts, entry_, ids_, type_, loop->span_);
+    stmts.push_back(std::move(updated));
+    return SeqStmts::Flatten(std::move(stmts), loop->span_);
+  }
+};
+
+}  // namespace
+
+void AddPeerWorkConflicts(const PeerLocalLane& lane, PeerWorkRange earlier, PeerWorkRange later,
+                          PeerWorkPairs& pairs) {
+  std::vector<Effect> effects;
+  CollectEffects(lane, earlier, false, effects);
+  CollectEffects(lane, later, true, effects);
+  std::sort(effects.begin(), effects.end(), [](const auto& a, const auto& b) {
+    return std::tie(a.storage, a.begin) < std::tie(b.storage, b.begin);
+  });
+  // Half-open byte intervals. The maximum end of each earlier-starting group
+  // suffices to test all opposite-phase read/write overlaps at this cut.
+  std::map<EffectKey, PrefixEnds> seen;
+  for (const auto& effect : effects) {
+    const EffectKey all{effect.storage, kAllSlots}, exact{effect.storage, effect.slot};
+    if (effect.slot == kMovingSlot) {
+      AddOverlaps(seen[all], effect, pairs);
+    } else {
+      AddOverlaps(seen[exact], effect, pairs);
+      AddOverlaps(seen[{effect.storage, kMovingSlot}], effect, pairs);
+    }
+    Remember(seen[exact], effect);
+    Remember(seen[all], effect);
+  }
+}
+
+FunctionPtr AddPeerWorkSeams(const FunctionPtr& function, const PeerLocalWorkLoop& loop,
+                             const PeerWorkPairs& entry, const PeerWorkPairs& exit,
+                             const PeerWorkSeamIds& ids) {
+  auto result = MutableCopy(function);
+  result->body_ = WorkLoopSeams(loop, entry, exit, ids, function->func_type_).Run(function->body_);
+  return result;
+}
+
+}  // namespace pypto::ir::sync

@@ -10,6 +10,7 @@
 """Replay original FIFO ordinals against the single-core command graph."""
 
 import json
+from collections import defaultdict
 
 import pytest
 from pypto import ir, passes
@@ -31,20 +32,28 @@ from .test_finite_sync_analysis import closure
 class MatSlotCommands(ClosedCommands):
     """The native receive cursor advances once per executed pop, including loop visits."""
 
-    def __init__(self, fn, depth, *, drop_releases=False):
+    def __init__(self, fn, depth, *, drop_releases=False, core=0, workers=1):
         super().__init__(fn, {}, range(8))
         self.env.update({param: 0 for param in fn.params})
+        self.coordinates = {opname("tile.get_block_idx"): core, opname("tile.get_block_num"): workers}
         self.depth = depth
         self.drop_releases = drop_releases
         self.pops = []
         self.readers = []
         self.order_checks = []
+        self.local_accesses = defaultdict(list)
+        self.local_checks = []
+        self.gm_writers = {}
+        self.gm_checks = []
 
     def assign(self, statement, env):
         call = statement.value
         if not isinstance(call, ir.Call):
             return super().assign(statement, env)
         name = call.op.name
+        if name in self.coordinates:
+            env[statement.var] = self.coordinates[name]
+            return
         if name in (
             ir.get_op("tile.alloc").name,
             ir.get_op("system.reserve_buffer").name,
@@ -68,6 +77,34 @@ class MatSlotCommands(ClosedCommands):
         self.edge(issue, done)
         self.edge(self.last_payload.get(pipe), done)
         self.last_payload[pipe] = done
+        # All Left, Right and Acc accesses in this fixture use complete tiles.
+        # Compare physical addresses even if different SSA names reuse a tile.
+        for operand, write in [(arg, False) for arg in call.args] + [(statement.var, True)]:
+            kind = operand.type
+            if not isinstance(kind, ir.TileType) or kind.memory_space not in (
+                ir.MemorySpace.Left,
+                ir.MemorySpace.Right,
+                ir.MemorySpace.Acc,
+            ):
+                continue
+            assert kind.memref is not None and isinstance(kind.memref.byte_offset_, ir.ConstInt)
+            accesses = self.local_accesses[kind.memory_space, kind.memref.byte_offset_.value]
+            self.local_checks.extend(
+                (older_done, issue)
+                for older_pipe, older_write, older_done in accesses
+                if pipe != older_pipe and (write or older_write)
+            )
+            accesses.append((pipe, write, done))
+        if name == opname("tile.store"):
+            # All stores write a 16-by-16 window of the same output. Distinct
+            # row offsets in this fixture are multiples of 16.
+            indices = call.args[1]
+            assert isinstance(indices, ir.MakeTuple)
+            offsets = tuple(index.value for index in indices.elements if isinstance(index, ir.ConstInt))
+            assert len(offsets) == 2
+            if offsets in self.gm_writers:
+                self.gm_checks.append((self.gm_writers[offsets], issue))
+            self.gm_writers[offsets] = done
         if name == ir.get_op("tile.tpop_from_aiv").name:
             visit = len(self.pops)
             if visit >= self.depth:
@@ -147,6 +184,85 @@ def test_last_reader_reaches_epilogue(tmp_path, trips, per_trip, two_readers):
             assert (reader, ("issue", pop[1])) not in broken
 
 
+@pytest.mark.ptoas_compile
+@pytest.mark.usefixtures("ascend_backend")
+@pytest.mark.parametrize("inner_trips", [1, 2])
+def test_runtime_work_loop_composes_slot_releases(tmp_path, inner_trips):
+    snapshots = []
+
+    def capture(transform, program):
+        if transform.get_name() == "RealizeSync":
+            snapshots.append(program)
+
+    cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
+    with passes.PassContext(
+        [passes.CallbackInstrument(after_pass=capture)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+    ):
+        # Three pops per item rotate the entry slot. Four return to the same slot.
+        program = _mat_receive_epilogue(128, "BF16", 2, loop=(inner_trips, 1), work_items=5)
+        ir.compile(program, **cfg.compile_kwargs())
+    manifest = json.loads((tmp_path / "ptoas" / "paired.sync.json").read_text())
+    cube = snapshots[0].get_function("cube")
+    vector = snapshots[0].get_function("vector")
+    assert manifest["owned"] and not manifest["ptoas_insert_sync"], (cube.attrs, vector.attrs)
+    for workers in (1, 2, 5, 6):
+        for core in range(workers):
+            state = MatSlotCommands(cube, 2, core=core, workers=workers)
+            order = state.run()
+            pops = 2 + len(range(core, 5, workers)) * (inner_trips + 2) + 1
+            assert len(state.pops) == len(state.readers) == pops
+            assert len(state.order_checks) == pops + max(0, pops - 2)
+            assert all(edge in order for edge in state.order_checks)
+            assert state.local_checks and all(edge in order for edge in state.local_checks)
+            assert all(edge in order for edge in state.gm_checks)
+            if workers == 1:
+                assert state.gm_checks
+            for subblock in (0, 1):
+                sender = PeerSenderCommands(vector, subblock, core=core, workers=workers)
+                sender.run()
+                assert sum(call.op.name in sender.push_pipes for call in sender.calls) == pops
+
+    # Delete the entry handoff and take the zero-trip path. The suffix now
+    # overwrites the first prefix slot without waiting for its reader.
+    stmts = cube.body.stmts
+    cut = next(i for i, stmt in enumerate(stmts) if isinstance(stmt, ir.ForStmt))
+    start = cut
+    while start and isinstance(stmts[start - 1], ir.EvalStmt):
+        if stmts[start - 1].expr.span.begin_line != stmts[cut].span.begin_line:
+            break
+        start -= 1
+    assert start < cut
+    mutant = MatSlotCommands(cube, 2, core=5, workers=6)
+    mutant.execute(ir.SeqStmts([*stmts[:start], *stmts[cut:]], cube.body.span), dict(mutant.env))
+    broken = closure(mutant.vertices, mutant.edges)
+    assert (mutant.readers[0], ("issue", mutant.pops[-1][1])) not in broken
+
+
+@pytest.mark.usefixtures("ascend_backend")
+def test_runtime_work_loop_requires_positive_stride():
+    # A core index may be zero. The same ready scalar is safe as a start but
+    # cannot serve as an unconditionally positive loop step.
+    source = _mat_receive_epilogue(128, "BF16", 2, loop=(1, 1), work_items=5, work_stride="core")
+    with passes.PassContext(
+        [],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+    ):
+        result = PassManager(ir.OptimizationStrategy.Default).run_passes(source)
+    for name in ("cube", "vector"):
+        endpoint = result.get_function(name)
+        assert endpoint is not None
+        attrs = endpoint.attrs
+        assert not attrs.get(PYPTO_AUTOSYNC_ATTR)
+        assert "proved positive" in attrs["autosync_fallback_reason"]
+
+
 class PeerSenderCommands(ClosedCommands):
     # This fixture models each original push as a native command, including
     # the zero-row lane's handshake, and tracks its completion at the exit.
@@ -161,16 +277,20 @@ class PeerSenderCommands(ClosedCommands):
         opname("tile.matmul"): ir.PipeType.M,
     }
 
-    def __init__(self, fn, subblock):
+    def __init__(self, fn, subblock, *, core=0, workers=1):
         super().__init__(fn, {}, range(8))
-        self.subblock = subblock
+        self.coordinates = {
+            opname("tile.get_subblock_idx"): subblock,
+            opname("tile.get_block_idx"): core,
+            opname("tile.get_block_num"): workers,
+        }
 
     def assign(self, statement, env):
         call = statement.value
         if isinstance(call, ir.Call):
             name = call.op.name
-            if name == opname("tile.get_subblock_idx"):
-                env[statement.var] = self.subblock
+            if name in self.coordinates:
+                env[statement.var] = self.coordinates[name]
                 return
             if name in (opname("tile.alloc"), opname("tile.create"), opname("system.import_peer_buffer")):
                 return

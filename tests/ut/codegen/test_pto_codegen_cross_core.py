@@ -133,7 +133,9 @@ class PairedConsumer:
 """)
 
 
-def _mat_receive_epilogue(width, dtype, ring_depth, *, sends=4, loop=None, two_readers=False):
+def _mat_receive_epilogue(
+    width, dtype, ring_depth, *, sends=4, loop=None, two_readers=False, work_items=None, work_stride="workers"
+):
     """Each new pop overwrites the Mat slot read two transfers earlier."""
     stride = 16 * width * 4
 
@@ -159,6 +161,27 @@ def _mat_receive_epilogue(width, dtype, ring_depth, *, sends=4, loop=None, two_r
         pops = [f"for i in pl.range({trips}):\n" + indent(body, "    ")]
         pops.extend(visit_ops(f"tail{i}", 16 * (i + 2)) for i in range(2))
         sends = trips * per_trip + 2
+
+    def work_loop(statements, prefix, suffix):
+        body = "\n".join(statements)
+        if work_items is None:
+            return body
+        return "\n".join(
+            [
+                *prefix,
+                "core = pl.tile.get_block_idx()",
+                "workers = pl.tile.get_block_num()",
+                f"for work in pl.range(core, {work_items}, {work_stride}):",
+                indent(body, "    "),
+                *suffix,
+            ]
+        )
+
+    push = "pl.tpush_to_aic(data, split=0)"
+    # The suffix overwrites the first prefix slot even when this core has no work.
+    receiver = work_loop(pops, [visit_ops("prefix0", 0), visit_ops("prefix1", 16)], [visit_ops("suffix", 32)])
+    sender = work_loop([push] * sends, [push, push], [push])
+
     return pl.parse_program(f"""
 @pl.program
 class MatReceiver:
@@ -170,7 +193,7 @@ class MatReceiver:
                                slot_num={ring_depth}, local_slot_num=2)
         matrix = pl.load(rhs, [0, 0], [{width}, 16], target_memory=pl.Mem.Mat)
         right = pl.move(matrix, target_memory=pl.Mem.Right)
-{indent(chr(10).join(pops), "        ")}
+{indent(receiver, "        ")}
         return out
 
     @pl.function(type=pl.FunctionType.AIV)
@@ -179,7 +202,7 @@ class MatReceiver:
         pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer, dir_mask=2, slot_size={stride},
                                slot_num={ring_depth}, local_slot_num=2)
         data = pl.load(x, [0, 0], [16, {width}], target_memory=pl.Mem.Vec)
-{indent(chr(10).join(["pl.tpush_to_aic(data, split=0)"] * sends), "        ")}
+{indent(sender, "        ")}
 
     @pl.function(type=pl.FunctionType.Group)
     def paired(self, rhs: pl.Tensor[[{width}, 16], pl.{dtype}], x: pl.Tensor[[16, {width}], pl.{dtype}],

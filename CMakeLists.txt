@@ -124,6 +124,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/peer_gm_invocation.cpp
     src/ir/transforms/utils/peer_local_effects.cpp
     src/ir/transforms/utils/peer_local_plan.cpp
+    src/ir/transforms/utils/peer_local_work_loop.cpp
     src/ir/transforms/utils/peer_fifo_pair.cpp
     src/ir/transforms/token_sync.cpp
     src/ir/transforms/utils/structured_token_sync.cpp

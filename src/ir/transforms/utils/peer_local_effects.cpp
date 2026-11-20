@@ -154,7 +154,7 @@ std::vector<std::vector<StmtPtr>> LaneStatements(const FunctionPtr& function) {
 class LaneImporter {
  public:
   LaneImporter(const FunctionPtr& function, const PeerTransportEffects& transport, const std::string& target,
-               std::set<size_t>& gm_formals)
+               const SyncParameterBounds& parameters, std::set<size_t>& gm_formals)
       : transport_(transport), backend_(*backend::BackendConfig::GetBackend()), gm_formals_(gm_formals) {
     result_.input.owner = function;
     result_.input.hardware_target = target;
@@ -194,6 +194,9 @@ class LaneImporter {
       const auto& parameter = function->params_[formal];
       if (As<ScalarType>(parameter->GetType())) {
         ready_.insert(parameter.get());
+        if (const auto bound = parameters.find(formal); bound != parameters.end()) {
+          coordinate_bounds_.emplace(parameter.get(), bound->second);
+        }
       } else if (As<TensorType>(parameter->GetType())) {
         gm_roots_.emplace(parameter.get(), formal);
       } else {
@@ -233,6 +236,8 @@ class LaneImporter {
   std::unordered_map<const PeerTransportSite*, int64_t> births_;
   std::unordered_set<const PeerTransportSite*> closed_;
   std::unordered_set<const Var*> ready_;
+  using CoordinateBounds = std::pair<int64_t, int64_t>;
+  std::unordered_map<const Var*, CoordinateBounds> coordinate_bounds_;
   mutable std::unordered_set<const Expr*> ready_expressions_;
   std::unordered_map<const Var*, TileWindow> local_;
   std::unordered_map<const Var*, size_t> gm_roots_;
@@ -254,6 +259,27 @@ class LaneImporter {
     }
     if (ready) ready_expressions_.insert(value.get());
     return ready;
+  }
+
+  std::optional<CoordinateBounds> Bounds(const ExprPtr& value) const {
+    const auto maximum = SyncCoordinateMaximum(value);
+    if (!maximum) {
+      return std::nullopt;
+    }
+    std::optional<CoordinateBounds> bound;
+    if (const auto known = As<ConstInt>(value)) {
+      bound = {{known->value_, known->value_}};
+    } else if (const auto variable = AsVarLike(value)) {
+      if (const auto found = coordinate_bounds_.find(variable.get()); found != coordinate_bounds_.end()) {
+        bound = found->second;
+      }
+    } else if (const auto cast = As<Cast>(value)) {
+      bound = Bounds(cast->operand_);
+    }
+    if (!bound || bound->first < 0 || bound->second > *maximum) {
+      return std::nullopt;
+    }
+    return bound;
   }
 
   void RequireReadyTuple(const ExprPtr& value, const Span& span) const {
@@ -593,48 +619,31 @@ class LaneImporter {
       CHECK_SPAN(!reshape && As<ScalarType>(destination->GetType()) && Ready(source), destination->span_)
           << "Unqualified peer local expression";
       ready_.insert(destination.get());
+      if (const auto bound = Bounds(source)) {
+        coordinate_bounds_.emplace(destination.get(), *bound);
+      }
     }
   }
 
-  void ImportLoop(const ForStmtPtr& loop) {
-    const auto start = transform_utils::EvalConstInt(loop->start_);
-    const auto stop = transform_utils::EvalConstInt(loop->stop_);
-    const auto step = transform_utils::EvalConstInt(loop->step_);
-    CHECK_SPAN(loop->kind_ == ForKind::Sequential && start && stop && step && *step > 0, loop->span_)
-        << "Peer endpoint requires a statically bounded sequential loop";
-    const __int128 trips = std::max<__int128>(0, (__int128(*stop) - *start + *step - 1) / *step);
-    CHECK_SPAN(trips <= INT64_MAX && __int128(*start) + trips * *step <= INT64_MAX, loop->span_)
-        << "Peer loop coordinate exceeds the index range";
-    CHECK_SPAN(births_.size() == closed_.size(), loop->span_) << "A live FIFO handle crosses loop entry";
-    CHECK_SPAN(loop->iter_args_.size() == loop->return_vars_.size(), loop->span_) << "Invalid loop carry";
-    for (const auto& arg : loop->iter_args_) BindAlias(arg, arg->initValue_);
-    ready_.insert(loop->loop_var_.get());
-    auto& seg = result_.input.segments.emplace_back();
-    seg.original_loop = loop;
-    seg.count = static_cast<int64_t>(trips);
-    seg.start = *start;
-    seg.step = *step;
-    std::vector<StmtPtr> body;
-    Flatten(loop->body_, body);
-    for (const auto& stmt : body) {
-      const auto it = sites_.find(stmt.get());
-      if (it != sites_.end() && it->second->kind == PeerTransportKind::Pop)
-        ++pops_per_visit_[it->second->pipe_id];
-    }
-    const auto entry = ordinals_;
-    const auto yield = body.empty() ? nullptr : As<YieldStmt>(body.back());
-    if (yield) body.pop_back();
+  void QualifyWorkLoop(const ForStmtPtr& loop) const {
+    const auto start = Bounds(loop->start_);
+    const auto stop = Bounds(loop->stop_);
+    const auto step = Bounds(loop->step_);
+    const auto maximum = SyncCoordinateMaximum(loop->loop_var_);
+    CHECK_SPAN(start && stop && step && step->first > 0 && maximum && start->second <= *maximum &&
+                   stop->second <= *maximum && step->second <= *maximum &&
+                   (__int128(stop->second) - 1 + step->second <= *maximum),
+               loop->span_)
+        << "Peer runtime work loop requires ready nonnegative bounds and a proved positive, bounded stride";
+  }
+
+  void BindLoopResults(const ForStmtPtr& loop, const YieldStmtPtr& yield) {
     CHECK_SPAN(loop->iter_args_.empty() ? !yield || yield->value_.empty()
                                         : yield && yield->value_.size() == loop->iter_args_.size(),
                loop->span_)
         << "Unsupported loop yield";
-    for (const auto& stmt : body) {
-      CHECK_SPAN(!IsA<ReturnStmt>(stmt) && !IsA<ForStmt>(stmt), stmt->span_)
-          << "Peer loop body requires a single sequential region";
-      Import(stmt, false);
-    }
     for (size_t i = 0; i < loop->iter_args_.size(); ++i) {
-      auto arg = loop->iter_args_[i];
+      const auto& arg = loop->iter_args_[i];
       const auto value = AsVarLike(yield->value_[i]);
       CHECK_SPAN(value && gm_roots_.count(arg.get()) && gm_roots_.count(value.get()) &&
                      gm_roots_.at(arg.get()) == gm_roots_.at(value.get()),
@@ -643,6 +652,77 @@ class LaneImporter {
       BindAlias(loop->return_vars_[i], arg);
     }
     CHECK_SPAN(births_.size() == closed_.size(), loop->span_) << "A live FIFO handle crosses a loop backedge";
+  }
+
+  void ImportWorkLoop(const ForStmtPtr& loop, bool allow_runtime, const std::vector<StmtPtr>& body,
+                      const YieldStmtPtr& yield) {
+    CHECK_SPAN(allow_runtime && !result_.work_loop, loop->span_)
+        << "Peer local planning requires at most one outer runtime work loop per lane";
+    QualifyWorkLoop(loop);
+    const auto entry = ordinals_;
+    auto& segments = result_.input.segments;
+    const auto first = segments.size();
+    segments.emplace_back();
+    for (const auto& stmt : body) {
+      if (const auto child = As<ForStmt>(stmt)) {
+        ImportLoop(child, /*allow_runtime=*/false);
+      } else {
+        Import(stmt, false);
+      }
+    }
+    BindLoopResults(loop, yield);
+    std::map<size_t, int64_t> advance;
+    for (const auto& [id, domain] : ring_domains_) {
+      const auto found = entry.find(id);
+      const auto initial = found == entry.end() ? 0 : found->second;
+      advance.emplace(domain, (ordinals_.at(id) - initial) % result_.input.storage[domain].slot_count);
+    }
+    // Rebase the suffix to the same ring origin as the item. Its actual origin
+    // can differ by any number of item advances; only seam analysis uses that
+    // uncertainty. A common rotation preserves all aliases within a phase.
+    ordinals_ = entry;
+    result_.work_loop = PeerLocalWorkLoop{loop, first, segments.size(), std::move(advance)};
+    segments.emplace_back();
+  }
+
+  void ImportLoop(const ForStmtPtr& loop, bool allow_runtime = true) {
+    const auto start = transform_utils::EvalConstInt(loop->start_);
+    const auto stop = transform_utils::EvalConstInt(loop->stop_);
+    const auto step = transform_utils::EvalConstInt(loop->step_);
+    CHECK_SPAN(loop->kind_ == ForKind::Sequential, loop->span_) << "Peer endpoint requires sequential loops";
+    CHECK_SPAN(births_.size() == closed_.size(), loop->span_) << "A live FIFO handle crosses loop entry";
+    CHECK_SPAN(loop->iter_args_.size() == loop->return_vars_.size(), loop->span_) << "Invalid loop carry";
+    std::vector<StmtPtr> body;
+    Flatten(loop->body_, body);
+    const auto yield = body.empty() ? nullptr : As<YieldStmt>(body.back());
+    if (yield) body.pop_back();
+    for (const auto& arg : loop->iter_args_) BindAlias(arg, arg->initValue_);
+    ready_.insert(loop->loop_var_.get());
+    if (!start || !stop || !step) {
+      ImportWorkLoop(loop, allow_runtime, body, yield);
+      return;
+    }
+    CHECK_SPAN(*step > 0, loop->span_) << "Peer endpoint requires a positive sequential loop stride";
+    const __int128 trips = std::max<__int128>(0, (__int128(*stop) - *start + *step - 1) / *step);
+    CHECK_SPAN(trips <= INT64_MAX && __int128(*start) + trips * *step <= INT64_MAX, loop->span_)
+        << "Peer loop coordinate exceeds the index range";
+    auto& seg = result_.input.segments.emplace_back();
+    seg.original_loop = loop;
+    seg.count = static_cast<int64_t>(trips);
+    seg.start = *start;
+    seg.step = *step;
+    for (const auto& stmt : body) {
+      const auto it = sites_.find(stmt.get());
+      if (it != sites_.end() && it->second->kind == PeerTransportKind::Pop)
+        ++pops_per_visit_[it->second->pipe_id];
+    }
+    const auto entry = ordinals_;
+    for (const auto& stmt : body) {
+      CHECK_SPAN(!IsA<ReturnStmt>(stmt) && !IsA<ForStmt>(stmt), stmt->span_)
+          << "Peer loop body requires a single sequential region";
+      Import(stmt, false);
+    }
+    BindLoopResults(loop, yield);
     for (const auto& [id, n] : pops_per_visit_) {
       const auto first = entry.find(id);
       const auto end = (first == entry.end() ? 0 : first->second) + trips * n;
@@ -693,6 +773,14 @@ class LaneImporter {
                  call->span_)
           << "Unqualified peer descriptor or ready scalar recipe";
       ready_.insert(result.get());
+      if (IsOp(call, "tile.get_block_idx") || IsOp(call, "tile.get_block_num")) {
+        CHECK_SPAN(call->args_.empty() && call->kwargs_.empty(), call->span_)
+            << "Invalid original block query";
+        // The emitted Group ABI forwards positive int32 dispatch cardinality
+        // and zero-based int32 block index to the Tile subfunction.
+        coordinate_bounds_.emplace(result.get(),
+                                   CoordinateBounds{IsOp(call, "tile.get_block_num") ? 1 : 0, INT32_MAX});
+      }
     } else if (IsOp(call, "tile.create")) {
       // Tile codegen emits only the alloc_tile descriptor. The replay lane
       // uses this uninitialized zero-row carrier to signal a no-data push.
@@ -718,7 +806,7 @@ class LaneImporter {
 }  // namespace
 
 PeerLocalEffects ImportPeerLocalEffects(const FunctionPtr& function, const PeerTransportEffects& transport,
-                                        const std::string& target) {
+                                        const std::string& target, const SyncParameterBounds& parameters) {
   backend::RequireLocalSyncExecutionContract(target);
   CHECK(function && function->ir_stage_ == FunctionIRStage::Functional &&
         (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV) &&
@@ -727,7 +815,7 @@ PeerLocalEffects ImportPeerLocalEffects(const FunctionPtr& function, const PeerT
   auto paths = LaneStatements(function);
   PeerLocalEffects result;
   for (const auto& path : paths) {
-    LaneImporter importer(function, transport, target, result.gm_formals);
+    LaneImporter importer(function, transport, target, parameters, result.gm_formals);
     result.lanes.push_back(importer.Run(path));
   }
   return result;

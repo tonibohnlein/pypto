@@ -391,12 +391,23 @@ and outstanding readers of each slot into the next region. An epilogue pop
 can therefore depend on a reader from an earlier visit, including when one
 visit advances only part of the ring.
 
-Supported control includes straight-line code, statically bounded sequential
-loops with a fixed receive count per visit, and a terminal AIV subblock branch
-with independently qualified arms. The local borrow must close inside its
-region. Functions with results require a terminal return on every path.
-Early returns, nested loops and runtime-bounded loops require further
-qualification.
+A lane can also contain one sequential work loop whose trip count depends on
+the launch. The planner must prove that its bounds are nonnegative, its stride
+is positive, and advancing the induction variable fits its type. A work item
+can contain statically bounded loops with a fixed receive count per visit.
+Each local borrow closes within its region. Loop-carried tensor handles must
+keep the same GM storage. A terminal AIV subblock branch can have independently
+qualified arms. Functions with results require a terminal return on every path.
+
+The planner analyzes the prefix, one work item, and the suffix separately.
+If each item advances a FIFO by `p` slots in a ring of depth `d`, successive
+entry slots differ by multiples of `gcd(d, p)`. The planner compares physical
+reads and writes across those possible rotations, including the direct path
+from prefix to suffix when the core receives no work. At each boundary it
+orders conflicting pipes and closes any events that the next item can reuse.
+It reserves the boundary events alongside native and within-item claims.
+The resulting plan applies to every qualified launch stride.
+
 The importer requires explicit
 placement, the conservative-prefix policy, and a qualified native FIFO
 workspace. The actual launch must bind the sized workspace separately from
