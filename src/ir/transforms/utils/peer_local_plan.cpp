@@ -72,10 +72,41 @@ FunctionPtr PlanLane(const PeerLocalLane& lane, const backend::LocalSyncExecutio
   return realized.function;
 }
 
+// The importer has ruled out earlier exits. Visit each path separately so
+// an explicit return in one arm does not hide a sibling's fallthrough.
+class CompletePeerPath : public SyncStatementMutator {
+ public:
+  CompletePeerPath(FunctionType type, const char* operation)
+      : core_(type == FunctionType::AIC ? "aic" : "aiv"), operation_(operation) {}
+
+  StmtPtr Run(const StmtPtr& body) {
+    auto completed = VisitStmt(body);
+    if (has_return_) {
+      return completed;
+    }
+    return SeqStmts::Flatten({completed, Drain(body->span_)}, body->span_);
+  }
+
+ private:
+  const std::string core_;
+  const char* operation_;
+  bool has_return_ = false;
+
+  StmtPtr Drain(const Span& span) const {
+    const auto drain = OpRegistry::GetInstance().Create(operation_, {}, {{"core_type", core_}}, span);
+    return std::make_shared<EvalStmt>(drain, span);
+  }
+
+  StmtPtr VisitStmt_(const ReturnStmtPtr& stmt) override {
+    has_return_ = true;
+    return std::make_shared<SeqStmts>(std::vector<StmtPtr>{Drain(stmt->span_), stmt}, stmt->span_);
+  }
+};
+
 // Each lane is planned in its original lexical scope. The endpoint has a
 // single terminal subblock branch, so the arms can share exactly the prefix
 // whose physical commands agree on both paths.
-FunctionPtr JoinLanes(const FunctionPtr& then_plan, const FunctionPtr& else_plan) {
+FunctionPtr JoinLanes(const FunctionPtr& then_plan, const FunctionPtr& else_plan, const char* completion_op) {
   auto left = transform_utils::FlattenToStmts(then_plan->body_);
   auto right = transform_utils::FlattenToStmts(else_plan->body_);
   CHECK(!left.empty() && left.size() == right.size())
@@ -90,27 +121,14 @@ FunctionPtr JoinLanes(const FunctionPtr& then_plan, const FunctionPtr& else_plan
     CHECK(lhs && rhs && structural_equal(lhs, rhs)) << "Peer local lane schedules disagree before the branch";
   }
   auto branch = MutableCopy(a);
-  branch->else_body_ = b->else_body_;
+  branch->then_body_ = CompletePeerPath(then_plan->func_type_, completion_op).Run(a->then_body_);
+  branch->else_body_ = CompletePeerPath(else_plan->func_type_, completion_op).Run(*b->else_body_);
   left.back() = branch;
   auto result = MutableCopy(then_plan);
   result->body_ = SeqStmts::Flatten(std::move(left), then_plan->span_);
   return result;
 }
 
-class DrainReturns : public SyncStatementMutator {
- public:
-  DrainReturns(FunctionType type, const char* operation)
-      : core_(type == FunctionType::AIC ? "aic" : "aiv"), operation_(operation) {}
-
- private:
-  const std::string core_;
-  const char* operation_;
-  StmtPtr VisitStmt_(const ReturnStmtPtr& stmt) override {
-    const auto drain = OpRegistry::GetInstance().Create(operation_, {}, {{"core_type", core_}}, stmt->span_);
-    return std::make_shared<SeqStmts>(
-        std::vector<StmtPtr>{std::make_shared<EvalStmt>(drain, stmt->span_), stmt}, stmt->span_);
-  }
-};
 }  // namespace
 
 FunctionPtr RealizePeerLocalPlan(const PeerLocalEffects& effects) {
@@ -126,11 +144,13 @@ FunctionPtr RealizePeerLocalPlan(const PeerLocalEffects& effects) {
   if (effects.lanes.size() == 2) {
     const auto& other = effects.lanes.back();
     INTERNAL_CHECK(other.input.owner == input.owner && other.input.hardware_target == input.hardware_target);
-    plan = JoinLanes(plan, PlanLane(other, execution));
+    plan = JoinLanes(plan, PlanLane(other, execution), execution.terminal_completion_op);
+  } else {
+    auto completed = MutableCopy(plan);
+    completed->body_ = CompletePeerPath(plan->func_type_, execution.terminal_completion_op).Run(plan->body_);
+    plan = completed;
   }
-  auto result = MutableCopy(plan);
-  result->body_ = DrainReturns(plan->func_type_, execution.terminal_completion_op).VisitStmt(plan->body_);
-  CheckPhysicalSyncResult(result);
-  return result;
+  CheckPhysicalSyncResult(plan);
+  return plan;
 }
 }  // namespace pypto::ir::sync

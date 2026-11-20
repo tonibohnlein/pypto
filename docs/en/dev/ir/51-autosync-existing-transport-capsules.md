@@ -379,7 +379,9 @@ logical borrow. The physical reader still has to finish before a later pop
 overwrites those bytes. A push reads its local source tile on its selected
 pipe. The local planner imports all of these effects alongside ordinary
 payloads and uses the same dependency analysis and local event allocator.
-It checks event consumption before reuse and drains the endpoint at return.
+It checks event consumption before reuse and drains the endpoint before an
+explicit return or at the end of a void path. Each arm of a terminal AIV
+subblock branch drains independently.
 
 The importer represents each FIFO as rotating physical storage. In a sequential
 loop with `p` pops per visit, visit `v` starts at slot
@@ -392,7 +394,9 @@ visit advances only part of the ring.
 Supported control includes straight-line code, statically bounded sequential
 loops with a fixed receive count per visit, and a terminal AIV subblock branch
 with independently qualified arms. The local borrow must close inside its
-region. Nested or runtime-bounded loops require further qualification.
+region. Functions with results require a terminal return on every path.
+Early returns, nested loops and runtime-bounded loops require further
+qualification.
 The importer requires explicit
 placement, the conservative-prefix policy, and a qualified native FIFO
 workspace. The actual launch must bind the sized workspace separately from

@@ -203,8 +203,10 @@ class LaneImporter {
   }
 
   PeerLocalLane Run(const std::vector<StmtPtr>& statements) {
-    CHECK(!statements.empty() && As<ReturnStmt>(statements.back()))
-        << "Peer local path requires a terminal return";
+    const auto& owner = result_.input.owner;
+    CHECK_SPAN(owner->return_types_.empty() || (!statements.empty() && As<ReturnStmt>(statements.back())),
+               owner->span_)
+        << "Peer local path with results requires a terminal return";
     for (size_t i = 0; i < statements.size(); ++i) {
       if (const auto loop = As<ForStmt>(statements[i]))
         ImportLoop(loop);
