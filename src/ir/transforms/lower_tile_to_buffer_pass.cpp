@@ -89,7 +89,7 @@ std::vector<int64_t> StaticExtents(const std::vector<ExprPtr>& extents, const Sp
 }
 
 void CheckDenseVecTile(const TileTypePtr& tile, const TileView& view, const Span& span) {
-  CHECK_SPAN(backend::IsDenseVecBufferTile(tile, view), span)
+  CHECK_SPAN(backend::IsDenseVecBufferTile(tile, view) || backend::IsFullZeroPaddedVec(tile, view), span)
       << "LowerTileToBuffer: this recipe requires dense rank-1 or rank-2 Vec tiles with a supported "
          "storage dtype";
 }
@@ -120,7 +120,8 @@ BufferTypePtr DenseDescriptor(const TileTypePtr& tile, const Span& span) {
   CHECK_SPAN(!column || (fixed_column && fixed_column->value_ == 1), span)
       << "LowerTileToBuffer: contiguous column vectors require a fixed valid column of one";
   return std::make_shared<BufferType>(shape, tile->dtype_, MemorySpace::Vec,
-                                      backend::MutableBufferValidShape(logical_valid), view.blayout);
+                                      backend::MutableBufferValidShape(logical_valid), view.blayout,
+                                      view.slayout, view.fractal, view.pad, view.compact);
 }
 
 // A use-site window of another handle. Its row pitch and offset belong to the
@@ -139,7 +140,7 @@ BufferTypePtr WindowDescriptor(const TileTypePtr& tile, const Span& span) {
   }
   return std::make_shared<BufferType>(shape, tile->dtype_, MemorySpace::Vec,
                                       backend::NormalizeBufferTileExtents(std::move(valid), int64_t{1}),
-                                      view.blayout);
+                                      view.blayout, view.slayout, view.fractal, view.pad, view.compact);
 }
 
 bool HasDynamicValid(const BufferTypePtr& type) {
@@ -363,12 +364,15 @@ class StorageIndex : public IRVisitor {
     const bool has_column = std::any_of(
         storage.members.begin(), storage.members.end(),
         [](const auto& member) { return backend::IsColumnVectorBufferGeometry(member.descriptor); });
+    const bool has_zero_pad =
+        std::any_of(storage.members.begin(), storage.members.end(),
+                    [](const auto& member) { return backend::IsFullZeroPaddedVec(member.descriptor); });
     const auto gather_workspace =
         std::find_if(storage.members.begin(), storage.members.end(),
                      [&](const auto& member) { return gather_workspaces_.count(member.tile.get()) != 0; });
     // Aliases and reuse can give scratch different descriptors over one allocation.
     // The native mask prefix must view the workspace directly, never a reshape.
-    if (backend::IsMatrixBufferSpace(*memory_space) || has_column ||
+    if (backend::IsMatrixBufferSpace(*memory_space) || has_column || has_zero_pad ||
         gather_workspace != storage.members.end()) {
       // Addressless typed storage allocates its first member and reshapes other
       // interpretations. A backing tile may precede its workspace reshape, so
@@ -1117,13 +1121,15 @@ class TileToBufferMutator : public IRMutator {
     }
     const bool store = IsOp(call, "tile.store");
     const auto* conversion = backend::FindLogicalBufferConversionRecipe(call->op_->name_);
-    const bool static_cast_recipe = conversion && conversion->kind == backend::BufferConversionKind::Cast &&
+    const bool guarded_conversion = conversion &&
+                                    (conversion->kind == backend::BufferConversionKind::Cast ||
+                                     conversion->kind == backend::BufferConversionKind::FillPad) &&
                                     backend::SupportsLogicalBufferConversion(*conversion, call);
     const auto* axis_recipe = backend::FindLogicalBufferAxisRecipe(call->op_->name_);
     const bool guarded_axis_op = axis_recipe && backend::SupportsLogicalBufferAxis(*axis_recipe, call);
     const bool data_operation = guarded_axis_op || store || IsOp(call, "tile.load") ||
                                 IsOp(call, "tile.move") ||
-                                backend::FindLogicalBufferElementwiseRecipe(call) || static_cast_recipe;
+                                backend::FindLogicalBufferElementwiseRecipe(call) || guarded_conversion;
     if (!data_operation || (!store && !result)) {
       return WithValidState(call, result, LowerCall(call, result));
     }
@@ -1330,7 +1336,28 @@ class TileToBufferMutator : public IRMutator {
     }
     if (const auto* conversion = backend::FindLogicalBufferConversionRecipe(call->op_->name_)) {
       CHECK_SPAN(result && backend::SupportsLogicalBufferConversion(*conversion, call), call->span_)
-          << "LowerTileToBuffer: unsupported cast, comparison or selection operands";
+          << "LowerTileToBuffer: unsupported cast, comparison, selection or fillpad operands";
+      if (conversion->kind == backend::BufferConversionKind::FillPad) {
+        const auto source = Handle(call->args_[0]);
+        const auto destination = Handle(result);
+        const auto rows = Valid(call->args_[0])->elements_[0];
+        const auto constant = As<ConstInt>(rows);
+        // TFillPad's row-copy loop requires a positive repeat count. Empty
+        // inputs still define every destination lane, using the ordinary fill.
+        if (constant && constant->value_ > 0) {
+          return Operation(conversion->buffer_op, {source, destination}, call->span_);
+        }
+        const auto dtype = As<BufferType>(destination->GetType())->dtype_;
+        const ExprPtr zero = dtype.IsSignedInt()
+                                 ? ExprPtr(std::make_shared<ConstInt>(0, dtype, call->span_))
+                                 : ExprPtr(std::make_shared<ConstFloat>(0.0, dtype, call->span_));
+        const auto empty_result = Operation("buffer.full", {zero, destination}, call->span_);
+        if (constant) return empty_result;
+        const auto positive = MakeGt(rows, std::make_shared<ConstInt>(0, GetScalarDtype(rows), call->span_));
+        const auto fill_copy = Operation(conversion->buffer_op, {source, destination}, call->span_);
+        return std::make_shared<IfStmt>(positive, fill_copy, empty_result, std::vector<VarPtr>{},
+                                        call->span_);
+      }
       std::vector<ExprPtr> args;
       std::vector<StmtPtr> out;
       // An old static alias may share a dynamically valid allocation handle.
@@ -1599,8 +1626,7 @@ class TileToBufferMutator : public IRMutator {
       if (backend::SupportsLogicalBufferScalarTransfer(call)) {
         // Keep the original GM rank and one-element extent. The separate
         // carrier descriptor remains rank two with physical capacity [1,8].
-        valid = std::make_shared<MakeTuple>(
-            std::vector<ExprPtr>{std::make_shared<ConstInt>(1, DataType::INDEX, call->span_)}, call->span_);
+        valid = backend::MakeBufferScalarGMExtent(*store_destination, call->span_);
       } else if (backend::SupportsLogicalVector1DBufferTransfer(call)) {
         valid = std::make_shared<MakeTuple>(std::vector<ExprPtr>{valid->elements_[1]}, call->span_);
       }

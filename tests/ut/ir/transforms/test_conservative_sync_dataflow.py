@@ -149,6 +149,9 @@ def _coverage(sites, trace, overlap):
                 assert previous in predecessors, (previous, index, trace)
         ancestors.append(predecessors)
         issued.setdefault(pipe, []).append(index)
+        destination = sites[label]["post_destination"]
+        if destination is not None:
+            imported.setdefault(destination, set()).update(publication(pipe))
 
 
 @pytest.mark.parametrize("kind", ["for", "while"])
@@ -257,3 +260,7 @@ def test_nested_control_uses_one_retained_parent_index():
         costs.append(cost)
     for counter in ("statements", "parent_links", "retained_facts"):
         assert costs[2][counter] - costs[1][counter] == 2 * (costs[1][counter] - costs[0][counter])
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

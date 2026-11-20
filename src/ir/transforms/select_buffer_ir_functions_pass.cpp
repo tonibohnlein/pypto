@@ -159,9 +159,15 @@ class BufferKernelSupport : public IRVisitor {
                                     ConstantEquals(view.stride[1], rows)),
             BufferAdmissionProperty::TypeLayout);
       } else {
-        admission.Require(
-            backend::IsDenseVecBufferTile(tile, view) && cols % (256 / tile->dtype_.GetBit()) == 0,
-            BufferAdmissionProperty::TypeLayout);
+        const bool zero_pad = backend::IsFullZeroPaddedVec(tile, view);
+        const auto* context = PassContext::Current();
+        // Pad mode belongs to a native tile object. Only placed plans can
+        // declare independent metadata objects for reused padded storage.
+        admission.Require(!zero_pad || !context || context->GetMemoryPlanner() != MemoryPlanner::PtoAS,
+                          BufferAdmissionProperty::TypeLayout);
+        admission.Require((zero_pad || backend::IsDenseVecBufferTile(tile, view)) &&
+                              cols % (256 / tile->dtype_.GetBit()) == 0,
+                          BufferAdmissionProperty::TypeLayout);
         admission.Require(view.stride.empty() ||
                               (one_d ? (view.stride.size() == 1 && ConstantEquals(view.stride[0], 1))
                                      : (view.stride.size() == 2 && ConstantEquals(view.stride[0], cols) &&
@@ -535,6 +541,9 @@ class BufferKernelSupport : public IRVisitor {
     }
     if (IsOp(call, "tile.load")) {
       has_load = true;
+      const auto tile = As<TileType>(call->GetType());
+      admission.Require(!tile || tile_view_semantics::GetEffectiveTileView(*tile).pad == PadValue::null,
+                        BufferAdmissionProperty::TransferOptions);
       CheckTransferParameter(call, 0, true);
       CheckTransferTypes(call, true);
       if (const auto source = As<TensorType>(call->args_[0]->GetType()); source && source->shape_.size() == 1)
@@ -653,8 +662,10 @@ class BufferKernelSupport : public IRVisitor {
       for (const auto& arg : call->args_)
         admission.Require(!views_.IsWindow(arg), BufferAdmissionProperty::OperationRecipe);
     } else if (const auto* conversion = backend::FindLogicalBufferConversionRecipe(call->op_->name_)) {
-      admission.Require(backend::SupportsLogicalBufferConversion(*conversion, call),
-                        BufferAdmissionProperty::OperationRecipe);
+      admission.Require(
+          backend::SupportsLogicalBufferConversion(*conversion, call) &&
+              (conversion->kind != backend::BufferConversionKind::FillPad || core_ == FunctionType::AIV),
+          BufferAdmissionProperty::OperationRecipe);
       for (const auto& arg : call->args_)
         admission.Require(!views_.IsWindow(arg), BufferAdmissionProperty::OperationRecipe);
     } else if (IsOp(call, "tile.transpose")) {

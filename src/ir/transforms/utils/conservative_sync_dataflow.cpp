@@ -15,6 +15,7 @@
 #include <array>
 #include <deque>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -811,13 +812,14 @@ class Builder {
           const std::vector<std::shared_ptr<const NativeSyncChild>>& retained,
           const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful,
           bool retain_incoming_diagnostics, bool enable_refresh_kill, const SyncParameterBounds& parameters,
-          const std::optional<std::pair<int64_t, int64_t>>& blocks)
+          const std::optional<std::pair<int64_t, int64_t>>& blocks, bool enable_loop_prefixes)
       : function_(function),
         target_(std::move(target)),
         trip_prover_(function, parameters, blocks),
         resolver_(function, &trip_prover_, /*run_scalar_layout_check=*/true, target_),
         retain_incoming_diagnostics_(retain_incoming_diagnostics),
-        enable_refresh_kill_(enable_refresh_kill) {
+        enable_refresh_kill_(enable_refresh_kill),
+        enable_loop_prefixes_(enable_loop_prefixes) {
     const auto* context = PassContext::Current();
     disjoint_gm_ = context && context->GetAutoSyncDisjointGM();
     scopes_.emplace_back();
@@ -1181,7 +1183,12 @@ class Builder {
     std::vector<LiveStorageState> live_in, live_out;
     SolveLiveStorage(cfg, rpo, rpo_pos, cfg_entry, live_in, live_out);
     ExtractSourcePipeServices(cfg, rpo, live_in, live_out);
+    const auto before_selection = cost;
     SelectAndCertifyDebts(cfg, rpo, rpo_pos, cfg_entry);
+    if (enable_loop_prefixes_) {
+      TryProducerPrefix(cfg, rpo, rpo_pos, cfg_entry, before_selection);
+      TryLoopEntrySplit();
+    }
 
     return retain_incoming_diagnostics_ ? live_out[cfg_exit].ToAccessSet() : ConservativeAccessSet{};
   }
@@ -1201,7 +1208,13 @@ class Builder {
     }
   }
 
-  size_t BuildSubCfg(const StmtPtr& statement, size_t entry, std::vector<CfgVertex>& cfg) const {
+  struct LoopEntryPhase {
+    ForStmtPtr loop;
+    std::vector<std::optional<size_t>> first_sites;  // Original site index to first-visit analysis site.
+  };
+
+  size_t BuildSubCfg(const StmtPtr& statement, size_t entry, std::vector<CfgVertex>& cfg,
+                     const LoopEntryPhase* phase = nullptr, bool first_visit = false) const {
     if (const auto child = child_index_.find(statement.get()); child != child_index_.end()) {
       const size_t node = cfg.size();
       cfg.push_back({CfgVertex::Kind::Child, child->second, {}, {}});
@@ -1210,7 +1223,8 @@ class Builder {
     }
     if (const auto site = site_index_.find(statement.get()); site != site_index_.end()) {
       const size_t node = cfg.size();
-      cfg.push_back({CfgVertex::Kind::Site, site->second, {}, {}});
+      const auto index = first_visit ? phase->first_sites[site->second].value() : site->second;
+      cfg.push_back({CfgVertex::Kind::Site, index, {}, {}});
       AddCfgEdge(cfg, entry, node);
       return node;
     }
@@ -1218,7 +1232,7 @@ class Builder {
       size_t cur = entry;
       const auto wit = window_slices_by_seq_.find(seq.get());
       if (wit == window_slices_by_seq_.end() || wit->second.empty()) {
-        for (const auto& child : seq->stmts_) cur = BuildSubCfg(child, cur, cfg);
+        for (const auto& child : seq->stmts_) cur = BuildSubCfg(child, cur, cfg, phase, first_visit);
         return cur;
       }
       const auto& slices = wit->second;
@@ -1233,15 +1247,16 @@ class Builder {
           i = slices[slice_idx].end;
           ++slice_idx;
         } else {
-          cur = BuildSubCfg(seq->stmts_[i], cur, cfg);
+          cur = BuildSubCfg(seq->stmts_[i], cur, cfg, phase, first_visit);
           ++i;
         }
       }
       return cur;
     }
     if (const auto branch = As<IfStmt>(statement)) {
-      const size_t then_exit = BuildSubCfg(branch->then_body_, entry, cfg);
-      const size_t else_exit = branch->else_body_ ? BuildSubCfg(*branch->else_body_, entry, cfg) : entry;
+      const size_t then_exit = BuildSubCfg(branch->then_body_, entry, cfg, phase, first_visit);
+      const size_t else_exit =
+          branch->else_body_ ? BuildSubCfg(*branch->else_body_, entry, cfg, phase, first_visit) : entry;
       const size_t merge = cfg.size();
       cfg.push_back({CfgVertex::Kind::BranchMerge, 0, {}, {}});
       AddCfgEdge(cfg, then_exit, merge);
@@ -1259,6 +1274,26 @@ class Builder {
         AddCfgEdge(cfg, exit_node, exit_v);
         return exit_v;
       };
+      if (phase && phase->loop == loop) {
+        // Only the first body uses distinct analysis sites. Both backedges
+        // enter the steady-state header, and original IR emits each site once.
+        const size_t first_exit = BuildSubCfg(loop->body_, entry, cfg, phase, true);
+        const size_t steady_header = cfg.size();
+        cfg.push_back({CfgVertex::Kind::Nop, 0, {}, {}});
+        const size_t steady_exit = BuildSubCfg(loop->body_, steady_header, cfg);
+        for (const size_t body_exit : {first_exit, steady_exit}) {
+          const size_t backedge = cfg.size();
+          cfg.push_back({CfgVertex::Kind::LoopBackedge, 0, {}, {}, loop.get()});
+          AddCfgEdge(cfg, body_exit, backedge);
+          AddCfgEdge(cfg, backedge, steady_header);
+        }
+        const size_t merge = cfg.size();
+        cfg.push_back({CfgVertex::Kind::BranchMerge, 0, {}, {}});
+        if (!positive) AddCfgEdge(cfg, entry, merge);
+        AddCfgEdge(cfg, first_exit, merge);
+        AddCfgEdge(cfg, steady_exit, merge);
+        return wrap_exit(merge);
+      }
       if (!As<ConstInt>(loop->start_) && at_most_one) {
         if (positive) {
           return wrap_exit(BuildSubCfg(loop->body_, entry, cfg));
@@ -1745,6 +1780,9 @@ class Builder {
         }
       }
       state.AddEffects(site_effect_fibers_[vertex.index]);
+      if (site.post_destination) {
+        state.DeliverSources(PipeToMask(destination), *site.post_destination);
+      }
     } else if (vertex.kind == CfgVertex::Kind::LoopBackedge && vertex.loop) {
       state.ApplyLoopBackedge(vertex.loop, affine_domain_bounds_);
     } else if (vertex.kind == CfgVertex::Kind::LoopExit && vertex.loop) {
@@ -1916,6 +1954,346 @@ class Builder {
           << "Internal error: conservative service certificate omitted a proposed deletion";
       break;
     }
+  }
+
+  struct ProducerPrefix {
+    size_t producer, consumer;
+    std::vector<bool> can_relay_destination;
+  };
+
+  struct PathGuard {
+    ExprPtr condition;
+    bool positive = true;
+
+    bool operator==(const PathGuard& other) const {
+      if (positive != other.positive) return false;
+      if (condition == other.condition) return true;
+      if (!condition || !other.condition) return false;
+      try {
+        return structural_equal(condition, other.condition, false);
+      } catch (const StructuralComparisonUnsupported&) {
+        return false;
+      }
+    }
+  };
+
+  // Keep one common loop occurrence frame and one layer of mutually
+  // exclusive paths. The fixed-point proof itself still includes every path
+  // and every entry/backedge. This path index only qualifies where placing a
+  // WAIT on an otherwise idle destination could allow more overlap.
+  bool CollectProducerPaths(const StmtPtr& statement, const PathGuard& guard,
+                            std::vector<std::optional<PathGuard>>& paths) const {
+    if (const auto seq = As<SeqStmts>(statement)) {
+      for (const auto& child : seq->stmts_) {
+        if (!CollectProducerPaths(child, guard, paths)) return false;
+      }
+      return true;
+    }
+    if (const auto branch = As<IfStmt>(statement)) {
+      return !guard.condition && branch->return_vars_.empty() &&
+             CollectProducerPaths(branch->then_body_, {branch->condition_, true}, paths) &&
+             (!branch->else_body_ ||
+              CollectProducerPaths(*branch->else_body_, {branch->condition_, false}, paths));
+    }
+    if (As<ForStmt>(statement) || As<WhileStmt>(statement)) return false;
+    if (const auto found = site_index_.find(statement.get()); found != site_index_.end()) {
+      paths[found->second] = guard;
+    }
+    return true;
+  }
+
+  ForStmtPtr FindSingleTopLevelLoop() const {
+    // Nominate one direct, lexically ordered loop seam. Each caller
+    // separately qualifies the loop body and any surrounding effects.
+    const auto seq = As<SeqStmts>(function_->body_);
+    if (!seq) return As<ForStmt>(function_->body_);
+    ForStmtPtr loop;
+    for (const auto& statement : seq->stmts_) {
+      if (const auto candidate = As<ForStmt>(statement)) {
+        if (loop) return nullptr;
+        loop = candidate;
+      } else if (As<IfStmt>(statement) || As<WhileStmt>(statement)) {
+        return nullptr;
+      }
+    }
+    return loop;
+  }
+
+  std::optional<ProducerPrefix> NominateProducerPrefix() {
+    if (!children.empty()) return std::nullopt;
+    const auto loop = FindSingleTopLevelLoop();
+    if (!loop || loop->kind_ != ForKind::Sequential) return std::nullopt;
+    std::vector<std::optional<PathGuard>> paths(sites.size());
+    if (!CollectProducerPaths(loop->body_, {}, paths)) return std::nullopt;
+    std::array<std::vector<size_t>, kPhysicalPipeCount> sites_by_pipe;
+    for (size_t i = 0; i < sites.size(); ++i) {
+      const auto pipe = static_cast<size_t>(sites[i].operation.Implementation().Pipe());
+      // Enclosing payloads and cross-pipe macros need entry/exit evidence
+      // beyond this sealed-loop family.
+      if (!paths[i] || pipe >= kPhysicalPipeCount) return std::nullopt;
+      sites_by_pipe[pipe].push_back(i);
+    }
+    for (const auto& targets : sites_by_pipe) {
+      if (targets.size() != 1) continue;
+      const auto consumer = targets.front();
+      const auto destination = sites[consumer].operation.Implementation().Pipe();
+      // Descriptor evaluation and scalar control may issue on S without a
+      // Buffer payload site. It cannot be shown idle from this inventory.
+      if (destination == PipeType::S) continue;
+      // Reuse the same conservative wildcard/domain conflict index. The
+      // footprint of a single native payload is bounded by its fixed effect
+      // operands; only the number of original sites grows with IR size.
+      LiveStorageState target_accesses, placed_target_accesses;
+      target_accesses.AddEffects(sites[consumer].effects);
+      ConservativeAccessSet placed;
+      for (const auto& effect : sites[consumer].effects) {
+        const auto& [space, pipe, write, domain] = effect;
+        if (domain != 0 && space != MemorySpace::DDR) placed.insert(effect);
+      }
+      placed_target_accesses.AddEffects(placed);
+      auto conflict = [&](const ConservativeSyncSite& site, bool require_placed) {
+        const auto& accesses = require_placed ? placed_target_accesses : target_accesses;
+        for (const auto& effect : site.effects) {
+          const auto& [space, pipe, write, domain] = effect;
+          if (require_placed && (domain == 0 || space == MemorySpace::DDR)) continue;
+          if (!accesses.QueryConflicts(effect, cost).empty()) return true;
+        }
+        return false;
+      };
+      std::map<std::pair<const Expr*, bool>, bool> matching_guards;
+      const auto matches_consumer = [&](const PathGuard& producer_guard) {
+        const auto key = std::make_pair(producer_guard.condition.get(), producer_guard.positive);
+        const auto [found, inserted] = matching_guards.try_emplace(key, false);
+        if (inserted) found->second = producer_guard == *paths[consumer];
+        return found->second;
+      };
+      for (const auto source : sites[consumer].source_pipes) {
+        const auto pipe = static_cast<size_t>(source);
+        if (pipe >= kPhysicalPipeCount || source == destination) continue;
+        const auto& producers = sites_by_pipe[pipe];
+        bool later_compatible = false;
+        for (auto it = producers.rbegin(); it != producers.rend() && *it > consumer; ++it) {
+          const auto i = *it;
+          // No later conflicting producer may be skipped, even with a
+          // different guard or an alias that has no matching SSA handle.
+          if (conflict(sites[i], false)) {
+            if (later_compatible && matches_consumer(*paths[i]) && conflict(sites[i], true)) {
+              ProducerPrefix result{i, consumer, std::vector<bool>(sites.size())};
+              result.can_relay_destination[consumer] = true;
+              for (size_t j = consumer + 1; j <= i; ++j) {
+                result.can_relay_destination[j] = !paths[consumer]->condition || matches_consumer(*paths[j]);
+              }
+              return result;
+            }
+            break;
+          }
+          if (!paths[i]->condition || matches_consumer(*paths[i])) later_compatible = true;
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  void TryProducerPrefix(const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo,
+                         const std::vector<size_t>& rpo_pos, size_t entry,
+                         const ConservativeSyncCost& before_selection) {
+    const auto candidate = NominateProducerPrefix();
+    if (!candidate) return;
+    // Native event claims can describe secondary queues. Leave those kernels
+    // to the original allocator and its complete native reservation model.
+    try {
+      for (const auto& site : sites) {
+        if (!site.operation.Implementation().Claims().empty()) return;
+      }
+    } catch (const pypto::ValueError&) {
+      return;
+    }
+    const auto& [producer, consumer, can_relay_destination] = *candidate;
+    const auto source = sites[producer].operation.Implementation().Pipe();
+    const auto destination = sites[consumer].operation.Implementation().Pipe();
+    const auto baseline_cost = cost;
+    std::vector<std::vector<PipeType>> baseline;
+    baseline.reserve(sites.size());
+    for (const auto& site : sites) baseline.push_back(site.source_pipes);
+    sites[producer].post_destination = destination;
+    cost = before_selection;
+    cost.conflict_queries = baseline_cost.conflict_queries;
+    SelectAndCertifyDebts(cfg, rpo, rpo_pos, entry);
+    const auto replay_visits = cost.certificate_visits - before_selection.certificate_visits;
+
+    // A relay reading the destination pipe can pick up the eager WAIT. This
+    // is covered by the original reuser's dependency only after the reuser
+    // executes and before the new publication, under a path that executes
+    // the reuser. In particular, a relay at the next visit's prefix or in
+    // a mismatched branch must not see the eager edge.
+    const auto has_source = [](const std::vector<PipeType>& pipes, PipeType pipe) {
+      return std::find(pipes.begin(), pipes.end(), pipe) != pipes.end();
+    };
+    bool accepted = !has_source(sites[consumer].source_pipes, source);
+    for (size_t i = 0; accepted && i < sites.size(); ++i) {
+      for (const auto pipe : sites[i].source_pipes) {
+        if (!has_source(baseline[i], pipe) || (pipe == destination && !can_relay_destination[i])) {
+          accepted = false;
+          break;
+        }
+      }
+    }
+    if (accepted) {
+      ++cost.services;
+      --cost.suppressed_services;
+      --cost.certificate_omissions;
+      cost.certificate_visits += baseline_cost.certificate_visits - before_selection.certificate_visits;
+    } else {
+      sites[producer].post_destination.reset();
+      cost = baseline_cost;
+      cost.certificate_visits += replay_visits;
+      for (size_t i = 0; i < sites.size(); ++i) sites[i].source_pipes = std::move(baseline[i]);
+    }
+  }
+
+  bool CanDistinguishLoopEntry(const ForStmtPtr& loop) const {
+    if (!loop || loop->kind_ != ForKind::Sequential ||
+        loop->hardware_loop_policy_ != HardwareLoopPolicy::Auto || trip_prover_.IsAtMostOneTrip(loop.get()) ||
+        GetScalarDtype(loop->loop_var_) != DataType::INDEX ||
+        GetScalarDtype(loop->start_) != DataType::INDEX || GetScalarDtype(loop->stop_) != DataType::INDEX ||
+        (!As<ConstInt>(loop->start_) && !AsVarLike(loop->start_)))
+      return false;
+    const auto step = As<ConstInt>(loop->step_);
+    if (!step || step->value_ <= 0) return false;
+    if (step->value_ == 1) return true;
+    const auto stop = trip_prover_.LookupAtCut(loop.get(), loop->stop_);
+    // Each executing IV is at most stop - 1; its increment must be representable.
+    // Therefore the original start is visited at most once, even for zero trips.
+    return stop && __int128(stop->hi) - 1 + step->value_ <= std::numeric_limits<int64_t>::max();
+  }
+
+  static PipeMask EntryPrefixPipes(const std::vector<ConservativeSyncSite>& original, size_t head,
+                                   const std::vector<PipeType>& entry) {
+    // S also executes the original scalar/metadata/loop control, which does
+    // not have payload sites. The head's incoming services occupy its
+    // destination and their recorded sources before its first payload.
+    PipeMask occupied =
+        PipeToMask(PipeType::S) | PipeToMask(original[head].operation.Implementation().Pipe());
+    for (const auto source : entry) occupied |= PipeToMask(source);
+    try {
+      for (size_t i = 0; i < head; ++i) {
+        const auto& site = original[i];
+        const auto& native = site.operation.Implementation();
+        occupied |= PipeToMask(native.Pipe());
+        for (const auto source : site.source_pipes) occupied |= PipeToMask(source);
+        // The resource catalog enumerates secondary event queues. Leave
+        // opaque implicit effects or unqualified secondary ownership guarded.
+        if (!native.ImplicitEffects().empty()) return kAllPhysicalPipesMask;
+        for (const auto& claim : native.Claims()) {
+          if (claim.pool.kind != pypto::sync::ResourceKind::PipelineEvent) return kAllPhysicalPipesMask;
+          occupied |= PipeToMask(claim.pool.src) | PipeToMask(claim.pool.dst);
+        }
+      }
+    } catch (const pypto::ValueError&) {
+      return kAllPhysicalPipesMask;
+    }
+    return occupied;
+  }
+
+  void TryLoopEntrySplit() {
+    if (!children.empty() || sites.empty()) return;
+    const auto loop = FindSingleTopLevelLoop();
+    if (!CanDistinguishLoopEntry(loop)) return;
+    const size_t original_count = sites.size();
+    std::vector<std::optional<PathGuard>> paths(original_count);
+    if (!CollectProducerPaths(loop->body_, {}, paths)) return;
+    const auto first =
+        std::find_if(paths.begin(), paths.end(), [](const auto& path) { return path.has_value(); });
+    // Only a direct first payload can capture the pre-loop prefix: no
+    // intervening producer on any native pipe, nor a skipped first use.
+    if (first == paths.end() || first == paths.begin() || (*first)->condition) return;
+    const size_t head = static_cast<size_t>(first - paths.begin());
+    if (sites[head].source_pipes.empty() || sites[head].operation.Implementation().Pipe() == PipeType::S)
+      return;
+    // Producer-side captures have an independent proof and are never replayed
+    // here. In particular the phase split does not delay a previously moved edge.
+    const auto has_capture = [](const auto& site) { return site.post_destination.has_value(); };
+    if (std::any_of(sites.begin(), sites.end(), has_capture)) return;
+
+    const auto baseline_sites = sites;
+    const auto baseline_cost = cost;
+    LoopEntryPhase phase{loop, std::vector<std::optional<size_t>>(original_count)};
+    for (size_t i = head; i < original_count; ++i) {
+      if (!paths[i]) continue;
+      phase.first_sites[i] = sites.size();
+      sites.push_back(baseline_sites[i]);
+      const auto effects = site_effect_fibers_[i];
+      const auto refreshed = site_refresh_fibers_[i];
+      site_effect_fibers_.push_back(effects);
+      site_refresh_fibers_.push_back(refreshed);
+    }
+    cost = {};
+    std::vector<CfgVertex> cfg{{CfgVertex::Kind::Nop, 0, {}, {}}};
+    BuildSubCfg(function_->body_, 0, cfg, &phase);
+    std::vector<size_t> rpo, rpo_pos;
+    ComputeRpo(cfg, 0, rpo, rpo_pos);
+    std::vector<LiveStorageState> live_in, live_out;
+    SolveLiveStorage(cfg, rpo, rpo_pos, 0, live_in, live_out);
+    ExtractSourcePipeServices(cfg, rpo, live_in, live_out);
+    SelectAndCertifyDebts(cfg, rpo, rpo_pos, 0);
+
+    const auto subset = [](const auto& a, const auto& b) {
+      return std::includes(b.begin(), b.end(), a.begin(), a.end());
+    };
+    const auto& entry = sites[phase.first_sites[head].value()].source_pipes;
+    const auto& backedge = sites[head].source_pipes;
+    const auto& baseline = baseline_sites[head].source_pipes;
+    std::vector<PipeType> selected, entry_only, backedge_only;
+    std::set_union(entry.begin(), entry.end(), backedge.begin(), backedge.end(),
+                   std::back_inserter(selected));
+    std::set_difference(entry.begin(), entry.end(), backedge.begin(), backedge.end(),
+                        std::back_inserter(entry_only));
+    std::set_difference(backedge.begin(), backedge.end(), entry.begin(), entry.end(),
+                        std::back_inserter(backedge_only));
+
+    // Keep other sites' existing service lists. Every proved phase-specific
+    // prerequisite remains covered by those supersets, even if a conditional
+    // producer in the loop revives a prologue pipe's debt on the backedge.
+    bool accepted = !entry_only.empty() && backedge.size() < baseline.size();
+    for (size_t i = 0; accepted && i < original_count; ++i) {
+      const auto& original = baseline_sites[i].source_pipes;
+      accepted = subset(sites[i].source_pipes, original) &&
+                 (!paths[i] || subset(sites[phase.first_sites[i].value()].source_pipes, original));
+    }
+
+    const auto occupied_entry =
+        accepted ? EntryPrefixPipes(baseline_sites, head, entry) : kAllPhysicalPipesMask;
+    const auto replay_cost = cost;
+    sites = baseline_sites;
+    site_effect_fibers_.resize(original_count);
+    site_refresh_fibers_.resize(original_count);
+    cost = baseline_cost;
+    cost.dataflow_visits += replay_cost.dataflow_visits;
+    cost.certificate_visits += replay_cost.certificate_visits;
+    cost.conflict_queries += replay_cost.conflict_queries;
+    cost.control_snapshot_facts += replay_cost.control_snapshot_facts;
+    cost.control_merge_facts += replay_cost.control_merge_facts;
+    if (!accepted) return;
+    std::vector<PipeType> empty_entry;
+    const auto captures_empty_prefix = [&](PipeType source) {
+      return (occupied_entry & PipeToMask(source)) == 0;
+    };
+    std::copy_if(backedge_only.begin(), backedge_only.end(), std::back_inserter(empty_entry),
+                 captures_empty_prefix);
+    // This initial consuming pair cannot order any earlier payload. Keeping
+    // its original static cut on all visits can close the loop's ID reuse
+    // proof without synthesizing a reverse acknowledgment.
+    backedge_only.erase(std::remove_if(backedge_only.begin(), backedge_only.end(), captures_empty_prefix),
+                        backedge_only.end());
+
+    const auto removed = baseline.size() - selected.size();
+    cost.services -= removed;
+    cost.suppressed_services += removed;
+    cost.certificate_omissions += removed;
+    sites[head].source_pipes = std::move(selected);
+    sites[head].loop_entry =
+        ConservativeLoopEntryServices{loop, !trip_prover_.IsPositiveTrip(loop.get()), std::move(entry_only),
+                                      std::move(backedge_only), std::move(empty_entry)};
   }
 
   void RefineStorage() {
@@ -2165,7 +2543,8 @@ class Builder {
     const auto inserted = site_index_.emplace(cut.get(), sites.size()).second;
     CHECK_SPAN(inserted, cut->span_)
         << "Conservative synchronization: shared statement identity has ambiguous insertion cuts";
-    sites.push_back({cut, std::move(operation), std::move(effects), {}, {}, {}, {}});
+    sites.push_back(
+        {cut, std::move(operation), std::move(effects), {}, {}, {}, {}, std::nullopt, std::nullopt});
     inside_child_.push_back(native_child_depth_ != 0);
     // The ordinary service protects the scalar instruction's storage read.
     // Only its selected blocking native return then makes the original SSA
@@ -2305,6 +2684,7 @@ class Builder {
   SyncFootprintResolver resolver_;
   bool retain_incoming_diagnostics_;
   bool enable_refresh_kill_;
+  bool enable_loop_prefixes_;
   std::unordered_map<const Expr*, ExprPtr> gm_roots_;
   std::unordered_map<const Var*, ExprPtr> ssa_defs_;
   std::vector<std::vector<const Var*>> scopes_;
@@ -2340,7 +2720,8 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
     const std::vector<std::shared_ptr<const NativeSyncChild>>& children,
     const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful_children,
     bool retain_incoming_diagnostics, bool automatic_children, bool enable_refresh_kill,
-    const SyncParameterBounds& parameters, const std::optional<std::pair<int64_t, int64_t>>& blocks) {
+    const SyncParameterBounds& parameters, const std::optional<std::pair<int64_t, int64_t>>& blocks,
+    bool enable_loop_prefixes) {
   CHECK(function && function->ir_stage_ == FunctionIRStage::Buffer)
       << "Conservative synchronization requires Buffer IR";
   CHECK(function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV)
@@ -2357,7 +2738,7 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
       if (attempt.child) selected.push_back(attempt.child);
   }
   Builder builder(function, target, children, selected, retain_incoming_diagnostics, enable_refresh_kill,
-                  parameters, blocks);
+                  parameters, blocks, enable_loop_prefixes);
   if (automatic_children && !selection.inline_subblocks.empty()) {
     builder.RegisterInlineSubblocks(selection.inline_subblocks);
   }

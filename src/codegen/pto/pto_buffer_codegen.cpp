@@ -94,12 +94,13 @@ std::string BufferTypeString(const ir::BufferTypePtr& type, const ir::Span& span
                     type->dtype_ == DataType::INT16 || type->dtype_ == DataType::UINT32) &&
                    type->blayout_ == ir::TileLayout::row_major &&
                    type->slayout_ == ir::TileLayout::none_box && type->fractal_ == 512 &&
-                   type->pad_ == ir::PadValue::null && type->compact_ == ir::CompactMode::null,
+                   (type->pad_ == ir::PadValue::null || backend::IsFullZeroPaddedVec(type)) &&
+                   type->compact_ == ir::CompactMode::null,
                span)
         << "Direct Buffer IR codegen currently requires dense row-major Vec "
            "FP16/BF16/FP32/INT32/INT16/UINT8/UINT32 "
            "buffers "
-           "with fractal=512, no padding, and no compact mode";
+           "with fractal=512, no compact mode, and null or full-valid zero padding";
   }
   const bool vector = type->shape_.size() == 1;
   const int64_t rows = vector ? 1 : type->shape_[0];
@@ -491,11 +492,13 @@ class BufferEmissionPreflight : public ir::IRVisitor {
       const auto buffer = As<ir::BufferType>(call->args_[load ? 3 : 0]->GetType());
       const auto tensor_type = As<ir::TensorType>(call->args_[load ? 0 : 3]->GetType());
       const auto tensor_columns = tensor_type ? As<ir::ConstInt>(tensor_type->shape_.back()) : nullptr;
-      const bool scalar_point = backend::SupportsBufferScalarTransfer(call->args_, load);
+      // A point-shaped partition may also satisfy an ordinary vector or
+      // rectangle DMA contract on a target without scalar GM staging.
+      const bool scalar_point = conversion_supported_ && function_->func_type_ == ir::FunctionType::AIV &&
+                                backend::SupportsBufferScalarTransfer(call->args_, load);
       const bool vector_1d = backend::SupportsBufferVector1DTransfer(call->args_, load);
-      CHECK_SPAN(!scalar_point || (conversion_supported_ && function_->func_type_ == ir::FunctionType::AIV),
-                 call->span_)
-          << "Rank-one scalar point transfers require A2/A3 AIV execution";
+      CHECK_SPAN(tensor_type->shape_.size() != 1 || scalar_point || vector_1d, call->span_)
+          << "Rank-one Buffer transfer requires a qualified scalar point or vector transfer";
       CHECK_SPAN(
           scalar_point || vector_1d ||
               (!backend::IsColumnVectorBufferGeometry(buffer) &&

@@ -1623,6 +1623,13 @@ void BindTesting(nb::module_& m) {
             record["incoming"] = nb::none();
           record["source_pipes"] = site.source_pipes;
           record["required_source_pipes"] = site.required_source_pipes;
+          record["post_destination"] = site.post_destination ? nb::cast(*site.post_destination) : nb::none();
+          record["entry_only_source_pipes"] =
+              site.loop_entry ? site.loop_entry->entry_only : std::vector<ir::PipeType>{};
+          record["backedge_only_source_pipes"] =
+              site.loop_entry ? site.loop_entry->backedge_only : std::vector<ir::PipeType>{};
+          record["empty_entry_source_pipes"] =
+              site.loop_entry ? site.loop_entry->empty_entry_sources : std::vector<ir::PipeType>{};
           nb::list refreshed;
           for (const auto& [space, domain] : site.refreshed_domains) {
             nb::dict entry;

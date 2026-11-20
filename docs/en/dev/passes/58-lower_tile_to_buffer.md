@@ -43,6 +43,7 @@ partition form before storage planning rather than failing during final lowering
 | Operations | Element types |
 | ---------- | ------------- |
 | Ordinary packed ND GM load/store | FP16, BF16, FP32, INT32 |
+| fillpad (zero, full columns, placed A2/A3 Vec) | FP16, BF16, FP32, INT32 |
 | Atomic-add Acc writeback to packed ND GM | FP32 source and destination, A2/A3 |
 | add, mul | FP16, FP32, INT32 |
 | sub, div, maximum, minimum, abs, exp, sqrt, neg, relu, log, recip | FP32 |
@@ -53,6 +54,13 @@ partition form before storage planning rather than failing during final lowering
 | col_sum/max/min/prod | FP32, positive static valid, sequential reduction |
 | col_expand_add/sub/mul/div/max/min | FP32, positive static valid, single-row carrier |
 | transpose | FP32, full-valid dense rank-2 matrices |
+
+For aligned rank-2 Vec buffers with full valid columns, zero `fillpad` copies
+the active rows into disjoint storage and fills the remaining rows with zeros.
+A runtime-empty input uses a full-destination zero fill. The full-valid result
+keeps its zero pad mode through supported casts and stores. The recipe requires
+placed storage from the PYPTO or DSA_RP planner and accounts for reads within
+the complete source allocation and writes to the complete destination.
 
 Scalar parameters use the existing scalar ABI; element operands receive explicit
 conversion during lowering. `full` followed by store also qualifies without a

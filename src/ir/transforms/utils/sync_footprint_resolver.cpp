@@ -516,7 +516,8 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
 
     if (elem_type->memory_space_ == MemorySpace::Vec && elem_type->shape_.size() == 2 && rows > 0 &&
         cols > 0 && elem_type->dtype_.GetBit() % 8 == 0 &&
-        (backend::DenseBufferBytes(elem_type) || backend::IsColumnVectorBuffer(elem_type))) {
+        (backend::DenseBufferBytes(elem_type) || backend::IsColumnVectorBuffer(elem_type) ||
+         backend::IsFullZeroPaddedVec(elem_type))) {
       const int64_t elem_bytes = elem_type->dtype_.GetByte();
       view.row_pitch_bytes = cols * elem_bytes;
       if (!multi) {

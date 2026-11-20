@@ -98,20 +98,19 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
     result.audited_signal_free_variant_ = true;
   } else if (IsOp(call, "buffer.load") || IsOp(call, "buffer.store")) {
     const bool load = IsOp(call, "buffer.load");
-    if (const auto tensor = As<ir::TensorType>(call->args_[load ? 0 : 3]->GetType());
-        tensor && tensor->shape_.size() == 1) {
-      const bool scalar_point = SupportsBufferScalarTransfer(call->args_, load);
-      const bool vector_1d = SupportsBufferVector1DTransfer(call->args_, load);
-      CHECK(core == FunctionType::AIV && target == "a2a3" && (scalar_point || vector_1d))
-          << "Rank-one Buffer DMA requires qualified A2/A3 AIV scalar point or vector 1D transfer contract";
-      if (scalar_point) {
-        // TLOAD reads one GM element and may write a local alignment tail;
-        // TSTORE writes exactly one GM element. Its selected ND unit view gives
-        // nBurst=1,lenBurst=4 in TStoreUb2gmNd2nd, then the A2/A3 b32 intrinsic.
-        // Both retain the normative selected native DMA contract. Conservative
-        // import covers the full carrier; no exact physical selector is granted.
-        result.audited_signal_free_variant_ = true;
-      }
+    const auto gm_tensor = As<ir::TensorType>(call->args_[load ? 0 : 3]->GetType());
+    if (SupportsBufferScalarTransfer(call->args_, load)) {
+      CHECK(core == FunctionType::AIV && target == "a2a3")
+          << "Scalar point Buffer DMA requires qualified A2/A3 AIV execution";
+      // An ND unit partition in either supported rank gives nBurst=1 and
+      // lenBurst=4 in the selected A2/A3 b32 path. TLOAD may write a local
+      // alignment tail. TSTORE transfers only the four destination bytes.
+      // Conservative import covers the full local carrier.
+      result.audited_signal_free_variant_ = true;
+    } else if (gm_tensor && gm_tensor->shape_.size() == 1) {
+      CHECK(core == FunctionType::AIV && target == "a2a3" &&
+            SupportsBufferVector1DTransfer(call->args_, load))
+          << "Rank-one Buffer DMA requires a qualified A2/A3 AIV vector 1D transfer contract";
     }
     const auto local = As<BufferType>(call->args_[load ? 3 : 0]->GetType());
     CHECK(local && (local->memory_space_ == MemorySpace::Vec ||
@@ -185,8 +184,9 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
         (lhs->shape_[0] / 16) * (rhs->shape_[1] / 16) >= 10;
   } else {
     if (const auto conversion = FindBufferConversionRecipe(call->op_->name_))
-      CHECK(conversion->kind == BufferConversionKind::Cast)
-          << "Synchronization conversion import requires a qualified AIV cast";
+      CHECK(conversion->kind == BufferConversionKind::Cast ||
+            conversion->kind == BufferConversionKind::FillPad)
+          << "Synchronization conversion import requires a qualified AIV cast or fillpad";
     result.pipe_ = PipeType::V;
   }
   if (IsOp(call, "buffer.ci_workspace")) {
@@ -210,6 +210,14 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
       // branches are not selected. Retain existing conservative catalog claims.
       CHECK(target == "a2a3") << "Direct BF16/FP32 conversion requires a qualified native implementation";
     }
+  }
+  if (IsOp(call, "buffer.fillpad")) {
+    CHECK(target == "a2a3" && core == FunctionType::AIV)
+        << "FillPad requires the qualified A2/A3 AIV implementation";
+    // The 2/4-byte Vec branch of A2/A3 TFillPad.hpp uses copies and vector
+    // duplication on explicit operands. The one-byte helper with a private
+    // V-to-S event is excluded by the registered dtype contract.
+    result.vec_fillpad_non_byte_ = true;
   }
   if (IsOp(call, "buffer.rsqrt") || IsOp(call, "buffer.rsqrt_workspace")) {
     CHECK(target == "a2a3") << "Rsqrt requires a qualified native implementation";
@@ -361,6 +369,15 @@ std::vector<sync::IsaResourceClaim> BufferSyncImplementation::Claims() const {
     // Acc->Mat FIXPIPE insert variant, never by the macro's name alone. The Vec
     // TEXTRACT / TINSERT helpers remain reserved when executed on AIV Vec.
     if ((mat_to_operand_extract_ || acc_to_mat_insert_) && claim.pool.core == CoreScope::AIV) continue;
+    // The macro catalog includes Handle32BAlignedPad_Byte. Suppress only
+    // that helper's known manual claim for the selected non-byte variant.
+    const sync::PoolKey byte_pad_pool{ResourceKind::PipelineEvent, CoreScope::AIV, ir::PipeType::V,
+                                      ir::PipeType::S, 0};
+    if (vec_fillpad_non_byte_ && claim.pool == byte_pad_pool && claim.source == IsaIdSource::Fixed &&
+        claim.lifetime == IsaResourceLifetime::Invocation && claim.ids.size() == 1 &&
+        claim.ids.front() == 0) {
+      continue;
+    }
     CHECK(claim.pool.kind == ResourceKind::PipelineEvent &&
           claim.pool.core == (core_ == ir::FunctionType::AIV ? CoreScope::AIV : CoreScope::AIC) &&
           claim.source == IsaIdSource::Fixed && claim.lifetime == IsaResourceLifetime::Invocation)

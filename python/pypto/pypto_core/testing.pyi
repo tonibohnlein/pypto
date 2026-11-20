@@ -365,8 +365,13 @@ def analyze_conservative_sync(
 
     Incoming history snapshots are an optional diagnostic export. When disabled,
     incoming fields are unavailable (None), rather than exact empty histories.
-    required_source_pipes retains baseline storage obligations; source_pipes is
-    the certified ordered subset constructed from established payload completions.
+    required_source_pipes retains baseline storage obligations. source_pipes is
+    the ordered union of selected sources across visits. entry_only_source_pipes
+    runs once before a nonempty loop. backedge_only_source_pipes runs before
+    the payload on later visits. empty_entry_source_pipes runs on every visit
+    and captures an empty prefix on the first. The remaining sources run at
+    the payload cut. An optional post_destination receives this pipe's
+    completion immediately after the payload.
     """
     ...
 

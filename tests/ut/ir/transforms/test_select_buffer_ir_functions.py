@@ -782,6 +782,40 @@ def test_conflicting_typed_window_parents_stay_tile(planner):
     assert _kernel(_lower(ConflictingParents, planner)).ir_stage == ir.FunctionIRStage.Functional
 
 
+@pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP])
+def test_fillpad_defines_zero_suffix_before_cast_and_store(planner):
+    @pl.program
+    class RuntimeRowFillPad:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            source: pl.Tensor[[16, 32], pl.BF16],
+            rows: pl.Scalar[pl.INDEX],
+            output: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+        ) -> pl.Tensor[[16, 32], pl.FP32]:
+            prefix = pl.load(source, [0, 0], [16, 32], valid_shape=[rows, 32])
+            padded = pl.fillpad(prefix, pad_value=pl.PadValue.zero)
+            widened = pl.cast(padded, pl.FP32)
+            return pl.store(widened, [0, 0], output)
+
+    program = _run_autosync(RuntimeRowFillPad, planner)
+    assert _kernel(program).ir_stage == ir.FunctionIRStage.Buffer
+    pto = codegen.PTOCodegen().generate(program, emit_tile_addr=True, emit_source_loc=False)
+    assert "pto.tfillpad" in pto
+    assert "pto.texpands" in pto
+    assert "pto.tcvt" in pto
+    assert "pad=1" in pto
+    namespace = {}
+    exec(torch_codegen(program), namespace)  # noqa: S102
+    original = torch.arange(1, 513, dtype=torch.bfloat16).reshape(16, 32)
+    for rows in (0, 3, 16):
+        output = torch.full((16, 32), -1.0)
+        namespace["kernel"](original, rows, output)
+        expected = original.float()
+        expected[rows:] = 0
+        torch.testing.assert_close(output, expected)
+
+
 @pytest.mark.parametrize("planner", _PLANNERS)
 @pytest.mark.parametrize("dynamic", ["offset", "valid"])
 def test_dynamic_window_forms_select_buffer(planner, dynamic):
@@ -1772,11 +1806,14 @@ def _run_autosync(program, planner=passes.MemoryPlanner.PYPTO, policy="conservat
     return synced
 
 
-@pytest.mark.parametrize("dtype_name,torch_dtype,fill_val", [
-    ("BF16", torch.bfloat16, 1.5),
-    ("FP16", torch.float16, 1.5),
-    ("INT32", torch.int32, 7),
-])
+@pytest.mark.parametrize(
+    "dtype_name,torch_dtype,fill_val",
+    [
+        ("BF16", torch.bfloat16, 1.5),
+        ("FP16", torch.float16, 1.5),
+        ("INT32", torch.int32, 7),
+    ],
+)
 def test_non_fp32_tile_full_selects_executes_and_owns_autosync(dtype_name, torch_dtype, fill_val):
     program = pl.parse_program(f"""
 @pl.program

@@ -344,6 +344,15 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
       }
       return;
     }
+    if (IsOp(call, "buffer.fillpad") && call->args_.size() == 2) {
+      const auto type = As<BufferType>(call->args_[0]->GetType());
+      const auto extents = Extents(call->args_[0]);
+      if (!type || !extents || !Equal((*extents)[1], Constant(type->shape_[1], call->span_)) ||
+          !AtomicInteger((*extents)[0]) || !analyzer_->CanProveGreaterEqual((*extents)[0], 1)) {
+        Refuse(call, "FillPad requires a positive source row guard and fixed full columns");
+      }
+      return;
+    }
     if (const auto* conversion = backend::FindBufferConversionRecipe(call->op_->name_);
         conversion && conversion->kind == backend::BufferConversionKind::Cast && call->args_.size() == 2) {
       bool dynamic = false;

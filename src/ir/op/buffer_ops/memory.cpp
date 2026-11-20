@@ -171,10 +171,13 @@ TypePtr DeduceBufferTransfer(const std::vector<ExprPtr>& args, bool load) {
   auto tensor = As<TensorType>(args[load ? 0 : 3]->GetType());
   auto buffer = As<BufferType>(args[load ? 3 : 0]->GetType());
   CHECK(tensor && buffer) << name << " requires an ordinary GM TensorType and a BufferType";
+  if (backend::SupportsBufferScalarTransfer(args, load)) {
+    return GetVoidType();
+  }
   if (tensor->shape_.size() == 1) {
-    CHECK(backend::SupportsBufferScalarTransfer(args, load) ||
-          backend::SupportsBufferVector1DTransfer(args, load))
-        << "Rank-one Buffer transfers require either a qualified INT32 scalar point transfer or an aligned "
+    CHECK(backend::SupportsBufferVector1DTransfer(args, load))
+        << "Rank-one Buffer transfers require either a qualified INT32/FP32 scalar point transfer or an "
+           "aligned "
            "rank-1 vector transfer into a [1, C] Vec buffer";
     return GetVoidType();
   }
@@ -325,7 +328,8 @@ REGISTER_OP("buffer.load")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       const int cache = GetIntKwarg(kwargs, "cache", static_cast<int>(CachePolicy::kDefault));
-      CHECK(cache == static_cast<int>(CachePolicy::kDefault) || cache == static_cast<int>(CachePolicy::kBypass))
+      CHECK(cache == static_cast<int>(CachePolicy::kDefault) ||
+            cache == static_cast<int>(CachePolicy::kBypass))
           << "buffer.load cache must be CachePolicy.NORMAL or CachePolicy.BYPASS";
       return DeduceBufferTransfer(args, true);
     });

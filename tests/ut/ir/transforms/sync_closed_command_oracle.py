@@ -389,7 +389,11 @@ class ClosedCommands:
                 if name == opname("buffer.load"):
                     destination = self.bytes(args[3], (0, 0, rect[2], rect[3]))
                     source = reads
-                    if len(args[0].type.shape) == 1:
+                    if len(args[0].type.shape) == 1 or (
+                        rect[2:] == (1, 1)
+                        and tuple(args[3].type.shape) == (1, 8)
+                        and tuple(args[3].type.valid_shape) == (1, 1)
+                    ):
                         # Deliberately poison inactive/dummy lanes: readiness
                         # and values must rely only on the original GM point.
                         for cell in writes - destination:

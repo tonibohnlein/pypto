@@ -80,6 +80,45 @@ bool IsPeerTransport(const CallPtr& call) {
   return op_predicates::IsTPush(call) || op_predicates::IsTPop(call) || op_predicates::IsTFree(call);
 }
 
+int IncomingDirection(core_affinity::CoreSide side) {
+  return side == core_affinity::CoreSide::AIC ? core_affinity::kDirMaskV2C : core_affinity::kDirMaskC2V;
+}
+
+using ReserveDeclarations = std::unordered_map<const Var*, CallPtr>;
+
+// Tile TPOP on A2/A3 issues TLOAD on MTE2, with the local slot offset based
+// on SLOT_SIZE even when its payload is shorter (TPush.hpp: Consumer::pop).
+// The incoming operand names a local reserve. A scalar address or imported
+// outbound address does not establish the identity and extent of that reserve.
+std::optional<ConsumerReceiveStorage> BindConsumerStorage(const CallPtr& setup, core_affinity::CoreSide side,
+                                                          const ReserveDeclarations& reserves) {
+  const int mask = setup->GetKwarg<int>("dir_mask", 0);
+  const int both = core_affinity::kDirMaskV2C | core_affinity::kDirMaskC2V;
+  const int slots = setup->GetKwarg<int>("slot_num", GetPtoasImplicitSlotNum(mask));
+  const int local = setup->GetKwarg<int>("local_slot_num", slots);
+  const int64_t stride = setup->GetKwarg<int>("slot_size", 0);
+  if (!(mask & IncomingDirection(side)) || (mask & ~both) || local <= 0 || local > slots || stride <= 0 ||
+      setup->args_.size() != 2) {
+    return std::nullopt;
+  }
+  const bool cube = side == core_affinity::CoreSide::AIC;
+  const auto reserve = AsVarLike(setup->args_[cube ? 1 : 0]);
+  const auto declaration = reserves.find(reserve.get());
+  if (declaration == reserves.end()) {
+    return std::nullopt;
+  }
+  const int64_t size = declaration->second->GetKwarg<int>("size", 0);
+  // All operands are widened from i32. The depth-stride product and the
+  // reserve's placed end therefore fit i64 before performing the arithmetic.
+  if (size < local * stride) {
+    return std::nullopt;
+  }
+  const int64_t base = declaration->second->GetKwarg<int>("base", kAutoBufferBase);
+  return ConsumerReceiveStorage{
+      reserve, cube ? MemorySpace::Mat : MemorySpace::Vec,    PipeType::MTE2, local, stride,
+      size,    base >= 0 ? std::optional{base} : std::nullopt};
+}
+
 // Each nested body closes its own borrows without popping an inherited queue
 // entry. Thus it restores the incoming state even for skipped or repeated visits.
 // Independent pipe IDs have independent slots and can release in either order.
@@ -196,11 +235,17 @@ class PeerCutVerifier : public IRVisitor {
     const bool at_cut = expected_ == expr.get();
     if (at_cut) expected_ = nullptr;
     CHECK(!call || !As<GlobalVar>(call->op_)) << "Outlined calls do not establish local peer FIFO order";
-    if (IsPeerTransport(call) || op_predicates::IsInitializePipe(call)) {
-      CHECK_SPAN(at_cut && seen_cuts_.insert(call.get()).second, call->span_)
-          << "Peer FIFO requires an original peer operation at a unique statement cut";
-      CHECK_SPAN(!op_predicates::IsInitializePipe(call) || initializers_.count(call.get()), call->span_)
-          << "Peer FIFO requires initializers that dominate all transport cuts";
+    const bool initializes = op_predicates::IsInitializePipe(call);
+    if (IsPeerTransport(call) || initializes) {
+      // Unrolling can share an immutable TPOP expression across assignments.
+      // ConsumerFifo counts every statement occurrence and matches each borrow
+      // using that assignment's result, even when the right-hand side is shared.
+      CHECK_SPAN(at_cut, call->span_) << "Peer FIFO requires a peer operation at a statement cut";
+      if (initializes) {
+        const bool first = seen_initializers_.insert(call.get()).second;
+        CHECK_SPAN(first && initializers_.count(call.get()), call->span_)
+            << "Peer FIFO requires initializers that dominate all transport cuts";
+      }
     }
     if (seen_values_.insert(expr.get()).second) IRVisitor::VisitExpr(expr);
   }
@@ -211,7 +256,7 @@ class PeerCutVerifier : public IRVisitor {
  private:
   const std::unordered_set<const Call*>& initializers_;
   const Call* expected_ = nullptr;
-  std::unordered_set<const Call*> seen_cuts_;
+  std::unordered_set<const Call*> seen_initializers_;
   std::unordered_set<const Expr*> seen_values_;
 };
 
@@ -237,7 +282,7 @@ std::optional<std::pair<int64_t, int64_t>> FullVecShape(const TypePtr& value) {
 }
 
 std::optional<Span> FindOverwrittenConsumer(const std::vector<StmtPtr>& stmts, size_t begin, int id,
-                                            size_t slots, int slot_size) {
+                                            const ConsumerReceiveStorage& storage) {
   std::vector<std::pair<const Var*, int64_t>> prior_slots;
   std::unordered_set<const Var*> overwritten;
   std::unordered_map<const Var*, const Var*> aliases;
@@ -258,7 +303,7 @@ std::optional<Span> FindOverwrittenConsumer(const std::vector<StmtPtr>& stmts, s
       }
       const auto shape = FullVecShape(assign->var_->GetType());
       const auto elements = shape && call->GetKwarg<int>("split", 0) == kSplitNone &&
-                                    shape->first <= (slot_size / 4) / shape->second
+                                    shape->first <= (storage.slot_bytes / 4) / shape->second
                                 ? shape->first * shape->second
                                 : 0;
       const auto current = std::pair{assign->var_.get(), elements};
@@ -271,7 +316,7 @@ std::optional<Span> FindOverwrittenConsumer(const std::vector<StmtPtr>& stmts, s
       } else {
         prior_slots.push_back(current);
       }
-      slot = (slot + 1) % slots;
+      slot = (slot + 1) % storage.local_slots;
       continue;
     }
     if (assign) {
@@ -314,12 +359,6 @@ struct C2VReceiveSite {
   std::optional<uint64_t> tile_bytes;
 };
 
-struct C2VReceiveRing {
-  const Var* reserve = nullptr;
-  int local_slots = 1;
-  int slot_bytes = 0;
-};
-
 class C2VReceiveSites : public IRVisitor {
  public:
   void VisitStmt(const StmtPtr& stmt) override {
@@ -344,10 +383,7 @@ class C2VReceiveSites : public IRVisitor {
   void VisitExpr(const ExprPtr&) override {}
 
   std::vector<C2VReceiveSite> sites;
-  std::map<int, C2VReceiveRing> rings;
-  // A native initializer can also take a raw scalar address. Only direct
-  // reserve_buffer results carry a trusted allocation identity and extent.
-  std::map<const Var*, CallPtr> reserve_declarations;
+  std::map<int, std::optional<ConsumerReceiveStorage>> rings;
   std::unordered_set<const Stmt*> early_exit_loops;
   bool has_explicit_wait = false;
 
@@ -375,20 +411,14 @@ class C2VReceiveSites : public IRVisitor {
   }
 
   void RecordRing(const CallPtr& call) {
-    const int mask = call->GetKwarg<int>("dir_mask", 0);
-    const bool receives_c2v = (mask & core_affinity::kDirMaskC2V) != 0;
-    const bool has_consumer_operands = call->args_.size() == 2;
-    if (!receives_c2v || !has_consumer_operands) {
+    constexpr auto side = core_affinity::CoreSide::AIV;
+    if (!(call->GetKwarg<int>("dir_mask", 0) & IncomingDirection(side))) {
       return;
     }
     const int id = call->GetKwarg<int>("id", 0);
-    const int slots = call->GetKwarg<int>("slot_num", GetPtoasImplicitSlotNum(mask));
-    const int depth = call->GetKwarg<int>("local_slot_num", slots);
-    const int bytes = call->GetKwarg<int>("slot_size", 0);
-    const C2VReceiveRing ring{AsVarLike(call->args_.front()).get(), std::max(1, depth), bytes};
-    const auto [entry, unique] = rings.emplace(id, ring);
+    const auto [entry, unique] = rings.emplace(id, BindConsumerStorage(call, side, reserve_declarations));
     if (!unique) {
-      entry->second = {};
+      entry->second.reset();
     }
   }
 
@@ -405,6 +435,7 @@ class C2VReceiveSites : public IRVisitor {
                      utils::StaticPhysicalAllocationBytes(tile, MemorySpace::Vec, nullptr)});
   }
 
+  ReserveDeclarations reserve_declarations;
   const Stmt* loop_ = nullptr;
   bool unconditional_ = false;
 };
@@ -414,23 +445,16 @@ bool MayAliasOtherRings(const C2VReceiveSites& receives) {
   std::unordered_set<const Var*> seen_reserves;
   for (const auto& site : receives.sites) {
     const auto entry = receives.rings.find(site.pipe_id);
-    if (entry == receives.rings.end()) {
+    if (entry == receives.rings.end() || !entry->second || !entry->second->placed_base) {
       return true;
     }
-    const auto& ring = entry->second;
-    const auto reserve = receives.reserve_declarations.find(ring.reserve);
-    if (reserve == receives.reserve_declarations.end()) {
-      return true;
-    }
-    const auto size = static_cast<int64_t>(reserve->second->GetKwarg<int>("size", 0));
-    const auto base = static_cast<int64_t>(reserve->second->GetKwarg<int>("base", kAutoBufferBase));
-    if (base < 0 || ring.slot_bytes <= 0 || size < int64_t{ring.local_slots} * ring.slot_bytes) {
-      return true;
-    }
+    const auto& ring = *entry->second;
+    const auto base = *ring.placed_base;
     if (site.may_write && (!site.tile_bytes || *site.tile_bytes > static_cast<uint64_t>(ring.slot_bytes))) {
       return true;
     }
-    if (seen_reserves.insert(ring.reserve).second && !address_ranges.emplace(base, base + size).second) {
+    if (seen_reserves.insert(ring.reserve.get()).second &&
+        !address_ranges.emplace(base, base + ring.reserve_bytes).second) {
       return true;
     }
   }
@@ -452,13 +476,13 @@ struct LocalSlotHistory {
   const Stmt* uniform_loop = nullptr;
   size_t period = 0;
 
-  void Include(const C2VReceiveSite& site, const C2VReceiveRing& ring) {
+  void Include(const C2VReceiveSite& site, int local_slots) {
     if (!site.may_write) {
       return;
     }
     if (distinct_sites == 0) {
       first_pipe = site.pipe_id;
-      safe_depth = ring.local_slots;
+      safe_depth = local_slots;
       uniform_loop = site.loop;
     }
     if (!site.unconditional || site.loop != uniform_loop) {
@@ -805,9 +829,6 @@ ConsumerFifoEvidence AnalyzeConsumerFifo(const FunctionPtr& function) {
   if (function->func_type_ != FunctionType::AIC && function->func_type_ != FunctionType::AIV) return {};
   const auto side =
       function->func_type_ == FunctionType::AIC ? core_affinity::CoreSide::AIC : core_affinity::CoreSide::AIV;
-  const int incoming =
-      side == core_affinity::CoreSide::AIC ? core_affinity::kDirMaskV2C : core_affinity::kDirMaskC2V;
-  const size_t operand = side == core_affinity::CoreSide::AIC ? 1 : 0;
   const auto stmts = FlattenBody(function->body_);
   ConsumerFifoEvidence evidence;
   try {
@@ -817,8 +838,8 @@ ConsumerFifoEvidence AnalyzeConsumerFifo(const FunctionPtr& function) {
     CHECK(!fifo.unsupported_control)
         << "Concurrent, outlined or early-exit control does not prove local FIFO order";
     const auto initialize = core_side_ops::InitializePipeOp(side);
-    std::unordered_map<const Var*, CallPtr> reserves;
-    std::map<int, CallPtr> initializers;
+    ReserveDeclarations reserves;
+    std::map<int, std::optional<ConsumerReceiveStorage>> local_storage;
     std::unordered_set<const Call*> prologue_initializers;
     for (size_t i = 0; i < fifo.first_transport; ++i) {
       const auto& stmt = stmts[i];
@@ -828,35 +849,24 @@ ConsumerFifoEvidence AnalyzeConsumerFifo(const FunctionPtr& function) {
         if (const auto assign = As<AssignStmt>(stmt)) reserves.emplace(assign->var_.get(), call);
       } else if (IsOp(call, initialize)) {
         prologue_initializers.insert(call.get());
-        if (call->GetKwarg<int>("dir_mask", 0) & incoming) {
-          CHECK(initializers.emplace(call->GetKwarg<int>("id", 0), call).second)
-              << "More than one dominating consumer initializer uses the same peer pipe id";
+        if (call->GetKwarg<int>("dir_mask", 0) & IncomingDirection(side)) {
+          const auto id = call->GetKwarg<int>("id", 0);
+          const bool unique = local_storage.emplace(id, BindConsumerStorage(call, side, reserves)).second;
+          CHECK(unique) << "More than one dominating consumer initializer uses the same peer pipe id";
         }
       }
     }
     PeerCutVerifier(prologue_initializers).VisitStmt(function->body_);
     for (const auto& [id, required] : fifo.peak_depth) {
-      const auto it = initializers.find(id);
-      CHECK(it != initializers.end()) << "No dominating consumer initializer for peer pipe id " << id;
-      const auto& setup = it->second;
-      const auto mask = setup->GetKwarg<int>("dir_mask", 0);
-      const auto slots = setup->GetKwarg<int>("slot_num", GetPtoasImplicitSlotNum(mask));
-      const auto local = setup->GetKwarg<int>("local_slot_num", slots);
-      const auto slot_size = setup->GetKwarg<int>("slot_size", 0);
-      CHECK((mask & ~(core_affinity::kDirMaskV2C | core_affinity::kDirMaskC2V)) == 0 && local > 0 &&
-            slots >= local && slot_size > 0 && setup->args_.size() == 2)
-          << "Invalid consumer slot geometry for peer pipe id " << id;
-      const auto reserve = reserves.find(AsVarLike(setup->args_[operand]).get());
-      CHECK(reserve != reserves.end() &&
-            reserve->second->GetKwarg<int>("size", 0) >= int64_t{local} * slot_size)
-          << "No reserve declaration covers the consumer slot window for peer pipe id " << id;
-      const auto depth = static_cast<size_t>(local);
-      evidence.capacities.emplace(id, ConsumerPipeCapacity{required, depth});
+      const auto it = local_storage.find(id);
+      CHECK(it != local_storage.end()) << "No dominating consumer initializer for peer pipe id " << id;
+      const auto& storage = it->second;
+      CHECK(storage) << "Invalid consumer slot geometry or missing local reserve for peer pipe id " << id;
+      evidence.capacities.emplace(id, ConsumerPipeCapacity{required, *storage});
       const bool can_prove_slot_reuse =
           side == core_affinity::CoreSide::AIV && prologue_initializers.size() == 1;
       if (can_prove_slot_reuse) {
-        if (const auto overwritten =
-                FindOverwrittenConsumer(stmts, fifo.first_transport, id, depth, slot_size)) {
+        if (const auto overwritten = FindOverwrittenConsumer(stmts, fifo.first_transport, id, *storage)) {
           evidence.overwritten_input.emplace(*overwritten);
         }
       }
@@ -875,18 +885,14 @@ std::unordered_set<const Stmt*> FindC2VSlotReuseFences(const FunctionPtr& functi
   if (ir.has_explicit_wait) {
     return {};
   }
-  const C2VReceiveRing unknown;
-  const auto ring_for = [&](int id) -> const C2VReceiveRing& {
-    const auto it = ir.rings.find(id);
-    return it == ir.rings.end() ? unknown : it->second;
-  };
   const bool may_alias_all = MayAliasOtherRings(ir);
   const auto reserve_for = [&](const C2VReceiveSite& site) {
-    return may_alias_all ? nullptr : ring_for(site.pipe_id).reserve;
+    return may_alias_all ? nullptr : ir.rings.at(site.pipe_id)->reserve.get();
   };
   std::map<const Var*, LocalSlotHistory> histories;
   for (const auto& site : ir.sites) {
-    histories[reserve_for(site)].Include(site, may_alias_all ? unknown : ring_for(site.pipe_id));
+    const auto local_slots = may_alias_all ? 1 : ir.rings.at(site.pipe_id)->local_slots;
+    histories[reserve_for(site)].Include(site, local_slots);
   }
   for (const auto& site : ir.sites) {
     histories.at(reserve_for(site)).ObservePeriod(site);

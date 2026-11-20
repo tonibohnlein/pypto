@@ -100,10 +100,31 @@ loops retain zero-trip and backedge facts without unfolding trip counts. No
 possible write kills older obligations. Unsupported effects, scalar-memory
 readiness and compound transport still refuse transactionally.
 
-Each cross-pipe consumer-cut service selects a logical forward-and-return
-acknowledgment before physical lowering. It may add payload order. The qualified
-closed protocol uses at most two eligible roles per direction, after existing
-native claims and exclusions; unavailable directions or capacity remain refusals.
+A consumer normally waits for the current prefix of the source pipe. This can
+delay storage reuse if an unrelated operation on that pipe follows the last
+access to the storage. In a single sequential loop, the conservative planner
+can capture completion immediately after that last access and issue the wait
+there on an idle destination pipe. Placement uses the physical read/write
+domains and control paths of the operations. The planner reruns its fixed-point
+check over loop entry, branches and backedges, and checks that the handoff
+replaces the original wait without adding another prerequisite service. When
+these checks fail it keeps the original placement. Physical lowering allocates
+events and supplies a return acknowledgment when reuse requires one.
+
+A loop head can reuse storage first touched in the prologue. The first
+overwrite may need a pre-loop reader to finish, while later overwrites need
+the previous iteration’s reader to finish. For an unconditional first payload
+of a qualified sequential counted loop, the planner analyzes the first visit
+separately from the backedge fixed point. It emits entry-only services once on
+the nonempty path, recurring services at the original payload cut, and
+backedge-only services there after the first iteration. If a backedge source
+pipe is provably empty at loop entry, its wait can execute on every visit.
+The first wait then captures an empty prefix and the recurring event pair can
+acknowledge reuse without a separate return event. Both analyses use
+physical storage overlaps, including aliases. A conditional access can
+therefore renew a debt on a later visit. The generated loop keeps its original
+bounds and payload body.
+
 The same invocation drain and whole-kernel ownership rules apply. This policy
 does not silently replace successful exact mathematics after an export failure.
 Its identity is retained by context cloning, JIT caches and route reports.

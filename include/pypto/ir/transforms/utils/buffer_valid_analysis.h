@@ -90,17 +90,18 @@ class BufferValidAnalysis : public IRVisitor {
     // Empty reduction axes have different semantics from empty elementwise
     // outputs; the axis recipes deliberately require a wholly static kernel.
     const auto* conversion = backend::FindLogicalBufferConversionRecipe(call->op_->name_);
-    // Static casts have an operation-local descriptor recipe. Lowering restores
-    // each logical alias's valid state and supplies a static use-site window
-    // even when another alias promoted its allocation handle to dynamic.
-    const bool static_cast_recipe = conversion && conversion->kind == backend::BufferConversionKind::Cast &&
+    // Casts restore each operand's valid state. FillPad restores its source
+    // state and defines a full output even when the source has zero live rows.
+    using Kind = backend::BufferConversionKind;
+    const bool guarded_conversion = conversion &&
+                                    (conversion->kind == Kind::Cast || conversion->kind == Kind::FillPad) &&
                                     backend::SupportsLogicalBufferConversion(*conversion, call);
     const auto* axis_recipe = backend::FindLogicalBufferAxisRecipe(call->op_->name_);
     const bool runtime_axis_op =
         axis_recipe &&
         (axis_recipe->axis == 1 || std::string_view(axis_recipe->buffer_op) == "buffer.col_expand_mul") &&
         backend::SupportsLogicalBufferAxis(*axis_recipe, call);
-    restricted_ |= (axis_recipe && !runtime_axis_op) || (conversion && !static_cast_recipe) ||
+    restricted_ |= (axis_recipe && !runtime_axis_op) || (conversion && !guarded_conversion) ||
                    backend::FindLogicalBufferIndexedRecipe(call->op_->name_) != nullptr;
     bool vector_reshape = backend::SupportsLogicalContiguousVectorReshape(call);
     if (vector_reshape) {

@@ -17,6 +17,7 @@ from pypto import ir, passes
 from pypto.backend.pto_backend import _publish_sync_execution_domains
 
 from .qualify_qwen_whole_model import (
+    apply_ptoas_audit,
     domain_ownership,
     expected_ownership_failures,
     function_inventory,
@@ -50,6 +51,38 @@ def test_named_ownership_does_not_hide_other_domains():
         {"function": "external", "status": "unverified_domain"},
     ]
     assert all(row["requested_policy"] == "conservative_prefix" for row in rows)
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("helper", [False, True])
+@pytest.mark.parametrize("identical", [False, True])
+def test_named_owner_obeys_ptoas_insertion_audit(mixed, helper, identical):
+    rows = receipt(True)
+    if mixed:
+        peer = next(row for row in rows if row["function"] == "external")
+        peer.update(synchronization_owner=False, status="delegated")
+    unit = {
+        "unit": "worker",
+        "functions": ["leaf", "external"] if mixed else ["leaf"],
+        "whole_module_domains": [],
+        "helpers": ["helper"] if helper else [],
+        "identical": identical,
+    }
+    errors = apply_ptoas_audit(rows, [unit])
+    assert bool(errors) == (not identical and not mixed and not helper)
+    assert bool(expected_ownership_failures(rows, ["leaf"])) == (not identical)
+
+
+def test_whole_module_claim_requires_a_leaf_owner_even_with_matching_code():
+    rows = receipt(False)
+    unit = {
+        "unit": "worker",
+        "functions": ["leaf"],
+        "whole_module_domains": ["leaf"],
+        "helpers": [],
+        "identical": True,
+    }
+    assert apply_ptoas_audit(rows, [unit]) == ["worker: whole-module claim lacks a PyPTO owner for leaf"]
 
 
 @pytest.mark.parametrize(

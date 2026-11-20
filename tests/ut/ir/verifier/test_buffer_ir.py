@@ -71,6 +71,23 @@ def test_incoming_buffers_and_explicit_writes_are_valid(func_type):
     assert _verify(_program(ir.EvalStmt(call, SPAN), [source, destination], func_type=func_type)) == []
 
 
+def test_dynamic_fillpad_requires_proof_of_full_source_columns():
+    source_type = ir.BufferType([16, 32], DataType.FP32, ir.MemorySpace.Vec, [-1, -1])
+    destination_type = ir.BufferType([16, 32], DataType.FP32, ir.MemorySpace.Vec, pad=ir.PadValue.zero)
+    source = _var("source", source_type)
+    destination = _var("destination", destination_type)
+    initial = ir.MakeTuple([_int(5), _int(16)], SPAN)
+    statements: list[ir.Stmt] = [
+        ir.AssignStmt(source, _call("buffer.alloc", [initial], source_type), SPAN),
+        ir.AssignStmt(destination, _allocation(destination_type), SPAN),
+        ir.EvalStmt(_call("buffer.fillpad", [source, destination]), SPAN),
+    ]
+    _assert_error(
+        _program(ir.SeqStmts(statements, SPAN), func_type=ir.FunctionType.AIV),
+        "FillPad requires a positive source row guard and fixed full columns",
+    )
+
+
 def test_explicit_allocation_defines_a_buffer():
     destination = _var("destination")
     allocation = _allocation(destination.type)

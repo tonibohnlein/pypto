@@ -67,6 +67,7 @@ class BufferSyncImplementation {
   bool produces_ready_scalar_ = false;
   bool mat_to_operand_extract_ = false;
   bool acc_to_mat_insert_ = false;
+  bool vec_fillpad_non_byte_ = false;
   bool audited_signal_free_variant_ = false;
   std::vector<BufferSyncImplicitEffect> implicit_effects_;
 };
