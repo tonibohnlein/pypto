@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -227,7 +228,12 @@ class ScheduleMaterializer : public IRMutator {
     return eval ? As<Call>(eval->expr_).get() : nullptr;
   }
   StmtPtr VisitStmt_(const EvalStmtPtr& statement) override {
-    const auto call = As<Call>(statement->expr_);
+    return ApplyCut(statement, As<Call>(statement->expr_));
+  }
+  StmtPtr VisitStmt_(const AssignStmtPtr& statement) override {
+    return ApplyCut(statement, As<Call>(statement->value_));
+  }
+  StmtPtr ApplyCut(const StmtPtr& statement, const CallPtr& call) {
     const auto found = inventory_.find(call.get());
     return found == inventory_.end() ? statement : Wrap(statement, *found->second);
   }

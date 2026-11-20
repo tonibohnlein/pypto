@@ -1266,7 +1266,7 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   fs_.current_function = func;
   fs_.truncating_floor_div_mod = PrepareScalarFloorDivMod(func->body_, func->params_);
   const bool has_local_receive_ring = IsAIVFunction() && GetBackendHandler()->SupportsLocalPipeDepth();
-  if (has_local_receive_ring) {
+  if (has_local_receive_ring && !func->GetAttr<bool>(ir::kAttrPyptoAutosync)) {
     // Skew and pipeline lowering can move or clone pops. Find the conflicting
     // cuts on the final body shared by stock and delegated AutoSync codegen.
     fs_.c2v_slot_reuse_fences = ir::cross_core_pipe::FindC2VSlotReuseFences(func);

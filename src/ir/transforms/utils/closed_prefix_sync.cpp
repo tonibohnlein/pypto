@@ -44,6 +44,35 @@
 #include "src/ir/transforms/utils/token_sync_lowering.h"
 
 namespace pypto::ir::sync {
+
+const char* RequireLocalSyncBarrier(PipeType pipe, FunctionType core) {
+  const bool vector = core == FunctionType::AIV;
+  switch (pipe) {
+    case PipeType::S:
+      return nullptr;
+    case PipeType::MTE2:
+      return "system.bar_mte2";
+    case PipeType::MTE3:
+      CHECK(vector) << "MTE3 completion is unavailable on this synchronization core";
+      return "system.bar_mte3";
+    case PipeType::V:
+      CHECK(vector) << "Vector completion is unavailable on this synchronization core";
+      return "system.bar_v";
+    case PipeType::MTE1:
+      CHECK(!vector) << "MTE1 completion is unavailable on this synchronization core";
+      return "system.bar_mte1";
+    case PipeType::M:
+      CHECK(!vector) << "Cube completion is unavailable on this synchronization core";
+      return "system.bar_m";
+    case PipeType::FIX:
+      CHECK(!vector) << "FIX completion is unavailable on this synchronization core";
+      return "system.bar_fix";
+    default:
+      CHECK(false) << "Unavailable current-prefix completion pipe";
+  }
+  return nullptr;
+}
+
 namespace {
 constexpr size_t kRelayPipeCount = 7;  // MTE1..FIX.
 using RelayMask = uint32_t;
@@ -640,34 +669,6 @@ struct AssignedCommand {
   SyncDirection ack_direction{};
   int ack_id = -1;
 };
-
-const char* LocalBarrier(PipeType pipe, FunctionType core) {
-  const bool vector = core == FunctionType::AIV;
-  switch (pipe) {
-    case PipeType::S:
-      return nullptr;
-    case PipeType::MTE2:
-      return "system.bar_mte2";
-    case PipeType::MTE3:
-      CHECK(vector) << "MTE3 completion is unavailable on this synchronization core";
-      return "system.bar_mte3";
-    case PipeType::V:
-      CHECK(vector) << "Vector completion is unavailable on this synchronization core";
-      return "system.bar_v";
-    case PipeType::MTE1:
-      CHECK(!vector) << "MTE1 completion is unavailable on this synchronization core";
-      return "system.bar_mte1";
-    case PipeType::M:
-      CHECK(!vector) << "Cube completion is unavailable on this synchronization core";
-      return "system.bar_m";
-    case PipeType::FIX:
-      CHECK(!vector) << "FIX completion is unavailable on this synchronization core";
-      return "system.bar_fix";
-    default:
-      CHECK(false) << "Unavailable current-prefix completion pipe";
-  }
-  return nullptr;
-}
 
 class Assignment {
  public:
@@ -1305,7 +1306,7 @@ class Assignment {
       }
     }
     for (const auto& local : discovered.local) {
-      const auto* barrier = LocalBarrier(local.pipe, owner->func_type_);
+      const auto* barrier = RequireLocalSyncBarrier(local.pipe, owner->func_type_);
       CHECK(local.pipe != PipeType::S || native.scalar_prefix_serialized)
           << "Scalar current-prefix completion lacks native order evidence";
       if (local.pipe != PipeType::S || !native.scalar_prefix_serialized) {
@@ -1429,7 +1430,8 @@ class Emit : public SyncStatementMutator {
       if (cmd->kind == CommandKind::Barrier) {
         return std::make_shared<EvalStmt>(
             OpRegistry::GetInstance().Create(
-                LocalBarrier(cmd->direction.first, core_ == "aiv" ? FunctionType::AIV : FunctionType::AIC),
+                RequireLocalSyncBarrier(cmd->direction.first,
+                                        core_ == "aiv" ? FunctionType::AIV : FunctionType::AIC),
                 {}, {{"core_type", core_}}, statement->span_),
             statement->span_);
       }

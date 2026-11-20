@@ -28,6 +28,17 @@ std::optional<uint64_t> DenseBufferBytes(const ir::BufferTypePtr& type);
 /// fractal matrix layouts, whose physical extents are already whole boxes.
 std::optional<uint64_t> PhysicalBufferBytes(const ir::BufferTypePtr& type);
 
+/// Address-independent geometry at a native TPUSH/TPOP site. The caller binds
+/// a receive to its reserved ring; a pop does not allocate another local tile.
+/// capacity_bytes is the full box, including inactive rows/columns. It bounds
+/// one no-split slot; split/converted transfers need their own transport map.
+struct PeerTransferBuffer {
+  ir::BufferTypePtr descriptor;
+  int64_t capacity_bytes;
+};
+
+std::optional<PeerTransferBuffer> DescribePeerTransferBuffer(const ir::TileTypePtr& tile);
+
 /// Whole contiguous FP32 vector relabel: column-major [L,1] and row-major
 /// [1,L], with full static valid extents and 32-byte alignment. This proves
 /// descriptor equivalence only; callers must preserve the original storage

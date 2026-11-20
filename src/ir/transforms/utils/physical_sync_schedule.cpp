@@ -28,6 +28,8 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/core_affinity.h"
+#include "src/ir/transforms/utils/closed_prefix_sync.h"
 #include "src/ir/transforms/utils/scoped_sync_palette.h"
 #include "src/ir/transforms/utils/scoped_token_families.h"
 #include "src/ir/transforms/utils/sync_invocation_domains.h"
@@ -83,15 +85,15 @@ class CutDomains : public IRVisitor {
     uniform_variables_ = std::move(saved_variables);
     domain_ = std::move(saved);
   }
-  void VisitStmt_(const AssignStmtPtr&) override {}
+  void VisitStmt_(const AssignStmtPtr& statement) override { QualifyCut(As<Call>(statement->value_)); }
   void VisitStmt_(const IfStmtPtr& branch) override {
     ++conditional_depth_;
     VisitStmt(branch->then_body_);
     if (branch->else_body_) VisitStmt(*branch->else_body_);
     --conditional_depth_;
   }
-  void VisitStmt_(const EvalStmtPtr& statement) override {
-    const auto call = As<Call>(statement->expr_);
+  void VisitStmt_(const EvalStmtPtr& statement) override { QualifyCut(As<Call>(statement->expr_)); }
+  void QualifyCut(const CallPtr& call) {
     if (auto found = cuts_.find(call.get()); found != cuts_.end()) {
       work_.cut_domain_interval_visits += domain_.size();
       found->second->domain = domain_;
@@ -812,11 +814,11 @@ class AssignedCommandLowering {
     }
 
     ControlForest commands;
+    const std::string core = input_.owner->func_type_ == FunctionType::AIV ? "aiv" : "aic";
     if (src == dst) {
-      INTERNAL_CHECK(dst == PipeType::M || dst == PipeType::V)
-          << "Only qualified M/V barriers may be emitted; scalar barriers are forbidden";
-      auto call = OpRegistry::GetInstance().Create(dst == PipeType::M ? "system.bar_m" : "system.bar_v", {},
-                                                   {}, span);
+      const auto* name = RequireLocalSyncBarrier(dst, input_.owner->func_type_);
+      INTERNAL_CHECK(name) << "Missing qualified same-pipe barrier";
+      auto call = OpRegistry::GetInstance().Create(name, {}, {{"core_type", core}}, span);
       commands.push_back(ControlCommand(call, span, result_));
       ++result_.barrier_sites;
     } else {
@@ -829,13 +831,12 @@ class AssignedCommandLowering {
               static_cast<int64_t>((__int128(phase_->first) + *phase_->residue - first) % period);
           idx = static_cast<size_t>((digit + period) % period);
         }
-        auto call = OpRegistry::GetInstance().Create(
-            publish ? "system.set_flag" : "system.wait_flag", {},
-            {{"src_pipe", static_cast<int>(src)},
-             {"dst_pipe", static_cast<int>(dst)},
-             {"event_id", ids[idx]},
-             {"core_type", std::string(input_.owner->func_type_ == FunctionType::AIV ? "aiv" : "aic")}},
-            span);
+        auto call = OpRegistry::GetInstance().Create(publish ? "system.set_flag" : "system.wait_flag", {},
+                                                     {{"src_pipe", static_cast<int>(src)},
+                                                      {"dst_pipe", static_cast<int>(dst)},
+                                                      {"event_id", ids[idx]},
+                                                      {"core_type", core}},
+                                                     span);
         commands.push_back(ControlCommand(call, span, result_));
         if (publish)
           ++result_.set_sites;
@@ -894,13 +895,12 @@ class AssignedCommandLowering {
           const RadixBoxGuard arm_guard =
               IntersectGuards(base_guard, RadixBoxGuard::FromBox(schedule_.arena, std::move(rc_box)));
           if (arm_guard.IsEmpty()) continue;
-          auto call = OpRegistry::GetInstance().Create(
-              publish ? "system.set_flag" : "system.wait_flag", {},
-              {{"src_pipe", static_cast<int>(src)},
-               {"dst_pipe", static_cast<int>(dst)},
-               {"event_id", ids[i]},
-               {"core_type", std::string(input_.owner->func_type_ == FunctionType::AIV ? "aiv" : "aic")}},
-              span);
+          auto call = OpRegistry::GetInstance().Create(publish ? "system.set_flag" : "system.wait_flag", {},
+                                                       {{"src_pipe", static_cast<int>(src)},
+                                                        {"dst_pipe", static_cast<int>(dst)},
+                                                        {"event_id", ids[i]},
+                                                        {"core_type", core}},
+                                                       span);
           arms.push_back({SimplifyGuardGiven(arm_guard, base_guard), ControlCommand(call, span, result_)});
           if (publish)
             ++result_.set_sites;
@@ -1724,7 +1724,7 @@ class ScheduleTreeSize : public IRVisitor {
   void VisitStmt_(const EvalStmtPtr& statement) override {
     const auto call = As<Call>(statement->expr_);
     if (call && !IsOp(call, "system.set_flag") && !IsOp(call, "system.wait_flag") &&
-        !IsOp(call, "system.bar_m") && !IsOp(call, "system.bar_v"))
+        !core_affinity::IsPipeBarrier(call))
       Add(payloads, 1);
     else if (call)
       Add(commands, 1);

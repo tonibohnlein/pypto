@@ -29,6 +29,7 @@
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/core_affinity.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/sync_invocation_domains.h"
 #include "src/ir/transforms/utils/sync_token_names.h"
@@ -2298,7 +2299,7 @@ ControlPtr ControlBranch(ExprPtr condition, ControlPtr body, std::optional<Contr
 ControlPtr ControlCommand(ExprPtr command, const Span& span, PhysicalSyncRealization& work) {
   const auto call = As<Call>(command);
   CHECK(call && (IsOp(call, "system.set_flag") || IsOp(call, "system.wait_flag") ||
-                 IsOp(call, "system.bar_m") || IsOp(call, "system.bar_v")))
+                 core_affinity::IsPipeBarrier(call)))
       << "Command descriptor requires a qualified physical synchronization leaf";
   CHECK(call->args_.empty()) << "Command descriptor requires literal physical assignments";
   ++work.control_descriptors;

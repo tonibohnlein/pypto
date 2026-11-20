@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -34,6 +35,7 @@
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/closed_prefix_sync.h"
 #include "src/ir/transforms/utils/conservative_sync_dataflow.h"
+#include "src/ir/transforms/utils/peer_fifo_pair.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/scoped_logical_sync.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
@@ -98,6 +100,13 @@ void CheckWholeModuleScope(const ProgramPtr& program) {
   }
   CHECK(leaves) << "Whole-module synchronization ownership requires a local compilation domain";
 }
+// The driver validates this claim against every body and helper in the
+// generated PTO unit before suppressing downstream insertion.
+FunctionPtr MarkCompleteSyncUnit(const FunctionPtr& function) {
+  auto marked = std::make_shared<Function>(*function);
+  marked->attrs_.emplace_back(kAttrAutosyncWholeModule, true);
+  return marked;
+}
 ProgramPtr PublishWholeModuleOutcome(const ProgramPtr& program) {
   for (const auto& [global, function] : program->functions_)
     if (IsOwnedLeaf(function))
@@ -107,9 +116,7 @@ ProgramPtr PublishWholeModuleOutcome(const ProgramPtr& program) {
   auto functions = program->functions_;
   for (auto& [global, function] : functions) {
     if (!IsOwnedLeaf(function)) continue;
-    auto marked = std::make_shared<Function>(*function);
-    marked->attrs_.emplace_back(kAttrAutosyncWholeModule, true);
-    function = std::move(marked);
+    function = MarkCompleteSyncUnit(function);
   }
   return std::make_shared<Program>(functions, program->name_, program->span_);
 }
@@ -480,6 +487,44 @@ Pass LowerSync(bool require_whole_module) {
       "LowerSync", PassProperties{.produced = {IRProperty::LogicalSyncValid}});
 }
 
+namespace {
+std::string PlacedBufferFallback(const FunctionPtr& function, const PassContext* ctx) {
+  std::string reason = "PyPTO synchronization requires physically placed Buffer IR";
+  if (function->HasAttr(kAttrBufferAdmissionProperty)) {
+    reason += "; first obligation: " + function->GetAttr<std::string>(kAttrBufferAdmissionStage) + "/" +
+              function->GetAttr<std::string>(kAttrBufferAdmissionProperty) + " at " +
+              function->GetAttr<std::string>(kAttrBufferAdmissionOperation);
+    const auto location = function->GetAttr<std::string>(kAttrBufferAdmissionLocation);
+    if (!location.empty()) {
+      reason += " (" + location + ")";
+    }
+  }
+  if (ctx->GetBackendHandler()->GetPtoTargetArch() == "a2a3") {
+    const auto peer = cross_core_pipe::AnalyzeConsumerFifo(function);
+    if (peer.has_transport) {
+      if (!peer.unavailable.empty()) {
+        reason += "; native peer FIFO proof unavailable: " + peer.unavailable;
+      } else {
+        for (const auto& [id, capacity] : peer.capacities) {
+          const auto& storage = capacity.storage;
+          reason += "; native peer FIFO pipe id " + std::to_string(id) + " has peak marker depth " +
+                    std::to_string(capacity.required) + ", declared local capacity " +
+                    std::to_string(storage.local_slots) + ", " + std::to_string(storage.slot_bytes) +
+                    "-byte slot stride in " + MemorySpaceToString(storage.space) + " via " +
+                    PipeTypeToString(storage.issue_pipe);
+          if (storage.placed_base) {
+            reason += ", reserve bytes [" + std::to_string(*storage.placed_base) + ", " +
+                      std::to_string(*storage.placed_base + storage.reserve_bytes) + ")";
+          }
+        }
+      }
+      reason += "; native peer borrows require local DMA readiness and release ordering";
+    }
+  }
+  return reason;
+}
+}  // namespace
+
 Pass RealizeSync(bool require_whole_module) {
   auto transform = [require_whole_module](const FunctionPtr& function,
                                           const sync::SyncParameterBounds& bounds,
@@ -496,39 +541,7 @@ Pass RealizeSync(bool require_whole_module) {
     if (function->func_type_ != FunctionType::AIC && function->func_type_ != FunctionType::AIV)
       return sync::SyncOutcome(function, false, "PyPTO synchronization supports only AIC/AIV leaves");
     if (function->ir_stage_ != FunctionIRStage::Buffer || ctx->GetMemoryPlanner() == MemoryPlanner::PtoAS) {
-      std::string reason = "PyPTO synchronization requires physically placed Buffer IR";
-      if (function->HasAttr(kAttrBufferAdmissionProperty)) {
-        reason += "; first obligation: " + function->GetAttr<std::string>(kAttrBufferAdmissionStage) + "/" +
-                  function->GetAttr<std::string>(kAttrBufferAdmissionProperty) + " at " +
-                  function->GetAttr<std::string>(kAttrBufferAdmissionOperation);
-        const auto location = function->GetAttr<std::string>(kAttrBufferAdmissionLocation);
-        if (!location.empty()) {
-          reason += " (" + location + ")";
-        }
-      }
-      if (ctx->GetBackendHandler()->GetPtoTargetArch() == "a2a3") {
-        const auto peer = cross_core_pipe::AnalyzeConsumerFifo(function);
-        if (peer.has_transport) {
-          if (!peer.unavailable.empty()) {
-            reason += "; native peer FIFO proof unavailable: " + peer.unavailable;
-          } else {
-            for (const auto& [id, capacity] : peer.capacities) {
-              const auto& storage = capacity.storage;
-              reason += "; native peer FIFO pipe id " + std::to_string(id) + " has peak marker depth " +
-                        std::to_string(capacity.required) + ", declared local capacity " +
-                        std::to_string(storage.local_slots) + ", " + std::to_string(storage.slot_bytes) +
-                        "-byte slot stride in " + MemorySpaceToString(storage.space) + " via " +
-                        PipeTypeToString(storage.issue_pipe);
-              if (storage.placed_base) {
-                reason += ", reserve bytes [" + std::to_string(*storage.placed_base) + ", " +
-                          std::to_string(*storage.placed_base + storage.reserve_bytes) + ")";
-              }
-            }
-          }
-          reason += "; peer Buffer bindings, local DMA readiness and slot reuse remain unqualified";
-        }
-      }
-      return sync::SyncOutcome(function, false, reason);
+      return sync::SyncOutcome(function, false, PlacedBufferFallback(function, ctx));
     }
     const bool prefix = ctx->GetAutoSyncPolicy() == "conservative_prefix";
     const bool disjoint_gm = ctx->GetAutoSyncDisjointGM();
@@ -606,7 +619,24 @@ Pass RealizeSync(bool require_whole_module) {
         }
         auto evidence = sync::CollectSyncInvocationEvidence(program);
         auto functions = program->functions_;
+        std::set<std::string> paired;
+        const auto* context = PassContext::Current();
+        if (context && context->GetBackendHandler()->GetPtoTargetArch() == "a2a3" &&
+            context->GetEnablePyptoAutoSync() && context->GetEnableBufferIR() &&
+            context->GetMemoryPlanner() != MemoryPlanner::PtoAS &&
+            context->GetAutoSyncPolicy() == "conservative_prefix") {
+          for (const auto& decision : sync::PlanPeerLocalUnits(program, evidence)) {
+            const auto& fn = decision.function;
+            if (!IsOwnedLeaf(fn)) continue;
+            paired.insert(fn->name_);
+            auto& candidate = functions.at(program->GetGlobalVar(fn->name_));
+            candidate = decision.fallback_reason.empty()
+                            ? MarkCompleteSyncUnit(sync::SyncOutcome(fn, true, ""))
+                            : sync::SyncOutcome(fn, false, decision.fallback_reason);
+          }
+        }
         for (auto& [global, function] : functions) {
+          if (paired.count(function->name_)) continue;
           auto block = evidence.block_indices.find(global->name_);
           function = transform(
               function, evidence.parameters[global->name_],

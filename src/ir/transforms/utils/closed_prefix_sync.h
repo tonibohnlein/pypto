@@ -20,6 +20,10 @@
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 
 namespace pypto::ir::sync {
+// A2/A3 current-prefix completion for an available pipe. Scalar completion is
+// native and therefore has no explicit barrier operation.
+const char* RequireLocalSyncBarrier(PipeType pipe, FunctionType core);
+
 // Syntactic routing only; this does not establish matching, resource, or native
 // execution qualification. It lets public lowering avoid unrelated occurrence
 // bound recovery when the actual program uses only current-cut transactions.

@@ -22,6 +22,7 @@
 
 #include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/buffer_sync_contract.h"
+#include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -31,6 +32,7 @@
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/type.h"
@@ -101,6 +103,43 @@ StmtPtr EvalCall(const char* op_name, std::vector<ExprPtr> args) {
 
 BufferTypePtr VecType(int64_t rows, int64_t cols, DataType dtype = DataType::FP32) {
   return std::make_shared<BufferType>(std::vector<int64_t>{rows, cols}, dtype, MemorySpace::Vec);
+}
+
+void TestPeerTransferBufferGeometry() {
+  const std::vector<ExprPtr> shape{CI(16), CI(128)};
+  auto vec = tile_view_semantics::GetImplicitTileView(shape, MemorySpace::Vec);
+  auto describe = [&](const TileView& view, MemorySpace space, DataType dtype) {
+    return backend::DescribePeerTransferBuffer(
+        std::make_shared<TileType>(shape, dtype, std::nullopt, view, space));
+  };
+  // Both subblocks advance the FIFO. An empty lane retains its full physical
+  // slot while its logical valid extents identify a transfer of zero elements.
+  vec.valid_shape = {CI(0), CI(0)};
+  vec.pad = PadValue::min;
+  const auto empty = describe(vec, MemorySpace::Vec, DataType::BF16);
+  assert(empty && empty->descriptor->valid_shape_ == std::vector<int64_t>({0, 0}));
+  assert(empty->capacity_bytes == 4096 && empty->descriptor->pad_ == PadValue::min);
+  vec.valid_shape = {CI(5), MakeVar("n", IndexType())};
+  const auto dynamic = describe(vec, MemorySpace::Vec, DataType::FP32);
+  assert(dynamic && dynamic->descriptor->valid_shape_ == std::vector<int64_t>({5, -1}));
+  assert(dynamic->capacity_bytes == 8192);
+  auto mat = tile_view_semantics::GetImplicitTileView(shape, MemorySpace::Mat);
+  mat.pad = PadValue::min;
+  const auto matrix = describe(mat, MemorySpace::Mat, DataType::BF16);
+  assert(matrix && matrix->capacity_bytes == 4096 && matrix->descriptor->slayout_ == TileLayout::row_major);
+  auto acc = tile_view_semantics::GetImplicitTileView(shape, MemorySpace::Acc);
+  const auto accumulator = describe(acc, MemorySpace::Acc, DataType::FP32);
+  assert(accumulator && accumulator->capacity_bytes == 8192 && accumulator->descriptor->fractal_ == 1024);
+  mat.slayout = TileLayout::none_box;
+  assert(!describe(mat, MemorySpace::Mat, DataType::BF16));
+  vec.stride = {CI(256), CI(1)};
+  assert(!describe(vec, MemorySpace::Vec, DataType::FP32));
+  vec.stride.clear();
+  vec.valid_shape = {CI(17), CI(128)};
+  assert(!describe(vec, MemorySpace::Vec, DataType::FP32));
+  const auto huge = std::make_shared<TileType>(std::vector<int64_t>{std::numeric_limits<int64_t>::max(), 128},
+                                               DataType::FP32, std::nullopt, std::nullopt, MemorySpace::Vec);
+  assert(!backend::DescribePeerTransferBuffer(huge));
 }
 
 BufferTypePtr MatType(int64_t rows, int64_t cols, DataType dtype = DataType::FP16,
@@ -1373,6 +1412,7 @@ void TestRound2AuditAndCleanupFixes() {
 
 int main() {
   pypto::backend::BackendConfig::SetBackendType(pypto::backend::BackendType::Ascend910);
+  pypto::ir::sync::TestPeerTransferBufferGeometry();
   pypto::ir::sync::TestB1SyncControlRangeProver();
   pypto::ir::sync::TestB1RangeUseCuts();
   pypto::ir::sync::TestB1PositiveTripCompletionAndRelay();
