@@ -664,6 +664,10 @@ def _buffer_active(buffer):
 def _buffer_copy(source, destination):
     _buffer_write(destination, _buffer_active(source))
 
+def _buffer_fillpad(source, destination):
+    destination.zero_()
+    _buffer_copy(source, destination)
+
 def _buffer_gather(source, indices, destination):
     index = _buffer_active(indices).to(torch.int64)
     if torch.any(index < 0) or torch.any(index >= source.numel()):
@@ -1538,6 +1542,7 @@ def _register_ops() -> None:  # noqa: PLR0915
     )
     m["buffer.gather"] = lambda a, _kw: f"_buffer_gather({a[0]}, {a[1]}, {a[3]})"
     m["buffer.scatter"] = lambda a, _kw: f"_buffer_scatter({a[0]}, {a[1]}, {a[2]})"
+    m["buffer.fillpad"] = lambda a, _kw: f"_buffer_fillpad({a[0]}, {a[1]})"
     m["buffer.cast"] = lambda a, kw: (
         f"_buffer_write({a[1]}, _cast_tensor(_buffer_active({a[0]}), {a[1]}.dtype, {int(kw.get('mode', 0))}))"
     )

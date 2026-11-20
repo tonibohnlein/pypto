@@ -6,6 +6,22 @@ selected-TLOAD 契约前提，不是新增的硬件证明。这扩展[架构计�
 的 M2/M3，并复用已确认的[本地标量桥接](43-autosync-value-and-scalar-contracts.md)。
 整模型主机捕获的局部所有权从 17 增至 19；不宣称完整 Qwen 所有权或设备验证。
 
+## 紧凑二维张量的单点读取
+
+`PassContext(enable_scalar_gm_dma=True)` 在 A2/A3 AIV 上为紧凑、无填充的
+ND 一维或二维 INT32 和 FP32 张量选择单点 DMA，保留原始张量、坐标和执行切点。
+二维读取在 `[row, col]` 处对原始张量划分范围 `[1, 1]`。列数须为静态，
+父视图的行跨度须符合原生突发间隔字段的范围。行数可以是动态值。显式步长
+须符合紧凑布局，GM 视图须全有效。
+
+两种类型的单位分区都产生一次四字节 GM 突发传输。窗口只有一行时，原父视图
+的行跨度仍参与起始地址计算。TLOAD 可能访问完整的 32 字节 UB 载体。保守
+同步导入该包络，此路径不提供精确物理访问恢复。
+
+A2/A3 的公开 DMA 契约支持两种四字节类型，并允许 GM 起始地址不按 32 字节
+对齐。原生实现要求本地载体按 32 字节对齐，并保留原张量访问不越界的前提。
+[CANN DataCopyPad 契约](https://www.hiascend.com/doc_center/source/zh/canncommercial/900/API/ascendcopapi/atlasascendc_api_07_0265.html)
+
 ## 构造与语义
 
 首个支持族是 A2/A3 AIV 内直接 SSA 赋值 `value = tensor.read(source, [index])`。

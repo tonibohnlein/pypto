@@ -405,7 +405,9 @@ void ValidateBufferElementwiseOperands(const BufferElementwiseRecipe& recipe,
     CHECK((descriptor->shape_.size() == 1 || descriptor->shape_.size() == 2) &&
           descriptor->blayout_ == ir::TileLayout::row_major &&
           descriptor->slayout_ == ir::TileLayout::none_box && descriptor->fractal_ == 512 &&
-          descriptor->pad_ == ir::PadValue::null && descriptor->compact_ == ir::CompactMode::null)
+          (descriptor->pad_ == ir::PadValue::null ||
+           (recipe.types == BufferElementwiseTypePolicy::DenseFillVec && IsFullZeroPaddedVec(descriptor))) &&
+          descriptor->compact_ == ir::CompactMode::null)
         << recipe.buffer_op
         << " currently requires a static dense rank-1/rank-2 row-major layout; valid extents may be runtime";
   }

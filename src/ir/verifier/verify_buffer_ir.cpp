@@ -252,6 +252,7 @@ class BufferIRVisitor : public IRVisitor {
           }
         }
         if (const auto* conversion = backend::FindBufferConversionRecipe(name)) {
+          if (conversion->kind == backend::BufferConversionKind::FillPad) CheckDensePhysicalPitch(op);
           for (const auto& pair : backend::BufferConversionAliasPairs(*conversion)) {
             CheckWindowPair(op, op->args_[pair.first], op->args_[pair.second], pair.exact_allowed);
           }

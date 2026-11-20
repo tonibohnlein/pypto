@@ -1468,7 +1468,8 @@ class Importer {
     // A full-valid column vector [R,1] occupies consecutive elements in either
     // major order. This does not admit general column-major matrices or views.
     CHECK(type->shape_ == type->valid_shape_ &&
-          (backend::DenseBufferBytes(type) || backend::IsColumnVectorBuffer(type)))
+          (backend::DenseBufferBytes(type) || backend::IsColumnVectorBuffer(type) ||
+           backend::IsFullZeroPaddedVec(type)))
         << "Synchronization Vec views require static full-valid dense descriptors";
     const auto end =
         Checked(__int128(view.address) + view.last_displacement + __int128(type->shape_[0] - 1) * view.pitch +
@@ -1768,27 +1769,38 @@ class Importer {
                             offsets->elements_.size() == 1 && shape->elements_.size() == 1 &&
                             !recover_accesses;
       const bool scalar_point = backend::SupportsBufferScalarTransfer(call->args_, load);
+      CHECK(!scalar_point || !recover_accesses)
+          << "Synchronization point DMA requires conservative GM and local carrier enclosures";
       CHECK(rank1_gm || (offsets && shape && offsets->elements_.size() == 2 && shape->elements_.size() == 2))
           << "Synchronization DMA requires a rank-two rectangle or conservative rank-one transfer";
-      if (rank1_gm) {
-        if (!scalar_point) RequireIndex(offsets->elements_[0]);
+      if (scalar_point || rank1_gm) {
+        if (!scalar_point) {
+          RequireIndex(offsets->elements_[0]);
+        }
         if (projected) {
           CHECK(load && gm_read && !gm_write) << "Read-only external projection requires a read-only DMA";
-          ReadyScalar(offsets->elements_[0], segment);
-        } else {
-          const auto off_root = coordinates.Build(offsets->elements_[0], segment, parameters, result);
-          coordinates.CheckScope(off_root, segment);
+        }
+        for (const auto& offset : offsets->elements_) {
+          if (projected) {
+            ReadyScalar(offset, segment);
+          } else {
+            const auto off_root = coordinates.Build(offset, segment, parameters, result);
+            coordinates.CheckScope(off_root, segment);
+          }
         }
         modes[gm_arg] = {gm_read, gm_write};
-        const auto local = As<BufferType>(call->args_[load ? 3 : 0]->GetType());
-        const bool valid_shape_match =
-            local && local->shape_[0] == 1 &&
-            (scalar_point
-                 ? (local->shape_[1] == 8 && Constant(shape->elements_[0]) == 1)
-                 : (local->valid_shape_[1] == -1 || local->shape_[1] == Constant(shape->elements_[0])));
-        CHECK(valid_shape_match) << "Partial DMA local footprint is not qualified";
-        CHECK(local->memory_space_ == MemorySpace::Vec) << "Rank-one DMA requires Vec storage";
-        whole(load ? 3 : 0, load);
+        if (scalar_point) {
+          // The alignment block is the local footprint enclosure. The
+          // selected native transfer still uses the original unit GM view.
+          enclosure(load ? 3 : 0, load);
+        } else {
+          const auto local = As<BufferType>(call->args_[load ? 3 : 0]->GetType());
+          CHECK(local && local->shape_[0] == 1 &&
+                (local->valid_shape_[1] == -1 || local->shape_[1] == Constant(shape->elements_[0])))
+              << "Partial DMA local footprint is not qualified";
+          CHECK(local->memory_space_ == MemorySpace::Vec) << "Rank-one DMA requires Vec storage";
+          whole(load ? 3 : 0, load);
+        }
       } else {
         // Coordinate readiness and checked arithmetic remain native admission
         // evidence even when no dependence footprint is requested.
@@ -2012,17 +2024,22 @@ class Importer {
       whole(2, true);
     } else if (auto recipe = backend::FindBufferConversionRecipe(call->op_->name_)) {
       CHECK(result.owner->func_type_ == FunctionType::AIV &&
-            recipe->kind == backend::BufferConversionKind::Cast)
-          << "Synchronization conversion import requires a qualified AIV cast";
-      // Shared call validation above establishes dtype, rounding and operand
-      // contracts. Shape-wide accesses are exact only for full-valid casts;
-      // packed predicates and conversion scratch need separate footprints.
-      for (const auto& argument : call->args_) {
-        const auto type = As<BufferType>(argument->GetType());
-        CHECK(type && type->valid_shape_ == type->shape_)
-            << "Synchronization cast requires a full-valid footprint";
+            (recipe->kind == backend::BufferConversionKind::Cast ||
+             recipe->kind == backend::BufferConversionKind::FillPad))
+          << "Synchronization conversion import requires a qualified AIV cast or fillpad";
+      if (recipe->kind == backend::BufferConversionKind::FillPad) {
+        // TFillPad copies the live source rows, then writes zeros across the
+        // trailing rows. The source allocation encloses the native reads.
+        enclosure(0, false);
+      } else {
+        // Shape-wide accesses are exact only for full-valid casts.
+        for (const auto& argument : call->args_) {
+          const auto type = As<BufferType>(argument->GetType());
+          CHECK(type && type->valid_shape_ == type->shape_)
+              << "Synchronization cast requires a full-valid footprint";
+        }
+        whole(0, false);
       }
-      whole(0, false);
       whole(1, true);
     } else if (IsOp(call, "buffer.ci_workspace")) {
       CHECK(result.owner->func_type_ == FunctionType::AIV) << "Sequence synchronization requires an AIV leaf";

@@ -321,5 +321,250 @@ def test_branch_must_completion_uses_current_prefix_on_every_path(kind, source, 
         check_execution(result, {2: choice, 3: 0}, memory={("gm", i): 7.0 for i in range(64)})
 
 
+def loop_fixture_parts(function: ir.Function):
+    assert isinstance(function.body, ir.SeqStmts)
+    x, z, y, load, reader, _, store, ret = function.body.stmts
+    assert isinstance(x, ir.AssignStmt) and isinstance(z, ir.AssignStmt) and isinstance(y, ir.AssignStmt)
+    assert isinstance(load, ir.EvalStmt)
+    assert isinstance(store, ir.EvalStmt) and isinstance(store.expr, ir.Call)
+    return x, z, y, load, reader, store.expr, ret
+
+
+def producer_capture_loop(late_reader):
+    """Two vector operations on separate slots, with the input reloaded each visit."""
+    original = fixture()
+    span = original.span
+    index = ir.DataType.INDEX
+
+    def ci(n):
+        return ir.ConstInt(n, index, span)
+
+    def payload(op, *args):
+        return ir.EvalStmt(ir.Call(ir.get_op(op), list(args), ir.VoidType(), span), span)
+
+    alloc_x, alloc_z, alloc_y, load, first_reader, store_z, ret = loop_fixture_parts(original)
+    x, z, y = alloc_x.var, alloc_z.var, alloc_y.var
+    definitions = [alloc_x, alloc_z, alloc_y]
+    extra_operand = z
+    if late_reader:
+        # A distinct SSA handle placed over the input's bytes.
+        extra_operand = ir.Var("input_alias", x.type, span)
+        definitions.append(ir.AssignStmt(extra_operand, alloc_x.value, span))
+    later = payload("buffer.add", z, extra_operand, y)
+    store_y = payload("buffer.store", y, *store_z.args[1:])
+    active = ir.Var("active", ir.ScalarType(ir.DataType.BOOL), span)
+    visits = ir.Var("visits", ir.ScalarType(index), span)
+    fill = payload("buffer.full", ir.ConstFloat(0.0, ir.DataType.FP32, span), z)
+    loop = ir.ForStmt(
+        ir.Var("i", ir.ScalarType(index), span),
+        ci(0),
+        visits,
+        ci(1),
+        [],
+        ir.SeqStmts(
+            [
+                ir.IfStmt(active, load, None, [], span),
+                ir.IfStmt(active, first_reader, fill, [], span),
+                later,
+                store_y,
+            ],
+            span,
+        ),
+        [],
+        span,
+    )
+    return ir.Function(
+        "guarded_vector_work",
+        [*zip(original.params, original.param_directions, strict=True), active, visits],
+        original.return_types,
+        ir.SeqStmts([*definitions, loop, ret], span),
+        span,
+        ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+
+
+@pytest.mark.parametrize("late_reader", [False, True])
+def test_loop_capture_orders_each_reader_before_input_reuse(late_reader):
+    # The later ADD always uses z. If it also reads x, its completion is
+    # required. Otherwise that ADD and the next load into x can overlap.
+    f = producer_capture_loop(late_reader)
+    plans = programs(f, disjoint=True)
+    first_reader = plans[0]["sites"][1]
+    assert (first_reader["post_destination"] == ir.PipeType.MTE2) == (not late_reader)
+    for active, visits in product((False, True), (0, 1, 4)):
+        if late_reader and not active:
+            continue  # The test's x input is defined by the active arm.
+        execution = check_execution(plans, {3: active, 4: visits})[-1]
+        if active:
+            for i in range(visits - 1):
+                next_load = ("payload", 4 * i + 4, "I")
+                assert (("payload", 4 * i + 1, "C"), next_load) in execution.order
+                assert ((("payload", 4 * i + 2, "C"), next_load) in execution.order) == late_reader
+
+
+def test_producer_capture_preserves_a_possible_gm_relay():
+    function = producer_capture_loop(late_reader=False)
+    plans = programs(function, disjoint=False)
+    # Alias the output and input tensors so the store must finish before the
+    # next load, even though the earlier vector reader has released its slot.
+    execution = check_execution(plans, {3: True, 4: 4}, tensor_bases={2: 0})[-1]
+    for i in range(3):
+        assert (("payload", 4 * i + 3, "C"), ("payload", 4 * i + 4, "I")) in execution.order
+
+
+def test_store_release_allows_next_input_load_to_overlap_an_independent_store():
+    original = fixture()
+    span = original.span
+    alloc_x, alloc_z, _, load, _, store, ret = loop_fixture_parts(original)
+    x, z = alloc_x.var, alloc_z.var
+    _, offset, valid, out = store.args
+    assert isinstance(out, ir.Var)
+
+    def payload(name, *args):
+        return ir.EvalStmt(ir.Call(ir.get_op(name), list(args), ir.VoidType(), span), span)
+
+    def ci(value):
+        return ir.ConstInt(value, ir.DataType.INDEX, span)
+
+    loop = ir.ForStmt(
+        ir.Var("i", ir.ScalarType(ir.DataType.INDEX), span),
+        ci(0),
+        ci(4),
+        ci(1),
+        [],
+        ir.SeqStmts(
+            [
+                payload("buffer.full", ir.ConstFloat(7.0, ir.DataType.FP32, span), z),
+                load,
+                payload("buffer.store", x, offset, valid, out),
+                payload("buffer.store", z, offset, valid, original.params[1]),
+            ],
+            span,
+        ),
+        [],
+        span,
+    )
+    function = ir.Function(
+        "two_output_stores",
+        [original.params[0], (original.params[1], ir.ParamDirection.Out), (out, ir.ParamDirection.Out)],
+        original.return_types,
+        ir.SeqStmts([alloc_x, alloc_z, loop, ret], span),
+        span,
+        ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    plans = programs(function, disjoint=True)
+    first_store = plans[0]["sites"][2]
+    assert first_store["pipe"] == ir.PipeType.MTE3 and first_store["post_destination"] == ir.PipeType.MTE2
+    execution = check_execution(plans, {})[-1]
+    for i in range(3):
+        next_load = ("payload", 4 * i + 5, "I")
+        assert (("payload", 4 * i + 2, "C"), next_load) in execution.order
+        assert (("payload", 4 * i + 3, "C"), next_load) not in execution.order
+
+
+def loop_entry_reader_fixture(revisit_reader=False, *, skip_first=False, preceding_store=False):
+    source = fixture()
+    alloc_x, alloc_z, alloc_y, load, read_x, store, ret = loop_fixture_parts(source)
+    assert isinstance(load.expr, ir.Call)
+    span = source.span
+    idx = ir.ScalarType(ir.DataType.INDEX)
+    iv, stop = (ir.Var(name, idx, span) for name in ("iv", "stop"))
+    zero = ir.ConstInt(0, ir.DataType.INDEX, span)
+    one = ir.ConstInt(1, ir.DataType.INDEX, span)
+
+    def payload(name, *args):
+        return ir.EvalStmt(ir.Call(ir.get_op(name), list(args), ir.VoidType(), span), span)
+
+    # A vector operation reads x before entry. Every visit overwrites x on
+    # MTE2 and drains it to GM on MTE3; a later visit can reuse x only after
+    # that store completes. The condition can reintroduce the vector reader.
+    store_x = payload("buffer.store", alloc_x.var, *store.args[1:])
+    statements: list[ir.Stmt] = [payload("buffer.load", *load.expr.args), store_x]
+    if revisit_reader:
+        alias = ir.Var("same_slot", alloc_x.var.type, span)
+        definitions = [alloc_x, alloc_z, ir.AssignStmt(alias, alloc_x.value, span)]
+        statements.append(
+            ir.IfStmt(
+                ir.Eq(iv, one, ir.DataType.BOOL, span),
+                payload("buffer.abs", alias, alloc_z.var),
+                None,
+                [],
+                span,
+            )
+        )
+    else:
+        definitions = [alloc_x, alloc_z]
+    body: ir.Stmt = ir.SeqStmts(statements, span)
+    if skip_first:
+        body = ir.IfStmt(ir.Gt(iv, zero, ir.DataType.BOOL, span), body, None, [], span)
+    loop = ir.ForStmt(iv, zero, stop, one, [], body, [], span)
+    prologue: list[ir.Stmt] = list(definitions)
+    if preceding_store:
+        _, offsets, valid, _ = store.args
+        prologue.extend(
+            [
+                alloc_y,
+                payload("buffer.load", source.params[0], offsets, valid, alloc_y.var),
+                payload("buffer.store", alloc_y.var, offsets, valid, source.params[1]),
+            ]
+        )
+    prologue.extend([load, read_x])
+    return ir.Function(
+        "loop_entry_reader",
+        [
+            source.params[0],
+            (source.params[1], ir.ParamDirection.InOut),
+            (source.params[2], ir.ParamDirection.InOut),
+            stop,
+        ],
+        source.return_types,
+        ir.SeqStmts([*prologue, loop, ret], span),
+        span,
+        ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+
+
+@pytest.mark.parametrize("revisit_reader", [False, True])
+def test_loop_entry_reader_and_backedge_have_distinct_release_obligations(revisit_reader):
+    plans = programs(loop_entry_reader_fixture(revisit_reader), disjoint=True)
+    for visits in (0, 1, 4):
+        actual = check_execution(plans, {3: visits})[-1]
+        if revisit_reader and visits > 2:
+            # At i=1 V also reads the bytes through a different handle. The
+            # i=2 load must respect that read as well as the previous store.
+            assert (("payload", 6, "C"), ("payload", 7, "I")) in actual.order
+        elif not revisit_reader:
+            assert actual.trace.count(("acquire", ir.PipeType.V, ir.PipeType.MTE2)) == int(visits > 0)
+            assert len(actual.publications) == 1 + int(visits > 0) + 2 * visits
+            if visits:
+                assert (("payload", 1, "C"), ("payload", 2, "I")) in actual.order
+            for i in range(1, visits):
+                assert (("payload", 2 * i + 1, "C"), ("payload", 2 * i + 2, "I")) in actual.order
+
+
+def test_first_executed_use_can_be_later_than_the_first_loop_iteration():
+    plans = programs(loop_entry_reader_fixture(skip_first=True), disjoint=True)
+    for visits in (0, 1, 2, 4):
+        actual = check_execution(plans, {3: visits})[-1]
+        assert len(actual.payloads) == 2 + 2 * max(visits - 1, 0)
+        if visits <= 1:
+            assert ("acquire", ir.PipeType.V, ir.PipeType.MTE2) not in actual.trace
+        else:
+            assert (("payload", 1, "C"), ("payload", 2, "I")) in actual.order
+
+
+def test_steady_wait_does_not_capture_independent_pre_loop_store():
+    plans = programs(loop_entry_reader_fixture(preceding_store=True), disjoint=True)
+    actual = check_execution(plans, {3: 4})[-1]
+    # The pre-loop store reads y and writes a separate GM allocation. It can
+    # overlap the first load into x. The stores of x inside the loop cannot
+    # overlap the next overwrite of x.
+    assert (("payload", 1, "C"), ("payload", 4, "I")) not in actual.order
+    assert (("payload", 5, "C"), ("payload", 6, "I")) in actual.order
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

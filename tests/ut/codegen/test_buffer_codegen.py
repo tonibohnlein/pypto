@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 from pypto import DataType, ir, passes
+from pypto.backend import BackendType
 from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.backend.pto_backend import _generate_arg_unpacking, _generate_kernel_wrapper, _run_ptoas
 from pypto.pypto_core import codegen
@@ -50,14 +51,14 @@ def _eval(name, *args):
     return ir.EvalStmt(_call(name, list(args)), SPAN)
 
 
-def _program(stmts, params=(), ir_stage=ir.FunctionIRStage.Functional):
+def _program(stmts, params=(), ir_stage=ir.FunctionIRStage.Functional, *, func_type=ir.FunctionType.InCore):
     function = ir.Function(
         "kernel",
         list(params),
         [],
         ir.SeqStmts(stmts, SPAN),
         SPAN,
-        type=ir.FunctionType.InCore,
+        type=func_type,
         ir_stage=ir_stage,
     )
     return ir.Program([function], "Buffers", SPAN)
@@ -87,6 +88,30 @@ def _compile_native(tmp_path, text, addressed):
 
 def _window(*values):
     return ir.MakeTuple([_int(value) if isinstance(value, int) else value for value in values], SPAN)
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("rank", [1, 2])
+def test_point_shaped_fp32_partition_keeps_ordinary_dma_route(ascend_backend, rank):
+    shape = [16, 32] if rank == 2 else [32]
+    tensor_type = ir.TensorType(shape, DataType.FP32)
+    source = ir.Var("source", tensor_type, SPAN)
+    output = ir.Var("output", tensor_type, SPAN)
+    tile, alloc = _alloc("tile", _type(shape=(1, 8), valid=(1, 1)))
+    offset = _window(*([0] * rank))
+    extent = _window(*([1] * rank))
+    program = _program(
+        [
+            alloc,
+            _eval("buffer.load", source, offset, extent, tile),
+            _eval("buffer.store", tile, offset, extent, output),
+        ],
+        [source, (output, ir.ParamDirection.Out)],
+        ir_stage=ir.FunctionIRStage.Buffer,
+        func_type=ir.FunctionType.AIV,
+    )
+    text = _emit(program, flag=False)
+    assert "pto.tload" in text and "pto.tstore" in text
 
 
 @pytest.mark.parametrize("rows", [0, 8, None])

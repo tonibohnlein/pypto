@@ -46,20 +46,46 @@ std::optional<uint32_t> BufferScalarPointOffset(const ir::BufferTypePtr& buffer,
 }
 
 bool IsBufferScalarGMSource(const ir::TensorTypePtr& tensor) {
-  if (!tensor || tensor->dtype_ != DataType::INT32 || tensor->shape_.size() != 1) return false;
-  const auto length = ir::As<ir::ConstInt>(tensor->shape_[0]);
-  const auto symbol = ir::As<ir::Var>(tensor->shape_[0]);
-  const auto scalar = symbol ? ir::As<ir::ScalarType>(symbol->GetType()) : nullptr;
-  if (!(length ? length->value_ > 0 : scalar && scalar->dtype_ == DataType::INDEX)) return false;
-  if (!tensor->tensor_view_) return true;
+  if (!tensor || (tensor->dtype_ != DataType::INT32 && tensor->dtype_ != DataType::FP32) ||
+      !IsBufferTensorShape(tensor->shape_)) {
+    return false;
+  }
+  const auto rank = tensor->shape_.size();
+  const auto& outer_extent = tensor->shape_.front();
+  if (!ir::As<ir::ConstInt>(outer_extent) && !ir::As<ir::Var>(outer_extent)) {
+    return false;
+  }
+  const auto columns = ir::As<ir::ConstInt>(tensor->shape_.back());
+  // ND TLOAD/TSTORE derive the GM burst gap from the parent row pitch,
+  // even for a one-row partition. Keep that byte gap in the native field.
+  constexpr int64_t kMaxNativeGap = std::numeric_limits<uint32_t>::max();
+  const auto element_bytes = static_cast<int64_t>(tensor->dtype_.GetByte());
+  if (rank == 2 && (!columns || columns->value_ - 1 > kMaxNativeGap / element_bytes)) {
+    return false;
+  }
+  if (!tensor->tensor_view_) {
+    return true;
+  }
   const auto& view = *tensor->tensor_view_;
   if (view.layout != ir::TensorLayout::ND || view.pad != ir::PadValue::null ||
       (!view.valid_shape.empty() &&
-       !ir::tile_view_semantics::ShapeExprListsEquivalent(view.valid_shape, tensor->shape_)))
+       !ir::tile_view_semantics::ShapeExprListsEquivalent(view.valid_shape, tensor->shape_))) {
     return false;
-  if (view.stride.empty()) return true;
-  const auto stride = view.stride.size() == 1 ? ir::As<ir::ConstInt>(view.stride[0]) : nullptr;
-  return stride && stride->value_ == 1;
+  }
+  if (view.stride.empty()) {
+    return true;
+  }
+  if (view.stride.size() != rank) {
+    return false;
+  }
+  const auto inner = ir::As<ir::ConstInt>(view.stride.back());
+  const auto outer = ir::As<ir::ConstInt>(view.stride.front());
+  return inner && inner->value_ == 1 && (rank == 1 || (outer && outer->value_ == columns->value_));
+}
+
+ir::MakeTuplePtr MakeBufferScalarGMExtent(const ir::TensorType& tensor, const ir::Span& span) {
+  const auto one = std::make_shared<ir::ConstInt>(1, DataType::INDEX, span);
+  return std::make_shared<ir::MakeTuple>(std::vector<ir::ExprPtr>(tensor.shape_.size(), one), span);
 }
 
 bool SupportsBufferScalarTransfer(const std::vector<ir::ExprPtr>& args, bool load) {
@@ -71,43 +97,57 @@ bool SupportsBufferScalarTransfer(const std::vector<ir::ExprPtr>& args, bool loa
   const auto offsets = ir::As<ir::MakeTuple>(args[1]);
   const auto valid = ir::As<ir::MakeTuple>(args[2]);
   if (!IsBufferScalarGMSource(tensor) || !IsAlignedDenseVecBufferGeometry(carrier) ||
-      carrier->dtype_ != DataType::INT32 || carrier->shape_ != std::vector<int64_t>{1, 8} ||
-      carrier->valid_shape_ != std::vector<int64_t>{1, 1} || !offsets || offsets->elements_.size() != 1 ||
-      !valid || valid->elements_.size() != 1)
+      carrier->dtype_ != tensor->dtype_ || carrier->shape_ != std::vector<int64_t>{1, 8} ||
+      carrier->valid_shape_ != std::vector<int64_t>{1, 1} || !offsets || !valid ||
+      offsets->elements_.size() != tensor->shape_.size() ||
+      valid->elements_.size() != tensor->shape_.size()) {
     return false;
-  const auto extent = ir::As<ir::ConstInt>(valid->elements_[0]);
-  if (!offsets->elements_[0] || !valid->elements_[0]) return false;
-  const auto index_type = ir::As<ir::ScalarType>(offsets->elements_[0]->GetType());
-  if (!extent || extent->value_ != 1 || !index_type ||
-      !(index_type->dtype_ == DataType::INDEX || index_type->dtype_.IsSignedInt()))
-    return false;
-  const auto index = ir::As<ir::ConstInt>(offsets->elements_[0]);
-  const auto length = ir::As<ir::ConstInt>(tensor->shape_[0]);
-  // Symbolic indices retain the original defined tensor.read/write precondition.
-  // Do not manufacture an in-bounds predicate or silently clamp the address.
-  return !index || (index->value_ >= 0 && (!length || index->value_ < length->value_));
+  }
+  for (size_t axis = 0; axis < tensor->shape_.size(); ++axis) {
+    const auto& offset = offsets->elements_[axis];
+    const auto extent = ir::As<ir::ConstInt>(valid->elements_[axis]);
+    const auto index_type = offset ? ir::As<ir::ScalarType>(offset->GetType()) : nullptr;
+    if (!extent || extent->value_ != 1 || !index_type ||
+        !(index_type->dtype_ == DataType::INDEX || index_type->dtype_.IsSignedInt())) {
+      return false;
+    }
+    // Symbolic indices retain the original defined tensor.read/write precondition.
+    const auto index = ir::As<ir::ConstInt>(offset);
+    const auto length = ir::As<ir::ConstInt>(tensor->shape_[axis]);
+    if (index && (index->value_ < 0 || (length && index->value_ >= length->value_))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool SupportsLogicalBufferScalarTransfer(const ir::CallPtr& call) {
   if (ir::IsOp(call, "tile.store")) {
     if (call->args_.size() != 3 || !call->args_[0] || !call->args_[1] || !call->args_[2]) return false;
     const auto descriptor = StaticLogicalBufferDescriptor(call->args_[0]->GetType());
-    if (!descriptor) return false;
+    const auto tensor = ir::As<ir::TensorType>(call->args_[2]->GetType());
+    if (!descriptor || !IsBufferScalarGMSource(tensor)) {
+      return false;
+    }
     const auto carrier = std::make_shared<ir::Var>("scalar_carrier_geometry", descriptor, call->span_);
-    const auto one = std::make_shared<ir::ConstInt>(1, DataType::INDEX, call->span_);
-    const auto valid = std::make_shared<ir::MakeTuple>(std::vector<ir::ExprPtr>{one}, call->span_);
     // Vec-to-GM ND TSTORE has one four-byte burst for this valid unit view.
     // This is the store geometry, not authorization from the TLOAD contract.
-    return SupportsBufferScalarTransfer({carrier, call->args_[1], valid, call->args_[2]}, false);
+    return SupportsBufferScalarTransfer(
+        {carrier, call->args_[1], MakeBufferScalarGMExtent(*tensor, call->span_), call->args_[2]}, false);
   }
   if (!ir::IsOp(call, "tile.load") || call->args_.size() != 4) return false;
   const auto shape = ir::As<ir::MakeTuple>(call->args_[2]);
-  const auto capacity =
-      shape && shape->elements_.size() == 1 ? ir::As<ir::ConstInt>(shape->elements_[0]) : nullptr;
+  const auto tensor = call->args_[0] ? ir::As<ir::TensorType>(call->args_[0]->GetType()) : nullptr;
   const auto descriptor = StaticLogicalBufferDescriptor(call->GetType());
-  if (!capacity || capacity->value_ != 8 || !descriptor) return false;
-  // Existing flattened-load semantics keep tensor-side rank-one window
-  // coordinates while the physical tile descriptor is two-dimensional.
+  if (!IsBufferScalarGMSource(tensor) || !shape || shape->elements_.size() != tensor->shape_.size() ||
+      !descriptor) {
+    return false;
+  }
+  const auto capacity = ir::As<ir::ConstInt>(shape->elements_.back());
+  const auto rows = ir::As<ir::ConstInt>(shape->elements_.front());
+  if (!capacity || capacity->value_ != 8 || (tensor->shape_.size() == 2 && (!rows || rows->value_ != 1))) {
+    return false;
+  }
   const auto carrier = std::make_shared<ir::Var>("scalar_carrier_geometry", descriptor, call->span_);
   return SupportsBufferScalarTransfer({call->args_[0], call->args_[1], call->args_[3], carrier}, true);
 }
@@ -146,7 +186,7 @@ bool LogicalScalarWriteSharesStorage(const ir::CallPtr& call, const ir::TypePtr&
 }
 
 bool SupportsBufferVector1DTransfer(const std::vector<ir::ExprPtr>& args, bool load) {
-  if (args.size() != 4 || SupportsBufferScalarTransfer(args, load)) return false;
+  if (args.size() != 4) return false;
   for (const auto& arg : args)
     if (!arg) return false;
   const auto tensor = ir::As<ir::TensorType>(args[load ? 0 : 3]->GetType());
@@ -160,6 +200,9 @@ bool SupportsBufferVector1DTransfer(const std::vector<ir::ExprPtr>& args, bool l
       valid->elements_.size() != 1) {
     return false;
   }
+  // Rank-one INT32 scalar carriers use the dedicated A2/A3 contract.
+  // FP32 point-sized partitions also have an ordinary vector DMA route.
+  if (tensor->dtype_ == DataType::INT32 && SupportsBufferScalarTransfer(args, load)) return false;
   if (tensor->tensor_view_) {
     const auto& view = *tensor->tensor_view_;
     if (view.layout != ir::TensorLayout::ND || view.pad != ir::PadValue::null) return false;

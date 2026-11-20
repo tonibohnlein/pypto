@@ -213,6 +213,109 @@ def test_write_staging_real_cpp_preserves_one_element_store_and_final_owner(plan
     assert "pipe_barrier(PIPE_S)" not in text
 
 
+def rank_two_point_copy(dtype, columns):
+    return pl.parse_program(f"""
+POINT_ROWS = pl.dynamic("POINT_ROWS")
+
+@pl.program
+class RankTwoPointCopy:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, cells: pl.InOut[pl.Tensor[[POINT_ROWS, {columns}], pl.{dtype}]],
+               row: pl.Scalar[pl.INDEX], source_column: pl.Scalar[pl.INDEX],
+               target_column: pl.Scalar[pl.INDEX], visits: pl.Scalar[pl.INDEX]
+               ) -> pl.Tensor[[POINT_ROWS, {columns}], pl.{dtype}]:
+        for i in pl.range(visits):
+            point = pl.tensor.read(cells, [row, source_column])
+            cells = pl.tensor.write(cells, [row, target_column], point)
+        return cells
+""")
+
+
+@pytest.mark.parametrize("dtype,element_type", [("INT32", "i32"), ("FP32", "f32")])
+@pytest.mark.parametrize("columns,source_column,target_column", [(1, 0, 0), (9, 1, 7), (9, 8, 0)])
+def test_rank_two_point_copy_keeps_parent_pitch_and_single_element_effects(
+    dtype, element_type, columns, source_column, target_column
+):
+    original = rank_two_point_copy(dtype, columns)
+    result = lower(original, passes.MemoryPlanner.PYPTO)
+    function = result.get_function("kernel")
+    assert function is not None and function.attrs.get("pypto_autosync", False)
+    assert not calls(result, "tensor.read") and not calls(result, "tensor.write")
+    tensor_type = function.params[0].type
+    assert isinstance(tensor_type, ir.TensorType)
+    row_symbol, column_extent = tensor_type.shape
+    assert isinstance(column_extent, ir.ConstInt) and column_extent.value == columns
+    (load,) = calls(result, "buffer.load")
+    (store,) = calls(result, "buffer.store")
+    for transfer, tensor in [(load, load.args[0]), (store, store.args[3])]:
+        assert tensor.same_as(function.params[0])
+        assert transfer.args[1].elements[0].same_as(function.params[1])
+        assert [extent.value for extent in transfer.args[2].elements] == [1, 1]
+    text = codegen.PTOCodegen().generate(result)
+    assert f"!pto.partition_tensor_view<1x1x{element_type}>" in text
+    assert f"!pto.partition_tensor_view<1x8x{element_type}>" not in text
+    # Read and write in the second row. The neighbors hold distinct values so
+    # a flat-without-pitch address or widened store changes observable bytes.
+    source = columns + source_column
+    target = columns + target_column
+    values = [index + (0.25 if dtype == "FP32" else 0) for index in range(2 * columns)]
+    for visits in [0, 1, 3]:
+        cells = {("gm", 4 * i + b): v for i, v in enumerate(values) for b in range(4)}
+        execution = ClosedCommands(
+            function,
+            {1: 1, 2: source_column, 3: target_column, 4: visits},
+            range(6),
+            shape_parameters={row_symbol: 2},
+            scalar_memory=cells,
+        )
+        check_order(execution)
+        assert len(execution.calls) == visits * 4
+        for command, _, _, reads, writes in execution.calls:
+            if command.op.name == opname("buffer.load"):
+                assert reads == frozenset(("gm", 4 * source + b) for b in range(4))
+                assert len(writes) == 32
+            elif command.op.name == opname("buffer.store"):
+                assert writes == frozenset(("gm", 4 * target + b) for b in range(4))
+                assert len(reads) == 32
+        expected = list(values)
+        if visits:
+            expected[target] = expected[source]
+        assert execution.scalar_memory is not None
+        assert [execution.scalar_memory[("gm", 4 * i)] for i in range(2 * columns)] == expected
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize("planner", PLANNERS)
+@pytest.mark.parametrize("dtype,columns", [("INT32", 9), ("FP32", 1)])
+def test_rank_two_scalar_copy_emits_actual_native_load_and_store(planner, dtype, columns, tmp_path):
+    if find_ptoas_binary() is None:
+        pytest.skip("PTOAS is unavailable")
+    result = lower(rank_two_point_copy(dtype, columns), planner)
+    pto, cpp = tmp_path / "rank-two-point.pto", tmp_path / "rank-two-point.cpp"
+    pto.write_text(codegen.PTOCodegen().generate(result))
+    level = "level2" if planner == passes.MemoryPlanner.PTOAS else "level3"
+    _run_ptoas(str(pto), str(cpp), [f"--pto-level={level}", "--pto-arch=a2"])
+    text = cpp.read_text()
+    assert "TLOAD" in text and "TSTORE" in text
+    assert ".GetValue(" in text and ".SetValue(" in text
+
+
+def test_rank_two_staging_keeps_default_native_accesses():
+    original = rank_two_point_copy("INT32", 9)
+    with passes.PassContext([], enable_pypto_autosync=True, autosync_policy="conservative_prefix"):
+        result = PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(original)
+    assert calls(result, "tensor.read") and calls(result, "tensor.write")
+    assert not calls(result, "buffer.read") and not calls(result, "buffer.write")
+
+
+@pytest.mark.parametrize("columns", ["POINT_ROWS", 2**30 + 1])
+def test_rank_two_point_copy_delegates_unqualified_native_pitch(columns):
+    result = lower(rank_two_point_copy("INT32", columns), passes.MemoryPlanner.PYPTO)
+    function = result.get_function("kernel")
+    assert function is not None and function.ir_stage == ir.FunctionIRStage.Functional
+    assert calls(result, "tensor.read") and calls(result, "tensor.write")
+
+
 def test_dynamic_trip_values_keep_one_static_write_carrier():
     result = lower(write_program(), passes.MemoryPlanner.PYPTO)
     assert len(point_stores(result)) == len(calls(result, "buffer.write")) == 1

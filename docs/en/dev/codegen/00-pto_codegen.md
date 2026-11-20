@@ -351,6 +351,8 @@ PTOAS supports locally allocated, TPOP-derived, and contiguous subview-derived d
 
 On A2/A3, an AIV C2V tile receive writes a rotating local slot through MTE2. A vector instruction can still be reading that slot when the next pop is issued, even after a matching `tfree_to_aic`. When distinct pop instructions can reuse the same local storage, codegen conservatively emits `pto.barrier <PIPE_ALL>` before the potentially overwriting pop. This also orders delegated kernels without reserving a hardware event ID. Functions containing explicit local event waits retain their authored schedule. Their author must order slot reuse. PTOAS continues to insert the usual receive-to-reader handoff.
 
+The A2/A3 FIFO analysis counts each pop statement, including clones that share the same expression. It checks that the incoming initializer names a local reserve covering the declared depth and slot stride. AIV receives use Vec storage and AIC receives use Mat storage. The reserve extent bounds the ring allocation. Each pop's write footprint depends on its tile descriptor.
+
 With explicit `c2v_dtype` on an A5 C2V-only initializer, codegen additionally
 emits `nosplit = true` and `acc_push_epilogue`. For `c2v_dtype=pl.BF16,
 pre_relu=True`, the extra attribute is:

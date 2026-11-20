@@ -84,12 +84,13 @@ inline bool IsBufferAccRowTrimDescriptor(const ir::BufferTypePtr& buffer) {
 }
 
 /// Logical descriptor shape shared by default selection and final lowering.
-inline bool IsDenseVecBufferTile(const ir::TileTypePtr& tile, const ir::TileView& view) {
+inline bool IsDenseVecBufferTile(const ir::TileTypePtr& tile, const ir::TileView& view,
+                                 ir::PadValue pad = ir::PadValue::null) {
   return (tile->shape_.size() == 1 || tile->shape_.size() == 2) &&
          (IsDenseBufferTransferDtype(tile->dtype_) || tile->dtype_ == DataType::UINT8 ||
           tile->dtype_ == DataType::UINT32) &&
          tile->GetMemorySpace() == ir::MemorySpace::Vec && view.blayout == ir::TileLayout::row_major &&
-         view.slayout == ir::TileLayout::none_box && view.fractal == 512 && view.pad == ir::PadValue::null &&
+         view.slayout == ir::TileLayout::none_box && view.fractal == 512 && view.pad == pad &&
          view.compact == ir::CompactMode::null;
 }
 
@@ -119,19 +120,40 @@ inline bool IsColumnVectorBuffer(const ir::BufferTypePtr& type) {
 }
 
 /// Dense allocation descriptors shared by heterogeneous native recipes.
-inline bool IsAlignedDenseVecBufferGeometry(const ir::BufferTypePtr& type) {
+inline bool IsAlignedDenseVecBufferGeometry(const ir::BufferTypePtr& type,
+                                            ir::PadValue pad = ir::PadValue::null) {
   const auto element_bytes = type ? type->dtype_.GetBit() / 8 : 0;
   // Check alignment without multiplying a potentially large physical extent.
   return element_bytes > 0 && element_bytes <= 32 && 32 % element_bytes == 0 && type &&
          type->shape_.size() == 2 && type->memory_space_ == ir::MemorySpace::Vec &&
          type->blayout_ == ir::TileLayout::row_major && type->slayout_ == ir::TileLayout::none_box &&
-         type->fractal_ == 512 && type->pad_ == ir::PadValue::null &&
-         type->compact_ == ir::CompactMode::null && type->shape_[0] > 0 && type->shape_[1] > 0 &&
-         type->shape_[1] % (32 / element_bytes) == 0;
+         type->fractal_ == 512 && type->pad_ == pad && type->compact_ == ir::CompactMode::null &&
+         type->shape_[0] > 0 && type->shape_[1] > 0 && type->shape_[1] % (32 / element_bytes) == 0;
 }
 
 inline bool IsAlignedDenseVecBuffer(const ir::BufferTypePtr& type) {
   return IsAlignedDenseVecBufferGeometry(type) && type->valid_shape_[0] > 0 && type->valid_shape_[1] > 0;
+}
+
+// The zero pad tag carries the instruction's fill value. Once full-valid, it
+// does not change Vec storage geometry and can survive a conversion or store.
+inline bool IsFullZeroPaddedVec(const ir::BufferTypePtr& type) {
+  return IsAlignedDenseVecBufferGeometry(type, ir::PadValue::zero) &&
+         IsDenseBufferTransferDtype(type->dtype_) && type->valid_shape_ == type->shape_;
+}
+
+inline bool IsFullZeroPaddedVec(const ir::TileTypePtr& tile, const ir::TileView& view) {
+  if (tile->shape_.size() != 2 || !IsDenseBufferTransferDtype(tile->dtype_) ||
+      !IsDenseVecBufferTile(tile, view, ir::PadValue::zero))
+    return false;
+  if (view.valid_shape.empty()) return true;
+  if (view.valid_shape.size() != tile->shape_.size()) return false;
+  for (size_t i = 0; i < tile->shape_.size(); ++i) {
+    const auto full = ir::As<ir::ConstInt>(tile->shape_[i]);
+    const auto valid = ir::As<ir::ConstInt>(view.valid_shape[i]);
+    if (!full || !valid || full->value_ != valid->value_) return false;
+  }
+  return true;
 }
 
 /// Native dense tiles represent a logical vector as one row. Apply the same
@@ -158,11 +180,14 @@ inline std::vector<int64_t> MutableBufferValidShape(const std::vector<ir::ExprPt
 /// Physical descriptor projection shared by native operation recipes. The
 /// returned full-shape valid fields describe capacity only, never the actual
 /// active domain; a caller must separately certify original valid metadata.
-inline ir::BufferTypePtr PhysicalLogicalVecDescriptor(const ir::TypePtr& type) {
+inline ir::BufferTypePtr PhysicalLogicalVecDescriptor(const ir::TypePtr& type,
+                                                      bool allow_full_zero_pad = false) {
   const auto tile = ir::As<ir::TileType>(type);
   if (!tile || (tile->shape_.size() != 1 && tile->shape_.size() != 2)) return nullptr;
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
-  if (!IsDenseVecBufferTile(tile, view) && !IsColumnVectorBufferTile(tile, view)) return nullptr;
+  if (!IsDenseVecBufferTile(tile, view) && !IsColumnVectorBufferTile(tile, view) &&
+      !(allow_full_zero_pad && IsFullZeroPaddedVec(tile, view)))
+    return nullptr;
   const auto offset = ir::As<ir::ConstInt>(view.start_offset);
   if (view.start_offset && (!offset || offset->value_ != 0)) return nullptr;
   std::vector<int64_t> shape;
@@ -187,12 +212,14 @@ inline ir::BufferTypePtr PhysicalLogicalVecDescriptor(const ir::TypePtr& type) {
       }
     }
   }
-  return std::make_shared<ir::BufferType>(shape, tile->dtype_, ir::MemorySpace::Vec, shape, view.blayout);
+  return std::make_shared<ir::BufferType>(shape, tile->dtype_, ir::MemorySpace::Vec, shape, view.blayout,
+                                          view.slayout, view.fractal, view.pad, view.compact);
 }
 
 /// Static positive-valid logical descriptors shared by heterogeneous recipes.
-inline ir::BufferTypePtr StaticLogicalBufferDescriptor(const ir::TypePtr& type) {
-  const auto physical = PhysicalLogicalVecDescriptor(type);
+inline ir::BufferTypePtr StaticLogicalBufferDescriptor(const ir::TypePtr& type,
+                                                       bool allow_full_zero_pad = false) {
+  const auto physical = PhysicalLogicalVecDescriptor(type, allow_full_zero_pad);
   const auto tile = ir::As<ir::TileType>(type);
   if (!physical || !tile) return nullptr;
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
@@ -203,7 +230,7 @@ inline ir::BufferTypePtr StaticLogicalBufferDescriptor(const ir::TypePtr& type) 
     if (valid[i] <= 0 || valid[i] > physical->shape_[i]) return nullptr;
   }
   return std::make_shared<ir::BufferType>(physical->shape_, tile->dtype_, ir::MemorySpace::Vec, valid,
-                                          view.blayout);
+                                          view.blayout, view.slayout, view.fractal, view.pad, view.compact);
 }
 
 /// Packed singleton-column GM and a full-valid contiguous FP32 Vec column.

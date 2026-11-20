@@ -254,8 +254,9 @@ FunctionPtr AnalyzeRegionSync(
                            sync::SyncExternalPolicy::Geometry, launch_count, {}, /*dry_run_only=*/true);
     return regional;
   } catch (const pypto::ValueError&) {
-    return sync::InsertConservativePrefixes(
-        sync::AnalyzeConservativeSync(function, target, {}, {}, false, false, true, parameters, blocks));
+    return sync::InsertConservativePrefixes(sync::AnalyzeConservativeSync(function, target, {}, {}, false,
+                                                                          false, true, parameters, blocks,
+                                                                          /*enable_loop_prefixes=*/false));
   }
 }
 }  // namespace
@@ -512,9 +513,16 @@ Pass RealizeSync(bool require_whole_module) {
             reason += "; native peer FIFO proof unavailable: " + peer.unavailable;
           } else {
             for (const auto& [id, capacity] : peer.capacities) {
+              const auto& storage = capacity.storage;
               reason += "; native peer FIFO pipe id " + std::to_string(id) + " has peak marker depth " +
                         std::to_string(capacity.required) + ", declared local capacity " +
-                        std::to_string(capacity.slots);
+                        std::to_string(storage.local_slots) + ", " + std::to_string(storage.slot_bytes) +
+                        "-byte slot stride in " + MemorySpaceToString(storage.space) + " via " +
+                        PipeTypeToString(storage.issue_pipe);
+              if (storage.placed_base) {
+                reason += ", reserve bytes [" + std::to_string(*storage.placed_base) + ", " +
+                          std::to_string(*storage.placed_base + storage.reserve_bytes) + ")";
+              }
             }
           }
           reason += "; peer Buffer bindings, local DMA readiness and slot reuse remain unqualified";
@@ -574,8 +582,9 @@ Pass RealizeSync(bool require_whole_module) {
             candidate, target, {}, {}, false, true, true, bounds, block_bounds));
         return realize_logical(regional_logical);
       } catch (const pypto::ValueError&) {
-        const auto fallback_logical = sync::InsertConservativePrefixes(sync::AnalyzeConservativeSync(
-            candidate, target, {}, {}, false, false, true, bounds, block_bounds));
+        const auto fallback_logical = sync::InsertConservativePrefixes(
+            sync::AnalyzeConservativeSync(candidate, target, {}, {}, false, false, true, bounds, block_bounds,
+                                          /*enable_loop_prefixes=*/false));
         return realize_logical(fallback_logical);
       }
     } catch (const pypto::ValueError& error) {

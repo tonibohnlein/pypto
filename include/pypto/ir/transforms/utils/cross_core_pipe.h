@@ -24,6 +24,8 @@
 
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
+#include "pypto/ir/memory_space.h"
+#include "pypto/ir/pipe.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
@@ -106,9 +108,23 @@ CallPtr CreateInitializePipe(core_affinity::CoreSide side, int dir_mask, int slo
 void CollectCrossCorePipeMetadata(const std::vector<StmtPtr>& stmts, CrossCorePipeMetadata& metadata);
 CrossCorePipeMetadata CollectDominatingPipeSetupMetadata(const std::vector<StmtPtr>& stmts);
 
+/// The local A2/A3 receive allocation. The native TPOP writes on MTE2 into
+/// (pop ordinal modulo local_slots) * slot_bytes within this reserve. Its
+/// per-call payload can be smaller than one slot. Placement can be absent
+/// before AllocateMemoryAddr while the declared depth is still usable.
+struct ConsumerReceiveStorage {
+  VarPtr reserve;
+  MemorySpace space;
+  PipeType issue_pipe;
+  int local_slots;
+  int64_t slot_bytes;
+  int64_t reserve_bytes;
+  std::optional<int64_t> placed_base;
+};
+
 struct ConsumerPipeCapacity {
   size_t required;
-  size_t slots;
+  ConsumerReceiveStorage storage;
 };
 
 struct ConsumerFifoEvidence {

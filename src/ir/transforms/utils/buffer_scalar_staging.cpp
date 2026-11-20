@@ -122,24 +122,31 @@ class Stage : public IRMutator {
   StmtPtr VisitStmt_(const AssignStmtPtr& assignment) override {
     const auto call = As<Call>(assignment->value_);
     if (IsOp(call, "tensor.write")) return Write(call, assignment->var_, assignment);
-    if (!IsOp(call, "tensor.read") || call->args_.size() != 2 || !call->args_[0] || !call->args_[1] ||
-        !call->kwargs_.empty() || !call->attrs_.empty() ||
-        !backend::IsBufferScalarGMSource(As<TensorType>(call->args_[0]->GetType())))
+    if (!IsOp(call, "tensor.read")) {
       return assignment;
+    }
+    const auto source = ScalarGMOperand(call, true);
+    if (!source) {
+      return assignment;
+    }
     const auto scalar = As<ScalarType>(assignment->var_->GetType());
-    if (!scalar || scalar->dtype_ != DataType::INT32) return assignment;
+    const auto read_type = As<ScalarType>(call->GetType());
+    if (!scalar || !read_type || scalar->dtype_ != source->dtype_ || read_type->dtype_ != source->dtype_) {
+      return assignment;
+    }
     const auto span = assignment->span_;
     const auto ci = [&](int64_t value) { return std::make_shared<ConstInt>(value, DataType::INDEX, span); };
     const auto tuple = [&](std::vector<ExprPtr> values) { return std::make_shared<MakeTuple>(values, span); };
     const auto one = ci(1), eight = ci(8);
-    const auto valid_source = tuple({one});
-    const auto [carrier, memory] = NewCarrier(one, eight, span);
+    const auto valid_source = backend::MakeBufferScalarGMExtent(*source, span);
+    const auto capacity = source->shape_.size() == 1 ? tuple({eight}) : tuple({one, eight});
+    const auto [carrier, memory] = NewCarrier(one, eight, source->dtype_, span);
     const auto type = carrier->GetType();
     // Flattened Tile loads already preserve source-rank window arguments with
     // an independently typed two-dimensional native destination.
     const auto load = std::make_shared<Call>(
         OpRegistry::GetInstance().GetOp("tile.load"),
-        std::vector<ExprPtr>{call->args_[0], call->args_[1], tuple({eight}), valid_source},
+        std::vector<ExprPtr>{call->args_[0], call->args_[1], capacity, valid_source},
         std::vector<std::pair<std::string, std::any>>{{"target_memory", MemorySpace::Vec}}, type, span);
     if (!backend::SupportsLogicalBufferScalarTransfer(load)) return assignment;
     allocations.push_back(CreateAllocStatement(memory, MemorySpace::Vec));
@@ -155,6 +162,27 @@ class Stage : public IRMutator {
   }
 
  private:
+  TensorTypePtr ScalarGMOperand(const CallPtr& call, bool read) {
+    if (!call || call->args_.size() != (read ? 2 : 3) || !AsVarLike(call->args_[0]) ||
+        !call->kwargs_.empty() || !call->attrs_.empty()) {
+      return nullptr;
+    }
+    const auto tensor = As<TensorType>(call->args_[0]->GetType());
+    const auto indices = As<MakeTuple>(call->args_[1]);
+    if (!backend::IsBufferScalarGMSource(tensor) || !indices ||
+        indices->elements_.size() != tensor->shape_.size()) {
+      return nullptr;
+    }
+    // Keep effects at their original statement cuts. A read index can be
+    // ordinary scalar arithmetic. Writes retain their normalized index form.
+    for (const auto& index : indices->elements_) {
+      if (read ? !PureScalarValue(index) : !(AsVarLike(index) || As<ConstInt>(index))) {
+        return nullptr;
+      }
+    }
+    return tensor;
+  }
+
   bool PureScalarValue(const ExprPtr& expression) {
     if (!expression) return false;
     std::vector<std::pair<ExprPtr, bool>> pending{{expression, false}};
@@ -174,7 +202,7 @@ class Stage : public IRMutator {
         continue;
       }
       if (!pure_values_.emplace(value.get(), false).second || !As<ScalarType>(value->GetType())) continue;
-      if (AsVarLike(value) || As<ConstInt>(value)) {
+      if (AsVarLike(value) || As<ConstInt>(value) || As<ConstFloat>(value)) {
         // A carry is its current SSA value, never an invitation to inspect or
         // replay its initializer. Lexical readiness remains a separate check.
         pure_values_[value.get()] = true;
@@ -209,42 +237,36 @@ class Stage : public IRMutator {
                        structural_equal(memory, target_memory));
   }
 
-  std::pair<VarPtr, MemRefPtr> NewCarrier(const ExprPtr& one, const ExprPtr& eight, const Span& span) {
+  std::pair<VarPtr, MemRefPtr> NewCarrier(const ExprPtr& one, const ExprPtr& eight, DataType dtype,
+                                          const Span& span) {
     const auto base = std::make_shared<Var>(Fresh("gm_scalar_base_"), GetPtrType(), span);
     const auto memory = std::make_shared<MemRef>(base, 0, backend::kBufferScalarCarrierBytes, span);
     TileView view;
     view.valid_shape = {one, one};
-    const auto type = std::make_shared<TileType>(std::vector<ExprPtr>{one, eight}, DataType::INT32, memory,
-                                                 view, MemorySpace::Vec);
+    const auto type =
+        std::make_shared<TileType>(std::vector<ExprPtr>{one, eight}, dtype, memory, view, MemorySpace::Vec);
     return {std::make_shared<Var>(Fresh("gm_scalar_carrier_"), type, span), memory};
   }
 
   StmtPtr Write(const CallPtr& call, const VarPtr& result, const StmtPtr& original) {
-    if (call->args_.size() != 3 || !call->args_[0] || !call->args_[1] || !call->args_[2] ||
-        !call->kwargs_.empty() || !call->attrs_.empty() ||
-        !backend::IsBufferScalarGMSource(As<TensorType>(call->args_[0]->GetType())))
+    const auto target = ScalarGMOperand(call, false);
+    if (!target || !call->args_[2]) {
       return original;
+    }
     const auto scalar = As<ScalarType>(call->args_[2]->GetType());
     const auto alias = ResultAliasedArgIndex(call);
-    if (!scalar || scalar->dtype_ != DataType::INT32 || !alias || *alias != 0 ||
+    if (!scalar || scalar->dtype_ != target->dtype_ || !alias || *alias != 0 ||
         !SameTensorAlias(call->GetType(), call->args_[0]->GetType()) ||
         (result && !SameTensorAlias(result->GetType(), call->args_[0]->GetType())))
       return original;
-    const auto indices = As<MakeTuple>(call->args_[1]);
-    // An index remains a ready identity/literal. The value may retain pure
-    // arithmetic at this exact cut, but no nested effect may move across the
-    // local write. Neither expression nor machine-width semantics are changed.
-    const auto scalar_identity = [](const ExprPtr& value) {
-      return value && (AsVarLike(value) || As<ConstInt>(value));
-    };
-    if (!AsVarLike(call->args_[0]) || !indices || indices->elements_.size() != 1 ||
-        !scalar_identity(indices->elements_[0]) || !PureScalarValue(call->args_[2]))
+    if (!PureScalarValue(call->args_[2])) {
       return original;
+    }
     const auto span = original->span_;
     const auto ci = [&](int64_t value) { return std::make_shared<ConstInt>(value, DataType::INDEX, span); };
     const auto tuple = [&](std::vector<ExprPtr> values) { return std::make_shared<MakeTuple>(values, span); };
     const auto one = ci(1), eight = ci(8);
-    const auto [carrier, memory] = NewCarrier(one, eight, span);
+    const auto [carrier, memory] = NewCarrier(one, eight, target->dtype_, span);
     const auto type = carrier->GetType();
     const auto store = std::make_shared<Call>(OpRegistry::GetInstance().GetOp("tile.store"),
                                               std::vector<ExprPtr>{carrier, call->args_[1], call->args_[0]},
@@ -255,7 +277,7 @@ class Stage : public IRMutator {
     // valid element before MTE3 reads it; inactive carrier lanes never escape.
     const auto create = std::make_shared<Call>(
         OpRegistry::GetInstance().GetOp("tile.create"), std::vector<ExprPtr>{tuple({one, eight})},
-        std::vector<std::pair<std::string, std::any>>{{"dtype", DataType::INT32},
+        std::vector<std::pair<std::string, std::any>>{{"dtype", target->dtype_},
                                                       {"target_memory", MemorySpace::Vec}},
         type, span);
     const auto write = OpRegistry::GetInstance().Create(

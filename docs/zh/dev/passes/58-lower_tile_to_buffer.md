@@ -32,6 +32,7 @@ autosync 仍须独立建立范围、访问与出现坐标的证明。
 | 算子 | 元素类型 |
 | ---- | -------- |
 | 普通紧密 ND GM load/store | FP16、BF16、FP32、INT32 |
+| fillpad（零填充、完整列、已放置的 A2/A3 Vec） | FP16、BF16、FP32、INT32 |
 | Acc 到紧密 ND GM 的原子累加写回 | FP32 源及目标，A2/A3 |
 | add、mul | FP16、FP32、INT32 |
 | sub、div、maximum、minimum、abs、exp、sqrt、neg、relu、log、recip | FP32 |
@@ -42,6 +43,11 @@ autosync 仍须独立建立范围、访问与出现坐标的证明。
 | col_sum/max/min/prod | FP32，正静态 valid，顺序归约 |
 | col_expand_add/sub/mul/div/max/min | FP32，正静态 valid，单行载体 |
 | transpose | FP32，full-valid 稠密二维矩阵 |
+
+对于有效列完整且对齐的二维 Vec Buffer，零值 `fillpad` 将有效行复制到不重叠的目标存储，
+并将其余行填零。运行时输入行数为零时，直接填零整个目标。全有效结果通过受支持的
+cast 和 store 保留零填充模式。该配方要求 PYPTO 或 DSA_RP 规划器已放置存储，
+同步分析覆盖整个源分配范围内的读取以及对整个目标的写入。
 
 标量参数遵循已有 scalar ABI，元素标量在 lowering 中显式转换。
 `full` 后接 store 的无 load kernel 也可入选。BF16 传输不包含 BF16 算术或填充。

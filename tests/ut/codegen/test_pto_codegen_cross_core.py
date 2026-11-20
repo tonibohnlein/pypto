@@ -325,9 +325,52 @@ class IndependentFifos:
         if early_exit:
             assert "early-exit control does not prove local FIFO order" in why
         else:
-            for pipe_id in (0, 1):
-                assert f"pipe id {pipe_id} has peak marker depth 1, declared local capacity 1" in why
+            for pipe_id, base in enumerate((4096, 8192)):
+                assert (
+                    f"pipe id {pipe_id} has peak marker depth 1, declared local capacity 1, "
+                    f"1024-byte slot stride in Vec via MTE2, reserve bytes [{base}, {base + 1024})"
+                ) in why
         ir.assert_structural_equal(before.body, after.body)
+
+
+@pytest.mark.usefixtures("ascend_backend")
+def test_peer_fifo_counts_each_statement_with_a_shared_pop_expression():
+    source = pl.parse_program("""
+@pl.program
+class RepeatedPopExpression:
+    @pl.function(type=pl.FunctionType.AIC)
+    def cube(self):
+        fifo = pl.reserve_buffer(name="fifo", size=1024, base=0)
+        pl.aic_initialize_pipe(pl.const(0, pl.INT32), fifo, dir_mask=2, slot_size=512, slot_num=2)
+        first: pl.Tile[[16, 16], pl.FP16, pl.Mem.Mat] = pl.tpop_from_aiv(split=0)
+        second: pl.Tile[[16, 16], pl.FP16, pl.Mem.Mat] = pl.tpop_from_aiv(split=0)
+        pl.tfree_to_aiv(first)
+        pl.tfree_to_aiv(second)
+""")
+
+    class SharePopExpression(ir.IRMutator):
+        pop = None
+
+        def visit_call(self, op):
+            if op.op.name != ir.get_op("tile.tpop_from_aiv").name:
+                return super().visit_call(op)
+            if self.pop is None:
+                self.pop = op
+            return self.pop
+
+    # A loop unroller can reuse a nullary TPOP expression while allocating a
+    # distinct SSA result for each cloned statement. Both borrows are live here.
+    source = SharePopExpression().visit_program(source)
+    with passes.PassContext([], enable_pypto_autosync=True, autosync_policy="conservative_prefix"):
+        result = passes.realize_sync()(source)
+    cube = result.get_function("cube")
+    assert cube is not None
+    assert not cube.attrs["pypto_autosync"]
+    why = cube.attrs["autosync_fallback_reason"]
+    assert (
+        "pipe id 0 has peak marker depth 2, declared local capacity 2, "
+        "512-byte slot stride in Mat via MTE2, reserve bytes [0, 1024)"
+    ) in why
 
 
 # ============================================================================

@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <optional>
@@ -17,6 +18,7 @@
 #include <vector>
 
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/conservative_sync_dataflow.h"
@@ -85,17 +87,23 @@ class FreshChildTokens : public IRMutator {
 class Insert : public IRMutator {
  public:
   explicit Insert(const ConservativeSyncAnalysis& analysis) : names_(analysis.Function()) {
-    // Build the full replacement inventory first. Every service uses its
-    // consumer's CURRENT control and cut; no historical guard or private state
-    // is introduced. Reusing the same static statement in two contexts requires
+    // Build the full replacement inventory first. Ordinary services use
+    // the consumer's current cut. A certified eager service runs in its
+    // producer's original branch and leaves no outstanding logical token.
+    // Reusing the same static statement in two contexts requires
     // distinct original cut evidence and is refused rather than conflated.
     for (const auto& site : analysis.Sites()) {
       const auto destination = site.operation.Implementation().Pipe();
       std::vector<std::pair<PipeType, PipeType>> services;
       for (const auto source : site.source_pipes) {
+        if (site.loop_entry && IsPhaseOnly(*site.loop_entry, source)) continue;
         services.emplace_back(source, destination);
       }
-      Wrap(site.cut, services);
+      const auto phased = site.loop_entry ? PrepareLoopEntry(*site.loop_entry, destination) : nullptr;
+      const auto post = site.post_destination
+                            ? std::make_optional(std::make_pair(destination, *site.post_destination))
+                            : std::nullopt;
+      Wrap(site.cut, services, nullptr, post, phased);
     }
     for (const auto& entry : analysis.ChildEntries()) {
       if (entry.inline_subblock) {
@@ -178,7 +186,10 @@ class Insert : public IRMutator {
   }
   StmtPtr VisitStmt_(const ForStmtPtr& loop) override {
     const auto replacement = replacements_.find(loop.get());
-    return replacement == replacements_.end() ? IRMutator::VisitStmt_(loop) : replacement->second;
+    if (replacement != replacements_.end()) return replacement->second;
+    auto lowered = IRMutator::VisitStmt_(loop);
+    const auto entry = entries_.find(loop.get());
+    return entry == entries_.end() ? lowered : SeqStmts::Flatten({entry->second, lowered}, loop->span_);
   }
   StmtPtr VisitStmt_(const SeqStmtsPtr& sequence) override {
     return RewriteSyncSequence(sequence, [this](const StmtPtr& statement) { return VisitStmt(statement); });
@@ -188,8 +199,34 @@ class Insert : public IRMutator {
  private:
   SyncTokenNames names_;
   std::map<const Stmt*, StmtPtr> replacements_;
+  std::map<const ForStmt*, StmtPtr> entries_;
+  static bool IsPhaseOnly(const ConservativeLoopEntryServices& phase, PipeType source) {
+    return std::binary_search(phase.entry_only.begin(), phase.entry_only.end(), source) ||
+           std::binary_search(phase.backedge_only.begin(), phase.backedge_only.end(), source);
+  }
+  StmtPtr PrepareLoopEntry(const ConservativeLoopEntryServices& phase, PipeType destination) {
+    const auto& loop = phase.loop;
+    const auto& span = loop->span_;
+    auto pairs = [&](const std::vector<PipeType>& sources) -> StmtPtr {
+      std::vector<StmtPtr> statements;
+      for (const auto source : sources) AppendPair(source, destination, statements, span);
+      return std::make_shared<SeqStmts>(std::move(statements), span);
+    };
+    auto entry = pairs(phase.entry_only);
+    if (phase.guard_nonempty) {
+      entry = std::make_shared<IfStmt>(MakeLt(loop->start_, loop->stop_, span), entry, std::nullopt,
+                                       std::vector<VarPtr>{}, span);
+    }
+    INTERNAL_CHECK(entries_.emplace(loop.get(), std::move(entry)).second)
+        << "Internal error: multiple entry plans for one loop";
+    if (phase.backedge_only.empty()) return nullptr;
+    return std::make_shared<IfStmt>(MakeNe(loop->loop_var_, loop->start_, span), pairs(phase.backedge_only),
+                                    std::nullopt, std::vector<VarPtr>{}, span);
+  }
+
   void Wrap(const StmtPtr& cut, const std::vector<std::pair<PipeType, PipeType>>& services,
-            StmtPtr retained = nullptr) {
+            StmtPtr retained = nullptr, std::optional<std::pair<PipeType, PipeType>> post = std::nullopt,
+            StmtPtr phased = nullptr) {
     std::vector<StmtPtr> statements;
     if (const auto recipe = As<SeqStmts>(retained)) {
       CHECK(!recipe->stmts_.empty()) << "Eventful child recipe has no whole invocation";
@@ -197,12 +234,17 @@ class Insert : public IRMutator {
       retained = recipe->stmts_.back();
     }
     for (const auto& [source, destination] : services) {
-      const auto forward = Record(source, statements, cut->span_);
-      Wait(forward, destination, statements, cut->span_);
+      AppendPair(source, destination, statements, cut->span_);
     }
+    if (phased) statements.push_back(std::move(phased));
     statements.push_back(retained ? std::move(retained) : cut);
+    if (post) AppendPair(post->first, post->second, statements, cut->span_);
     CHECK(replacements_.emplace(cut.get(), std::make_shared<SeqStmts>(statements, cut->span_)).second)
         << "Conservative prefix entries require distinct original static cuts";
+  }
+  void AppendPair(PipeType source, PipeType destination, std::vector<StmtPtr>& output, const Span& span) {
+    const auto forward = Record(source, output, span);
+    Wait(forward, destination, output, span);
   }
   VarPtr Record(PipeType pipe, std::vector<StmtPtr>& output, const Span& span) {
     const auto operation =

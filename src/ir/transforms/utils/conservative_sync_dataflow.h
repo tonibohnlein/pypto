@@ -79,6 +79,15 @@ struct ConservativeStorageDomain {
 };
 using ConservativeAccessSet = std::set<ConservativeAccessFact>;
 
+struct ConservativeLoopEntryServices {
+  ForStmtPtr loop;
+  bool guard_nonempty;
+  std::vector<PipeType> entry_only;
+  std::vector<PipeType> backedge_only;
+  // A steady service can be unguarded when its first publication is empty.
+  std::vector<PipeType> empty_entry_sources;
+};
+
 struct ConservativeSyncSite {
   StmtPtr cut;  // Original statement, immediately before its payload call.
   backend::BufferSyncOperation operation;
@@ -90,6 +99,11 @@ struct ConservativeSyncSite {
   // child/rearming services are protected separately and never filtered here.
   std::vector<PipeType> source_pipes;
   std::vector<PipeType> required_source_pipes;
+  // A separately certified producer-side service, after this payload. The
+  // destination pipe has no later payload before the next loop visit.
+  std::optional<PipeType> post_destination;
+  // Phase-only subsets of source_pipes. All other services run on both paths.
+  std::optional<ConservativeLoopEntryServices> loop_entry;
 };
 
 struct ConservativeSyncChildEntry {
@@ -154,7 +168,7 @@ class ConservativeSyncAnalysis {
   friend ConservativeSyncAnalysis AnalyzeConservativeSync(
       const FunctionPtr&, const std::string&, const std::vector<std::shared_ptr<const NativeSyncChild>>&,
       const std::vector<std::shared_ptr<const EventfulSyncChild>>&, bool, bool, bool,
-      const SyncParameterBounds&, const std::optional<std::pair<int64_t, int64_t>>&);
+      const SyncParameterBounds&, const std::optional<std::pair<int64_t, int64_t>>&, bool);
   ConservativeSyncAnalysis(FunctionPtr function, std::vector<ConservativeSyncSite> sites,
                            ConservativeAccessSet exit, ConservativeSyncCost cost,
                            std::vector<ConservativeSyncChildEntry> children,
@@ -191,7 +205,8 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
     const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful_children = {},
     bool retain_incoming_diagnostics = false, bool automatic_children = false,
     bool enable_refresh_kill = true, const SyncParameterBounds& parameters = {},
-    const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt);
+    const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt,
+    bool enable_loop_prefixes = true);
 // Explicit policy construction. Acknowledgment-induced order is represented
 // here in logical tokens before LowerSync; no physical resource is assigned.
 FunctionPtr InsertConservativePrefixes(const ConservativeSyncAnalysis& analysis);

@@ -25,9 +25,10 @@ namespace pypto::backend {
 // readiness or allocation ownership is inferred from this descriptor proof.
 std::optional<uint32_t> BufferScalarPointOffset(const ir::BufferTypePtr& buffer, const ir::ExprPtr& indices);
 bool SupportsLogicalBufferScalar(const ir::CallPtr& call);
-// Narrow source ABI for point staging. This proves packed geometry, not input
+// Packed rank-one or rank-two ABI for point staging. This proves geometry, not input
 // address validity, external publication, alias disjointness or scalar readiness.
 bool IsBufferScalarGMSource(const ir::TensorTypePtr& tensor);
+ir::MakeTuplePtr MakeBufferScalarGMExtent(const ir::TensorType& tensor, const ir::Span& span);
 // Direction is part of the contract: load reads four GM bytes; store writes
 // exactly four GM bytes. Both retain a complete aligned 32-byte local carrier.
 bool SupportsBufferScalarTransfer(const std::vector<ir::ExprPtr>& args, bool load);

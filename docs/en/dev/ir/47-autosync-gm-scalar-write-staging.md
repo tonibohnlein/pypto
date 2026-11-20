@@ -11,6 +11,17 @@ The [machine-readable checkpoint](47-autosync-gm-scalar-write-staging.json)
 records the preserved failed runs and final source/tool identities. No device execution
 has been performed.
 
+## Packed rank-two point writes
+
+The explicit DMA option also handles packed, fully valid, unpadded ND INT32
+and FP32 rank-two tensors under the same A2/A3 AIV and native row-pitch
+constraints as point reads. The store preserves the original GM allocation
+and both coordinates. Its `[1, 1]` partition selects one four-byte burst in
+the ND b32 TSTORE path even at a column that is unaligned to 32 bytes. Local
+effects cover the complete private carrier. The GM write still touches just
+the selected element. Scalar D-cache publication and peer readiness remain
+separate contracts. [GM point-read geometry](44-autosync-gm-scalar-staging.md)
+
 ## One original write, one executed transfer
 
 Admit an ordinary A2/A3 AIV `tensor.write(destination, [index], value)` on a

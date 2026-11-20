@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "pypto/backend/common/buffer_type_support.h"
+#include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/core/any_cast.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
@@ -36,6 +37,7 @@ const std::vector<BufferConversionRecipe>& GetBufferConversionRecipes() {
   using K = BufferConversionKind;
   static const std::vector<BufferConversionRecipe> recipes = {
       {"tile.cast", "buffer.cast", "pto.tcvt", K::Cast, 1},
+      {"tile.fillpad", "buffer.fillpad", "pto.tfillpad", K::FillPad, 1},
       {"tile.cmp", "buffer.cmp", "pto.tcmp", K::Compare, 2},
       {"tile.cmps", "buffer.cmps", "pto.tcmps", K::CompareScalar, 2, 1},
       {"tile.sel", "buffer.sel", "pto.tsel", K::Select, 4, -1, 3},
@@ -115,6 +117,25 @@ bool Predicate(const ir::BufferTypePtr& mask, const ir::BufferTypePtr& values) {
 
 const char* OperandError(const BufferConversionRecipe& recipe, const std::vector<ir::BufferTypePtr>& types,
                          const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  if (recipe.kind == K::FillPad) {
+    const auto& src = types[0];
+    const auto& dst = types[1];
+    // Keep both the row repeat and pitch within the native eight-bit
+    // encodings. The padding duplicate's count is bounded by Vec capacity.
+    constexpr int64_t kMaxRowRepeat = 255;
+    constexpr int64_t kMaxStrideBlocks = 255;
+    constexpr uint64_t kVecCapacityBytes = 192 * 1024;
+    const auto bytes = PhysicalBufferBytes(dst);
+    return IsAlignedDenseVecBufferGeometry(src) && IsFullZeroPaddedVec(dst) && src->shape_ == dst->shape_ &&
+                   src->dtype_ == dst->dtype_ &&
+                   (src->valid_shape_[1] == src->shape_[1] || src->valid_shape_[1] == -1) &&
+                   src->shape_[0] <= kMaxRowRepeat &&
+                   src->shape_[1] <= kMaxStrideBlocks * 32 / src->dtype_.GetByte() && bytes &&
+                   *bytes <= kVecCapacityBytes
+               ? nullptr
+               : "requires aligned equal-shaped Vec buffers, full source columns and a full zero-padded "
+                 "destination";
+  }
   const bool has_runtime_shape =
       recipe.kind == K::Cast && types.size() == 2 && (Dynamic(types[0]) || Dynamic(types[1]));
   if (has_runtime_shape && IsAlignedDenseVecBufferGeometry(types[0]) &&
@@ -127,7 +148,9 @@ const char* OperandError(const BufferConversionRecipe& recipe, const std::vector
   const bool runtime_cast = has_runtime_shape && RuntimeBfloatGeometry(types[0], types[1]);
   for (size_t i = 0; i < types.size(); ++i) {
     if (static_cast<int>(i) != recipe.scalar_index &&
-        !(runtime_cast ? IsAlignedDenseVecBufferGeometry(types[i]) : IsAlignedDenseVecBuffer(types[i]))) {
+        !(runtime_cast ? IsAlignedDenseVecBufferGeometry(types[i])
+                       : IsAlignedDenseVecBuffer(types[i]) ||
+                             (recipe.kind == K::Cast && IsFullZeroPaddedVec(types[i])))) {
       return "requires aligned dense rank-2 Vec buffers with positive static valid extents";
     }
   }
@@ -165,7 +188,8 @@ const char* OperandError(const BufferConversionRecipe& recipe, const std::vector
     }
     return (float_half || bfloat || fp_to_int32 || int32_to_fp) && (Geometry(src, dst) || runtime_cast)
                ? nullptr
-               : "requires FP16/FP32, BF16/FP32, or FP/INT32 conversion with matching physical and valid shapes";
+               : "requires FP16/FP32, BF16/FP32, or FP/INT32 conversion with matching physical and valid "
+                 "shapes";
   }
   if (recipe.kind == K::Compare || recipe.kind == K::CompareScalar) {
     const auto& src = types[0];
@@ -198,6 +222,12 @@ const char* OperandError(const BufferConversionRecipe& recipe, const std::vector
 
 bool Attributes(const BufferConversionRecipe& recipe,
                 const std::vector<std::pair<std::string, std::any>>& kwargs, bool logical) {
+  if (recipe.kind == K::FillPad) {
+    if (kwargs.empty()) return true;
+    const auto pad = std::any_cast<ir::PadValue>(&kwargs.front().second);
+    return logical && kwargs.size() == 1 && kwargs.front().first == "pad_value" && pad &&
+           *pad == ir::PadValue::zero;
+  }
   int mode = 0;
   int saturation = 0;
   int comparison = -1;
@@ -234,16 +264,30 @@ bool Scalar(const ir::ExprPtr& arg, bool logical) {
 
 bool SupportsLogicalBufferConversion(const BufferConversionRecipe& recipe, const ir::CallPtr& call) {
   if (call->args_.size() != recipe.input_count || !Attributes(recipe, call->kwargs_, true)) return false;
+  if (recipe.kind == K::FillPad) {
+    const auto tile = ir::As<ir::TileType>(call->args_[0]->GetType());
+    if (!tile || tile->shape_.size() != 2) return false;
+    const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
+    const auto& valid = view.valid_shape.empty() ? tile->shape_ : view.valid_shape;
+    if (valid.size() != 2 || !ir::structural_equal(valid[1], tile->shape_[1]) ||
+        (!ir::AsVarLike(valid[0]) && !ir::As<ir::ConstInt>(valid[0])))
+      return false;
+    return OperandError(
+               recipe,
+               {PhysicalLogicalVecDescriptor(tile), StaticLogicalBufferDescriptor(call->GetType(), true)},
+               {}) == nullptr;
+  }
+  const bool permit_zero_pad = recipe.kind == K::Cast;
   std::vector<ir::BufferTypePtr> types;
   for (size_t i = 0; i < call->args_.size(); ++i) {
     if (static_cast<int>(i) == recipe.scalar_index) {
       if (!Scalar(call->args_[i], true)) return false;
       types.push_back(nullptr);
     } else {
-      types.push_back(StaticLogicalBufferDescriptor(call->args_[i]->GetType()));
+      types.push_back(StaticLogicalBufferDescriptor(call->args_[i]->GetType(), permit_zero_pad));
     }
   }
-  types.push_back(StaticLogicalBufferDescriptor(call->GetType()));
+  types.push_back(StaticLogicalBufferDescriptor(call->GetType(), permit_zero_pad));
   if (OperandError(recipe, types, call->kwargs_) == nullptr) return true;
   if (recipe.kind != K::Cast || !MatchingRuntimeCastValid(call->args_[0]->GetType(), call->GetType()))
     return false;

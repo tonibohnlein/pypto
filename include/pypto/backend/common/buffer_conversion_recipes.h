@@ -22,7 +22,7 @@
 
 namespace pypto::backend {
 
-enum class BufferConversionKind { Cast, Compare, CompareScalar, Select, SelectScalar };
+enum class BufferConversionKind { Cast, Compare, CompareScalar, Select, SelectScalar, FillPad };
 
 /// Conversion recipes carry heterogeneous buffers and packed predicates. Each
 /// instruction writes its last operand; scratch is a separate writable input.

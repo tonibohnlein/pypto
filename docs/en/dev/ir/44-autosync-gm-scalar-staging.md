@@ -10,6 +10,27 @@ qualified [local scalar bridge](43-autosync-value-and-scalar-contracts.md).
 The whole-model host capture improves local ownership from 17 to 19 leaves;
 complete Qwen ownership and device results are not claimed.
 
+## Packed rank-two point reads
+
+`PassContext(enable_scalar_gm_dma=True)` selects point DMA for packed, unpadded
+ND INT32 and FP32 tensors of rank one or two on A2/A3 AIV. It preserves the
+original tensor, coordinates, and execution cut. A rank-two read partitions
+the original tensor at `[row, col]` with extent `[1, 1]`. The column extent
+must be static and the parent stride must fit the native burst-gap field.
+The row extent may be dynamic. Explicit strides must agree with the packed
+layout. The recipe requires full-valid GM views.
+
+The unit partition gives one four-byte GM burst for either dtype. The
+original parent row pitch still contributes to the starting address even
+when the selected window is one row tall. TLOAD may touch the complete
+32-byte UB carrier. Conservative synchronization imports that enclosure and
+leaves exact physical recovery unavailable.
+
+The A2/A3 public DMA contract accepts both four-byte dtypes and permits GM
+start addresses that are unaligned to 32 bytes. The native implementation
+requires a 32-byte-aligned local carrier and preserves the original
+in-bounds tensor access precondition. [CANN DataCopyPad contract](https://www.hiascend.com/doc_center/source/zh/canncommercial/900/API/ascendcopapi/atlasascendc_api_07_0265.html)
+
 ## Supported construction and preserved semantics
 
 Start with a direct SSA definition `value = tensor.read(source, [index])` in an

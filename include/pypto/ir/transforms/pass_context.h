@@ -311,7 +311,7 @@ class PassContext {
    * @param enable_software_pipeline Lower eligible pipeline loops to rotating
    *        slots with explicit prefetch (default: false). Requires PyPTO memory
    *        planning and the tile IR pipeline.
-   * @param enable_scalar_gm_dma Explicit default-off AIV/A2A3 rank-one INT32 DMA legalization;
+   * @param enable_scalar_gm_dma Explicit default-off AIV/A2A3 INT32/FP32 point DMA legalization;
    *        does not imply synchronization ownership or native scalar visibility.
    * @param autosync_policy Logical synchronization producer: "exact" (default)
    *        or the explicitly conservative "conservative_prefix" construction.
