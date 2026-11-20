@@ -574,6 +574,9 @@ Pass OptimizeOrchTensors();
  */
 Pass BlockNzTensorViews();
 
+/// Preserve logical NZ until selection when a private NZ allocation is present.
+Pass PrepareIntermediateTensorLayouts();
+
 /**
  * @brief Rewrite logical MX scale tensor views into A5's packed rank-5 form
  *
@@ -806,6 +809,8 @@ struct AutoLayoutOptions {
   int64_t max_treewidth = 8;
   std::string name = "AutoLayout";
   bool fail_on_writeback_issues = false;
+  // Read-only entry inputs whose loader can supply dense ND or packed NZ bytes.
+  std::unordered_set<std::string> nz_inputs;
 };
 
 /**
