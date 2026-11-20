@@ -901,9 +901,7 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
     const auto type = As<ir::TensorType>(tensor->GetType());
     const std::string partition_type = backend::pto_ops_detail::MakePartitionTensorViewType(
         backend::pto_ops_detail::GetDimStrings(extents->elements_), GetTypeString(type->dtype_));
-    // Cache the shared tensor view outside the guard so later accesses can
-    // reuse it without referring to a value defined only in this branch.
-    const auto tensor_view = GetOrCreateTensorView(tensor);
+    const auto tensor_view = backend::pto_ops_detail::GetTransferTensorView(tensor, call, *this);
     const bool guarded =
         fs_.nonempty_buffer_transfers.count(call.get()) == 0 &&
         backend::pto_ops_detail::BeginNonEmptyRegion(extents->elements_, *this, extent_values);

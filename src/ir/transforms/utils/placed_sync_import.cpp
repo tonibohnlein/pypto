@@ -2592,9 +2592,19 @@ class InvocationBounds : public IRVisitor {
     ranges_.emplace(expression.get(), result);
     return result;
   }
+  static bool IsLaunchCapacity(const ExprPtr& expression) {
+    const auto call = As<Call>(expression);
+    return call && call->args_.empty() &&
+           (IsOp(call, "system.available_cluster_count") || IsOp(call, "system.available_aiv_count"));
+  }
   std::optional<Bound> ComputeRange(const ExprPtr& expression) {
     const auto maximum = SyncCoordinateMaximum(expression);
     if (!maximum) return std::nullopt;
+    // Orchestration reads the runtime's nonnegative INT32 launch capacity.
+    // A dominated nonempty launch can narrow this to a positive worker stride.
+    if (IsLaunchCapacity(expression)) {
+      return Bound{0, *maximum};
+    }
     if (auto call = As<Call>(expression);
         call && (IsOp(call, "buffer.get_block_idx") || IsOp(call, "tile.get_block_idx"))) {
       return block_index_;
@@ -2812,7 +2822,11 @@ class InvocationBounds : public IRVisitor {
       // This producer consumes only substitutions and constant bounds. Do not
       // populate transitive-comparison inventories which it never queries (and
       // whose per-definition removal scans the entire retained inventory).
-      analyzer_->rewrite_simplify.Update(statement->var_, analyzer_->Simplify(statement->value_));
+      // Keep the runtime observation as an SSA variable. Inlining the opaque
+      // query into a branch condition would discard the variable's scoped bound.
+      if (!IsLaunchCapacity(statement->value_)) {
+        analyzer_->rewrite_simplify.Update(statement->var_, analyzer_->Simplify(statement->value_));
+      }
       // Preserve specialized bounds for calls such as get_block_idx which the
       // generic arithmetic analyzer intentionally treats as opaque.
       analyzer_->const_int_bound.Update(statement->var_, {b->first, b->second});

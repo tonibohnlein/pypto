@@ -9,6 +9,8 @@
 
 """Independent point-write values, bytes and actual consuming command checks."""
 
+import re
+
 import pytest
 from pypto import codegen, ir, passes, testing
 from pypto import language as pl
@@ -213,20 +215,36 @@ def test_write_staging_real_cpp_preserves_one_element_store_and_final_owner(plan
     assert "pipe_barrier(PIPE_S)" not in text
 
 
-def rank_two_point_copy(dtype, columns):
+def rank_two_point_copy(dtype, columns, *, mixed_column=False, explicit_strides=False):
+    rows = 16 if mixed_column else "POINT_ROWS"
+    view = f", pl.TensorView(stride=[{columns}, 1], layout=pl.TensorLayout.ND)" if explicit_strides else ""
+    # Mixed fixtures express the point transfer directly because the frontend
+    # rejects raw tensor.write and tile.store to the same tensor before staging.
+    point_copy = (
+        "point = pl.load(cells, [row, source_column], [1, 8], valid_shape=[1, 1])\n"
+        "            cells = pl.store(point, [row, target_column], cells)"
+        if mixed_column
+        else "point = pl.tensor.read(cells, [row, source_column])\n"
+        "            cells = pl.tensor.write(cells, [row, target_column], point)"
+    )
+    column_copy = (
+        "column = pl.load(cells, [8, 0], [8, 1])\n        cells = pl.store(column, [0, 0], cells)"
+        if mixed_column
+        else ""
+    )
     return pl.parse_program(f"""
 POINT_ROWS = pl.dynamic("POINT_ROWS")
 
 @pl.program
 class RankTwoPointCopy:
     @pl.function(type=pl.FunctionType.InCore)
-    def kernel(self, cells: pl.InOut[pl.Tensor[[POINT_ROWS, {columns}], pl.{dtype}]],
+    def kernel(self, cells: pl.InOut[pl.Tensor[[{rows}, {columns}], pl.{dtype}{view}]],
                row: pl.Scalar[pl.INDEX], source_column: pl.Scalar[pl.INDEX],
                target_column: pl.Scalar[pl.INDEX], visits: pl.Scalar[pl.INDEX]
-               ) -> pl.Tensor[[POINT_ROWS, {columns}], pl.{dtype}]:
+               ) -> pl.Tensor[[{rows}, {columns}], pl.{dtype}]:
         for i in pl.range(visits):
-            point = pl.tensor.read(cells, [row, source_column])
-            cells = pl.tensor.write(cells, [row, target_column], point)
+            {point_copy}
+        {column_copy}
         return cells
 """)
 
@@ -286,7 +304,8 @@ def test_rank_two_point_copy_keeps_parent_pitch_and_single_element_effects(
 
 @pytest.mark.ptoas_compile
 @pytest.mark.parametrize("planner", PLANNERS)
-@pytest.mark.parametrize("dtype,columns", [("INT32", 9), ("FP32", 1)])
+@pytest.mark.parametrize("dtype", ["INT32", "FP32"])
+@pytest.mark.parametrize("columns", [1, 9])
 def test_rank_two_scalar_copy_emits_actual_native_load_and_store(planner, dtype, columns, tmp_path):
     if find_ptoas_binary() is None:
         pytest.skip("PTOAS is unavailable")
@@ -298,6 +317,37 @@ def test_rank_two_scalar_copy_emits_actual_native_load_and_store(planner, dtype,
     text = cpp.read_text()
     assert "TLOAD" in text and "TSTORE" in text
     assert ".GetValue(" in text and ".SetValue(" in text
+    assert "Layout::ND" in text
+
+
+@pytest.mark.parametrize("planner", PLANNERS)
+@pytest.mark.parametrize("mixed_column,columns", [(False, 1), (False, 9), (True, 1)])
+@pytest.mark.parametrize("explicit_strides", [False, True])
+def test_rank_two_transfer_layout_follows_each_consumer(planner, mixed_column, columns, explicit_strides):
+    # Both transfers use the same original GM pointer. In the mixed case the
+    # point carrier still requires ND and the aligned column tile requires DN.
+    result = lower(
+        rank_two_point_copy("FP32", columns, mixed_column=mixed_column, explicit_strides=explicit_strides),
+        planner,
+    )
+    text = codegen.PTOCodegen().generate(result)
+    views = {
+        line.strip().split(" = ", 1)[0]: line
+        for line in text.splitlines()
+        if " = pto.make_tensor_view %arg0," in line
+    }
+    partition_sources = re.findall(
+        r"pto\.partition_view (%\S+), [^\n]+ -> !pto\.partition_tensor_view<(\d+)x1xf32>", text
+    )
+    assert sorted(int(rows) for _, rows in partition_sources) == ([1, 1, 8, 8] if mixed_column else [1, 1])
+    for source, rows in partition_sources:
+        if rows == "1":
+            assert "layout = #pto.layout<nd>" in views[source]
+            assert f"strides = [%c{columns}_index, %c1_index]" in views[source]
+        else:
+            assert "layout = #pto.layout<dn>" in views[source]
+            column_stride = 1 if explicit_strides else 16
+            assert f"strides = [%c1_index, %c{column_stride}_index]" in views[source]
 
 
 def test_rank_two_staging_keeps_default_native_accesses():

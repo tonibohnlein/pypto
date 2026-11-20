@@ -20,6 +20,11 @@ must be static and the parent stride must fit the native burst-gap field.
 The row extent may be dynamic. Explicit strides must agree with the packed
 layout. The recipe requires full-valid GM views.
 
+For a packed tensor of width one, point loads and stores use an ND view
+with strides `[1, 1]` over the original GM pointer. This gives the row-major
+Vec carrier a matching transfer layout. Column-tile transfers can still use
+their DN view of the same tensor.
+
 The unit partition gives one four-byte GM burst for either dtype. The
 original parent row pitch still contributes to the starting address even
 when the selected window is one row tall. TLOAD may touch the complete

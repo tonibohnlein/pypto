@@ -11,10 +11,13 @@
 
 #include "src/ir/transforms/utils/peer_local_plan.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -24,51 +27,172 @@
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "src/ir/transforms/utils/peer_local_effects.h"
+#include "src/ir/transforms/utils/peer_local_work_loop.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
 
 namespace pypto::ir::sync {
 namespace {
 
-// The numerical analysis owns both the within-region dependence families and
-// the finite crossing demands. Keep their original visit ordinals through the
-// shared allocator and materializer, including the final visit of each loop.
-FunctionPtr PlanLane(const PeerLocalLane& lane, const backend::LocalSyncExecutionContract& execution) {
-  const auto& input = lane.input;
-  const auto math = AnalyzeCompactSync(input);
-  const auto crossings = math.ExportCrossingDemands();
-  CHECK(crossings) << "Peer local region has no complete crossing demand export";
-  std::vector<PhysicalSyncFamily> families;
-  auto append = [&](PhysicalSyncFamily family) {
+struct PeerPhase {
+  size_t first;
+  CompactSyncResult math;
+  std::set<SyncDirection> events;
+  PeerWorkPairs seam;
+
+  Occurrence Local(Occurrence occurrence) const {
+    std::get<0>(occurrence) -= first;
+    return occurrence;
+  }
+};
+
+SyncDirection SeamPair(PipeType source, PipeType target) {
+  return {std::min(source, target), std::max(source, target)};
+}
+
+// Finite regions still use the ordinary rotating/static demand provider.
+// A runtime item is one invocation of that finite model. Keep original visit
+// ordinals and call cuts, offsetting only the phase's segment indices.
+PeerPhase AnalyzePeerPhase(const CompactSyncInput& input, PeerWorkRange range, bool scalar_serial,
+                           std::vector<PhysicalSyncFamily>& families) {
+  CompactSyncInput finite;
+  finite.owner = input.owner;
+  finite.hardware_target = input.hardware_target;
+  finite.storage = input.storage;
+  finite.segments.assign(input.segments.begin() + range.first, input.segments.begin() + range.second);
+  PeerPhase phase{range.first, AnalyzeCompactSync(std::move(finite)), {}, {}};
+  const auto append = [&](PhysicalSyncFamily family) {
     const auto [source, target] = SyncFamilyPipes(input, family);
-    if (source != PipeType::S || target != source || !execution.scalar_prefix_serialized)
+    if (source != PipeType::S || target != source || !scalar_serial) {
       families.push_back(std::move(family));
+    }
+    if (source != target) {
+      phase.events.emplace(source, target);
+    }
   };
-  for (size_t r = 0; r < input.segments.size(); ++r) {
-    const auto& segment = math.State().segments.at(r);
-    for (const auto& d : segment.demands) {
-      if (segment.count > d.distance)
-        append({r, d.source, r, d.target, 0, d.distance, segment.count - d.distance, {}});
+  const auto& segments = phase.math.State().segments;
+  for (size_t i = 0; i < segments.size(); ++i) {
+    const auto& segment = segments[i];
+    const auto r = i + range.first;
+    for (const auto& demand : segment.demands) {
+      if (segment.count > demand.distance) {
+        append({r, demand.source, r, demand.target, 0, demand.distance, segment.count - demand.distance, {}});
+      }
     }
   }
+  const auto crossings = phase.math.ExportCrossingDemands();
+  CHECK(crossings) << "Peer local region has no complete crossing demand export";
   for (const auto& edge : *crossings) {
     const auto& [r, v, s] = edge.first;
     const auto& [t, w, u] = edge.second;
-    append({r, s, t, u, v, w, 1, {}});
+    append({r + range.first, s, t + range.first, u, v, w, 1, {}});
   }
+  return phase;
+}
+
+PeerWorkSeamIds ReserveWorkSeams(const PeerLocalLane& lane, const std::vector<PeerPhase>& phases,
+                                 SyncNativeReservations& reserved) {
+  PeerWorkSeamIds ids;
+  const auto reserve = [&](SyncDirection direction) {
+    if (ids.count(direction)) {
+      return;
+    }
+    const auto eligible =
+        SyncEligibleIds(lane.input, lane.input.hardware_target, direction, std::nullopt, lane.reservations);
+    CHECK(!eligible.empty()) << "Runtime work-item seam has no eligible directional event";
+    const auto id = eligible.back();
+    ids.emplace(direction, id);
+    reserved[direction].insert(id);
+  };
+  for (const auto& phase : phases) {
+    for (const auto& [source, target] : phase.seam) {
+      if (source != target) {
+        reserve({source, target});
+        reserve({target, source});
+      }
+    }
+  }
+  return ids;
+}
+
+std::vector<PeerPhase> AnalyzePeerLane(const PeerLocalLane& lane, bool scalar_serial,
+                                       std::vector<PhysicalSyncFamily>& families) {
+  const auto end = lane.input.segments.size();
+  if (!lane.work_loop) {
+    return {AnalyzePeerPhase(lane.input, {0, end}, scalar_serial, families)};
+  }
+  const PeerWorkRange prefix{0, lane.work_loop->first}, item{lane.work_loop->first, lane.work_loop->end},
+      suffix{lane.work_loop->end, end};
+  std::vector<PeerPhase> phases;
+  for (const auto& range : {prefix, item, suffix}) {
+    phases.push_back(AnalyzePeerPhase(lane.input, range, scalar_serial, families));
+  }
+  AddPeerWorkConflicts(lane, prefix, item, phases[0].seam);
+  // A zero-trip path goes directly from prefix to suffix. Even on a nonempty
+  // path a disjoint item may leave a prefix hazard live until that suffix.
+  AddPeerWorkConflicts(lane, prefix, suffix, phases[0].seam);
+  AddPeerWorkConflicts(lane, item, item, phases[1].seam);
+  AddPeerWorkConflicts(lane, item, suffix, phases[1].seam);
+  for (const auto& [source, target] : phases[0].events) {
+    if (phases[1].events.count({source, target}) || phases[2].events.count({source, target})) {
+      phases[0].seam.insert(SeamPair(source, target));
+    }
+  }
+  // Within-item allocations are proved in the finite model. Its last WAIT
+  // must also precede the first SET of the next item on that event bank.
+  for (const auto& [source, target] : phases[1].events) {
+    phases[1].seam.insert(SeamPair(source, target));
+  }
+  return phases;
+}
+
+FunctionPtr PlanLane(const PeerLocalLane& lane, const backend::LocalSyncExecutionContract& execution) {
+  const auto& input = lane.input;
+  std::vector<PhysicalSyncFamily> families;
+  auto phases = AnalyzePeerLane(lane, execution.scalar_prefix_serialized, families);
+  const auto phase_index = [&](size_t r) -> size_t {
+    return !lane.work_loop || r < lane.work_loop->first ? 0 : r < lane.work_loop->end ? 1 : 2;
+  };
   DirectSyncOrder order;
-  order.precedes = [&](const Occurrence& a, const Occurrence& b) { return math.Precedes(a, true, b, false); };
+  order.precedes = [&](const Occurrence& a, const Occurrence& b) {
+    const auto ar = std::get<0>(a), br = std::get<0>(b);
+    const auto i = phase_index(ar), j = phase_index(br);
+    const auto& phase = phases[i];
+    if (i == j) {
+      return phase.math.Precedes(phase.Local(a), true, phase.Local(b), false);
+    }
+    // Reuse queries compare WAIT and SET cuts on the same directional bank.
+    // The earlier phase's seam consumes waits on the destination queue
+    // before a later phase can publish again on the source queue.
+    const auto pair = SeamPair(input.segments[ar].sites[std::get<2>(a)].pipe,
+                               input.segments[br].sites[std::get<2>(b)].pipe);
+    return i < j && phase.seam.count(pair) != 0;
+  };
   order.reference_before = [&](const Occurrence& a, const Occurrence& b) {
-    return math.ReferenceBefore(a, b);
+    const auto i = phase_index(std::get<0>(a)), j = phase_index(std::get<0>(b));
+    const auto& phase = phases[i];
+    return i == j ? phase.math.ReferenceBefore(phase.Local(a), phase.Local(b)) : i < j;
   };
   order.threshold = [&](size_t r, size_t a, size_t b) {
-    return math.State().segments.at(r).Threshold(a, true, b, false);
+    const auto& phase = phases[phase_index(r)];
+    return phase.math.State().segments.at(r - phase.first).Threshold(a, true, b, false);
   };
   order.allow_stronger_barriers = true;
   order.finite_minimum = input.segments.size() == 1;
   order.imported_native_claims = &lane.reservations;
-  auto realized =
-      RealizeDirectSync(input, std::move(families), order, input.hardware_target, std::nullopt, {});
+  SyncNativeReservations seam_reservations;
+  const auto ids = ReserveWorkSeams(lane, phases, seam_reservations);
+  SyncSchedulePolicy policy;
+  if (lane.work_loop) {
+    // Every call, descriptor and FIFO operation stays at its authored cut.
+    policy.mode = "guarded";
+    policy.boundary_motion = false;
+  }
+  auto realized = RealizeDirectSync(input, std::move(families), order, input.hardware_target, std::nullopt,
+                                    policy, seam_reservations);
+  if (lane.work_loop) {
+    return AddPeerWorkSeams(realized.function, *lane.work_loop, phases[0].seam, phases[1].seam, ids);
+  }
   return realized.function;
 }
 

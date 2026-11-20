@@ -11,6 +11,7 @@
 
 import pytest
 from pypto import codegen, ir, passes, testing
+from pypto import language as pl
 from pypto.backend.pto_backend import _run_ptoas
 
 from .sync_matmul_oracle import validate
@@ -275,6 +276,35 @@ def test_forwarded_ranges_join_all_original_callers(submit, unknown, worker_kind
     assert evidence["call_graph_nodes"] == 3
     assert evidence["call_graph_edges"] == 2
     assert evidence["processed_functions"] == 3
+
+
+@pytest.mark.parametrize("query", ["available_cluster_count", "available_aiv_count"])
+def test_runtime_capacity_positive_only_on_guarded_call(query):
+    program = pl.parse_program(f"""
+@pl.program
+class RuntimeCapacity:
+    @pl.function(type=pl.FunctionType.AIC)
+    def worker(self, step: pl.Scalar[pl.INT32]):
+        return
+
+    @pl.function(type=pl.FunctionType.Group)
+    def forward(self, step: pl.Scalar[pl.INT32]):
+        self.worker(step)
+
+    @pl.function(type=pl.FunctionType.AIC)
+    def unguarded(self, step: pl.Scalar[pl.INT32]):
+        return
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(self):
+        width = pl.system.{query}()
+        if pl.const(0, pl.INT32) < width:
+            self.forward(width)
+        self.unguarded(width)
+""")
+    bounds = testing.sync_invocation_evidence(program)["parameters"]
+    assert bounds["worker"][0] == bounds["forward"][0] == (1, 2**31 - 1)
+    assert bounds["unguarded"][0] == (0, 2**31 - 1)
 
 
 @pytest.mark.parametrize("launches", [(20, None), (20, 0), (20, -1)])

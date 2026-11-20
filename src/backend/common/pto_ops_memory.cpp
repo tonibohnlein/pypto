@@ -27,6 +27,7 @@
 
 #include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_handler.h"
+#include "pypto/backend/common/buffer_scalar_recipes.h"
 #include "pypto/codegen/codegen_base.h"
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/codegen/pto/pto_type_utils.h"
@@ -70,7 +71,37 @@ using pto_ops_detail::EndNonEmptyRegion;
 using pto_ops_detail::GetDimStrings;
 using pto_ops_detail::GetIndexOffsetCodes;
 using pto_ops_detail::GetSizeCodes;
+using pto_ops_detail::GetTransferTensorView;
 using pto_ops_detail::MakePartitionTensorViewType;
+
+std::string pto_ops_detail::GetTransferTensorView(const ir::VarPtr& tensor, const ir::CallPtr& transfer,
+                                                  codegen::PTOCodegen& codegen) {
+  const auto type = AsTensorTypeLike(tensor->GetType());
+  const auto columns = type && type->shape_.size() == 2 ? As<ir::ConstInt>(type->shape_.back()) : nullptr;
+  if (!columns || columns->value_ != 1 || codegen.GetBackendHandler()->GetPtoTargetArch() != "a2a3") {
+    return codegen.GetOrCreateTensorView(tensor);
+  }
+  const bool buffer_load = ir::IsOp(transfer, "buffer.load");
+  const bool buffer_transfer = buffer_load || ir::IsOp(transfer, "buffer.store");
+  const bool scalar_point = buffer_transfer ? SupportsBufferScalarTransfer(transfer->args_, buffer_load)
+                                            : SupportsLogicalBufferScalarTransfer(transfer);
+  if (!scalar_point) {
+    return codegen.GetOrCreateTensorView(tensor);
+  }
+
+  // The shared singleton-column view is DN for column tiles. A scalar
+  // transfer uses a row-major Vec carrier and needs ND. Point qualification
+  // proves packed strides [1, 1], so the alias keeps the same base, shape,
+  // and in-bounds addresses, including when a column transfer also uses it.
+  const auto& row_extent = type->shape_.front();
+  const auto rows = codegen.EmitCastToIndex(row_extent, codegen.GetExprAsCode(row_extent));
+  const auto one = codegen.GetOrEmitConstant(int64_t{1}, DataType::INDEX);
+  const auto view = codegen.NewNamedTemp(tensor->name_hint_ + "_point_view");
+  codegen.Emit(view + " = pto.make_tensor_view " + codegen.GetTensorBasePtr(tensor) + ", shape = [" + rows +
+               ", " + one + "], strides = [" + one + ", " + one +
+               "] {layout = #pto.layout<nd>} : " + codegen.GetTensorViewTypeString(type.get()));
+  return view;
+}
 
 // Helper function for StoreFP
 static std::string MakeStoreFPCodegenPTO(const std::string& pto_op_name, const CallPtr& op,
@@ -202,10 +233,10 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   std::vector<std::string> partition_dims = GetDimStrings(valid_shape_tuple->elements_);
   std::vector<std::string> offset_codes = GetIndexOffsetCodes(offsets_tuple->elements_, codegen);
   std::vector<std::string> size_codes = GetSizeCodes(valid_shape_tuple->elements_, codegen);
-  std::string tensor_view = codegen.GetOrCreateTensorView(tensor);
   std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
 
   if (ir::tile_view_semantics::HasZeroValidExtent(valid_shape_tuple->elements_)) return "";
+  std::string tensor_view = GetTransferTensorView(tensor, op, codegen);
   const bool guarded = BeginNonEmptyRegion(valid_shape_tuple->elements_, codegen, size_codes);
   std::string partition_type = MakePartitionTensorViewType(partition_dims, dtype_str);
   std::string partition_view = EmitPartitionViewPTO(tensor->name_hint_, tensor_view, tensor_view_type,
@@ -379,7 +410,6 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
   }
 
   std::string dtype_str = codegen.GetTypeString(tensor_type->dtype_);
-  std::string tensor_view = codegen.GetOrCreateTensorView(output_tensor);
   std::string tile_buf = codegen.GetVarName(tile);
 
   std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
@@ -387,6 +417,7 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
 
   auto result_var = codegen.GetCurrentResultVar();
   if (result_var != nullptr) {
+    const auto tensor_view = codegen.GetOrCreateTensorView(output_tensor);
     codegen.RegisterTensorView(result_var, tensor_view);
     codegen.RegisterVarToMlir(result_var, tensor_view);
     codegen.RegisterBasePtr(result_var, codegen.GetTensorBasePtr(output_tensor));
@@ -405,8 +436,12 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
   // straight-line pairing and can stall a later producer. Keep phased stores
   // unconditional, including the backend's existing empty-window restrictions.
   bool guarded = false;
+  if (st_phase == static_cast<int>(ir::STPhase::kUnspecified) &&
+      ir::tile_view_semantics::HasZeroValidExtent(valid_shape)) {
+    return "";
+  }
+  const auto tensor_view = GetTransferTensorView(output_tensor, op, codegen);
   if (st_phase == static_cast<int>(ir::STPhase::kUnspecified)) {
-    if (ir::tile_view_semantics::HasZeroValidExtent(valid_shape)) return "";
     guarded = BeginNonEmptyRegion(valid_shape, codegen);
   }
 

@@ -13,6 +13,9 @@
 #define SRC_IR_TRANSFORMS_UTILS_PEER_LOCAL_EFFECTS_H_
 
 #include <cstddef>
+#include <cstdint>
+#include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -23,9 +26,18 @@
 
 namespace pypto::ir::sync {
 
+struct PeerLocalWorkLoop {
+  ForStmtPtr original;
+  // Half-open segment range comprising one execution of the original body.
+  size_t first, end;
+  // Each receive domain advances by this many pops per work item, modulo its depth.
+  std::map<size_t, int64_t> ring_advance;
+};
+
 struct PeerLocalLane {
   CompactSyncInput input;
   SyncNativeReservations reservations;
+  std::optional<PeerLocalWorkLoop> work_loop;
 };
 
 struct PeerLocalEffects {
@@ -38,7 +50,7 @@ struct PeerLocalEffects {
 // ValueError if any effective path, operation or placement is unqualified.
 PeerLocalEffects ImportPeerLocalEffects(const FunctionPtr& function,
                                         const cross_core_pipe::PeerTransportEffects& transport,
-                                        const std::string& target);
+                                        const std::string& target, const SyncParameterBounds& parameters);
 
 }  // namespace pypto::ir::sync
 

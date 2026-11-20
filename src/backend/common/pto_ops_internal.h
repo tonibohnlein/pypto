@@ -81,6 +81,10 @@ std::vector<std::string> GetIndexOffsetCodes(const std::vector<ir::ExprPtr>& exp
                                              codegen::PTOCodegen& codegen);
 std::vector<std::string> GetDimStrings(const std::vector<ir::ExprPtr>& exprs);
 std::vector<std::string> GetSizeCodes(const std::vector<ir::ExprPtr>& exprs, codegen::PTOCodegen& codegen);
+// For a qualified singleton-column scalar DMA, use a packed ND alias of the
+// original GM view. Other transfers use the shared tensor view.
+std::string GetTransferTensorView(const ir::VarPtr& tensor, const ir::CallPtr& transfer,
+                                  codegen::PTOCodegen& codegen);
 // Open a guard for dimensions not statically known positive. Callers must
 // eliminate statically empty regions first and bind shared tensor views outside
 // the region. Close it after the memory operation when the return value is true.
