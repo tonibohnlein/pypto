@@ -15,6 +15,7 @@
 #include <array>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -1585,6 +1586,69 @@ std::set<SyncDirection> CollectChildResourceDirections(const FunctionPtr& logica
   return publications.directions;
 }
 
+void AppendChildScheduleReceipt(PhysicalSyncRealization& parent, PhysicalSyncRealization& child,
+                                const std::string& region) {
+  // Bindings have local loop ordinals and may use a standalone "<function>"
+  // receipt. Qualify both choices and their gap references at the splice site.
+  for (auto& choice : child.schedule_choices) {
+    choice.loop = region + choice.loop;
+    parent.schedule_choices.push_back(std::move(choice));
+  }
+  for (auto& gap : child.schedule_parent_gaps) {
+    gap.loop = region + gap.loop;
+    parent.schedule_parent_gaps.push_back(std::move(gap));
+  }
+  // Add schedule work for each invocation case. The shared schedule compiler
+  // charges invocation-wide work to the first case. Growth uses the budget
+  // debits below, and the final census measures the composed function.
+  for (auto member : {&PhysicalSyncRealization::guard_sites,
+                      &PhysicalSyncRealization::shared_guard_sites,
+                      &PhysicalSyncRealization::control_statement_visits,
+                      &PhysicalSyncRealization::shared_composed_guard_sites,
+                      &PhysicalSyncRealization::simplified_guard_sites,
+                      &PhysicalSyncRealization::shared_control_values,
+                      &PhysicalSyncRealization::cut_domain_interval_visits,
+                      &PhysicalSyncRealization::cut_case_comparisons,
+                      &PhysicalSyncRealization::coalesced_cut_cases,
+                      &PhysicalSyncRealization::case_sequence_visits,
+                      &PhysicalSyncRealization::case_sequence_comparisons,
+                      &PhysicalSyncRealization::factored_case_cuts,
+                      &PhysicalSyncRealization::shared_disjoint_case_cuts,
+                      &PhysicalSyncRealization::endpoint_domain_entries,
+                      &PhysicalSyncRealization::endpoint_predicates_constructed,
+                      &PhysicalSyncRealization::normalized_endpoint_bounds,
+                      &PhysicalSyncRealization::control_descriptors,
+                      &PhysicalSyncRealization::materialized_control_statements,
+                      &PhysicalSyncRealization::invocation_scheduled_loops,
+                      &PhysicalSyncRealization::invocation_schedule_groups,
+                      &PhysicalSyncRealization::invocation_schedule_visits,
+                      &PhysicalSyncRealization::invocation_schedule_comparisons,
+                      &PhysicalSyncRealization::invocation_schedule_model_saving,
+                      &PhysicalSyncRealization::schedule_name_scans,
+                      &PhysicalSyncRealization::schedule_name_visits,
+                      &PhysicalSyncRealization::schedule_inspected_descriptors,
+                      &PhysicalSyncRealization::schedule_inspected_expressions,
+                      &PhysicalSyncRealization::regular_schedule_candidates,
+                      &PhysicalSyncRealization::regular_schedule_loops,
+                      &PhysicalSyncRealization::regular_schedule_boundaries,
+                      &PhysicalSyncRealization::regular_schedule_body_copies,
+                      &PhysicalSyncRealization::regular_schedule_payload_copies,
+                      &PhysicalSyncRealization::regular_schedule_model_saving,
+                      &PhysicalSyncRealization::assigned_schedule_endpoints,
+                      &PhysicalSyncRealization::schedule_candidates,
+                      &PhysicalSyncRealization::scheduled_loops,
+                      &PhysicalSyncRealization::schedule_boundary_commands,
+                      &PhysicalSyncRealization::schedule_size_refusals,
+                      &PhysicalSyncRealization::schedule_body_visits,
+                      &PhysicalSyncRealization::schedule_descriptor_visits,
+                      &PhysicalSyncRealization::schedule_original_nodes,
+                      &PhysicalSyncRealization::schedule_candidate_nodes,
+                      &PhysicalSyncRealization::control_expression_visits}) {
+    auto& total = parent.*member;
+    total += std::min(child.*member, std::numeric_limits<size_t>::max() - total);
+  }
+}
+
 // Walk original control cuts with actual child directions. Both arms start
 // with the entering claims; only a following cut sees the union of the arms.
 class ChildEntryVerifier : public IRVisitor {
@@ -1722,7 +1786,9 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
   const auto* ctx = PassContext::Current();
   const bool disjoint_gm = ctx && ctx->GetAutoSyncDisjointGM();
   auto remaining_schedule = schedule_policy;
-  for (const auto& child : discovered.children) {
+  PhysicalSyncRealization result;
+  for (size_t ordinal = 0; ordinal < discovered.children.size(); ++ordinal) {
+    const auto& child = discovered.children[ordinal];
     SyncExternalPolicy external_policy = SyncExternalPolicy::Geometry;
     if (child->HasAttr(kClosedSyncChildExternalPolicyAttr)) {
       const auto policy_attr = child->GetAttr<std::string>(kClosedSyncChildExternalPolicyAttr);
@@ -1819,7 +1885,8 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     children.emplace(child.get(), std::make_shared<SeqStmts>(recipe, child->span_));
     child_sets += lowered.set_sites;
     child_waits += lowered.wait_sites;
-    for (const auto& plan : lowered.physical_cases) {
+    const auto region = "retained[" + std::to_string(ordinal) + "]:" + child->loop_var_->name_hint_ + "/";
+    for (auto& plan : lowered.physical_cases) {
       child_barriers += plan.barrier_sites;
       child_lanes += plan.reserved_lanes;
       child_suffix_visits += plan.closed_prefix_suffix_visits;
@@ -1828,6 +1895,7 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
           << "Child synchronization schedule exceeds its inherited growth budget";
       remaining_schedule.max_extra_payload_sites -= plan.schedule_payload_growth_debit;
       remaining_schedule.max_extra_control_nodes -= plan.schedule_control_growth_debit;
+      AppendChildScheduleReceipt(result, plan, region);
     }
   }
 
@@ -1835,7 +1903,6 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     ChildEntryVerifier(discovered, child_directions).VisitFunction(function);
   }
   Emit emit(assignment, function->func_type_, children);
-  PhysicalSyncRealization result;
   result.function = emit.Rewrite(function);
   result.set_sites = assignment.OneWaySites() + assignment.OneWayFallbackSites() + child_sets;
   result.wait_sites = assignment.OneWaySites() + assignment.OneWayFallbackSites() + child_waits;

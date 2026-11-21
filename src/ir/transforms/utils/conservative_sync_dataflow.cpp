@@ -1205,6 +1205,51 @@ class Builder {
     return retain_incoming_diagnostics_ ? live_out[cfg_exit].ToAccessSet() : ConservativeAccessSet{};
   }
 
+  bool CertifyEarlierPrefixes(const ConservativeSyncAnalysis& baseline,
+                              const std::vector<EarlierPeerPrefix>& moves) {
+    if (sites.size() != baseline.Sites().size()) {
+      return false;
+    }
+    for (size_t i = 0; i < sites.size(); ++i) {
+      if (sites[i].cut != baseline.Sites()[i].cut) {
+        return false;
+      }
+    }
+    // Recover the bounded first-visit CFG used by the original proof. Only
+    // phases that actually survived into the fixed schedule are relevant.
+    NominatePreciseCaptures(function_->body_);
+    sites = baseline.Sites();
+    rechecking_prefixes_ = true;
+    LoopEntryPhases phases{{}, std::vector<std::optional<size_t>>(sites.size()), {}};
+    CollectLoopEntryPhases(function_->body_, nullptr, phases);
+    const auto guarded = [](const auto& site) { return site.guarded_capture.has_value(); };
+    if (static_cast<size_t>(std::count_if(sites.begin(), sites.end(), guarded)) != phases.heads.size()) {
+      return false;
+    }
+    for (const auto& [loop, head] : phases.heads) {
+      prefix_phase_loops_.emplace(loop->loop_var_.get(), std::make_pair(loop.get(), head.site));
+    }
+    for (const size_t site : phases.first_visit_copies) {
+      sites.push_back(sites[site]);
+      site_effect_fibers_.push_back(site_effect_fibers_[site]);
+      site_refresh_fibers_.push_back(site_refresh_fibers_[site]);
+    }
+    for (const auto& [index, capture] : first_prefix_deliveries_) {
+      auto& pipes = sites[index].source_pipes;
+      const auto source = std::find(pipes.begin(), pipes.end(), sites[capture.record_site].pipe);
+      if (source == pipes.end()) {
+        return false;
+      }
+      pipes.erase(source);
+    }
+    for (const auto& move : moves) {
+      if (!InstallEarlierPrefixProof(move, phases)) {
+        return false;
+      }
+    }
+    return CheckFixedPrefixDebts(phases);
+  }
+
   std::vector<ConservativeSyncSite> sites;
   std::vector<ConservativeSyncChildEntry> children;
   ConservativeSyncCost cost;
@@ -1236,6 +1281,68 @@ class Builder {
     ExprPtr condition;
     DebtState displaced_effects;
   };
+
+  struct EarlierPrefixDelivery {
+    PipeType source;
+    DebtState excluded;
+  };
+
+  bool InstallEarlierPrefixProof(const EarlierPeerPrefix& move, const LoopEntryPhases& phases) {
+    const auto found = site_index_.find(move.consumer);
+    if (found == site_index_.end()) {
+      return false;
+    }
+    const auto consumer = found->second;
+    if (!std::binary_search(sites[consumer].source_pipes.begin(), sites[consumer].source_pipes.end(),
+                            move.source)) {
+      return false;
+    }
+    DebtState displaced;
+    for (const auto* statement : move.displaced) {
+      const auto site = site_index_.find(statement);
+      if (site == site_index_.end() || sites[site->second].pipe != move.source) {
+        return false;
+      }
+      displaced.AddEffects(site_effect_fibers_[site->second]);
+    }
+    const auto first = phases.first_sites[consumer];
+    if (move.backedge_iv) {
+      const auto loop = prefix_phase_loops_.find(move.backedge_iv);
+      if (loop == prefix_phase_loops_.end() || loop->second.second != consumer) {
+        return false;
+      }
+      displaced.ApplyLoopBackedge(loop->second.first, affine_domain_bounds_);
+    } else if (first) {
+      earlier_deliveries_.emplace(*first, EarlierPrefixDelivery{move.source, displaced});
+    }
+    return earlier_deliveries_.emplace(consumer, EarlierPrefixDelivery{move.source, std::move(displaced)})
+        .second;
+  }
+
+  bool CheckFixedPrefixDebts(const LoopEntryPhases& phases) {
+    std::vector<CfgVertex> cfg{{CfgVertex::Kind::Nop, 0, {}, {}}};
+    BuildSubCfg(function_->body_, 0, cfg, &phases);
+    std::vector<size_t> rpo, rpo_pos;
+    ComputeRpo(cfg, 0, rpo, rpo_pos);
+    std::vector<DebtState> in, out;
+    std::vector<bool> visited;
+    SolveDebtFixedPoint(/*use_selected=*/true, cfg, rpo, rpo_pos, in, out, visited);
+    for (const size_t vertex : rpo) {
+      if (cfg[vertex].kind != CfgVertex::Kind::Site) {
+        continue;
+      }
+      const auto index = cfg[vertex].index;
+      const auto& site = sites[index];
+      auto known = std::move(in[vertex]);
+      ApplySelectedDeliveries(known, index, site.source_pipes);
+      for (const auto required : site.required_source_pipes) {
+        if (!known.CoversConflicts(required, site.pipe, site_effect_fibers_[index])) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
 
   size_t BuildSubCfg(const StmtPtr& statement, size_t entry, std::vector<CfgVertex>& cfg,
                      const LoopEntryPhases* phases = nullptr, bool first_visit = false) const {
@@ -1796,11 +1903,8 @@ class Builder {
     } else if (vertex.kind == CfgVertex::Kind::Site) {
       const auto& site = sites[vertex.index];
       const auto destination = site.pipe;
-      const auto& pipes = use_selected ? site.source_pipes : site.required_source_pipes;
-      PipeMask sources_mask = 0;
-      for (const auto source : pipes) sources_mask |= PipeToMask(source);
-      ApplyFirstPrefixCapture(state, vertex.index);
-      state.DeliverSources(sources_mask, destination);
+      ApplySelectedDeliveries(state, vertex.index,
+                              use_selected ? site.source_pipes : site.required_source_pipes);
       if (site.precise_capture) {
         state.DeliverSources(PipeToMask(destination), site.precise_capture->destination);
       }
@@ -2000,6 +2104,21 @@ class Builder {
     const auto& capture = found->second;
     incoming.DeliverSources(PipeToMask(sites[capture.record_site].pipe), sites[site].pipe,
                             &capture.displaced_effects);
+  }
+
+  void ApplySelectedDeliveries(DebtState& state, size_t index, const std::vector<PipeType>& pipes) const {
+    ApplyFirstPrefixCapture(state, index);
+    const auto destination = sites[index].pipe;
+    PipeMask mask = 0;
+    for (const auto source : pipes) {
+      mask |= PipeToMask(source);
+    }
+    if (const auto move = earlier_deliveries_.find(index); move != earlier_deliveries_.end()) {
+      const auto early = PipeToMask(move->second.source);
+      state.DeliverSources(mask & early, destination, &move->second.excluded);
+      mask &= ~early;
+    }
+    state.DeliverSources(mask, destination);
   }
 
   bool NominateCapture(const std::vector<size_t>& source_run, const std::vector<size_t>& target_run) {
@@ -2457,6 +2576,15 @@ class Builder {
     }
     if (enable_precise_captures_) {
       if (auto capture = FindFirstPrefixCapture(loop)) {
+        if (rechecking_prefixes_) {
+          const auto& guarded = sites[capture->record_site].guarded_capture;
+          const auto& entry = sites[capture->wait_site].loop_entry;
+          if (!guarded || !entry || entry->loop != loop ||
+              guarded->destination != sites[capture->wait_site].pipe ||
+              !structural_equal(guarded->condition, capture->condition)) {
+            return;
+          }
+        }
         SaveLoopEntryPhase(body_sites, phases);
         phases.heads.emplace(loop, LoopEntryPhases::Head{capture->wait_site, 0});
         first_prefix_deliveries_.emplace(phases.first_sites[capture->wait_site].value(), std::move(*capture));
@@ -3112,6 +3240,9 @@ class Builder {
   std::unordered_map<const Var*, size_t> definition_order_;
   std::unordered_map<const ForStmt*, std::vector<size_t>> loop_capture_sources_;
   std::unordered_map<size_t, FirstPrefixCapture> first_prefix_deliveries_;
+  bool rechecking_prefixes_ = false;
+  std::unordered_map<const Var*, std::pair<const ForStmt*, size_t>> prefix_phase_loops_;
+  std::unordered_map<size_t, EarlierPrefixDelivery> earlier_deliveries_;
   std::unordered_map<const Expr*, ExprPtr> gm_roots_;
   std::unordered_map<const Var*, ExprPtr> ssa_defs_;
   std::vector<std::vector<const Var*>> scopes_;
@@ -3140,6 +3271,16 @@ class Builder {
 CompletionSummary SummarizeStraightLineLogicalCompletion(const StmtPtr& body, FunctionType func_type,
                                                          const std::string& target) {
   return Builder::ComputeRecipeCompletionSummary(body, func_type, target, 0, nullptr, nullptr);
+}
+
+bool CertifyEarlierPeerPrefixes(const ConservativeSyncAnalysis& baseline, const ImportedLocalSync& imported,
+                                const std::string& target, const SyncParameterBounds& parameters,
+                                const std::vector<EarlierPeerPrefix>& moves) {
+  Builder builder(baseline.Function(), target, {}, {}, /*retain_incoming_diagnostics=*/false,
+                  /*enable_refresh_kill=*/false, parameters, std::nullopt, /*enable_loop_prefixes=*/false,
+                  &imported, /*enable_precise_captures=*/true);
+  builder.Build();
+  return builder.CertifyEarlierPrefixes(baseline, moves);
 }
 
 ConservativeSyncAnalysis AnalyzeConservativeSync(

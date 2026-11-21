@@ -19,12 +19,16 @@ import pytest
 from pypto import ir, passes, testing
 
 from .sync_control_metrics import COMMANDS, statements, trace_control
+from .sync_physical_oracle import run_physical
 from .sync_qwen_prefill_cases import capture_qwen_projection
 from .test_autosync_switch import clone
+from .test_nested_sync_repetition import BOUNDS as NESTED_DMA_BOUNDS
+from .test_nested_sync_repetition import nested_fixture
 from .test_parameterized_token_sync import check, worker
 from .test_streamed_slot_composition import streamed_fixture
 from .test_sync_case_only_schedule import case_only_fixture
 from .test_sync_command_control import command, guarded, seq
+from .test_sync_range_proofs import caller_program
 from .test_token_sync_lowering import _apply, _check_actual_tokens, _two_streams
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
@@ -352,12 +356,41 @@ def test_retained_projection_children_share_a_payload_growth_budget():
         if isinstance(s, ir.ForStmt) and "pypto.closed_sync_child" in s.attrs
     ]
     assert len(retained) > 1
-    baseline = lower(logical, "guarded", **bounds)["function"]
+    baseline = lower(logical, "guarded", **bounds)
     budget = 14
-    limited = lower(logical, "auto_boundary", max_extra_payload_sites=budget, **bounds)["function"]
-    assert 0 < census(limited).payloads - census(baseline).payloads <= budget
+    limited = lower(logical, "auto_boundary", max_extra_payload_sites=budget, **bounds)
+    before, after = baseline["function"], limited["function"]
+    growth = census(after).payloads - census(before).payloads
+    assert 0 < growth <= budget
+    schedule = limited["schedule"]
+    assert schedule["emitted_payload_sites"] - baseline["schedule"]["emitted_payload_sites"] == growth
+    assert schedule["payload_growth_debit"] == growth
+    assert baseline["schedule"]["payload_growth_debit"] == 0
+    assert 0 < schedule["control_growth_debit"] <= limited["schedule_policy"]["max_extra_control_nodes"]
+
+    # The growth belongs to the selected child boundary schedule. A guarded
+    # identity for the parent alone used to hide the child choices and savings.
+    chosen = selected(limited)
+    labels = [row["loop"] for row in chosen]
+    assert len(set(labels)) == len(labels)
+    assert list(dict.fromkeys(label.split("/", 1)[0] for label in labels)) == [
+        f"retained[{ordinal}]:{child.loop_var.name_hint}" for ordinal, child in enumerate(retained)
+    ]
+    guarded_payloads = {row["loop"]: row["payload_sites"] for row in selected(baseline)}
+    assert set(guarded_payloads) == set(labels)
+    assert all(row["mode"] == "guarded" for row in selected(baseline))
+    boundary_loops = sum(row["mode"] == "boundary" for row in chosen)
+    assert boundary_loops > 0
+    assert sum(row["payload_sites"] - guarded_payloads[row["loop"]] for row in chosen) == growth
+    work = limited["physical_cases"][0]
+    assert work["regular_schedule_loops"] == boundary_loops
+    assert work["regular_schedule_candidates"] >= boundary_loops
+    assert work["regular_schedule_payload_copies"] >= growth
+    assert work["regular_schedule_model_saving"] > 0
+    assert baseline["physical_cases"][0]["regular_schedule_model_saving"] == 0
+    assert {gap["loop"] for gap in schedule["parent_gaps"]}.issubset(labels)
     for block in (0, 7, 23):
-        assert trace_control(baseline, {3: 1}, block).trace == trace_control(limited, {3: 1}, block).trace
+        assert trace_control(before, {3: 1}, block).trace == trace_control(after, {3: 1}, block).trace
 
 
 @pytest.mark.parametrize("count", [2, 7])
@@ -366,6 +399,85 @@ def test_boundary_auto_leaves_flat_or_short_repetition_guarded(count):
     result = lower(logical, "auto_boundary", no_clone=False)
     assert all(row["mode"] == "guarded" for row in selected(result))
     ir.assert_structural_equal(lower(logical, "guarded")["function"], result["function"])
+
+
+@pytest.mark.parametrize("count", [2, 3])
+@pytest.mark.parametrize("two_tiles", [False, True])
+def test_boundary_auto_short_single_visit_phases(count, two_tiles):
+    original = nested_fixture((4, count), repeats=2)
+    if two_tiles:
+        original = add_independent_dma_tile(original)
+    with passes.PassContext([], enable_pypto_autosync=True, autosync_disjoint_gm=True):
+        logical = worker(passes.insert_sync()(caller_program(original)), original.name)
+    bounds = {"parameter_bounds": NESTED_DMA_BOUNDS}
+    baseline = lower(logical, "guarded", **bounds)
+    growth_per_loop = (4 if two_tiles else 2) * (count - 1)
+    result = lower(logical, "auto_boundary", max_extra_payload_sites=growth_per_loop, **bounds)
+
+    choices = result["schedule"]["choices"]
+    boundary = [row for row in choices if row["mode"] == "boundary"]
+    assert len(boundary) == 2
+    if not two_tiles:
+        # Extra singleton headers consume the proved decision saving for one tile.
+        assert all(row["status"] in ("not_profitable", "cost_unproved") for row in boundary)
+        ir.assert_structural_equal(result["function"], baseline["function"])
+        return
+
+    parameters = {1: 16, 3: 64}
+    before, before_work = emitted_work(baseline["function"], parameters)
+    after, after_work = emitted_work(result["function"], parameters)
+
+    # The nonzero, nonunit inner counter indexes the original scope. Both
+    # qualifying loops compete for one leaf budget, so exactly one can split.
+    assert [row["status"] for row in boundary] == ["selected", "over_budget"]
+    assert result["schedule"]["payload_growth_debit"] == growth_per_loop
+    assert census(result["function"]).payloads - census(baseline["function"]).payloads == growth_per_loop
+    assert before.trace == after.trace
+    assert sum(after_work) < sum(before_work)
+    run_physical(original, result["function"], range(6), parameters)
+
+
+def add_independent_dma_tile(function):
+    """Copy each DMA and vector access into an independent UB tile and GM column range."""
+    span = function.span
+    allocation, *rest = cast(ir.SeqStmts, function.body).stmts
+    assert isinstance(allocation, ir.AssignStmt) and isinstance(allocation.value, ir.Call)
+    tile = allocation.var
+    other = ir.Var("second_tile", tile.type, span)
+    second_address = ir.ConstInt(4096, ir.DataType.INDEX, span)
+    second_alloc_call = ir.Call(
+        allocation.value.op, [allocation.value.args[0], second_address], other.type, span
+    )
+    second_allocation = ir.AssignStmt(other, second_alloc_call, span)
+    dma_ops = {ir.get_op(name).name for name in ("buffer.load", "buffer.store")}
+
+    def duplicate_access(stmt):
+        assert isinstance(stmt.expr, ir.Call)
+        call = stmt.expr
+        args = [other if operand.same_as(tile) else operand for operand in call.args]
+        if call.op.name in dma_ops:
+            offsets = cast(ir.MakeTuple, args[1])
+            args[1] = ir.MakeTuple([offsets.elements[0], ir.ConstInt(32, ir.DataType.INDEX, span)], span)
+        return ir.EvalStmt(ir.Call(call.op, args, call.type, span), span)
+
+    def duplicate_payload(body):
+        # Keep each loop body flat so the placed-sync importer sees the
+        # repeated access sites at their original loop depth.
+        output = []
+        for stmt in body:
+            if isinstance(stmt, ir.ForStmt):
+                nested = duplicate_payload(cast(ir.SeqStmts, stmt.body).stmts)
+                output.append(
+                    ir.ForStmt(stmt.loop_var, stmt.start, stmt.stop, stmt.step, [], nested, [], span)
+                )
+            else:
+                output.append(stmt)
+                if isinstance(stmt, ir.EvalStmt):
+                    output.append(duplicate_access(stmt))
+        return ir.SeqStmts(output, span)
+
+    payload = duplicate_payload(rest)
+    return clone(function, body=ir.SeqStmts([allocation, second_allocation, *payload.stmts], span))
 
 
 def test_no_clone_policy_keeps_static_payload_sites_for_every_mode():

@@ -536,6 +536,12 @@ the directions actually published by the child and its native reservations.
 A record used as evidence captures only the pipe prefix at that record.
 Missing ordering evidence or event capacity causes qualification to fail.
 
+The `testing.lower_sync_schedule` receipt includes each retained child's choices
+and parent-gap records under labels qualified by its source-order region. Candidate
+costs are local to each region, and the reported model savings sum the regional
+estimates. The parent reports cumulative growth debits and counts emitted sites
+in the final composed body.
+
 A request batch builds one original-owner statement/definition index using
 `ParentStmtAnalysis`; each region then visits only its own scope, ancestors and
 necessary dominating bindings. `child.describe()` reports the shared index nodes

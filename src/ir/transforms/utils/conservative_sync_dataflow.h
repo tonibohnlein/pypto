@@ -101,6 +101,16 @@ struct ImportedLocalSync {
   const IfStmt* terminal_branch = nullptr;
 };
 
+// An allocated SET may move before these producer effects. Its WAIT and all
+// other services stay at their original cuts. A latch move applies only to
+// the steady visits of the original loop identified by the induction variable.
+struct EarlierPeerPrefix {
+  const Stmt* consumer;
+  PipeType source;
+  std::vector<const Stmt*> displaced;
+  const Var* backedge_iv = nullptr;
+};
+
 struct ConservativeLoopEntryServices {
   ForStmtPtr loop;
   bool guard_nonempty;
@@ -250,6 +260,12 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
 // Explicit policy construction. Acknowledgment-induced order is represented
 // here in logical tokens before LowerSync; no physical resource is assigned.
 FunctionPtr InsertConservativePrefixes(const ConservativeSyncAnalysis& analysis);
+bool CertifyEarlierPeerPrefixes(const ConservativeSyncAnalysis& baseline, const ImportedLocalSync& imported,
+                                const std::string& target, const SyncParameterBounds& parameters,
+                                const std::vector<EarlierPeerPrefix>& moves);
+FunctionPtr MoveEarlierPeerPrefixes(const FunctionPtr& physical, const ConservativeSyncAnalysis& baseline,
+                                    const ImportedLocalSync& imported, const std::string& target,
+                                    const SyncParameterBounds& parameters);
 CompletionSummary SummarizeStraightLineLogicalCompletion(const StmtPtr& body, FunctionType func_type,
                                                          const std::string& target);
 }  // namespace pypto::ir::sync

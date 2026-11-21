@@ -804,6 +804,8 @@ nb::dict DescribeSchedule(const ir::sync::PhysicalSyncRealization& result) {
   out["inspected_expressions"] = result.schedule_inspected_expressions;
   out["emitted_payload_sites"] = result.schedule_emitted_payload_sites;
   out["emitted_control_nodes"] = result.schedule_emitted_control_nodes;
+  out["payload_growth_debit"] = result.schedule_payload_growth_debit;
+  out["control_growth_debit"] = result.schedule_control_growth_debit;
   return out;
 }
 nb::dict DescribeScopedPalette(const ir::sync::ScopedPaletteResult& result);

@@ -2385,6 +2385,9 @@ PreparedLoops PlanLoopSchedules(const AssignedRegionSchedule& assigned, const Cu
     size_t chosen = 0;
     int64_t longest_boundary = 0;
     for (const auto& [first, end] : loop.phases) longest_boundary = std::max(longest_boundary, end - first);
+    // Short loops can still remove repeated synchronization tests when
+    // every phase is a single visit. Keep other short shapes guarded.
+    const bool short_with_repeated_phase = loop.count < kMinAutoBoundaryTrips && longest_boundary > 1;
     for (unsigned mode = 1; mode < kScheduleModes.size(); ++mode) {
       if (!RequestsScheduleMode(policy, mode)) {
         continue;
@@ -2395,8 +2398,8 @@ PreparedLoops PlanLoopSchedules(const AssignedRegionSchedule& assigned, const Cu
         candidate.receipt.reason = "case versioning needs multiple cases and a dominating launch binding";
       else if ((mode & 2) && loop.phases.size() < 2)
         candidate.receipt.reason = "no internal endpoint boundary";
-      else if (boundary_auto && (depth == 0 || loop.count < kMinAutoBoundaryTrips ||
-                                 loop.phases.size() > kMaxAutoBoundaryPhases))
+      else if (boundary_auto &&
+               (depth == 0 || short_with_repeated_phase || loop.phases.size() > kMaxAutoBoundaryPhases))
         candidate.receipt.reason = "outside the bounded boundary-specialization shape";
       else if ((mode & 4) && (loop.period <= 1 || ((mode & 2) ? longest_boundary : loop.count) < loop.period))
         candidate.receipt.reason = "no supported common nonunit period with a complete group";

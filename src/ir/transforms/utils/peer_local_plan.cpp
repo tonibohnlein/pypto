@@ -285,27 +285,36 @@ FunctionPtr PlanStructuredEndpoint(const PeerLocalEffects& effects) {
       reserved[direction].insert(ids.begin(), ids.end());
     }
   }
-  const auto realize = [&](bool precise_captures) {
-    const auto analysis = AnalyzeConservativeSync(
+  using Plan = std::pair<FunctionPtr, ConservativeSyncAnalysis>;
+  const auto realize = [&](bool precise_captures) -> std::optional<Plan> {
+    auto analysis = AnalyzeConservativeSync(
         imported.owner, target, {}, {}, /*retain_incoming_diagnostics=*/false,
         /*automatic_children=*/false, /*enable_refresh_kill=*/false, effects.parameters, std::nullopt,
         /*enable_loop_prefixes=*/false, &imported, precise_captures);
     const auto logical = InsertConservativePrefixes(analysis);
     CheckGeneratedLogicalSync(logical);
-    return TryLowerClosedPrefixSync(logical, target, std::nullopt, reserved, effects.parameters, std::nullopt,
-                                    &imported);
+    auto physical = TryLowerClosedPrefixSync(logical, target, std::nullopt, reserved, effects.parameters,
+                                             std::nullopt, &imported);
+    if (!physical) {
+      return std::nullopt;
+    }
+    return Plan{std::move(physical->function), std::move(analysis)};
   };
   // Separating record and wait may keep more event slots live. Use the same
   // allocator and its consumption proof, with the original adjacent-prefix
   // schedule available when the directional palette cannot hold both.
+  std::optional<Plan> precise;
   try {
-    if (const auto precise = realize(true)) return precise->function;
+    precise = realize(true);
   } catch (const pypto::ValueError&) {
     // The unmodified plan remains available for a supported original endpoint.
   }
+  if (precise) {
+    return MoveEarlierPeerPrefixes(precise->first, precise->second, imported, target, effects.parameters);
+  }
   const auto physical = realize(false);
   CHECK(physical) << "No closed-prefix schedule for the imported peer endpoint";
-  return physical->function;
+  return physical->first;
 }
 
 }  // namespace

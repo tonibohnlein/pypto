@@ -219,7 +219,8 @@ class PhysicalSyncRealization(TypedDict):
 
     schedule_name_scans: int
     schedule_name_visits: int
-    # choices carry standalone model_scope; parent_gaps certify subsequent sharing.
+    # Choices carry standalone model_scope and retained region-qualified labels.
+    # Parent gaps certify subsequent sharing. Growth debits apply to the whole body.
     schedule: dict[str, Any]
     schedule_policy: dict[str, Any]
 

@@ -121,6 +121,15 @@ on later visits. Authored peer commands retain their original cuts, and
 operations with native event claims end the candidate suffix. The original
 schedule remains available if event allocation cannot realize the split.
 
+After allocating an imported endpoint, the planner can place a local SET
+on each arm of the preceding branch or at the preceding loop latch. A
+branch-arm SET uses the receiving branch's predicate. A unit-stride latch
+publishes only when the next iteration will execute its guarded receive.
+Both forms preserve the WAIT cut and physical event ID. The planner checks
+the crossed commands for event reuse and rechecks the fixed services with
+the displaced payload effects excluded from the earlier prefix. If these
+checks or Buffer validity fail, the endpoint uses its original allocation.
+
 A loop head can reuse storage first touched in the prologue. The first
 overwrite may need a pre-loop reader to finish, while later overwrites need
 the previous iteration’s reader to finish. The planner separates the first
@@ -297,9 +306,10 @@ Six-ID allocation uses the existing sufficient certificate. Unsupported
 coordinates, same-pipe mechanisms or resource evidence still delegate.
 
 Physical lowering can split a qualified innermost loop into up to three
-constant-bound phases at assigned endpoint boundaries. Each phase emits the
-original visits and the same allocated commands at their original payload
-cuts. With the residual enclosing-loop guards accounted for, the upper bound
+constant-bound phases at assigned endpoint boundaries. Loops with fewer than
+four trips are eligible only when every phase is a single visit. Each phase
+emits the original visits and the same allocated commands at their original
+payload cuts. With the residual enclosing-loop guards accounted for, the upper bound
 on the specialized loop's control work, including its loop headers, must be
 below the lower bound for guarded lowering in every launch case. The compiler
 charges each duplicated payload site and the full expanded replacement across

@@ -218,6 +218,7 @@ class _AuthoredCommands(ClosedCommands):
     def __init__(self, function, *, scalar_memory=None):
         super().__init__(function, {}, range(6), scalar_memory=scalar_memory)
         self.authored = []
+        self.local_flags = []
 
     def assign(self, statement, env):
         call = statement.value
@@ -240,6 +241,16 @@ class _AuthoredCommands(ClosedCommands):
         }:
             self.authored.append((len(self.payloads), call.op.name, call.kwargs))
             return
+        if call.op.name in (opname("system.set_flag"), opname("system.wait_flag")):
+            self.local_flags.append(
+                (
+                    len(self.payloads),
+                    call.op.name,
+                    ir.PipeType(call.kwargs["src_pipe"]),
+                    ir.PipeType(call.kwargs["dst_pipe"]),
+                    call.kwargs["event_id"],
+                )
+            )
         super().evaluate(statement, env)
 
 
@@ -272,7 +283,7 @@ def test_authored_gm_prefix_capture_skips_only_independent_prefetches(consume_la
                 assert (("payload", earlier, "C"), ("payload", index, "I")) in order
 
 
-def _guarded_vec_prefix_program(alias_tail):
+def _guarded_vec_prefix_program(alias_tail, *, boundary=None, alias_displaced=False):
     program = _lower(_mixed_program())
     vec = program.get_function("vec")
     assert vec is not None and isinstance(vec.body, ir.SeqStmts)
@@ -318,20 +329,58 @@ def _guarded_vec_prefix_program(alias_tail):
     visits = ir.Var("visits", ir.ScalarType(index_type), span)
     define_visits = ir.AssignStmt(visits, ir.Cast(read.var, index_type, span), span)
     induction = ir.Var("visit", ir.ScalarType(index_type), span)
-    step = ir.IfStmt(
-        ir.Lt(induction, visits, ir.DataType.BOOL, span),
-        ir.SeqStmts([load, fill(carrier)], span),
-        None,
-        [],
-        span,
-    )
+    during_work = ir.Lt(induction, visits, ir.DataType.BOOL, span)
+    payloads: list[ir.Stmt] = [load, fill(carrier)]
+    if boundary is not None:
+        authored = next(
+            statement.expr
+            for statement in statements[:read_index]
+            if isinstance(statement, ir.EvalStmt)
+            and isinstance(statement.expr, ir.Call)
+            and statement.expr.op.name == opname("system.sync_wait")
+        )
+        wait = ir.Call(authored.op, authored.args, authored.kwargs, authored.type, span)
+        payloads.insert(0, ir.EvalStmt(wait, span))
+    step = ir.IfStmt(during_work, ir.SeqStmts(payloads, span), None, [], span)
+    loop_body = step
+    if boundary is not None:
+        displaced = carrier if alias_displaced else scratch
+        if boundary == "latch":
+            loop_body = ir.SeqStmts([step, fill(displaced)], span)
+        else:
+            scalar_write = next(
+                statement.expr
+                for statement in statements[load_index:]
+                if isinstance(statement, ir.EvalStmt)
+                and isinstance(statement.expr, ir.Call)
+                and statement.expr.op.name == opname("buffer.write")
+            )
+
+            def producer_arm():
+                # The scalar store makes the vector pipe acquire an incoming
+                # wait before the last scratch write. It limits how far the
+                # new publication can cross these independent operations.
+                write = ir.Call(scalar_write.op, [scratch, *scalar_write.args[1:]], scalar_write.type, span)
+                arm: list[ir.Stmt] = [fill(carrier), fill(scratch), ir.EvalStmt(write, span), fill(scratch)]
+                if alias_displaced:
+                    arm.append(fill(displaced))
+                return ir.SeqStmts(arm, span)
+
+            prior = ir.IfStmt(
+                ir.Eq(induction, ci(0), ir.DataType.BOOL, span),
+                producer_arm(),
+                producer_arm(),
+                [],
+                span,
+            )
+            loop_body = ir.SeqStmts([prior, step], span)
     loop = ir.ForStmt(
         induction,
         ci(0),
         ir.Add(visits, ci(1), index_type, span),
         ci(1),
         [],
-        step,
+        loop_body,
         [],
         span,
     )
@@ -404,6 +453,56 @@ def test_authored_gm_first_loop_wait_keeps_only_the_needed_prefix(alias_tail):
                 assert (("payload", previous + 1, "C"), ("payload", current, "I")) in order
         else:
             assert ("acquire", ir.PipeType.V, ir.PipeType.MTE2) not in actual.trace
+
+
+@pytest.mark.parametrize("boundary", ["sibling", "latch"])
+@pytest.mark.parametrize("alias_displaced", [False, True])
+def test_authored_gm_earlier_publication_keeps_wait_and_storage_order(boundary, alias_displaced):
+    program = _guarded_vec_prefix_program(False, boundary=boundary, alias_displaced=alias_displaced)
+    with passes.PassContext(
+        [],
+        enable_buffer_ir=True,
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+    ):
+        vec = passes.realize_sync()(program).get_function("vec")
+    assert vec is not None
+    assert vec.attrs["pypto_autosync"], vec.attrs
+    table = next(i for i, var in enumerate(vec.params) if var.name_hint.startswith("table"))
+    for trips in (-1, 0, 1, 4):
+        memory = {("gm", table * 4096 + byte): trips for byte in range(4)}
+        before = _AuthoredCommands(program.get_function("vec"), scalar_memory=memory)
+        actual = _AuthoredCommands(vec, scalar_memory=memory)
+        before.run()
+        order = actual.run()
+        assert before.authored == actual.authored
+        assert before.payloads == actual.payloads
+        loads = [index for index, (_, pipe, _, _) in enumerate(actual.payloads) if pipe == ir.PipeType.MTE2]
+        assert len(loads) == max(0, trips)
+        pairs_per_visit = 2 if boundary == "latch" else 1
+        assert actual.trace.count(("acquire", ir.PipeType.V, ir.PipeType.MTE2)) == pairs_per_visit * len(
+            loads
+        )
+        if trips == 4:
+            assert actual.reuses
+        for load in loads[1:] if boundary == "latch" else loads:
+            required = load - (2 if boundary == "latch" else 4 + alias_displaced)
+            assert (("payload", required, "C"), ("payload", load, "I")) in order
+            assert ((("payload", load - 1, "C"), ("payload", load, "I")) in order) == alias_displaced
+            receive_wait = [
+                command
+                for command in actual.local_flags
+                if command[:4] == (load, opname("system.wait_flag"), ir.PipeType.V, ir.PipeType.MTE2)
+            ]
+            assert len(receive_wait) == 1
+            publish_cut = load if alias_displaced else load - 1
+            assert (publish_cut, opname("system.set_flag"), *receive_wait[0][2:]) in actual.local_flags
+            if boundary == "sibling" and not alias_displaced:
+                commands = [command[1:4] for command in actual.local_flags if command[0] == load - 1]
+                arriving = (opname("system.wait_flag"), ir.PipeType.S, ir.PipeType.V)
+                moved = (opname("system.set_flag"), ir.PipeType.V, ir.PipeType.MTE2)
+                assert commands.index(arriving) < commands.index(moved)
 
 
 @pytest.mark.parametrize("requested_extent,upper", [("pl.min(length, 16)", 16), ("signed_extent", 2**32 - 1)])
