@@ -20,6 +20,8 @@
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 
 namespace pypto::ir::sync {
+
+struct ImportedLocalSync;
 // A2/A3 current-prefix completion for an available pipe. Scalar completion is
 // native and therefore has no explicit barrier operation.
 const char* RequireLocalSyncBarrier(PipeType pipe, FunctionType core);
@@ -47,6 +49,7 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     const FunctionPtr& function, const std::string& target,
     const std::optional<std::vector<int>>& eligible_ids,
     const SyncNativeReservations& extra_reservations = {}, const SyncParameterBounds& parameters = {},
-    const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt);
+    const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt,
+    const ImportedLocalSync* imported = nullptr);
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_CLOSED_PREFIX_SYNC_H_

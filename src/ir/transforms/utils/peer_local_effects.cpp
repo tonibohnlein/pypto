@@ -216,16 +216,26 @@ std::vector<std::vector<StmtPtr>> LaneStatements(const FunctionPtr& function) {
   return {std::move(statements), std::move(other)};
 }
 
+bool HasConditional(const StmtPtr& statement) {
+  if (As<IfStmt>(statement)) return true;
+  if (const auto seq = As<SeqStmts>(statement)) {
+    return std::any_of(seq->stmts_.begin(), seq->stmts_.end(), HasConditional);
+  }
+  const auto loop = As<ForStmt>(statement);
+  return loop && HasConditional(loop->body_);
+}
+
 class LaneImporter {
  public:
   LaneImporter(const FunctionPtr& function, const PeerTransportEffects& transport, const std::string& target,
                const SyncParameterBounds& parameters, PeerGmEffects& gm, const SyncControlRangeProver& ranges,
-               const SyncFootprintResolver* footprint)
+               const SyncFootprintResolver* footprint, ImportedLocalSync* structured)
       : transport_(transport),
         backend_(*backend::BackendConfig::GetBackend()),
         gm_(gm),
         ranges_(ranges),
-        footprint_(footprint) {
+        footprint_(footprint),
+        structured_(structured) {
     result_.input.owner = function;
     result_.input.hardware_target = target;
     result_.input.segments.emplace_back();
@@ -284,6 +294,11 @@ class LaneImporter {
     CHECK_SPAN(owner->return_types_.empty() || (!statements.empty() && As<ReturnStmt>(statements.back())),
                owner->span_)
         << "Peer local path with results requires a terminal return";
+    if (structured_) {
+      ImportStructuredSequence(statements, /*endpoint=*/true);
+      ExportStructuredEffects();
+      return std::move(result_);
+    }
     for (size_t i = 0; i < statements.size(); ++i) {
       const auto& statement = statements[i];
       if (IsOp(GetCallFromStmt(statement), "system.syncall")) {
@@ -306,6 +321,7 @@ class LaneImporter {
   PeerGmEffects& gm_;
   const SyncControlRangeProver& ranges_;
   const SyncFootprintResolver* footprint_;
+  ImportedLocalSync* structured_;
   PeerLocalLane result_;
   size_t region_start_ = 0;
   std::optional<PeerLocalWorkLoop> work_loop_;
@@ -327,6 +343,84 @@ class LaneImporter {
   std::unordered_set<const Var*> ambiguous_metadata_handles_;
   std::unordered_map<const Var*, size_t> gm_roots_;
   std::map<MemorySpace, size_t> storage_;
+
+  void RequireClosedBorrows(const Span& span) const {
+    CHECK_SPAN(births_.size() == closed_.size(), span) << "A live FIFO handle crosses structured control";
+  }
+
+  void ImportStructuredSequence(const std::vector<StmtPtr>& body, bool endpoint = false) {
+    for (size_t i = 0; i < body.size(); ++i) {
+      const auto& statement = body[i];
+      const bool tail = i + 1 == body.size();
+      if (const auto branch = As<IfStmt>(statement)) {
+        RequireClosedBorrows(branch->span_);
+        CHECK_SPAN(Ready(branch->condition_) && branch->return_vars_.empty(), branch->span_)
+            << "Peer conditional requires ready control and no carried values";
+        ImportStructuredArm(branch->then_body_);
+        if (branch->else_body_) ImportStructuredArm(*branch->else_body_);
+      } else if (const auto loop = As<ForStmt>(statement)) {
+        RequireClosedBorrows(loop->span_);
+        CHECK_SPAN(loop->kind_ == ForKind::Sequential && loop->iter_args_.size() == loop->return_vars_.size(),
+                   loop->span_)
+            << "Peer structured loop requires sequential execution and matching carries";
+        QualifyWorkLoop(loop);
+        for (const auto& arg : loop->iter_args_) BindAlias(arg, arg->initValue_);
+        ready_.insert(loop->loop_var_.get());
+        std::vector<StmtPtr> item;
+        Flatten(loop->body_, item);
+        const auto yield = item.empty() ? nullptr : As<YieldStmt>(item.back());
+        if (yield) item.pop_back();
+        const auto entry = ordinals_;
+        ImportStructuredSequence(item);
+        BindLoopResults(loop, yield);
+        // The next actual cursor depends on the path and trip count. Only
+        // representative ordinals for one closed lexical borrow are needed.
+        ordinals_ = entry;
+      } else {
+        Import(statement, endpoint && tail);
+      }
+    }
+    if (!body.empty()) RequireClosedBorrows(body.back()->span_);
+  }
+
+  void ImportStructuredArm(const StmtPtr& arm) {
+    std::vector<StmtPtr> body;
+    Flatten(arm, body);
+    if (!body.empty()) {
+      if (const auto yield = As<YieldStmt>(body.back())) {
+        CHECK_SPAN(yield->value_.empty(), yield->span_) << "Peer conditional cannot yield a value";
+        body.pop_back();
+      }
+    }
+    const auto entry = ordinals_;
+    ImportStructuredSequence(body);
+    ordinals_ = entry;
+  }
+
+  void ExportStructuredEffects() {
+    for (const auto& site : result_.input.segments.front().sites) {
+      auto& cut = structured_->calls.at(site.original.get());
+      // The common prefix is imported in each lane at the same original cuts.
+      if (cut.pipe) {
+        INTERNAL_CHECK(*cut.pipe == site.pipe);
+        continue;
+      }
+      cut.pipe = site.pipe;
+      for (const auto& access : site.accesses) {
+        const auto& storage = result_.input.storage[access.storage];
+        std::optional<backend::BufferSyncByteWindow> interval;
+        if (storage.space != MemorySpace::DDR) {
+          // Reaching definitions across control may choose different slots.
+          // Enclose every possible slot, and never certify a full overwrite
+          // of that enclosure from a single receive.
+          interval = storage.slot_bytes > 0
+                         ? backend::BufferSyncByteWindow{storage.address, storage.address + storage.bytes}
+                         : backend::BufferSyncByteWindow{access.column, access.column + access.columns};
+        }
+        cut.effects.push_back({storage.space, access.write, interval});
+      }
+    }
+  }
 
   void ImportSyncAll(const StmtPtr& statement) {
     const auto call = GetCallFromStmt(statement);
@@ -470,7 +564,7 @@ class LaneImporter {
     return length ? std::min(upper, length->value_ - 1) : upper;
   }
 
-  void QualifyScalarGmAddress(const TensorType& tensor, const MakeTuple& indices, const Span& span) const {
+  bool NeedsHostScalarExtent(const TensorType& tensor, const MakeTuple& indices, const Span& span) const {
     const auto rank = tensor.shape_.size();
     const auto columns = rank == 2 ? As<ConstInt>(tensor.shape_.back()) : nullptr;
     CHECK_SPAN(indices.elements_.size() == rank && (rank == 1 || columns), span)
@@ -483,8 +577,16 @@ class LaneImporter {
     // PTOAS emits a signed int64 INDEX for the flattened typed pointer
     // subscript. Check its enclosing byte extent before relying on address
     // arithmetic. The original caller still supplies valid backing storage.
-    CHECK_SPAN(maximum < std::numeric_limits<int64_t>::max() / tensor.dtype_.GetByte(), span)
+    const auto offset_limit = std::numeric_limits<int64_t>::max() / tensor.dtype_.GetByte();
+    if (maximum < offset_limit) return false;
+    const auto extent = rank == 1 ? As<Var>(tensor.shape_.front()) : nullptr;
+    CHECK_SPAN(extent && GetScalarDtype(extent) == DataType::INDEX &&
+                   std::numeric_limits<uint32_t>::max() < offset_limit,
+               span)
         << "Peer scalar GM address may exceed the signed native byte offset";
+    // Check the original host Tensor shape at every launch before ownership
+    // is published. A symbolic leaf shape alone does not establish this bound.
+    return true;
   }
 
   void ImportScalarGmRead(const CallPtr& call, const VarPtr& result) {
@@ -509,7 +611,9 @@ class LaneImporter {
                call->span_)
         << "Peer scalar GM read must preserve its original packed pointer and scalar dtype";
     RequireReadyTuple(call->args_[1], call->span_);
-    QualifyScalarGmAddress(*tensor, *As<MakeTuple>(call->args_[1]), call->span_);
+    if (NeedsHostScalarExtent(*tensor, *As<MakeTuple>(call->args_[1]), call->span_)) {
+      gm_.host_extent_requirements.insert(root->second);
+    }
     gm_.formals.insert(root->second);
     gm_.scalar_reads.insert(root->second);
     CHECK_SPAN(ready_.insert(result.get()).second, call->span_) << "Peer scalar GM result is defined twice";
@@ -1157,8 +1261,20 @@ class LaneImporter {
       BindAlias(result, assignment->value_);
       return;
     }
+    if (structured_) {
+      const auto [saved, fresh] =
+          structured_->calls.try_emplace(call.get(), ImportedLocalCut{statement.get(), std::nullopt, {}});
+      CHECK_SPAN(fresh || saved->second.statement == statement.get(), statement->span_)
+          << "Peer local planning requires one original cut per imported call";
+    }
     const auto peer = sites_.find(statement.get());
     if (peer != sites_.end()) {
+      if (structured_) {
+        for (const auto& argument : call->args_) {
+          CheckSyncScalarReadiness(argument,
+                                   [this](const VarPtr& var) { return ready_.count(var.get()) != 0; });
+        }
+      }
       ImportPeer(call, *peer->second);
       return;
     }
@@ -1254,8 +1370,18 @@ PeerLocalEffects ImportPeerLocalEffects(const FunctionPtr& function, const PeerT
                                                                              /*resolve_peer_slots=*/true)
                                    : nullptr;
   PeerLocalEffects result;
+  const bool structured = buffer_ir && std::any_of(paths.begin(), paths.end(), [](const auto& path) {
+                            return std::any_of(path.begin(), path.end(), HasConditional);
+                          });
+  if (structured) {
+    const auto body = transform_utils::FlattenToStmts(function->body_);
+    result.structured.emplace(
+        ImportedLocalSync{function, {}, paths.size() == 2 ? As<IfStmt>(body.back()).get() : nullptr});
+    result.parameters = parameters;
+  }
   for (const auto& path : paths) {
-    LaneImporter importer(function, transport, target, parameters, result.gm, ranges, footprint.get());
+    LaneImporter importer(function, transport, target, parameters, result.gm, ranges, footprint.get(),
+                          result.structured ? &*result.structured : nullptr);
     result.lanes.push_back(importer.Run(path));
   }
   return result;

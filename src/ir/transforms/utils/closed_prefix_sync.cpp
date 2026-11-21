@@ -36,6 +36,7 @@
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/verifier/sync.h"
+#include "src/ir/transforms/utils/conservative_sync_dataflow.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/retained_sync_child.h"
 #include "src/ir/transforms/utils/sync_loop_trip_proof.h"
@@ -579,11 +580,16 @@ class Discover : public IRVisitor {
 
 class NativeOperations : public IRVisitor {
  public:
-  NativeOperations(FunctionType core, std::string target, bool track_payload_pipes = false)
-      : core_(core), target_(std::move(target)), track_payload_pipes_(track_payload_pipes) {
+  NativeOperations(FunctionType core, std::string target, bool track_payload_pipes = false,
+                   const ImportedLocalSync* imported = nullptr)
+      : core_(core),
+        target_(std::move(target)),
+        track_payload_pipes_(track_payload_pipes),
+        imported_(imported) {
     CHECK(core == FunctionType::AIC || core == FunctionType::AIV)
         << "Closed prefix protocols require one AIC/AIV invocation owner";
   }
+  bool HasImportedNativeCuts() const { return imported_ != nullptr; }
   std::vector<CallPtr> payloads;
   std::vector<CallPtr> all_native_payloads;
   std::unordered_map<const Stmt*, RelayMask> subtree_payload_pipes;
@@ -628,7 +634,14 @@ class NativeOperations : public IRVisitor {
   }
   void VisitExpr_(const CallPtr& call) override {
     if (GetLogicalSyncKind(call->op_) == LogicalSyncKind::None) {
-      if (in_child_scope_ == 0) {
+      if (imported_) {
+        const auto found = imported_->calls.find(call.get());
+        CHECK_SPAN(found != imported_->calls.end(), call->span_)
+            << "Closed prefix protocols require the original imported native cuts";
+        if (found->second.pipe && !stmt_pipe_stack_.empty()) {
+          stmt_pipe_stack_.back() |= RelayPipeBit(*found->second.pipe);
+        }
+      } else if (in_child_scope_ == 0) {
         CHECK(call->attrs_.empty())
             << "Closed prefix operation attributes require an explicit native execution contract";
         if (const auto descriptor = backend::QualifyBufferSyncNonPayload(call, target_)) {
@@ -656,6 +669,7 @@ class NativeOperations : public IRVisitor {
   FunctionType core_;
   std::string target_;
   bool track_payload_pipes_ = false;
+  const ImportedLocalSync* imported_;
   size_t in_child_scope_ = 0;
   std::vector<RelayMask> stmt_pipe_stack_;
   std::set<const Expr*> visited_;
@@ -802,11 +816,15 @@ class Assignment {
     const auto& native = backend::RequireLocalSyncExecutionContract(target);
     CHECK(native.set_completes_source_prefix && native.wait_consumes_before_advance)
         << "Closed prefix protocols require ordered consuming event commands";
-    reservations_ = SyncNativeClaims(owner, native_ops.all_native_payloads, target);
+    reservations_ = native_ops.HasImportedNativeCuts()
+                        ? extra_reservations
+                        : SyncNativeClaims(owner, native_ops.all_native_payloads, target);
     for (const auto& [direction, ids] : reservations_)
       for (int id : ids) native_claimed_.emplace_back(direction.first, direction.second, id);
-    for (const auto& [direction, ids] : extra_reservations)
-      reservations_[direction].insert(ids.begin(), ids.end());
+    if (!native_ops.HasImportedNativeCuts()) {
+      for (const auto& [direction, ids] : extra_reservations)
+        reservations_[direction].insert(ids.begin(), ids.end());
+    }
 
     suffix_visits_ = PlanOneWayClosure(owner, discovered, prover);
 
@@ -1675,16 +1693,22 @@ bool HasClosedSyncChild(const FunctionPtr& function) {
 std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     const FunctionPtr& function, const std::string& target,
     const std::optional<std::vector<int>>& eligible_ids, const SyncNativeReservations& extra_reservations,
-    const SyncParameterBounds& parameters, const std::optional<std::pair<int64_t, int64_t>>& blocks) {
+    const SyncParameterBounds& parameters, const std::optional<std::pair<int64_t, int64_t>>& blocks,
+    const ImportedLocalSync* imported) {
   const SyncControlRangeProver prover(function, parameters, blocks);
   Discover discovered(&prover);
   discovered.VisitFunction(function);
   if (!HasMatchingClosedPrefixUses(function, discovered)) return std::nullopt;
+  CHECK(!imported ||
+        (discovered.children.empty() && imported->owner && imported->owner->name_ == function->name_ &&
+         imported->owner->params_ == function->params_ &&
+         imported->owner->func_type_ == function->func_type_))
+      << "Imported local prefix protocols require their original native owner";
   CHECK(!function->requires_runtime_binding_ && !function->HasAttr(kAttrExternalSource) &&
         !function->HasAttr(kAttrBuiltinTemplateDir))
       << "Closed prefix protocols cannot replace an external invocation owner";
 
-  NativeOperations native(function->func_type_, target, /*track_payload_pipes=*/true);
+  NativeOperations native(function->func_type_, target, /*track_payload_pipes=*/true, imported);
   native.VisitFunction(function);
   const Assignment assignment(function, discovered, native, target, eligible_ids, extra_reservations, prover);
 

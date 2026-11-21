@@ -38,6 +38,7 @@ class PeerInvocationGmEvidence {
   void Check(const FunctionPtr& group, const std::set<size_t>& ordinary_formals, size_t workspace_formal);
   std::optional<SyncDispatchCoordinates> TryLaunchCoordinates(const FunctionPtr& group,
                                                               size_t workspace_formal);
+  void CheckHostRankOneExtent(const FunctionPtr& group, size_t formal) const;
   void CheckScalarReads(const FunctionPtr& group, const PeerGmEffects& effects, bool disjoint_gm) const;
 
  private:

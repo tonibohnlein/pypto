@@ -437,6 +437,21 @@ orders conflicting pipes and closes any events that the next item can reuse.
 It reserves the boundary events alongside native and within-item claims.
 The resulting plan applies to every qualified launch stride.
 
+A Buffer endpoint can also use nested scalar conditionals in sequential
+loops. The importer requires each receive borrow to close within a
+straight-line sequence. It checks the exact ordinal distance between the pop
+and each use in that sequence. When control can change the incoming cursor,
+each possible local access through the borrow is enclosed by the qualified
+receive slots. A pop never counts as an overwrite of that entire enclosure.
+
+The conservative dataflow carries possible outstanding readers and writers
+through both arms, the zero-trip path, each backedge, and the epilogue. It
+requests directional completion immediately before a conflicting local
+operation. The event allocator proves consumption before reuse and reserves
+the ordinary native operations' event claims. The original guards, loops,
+transport operations and their ready and credit signals keep their issue
+cuts. Endpoint completion still drains the local pipes at exit.
+
 The importer requires explicit
 placement, the conservative-prefix policy, and a qualified native FIFO
 workspace. The actual launch must bind the sized workspace separately from
@@ -448,8 +463,10 @@ rank-two INT32 or FP32 tensor. For rank two, the inner extent must be static.
 The coordinates must be ready at the original statement and the flattened
 byte address must fit the native signed offset under the original in-bounds
 access precondition. The original cacheable pointer load produces the scalar
-synchronously. The caller still supplies valid storage and the required GM
-publication before dispatch.
+synchronously. An in-bounds index into a dynamic rank-one tensor can use
+the unsigned 32-bit extent in the host Tensor ABI when every launch forwards
+the same original packed formal and shape. The caller still supplies valid
+storage and the required GM publication before dispatch.
 
 The launch proof traces the scalar source and every GM write in both
 endpoints through their Group and root bindings. The source must be separate

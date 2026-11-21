@@ -22,6 +22,7 @@
 
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
+#include "src/ir/transforms/utils/conservative_sync_dataflow.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/sync_loop_trip_proof.h"
 
@@ -51,12 +52,16 @@ struct PeerLocalLane {
 struct PeerGmEffects {
   std::set<size_t> formals;
   std::set<size_t> scalar_reads;
+  // Scalar address proofs that still require a bounded original host extent.
+  std::set<size_t> host_extent_requirements;
   std::set<size_t> writes;
 };
 
 struct PeerLocalEffects {
   // One common path, or the then and else paths of the original AIV subblock branch.
   std::vector<PeerLocalLane> lanes;
+  std::optional<ImportedLocalSync> structured;
+  SyncParameterBounds parameters;
   PeerGmEffects gm;
 };
 

@@ -18,6 +18,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -79,6 +80,26 @@ struct ConservativeStorageDomain {
 };
 using ConservativeAccessSet = std::set<ConservativeAccessFact>;
 
+// A selected transport adapter can supply checked local effects for the
+// complete original owner. A call without a pipe has no asynchronous issue
+// at this cut. Actual transfer and ready/credit commands remain in the IR.
+struct ImportedLocalEffect {
+  MemorySpace space;
+  bool write;
+  std::optional<backend::BufferSyncByteWindow> enclosure;
+};
+struct ImportedLocalCut {
+  const Stmt* statement;
+  std::optional<PipeType> pipe;
+  std::vector<ImportedLocalEffect> effects;
+};
+using ImportedLocalCuts = std::unordered_map<const Call*, ImportedLocalCut>;
+struct ImportedLocalSync {
+  FunctionPtr owner;
+  ImportedLocalCuts calls;
+  const IfStmt* terminal_branch = nullptr;
+};
+
 struct ConservativeLoopEntryServices {
   ForStmtPtr loop;
   bool guard_nonempty;
@@ -90,7 +111,9 @@ struct ConservativeLoopEntryServices {
 
 struct ConservativeSyncSite {
   StmtPtr cut;  // Original statement, immediately before its payload call.
-  backend::BufferSyncOperation operation;
+  CallPtr operation;
+  PipeType pipe;
+  std::optional<backend::BufferSyncOperation> buffer_operation;
   ConservativeAccessSet effects;
   ConservativeAccessSet incoming;  // Unavailable unless HasIncomingDiagnostics() is true.
   // Full-overwrite (space, domain) pairs proven to overwrite the entire domain cleanly.
@@ -168,7 +191,8 @@ class ConservativeSyncAnalysis {
   friend ConservativeSyncAnalysis AnalyzeConservativeSync(
       const FunctionPtr&, const std::string&, const std::vector<std::shared_ptr<const NativeSyncChild>>&,
       const std::vector<std::shared_ptr<const EventfulSyncChild>>&, bool, bool, bool,
-      const SyncParameterBounds&, const std::optional<std::pair<int64_t, int64_t>>&, bool);
+      const SyncParameterBounds&, const std::optional<std::pair<int64_t, int64_t>>&, bool,
+      const ImportedLocalSync*);
   ConservativeSyncAnalysis(FunctionPtr function, std::vector<ConservativeSyncSite> sites,
                            ConservativeAccessSet exit, ConservativeSyncCost cost,
                            std::vector<ConservativeSyncChildEntry> children,
@@ -205,8 +229,8 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
     const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful_children = {},
     bool retain_incoming_diagnostics = false, bool automatic_children = false,
     bool enable_refresh_kill = true, const SyncParameterBounds& parameters = {},
-    const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt,
-    bool enable_loop_prefixes = true);
+    const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt, bool enable_loop_prefixes = true,
+    const ImportedLocalSync* imported = nullptr);
 // Explicit policy construction. Acknowledgment-induced order is represented
 // here in logical tokens before LowerSync; no physical resource is assigned.
 FunctionPtr InsertConservativePrefixes(const ConservativeSyncAnalysis& analysis);

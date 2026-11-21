@@ -1647,8 +1647,8 @@ void BindTesting(nb::module_& m) {
           const auto& site = analysis.Sites()[index];
           nb::dict record;
           record["cut"] = site.cut;
-          record["operation"] = site.operation.Operation();
-          record["pipe"] = site.operation.Implementation().Pipe();
+          record["operation"] = site.operation;
+          record["pipe"] = site.pipe;
           std::vector<ir::StmtPtr> control;
           for (auto parent = parents.GetParent(site.cut); parent; parent = parents.GetParent(parent)) {
             if (ir::As<ir::IfStmt>(parent) || ir::As<ir::ForStmt>(parent) || ir::As<ir::WhileStmt>(parent))

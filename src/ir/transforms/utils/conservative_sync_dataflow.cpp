@@ -812,14 +812,16 @@ class Builder {
           const std::vector<std::shared_ptr<const NativeSyncChild>>& retained,
           const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful,
           bool retain_incoming_diagnostics, bool enable_refresh_kill, const SyncParameterBounds& parameters,
-          const std::optional<std::pair<int64_t, int64_t>>& blocks, bool enable_loop_prefixes)
+          const std::optional<std::pair<int64_t, int64_t>>& blocks, bool enable_loop_prefixes,
+          const ImportedLocalSync* imported)
       : function_(function),
         target_(std::move(target)),
         trip_prover_(function, parameters, blocks),
         resolver_(function, &trip_prover_, /*run_scalar_layout_check=*/true, target_),
         retain_incoming_diagnostics_(retain_incoming_diagnostics),
         enable_refresh_kill_(enable_refresh_kill),
-        enable_loop_prefixes_(enable_loop_prefixes) {
+        enable_loop_prefixes_(enable_loop_prefixes),
+        imported_(imported) {
     const auto* context = PassContext::Current();
     disjoint_gm_ = context && context->GetAutoSyncDisjointGM();
     scopes_.emplace_back();
@@ -1581,7 +1583,7 @@ class Builder {
         debt_out[u] = TransferDebt(v, std::move(cur_in), /*use_selected=*/true);
       } else if (v.kind == CfgVertex::Kind::Site) {
         auto& site = sites[v.index];
-        const auto destination = site.operation.Implementation().Pipe();
+        const auto destination = site.pipe;
         const auto& effs = site_effect_fibers_[v.index];
         site.source_pipes = cur_in.Select(site.required_source_pipes, destination, effs);
         PipeMask sources_mask = 0;
@@ -1769,7 +1771,7 @@ class Builder {
       state.AddEffects(entry.effects, &entry.completion);
     } else if (vertex.kind == CfgVertex::Kind::Site) {
       const auto& site = sites[vertex.index];
-      const auto destination = site.operation.Implementation().Pipe();
+      const auto destination = site.pipe;
       const auto& pipes = use_selected ? site.source_pipes : site.required_source_pipes;
       PipeMask sources_mask = 0;
       for (const auto source : pipes) sources_mask |= PipeToMask(source);
@@ -1876,7 +1878,7 @@ class Builder {
       }
       if (cfg[u].kind == CfgVertex::Kind::Site) {
         auto& site = sites[cfg[u].index];
-        const auto destination = site.operation.Implementation().Pipe();
+        const auto destination = site.pipe;
         site.source_pipes =
             cur_in.Select(site.required_source_pipes, destination, site_effect_fibers_[cfg[u].index]);
       }
@@ -1894,7 +1896,7 @@ class Builder {
       for (const size_t u : dirty) {
         if (cfg[u].kind != CfgVertex::Kind::Site) continue;
         auto& site = sites[cfg[u].index];
-        const auto destination = site.operation.Implementation().Pipe();
+        const auto destination = site.pipe;
         DebtState after_services = sel_in[u];
         PipeMask sources_mask = 0;
         for (const auto source : site.source_pipes) sources_mask |= PipeToMask(source);
@@ -1928,7 +1930,7 @@ class Builder {
         } else if (cfg[u].kind == CfgVertex::Kind::Site) {
           const auto& selected = sites[cfg[u].index];
           size_t next = 0;
-          const auto destination = selected.operation.Implementation().Pipe();
+          const auto destination = selected.pipe;
           DebtState known = sel_in[u];
           PipeMask sources_mask = 0;
           for (const auto source : selected.required_source_pipes) {
@@ -2027,7 +2029,7 @@ class Builder {
     if (!CollectProducerPaths(loop->body_, {}, paths)) return std::nullopt;
     std::array<std::vector<size_t>, kPhysicalPipeCount> sites_by_pipe;
     for (size_t i = 0; i < sites.size(); ++i) {
-      const auto pipe = static_cast<size_t>(sites[i].operation.Implementation().Pipe());
+      const auto pipe = static_cast<size_t>(sites[i].pipe);
       // Enclosing payloads and cross-pipe macros need entry/exit evidence
       // beyond this sealed-loop family.
       if (!paths[i] || pipe >= kPhysicalPipeCount) return std::nullopt;
@@ -2036,7 +2038,7 @@ class Builder {
     for (const auto& targets : sites_by_pipe) {
       if (targets.size() != 1) continue;
       const auto consumer = targets.front();
-      const auto destination = sites[consumer].operation.Implementation().Pipe();
+      const auto destination = sites[consumer].pipe;
       // Descriptor evaluation and scalar control may issue on S without a
       // Buffer payload site. It cannot be shown idle from this inventory.
       if (destination == PipeType::S) continue;
@@ -2103,14 +2105,14 @@ class Builder {
     // to the original allocator and its complete native reservation model.
     try {
       for (const auto& site : sites) {
-        if (!site.operation.Implementation().Claims().empty()) return;
+        if (!site.buffer_operation->Implementation().Claims().empty()) return;
       }
     } catch (const pypto::ValueError&) {
       return;
     }
     const auto& [producer, consumer, can_relay_destination] = *candidate;
-    const auto source = sites[producer].operation.Implementation().Pipe();
-    const auto destination = sites[consumer].operation.Implementation().Pipe();
+    const auto source = sites[producer].pipe;
+    const auto destination = sites[consumer].pipe;
     const auto baseline_cost = cost;
     std::vector<std::vector<PipeType>> baseline;
     baseline.reserve(sites.size());
@@ -2172,13 +2174,12 @@ class Builder {
     // S also executes the original scalar/metadata/loop control, which does
     // not have payload sites. The head's incoming services occupy its
     // destination and their recorded sources before its first payload.
-    PipeMask occupied =
-        PipeToMask(PipeType::S) | PipeToMask(original[head].operation.Implementation().Pipe());
+    PipeMask occupied = PipeToMask(PipeType::S) | PipeToMask(original[head].pipe);
     for (const auto source : entry) occupied |= PipeToMask(source);
     try {
       for (size_t i = 0; i < head; ++i) {
         const auto& site = original[i];
-        const auto& native = site.operation.Implementation();
+        const auto& native = site.buffer_operation->Implementation();
         occupied |= PipeToMask(native.Pipe());
         for (const auto source : site.source_pipes) occupied |= PipeToMask(source);
         // The resource catalog enumerates secondary event queues. Leave
@@ -2208,8 +2209,7 @@ class Builder {
     // intervening producer on any native pipe, nor a skipped first use.
     if (first == paths.end() || first == paths.begin() || (*first)->condition) return;
     const size_t head = static_cast<size_t>(first - paths.begin());
-    if (sites[head].source_pipes.empty() || sites[head].operation.Implementation().Pipe() == PipeType::S)
-      return;
+    if (sites[head].source_pipes.empty() || sites[head].pipe == PipeType::S) return;
     // Producer-side captures have an independent proof and are never replayed
     // here. In particular the phase split does not delay a previously moved edge.
     const auto has_capture = [](const auto& site) { return site.post_destination.has_value(); };
@@ -2299,7 +2299,14 @@ class Builder {
   void RefineStorage() {
     std::vector<std::vector<RawEffect>> raw(sites.size());
     for (size_t site = 0; site < sites.size(); ++site) {
-      const auto& operation = sites[site].operation;
+      if (imported_) {
+        const auto& cut = imported_->calls.at(sites[site].operation.get());
+        for (const auto& effect : cut.effects) {
+          raw[site].push_back({effect.space, *cut.pipe, effect.write, effect.enclosure, nullptr});
+        }
+        continue;
+      }
+      const auto& operation = *sites[site].buffer_operation;
       const auto& call = operation.Operation();
       const auto pipe = operation.Implementation().Pipe();
       const auto append = [&](MemorySpace space, BufferAccess mode,
@@ -2498,6 +2505,22 @@ class Builder {
     CHECK_SPAN(call->attrs_.empty(), call->span_)
         << "Conservative synchronization: operation attributes require an execution contract";
     for (const auto& argument : call->args_) Ready(argument);
+    if (imported_) {
+      const auto found = imported_->calls.find(call.get());
+      CHECK_SPAN(found != imported_->calls.end() && found->second.statement == cut.get(), call->span_)
+          << "Conservative synchronization: missing original imported local cut";
+      const auto& local = found->second;
+      if (local.pipe) {
+        const auto inserted = site_index_.emplace(cut.get(), sites.size()).second;
+        CHECK_SPAN(inserted, cut->span_)
+            << "Conservative synchronization: shared statement identity has ambiguous insertion cuts";
+        sites.push_back(
+            {cut, call, *local.pipe, std::nullopt, {}, {}, {}, {}, {}, std::nullopt, std::nullopt});
+        inside_child_.push_back(false);
+      }
+      if (result) Bind(result);
+      return;
+    }
     if (auto descriptor = backend::QualifyBufferSyncNonPayload(call, target_)) {
       const auto behavior = descriptor->Result().behavior;
       CHECK_SPAN(static_cast<bool>(result) == (behavior != BufferResultBehavior::None), call->span_)
@@ -2543,8 +2566,17 @@ class Builder {
     const auto inserted = site_index_.emplace(cut.get(), sites.size()).second;
     CHECK_SPAN(inserted, cut->span_)
         << "Conservative synchronization: shared statement identity has ambiguous insertion cuts";
-    sites.push_back(
-        {cut, std::move(operation), std::move(effects), {}, {}, {}, {}, std::nullopt, std::nullopt});
+    sites.push_back({cut,
+                     call,
+                     operation.Implementation().Pipe(),
+                     std::move(operation),
+                     std::move(effects),
+                     {},
+                     {},
+                     {},
+                     {},
+                     std::nullopt,
+                     std::nullopt});
     inside_child_.push_back(native_child_depth_ != 0);
     // The ordinary service protects the scalar instruction's storage read.
     // Only its selected blocking native return then makes the original SSA
@@ -2618,7 +2650,9 @@ class Builder {
         PopScope();
       }
       --control_depth_;
-      CHECK_SPAN(!then_end.returned && !else_end.returned, statement->span_)
+      CHECK_SPAN((!then_end.returned && !else_end.returned) ||
+                     (imported_ && imported_->terminal_branch == branch.get()),
+                 statement->span_)
           << "Conservative synchronization: nested invocation exits are unavailable";
       const auto count = branch->return_vars_.size();
       CHECK_SPAN(then_end.yield.value_or(0) == count && else_end.yield.value_or(0) == count, statement->span_)
@@ -2644,7 +2678,8 @@ class Builder {
       return {yield->value_.size(), false};
     }
     if (const auto ret = As<ReturnStmt>(statement)) {
-      CHECK_SPAN(control_depth_ == 0, statement->span_)
+      CHECK_SPAN(control_depth_ == 0 || (control_depth_ == 1 && imported_ && imported_->terminal_branch),
+                 statement->span_)
           << "Conservative synchronization: nested invocation exits are unavailable";
       for (const auto& value : ret->value_) Ready(value);
       return {std::nullopt, true};
@@ -2685,6 +2720,7 @@ class Builder {
   bool retain_incoming_diagnostics_;
   bool enable_refresh_kill_;
   bool enable_loop_prefixes_;
+  const ImportedLocalSync* imported_;
   std::unordered_map<const Expr*, ExprPtr> gm_roots_;
   std::unordered_map<const Var*, ExprPtr> ssa_defs_;
   std::vector<std::vector<const Var*>> scopes_;
@@ -2721,7 +2757,7 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
     const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful_children,
     bool retain_incoming_diagnostics, bool automatic_children, bool enable_refresh_kill,
     const SyncParameterBounds& parameters, const std::optional<std::pair<int64_t, int64_t>>& blocks,
-    bool enable_loop_prefixes) {
+    bool enable_loop_prefixes, const ImportedLocalSync* imported) {
   CHECK(function && function->ir_stage_ == FunctionIRStage::Buffer)
       << "Conservative synchronization requires Buffer IR";
   CHECK(function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV)
@@ -2730,6 +2766,10 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
   RequireBufferRuntimeValid(function);
   CHECK(!automatic_children || (children.empty() && eventful_children.empty()))
       << "Automatic child selection cannot replace explicitly supplied child capabilities";
+  CHECK(!imported || (imported->owner == function && !automatic_children && children.empty() &&
+                      eventful_children.empty() && !enable_refresh_kill && !enable_loop_prefixes))
+      << "Imported local synchronization requires its original owner without derived child or overwrite "
+         "proofs";
   AutomaticSyncChildren selection;
   std::vector<std::shared_ptr<const EventfulSyncChild>> selected = eventful_children;
   if (automatic_children) {
@@ -2738,7 +2778,7 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
       if (attempt.child) selected.push_back(attempt.child);
   }
   Builder builder(function, target, children, selected, retain_incoming_diagnostics, enable_refresh_kill,
-                  parameters, blocks, enable_loop_prefixes);
+                  parameters, blocks, enable_loop_prefixes, imported);
   if (automatic_children && !selection.inline_subblocks.empty()) {
     builder.RegisterInlineSubblocks(selection.inline_subblocks);
   }

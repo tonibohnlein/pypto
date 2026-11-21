@@ -93,7 +93,7 @@ class Insert : public IRMutator {
     // Reusing the same static statement in two contexts requires
     // distinct original cut evidence and is refused rather than conflated.
     for (const auto& site : analysis.Sites()) {
-      const auto destination = site.operation.Implementation().Pipe();
+      const auto destination = site.pipe;
       std::vector<std::pair<PipeType, PipeType>> services;
       for (const auto source : site.source_pipes) {
         if (site.loop_entry && IsPhaseOnly(*site.loop_entry, source)) continue;

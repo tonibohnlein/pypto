@@ -29,6 +29,7 @@
 #include "pypto/core/error.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -583,6 +584,15 @@ FunctionPtr PlanLocalEndpoint(const WrapperCallInfo& call, const FunctionPtr& gr
     }
   }
   gm.Check(group, touched, workspace_formal);
+  for (const auto index : local.gm.host_extent_requirements) {
+    const auto argument = AsVarLike(call.inner_call->args_[index]);
+    const auto from = As<TensorType>(argument->GetType());
+    const auto to = As<TensorType>(fn->params_[index]->GetType());
+    CHECK(from && to && from->dtype_ == to->dtype_ &&
+          tile_view_semantics::ShapeExprListsEquivalent(from->shape_, to->shape_))
+        << "Peer scalar GM address requires the original Group tensor shape";
+    gm.CheckHostRankOneExtent(group, positions.at(argument.get()));
+  }
   return RealizePeerLocalPlan(local);
 }
 

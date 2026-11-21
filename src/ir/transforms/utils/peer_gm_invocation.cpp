@@ -30,6 +30,7 @@
 #include "pypto/ir/memref.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/alloc_batching.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
@@ -182,6 +183,25 @@ class RootInventory final : public IRVisitor {
       JoinCoordinates(coordinates, minimum, maximum, std::move(formals));
     }
     return coordinates;
+  }
+
+  void CheckHostRankOneExtent(const FunctionPtr& launch, size_t formal, const TensorType& expected) const {
+    const auto matches = [&](const Var* value) {
+      const auto type = value ? As<TensorType>(value->GetType()) : nullptr;
+      return type && !type->tensor_view_ && type->dtype_ == expected.dtype_ &&
+             tile_view_semantics::ShapeExprListsEquivalent(type->shape_, expected.shape_);
+    };
+    CHECK(matches(launch->params_.at(formal).get()))
+        << "Peer scalar GM address requires its original packed rank-one launch shape";
+    for (const auto& site : calls_.at(launch->name_)) {
+      const auto* argument = site.arguments.at(formal).value;
+      const auto origin = StorageOf(argument);
+      // The actual root formal is described by the runtime Tensor ABI,
+      // whose shapes[0] is uint32_t. Do not use this evidence for constructed
+      // views or for a value that merely shares the original backing storage.
+      CHECK_SPAN(origin.kind == OriginKind::Formal && origin.root == argument && matches(argument), site.span)
+          << "Peer scalar GM address requires a direct bounded host Tensor extent";
+    }
   }
 
   void CheckScalarReads(const FunctionPtr& launch, const PeerGmEffects& effects, bool disjoint_gm) const {
@@ -736,6 +756,16 @@ std::optional<SyncDispatchCoordinates> PeerInvocationGmEvidence::TryLaunchCoordi
   }
   const auto found = state_->coordinates.find(group->name_);
   return found == state_->coordinates.end() ? std::nullopt : found->second;
+}
+
+void PeerInvocationGmEvidence::CheckHostRankOneExtent(const FunctionPtr& group, size_t formal) const {
+  const auto expected = As<TensorType>(group->params_.at(formal)->GetType());
+  const auto extent = expected && expected->shape_.size() == 1 ? As<Var>(expected->shape_.front()) : nullptr;
+  CHECK(expected && !expected->tensor_view_ && extent && GetScalarDtype(extent) == DataType::INDEX)
+      << "Peer scalar GM address requires a plain symbolic rank-one Group formal";
+  for (const auto& [inventory, launch] : state_->qualified.at(group->name_)) {
+    inventory->CheckHostRankOneExtent(launch, formal, *expected);
+  }
 }
 
 void PeerInvocationGmEvidence::CheckScalarReads(const FunctionPtr& group, const PeerGmEffects& effects,

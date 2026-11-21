@@ -51,8 +51,8 @@ trips = (wide - core + 2) // wide
 for _ in pl.range(trips):
 """
         if guarded_transport:
-            # Proving the outer loop's extent does not qualify a branch that
-            # conditionally changes the number of issued FIFO operations.
+            # The qualified dispatch width also controls whether a work item
+            # issues its FIFO commands. The loop may carry a rotated cursor.
             cube_work = "if width < 8:\n" + indent(cube_work, "    ")
             vector_work = "if width < 8:\n" + indent(vector_work, "    ")
         cube_work = header + indent(cube_work, "    ")
@@ -197,12 +197,13 @@ def test_peer_group_workspace_follows_spmd_launch(
             "ready nonnegative bounds",
             id="one-of-two-launches-disagrees",
         ),
+        pytest.param(("width",), False, True, None, id="guarded-transport"),
         pytest.param(
-            ("width",),
+            ("pl.const(1, pl.INT32)",),
             False,
             True,
-            "needs an effect summary for this conditional region",
-            id="data-dependent-transport",
+            "ready nonnegative bounds",
+            id="guarded-unrelated-scalar",
         ),
     ],
 )
@@ -230,14 +231,6 @@ def test_peer_work_loop_uses_original_dispatch_width(
     for name in ("cube", "vector"):
         endpoint = lowered.get_function(name)
         assert endpoint is not None and endpoint.attrs["buffer_ir_selected"]
-        if guarded_transport:
-            authored = original.get_function(name)
-            assert authored is not None and isinstance(authored.body, ir.SeqStmts)
-            loop = next(stmt for stmt in authored.body.stmts if isinstance(stmt, ir.ForStmt))
-            nested = loop.body.stmts if isinstance(loop.body, ir.SeqStmts) else [loop.body]
-            branch = next(stmt for stmt in nested if isinstance(stmt, ir.IfStmt))
-            diagnostic = endpoint.attrs[AUTOSYNC_FALLBACK_REASON_ATTR].splitlines()[0]
-            assert f"[{branch.span.to_string()}]" in diagnostic
     _assert_outcome(lowered, refusal)
 
 

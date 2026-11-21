@@ -23,6 +23,7 @@ from tests.ut.codegen.test_pto_codegen_cross_core import (
     _mat_receive_epilogue,
     _paired_consumer,
     _paired_receive_program,
+    _PeerWorkLoop,
     _SharePopExpression,
 )
 
@@ -281,7 +282,7 @@ def test_runtime_work_loop_composes_slot_releases(tmp_path, inner_trips):
         autosync_policy="conservative_prefix",
     ):
         # Three pops per item rotate the entry slot. Four return to the same slot.
-        program = _mat_receive_epilogue(128, "BF16", 2, loop=(inner_trips, 1), work_items=5)
+        program = _mat_receive_epilogue(128, "BF16", 2, loop=(inner_trips, 1), work=_PeerWorkLoop(5))
         ir.compile(program, **cfg.compile_kwargs())
     manifest = json.loads((tmp_path / "ptoas" / "paired.sync.json").read_text())
     cube = snapshots[0].get_function("cube")
@@ -322,6 +323,70 @@ def test_runtime_work_loop_composes_slot_releases(tmp_path, inner_trips):
 
 @pytest.mark.ptoas_compile
 @pytest.mark.usefixtures("ascend_backend")
+def test_guarded_work_preserves_readers_through_join(tmp_path):
+    snapshots = []
+
+    def capture(transform, program):
+        if transform.get_name() == "RealizeSync":
+            snapshots.append(program)
+
+    source = _mat_receive_epilogue(128, "BF16", 2, loop=(1, 1), work=_PeerWorkLoop(5, guarded_until=3))
+    cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
+    with passes.PassContext(
+        [passes.CallbackInstrument(after_pass=capture)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+    ):
+        ir.compile(source, **cfg.compile_kwargs())
+
+    cube = snapshots[0].get_function("cube")
+    vector = snapshots[0].get_function("vector")
+    manifest = json.loads((tmp_path / "ptoas" / "paired.sync.json").read_text())
+    assert manifest["owned"] and not manifest["ptoas_insert_sync"], (cube.attrs, vector.attrs)
+    for core, workers in [(5, 6), (4, 6), (2, 2), (0, 2), (0, 1)]:
+        # These paths include a zero-trip loop, a skipped branch, and odd/even
+        # guard counts. The unguarded epilogue writes the actual rotated slot.
+        state = MatSlotCommands(cube, 2, core=core, workers=workers)
+        order = state.run()
+        pops = 3 + 3 * len(range(core, 3, workers))
+        assert len(state.pops) == pops
+        assert all(state.readers)
+        assert len(state.order_checks) == 2 * pops - 2
+        assert all(edge in order for edge in state.order_checks + state.local_checks + state.gm_checks)
+        for subblock in (0, 1):
+            sender = PeerSenderCommands(vector, subblock, core=core, workers=workers)
+            sender.run()
+            assert sum(call.op.name in sender.push_pipes for call in sender.calls) == pops
+
+    # On the zero-trip path the epilogue overwrites the first receive slot.
+    mutant = MatSlotCommands(cube, 2, core=5, workers=6, drop_releases=True)
+    mutant.execute(cube.body, dict(mutant.env))
+    broken = closure(mutant.vertices, mutant.edges)
+    assert (mutant.readers[0], ("issue", mutant.pops[-1][1])) not in broken
+
+
+@pytest.mark.usefixtures("ascend_backend")
+def test_guarded_work_rejects_receive_borrow_crossing_a_branch():
+    source = _paired_receive_program(
+        2,
+        """values = pl.load(x, [0, 0], [16, 16])
+result = pl.matmul(values, values)
+pl.tpush_to_aiv(result, split=0)""",
+        """received: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+core = pl.tile.get_block_idx()
+if core < 1:
+    result = pl.add(received, received)
+    out = pl.store(result, [0, 0], out)
+pl.tfree_to_aic(received)
+return out""",
+    )
+    _check_peer_region_fallback(source, "A live FIFO handle crosses structured control")
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.usefixtures("ascend_backend")
 def test_hard_mix_syncall_separates_runtime_work_regions(tmp_path):
     snapshots = []
 
@@ -331,7 +396,7 @@ def test_hard_mix_syncall_separates_runtime_work_regions(tmp_path):
 
     mixed_cut = "pl.system.syncall(core_type=pl.KernelType.MIX)"
     source = _mat_receive_epilogue(
-        128, "BF16", 2, loop=(1, 1), work_items=5, region_boundaries=(mixed_cut,) * 2
+        128, "BF16", 2, loop=(1, 1), work=_PeerWorkLoop(5), region_boundaries=(mixed_cut,) * 2
     )
     cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
     with passes.PassContext(
@@ -373,7 +438,7 @@ def test_runtime_work_regions_require_hard_mix_syncall(boundary, reason):
         "BF16",
         2,
         loop=(1, 1),
-        work_items=5,
+        work=_PeerWorkLoop(5),
         region_boundaries=(boundary,),
     )
     _check_peer_region_fallback(source, reason)
@@ -458,7 +523,7 @@ def _check_peer_region_fallback(source, reason):
 def test_runtime_work_loop_requires_positive_stride():
     # A core index may be zero. The same ready scalar is safe as a start but
     # cannot serve as an unconditionally positive loop step.
-    source = _mat_receive_epilogue(128, "BF16", 2, loop=(1, 1), work_items=5, work_stride="core")
+    source = _mat_receive_epilogue(128, "BF16", 2, loop=(1, 1), work=_PeerWorkLoop(5, stride="core"))
     with passes.PassContext(
         [],
         memory_planner=passes.MemoryPlanner.PYPTO,

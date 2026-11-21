@@ -28,6 +28,7 @@ Multiple explicit pipes:
 
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from textwrap import indent
 
@@ -159,6 +160,13 @@ class PairedConsumer:
 """)
 
 
+@dataclass(frozen=True)
+class _PeerWorkLoop:
+    items: int
+    stride: str = "workers"
+    guarded_until: int | None = None
+
+
 def _mat_receive_epilogue(
     width,
     dtype,
@@ -167,8 +175,7 @@ def _mat_receive_epilogue(
     sends=4,
     loop=None,
     two_readers=False,
-    work_items=None,
-    work_stride="workers",
+    work: _PeerWorkLoop | None = None,
     region_boundaries=(),
     pad=None,
 ):
@@ -202,14 +209,16 @@ def _mat_receive_epilogue(
 
     def work_loop(statements, prefix, suffix):
         body = "\n".join(statements)
-        if work_items is None:
+        if work is None:
             return body
+        if work.guarded_until is not None:
+            body = f"if work < {work.guarded_until}:\n" + indent(body, "    ")
         return "\n".join(
             [
                 *prefix,
                 "core = pl.tile.get_block_idx()",
                 "workers = pl.tile.get_block_num()",
-                f"for work in pl.range(core, {work_items}, {work_stride}):",
+                f"for work in pl.range(core, {work.items}, {work.stride}):",
                 indent(body, "    "),
                 *suffix,
             ]

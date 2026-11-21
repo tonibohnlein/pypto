@@ -32,8 +32,11 @@ def _program(
     alias: str = "",
     columns: str = "16",
     fresh_writer: bool = False,
+    rank_one_extent: str = "length",
 ) -> ir.Program:
-    source = f"pl.Tensor[[16, {columns}], pl.FP32]" if rank_two else "pl.Tensor[[length], pl.INT32]"
+    source = (
+        f"pl.Tensor[[16, {columns}], pl.FP32]" if rank_two else f"pl.Tensor[[{rank_one_extent}], pl.INT32]"
+    )
     coordinates = f"[{coordinate}, 0]" if rank_two else f"[{coordinate}]"
     update = (
         "\n        tile = pl.load(out, [0, 0], [16, 16], target_memory=pl.Mem.Vec)"
@@ -113,7 +116,12 @@ def _context(disjoint: bool, instruments=(), enable_buffer_ir=True) -> passes.Pa
             "aliases a GM write",
             id="same-root-actual",
         ),
-        pytest.param({"position_type": "INDEX"}, False, "scalar GM address", id="unbounded-byte-offset"),
+        pytest.param(
+            {"position_type": "INDEX", "rank_one_extent": str(2**61 + 1)},
+            False,
+            "scalar GM address",
+            id="oversized-static-byte-offset",
+        ),
         pytest.param({"rank_two": True, "coordinate": "16"}, False, "scalar GM address", id="out-of-bounds"),
         pytest.param(
             {"rank_two": True, "columns": "length"}, False, "static inner extent", id="dynamic-pitch"
@@ -135,6 +143,9 @@ def test_original_peer_scalar_load_delegates_without_qualification(options, disj
     "options,disjoint",
     [
         pytest.param({}, False, id="read-only-dispatch"),
+        # The original host Tensor ABI bounds the in-bounds INDEX even though
+        # the kernel's rank-one shape is symbolic.
+        pytest.param({"position_type": "INDEX"}, False, id="direct-host-dynamic-extent"),
         pytest.param({"writer": True, "fresh_writer": True}, False, id="fresh-writer-under-may-alias"),
         pytest.param({"writer": True}, True, id="rank-one-read-with-disjoint-writer"),
         pytest.param({"writer": True, "rank_two": True}, True, id="rank-two-read-with-disjoint-writer"),

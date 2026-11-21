@@ -26,6 +26,8 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
+#include "src/ir/transforms/utils/closed_prefix_sync.h"
+#include "src/ir/transforms/utils/conservative_sync_dataflow.h"
 #include "src/ir/transforms/utils/peer_local_effects.h"
 #include "src/ir/transforms/utils/peer_local_work_loop.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
@@ -242,6 +244,18 @@ class CompletePeerPath : public SyncStatementMutator {
   }
 };
 
+FunctionPtr CompleteTerminalLanes(const FunctionPtr& owner, std::vector<StmtPtr> statements,
+                                  const StmtPtr& else_body, const char* completion_op) {
+  const auto original = As<IfStmt>(statements.back());
+  auto branch = MutableCopy(original);
+  branch->then_body_ = CompletePeerPath(owner->func_type_, completion_op).Run(original->then_body_);
+  branch->else_body_ = CompletePeerPath(owner->func_type_, completion_op).Run(else_body);
+  statements.back() = branch;
+  auto result = MutableCopy(owner);
+  result->body_ = SeqStmts::Flatten(std::move(statements), owner->span_);
+  return result;
+}
+
 // Each lane is planned in its original lexical scope. The endpoint has a
 // single terminal subblock branch, so the arms can share exactly the prefix
 // whose physical commands agree on both paths.
@@ -259,13 +273,28 @@ FunctionPtr JoinLanes(const FunctionPtr& then_plan, const FunctionPtr& else_plan
     const auto lhs = As<EvalStmt>(left[i]), rhs = As<EvalStmt>(right[i]);
     CHECK(lhs && rhs && structural_equal(lhs, rhs)) << "Peer local lane schedules disagree before the branch";
   }
-  auto branch = MutableCopy(a);
-  branch->then_body_ = CompletePeerPath(then_plan->func_type_, completion_op).Run(a->then_body_);
-  branch->else_body_ = CompletePeerPath(else_plan->func_type_, completion_op).Run(*b->else_body_);
-  left.back() = branch;
-  auto result = MutableCopy(then_plan);
-  result->body_ = SeqStmts::Flatten(std::move(left), then_plan->span_);
-  return result;
+  return CompleteTerminalLanes(then_plan, std::move(left), *b->else_body_, completion_op);
+}
+
+FunctionPtr PlanStructuredEndpoint(const PeerLocalEffects& effects) {
+  const auto& imported = *effects.structured;
+  const auto& target = effects.lanes.front().input.hardware_target;
+  SyncNativeReservations reserved;
+  for (const auto& lane : effects.lanes) {
+    for (const auto& [direction, ids] : lane.reservations) {
+      reserved[direction].insert(ids.begin(), ids.end());
+    }
+  }
+  const auto analysis = AnalyzeConservativeSync(
+      imported.owner, target, {}, {}, /*retain_incoming_diagnostics=*/false,
+      /*automatic_children=*/false, /*enable_refresh_kill=*/false, effects.parameters, std::nullopt,
+      /*enable_loop_prefixes=*/false, &imported);
+  const auto logical = InsertConservativePrefixes(analysis);
+  CheckGeneratedLogicalSync(logical);
+  const auto physical = TryLowerClosedPrefixSync(logical, target, std::nullopt, reserved, effects.parameters,
+                                                 std::nullopt, &imported);
+  CHECK(physical) << "No closed-prefix schedule for the imported peer endpoint";
+  return physical->function;
 }
 
 }  // namespace
@@ -279,8 +308,17 @@ FunctionPtr RealizePeerLocalPlan(const PeerLocalEffects& effects) {
   CHECK(execution.set_completes_source_prefix && execution.wait_consumes_before_advance &&
         execution.terminal_completion_op)
       << "Unavailable peer local event execution contract";
-  auto plan = PlanLane(effects.lanes.front(), execution);
-  if (effects.lanes.size() == 2) {
+  auto plan =
+      effects.structured ? PlanStructuredEndpoint(effects) : PlanLane(effects.lanes.front(), execution);
+  if (effects.structured && effects.structured->terminal_branch) {
+    auto body = transform_utils::FlattenToStmts(plan->body_);
+    const auto branch = body.empty() ? nullptr : As<IfStmt>(body.back());
+    INTERNAL_CHECK(branch && branch->else_body_ &&
+                   branch->condition_ == effects.structured->terminal_branch->condition_)
+        << "Original terminal peer branches must retain their control cut";
+    plan =
+        CompleteTerminalLanes(plan, std::move(body), *branch->else_body_, execution.terminal_completion_op);
+  } else if (effects.lanes.size() == 2) {
     const auto& other = effects.lanes.back();
     INTERNAL_CHECK(other.input.owner == input.owner && other.input.hardware_target == input.hardware_target);
     plan = JoinLanes(plan, PlanLane(other, execution), execution.terminal_completion_op);
