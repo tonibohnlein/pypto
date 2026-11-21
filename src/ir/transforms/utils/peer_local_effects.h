@@ -63,6 +63,9 @@ struct PeerLocalEffects {
   std::optional<ImportedLocalSync> structured;
   SyncParameterBounds parameters;
   PeerGmEffects gm;
+  // An authored publication seam separates independently checked cached GM
+  // reads. Local storage dependencies still span the original seam.
+  std::vector<PeerGmEffects> gm_phases;
 };
 
 // Recover the native physical effects at their original statement cuts. Throws
@@ -70,7 +73,8 @@ struct PeerLocalEffects {
 PeerLocalEffects ImportPeerLocalEffects(const FunctionPtr& function,
                                         const cross_core_pipe::PeerTransportEffects& transport,
                                         const std::string& target, const SyncParameterBounds& parameters,
-                                        const std::optional<SyncDispatchCoordinates>& dispatch);
+                                        const std::optional<SyncDispatchCoordinates>& dispatch,
+                                        const Stmt* authored_acquire = nullptr);
 
 }  // namespace pypto::ir::sync
 

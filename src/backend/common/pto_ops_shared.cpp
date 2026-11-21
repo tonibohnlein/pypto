@@ -102,6 +102,7 @@ const PtoNativeOpSpec& GetPtoNativeOpSpec(std::string_view logical_op) {
       {"tile.col_expand_max", {"pto.tcolexpandmax"}},
       {"tile.col_expand_min", {"pto.tcolexpandmin"}},
       {"tile.transpose", {"pto.ttrans"}},
+      {"tile.concat", {"pto.tconcat"}},
   };
   const auto found = specs.find(logical_op);
   INTERNAL_CHECK(found != specs.end())

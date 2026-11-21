@@ -128,7 +128,8 @@ class BufferValidAnalysis : public IRVisitor {
         vector_reshape = false;
     }
     if ((IsOp(call, "tile.reshape") && !vector_reshape && !HasIndependentStaticReshape(call)) ||
-        IsOp(call, "tile.reinterpret_view") || IsOp(call, "tile.assemble") || IsOp(call, "tile.move") ||
+        IsOp(call, "tile.reinterpret_view") || IsOp(call, "tile.assemble") ||
+        (IsOp(call, "tile.move") && !backend::SupportsLogicalBufferVecCopy(call)) ||
         (IsOp(call, "tile.extract") && (!HasFullStaticVecExtract(call) || views_.IsWindow(call->args_[0]))) ||
         IsOp(call, "tile.transpose_view") || IsOp(call, "tile.matmul") || IsOp(call, "tile.matmul_acc") ||
         IsOp(call, "tile.transpose")) {

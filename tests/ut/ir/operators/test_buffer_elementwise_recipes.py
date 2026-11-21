@@ -46,12 +46,34 @@ def _call(suffix, args, **kwargs):
 
 def test_reported_recipes_are_the_actual_sorted_independent_snapshot():
     expected = sorted(
-        ir.get_op(f"tile.{suffix}").name for suffix in [*[s for s, _ in _RECIPES], *_SCALAR_RECIPES]
+        ir.get_op(f"tile.{suffix}").name
+        for suffix in [*[s for s, _ in _RECIPES], *_SCALAR_RECIPES, "concat", "rsqrt"]
     )
     names = backend.get_buffer_elementwise_recipe_names()
     assert names == expected
     names.clear()
     assert backend.get_buffer_elementwise_recipe_names() == expected
+
+
+def test_concat_requires_full_blocks_and_an_exact_column_sum():
+    left = _buffer("left", shape=[16, 8])
+    right = _buffer("right", shape=[16, 16])
+    out = _buffer("out", shape=[16, 24])
+    call = _call("concat", [left, right, out])
+    assert isinstance(call.type, ir.VoidType)
+    for operand, effect in enumerate([ir.BufferAccess.Read, ir.BufferAccess.Read, ir.BufferAccess.Write]):
+        assert ir.get_op_buffer_arg_effect(call.op.name, operand).data == effect
+    for invalid in (
+        _buffer("misaligned", shape=[16, 7]),
+        _buffer("partial", shape=[16, 8], valid_shape=[8, 8]),
+        _buffer("dynamic", shape=[16, 8], valid_shape=[-1, 8]),
+        _buffer("short", shape=[8, 8]),
+        _buffer("wrong_type", shape=[16, 8], dtype=DataType.INT32),
+    ):
+        with pytest.raises(ValueError, match="full-valid block-aligned dense Vec"):
+            _call("concat", [invalid, right, out])
+    with pytest.raises(ValueError, match="destination columns equal to the sum"):
+        _call("concat", [left, right, _buffer("wide", shape=[16, 32])])
 
 
 @pytest.mark.parametrize("suffix,input_count", _RECIPES)

@@ -17,6 +17,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "pypto/ir/program.h"
 #include "src/ir/transforms/utils/sync_loop_trip_proof.h"
@@ -40,6 +41,11 @@ class PeerInvocationGmEvidence {
                                                               size_t workspace_formal);
   void CheckHostRankOneExtent(const FunctionPtr& group, size_t formal) const;
   void CheckScalarReads(const FunctionPtr& group, const PeerGmEffects& effects, bool disjoint_gm) const;
+  // The authored publication seam does not imply that arbitrary external
+  // GM tensors are disjoint. Check the raw readers against concurrent writes
+  // in each phase and prove the hidden FFTS scratch is isolated.
+  void CheckAuthoredGM(const FunctionPtr& group, size_t workspace_formal,
+                       const std::vector<PeerGmEffects>& phases, bool disjoint_gm);
 
  private:
   struct State;

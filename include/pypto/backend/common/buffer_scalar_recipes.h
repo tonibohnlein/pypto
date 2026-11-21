@@ -33,6 +33,10 @@ bool SupportsLogicalBufferScalar(const ir::CallPtr& call);
 // Packed rank-one or rank-two ABI for point staging. This proves geometry, not input
 // address validity, external publication, alias disjointness or scalar readiness.
 bool IsBufferScalarGMSource(const ir::TensorTypePtr& tensor);
+
+// Raw pto.load uses packed scalar address arithmetic. Dynamic row pitch is
+// expressible from the INDEX ABI and has no DMA burst-field constraint.
+bool IsPackedBufferGMPointSource(const ir::TensorTypePtr& tensor);
 // Uncached behavior is not assumed. The native AIC pointer read retains the
 // original caller's validity precondition and needs read-only alias evidence
 // over the invocation before PyPTO may own local synchronization.

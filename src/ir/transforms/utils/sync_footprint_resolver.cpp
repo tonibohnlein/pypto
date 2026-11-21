@@ -332,8 +332,17 @@ void SyncFootprintResolver::RequireVecCopyPlacement(const backend::BufferSyncOpe
   if (!IsOp(call, "buffer.copy") || operation.Implementation().Pipe() != PipeType::V) return;
   constexpr int64_t kBlockBytes = 32;
   const auto full_window = [&](const ExprPtr& operand) {
-    const auto window = ExactFullWindow(operand);
-    const auto bytes = backend::DenseBufferBytes(As<BufferType>(operand->GetType()));
+    const auto type = As<BufferType>(operand->GetType());
+    const auto* view = ViewOf(operand);
+    // Row-prefix TMOV uses a contiguous prefix of a placed allocation.
+    // The allocation enclosure is suitable for alignment and separation,
+    // but does not certify a whole-window overwrite.
+    const bool row_prefix =
+        backend::IsMinimumPaddedVecRowGeometry(type) || backend::IsColumnVectorBufferGeometry(type);
+    const auto window = row_prefix && view && view->kind == SyncViewKind::PlacedLocal && !view->peer_borrow
+                            ? view->byte_hull
+                            : ExactFullWindow(operand);
+    const auto bytes = backend::PhysicalBufferBytes(type);
     CHECK_SPAN(window && bytes && window->begin % kBlockBytes == 0 &&
                    __int128(window->end) - window->begin == *bytes,
                call->span_)
@@ -541,8 +550,8 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
 
     if (elem_type->memory_space_ == MemorySpace::Vec && elem_type->shape_.size() == 2 && rows > 0 &&
         cols > 0 && elem_type->dtype_.GetBit() % 8 == 0 &&
-        (backend::DenseBufferBytes(elem_type) || backend::IsColumnVectorBuffer(elem_type) ||
-         backend::IsFullPaddedVec(elem_type))) {
+        (backend::DenseBufferBytes(elem_type) || backend::IsColumnVectorBufferGeometry(elem_type) ||
+         backend::IsFullPaddedVec(elem_type) || backend::IsMinimumPaddedVecRowGeometry(elem_type))) {
       const int64_t elem_bytes = elem_type->dtype_.GetByte();
       view.row_pitch_bytes = cols * elem_bytes;
       if (!multi) {

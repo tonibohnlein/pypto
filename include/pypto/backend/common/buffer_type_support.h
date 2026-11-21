@@ -80,6 +80,19 @@ inline bool SupportsMatrixBufferPadding(ir::MemorySpace space, DataType dtype, i
                                        (space == ir::MemorySpace::Mat || space == ir::MemorySpace::Left));
 }
 
+/// A2/A3 compact FP32 Acc reads and writes use the row pitch of the
+/// active mad box. Accept a compact descriptor only if that rounded pitch
+/// is exactly the declared physical pitch. The storage model then keeps
+/// the same complete L0C byte enclosure as a noncompact descriptor.
+inline bool SupportsMatrixBufferCompact(ir::MemorySpace space, DataType dtype, ir::CompactMode compact,
+                                        int64_t rows, int64_t valid_rows) {
+  constexpr int64_t kFp32AccRows = 16;
+  return compact == ir::CompactMode::null ||
+         (compact == ir::CompactMode::normal && space == ir::MemorySpace::Acc && dtype == DataType::FP32 &&
+          rows >= kFp32AccRows && rows % kFp32AccRows == 0 && valid_rows <= rows &&
+          valid_rows > rows - kFp32AccRows);
+}
+
 /// Runtime Acc row-store metadata keeps the static NZ physical pitch. This
 /// descriptor predicate proves no runtime equality/range/availability; those
 /// are checked at the actual store by BufferRuntimeValidAnalysis.
@@ -178,6 +191,29 @@ inline bool IsFullZeroPaddedVec(const ir::BufferTypePtr& type) {
   return IsFullPaddedVec(type) && type->pad_ == ir::PadValue::zero;
 }
 
+/// The pad tag travels with a full-column row prefix of a materialized tile.
+/// A mutable descriptor does not alone prove its actual extents. Consumers
+/// must check matching positive runtime rows and full columns at the use.
+inline bool IsMinimumPaddedVecRowGeometry(const ir::BufferTypePtr& type) {
+  return IsAlignedDenseVecBufferGeometry(type, ir::PadValue::min) &&
+         IsBufferMaterializedVecPad(type->pad_, type->dtype_) && type->valid_shape_[0] != 0 &&
+         (type->valid_shape_[1] == -1 || type->valid_shape_[1] == type->shape_[1]);
+}
+
+inline bool IsMinimumPaddedVecRowPrefix(const ir::TileTypePtr& tile, const ir::TileView& view) {
+  if (tile->shape_.size() != 2 || !IsDenseVecBufferTile(tile, view, ir::PadValue::min) ||
+      !IsBufferMaterializedVecPad(view.pad, tile->dtype_) || view.valid_shape.size() != 2) {
+    return false;
+  }
+  const auto columns = ir::As<ir::ConstInt>(view.valid_shape[1]);
+  const auto capacity = ir::As<ir::ConstInt>(tile->shape_[1]);
+  if (!columns || !capacity || columns->value_ != capacity->value_) {
+    return false;
+  }
+  const auto rows = ir::As<ir::ConstInt>(view.valid_shape[0]);
+  return rows ? rows->value_ > 0 : ir::AsVarLike(view.valid_shape[0]) != nullptr;
+}
+
 // Replay carriers preserve the transport type while supplying zero bytes.
 // Keep their logical validity immutable to distinguish them from active
 // dynamic descriptors in the ordinary operation contracts.
@@ -222,12 +258,14 @@ inline std::vector<int64_t> MutableBufferValidShape(const std::vector<ir::ExprPt
 /// Physical descriptor projection shared by native operation recipes. The
 /// returned full-shape valid fields describe capacity only, never the actual
 /// active domain; a caller must separately certify original valid metadata.
-inline ir::BufferTypePtr PhysicalLogicalVecDescriptor(const ir::TypePtr& type, bool allow_full_pad = false) {
+inline ir::BufferTypePtr PhysicalLogicalVecDescriptor(const ir::TypePtr& type, bool allow_full_pad = false,
+                                                      bool allow_row_prefix_pad = false) {
   const auto tile = ir::As<ir::TileType>(type);
   if (!tile || (tile->shape_.size() != 1 && tile->shape_.size() != 2)) return nullptr;
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
   if (!IsDenseVecBufferTile(tile, view) && !IsColumnVectorBufferTile(tile, view) &&
-      !(allow_full_pad && IsFullPaddedVec(tile, view)))
+      !(allow_full_pad && IsFullPaddedVec(tile, view)) &&
+      !(allow_row_prefix_pad && IsMinimumPaddedVecRowPrefix(tile, view)))
     return nullptr;
   const auto offset = ir::As<ir::ConstInt>(view.start_offset);
   if (view.start_offset && (!offset || offset->value_ != 0)) return nullptr;

@@ -74,6 +74,12 @@ const std::vector<BufferAxisRecipe>& GetBufferAxisRecipes() {
   return recipes;
 }
 
+static bool AllowsMinimumPaddedRows(const BufferAxisRecipe& recipe, size_t operand) {
+  const std::string_view operation = recipe.buffer_op;
+  return ((operation == "buffer.row_max" || operation == "buffer.row_sum") && operand == 0) ||
+         (operation == "buffer.row_expand_sub" && (operand == 0 || operand == 2));
+}
+
 const BufferAxisRecipe* FindLogicalBufferAxisRecipe(const std::string& name) {
   static const auto index = [] {
     std::unordered_map<std::string, const BufferAxisRecipe*> result;
@@ -191,7 +197,8 @@ const char* OperandError(const BufferAxisRecipe& recipe, const std::vector<ir::B
                type->memory_space_ != ir::MemorySpace::Vec || type->blayout_ != ir::TileLayout::row_major ||
                type->slayout_ != ir::TileLayout::none_box || type->fractal_ != 512 ||
                (type->pad_ != ir::PadValue::null &&
-                !((i == 0 || (!recipe.reduction && i == 2)) && IsFullPaddedVec(type))) ||
+                !((i == 0 || (!recipe.reduction && i == 2)) && IsFullPaddedVec(type)) &&
+                !(AllowsMinimumPaddedRows(recipe, i) && IsMinimumPaddedVecRowGeometry(type))) ||
                type->compact_ != ir::CompactMode::null || type->shape_[1] % 8 != 0) {
       return "requires aligned rank-2 row-major Vec FP32 operands";
     }
@@ -365,10 +372,12 @@ bool SupportsLogicalBufferAxis(const BufferAxisRecipe& recipe, const ir::CallPtr
              BufferColumnBroadcastEncodingError(recipe, types.back()) == nullptr;
     }
     if (recipe.axis != 1 || !MatchingLogicalRowValid(recipe, call)) return false;
-    types = {PhysicalLogicalVecDescriptor(call->args_[0]->GetType()),
+    types = {PhysicalLogicalVecDescriptor(call->args_[0]->GetType(), /*allow_full_pad=*/false,
+                                          AllowsMinimumPaddedRows(recipe, 0)),
              recipe.reduction ? StaticLogicalBufferDescriptor(call->args_[1]->GetType())
                               : PhysicalLogicalVecDescriptor(call->args_[1]->GetType()),
-             PhysicalLogicalVecDescriptor(call->GetType())};
+             PhysicalLogicalVecDescriptor(call->GetType(), /*allow_full_pad=*/false,
+                                          AllowsMinimumPaddedRows(recipe, 2))};
   }
   return OperandError(recipe, types) == nullptr && RuntimeRowEncodingError(recipe, types) == nullptr;
 }

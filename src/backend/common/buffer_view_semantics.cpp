@@ -57,6 +57,59 @@ std::optional<uint64_t> PhysicalBufferBytes(const ir::BufferTypePtr& type) {
   return bytes;
 }
 
+bool SupportsA2A3VecCopyDescriptor(const ir::BufferTypePtr& type) {
+  const auto bytes = PhysicalBufferBytes(type);
+  constexpr uint64_t kBlockBytes = 32;
+  return bytes && *bytes / kBlockBytes <= std::numeric_limits<uint16_t>::max() &&
+         ((IsAlignedDenseVecBufferGeometry(type) && type->shape_ == type->valid_shape_) ||
+          IsMinimumPaddedVecRowGeometry(type) ||
+          (IsColumnVectorBufferGeometry(type) && type->valid_shape_[0] != 0 &&
+           (type->valid_shape_[1] == -1 || type->valid_shape_[1] == 1)));
+}
+
+bool SupportsLogicalBufferVecCopy(const ir::CallPtr& call) {
+  if (call->args_.size() != 1) {
+    return false;
+  }
+  const auto source = ir::As<ir::TileType>(call->args_[0]->GetType());
+  const auto target = ir::As<ir::TileType>(call->GetType());
+  if (!source || !target) {
+    return false;
+  }
+  const auto view = ir::tile_view_semantics::GetEffectiveTileView(*target);
+  if (view != ir::tile_view_semantics::GetEffectiveTileView(*source)) {
+    return false;
+  }
+  const bool row_prefix = IsMinimumPaddedVecRowPrefix(source, view);
+  const bool contiguous_column = IsColumnVectorBufferTile(source, view);
+  const auto a = (row_prefix || contiguous_column)
+                     ? PhysicalLogicalVecDescriptor(source, /*allow_full_pad=*/false, row_prefix)
+                     : StaticLogicalBufferDescriptor(source);
+  const auto b = (row_prefix || contiguous_column)
+                     ? PhysicalLogicalVecDescriptor(target, /*allow_full_pad=*/false, row_prefix)
+                     : StaticLogicalBufferDescriptor(target);
+  if (contiguous_column) {
+    const auto& valid = view.valid_shape.empty() ? source->shape_ : view.valid_shape;
+    const auto columns = valid.size() == 2 ? ir::As<ir::ConstInt>(valid[1]) : nullptr;
+    if (!columns || columns->value_ != 1) {
+      return false;
+    }
+  }
+  if (!SupportsA2A3VecCopyDescriptor(a) || !ir::structural_equal(a, b)) {
+    return false;
+  }
+  for (const auto& [name, value] : call->kwargs_) {
+    const bool valid =
+        (name == "target_memory" && call->GetKwarg<ir::MemorySpace>(name) == ir::MemorySpace::Vec) ||
+        (name == "blayout" && call->GetKwarg<ir::TileLayout>(name) == a->blayout_) ||
+        (name == "slayout" && call->GetKwarg<ir::TileLayout>(name) == a->slayout_);
+    if (!valid) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::optional<PeerTransferBuffer> DescribePeerTransferBuffer(const ir::TileTypePtr& tile) {
   if (!tile || tile->shape_.size() != 2) return std::nullopt;
   const auto space = tile->GetMemorySpace();

@@ -1583,6 +1583,7 @@ def _register_ops() -> None:  # noqa: PLR0915
         "relu",
         "log",
         "recip",
+        "concat",
     ):
         handler = m[f"tile.{suffix}"]
         m[f"buffer.{suffix}"] = lambda a, kw, fn=handler: (

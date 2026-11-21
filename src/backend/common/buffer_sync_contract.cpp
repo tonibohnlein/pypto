@@ -89,8 +89,7 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
                  [](unsigned char c) { return c == '.' ? '_' : std::toupper(c); });
   BufferSyncImplementation result{PipeType::ALL, "pto::" + macro, core, target};
   if (IsOp(call, "buffer.gm_read")) {
-    CHECK(core == FunctionType::AIC && target == "a2a3")
-        << "Blocking GM scalar access is qualified only for A2/A3 AIC";
+    CHECK(target == "a2a3") << "Blocking GM scalar access is qualified only for A2/A3";
     // PTOAS lowers pto.load on the raw pointer to a cacheable blocking
     // dereference. The invocation must exclude writes to that storage.
     result.pipe_ = PipeType::S;
@@ -150,15 +149,15 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
         destination->memory_space_ == MemorySpace::Vec) {
       result.pipe_ = PipeType::V;
       if (!extract) {
-        const auto bytes = DenseBufferBytes(source);
-        constexpr uint64_t kBlockBytes = 32;
-        CHECK(target == "a2a3" && core == FunctionType::AIV && IsAlignedDenseVecBufferGeometry(source) &&
-              source->shape_ == source->valid_shape_ && bytes &&
-              *bytes / kBlockBytes <= std::numeric_limits<uint16_t>::max())
-            << "Vec copy needs full static dense A2/A3 AIV block-burst geometry";
+        CHECK(target == "a2a3" && core == FunctionType::AIV && SupportsA2A3VecCopyDescriptor(source))
+            << "Vec copy needs full static dense A2/A3 AIV block-burst geometry or a qualified "
+               "minimum-padded row prefix or contiguous FP32 column";
         // The registered Vec copy has identical descriptors. A2/A3 TMovToVec
         // selects one copy_ubuf_to_ubuf burst on PIPE_V, with no implicit
-        // storage or numbered events; the importer proves actual placement.
+        // storage or numbered events. For a contiguous FP32 column that burst
+        // rounds active rows up to one complete block, bounded by the aligned
+        // allocation. The importer proves placement and BufferRuntimeValidAnalysis
+        // proves full columns and bounded active rows at runtime uses.
         result.audited_signal_free_variant_ = true;
       }
     } else {
@@ -207,6 +206,14 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
     result.audited_signal_free_variant_ = true;
   } else if (IsOp(call, "buffer.ci")) {
     CHECK(false) << "Synchronization import requires explicit workspace buffer.ci_workspace";
+  }
+  if (IsOp(call, "buffer.concat")) {
+    CHECK(target == "a2a3" && core == FunctionType::AIV)
+        << "Buffer concat requires the qualified A2/A3 AIV implementation";
+    // In pto-isa A2/A3 TConcat.hpp the ordinary three-operand overload issues
+    // only UB-to-UB copies on PIPE_V for block-aligned source widths. The
+    // registry excludes scalar tails and indexed forms, which use EVENT_ID0.
+    result.vec_concat_full_blocks_ = true;
   }
   if (IsOp(call, "buffer.cast")) {
     const auto source = As<BufferType>(call->args_[0]->GetType());
@@ -285,7 +292,8 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
   const bool vector = core == FunctionType::AIV;
   CHECK(vector ? (result.pipe_ == PipeType::MTE2 || result.pipe_ == PipeType::MTE3 ||
                   result.pipe_ == PipeType::V ||
-                  (result.pipe_ == PipeType::S && (IsOp(call, "buffer.read") || IsOp(call, "buffer.write"))))
+                  (result.pipe_ == PipeType::S &&
+                   (result.RequiresReadOnlyGM() || IsOp(call, "buffer.read") || IsOp(call, "buffer.write"))))
                : (result.pipe_ == PipeType::MTE2 || result.pipe_ == PipeType::MTE1 ||
                   result.pipe_ == PipeType::M || result.pipe_ == PipeType::FIX ||
                   (result.pipe_ == PipeType::S && result.RequiresReadOnlyGM())))
@@ -385,13 +393,18 @@ std::vector<sync::IsaResourceClaim> BufferSyncImplementation::Claims() const {
     // Acc->Mat FIXPIPE insert variant, never by the macro's name alone. The Vec
     // TEXTRACT / TINSERT helpers remain reserved when executed on AIV Vec.
     if ((mat_to_operand_extract_ || acc_to_mat_insert_) && claim.pool.core == CoreScope::AIV) continue;
-    // The macro catalog includes Handle32BAlignedPad_Byte. Suppress only
-    // that helper's known manual claim for the selected non-byte variant.
-    const sync::PoolKey byte_pad_pool{ResourceKind::PipelineEvent, CoreScope::AIV, ir::PipeType::V,
-                                      ir::PipeType::S, 0};
-    if (vec_fillpad_non_byte_ && claim.pool == byte_pad_pool && claim.source == IsaIdSource::Fixed &&
-        claim.lifetime == IsaResourceLifetime::Invocation && claim.ids.size() == 1 &&
-        claim.ids.front() == 0) {
+    // These catalog entries also cover overloads with scalar padding or
+    // scalar tails. Discharge only the known fixed events of those paths.
+    using ir::PipeType;
+    const auto& pool = claim.pool;
+    const bool vector_to_scalar = pool.src == PipeType::V && pool.dst == PipeType::S;
+    const bool concat_tail = vector_to_scalar || (pool.src == PipeType::S && pool.dst == PipeType::V) ||
+                             (pool.src == PipeType::MTE2 && pool.dst == PipeType::S) ||
+                             (pool.src == PipeType::S && pool.dst == PipeType::MTE3);
+    if (((vec_fillpad_non_byte_ && vector_to_scalar) || (vec_concat_full_blocks_ && concat_tail)) &&
+        pool.kind == ResourceKind::PipelineEvent && pool.core == CoreScope::AIV && pool.replica == 0 &&
+        claim.source == IsaIdSource::Fixed && claim.lifetime == IsaResourceLifetime::Invocation &&
+        claim.ids.size() == 1 && claim.ids.front() == 0) {
       continue;
     }
     CHECK(claim.pool.kind == ResourceKind::PipelineEvent &&

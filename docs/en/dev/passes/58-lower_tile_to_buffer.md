@@ -54,6 +54,10 @@ partition form before storage planning rather than failing during final lowering
 | col_sum/max/min/prod | FP32, positive static valid, sequential reduction |
 | col_expand_add/sub/mul/div/max/min | FP32, positive static valid, single-row carrier |
 | transpose | FP32, full-valid dense rank-2 matrices |
+| concat | FP16, BF16, FP32, INT32, full-valid 32-byte-aligned row-major Vec tiles, equal rows, disjoint destination with summed width |
+
+A2/A3 `TCONCAT` uses block copies without numbered flags or implicit workspace.
+Column-broadcast multiply accepts aligned, full-valid, constant-offset one-row windows.
 
 For aligned rank-2 Vec buffers with full valid columns, zero `fillpad` copies
 the active rows into disjoint storage and fills the remaining rows with zeros.
@@ -61,6 +65,11 @@ A runtime-empty input uses a full-destination zero fill. The full-valid result
 keeps its zero pad mode through supported casts and stores. The recipe requires
 placed storage from the PYPTO or DSA_RP planner and accounts for reads within
 the complete source allocation and writes to the complete destination.
+
+Minimum `fillpad` accepts runtime rows and columns proved positive and within capacity.
+A matching ceiling-division tile guard can prove a positive tail width. For full-column
+padded row prefixes, row max/sum, row broadcast subtract, exp, Vec copy and BF16/FP32
+cast preserve the active rows. Vec copy uses one aligned vector-pipe burst on disjoint placed buffers, rounding contiguous FP32 column copies to whole blocks.
 
 Scalar parameters use the existing scalar ABI; element operands receive explicit
 conversion during lowering. `full` followed by store also qualifies without a
@@ -414,6 +423,20 @@ Custom pipelines can call `passes.lower_tile_to_buffer()` once the same storage,
 SSA, return normalization, and device/orchestration separation invariants hold.
 `NoNestedCalls` is also required: run `FlattenCallExpr` before this boundary.
 The pass produces `BufferIR` and invalidates properties describing Tile storage.
+
+### Authored GM synchronization
+
+A3 FFTS setup, whole-GM cache invalidation and fencing, hard MIX rendezvous,
+and literal cross-core events retain their original call sites in Buffer IR.
+The native FFTS setup uses the INT64 tensor as a scratch pointer.
+
+With conservative PyPTO synchronization enabled, an original mixed Group
+can receive one atomic decision for its two local plans. The authored
+whole-GM cache invalidation, fence, hard MIX and final invalidation form a
+publication boundary for cached scalar reads. Qualification proves fresh FFTS
+scratch at the original launch and checks each raw read against all potentially
+aliased writes in its phase. The planner derives dependencies for the ordinary
+local payloads and leaves the authored cross-core event stream in place.
 
 ## Representation example
 

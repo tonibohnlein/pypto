@@ -11,9 +11,12 @@
 
 import pypto.language as pl
 import pytest
+import torch
 from pypto import ir, passes, testing
+from pypto.debug import torch_codegen
+from pypto.pypto_core import codegen
 
-from .test_select_buffer_ir_functions import _kernel, _lower
+from .test_select_buffer_ir_functions import _compile_dynamic_state_native, _kernel, _lower
 from .test_vec_sync_analysis import vec_fixture
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
@@ -133,3 +136,70 @@ def test_malformed_call_is_not_a_qualification_refusal():
     call = ir.Call(ir.get_op("buffer.load"), [], ir.VoidType(), ir.Span.unknown())
     with pytest.raises(ValueError, match="argument|requires|operand"):
         testing.describe_buffer_sync_operation(call, ir.FunctionType.AIV)
+
+
+def test_concat_uses_the_flag_free_vector_copy_variant(tmp_path):
+    program = pl.parse_program("""
+@pl.program
+class Concat:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[4, 8], pl.FP32], b: pl.Tensor[[4, 16], pl.FP32],
+               out: pl.Out[pl.Tensor[[4, 24], pl.FP32]]) -> pl.Tensor[[4, 24], pl.FP32]:
+        left = pl.load(a, [0, 0], [4, 8])
+        right = pl.load(b, [0, 0], [4, 16])
+        value = pl.tile.concat(left, right)
+        return pl.store(value, [0, 0], out)
+""")
+    planner = passes.MemoryPlanner.PYPTO
+    lowered = _lower(program, planner)
+    function = _kernel(lowered)
+    assert function.ir_stage == ir.FunctionIRStage.Buffer
+    (concat,) = _calls(function, ["buffer.concat"])
+    operation = testing.describe_buffer_sync_operation(concat, function.func_type)
+    assert operation["pipe"] == ir.PipeType.V
+    assert [arg["data"] for arg in operation["arguments"]] == ["read", "read", "write"]
+    assert operation["implicit_effects"] == []
+    physical = testing.analyze_placed_sync(function, True).realize_physical("a2a3", list(range(6)))
+    assert physical["native_reserved_ids"] == []
+    pto = codegen.PTOCodegen().generate(lowered)
+    assert "pto.tconcat ins(" in pto
+    _compile_dynamic_state_native(lowered, tmp_path, planner)
+
+    namespace = {}
+    exec(torch_codegen(lowered), namespace)  # noqa: S102
+    left = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    right = -torch.arange(64, dtype=torch.float32).reshape(4, 16)
+    output = torch.empty(4, 24)
+    namespace["kernel"](left, right, output)
+    torch.testing.assert_close(output, torch.cat((left, right), dim=1))
+
+
+@pytest.mark.parametrize("rows,matrix_view", [(1, True), (4, False), (4, True)])
+def test_col_expand_mul_allows_an_aligned_one_row_view(tmp_path, rows, matrix_view):
+    cols = 32 if matrix_view else 16
+    matrix = (
+        f"pl.tile.slice(left, [{rows}, 16], [0, 16], valid_shape=[{rows}, 16])" if matrix_view else "left"
+    )
+    program = pl.parse_program(f"""
+@pl.program
+class Broadcast:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[{rows}, {cols}], pl.FP32], b: pl.Tensor[[1, 32], pl.FP32],
+               out: pl.Out[pl.Tensor[[{rows}, 16], pl.FP32]]) -> pl.Tensor[[{rows}, 16], pl.FP32]:
+        left = pl.load(a, [0, 0], [{rows}, {cols}])
+        right = pl.load(b, [0, 0], [1, 32])
+        matrix = {matrix}
+        carrier = pl.tile.slice(right, [1, 16], [0, 16], valid_shape=[1, 16])
+        value = pl.tile.col_expand_mul(matrix, carrier)
+        return pl.store(value, [0, 0], out)
+""")
+    planner = passes.MemoryPlanner.PYPTO
+    lowered = _lower(program, planner)
+    function = _kernel(lowered)
+    if rows != 1 and matrix_view:
+        # A multirow matrix advances with the physical stride at each repeat.
+        assert function.ir_stage == ir.FunctionIRStage.Functional
+        return
+    assert function.ir_stage == ir.FunctionIRStage.Buffer
+    assert _calls(function, ["buffer.col_expand_mul"])
+    _compile_dynamic_state_native(lowered, tmp_path, planner)

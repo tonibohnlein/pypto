@@ -84,10 +84,11 @@ std::string BufferTypeString(const ir::BufferTypePtr& type, const ir::Span& span
   if (backend::IsMatrixBufferSpace(space)) {
     CHECK_SPAN(type->shape_.size() == 2 && backend::IsMatrixBufferDtype(space, type->dtype_) &&
                    backend::SupportsMatrixBufferPadding(space, type->dtype_, type->pad_,
-                                                        type->shape_ == type->valid_shape_),
+                                                        type->shape_ == type->valid_shape_) &&
+                   backend::SupportsMatrixBufferCompact(space, type->dtype_, type->compact_, type->shape_[0],
+                                                        type->valid_shape_[0]),
                span)
-        << "Direct Buffer IR codegen requires qualified rank-2 cube operand or accumulator padding and dtype "
-           "in "
+        << "Direct Buffer IR codegen requires qualified rank-2 cube operand or accumulator geometry in "
         << ir::MemorySpaceToString(space);
   } else if (!backend::IsColumnVectorBufferGeometry(type)) {
     CHECK_SPAN(space == ir::MemorySpace::Vec &&
@@ -96,13 +97,13 @@ std::string BufferTypeString(const ir::BufferTypePtr& type, const ir::Span& span
                    type->blayout_ == ir::TileLayout::row_major &&
                    type->slayout_ == ir::TileLayout::none_box && type->fractal_ == 512 &&
                    (type->pad_ == ir::PadValue::null || backend::IsFullPaddedVec(type) ||
-                    backend::IsEmptyPaddedVec(type)) &&
+                    backend::IsEmptyPaddedVec(type) || backend::IsMinimumPaddedVecRowGeometry(type)) &&
                    type->compact_ == ir::CompactMode::null,
                span)
         << "Direct Buffer IR codegen currently requires dense row-major Vec "
            "FP16/BF16/FP32/INT32/INT16/UINT8/UINT32 "
            "buffers "
-           "with fractal=512, no compact mode, and qualified full-valid padding";
+           "with fractal=512, no compact mode, and qualified padding";
   }
   const bool vector = type->shape_.size() == 1;
   const int64_t rows = vector ? 1 : type->shape_[0];
@@ -122,7 +123,9 @@ std::string BufferTypeString(const ir::BufferTypePtr& type, const ir::Span& span
 }
 
 void CheckBufferTensorParameter(const ir::TensorTypePtr& tensor, const ir::Span& span) {
-  if (backend::IsBufferScalarGMSource(tensor)) return;
+  if (backend::IsBufferScalarGMSource(tensor) || ir::cross_core_pipe::IsFFTSWorkspace(tensor)) {
+    return;
+  }
   CHECK_SPAN((tensor->shape_.size() == 1 || tensor->shape_.size() == 2) &&
                  (backend::IsDenseBufferTransferDtype(tensor->dtype_) ||
                   backend::IsCubeOperandDtype(tensor->dtype_)),
@@ -439,6 +442,14 @@ class BufferEmissionPreflight : public ir::IRVisitor {
   }
 
   void VisitExpr_(const ir::CallPtr& call) override {
+    if (ir::cross_core_pipe::IsAuthoredGMProtocolCall(call)) {
+      CHECK_SPAN(conversion_supported_, call->span_) << "Direct Buffer GM protocol requires A2/A3";
+      if (ir::IsOp(call, "system.set_ffts")) {
+        CHECK_SPAN(tensor_parameters_.count(ir::As<ir::Var>(call->args_.front()).get()), call->span_)
+            << "Direct Buffer FFTS workspace must be a formal tensor";
+      }
+      return;
+    }
     if (ir::cross_core_pipe::IsPeerPipeSetup(call) || ir::cross_core_pipe::IsBufferPeerTransport(call) ||
         ir::cross_core_pipe::IsHardMixedSyncAll(call)) {
       CHECK_SPAN(conversion_supported_, call->span_) << "Direct Buffer peer transport requires A2/A3";
@@ -460,9 +471,10 @@ class BufferEmissionPreflight : public ir::IRVisitor {
     uses_spmd_subblock |= ir::IsOp(call, "buffer.get_subblock_idx");
     if (ir::IsOp(call, "buffer.read") || ir::IsOp(call, "buffer.write") || ir::IsOp(call, "buffer.gm_read")) {
       const bool gm_read = ir::IsOp(call, "buffer.gm_read");
-      const auto core = gm_read ? ir::FunctionType::AIC : ir::FunctionType::AIV;
-      CHECK_SPAN(conversion_supported_ && function_->func_type_ == core, call->span_)
-          << (gm_read ? "Direct Buffer GM scalar read requires A2/A3 AIC"
+      const bool supported_core = function_->func_type_ == ir::FunctionType::AIV ||
+                                  (gm_read && function_->func_type_ == ir::FunctionType::AIC);
+      CHECK_SPAN(conversion_supported_ && supported_core, call->span_)
+          << (gm_read ? "Direct Buffer GM scalar read requires A2/A3 AIC or AIV"
                       : "Direct Buffer local scalar access requires A2/A3 AIV");
       IRVisitor::VisitExpr_(call);
       return;
@@ -488,6 +500,10 @@ class BufferEmissionPreflight : public ir::IRVisitor {
           << "Runtime-valid Buffer row operations currently support A2/A3 only";
     }
     const auto* recipe = backend::FindBufferElementwiseRecipe(call->op_->name_);
+    if (ir::IsOp(call, "buffer.concat")) {
+      CHECK_SPAN(conversion_supported_ && function_->func_type_ == ir::FunctionType::AIV, call->span_)
+          << "Direct Buffer concat requires the qualified A2/A3 AIV implementation";
+    }
     CHECK_SPAN(recipe || backend::FindBufferAxisRecipe(call->op_->name_) ||
                    backend::FindBufferConversionRecipe(call->op_->name_) ||
                    backend::FindBufferIndexedRecipe(call->op_->name_) || ir::IsOp(call, "buffer.alloc") ||

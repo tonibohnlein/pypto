@@ -94,7 +94,7 @@ std::vector<int64_t> StaticExtents(const std::vector<ExprPtr>& extents, const Sp
 
 void CheckDenseVecTile(const TileTypePtr& tile, const TileView& view, const Span& span) {
   CHECK_SPAN(backend::IsDenseVecBufferTile(tile, view) || backend::IsFullPaddedVec(tile, view) ||
-                 backend::IsEmptyPaddedVec(tile, view),
+                 backend::IsEmptyPaddedVec(tile, view) || backend::IsMinimumPaddedVecRowPrefix(tile, view),
              span)
       << "LowerTileToBuffer: this recipe requires dense rank-1 or rank-2 Vec tiles with a supported "
          "storage dtype";
@@ -376,7 +376,8 @@ class StorageIndex : public IRVisitor {
         storage.members.begin(), storage.members.end(),
         [](const auto& member) { return backend::IsColumnVectorBufferGeometry(member.descriptor); });
     const bool has_pad = std::any_of(storage.members.begin(), storage.members.end(), [](const auto& member) {
-      return backend::IsFullPaddedVec(member.descriptor) || backend::IsEmptyPaddedVec(member.descriptor);
+      return backend::IsFullPaddedVec(member.descriptor) || backend::IsEmptyPaddedVec(member.descriptor) ||
+             backend::IsMinimumPaddedVecRowGeometry(member.descriptor);
     });
     const auto gather_workspace =
         std::find_if(storage.members.begin(), storage.members.end(),
@@ -551,6 +552,43 @@ class StorageIndex : public IRVisitor {
     }
   }
 
+  bool MaterializeFixedSlots(const Var* base, BufferStorage& storage, const BufferTypePtr& descriptor,
+                             uint64_t count, const Span& span) {
+    if (!addressed_ || !backend::IsMatrixBufferSpace(descriptor->memory_space_)) {
+      return false;
+    }
+    std::map<int64_t, VarPtr> handles_by_index;
+    for (const auto& member : storage.members) {
+      const auto index = As<ConstInt>(*member.memory->slot_index_);
+      if (!index) {
+        return false;
+      }
+      CHECK_SPAN(index->value_ >= 0 && static_cast<uint64_t>(index->value_) < count, member.span)
+          << "LowerTileToBuffer: literal slot is outside its planned allocation";
+      handles_by_index.try_emplace(index->value_, nullptr);
+    }
+    if (handles_by_index.size() < 2) {
+      return false;
+    }
+    // Distinct fixed-address native tiles preserve the planned slot
+    // addresses. This avoids sending co-live pto.multi_tile_get operations
+    // through the unsupported automatic insertion route (PTOAS #1519).
+    for (const auto& member : storage.members) {
+      const auto index = As<ConstInt>(*member.memory->slot_index_)->value_;
+      auto& handle = handles_by_index.at(index);
+      if (!handle) {
+        handle = std::make_shared<Var>(base->name_hint_ + "_slot_" + std::to_string(index), descriptor, span);
+        auto allocation = OpRegistry::GetInstance().CreateInternal(
+            "buffer.alloc",
+            {std::make_shared<MakeTuple>(std::vector<ExprPtr>{}, span), member.memory->byte_offset_}, {},
+            descriptor, span);
+        storage.definitions.push_back(std::make_shared<AssignStmt>(handle, allocation, span));
+      }
+      handles.emplace(member.tile.get(), handle);
+    }
+    return true;
+  }
+
   // Keep the allocation and its selectors explicit. A containing reservation
   // alone does not prove slot stride: compare each member's resolved address
   // against exactly base + index * physical-slot-bytes.
@@ -587,6 +625,9 @@ class StorageIndex : public IRVisitor {
                               static_cast<uint64_t>(*origin) % alignment == 0),
                span)
         << "LowerTileToBuffer: uniform slots require native-aligned stride and allocation base";
+    if (MaterializeFixedSlots(base, storage, descriptor, count, span)) {
+      return;
+    }
     auto multi = std::make_shared<MultiBufferType>(descriptor, static_cast<int64_t>(count));
     storage.handle = std::make_shared<Var>(base->name_hint_ + "_slots", multi, span);
     std::vector<ExprPtr> args{std::make_shared<MakeTuple>(std::vector<ExprPtr>{}, span)};
@@ -1111,8 +1152,8 @@ class TileToBufferMutator : public IRMutator {
   }
 
   StmtPtr LowerDefinition(const CallPtr& call, const VarPtr& result) {
-    if (cross_core_pipe::IsHardMixedSyncAll(call)) {
-      CHECK_SPAN(!result, call->span_) << "A hard MIX barrier has no result";
+    if (cross_core_pipe::IsHardMixedSyncAll(call) || cross_core_pipe::IsAuthoredGMProtocolCall(call)) {
+      CHECK_SPAN(!result, call->span_) << "An authored protocol marker has no result";
       return std::make_shared<EvalStmt>(call, call->span_);
     }
     if (cross_core_pipe::IsPeerPipeSetup(call) || op_predicates::IsTPush(call) ||
@@ -1339,9 +1380,10 @@ class TileToBufferMutator : public IRMutator {
     CHECK_SPAN(StripAttr(call->attrs_, kPipelineMembershipAttr).empty(), call->span_)
         << "LowerTileToBuffer: device-call attributes require an explicit conversion contract";
     if (IsOp(call, "tensor.read")) {
-      CHECK_SPAN(result && core_ == FunctionType::AIC && backend::SupportsBufferGMRead(call->args_),
+      CHECK_SPAN(result && (core_ == FunctionType::AIC || core_ == FunctionType::AIV) &&
+                     backend::SupportsBufferGMRead(call->args_),
                  call->span_)
-          << "LowerTileToBuffer: GM scalar read needs a qualified A2/A3 AIC pointer";
+          << "LowerTileToBuffer: GM scalar read needs a qualified packed A2/A3 pointer";
       auto value = OpRegistry::GetInstance().CreateInternal(
           "buffer.gm_read", {VisitExpr(call->args_[0]), VisitExpr(call->args_[1])}, {}, call->span_);
       return std::make_shared<AssignStmt>(result, value, call->span_);
@@ -1446,6 +1488,12 @@ class TileToBufferMutator : public IRMutator {
       if (conversion->kind == backend::BufferConversionKind::FillPad) {
         const auto source = Handle(call->args_[0]);
         const auto destination = Handle(result);
+        if (call->GetKwarg<PadValue>("pad_value", PadValue::zero) == PadValue::min) {
+          // Minimum padding is admitted only with positive, bounded source
+          // rows and columns. The empty-source zero-fill path below belongs
+          // exclusively to the zero-padding recipe.
+          return Operation(conversion->buffer_op, {source, destination}, call->span_);
+        }
         const auto rows = Valid(call->args_[0])->elements_[0];
         const auto constant = As<ConstInt>(rows);
         // TFillPad's row-copy loop requires a positive repeat count. Empty

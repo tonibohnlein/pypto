@@ -131,6 +131,7 @@ MIGRATION_FAMILIES = (
                 "tile.log",
                 "tile.recip",
                 "tile.div",
+                "tile.rsqrt",
             }
         ),
     ),
@@ -256,7 +257,7 @@ MIGRATION_FAMILIES = (
             # Direct cross-core FIXPIPE currently has a TileIR callback only.
             "tile.tpush_to_aiv_direct",
         ),
-        restricted=frozenset({"tile.move", "tile.cast", "tile.transpose"}),
+        restricted=frozenset({"tile.move", "tile.cast", "tile.transpose", "tile.concat"}),
     ),
     MigrationFamily(
         "G13: Views and valid metadata",

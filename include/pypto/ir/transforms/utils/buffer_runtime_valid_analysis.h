@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -63,6 +64,7 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
         check_payload_capacity_(check_payload_capacity) {
     if (function) {
       core_ = function->func_type_;
+      dual_aiv_ = core_ == FunctionType::AIV && function->GetAttr<bool>(kAttrDualAivDispatch);
       BindBufferAccTrimParameters(function, *analyzer_, ready_, positive_loop_parameters);
       if (function->body_) VisitStmt(function->body_);
     }
@@ -142,12 +144,28 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     }
     if (const auto scalar = As<ScalarType>(statement->var_->GetType());
         scalar && (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt())) {
-      auto range = Bounds(statement->value_);
+      auto range = GuardedTileTail(statement->value_);
+      if (!range) range = Bounds(statement->value_);
+      if (call && scalar->dtype_.IsSignedInt() && scalar->dtype_.GetBit() < 64 &&
+          (IsOp(call, "tensor.read") || IsOp(call, "tile.read") || IsOp(call, "buffer.gm_read") ||
+           IsOp(call, "buffer.read"))) {
+        // Only the representation range is known for a scalar memory value.
+        const int64_t max = (int64_t{1} << (scalar->dtype_.GetBit() - 1)) - 1;
+        range = arith::ConstIntBound{-max - 1, max};
+      }
+      if (dual_aiv_ && call && call->args_.empty() &&
+          (IsOp(call, "tile.get_subblock_idx") || IsOp(call, "buffer.get_subblock_idx"))) {
+        // The dual-AIV dispatch ABI supplies the two hardware lane IDs.
+        range = arith::ConstIntBound{0, 1};
+      }
       if (!range) {
         range = ObservedMinimum(statement, scalar->dtype_);
       }
       if (range) {
-        if (ready_.insert(statement->var_.get()).second) scalar_definitions_.push_back(statement->var_);
+        if (ready_.insert(statement->var_.get()).second) {
+          scalar_definitions_.push_back(statement->var_);
+          scalar_values_.emplace(statement->var_.get(), ScalarValue(statement->value_));
+        }
         analyzer_->const_int_bound.Update(statement->var_, *range);
       }
     }
@@ -196,7 +214,24 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     bound_cache_.clear();
     {
       BufferAccTrimGuardScope constraint(branch->condition_, true, analyzer_, guard_aliases_);
+      const auto tail = GetTileTailGuard(branch->condition_);
+      // A nested guard may prove the same ordinal and tile size using another
+      // extent. Keep the nearest such witness only for its own lexical body.
+      ExprPtr previous;
+      if (tail) {
+        const auto [entry, inserted] = tail_guards_.try_emplace(tail->first, tail->second);
+        if (!inserted) {
+          previous = std::exchange(entry->second, tail->second);
+        }
+      }
       VisitStmt(branch->then_body_);
+      if (tail) {
+        if (previous) {
+          tail_guards_.at(tail->first) = std::move(previous);
+        } else {
+          tail_guards_.erase(tail->first);
+        }
+      }
       RestoreScalars(checkpoint);
     }
     // Neither arm's mutations prove the other's initial metadata. The initial
@@ -223,6 +258,57 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     const auto type = expression ? As<ScalarType>(expression->GetType()) : nullptr;
     return type && (type->dtype_.IsSignedInt() || type->dtype_ == DataType::INDEX) &&
            (AsVarLike(expression) || As<ConstInt>(expression));
+  }
+
+  using TileTailKey = std::pair<VarPtr, int64_t>;
+  ExprPtr ScalarValue(const ExprPtr& value) const {
+    const auto var = AsVarLike(value);
+    const auto found = scalar_values_.find(var.get());
+    return found == scalar_values_.end() ? value : found->second;
+  }
+
+  std::optional<std::pair<TileTailKey, ExprPtr>> GetTileTailGuard(const ExprPtr& condition) {
+    const auto less = As<Lt>(condition);
+    if (!less) return std::nullopt;
+    const auto ordinal = AsVarLike(ScalarValue(less->left_));
+    const auto quotient = As<FloorDiv>(ScalarValue(less->right_));
+    const auto cap = quotient ? As<ConstInt>(quotient->right_) : nullptr;
+    const auto padded = quotient ? As<Add>(quotient->left_) : nullptr;
+    const auto adjustment = padded ? As<ConstInt>(padded->right_) : nullptr;
+    if (!ordinal || !cap || cap->value_ <= 0 || !adjustment || adjustment->value_ != cap->value_ - 1 ||
+        !Bounds(quotient->left_)) {
+      return std::nullopt;
+    }
+    const auto index = Bounds(less->left_);
+    if (!index || index->min_value < 0) return std::nullopt;
+    return std::make_pair(TileTailKey{ordinal, cap->value_}, padded->left_);
+  }
+
+  std::optional<arith::ConstIntBound> GuardedTileTail(const ExprPtr& value) {
+    const auto minimum = As<Min>(value);
+    if (!minimum) return std::nullopt;
+    const bool cap_on_right = As<ConstInt>(minimum->right_) != nullptr;
+    const auto cap = As<ConstInt>(cap_on_right ? minimum->right_ : minimum->left_);
+    const auto remainder = As<Sub>(cap_on_right ? minimum->left_ : minimum->right_);
+    const auto product = remainder ? As<Mul>(remainder->right_) : nullptr;
+    const auto step = product ? As<ConstInt>(product->right_) : nullptr;
+    const auto ordinal = product ? AsVarLike(ScalarValue(product->left_)) : nullptr;
+    if (!cap || !step || cap->value_ != step->value_ || !ordinal) return std::nullopt;
+    const auto guard = tail_guards_.find(TileTailKey{ordinal, cap->value_});
+    // Only compare the same typed extent, and first prove every subtraction
+    // operand and result representable. For i >= 0, i < (n+C-1)/C gives
+    // n+C-1 >= (i+1)*C, hence 1 <= min(n-i*C,C) <= C.
+    if (guard == tail_guards_.end() || !Bounds(remainder) ||
+        !SameTailExtent(guard->second, remainder->left_)) {
+      return std::nullopt;
+    }
+    return arith::ConstIntBound{1, cap->value_};
+  }
+
+  static bool SameTailExtent(const ExprPtr& a, const ExprPtr& b) {
+    if (a == b) return true;
+    const auto ca = As<Cast>(a), cb = As<Cast>(b);
+    return ca && cb && GetScalarDtype(ca) == GetScalarDtype(cb) && ca->operand_ == cb->operand_;
   }
   std::optional<arith::ConstIntBound> Bounds(const ExprPtr& value) {
     return BoundBufferAccTrimScalar(
@@ -330,6 +416,21 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
       if (!bound || bound->min_value <= 0 || bound->max_value > type->shape_[axis]) {
         Refuse(call, "Buffer runtime valid extent has no positive in-capacity bound");
       }
+    }
+  }
+
+  void CheckMatchingFullColumnRows(const CallPtr& call, const ExprPtr& source, const ExprPtr& destination,
+                                   const BufferTypePtr& type) {
+    const auto a = Extents(source);
+    const auto b = Extents(destination);
+    const auto columns = Constant(type->shape_[1], call->span_);
+    if (!a || !b || !Equal((*a)[0], (*b)[0]) || !Equal((*a)[1], columns) || !Equal((*b)[1], columns)) {
+      Refuse(call, call->op_->name_ + " requires matching runtime rows and fixed full columns");
+      return;
+    }
+    const auto rows = Bounds((*a)[0]);
+    if (!rows || rows->min_value < 1 || rows->max_value > type->shape_[0]) {
+      Refuse(call, call->op_->name_ + " requires positive runtime rows within physical capacity");
     }
   }
   void CheckCall(const CallPtr& call) {
@@ -479,6 +580,15 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
       }
       return;
     }
+    if ((IsOp(call, "buffer.copy") || IsOp(call, "buffer.exp")) && call->args_.size() == 2) {
+      const auto type = As<BufferType>(call->args_[0]->GetType());
+      const bool column_copy = IsOp(call, "buffer.copy") && backend::IsColumnVectorBufferGeometry(type);
+      if ((backend::IsMinimumPaddedVecRowGeometry(type) || column_copy) &&
+          (type->valid_shape_[0] < 0 || type->valid_shape_[1] < 0)) {
+        CheckMatchingFullColumnRows(call, call->args_[0], call->args_[1], type);
+      }
+      return;
+    }
     if (const auto* conversion = backend::FindBufferConversionRecipe(call->op_->name_);
         conversion && conversion->kind == backend::BufferConversionKind::Cast && call->args_.size() == 2) {
       bool dynamic = false;
@@ -490,6 +600,13 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
       const auto source = Extents(call->args_[0]);
       const auto target = Extents(call->args_[1]);
       const auto type = As<BufferType>(call->args_[0]->GetType());
+      const auto destination = As<BufferType>(call->args_[1]->GetType());
+      if (backend::IsMinimumPaddedVecRowGeometry(type) ||
+          backend::IsMinimumPaddedVecRowGeometry(destination)) {
+        CheckMatchingFullColumnRows(call, call->args_[0], call->args_[1],
+                                    backend::IsMinimumPaddedVecRowGeometry(type) ? type : destination);
+        return;
+      }
       if (!source || !target || !type) {
         Refuse(call,
                "Runtime cast valid metadata is unavailable at this use; restore owned allocation metadata");
@@ -537,6 +654,9 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
              "this use; unrelated dynamic descriptor fields are not equal metadata");
     } else if (!AtomicInteger((*source)[0]) || !analyzer_->CanProveGreaterEqual((*source)[0], 1)) {
       Refuse(call, "Row operation requires a proved positive-row guard at this use");
+    } else if (backend::IsMinimumPaddedVecRowGeometry(type) &&
+               (!Bounds((*source)[0]) || Bounds((*source)[0])->max_value > type->shape_[0])) {
+      Refuse(call, "Minimum-padded row operation requires runtime rows within physical capacity");
     }
   }
   void RestoreScalars(size_t checkpoint) {
@@ -545,13 +665,17 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
       analyzer_->Unbind(scalar_definitions_.back());
       ready_.erase(scalar_definitions_.back().get());
       guard_aliases_.erase(scalar_definitions_.back().get());
+      scalar_values_.erase(scalar_definitions_.back().get());
       scalar_definitions_.pop_back();
     }
   }
   FunctionType core_ = FunctionType::Opaque;
+  bool dual_aiv_ = false;
   std::unordered_set<const Var*> ready_, addressed_;
   BufferAccTrimBoundCache bound_cache_;
   std::unordered_map<const Var*, ExprPtr> guard_aliases_;
+  std::unordered_map<const Var*, ExprPtr> scalar_values_;
+  std::map<TileTailKey, ExprPtr> tail_guards_;
   std::vector<VarPtr> scalar_definitions_;
   uint64_t epoch_ = 0;
   arith::AnalyzerPtr analyzer_;

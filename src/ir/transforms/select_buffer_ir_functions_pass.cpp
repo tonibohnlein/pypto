@@ -159,12 +159,17 @@ class BufferKernelSupport : public IRVisitor {
       if (space && backend::IsMatrixBufferSpace(*space)) {
         const auto box = tile_view_semantics::GetBoxedTileAlignment(view, tile->dtype_);
         const bool full_valid = view.valid_shape.empty() || SameShape(view.valid_shape, tile->shape_);
+        const auto rows = As<ConstInt>(tile->shape_.front())->value_;
+        const auto valid_rows =
+            As<ConstInt>(view.valid_shape.empty() ? tile->shape_.front() : view.valid_shape.front());
         admission.Require(
             backend::IsMatrixBufferDtype(*space, tile->dtype_) && box &&
                 (view.fractal == (*space == MemorySpace::Acc ? 1024 : 512)) &&
                 (view.blayout == TileLayout::row_major || view.blayout == TileLayout::col_major) &&
                 backend::SupportsMatrixBufferPadding(*space, tile->dtype_, view.pad, full_valid) &&
-                view.compact == CompactMode::null && view.stride.empty(),
+                backend::SupportsMatrixBufferCompact(*space, tile->dtype_, view.compact, rows,
+                                                     valid_rows ? valid_rows->value_ : -1) &&
+                view.stride.empty(),
             BufferAdmissionProperty::TypeLayout);
         if (box)
           admission.Require(As<ConstInt>(tile->shape_[0])->value_ % box->rows == 0 && cols % box->cols == 0,
@@ -176,7 +181,8 @@ class BufferKernelSupport : public IRVisitor {
                                     ConstantEquals(view.stride[1], rows)),
             BufferAdmissionProperty::TypeLayout);
       } else {
-        const bool padded = backend::IsFullPaddedVec(tile, view) || backend::IsEmptyPaddedVec(tile, view);
+        const bool padded = backend::IsFullPaddedVec(tile, view) || backend::IsEmptyPaddedVec(tile, view) ||
+                            backend::IsMinimumPaddedVecRowPrefix(tile, view);
         const auto* context = PassContext::Current();
         // Pad mode belongs to a native tile object. Only placed plans can
         // declare independent metadata objects for reused padded storage.
@@ -264,7 +270,7 @@ class BufferKernelSupport : public IRVisitor {
     const auto call = As<Call>(expr);
     if (!op_predicates::IsInitializePipe(call) && !op_predicates::IsTPush(call) &&
         !op_predicates::IsTPop(call) && !op_predicates::IsTFree(call) &&
-        !cross_core_pipe::IsHardMixedSyncAll(call)) {
+        !cross_core_pipe::IsHardMixedSyncAll(call) && !cross_core_pipe::IsAuthoredGMProtocolCall(call)) {
       CheckType(physical_result == assigned_slot_types_.end() ? expr->GetType() : physical_result->second);
     }
     if (const auto var = AsVarLike(expr)) {
@@ -283,7 +289,8 @@ class BufferKernelSupport : public IRVisitor {
             if (admission.supported() && !loop_slots_.empty()) {
               const auto index = *memory->slot_index_;
               auto [entry, inserted] = loop_slots_.front().emplace(memory->base_.get(), index);
-              admission.Require(inserted || structural_equal(entry->second, index),
+              admission.Require(inserted || structural_equal(entry->second, index) ||
+                                    CanMaterializeFixedSlots(tile, memory, entry->second, index),
                                 BufferAdmissionProperty::ExpressionForm);
             }
           } else {
@@ -457,7 +464,10 @@ class BufferKernelSupport : public IRVisitor {
       admission.Require(false, BufferAdmissionProperty::OperationRecipe);
       return;
     }
+    const auto* original = evaluation_;
+    evaluation_ = As<Call>(eval->expr_).get();
     IRVisitor::VisitStmt_(eval);
+    evaluation_ = original;
   }
 
   void VisitStmt_(const ReturnStmtPtr& ret) override {
@@ -577,6 +587,16 @@ class BufferKernelSupport : public IRVisitor {
     }
     if (cross_core_pipe::IsHardMixedSyncAll(call)) {
       admission.Require(scalar_definition_ != call.get(), BufferAdmissionProperty::OperationRecipe);
+    } else if (cross_core_pipe::IsAuthoredGMProtocolCall(call)) {
+      admission.Require(evaluation_ == call.get(), BufferAdmissionProperty::OperationRecipe);
+      if (IsOp(call, "system.set_ffts")) {
+        // Only the directly bound parameter may bypass tile-transfer type
+        // admission. Every other use still traverses the ordinary type checks.
+        const auto workspace = As<Var>(call->args_.front());
+        admission.Require(directions_.count(workspace.get()) != 0, BufferAdmissionProperty::ParameterABI);
+        has_authored_ffts_ |= !region_;
+      }
+      return;
     } else if (cross_core_pipe::IsPeerPipeSetup(call)) {
       has_peer_setup = true;
       if (IsOp(call, "system.reserve_buffer") || IsOp(call, "system.import_peer_buffer")) {
@@ -687,8 +707,12 @@ class BufferKernelSupport : public IRVisitor {
                         BufferAdmissionProperty::OperationRecipe);
     } else if (IsOp(call, "tensor.read")) {
       const auto scalar = As<ScalarType>(call->GetType());
-      admission.Require(core_ == FunctionType::AIC && scalar_definition_ == call.get() &&
-                            backend::SupportsBufferGMRead(call->args_) && call->kwargs_.empty() && scalar &&
+      // Ordinary AIV leaves retain the existing opt-in scalar DMA path.
+      // The authored FFTS family can instead keep its original raw read,
+      // subject to separate phase-local visibility qualification.
+      admission.Require((core_ == FunctionType::AIC || (core_ == FunctionType::AIV && has_authored_ffts_)) &&
+                            scalar_definition_ == call.get() && backend::SupportsBufferGMRead(call->args_) &&
+                            call->kwargs_.empty() && scalar &&
                             scalar->dtype_ == As<TensorType>(call->args_[0]->GetType())->dtype_,
                         BufferAdmissionProperty::OperationRecipe);
       if (admission.supported()) CheckTransferParameter(call, 0, /*load=*/true);
@@ -760,15 +784,33 @@ class BufferKernelSupport : public IRVisitor {
                         BufferAdmissionProperty::OperationRecipe);
       // Native axis recipes below are dense allocations. A slice retains a
       // different physical pitch and needs its own reduction/broadcast recipe,
-      // except a contiguous column vector reshaped from a 1-row dense slice.
-      for (const auto& arg : call->args_)
-        admission.Require(!views_.IsWindow(arg) || views_.IsContiguousColumnRelabel(arg),
+      // except a contiguous column relabel or a one-row window used by
+      // A2/A3 TColExpandMul. Its carrier has zero repeat stride, and a
+      // one-row matrix issues a single repeat, so neither uses a second row.
+      for (const auto& arg : call->args_) {
+        const auto view = views_.Get(arg);
+        const auto tile = As<TileType>(arg->GetType());
+        const bool single_row_mul = IsOp(call, "tile.col_expand_mul") && view.slice && view.offsets && tile &&
+                                    tile->shape_.size() == 2 && ConstantEquals(tile->shape_[0], 1) &&
+                                    SameShape(ValidShape(tile), tile->shape_);
+        admission.Require(!view.window || view.contiguous_column_relabel || single_row_mul,
                           BufferAdmissionProperty::OperationRecipe);
+      }
     } else if (!IsOp(call, "tile.alloc")) {
       const auto* recipe = backend::FindLogicalBufferElementwiseRecipe(call);
       admission.Require(
           recipe && recipe->default_enabled && backend::SupportsLogicalBufferElementwise(*recipe, call),
           BufferAdmissionProperty::OperationRecipe);
+      if (admission.supported() && IsOp(call, "tile.concat")) {
+        // TCONCAT bakes each row stride into the tile descriptor. A narrow
+        // window may retain its parent's pitch even with fully valid extents.
+        admission.Require(core_ == FunctionType::AIV, BufferAdmissionProperty::OperationRecipe);
+        for (const auto& arg : call->args_) {
+          const auto view = views_.Get(arg);
+          admission.Require(views_.HasDenseRowPitch(arg) && (!view.window || view.offsets.has_value()),
+                            BufferAdmissionProperty::OperationRecipe);
+        }
+      }
       if (admission.supported() && IsOp(call, "tile.rsqrt") && call->args_.size() == 2) {
         admission.Require(QualifyRsqrtWorkspace(call), BufferAdmissionProperty::OperationRecipe);
       }
@@ -949,11 +991,30 @@ class BufferKernelSupport : public IRVisitor {
     }
   }
 
+  bool CanMaterializeFixedSlots(const TileTypePtr& tile, const MemRefPtr& memory, const ExprPtr& earlier,
+                                const ExprPtr& current) {
+    const auto* context = PassContext::Current();
+    const auto space = tile->GetMemorySpace();
+    if ((context && context->GetMemoryPlanner() == MemoryPlanner::PtoAS) || !space ||
+        !backend::IsMatrixBufferSpace(*space) || !As<ConstInt>(earlier) || !As<ConstInt>(current) ||
+        symbolic_slot_families_.count(memory->base_.get())) {
+      return false;
+    }
+    fixed_slot_families_.insert(memory->base_.get());
+    return true;
+  }
+
   bool QualifySlot(const TileTypePtr& tile, const MemRefPtr& memory) {
     const auto space = tile->GetMemorySpace();
     if (!space || (*space != MemorySpace::Vec && !backend::IsMatrixBufferSpace(*space)) || !memory->base_ ||
         !memory->slot_index_ || !*memory->slot_index_ || memory->slot_count_ == 0 || memory->slot_count_ > 16)
       return false;
+    if (!As<ConstInt>(*memory->slot_index_)) {
+      if (fixed_slot_families_.count(memory->base_.get())) {
+        return false;
+      }
+      symbolic_slot_families_.insert(memory->base_.get());
+    }
     const auto capacity = allocation_capacities_.find(memory->base_.get());
     const auto bytes = TileBytes(tile);
     const auto origin = FixedMultiBufferBase(memory);
@@ -1026,6 +1087,13 @@ class BufferKernelSupport : public IRVisitor {
     const auto source = call->args_.empty() ? nullptr : As<TileType>(call->args_[0]->GetType());
     if (!source || !destination) {
       admission.Require(false, BufferAdmissionProperty::MatrixRecipe);
+      return;
+    }
+    if (IsOp(call, "tile.move") && source->GetMemorySpace() == MemorySpace::Vec &&
+        destination->GetMemorySpace() == MemorySpace::Vec) {
+      admission.Require(core_ == FunctionType::AIV && !views_.IsWindow(call->args_[0]) &&
+                            backend::SupportsLogicalBufferVecCopy(call),
+                        BufferAdmissionProperty::OperationRecipe);
       return;
     }
     if (IsOp(call, "tile.move") || IsOp(call, "tile.extract")) {
@@ -1274,6 +1342,8 @@ class BufferKernelSupport : public IRVisitor {
   std::unordered_map<const Var*, uint64_t> allocation_capacities_;
   std::unordered_map<const Var*, TypePtr> slot_descriptors_;
   std::vector<std::unordered_map<const Var*, ExprPtr>> loop_slots_;
+  std::unordered_set<const Var*> fixed_slot_families_;
+  std::unordered_set<const Var*> symbolic_slot_families_;
   Region* region_ = nullptr;
   const std::vector<TypePtr>& return_types_;
   BufferViewAnalysis views_;
@@ -1289,6 +1359,8 @@ class BufferKernelSupport : public IRVisitor {
   std::unordered_map<const Expr*, TypePtr> assigned_slot_types_;
   PositiveLoopStepProof step_proof_;
   const Call* scalar_definition_ = nullptr;
+  const Call* evaluation_ = nullptr;
+  bool has_authored_ffts_ = false;
 };
 
 bool SupportsDelegatedPeerTransport(const FunctionPtr& function) {
@@ -1360,7 +1432,9 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper
     // Device Tile parameters still require a separate helper ABI.
     support.admission.Require(As<TensorType>(param->GetType()) || As<ScalarType>(param->GetType()),
                               BufferAdmissionProperty::ParameterABI);
-    support.CheckType(param->GetType());
+    if (!cross_core_pipe::IsFFTSWorkspace(As<TensorType>(param->GetType()))) {
+      support.CheckType(param->GetType());
+    }
   }
   for (const auto& type : function->return_types_) {
     support.admission.Require(As<TensorType>(type) != nullptr, BufferAdmissionProperty::ReturnABI);

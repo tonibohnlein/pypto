@@ -85,8 +85,7 @@ Domain Declared(const TypePtr& type) {
     if (structural_equal(valid[i], tile->shape_[i])) continue;
     // A named bound gives constant-time lexical/invariance checks. More general
     // expressions retain the original IR until they have a shared proof owner.
-    if (result.kind == DomainKind::Prefix || (!AsVarLike(valid[i]) && !As<ConstInt>(valid[i])))
-      return {};
+    if (result.kind == DomainKind::Prefix || (!AsVarLike(valid[i]) && !As<ConstInt>(valid[i]))) return {};
     result = {DomainKind::Prefix, valid[i], tile->shape_.size() == 1 ? 1 : static_cast<int>(i)};
   }
   return result;
@@ -99,7 +98,8 @@ bool Contains(const Domain& defined, const Domain& required) {
 }
 
 bool IsElementwise(const CallPtr& call) {
-  return backend::FindLogicalBufferElementwiseRecipe(call) != nullptr;
+  const auto* recipe = backend::FindLogicalBufferElementwiseRecipe(call);
+  return recipe && recipe->types != backend::BufferElementwiseTypePolicy::DenseConcatVec;
 }
 bool IsCast(const CallPtr& call) {
   const auto recipe = backend::FindLogicalBufferConversionRecipe(call->op_->name_);
@@ -115,7 +115,8 @@ bool IsRowAxisOp(const CallPtr& call) {
 bool KnownData(const CallPtr& call) {
   return IsElementwise(call) || IsCast(call) || IsVectorReshape(call) || IsOp(call, "tile.full") ||
          IsOp(call, "tile.create") || IsOp(call, "tile.load") || IsOp(call, "tile.store") ||
-         IsOp(call, "tile.set_validshape") || IsOp(call, "tile.ci") || IsRowAxisOp(call);
+         IsOp(call, "tile.set_validshape") || IsOp(call, "tile.ci") || IsOp(call, "tile.concat") ||
+         IsRowAxisOp(call);
 }
 
 Domain AxisMap(Domain domain, const TypePtr& target) {
@@ -367,6 +368,15 @@ class DomainIndex : public IRVisitor {
     }
     if (IsOp(call, "tile.set_validshape")) return Meet(Get(call->args_[0]), Declared(call->GetType()));
     if (IsVectorReshape(call)) return ReshapeDomain(Get(call->args_[0]), call, call->GetType());
+    if (IsOp(call, "tile.concat")) {
+      // A column prefix of the second source starts after the first source's
+      // entire width in the result. The elementwise meet does not model that
+      // offset, and the native recipe accepts only fully defined rectangles.
+      if (Get(call->args_[0]).kind != DomainKind::Full || Get(call->args_[1]).kind != DomainKind::Full) {
+        return {};
+      }
+      return Declared(call->GetType());
+    }
     if (const auto* recipe = backend::FindLogicalBufferElementwiseRecipe(call)) {
       Domain result{DomainKind::Full, nullptr, 0};
       for (const auto& input : recipe->inputs) {

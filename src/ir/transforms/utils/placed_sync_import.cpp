@@ -1892,8 +1892,14 @@ class Importer {
       const auto& t = result.storage[tid];
       if (!extract && implementation.Pipe() == PipeType::V) {
         resolver->RequireVecCopyPlacement(operation);
-        whole(0, false);
-        whole(target, true);
+        const auto type = As<BufferType>(call->args_[0]->GetType());
+        if (type->valid_shape_ == type->shape_) {
+          whole(0, false);
+          whole(target, true);
+        } else {
+          enclosure(0, false);
+          enclosure(target, true);
+        }
       } else if (extract && s.space == MemorySpace::Vec && t.space == MemorySpace::Vec) {
         auto row = Coordinate(call->args_[1], segment);
         auto column = Coordinate(call->args_[2], segment);
@@ -2578,6 +2584,7 @@ class InvocationBounds : public IRVisitor {
   std::vector<VarPtr> definitions_;
   std::set<const Expr*> unproved_definitions_;
   std::unordered_map<const Var*, ExprPtr> scalar_definitions_;
+  std::unordered_map<const Var*, MakeTuplePtr> tensor_slice_shapes_;
   std::unordered_map<const Var*, TiledLoop> tiled_loops_;
   const std::map<std::string, FunctionPtr>& functions_;
   std::map<std::string, std::map<size_t, std::optional<Bound>>>& evidence_;
@@ -2683,6 +2690,38 @@ class InvocationBounds : public IRVisitor {
     return call && call->args_.empty() &&
            (IsOp(call, "system.available_cluster_count") || IsOp(call, "system.available_aiv_count"));
   }
+  std::optional<Bound> HostTensorDim(const CallPtr& call) {
+    if (caller_->func_type_ != FunctionType::Orchestration || call->args_.size() != 2 ||
+        GetScalarDtype(call) != DataType::INDEX) {
+      return std::nullopt;
+    }
+    const auto var = As<Var>(call->args_[0]);
+    const auto tensor = var ? As<TensorType>(var->GetType()) : nullptr;
+    const auto axis = As<ConstInt>(call->args_[1]);
+    if (!tensor || !axis || axis->value_ < 0 ||
+        static_cast<uint64_t>(axis->value_) >= tensor->shape_.size()) {
+      return std::nullopt;
+    }
+    constexpr int64_t kMaxExtent = std::numeric_limits<uint32_t>::max();
+    const size_t index = static_cast<size_t>(axis->value_);
+    if (const auto extent = As<ConstInt>(tensor->shape_[index])) {
+      return extent->value_ >= 0 && extent->value_ <= kMaxExtent
+                 ? std::optional<Bound>{{extent->value_, extent->value_}}
+                 : std::nullopt;
+    }
+    // Host tensor.dim loads the uint32 Tensor::shapes entry. A directly
+    // constructed view clips its requested shape against the parent, which
+    // can only reduce an already representable requested upper bound.
+    const auto source = tensor_slice_shapes_.find(var.get());
+    if (source != tensor_slice_shapes_.end() && index < source->second->elements_.size()) {
+      auto requested = Range(source->second->elements_[index]);
+      if (requested && requested->first >= 0 && requested->second <= kMaxExtent) {
+        return Bound{0, requested->second};
+      }
+    }
+    return Bound{0, kMaxExtent};
+  }
+
   std::optional<Bound> ComputeRange(const ExprPtr& expression) {
     const auto maximum = SyncCoordinateMaximum(expression);
     if (!maximum) return std::nullopt;
@@ -2690,6 +2729,9 @@ class InvocationBounds : public IRVisitor {
     // A dominated nonempty launch can narrow this to a positive worker stride.
     if (IsLaunchCapacity(expression)) {
       return Bound{0, *maximum};
+    }
+    if (const auto call = As<Call>(expression); IsOp(call, "tensor.dim")) {
+      return HostTensorDim(call);
     }
     if (auto call = As<Call>(expression);
         call && (IsOp(call, "buffer.get_block_idx") || IsOp(call, "tile.get_block_idx"))) {
@@ -2794,6 +2836,7 @@ class InvocationBounds : public IRVisitor {
       Unbind(definitions_.back());
       unproved_definitions_.erase(definitions_.back().get());
       scalar_definitions_.erase(definitions_.back().get());
+      tensor_slice_shapes_.erase(definitions_.back().get());
       definitions_.pop_back();
     }
   }
@@ -2943,6 +2986,12 @@ class InvocationBounds : public IRVisitor {
     VisitExpr(statement->value_);
     auto b = Range(statement->value_);
     definitions_.push_back(statement->var_);
+    const auto operation = As<Call>(statement->value_);
+    if (IsOp(operation, "tensor.slice") && operation->args_.size() >= 3 && operation->args_.size() <= 4) {
+      if (const auto shape = As<MakeTuple>(operation->args_[1])) {
+        tensor_slice_shapes_.emplace(statement->var_.get(), shape);
+      }
+    }
     if (b && SameCoordinateType(statement->var_, statement->value_)) {
       auto definition = Definition(statement->value_);
       if (const auto cast = As<Cast>(definition); cast && SameCoordinateType(cast, cast->operand_))

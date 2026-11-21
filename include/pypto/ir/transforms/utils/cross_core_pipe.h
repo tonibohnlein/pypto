@@ -159,6 +159,10 @@ BufferTypePtr MakePeerReserveDescriptor(int64_t bytes, MemorySpace space);
 bool IsPeerPipeSetup(const CallPtr& call);
 // Existing no-argument hard MIX barrier. It is emitted at the original cut.
 bool IsHardMixedSyncAll(const CallPtr& call);
+// A3 GM-mediated protocol markers preserve their original native and lexical
+// cuts. This emission predicate grants no visibility or local completion.
+bool IsFFTSWorkspace(const TensorTypePtr& tensor);
+bool IsAuthoredGMProtocolCall(const CallPtr& call);
 bool IsBufferPeerTransport(const CallPtr& call);
 
 /// Return sites in both arms of a terminal dual-AIV dispatch branch.

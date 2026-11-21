@@ -30,6 +30,7 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -423,10 +424,106 @@ std::string CheckPair(codegen::gm_pipe::LayoutEvidence& workspace, const Functio
          (stalled.empty() ? "FIFO ready/credit progress proved for the paired issue streams" : stalled);
 }
 
+struct AuthoredGMEndpoint {
+  StmtPtr acquire;
+  VarPtr workspace;
+};
+
+class AuthoredGMMarkers : public IRVisitor {
+ public:
+  explicit AuthoredGMMarkers(FunctionType core) : core_(core) {}
+  bool present = false;
+  std::set<const Call*> commands;
+  VarPtr workspace;
+
+  void Check(const FunctionPtr& fn) {
+    checking_ = true;
+    VisitStmt(fn->body_);
+  }
+
+ protected:
+  void VisitStmt_(const EvalStmtPtr& stmt) override {
+    const auto call = As<Call>(stmt->expr_);
+    if (checking_ && IsMarker(call)) {
+      CHECK_SPAN(cross_core_pipe::IsHardMixedSyncAll(call) || cross_core_pipe::IsAuthoredGMProtocolCall(call),
+                 call->span_)
+          << "Authored GM protocol requires an executable static event or whole-GM marker";
+      commands.insert(call.get());
+      CheckCommand(call);
+    }
+    IRVisitor::VisitStmt_(stmt);
+  }
+
+  void VisitExpr_(const CallPtr& call) override {
+    if (IsMarker(call)) {
+      present |= !IsOp(call, "system.syncall");
+      CHECK_SPAN(!checking_ || commands.count(call.get()), call->span_)
+          << "Authored GM protocol requires direct standalone commands";
+    }
+    IRVisitor::VisitExpr_(call);
+  }
+
+ private:
+  FunctionType core_;
+  bool checking_ = false;
+
+  static bool IsMarker(const CallPtr& call) {
+    return IsOp(call, "system.set_ffts") || IsOp(call, "system.sync_set") || IsOp(call, "system.sync_wait") ||
+           IsOp(call, "system.syncall") || IsOp(call, "system.cacheinvalid") || IsOp(call, "system.fence");
+  }
+
+  void CheckCommand(const CallPtr& call) {
+    if (IsOp(call, "system.set_ffts")) {
+      const auto root = As<Var>(call->args_.front());
+      CHECK_SPAN(!workspace || root == workspace, call->span_)
+          << "Authored GM protocol must retain one FFTS workspace";
+      workspace = root;
+    }
+    const bool set = IsOp(call, "system.sync_set");
+    if (set || IsOp(call, "system.sync_wait")) {
+      const bool cube = core_ == FunctionType::AIC;
+      const std::string core = cube ? "aic" : "aiv";
+      const auto pipe = set ? (cube ? PipeType::FIX : PipeType::MTE3) : PipeType::MTE2;
+      CHECK_SPAN(call->GetKwarg<std::string>("core_type", core) == core &&
+                     call->GetKwarg<int>("pipe") == static_cast<int>(pipe) &&
+                     (!set || call->GetKwarg<int>("ffts_mode", 0) == 2),
+                 call->span_)
+          << "Authored GM event does not use the qualified native pipe for this endpoint";
+    }
+  }
+};
+
+AuthoredGMEndpoint QualifyAuthoredGMEndpoint(const FunctionPtr& fn) {
+  AuthoredGMMarkers markers(fn->func_type_);
+  markers.Check(fn);
+  const auto body = FlattenToStmts(fn->body_);
+  StmtPtr acquire;
+  bool setup = false;
+  for (size_t i = 0; i + 3 < body.size(); ++i) {
+    setup |= IsOp(GetCallFromStmt(body[i]), "system.set_ffts");
+    if (!IsOp(GetCallFromStmt(body[i]), "system.cacheinvalid") ||
+        !IsOp(GetCallFromStmt(body[i + 1]), "system.fence") ||
+        !cross_core_pipe::IsHardMixedSyncAll(GetCallFromStmt(body[i + 2])) ||
+        !IsOp(GetCallFromStmt(body[i + 3]), "system.cacheinvalid")) {
+      continue;
+    }
+    CHECK_SPAN(setup && !acquire, body[i]->span_)
+        << "Authored GM cache publication requires one shared seam after FFTS setup";
+    acquire = body[i + 3];
+  }
+  const auto rendezvous = std::count_if(markers.commands.begin(), markers.commands.end(),
+                                        [](const Call* c) { return IsOp(c->op_, "system.syncall"); });
+  CHECK_SPAN(acquire && markers.workspace && rendezvous == 1, fn->span_)
+      << "Authored GM cached reads require the original whole-GM cache/fence/MIX/cache publication seam";
+  return {acquire, markers.workspace};
+}
+
 struct PeerDispatch {
   FunctionPtr group;
   std::vector<FunctionPtr> functions;
   std::vector<WrapperCallInfo> endpoints;  // An emission unit with exactly one AIC and one AIV.
+  bool authored_gm = false;
+  bool has_fifo = false;
 };
 
 std::vector<PeerDispatch> CollectPeerDispatches(const ProgramPtr& program) {
@@ -465,7 +562,6 @@ std::vector<PeerDispatch> CollectPeerDispatches(const ProgramPtr& program) {
     regular &= straight.size() == 2;
     std::optional<WrapperCallInfo> cube, vec;
     PeerDispatch dispatch{group, {}, {}};
-    bool has_fifo = false;
     for (const auto& call : calls) {
       const auto type = call.inner_callee->func_type_;
       if (type != FunctionType::AIC && type != FunctionType::AIV) continue;
@@ -476,9 +572,12 @@ std::vector<PeerDispatch> CollectPeerDispatches(const ProgramPtr& program) {
       dispatch.functions.push_back(call.inner_callee);
       CrossCorePipeMetadata metadata;
       CollectCrossCorePipeMetadata(FlattenToStmts(call.inner_callee->body_), metadata);
-      has_fifo |= metadata.HasAnySetup() || metadata.HasCrossCoreOps();
+      dispatch.has_fifo |= metadata.HasAnySetup() || metadata.HasCrossCoreOps();
+      AuthoredGMMarkers markers(type);
+      markers.VisitStmt(call.inner_callee->body_);
+      dispatch.authored_gm |= markers.present;
     }
-    if (!has_fifo) continue;
+    if (!dispatch.has_fifo && !dispatch.authored_gm) continue;
     if (regular && cube && vec) dispatch.endpoints = {*cube, *vec};
     dispatches.push_back(std::move(dispatch));
   }
@@ -596,6 +695,70 @@ FunctionPtr PlanLocalEndpoint(const WrapperCallInfo& call, const FunctionPtr& gr
   return RealizePeerLocalPlan(local);
 }
 
+size_t MapAuthoredFormal(const WrapperCallInfo& endpoint, const FunctionPtr& group, size_t index) {
+  const auto actual = AsVarLike(endpoint.inner_call->args_.at(index));
+  const auto found = std::find(group->params_.begin(), group->params_.end(), actual);
+  CHECK(found != group->params_.end()) << "Authored GM endpoint requires original Group tensor actuals";
+  return static_cast<size_t>(found - group->params_.begin());
+}
+
+void MergeAuthoredGMEffects(const WrapperCallInfo& endpoint, const FunctionPtr& group,
+                            const PeerGmEffects& local, PeerGmEffects& mixed) {
+  for (const auto formal : local.formals) {
+    mixed.formals.insert(MapAuthoredFormal(endpoint, group, formal));
+  }
+  for (const auto formal : local.writes) {
+    mixed.writes.insert(MapAuthoredFormal(endpoint, group, formal));
+  }
+  for (const auto formal : local.scalar_reads) {
+    mixed.scalar_reads.insert(MapAuthoredFormal(endpoint, group, formal));
+  }
+}
+
+std::vector<PeerLocalDecision> PlanAuthoredGMUnit(const PeerDispatch& dispatch,
+                                                  const SyncInvocationEvidence& invocation,
+                                                  PeerInvocationGmEvidence& gm, bool disjoint_gm) {
+  CHECK(!dispatch.has_fifo) << "Combined authored GM and managed FIFO synchronization is unqualified";
+  std::vector<PeerLocalEffects> endpoints;
+  std::vector<PeerGmEffects> phases(2);
+  std::optional<size_t> workspace;
+  for (const auto& endpoint : dispatch.endpoints) {
+    const auto fn = DistinctIssueCuts().Run(endpoint.inner_callee);
+    CHECK(fn->ir_stage_ == FunctionIRStage::Buffer && !fn->requires_runtime_binding_ &&
+          !fn->HasAttr(kAttrExternalSource) && !fn->HasAttr(kAttrBuiltinTemplateDir))
+        << "Authored GM synchronization requires both placed Buffer endpoints";
+    const auto& callers = gm.CallersOf(fn->name_);
+    const auto nested = invocation.callees.find(fn->name_);
+    CHECK(callers.size() == 1 && callers.count(dispatch.group->name_) &&
+          (nested == invocation.callees.end() || nested->second.empty()))
+        << "Authored GM synchronization requires direct local endpoints of one Group";
+    const auto protocol = QualifyAuthoredGMEndpoint(fn);
+    const auto formal = std::find(fn->params_.begin(), fn->params_.end(), protocol.workspace);
+    CHECK(formal != fn->params_.end()) << "Authored FFTS setup requires a workspace formal";
+    const auto pos = MapAuthoredFormal(endpoint, dispatch.group, formal - fn->params_.begin());
+    CHECK(!workspace || *workspace == pos) << "Authored FFTS endpoints must use the same Group workspace";
+    workspace = pos;
+    const auto parameters = invocation.parameters.find(fn->name_);
+    auto local = ImportPeerLocalEffects(
+        fn, {}, "a2a3",
+        parameters == invocation.parameters.end() ? SyncParameterBounds{} : parameters->second, std::nullopt,
+        protocol.acquire.get());
+    for (size_t i = 0; i < phases.size(); ++i) {
+      CHECK(local.gm_phases[i].host_extent_requirements.empty())
+          << "Authored GM scalar address requires a bounded launch byte extent";
+      MergeAuthoredGMEffects(endpoint, dispatch.group, local.gm_phases[i], phases[i]);
+    }
+    endpoints.push_back(std::move(local));
+  }
+  CHECK(workspace) << "Authored FFTS setup requires a Group workspace";
+  gm.CheckAuthoredGM(dispatch.group, *workspace, phases, disjoint_gm);
+  std::vector<PeerLocalDecision> decisions;
+  for (const auto& endpoint : endpoints) {
+    decisions.push_back({RealizePeerLocalPlan(endpoint), {}});
+  }
+  return decisions;
+}
+
 }  // namespace
 
 std::vector<PeerLocalDecision> PlanPeerLocalUnits(const ProgramPtr& program,
@@ -611,6 +774,25 @@ std::vector<PeerLocalDecision> PlanPeerLocalUnits(const ProgramPtr& program,
     if (dispatch.endpoints.empty()) {
       for (const auto& fn : dispatch.functions)
         decisions.push_back({fn, "mixed emission unit requires one unconditional call to each peer"});
+      continue;
+    }
+
+    if (dispatch.authored_gm) {
+      if (!std::all_of(dispatch.endpoints.begin(), dispatch.endpoints.end(), [](const auto& endpoint) {
+            return endpoint.inner_callee->ir_stage_ == FunctionIRStage::Buffer;
+          })) {
+        // Keep the original per-leaf Buffer admission evidence until both
+        // native members can present a complete local effect inventory.
+        continue;
+      }
+      try {
+        auto plans = PlanAuthoredGMUnit(dispatch, invocation, gm, disjoint_gm);
+        decisions.insert(decisions.end(), plans.begin(), plans.end());
+      } catch (const ValueError& error) {
+        for (const auto& endpoint : dispatch.endpoints) {
+          decisions.push_back({endpoint.inner_callee, error.what()});
+        }
+      }
       continue;
     }
 
@@ -649,6 +831,9 @@ std::map<std::string, std::string> InspectPeerFifoProtocols(const ProgramPtr& pr
   std::map<std::string, std::string> reports;
   codegen::gm_pipe::LayoutEvidence layout(program);
   for (const auto& dispatch : CollectPeerDispatches(program)) {
+    if (!dispatch.has_fifo) {
+      continue;
+    }
     if (dispatch.endpoints.empty()) {
       reports[dispatch.group->name_] = "diagnostic requires one unconditional call to each peer";
       continue;

@@ -124,8 +124,9 @@ const Expr* KnownAliasIdentity(const Origin& origin) {
 // most two transitions (pending -> known -> unknown), including loop cycles.
 class RootInventory final : public IRVisitor {
  public:
-  RootInventory(const FunctionPtr& root, const std::set<std::string>& launches, const ProgramPtr& program)
-      : launches_(launches), program_(program) {
+  RootInventory(const FunctionPtr& root, const std::set<std::string>& launches, const ProgramPtr& program,
+                bool allow_slice_origins = false)
+      : launches_(launches), program_(program), allow_slice_origins_(allow_slice_origins) {
     for (const auto& formal : root->params_) {
       formal_names_.insert(formal->name_hint_);
       live_.insert(formal.get());
@@ -222,6 +223,31 @@ class RootInventory final : public IRVisitor {
         CHECK_SPAN(disjoint_gm || read_origin.kind == OriginKind::Fresh || !writes_formal, site.span)
             << "Peer scalar GM read may alias a GM write without a disjoint GM contract";
       }
+    }
+  }
+
+  void CheckAuthoredGM(const FunctionPtr& launch, size_t workspace_formal,
+                       const std::vector<PeerGmEffects>& phases, bool disjoint_gm) const {
+    const auto found = calls_.find(launch->name_);
+    CHECK(found != calls_.end() && !found->second.empty())
+        << "Authored GM synchronization requires an original root launch";
+    std::set<size_t> ordinary;
+    for (const auto& phase : phases) {
+      ordinary.insert(phase.formals.begin(), phase.formals.end());
+    }
+    for (const auto& site : found->second) {
+      CHECK_SPAN(site.qualified, site.span) << "Authored GM synchronization requires a direct root launch";
+      const auto workspace = StorageOf(site.arguments.at(workspace_formal).value);
+      CHECK_SPAN(workspace.kind == OriginKind::Fresh, site.span)
+          << "Authored FFTS workspace requires a fresh root allocation";
+      for (const auto formal : ordinary) {
+        const auto actual = StorageOf(site.arguments.at(formal).value);
+        CHECK_SPAN(actual.Known() && actual.root != workspace.root, site.span)
+            << "Authored FFTS workspace lacks separation from an ordinary GM access";
+      }
+    }
+    for (const auto& phase : phases) {
+      CheckScalarReads(launch, phase, disjoint_gm);
     }
   }
 
@@ -348,6 +374,7 @@ class RootInventory final : public IRVisitor {
 
   const std::set<std::string>& launches_;
   ProgramPtr program_;
+  bool allow_slice_origins_;
   bool qualified_ = true;
   const Expr* direct_ = nullptr;
   const SeqStmts* sequence_ = nullptr;
@@ -458,7 +485,12 @@ class RootInventory final : public IRVisitor {
 
   const Var* SourceOf(const ExprPtr& expression) {
     if (const auto call = transform_utils::AsCallOrSubmitView(expression)) {
-      if ((IsOp(call, "tensor.reshape") || IsOp(call, "tensor.assemble")) && !call->args_.empty()) {
+      // The authored proof uses only storage identity from a host view,
+      // never its projected box. Keep the existing managed-workspace proof's
+      // stricter original-argument scope for the separate FIFO route.
+      const bool authored_slice = allow_slice_origins_ && IsOp(call, "tensor.slice");
+      if ((IsOp(call, "tensor.reshape") || IsOp(call, "tensor.assemble") || authored_slice) &&
+          !call->args_.empty()) {
         return LiveVar(call->args_.front());
       }
       return ReturnOrigin(call, 0);
@@ -639,6 +671,7 @@ struct PeerInvocationGmEvidence::State {
   std::set<std::string> launches;
   std::map<std::string, std::set<std::string>> callers;
   std::map<std::string, std::unique_ptr<RootInventory>> roots;
+  std::map<std::string, std::unique_ptr<RootInventory>> authored_roots;
   std::map<std::string, std::vector<std::pair<RootInventory*, FunctionPtr>>> qualified;
   std::map<std::string, bool> sharding;
   std::map<std::string, std::optional<SyncDispatchCoordinates>> coordinates;
@@ -765,6 +798,32 @@ void PeerInvocationGmEvidence::CheckHostRankOneExtent(const FunctionPtr& group, 
       << "Peer scalar GM address requires a plain symbolic rank-one Group formal";
   for (const auto& [inventory, launch] : state_->qualified.at(group->name_)) {
     inventory->CheckHostRankOneExtent(launch, formal, *expected);
+  }
+}
+
+void PeerInvocationGmEvidence::CheckAuthoredGM(const FunctionPtr& group, size_t workspace_formal,
+                                               const std::vector<PeerGmEffects>& phases, bool disjoint_gm) {
+  const auto& callers = CallersOf(group->name_);
+  CHECK(!callers.empty()) << "Authored GM group has no original root launch";
+  for (const auto& caller : callers) {
+    const auto enclosing = state_->program->GetFunction(caller);
+    CHECK(enclosing) << "Authored GM group has no enclosing function";
+    const bool spmd = enclosing->func_type_ == FunctionType::Spmd;
+    const auto launch = spmd ? enclosing : group;
+    CHECK(!spmd || DirectForwarding(launch, group))
+        << "Authored GM SPMD wrapper must directly forward the Group ABI";
+    const auto roots = spmd ? CallersOf(caller) : std::set<std::string>{caller};
+    CHECK(!roots.empty()) << "Authored GM group has no original root launch";
+    for (const auto& name : roots) {
+      const auto root = state_->program->GetFunction(name);
+      CHECK(root && root->func_type_ == FunctionType::Orchestration && CallersOf(name).empty())
+          << "Authored GM synchronization requires direct root orchestration";
+      auto& inventory = state_->authored_roots[name];
+      if (!inventory) {
+        inventory = std::make_unique<RootInventory>(root, state_->launches, state_->program, true);
+      }
+      inventory->CheckAuthoredGM(launch, workspace_formal, phases, disjoint_gm);
+    }
   }
 }
 

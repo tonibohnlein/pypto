@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -220,6 +221,14 @@ const std::vector<BufferElementwiseRecipe>& GetBufferElementwiseRecipes() {
        BufferElementwiseTypePolicy::DenseFillVec,
        BufferDestinationAliasPolicy::ExactOrDisjoint,
        true},
+      {"tile.concat",
+       "buffer.concat",
+       GetPtoNativeOpSpec("tile.concat").native_op,
+       {{0}, {1}},
+       BufferPrecisionKind::None,
+       BufferElementwiseTypePolicy::DenseConcatVec,
+       BufferDestinationAliasPolicy::Disjoint,
+       true},
   };
   return recipes;
 }
@@ -261,6 +270,29 @@ std::vector<std::string> GetBufferElementwiseRecipeNames() {
 }
 
 namespace {
+bool SupportsConcatDescriptor(const ir::BufferTypePtr& type) {
+  constexpr uint64_t kA2A3VecCapacity = 192 * 1024;
+  if (!IsAlignedDenseVecBufferGeometry(type) || type->valid_shape_ != type->shape_ ||
+      !IsDenseBufferTransferDtype(type->dtype_)) {
+    return false;
+  }
+  // Fitting the A2/A3 UB also bounds the uint16_t burst and gap fields
+  // (in 32-byte blocks) and the native per-row pointer arithmetic.
+  const auto bytes = PhysicalBufferBytes(type);
+  return bytes && *bytes <= kA2A3VecCapacity;
+}
+
+bool SupportsConcatGeometry(const ir::BufferTypePtr& first, const ir::BufferTypePtr& second,
+                            const ir::BufferTypePtr& destination) {
+  if (!SupportsConcatDescriptor(first) || !SupportsConcatDescriptor(second) ||
+      !SupportsConcatDescriptor(destination)) {
+    return false;
+  }
+  return first->dtype_ == destination->dtype_ && second->dtype_ == destination->dtype_ &&
+         first->shape_[0] == destination->shape_[0] && second->shape_[0] == destination->shape_[0] &&
+         first->shape_[1] + second->shape_[1] == destination->shape_[1];
+}
+
 bool SupportsElementwiseDtype(const BufferElementwiseRecipe& recipe, DataType dtype) {
   if (recipe.types == BufferElementwiseTypePolicy::DenseFP32) return dtype == DataType::FP32;
   if (recipe.types == BufferElementwiseTypePolicy::DenseFillVec) return IsDenseBufferTransferDtype(dtype);
@@ -291,6 +323,11 @@ bool SupportsLogicalBufferElementwise(const BufferElementwiseRecipe& recipe, con
   for (const auto& input : recipe.inputs) arity = std::max(arity, input.logical_index + 1);
   if (call->args_.size() != arity || !SupportsBufferElementwiseAttributes(recipe, call->kwargs_))
     return false;
+  if (recipe.types == BufferElementwiseTypePolicy::DenseConcatVec) {
+    return SupportsConcatGeometry(StaticLogicalBufferDescriptor(call->args_[0]->GetType()),
+                                  StaticLogicalBufferDescriptor(call->args_[1]->GetType()),
+                                  StaticLogicalBufferDescriptor(call->GetType()));
+  }
   const auto destination = ir::As<ir::TileType>(call->GetType());
   if (!destination) return false;
   const auto dtype = destination->dtype_;
@@ -301,7 +338,8 @@ bool SupportsLogicalBufferElementwise(const BufferElementwiseRecipe& recipe, con
   // A2/A3 TEXP derives its vector mask and strides from the full valid
   // geometry. A materialized pad value is already data in that geometry.
   const bool padded_exp =
-      std::string_view(recipe.buffer_op) == "buffer.exp" && IsFullPaddedVec(destination, view);
+      std::string_view(recipe.buffer_op) == "buffer.exp" &&
+      (IsFullPaddedVec(destination, view) || IsMinimumPaddedVecRowPrefix(destination, view));
   const bool padded_matching = SupportsFullPaddedOperand(recipe);
   if (!IsDenseVecBufferTile(destination, view) && !padded_exp &&
       !(padded_matching && IsFullPaddedVec(destination, view)))
@@ -374,6 +412,16 @@ void ValidateBufferElementwiseOperands(const BufferElementwiseRecipe& recipe,
   CHECK(args.size() == recipe.inputs.size() + 1)
       << recipe.buffer_op << " requires " << recipe.inputs.size() + 1 << " explicit operands, got "
       << args.size();
+  if (recipe.types == BufferElementwiseTypePolicy::DenseConcatVec) {
+    const auto descriptor = [](const ir::ExprPtr& operand) {
+      return operand ? ir::As<ir::BufferType>(operand->GetType()) : nullptr;
+    };
+    CHECK(SupportsConcatGeometry(descriptor(args[0]), descriptor(args[1]), descriptor(args[2])))
+        << "buffer.concat requires full-valid block-aligned dense Vec operands of one dtype and equal "
+           "row count, with destination columns equal to the sum of the input columns";
+    CHECK(args[0] != args[2] && args[1] != args[2]) << "buffer.concat requires a distinct destination";
+    return;
+  }
   CHECK(args.back()) << recipe.buffer_op << " destination must not be null";
   const auto descriptor = ir::As<ir::BufferType>(args.back()->GetType());
   CHECK(descriptor) << recipe.buffer_op << " destination must have BufferType";
@@ -439,7 +487,8 @@ void ValidateBufferElementwiseOperands(const BufferElementwiseRecipe& recipe,
           descriptor->blayout_ == ir::TileLayout::row_major &&
           descriptor->slayout_ == ir::TileLayout::none_box && descriptor->fractal_ == 512 &&
           (descriptor->pad_ == ir::PadValue::null ||
-           (std::string_view(recipe.buffer_op) == "buffer.exp" && IsFullPaddedVec(descriptor)) ||
+           (std::string_view(recipe.buffer_op) == "buffer.exp" &&
+            (IsFullPaddedVec(descriptor) || IsMinimumPaddedVecRowGeometry(descriptor))) ||
            (recipe.types == BufferElementwiseTypePolicy::DenseFillVec && IsFullZeroPaddedVec(descriptor))) &&
           descriptor->compact_ == ir::CompactMode::null)
         << recipe.buffer_op

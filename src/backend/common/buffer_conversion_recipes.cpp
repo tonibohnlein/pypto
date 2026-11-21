@@ -73,9 +73,12 @@ bool Geometry(const ir::BufferTypePtr& a, const ir::BufferTypePtr& b) {
   return a->shape_ == b->shape_ && a->valid_shape_ == b->valid_shape_;
 }
 
+bool BfloatVecGeometry(const ir::BufferTypePtr& type) {
+  return IsAlignedDenseVecBufferGeometry(type) || IsMinimumPaddedVecRowGeometry(type);
+}
+
 bool RuntimeBfloatGeometry(const ir::BufferTypePtr& source, const ir::BufferTypePtr& target) {
-  if (!IsAlignedDenseVecBufferGeometry(source) || !IsAlignedDenseVecBufferGeometry(target) ||
-      source->shape_ != target->shape_)
+  if (!BfloatVecGeometry(source) || !BfloatVecGeometry(target) || source->shape_ != target->shape_)
     return false;
   const bool pair = (source->dtype_ == DataType::BF16 && target->dtype_ == DataType::FP32) ||
                     (source->dtype_ == DataType::FP32 && target->dtype_ == DataType::BF16);
@@ -103,6 +106,16 @@ bool MatchingRuntimeCastValid(const ir::TypePtr& a_type, const ir::TypePtr& b_ty
   const auto& y = bv.valid_shape.empty() ? b->shape_ : bv.valid_shape;
   return x.size() == 2 && y.size() == 2 && ir::structural_equal(x[0], y[0]) &&
          ir::structural_equal(x[1], a->shape_[1]) && ir::structural_equal(y[1], b->shape_[1]);
+}
+
+bool IsNamedOrPositiveExtent(const ir::ExprPtr& extent, const ir::ExprPtr& shape) {
+  if (const auto literal = ir::As<ir::ConstInt>(extent)) {
+    const auto capacity = ir::As<ir::ConstInt>(shape);
+    return capacity && literal->value_ > 0 && literal->value_ <= capacity->value_;
+  }
+  const auto scalar = ir::As<ir::ScalarType>(extent->GetType());
+  return ir::AsVarLike(extent) && scalar &&
+         (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt());
 }
 
 // A predicate byte encodes eight logical columns, least-significant bit first.
@@ -141,8 +154,8 @@ const char* OperandError(const BufferConversionRecipe& recipe, const std::vector
   }
   const bool has_runtime_shape =
       recipe.kind == K::Cast && types.size() == 2 && (Dynamic(types[0]) || Dynamic(types[1]));
-  if (has_runtime_shape && IsAlignedDenseVecBufferGeometry(types[0]) &&
-      IsAlignedDenseVecBufferGeometry(types[1]) && types[0]->shape_ == types[1]->shape_) {
+  if (has_runtime_shape && BfloatVecGeometry(types[0]) && BfloatVecGeometry(types[1]) &&
+      types[0]->shape_ == types[1]->shape_) {
     const bool bfloat = (types[0]->dtype_ == DataType::BF16 && types[1]->dtype_ == DataType::FP32) ||
                         (types[0]->dtype_ == DataType::FP32 && types[1]->dtype_ == DataType::BF16);
     if (bfloat && !RuntimeBfloatGeometry(types[0], types[1]))
@@ -154,10 +167,11 @@ const char* OperandError(const BufferConversionRecipe& recipe, const std::vector
                                 (types[0]->dtype_ == DataType::BF16 && types[1]->dtype_ == DataType::FP32));
   for (size_t i = 0; i < types.size(); ++i) {
     if (static_cast<int>(i) != recipe.scalar_index &&
-        !(runtime_cast ? IsAlignedDenseVecBufferGeometry(types[i])
+        !(runtime_cast ? BfloatVecGeometry(types[i])
                        : IsAlignedDenseVecBuffer(types[i]) ||
                              (recipe.kind == K::Cast && IsFullZeroPaddedVec(types[i])) ||
-                             (full_float_pair && IsFullPaddedVec(types[i])))) {
+                             (full_float_pair &&
+                              (IsFullPaddedVec(types[i]) || IsMinimumPaddedVecRowGeometry(types[i]))))) {
       return "requires aligned dense rank-2 Vec buffers with positive static valid extents";
     }
   }
@@ -281,15 +295,14 @@ bool SupportsLogicalBufferConversion(const BufferConversionRecipe& recipe, const
     const auto pad = call->GetKwarg<ir::PadValue>("pad_value", ir::PadValue::zero);
     if (!target || target->pad_ != pad) return false;
     if (pad == ir::PadValue::min) {
-      if (ir::As<ir::ConstInt>(valid[1])) {
+      if (ir::As<ir::ConstInt>(valid[0]) && ir::As<ir::ConstInt>(valid[1])) {
         return OperandError(recipe, {StaticLogicalBufferDescriptor(tile), target}, {}) == nullptr;
       }
-      // Runtime columns use the same native tail. Ordinary admission and
-      // placed validity analysis both require a positive in-capacity width.
-      const auto rows = ir::As<ir::ConstInt>(valid[0]);
-      const auto capacity = ir::As<ir::ConstInt>(tile->shape_[0]);
-      return rows && capacity && rows->value_ > 0 && rows->value_ <= capacity->value_ &&
-             ir::AsVarLike(valid[1]) &&
+      // TFillPad handles both runtime extents in the same native copy/tail
+      // loop. Selection and explicit Buffer validation prove positivity and
+      // capacity of each active extent at its use.
+      return IsNamedOrPositiveExtent(valid[0], tile->shape_[0]) &&
+             IsNamedOrPositiveExtent(valid[1], tile->shape_[1]) &&
              OperandError(recipe, {PhysicalLogicalVecDescriptor(tile), target}, {}) == nullptr;
     }
     return ir::structural_equal(valid[1], tile->shape_[1]) &&
@@ -310,8 +323,10 @@ bool SupportsLogicalBufferConversion(const BufferConversionRecipe& recipe, const
   if (OperandError(recipe, types, call->kwargs_) == nullptr) return true;
   if (recipe.kind != K::Cast || !MatchingRuntimeCastValid(call->args_[0]->GetType(), call->GetType()))
     return false;
-  types = {PhysicalLogicalVecDescriptor(call->args_[0]->GetType()),
-           PhysicalLogicalVecDescriptor(call->GetType())};
+  types = {PhysicalLogicalVecDescriptor(call->args_[0]->GetType(), /*allow_full_pad=*/false,
+                                        /*allow_row_prefix_pad=*/true),
+           PhysicalLogicalVecDescriptor(call->GetType(), /*allow_full_pad=*/false,
+                                        /*allow_row_prefix_pad=*/true)};
   return RuntimeBfloatGeometry(types[0], types[1]) && OperandError(recipe, types, call->kwargs_) == nullptr;
 }
 

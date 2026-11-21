@@ -55,6 +55,20 @@ std::optional<BufferScalarPointLayout> GetBufferScalarPointLayout(const ir::Buff
   return layout;
 }
 
+bool IsPackedBufferGMPointSource(const ir::TensorTypePtr& tensor) {
+  if (!tensor || tensor->tensor_view_ ||
+      (tensor->dtype_ != DataType::INT32 && tensor->dtype_ != DataType::FP32) ||
+      !IsBufferTensorShape(tensor->shape_)) {
+    return false;
+  }
+  for (const auto& extent : tensor->shape_) {
+    if (!ir::As<ir::ConstInt>(extent) && !ir::As<ir::Var>(extent)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool IsBufferScalarGMSource(const ir::TensorTypePtr& tensor) {
   if (!tensor || (tensor->dtype_ != DataType::INT32 && tensor->dtype_ != DataType::FP32) ||
       !IsBufferTensorShape(tensor->shape_)) {
@@ -102,18 +116,19 @@ bool SupportsBufferGMRead(const std::vector<ir::ExprPtr>& args) {
   if (args.size() != 2 || !ir::AsVarLike(args[0])) return false;
   const auto source = ir::As<ir::TensorType>(args[0]->GetType());
   const auto indices = ir::As<ir::MakeTuple>(args[1]);
-  if (!IsBufferScalarGMSource(source) || source->tensor_view_ || !indices ||
+  if (!IsPackedBufferGMPointSource(source) || !indices ||
       indices->elements_.size() != source->shape_.size()) {
     return false;
   }
   const auto last = ir::As<ir::ConstInt>(indices->elements_.back());
   const auto first = ir::As<ir::ConstInt>(indices->elements_.front());
-  if (first && last) {
-    __int128 offset = first->value_;
-    if (source->shape_.size() == 2) {
-      offset = offset * ir::As<ir::ConstInt>(source->shape_[1])->value_ + last->value_;
+  const auto columns = ir::As<ir::ConstInt>(source->shape_.back());
+  if (first && last && columns) {
+    const __int128 offset =
+        source->shape_.size() == 2 ? __int128(first->value_) * columns->value_ + last->value_ : first->value_;
+    if (offset >= std::numeric_limits<int64_t>::max() / source->dtype_.GetByte()) {
+      return false;
     }
-    if (offset >= std::numeric_limits<int64_t>::max() / source->dtype_.GetByte()) return false;
   }
   for (size_t axis = 0; axis < source->shape_.size(); ++axis) {
     const auto& index = indices->elements_[axis];

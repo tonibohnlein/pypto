@@ -88,6 +88,50 @@ bool IsHardMixedSyncAll(const CallPtr& call) {
          call->GetKwarg<std::string>("core_type", "mix") == "mix";
 }
 
+bool IsFFTSWorkspace(const TensorTypePtr& tensor) {
+  constexpr int64_t kMinFFTSWorkspaceElements = 256;
+  if (!tensor || tensor->dtype_ != DataType::INT64 || tensor->shape_.size() != 1 || tensor->tensor_view_) {
+    return false;
+  }
+  const auto extent = As<ConstInt>(tensor->shape_.front());
+  return extent && extent->value_ >= kMinFFTSWorkspaceElements;
+}
+
+bool IsAuthoredGMProtocolCall(const CallPtr& call) {
+  if (!call || !call->attrs_.empty()) {
+    return false;
+  }
+  if (IsOp(call, "system.set_ffts")) {
+    return call->args_.size() == 1 && call->kwargs_.empty() && As<Var>(call->args_.front()) &&
+           IsFFTSWorkspace(As<TensorType>(call->args_.front()->GetType()));
+  }
+  if (IsOp(call, "system.cacheinvalid") || IsOp(call, "system.fence")) {
+    return call->args_.empty() && call->kwargs_.empty();
+  }
+  const bool set = IsOp(call, "system.sync_set");
+  if ((!set && !IsOp(call, "system.sync_wait")) || call->args_.size() > 1) {
+    return false;
+  }
+  // Inlining can turn an authored compile-time constant into an INDEX
+  // operand. Keep the native spelling and qualify its value at either cut.
+  const auto operand = call->args_.empty() ? nullptr : As<ConstInt>(call->args_.front());
+  if (!call->args_.empty() &&
+      (!operand || GetScalarDtype(operand) != DataType::INDEX || call->HasKwarg("event_id"))) {
+    return false;
+  }
+  const int64_t event_id = operand ? operand->value_ : call->GetKwarg<int>("event_id", -1);
+  const auto pipe = call->GetKwarg<int>("pipe", -1);
+  const auto core = call->GetKwarg<std::string>("core_type", "");
+  const auto mode = call->GetKwarg<int>("ffts_mode", 0);
+  return event_id >= 0 && event_id <= 13 && pipe >= static_cast<int>(PipeType::MTE1) &&
+         pipe <= static_cast<int>(PipeType::ALL) && (core.empty() || core == "aic" || core == "aiv") &&
+         mode >= 0 && mode <= 2 &&
+         std::all_of(call->kwargs_.begin(), call->kwargs_.end(), [set](const auto& option) {
+           return option.first == "pipe" || option.first == "event_id" || option.first == "core_type" ||
+                  (set && option.first == "ffts_mode");
+         });
+}
+
 bool IsBufferPeerTransport(const CallPtr& call) {
   return IsOp(call, "buffer.peer_push") || IsOp(call, "buffer.peer_pop") || IsOp(call, "buffer.peer_free");
 }

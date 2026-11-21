@@ -1063,6 +1063,158 @@ class GuardedWidth:
         assert "pto.tfillpad" in text and "pto.set_validshape" in text
 
 
+@pytest.mark.parametrize(
+    ("row_guard", "selected"),
+    [
+        ("rows > 0 and rows <= 16", True),
+        ("rows >= 0 and rows <= 16", False),
+        ("rows > 0 and rows <= 17", False),
+    ],
+)
+def test_minimum_fillpad_accepts_both_runtime_extents_under_exact_guards(row_guard, selected, tmp_path):
+    program = pl.parse_program(f"""
+@pl.program
+class GuardedBox:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, source: pl.Tensor[[16, 32], pl.FP32], rows: pl.Scalar[pl.INDEX],
+               columns: pl.Scalar[pl.INDEX],
+               output: pl.InOut[pl.Tensor[[16, 1], pl.FP32]]) -> pl.Tensor[[16, 1], pl.FP32]:
+        if {row_guard} and columns > 0 and columns <= 32:
+            src = pl.load(source, [0, 0], [16, 32])
+            prefix = pl.set_validshape(src, rows, columns)
+            padded = pl.fillpad(prefix, pad_value=pl.PadValue.min)
+            workspace = pl.tile.create([16, 32], dtype=pl.FP32)
+            maximum = pl.row_max(padded, workspace)
+            output = pl.store(maximum, [0, 0], output)
+        return output
+""")
+    planner = passes.MemoryPlanner.PYPTO
+    lowered = _lower(program, planner)
+    assert (_kernel(lowered).ir_stage == ir.FunctionIRStage.Buffer) is selected
+    if selected:
+        text = codegen.PTOCodegen().generate(lowered, emit_source_loc=False)
+        assert "pto.tfillpad" in text and "pto.texpands" not in text
+        _compile_dynamic_state_native(lowered, tmp_path, planner)
+
+
+@pytest.mark.parametrize(
+    ("case", "selected"),
+    [
+        ("matching", True),
+        ("different_extent", False),
+        ("different_divisor", False),
+        ("shadowed_quotient", False),
+        ("unproved_formal", False),
+    ],
+)
+def test_minimum_fillpad_uses_the_matching_ceil_div_tile_guard(case, selected):
+    # A narrow scalar formal without the qualified scalar-read range remains
+    # outside this tail proof.
+    read_extent = "formal" if case == "unproved_formal" else "pl.tensor.read(extent_values, [0])"
+    tail_source = "other" if case == "different_extent" else "extent"
+    divisor = 16 if case == "different_divisor" else 32
+    shadow = "tiles = pl.cast(other, pl.INDEX)" if case == "shadowed_quotient" else ""
+    program = pl.parse_program(f"""
+@pl.program
+class GuardedTail:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, source: pl.Tensor[[16, 32], pl.FP32], extent_values: pl.Tensor[[1], pl.INT32],
+               other_values: pl.Tensor[[1], pl.INT32], formal: pl.Scalar[pl.INT32],
+               output: pl.InOut[pl.Tensor[[16, 1], pl.FP32]]) -> pl.Tensor[[16, 1], pl.FP32]:
+        extent = {read_extent}
+        other = pl.tensor.read(other_values, [0])
+        tiles = (pl.cast(extent, pl.INDEX) + {divisor - 1}) // {divisor}
+        {shadow}
+        for i in pl.range(tiles + 2):
+            if i < tiles:
+                columns = pl.min(pl.cast({tail_source}, pl.INDEX) - i * 32, 32)
+                src = pl.load(source, [0, 0], [16, 32])
+                prefix = pl.set_validshape(src, 16, columns)
+                padded = pl.fillpad(prefix, pad_value=pl.PadValue.min)
+                workspace = pl.tile.create([16, 32], dtype=pl.FP32)
+                maximum = pl.row_max(padded, workspace)
+                output = pl.store(maximum, [0, 0], output)
+        return output
+""")
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO, enable_scalar_gm_dma=True):
+        actual = _kernel(PassManager(OptimizationStrategy.Default).run_passes(program))
+    assert (actual.ir_stage == ir.FunctionIRStage.Buffer) is selected, str(actual)
+
+
+@pytest.mark.parametrize("prefix_cols", ["32", "columns"])
+def test_minimum_pad_runtime_rows_flow_through_native_payloads(prefix_cols, tmp_path):
+    program = pl.parse_program(f"""
+@pl.program
+class PaddedRows:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, source: pl.Tensor[[16, 32], pl.FP32], rows: pl.Scalar[pl.INDEX],
+               columns: pl.Scalar[pl.INDEX],
+               output: pl.InOut[pl.Tensor[[16, 32], pl.BF16]]) -> pl.Tensor[[16, 32], pl.BF16]:
+        if rows > 0 and rows <= 16 and columns > 0 and columns <= 32:
+            src = pl.load(source, [0, 0], [16, 32])
+            prefix = pl.set_validshape(src, rows, columns)
+            padded = pl.fillpad(prefix, pad_value=pl.PadValue.min)
+            active = pl.set_validshape(padded, rows, {prefix_cols})
+            workspace = pl.tile.create([16, 32], dtype=pl.FP32)
+            maximum = pl.row_max(active, workspace)
+            shifted = pl.row_expand_sub(active, maximum)
+            weights = pl.exp(shifted)
+            copied = pl.tile.move(weights, target_memory=pl.Mem.Vec, slayout=pl.TileLayout.none_box)
+            sums = pl.row_sum(copied, workspace)
+            centered = pl.row_expand_sub(weights, sums)
+            packed = pl.cast(centered, pl.BF16)
+            output = pl.store(packed, [0, 0], output)
+        return output
+""")
+    planner = passes.MemoryPlanner.PYPTO
+    lowered = _lower(program, planner)
+    actual = _kernel(lowered)
+    assert (actual.ir_stage == ir.FunctionIRStage.Buffer) is (prefix_cols == "32"), str(actual)
+    if prefix_cols == "32":
+        text = codegen.PTOCodegen().generate(lowered, emit_source_loc=False)
+        assert all(
+            f"pto.{op}" in text
+            for op in ["tfillpad", "trowmax", "trowexpandsub", "texp", "tmov", "trowsum", "tcvt"]
+        )
+        _compile_dynamic_state_native(lowered, tmp_path, planner)
+
+
+def test_contiguous_column_move_preserves_runtime_rows(tmp_path):
+    program = pl.parse_program("""
+@pl.program
+class ColumnMove:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, source: pl.Tensor[[1, 16], pl.FP32], rows: pl.Scalar[pl.INDEX],
+               output: pl.InOut[pl.Tensor[[1, 16], pl.FP32]]) -> pl.Tensor[[1, 16], pl.FP32]:
+        if rows > 0 and rows <= 16:
+            src = pl.load(source, [0, 0], [1, 16])
+            active = pl.set_validshape(src, 1, rows)
+            column = pl.reshape(active, [16, 1])
+            copied = pl.tile.move(column, target_memory=pl.Mem.Vec)
+            copy_row = pl.reshape(copied, [1, 16])
+            original_row = pl.reshape(column, [1, 16])
+            changed = pl.mul(copy_row, 2.0)
+            result = pl.add(original_row, changed)
+            output = pl.store(result, [0, 0], output)
+        return output
+""")
+    planner = passes.MemoryPlanner.PYPTO
+    lowered = _lower(program, planner)
+    actual = _kernel(lowered)
+    assert actual.ir_stage == ir.FunctionIRStage.Buffer, str(actual)
+    text = codegen.PTOCodegen().generate(lowered, emit_source_loc=False)
+    assert "pto.tmov" in text
+    _compile_dynamic_state_native(lowered, tmp_path, planner)
+    namespace = {}
+    exec(torch_codegen(lowered), namespace)  # noqa: S102
+    source = torch.arange(16, dtype=torch.float32).reshape(1, 16)
+    for rows in (3, 15):
+        output = torch.full_like(source, -1)
+        namespace["kernel"](source, rows, output)
+        torch.testing.assert_close(output[:, :rows], 3 * source[:, :rows])
+        assert torch.all(output[:, rows:] == -1)
+
+
 @pytest.mark.ptoas_compile
 @pytest.mark.parametrize("planner", _PLANNERS)
 @pytest.mark.parametrize("window", ["identity", "offset", "valid"])

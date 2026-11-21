@@ -34,6 +34,7 @@
 #include "pypto/backend/common/buffer_sync_contract.h"
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
+#include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memory_allocator_policy.h"
@@ -44,6 +45,7 @@
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/transforms/utils/l0c_footprint.h"
+#include "pypto/ir/transforms/utils/loop_step_qualification.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "src/ir/transforms/utils/sync_footprint_resolver.h"
@@ -229,13 +231,16 @@ class LaneImporter {
  public:
   LaneImporter(const FunctionPtr& function, const PeerTransportEffects& transport, const std::string& target,
                const SyncParameterBounds& parameters, PeerGmEffects& gm, const SyncControlRangeProver& ranges,
-               const SyncFootprintResolver* footprint, ImportedLocalSync* structured)
+               const SyncFootprintResolver* footprint, ImportedLocalSync* structured,
+               const Stmt* authored_acquire, std::vector<PeerGmEffects>& gm_phases)
       : transport_(transport),
         backend_(*backend::BackendConfig::GetBackend()),
         gm_(gm),
         ranges_(ranges),
         footprint_(footprint),
-        structured_(structured) {
+        structured_(structured),
+        authored_acquire_(authored_acquire),
+        gm_phases_(gm_phases) {
     result_.input.owner = function;
     result_.input.hardware_target = target;
     result_.input.segments.emplace_back();
@@ -272,6 +277,16 @@ class LaneImporter {
         CHECK(end <= begin) << "Peer receive reserves overlap";
         end = next_end;
       }
+    }
+    if (authored_acquire_) {
+      std::vector<int> positive;
+      for (const auto& [formal, range] : parameters) {
+        if (formal < function->params_.size() && formal <= static_cast<size_t>(INT32_MAX) &&
+            range.first > 0) {
+          positive.push_back(static_cast<int>(formal));
+        }
+      }
+      step_proof_.BindCallerParameters(function, positive);
     }
     for (size_t formal = 0; formal < function->params_.size(); ++formal) {
       const auto& parameter = function->params_[formal];
@@ -322,6 +337,10 @@ class LaneImporter {
   const SyncControlRangeProver& ranges_;
   const SyncFootprintResolver* footprint_;
   ImportedLocalSync* structured_;
+  const Stmt* authored_acquire_;
+  std::vector<PeerGmEffects>& gm_phases_;
+  size_t authored_phase_ = 0;
+  PositiveLoopStepProof step_proof_;
   PeerLocalLane result_;
   size_t region_start_ = 0;
   std::optional<PeerLocalWorkLoop> work_loop_;
@@ -537,12 +556,14 @@ class LaneImporter {
                              window.end - window.begin, false, exact});
   }
 
+  PeerGmEffects& Gm() { return authored_acquire_ ? gm_phases_.at(authored_phase_) : gm_; }
+
   void GmAccess(SyncSite& site, const StmtPtr& statement, const ExprPtr& value, bool write) {
     const auto it = gm_roots_.find(AsVarLike(value).get());
     CHECK_SPAN(it != gm_roots_.end(), statement->span_) << "Peer GM transfer has no original formal root";
-    gm_.formals.insert(it->second);
+    Gm().formals.insert(it->second);
     if (write) {
-      gm_.writes.insert(it->second);
+      Gm().writes.insert(it->second);
     }
     Access(site, {MemorySpace::DDR, 0, 1}, write);
   }
@@ -562,6 +583,56 @@ class LaneImporter {
     const auto upper = bound ? bound->second : *maximum;
     // As for the original tensor.read, only in-bounds executions are defined.
     return length ? std::min(upper, length->value_ - 1) : upper;
+  }
+
+  std::optional<int64_t> AuthoredScalarExtentMaximum(const ExprPtr& extent) const {
+    if (const auto bounds = Bounds(extent)) {
+      return bounds->second;
+    }
+    const auto symbol = As<Var>(extent);
+    if (!symbol) {
+      return std::nullopt;
+    }
+    const auto& parameters = result_.input.owner->params_;
+    // Explicit scalar arguments are not loaded from the Tensor descriptor.
+    if (std::find(parameters.begin(), parameters.end(), symbol) != parameters.end()) {
+      return std::nullopt;
+    }
+    for (const auto& parameter : parameters) {
+      const auto tensor = As<TensorType>(parameter->GetType());
+      if (!tensor) {
+        continue;
+      }
+      for (const auto& dimension : tensor->shape_) {
+        const auto variables = codegen::CollectVarsFromShapeExpr(dimension);
+        if (std::find(variables.begin(), variables.end(), symbol) != variables.end()) {
+          // The wrapper's first matching bare symbol reads a uint32_t
+          // Tensor::shapes field. A previous affine occurrence may instead
+          // select an inverse transform whose result has different bounds.
+          return dimension == symbol ? std::make_optional<int64_t>(UINT32_MAX) : std::nullopt;
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  void CheckAuthoredScalarExtent(const TensorType& tensor, const MakeTuple& indices, const Span& span) const {
+    const auto rank = tensor.shape_.size();
+    CHECK_SPAN(indices.elements_.size() == rank && (rank == 1 || rank == 2), span)
+        << "Authored GM scalar read needs a packed rank-one or rank-two coordinate tuple";
+    std::vector<int64_t> extent_maxima;
+    for (const auto& extent : tensor.shape_) {
+      const auto bound = AuthoredScalarExtentMaximum(extent);
+      CHECK_SPAN(bound && *bound > 0, span) << "Authored GM scalar address requires a bounded launch extent";
+      extent_maxima.push_back(*bound);
+    }
+    // Valid source coordinates must be within the original descriptor.
+    // Prove the byte offset over that entire enclosing rectangle, regardless
+    // of the data-dependent coordinate expressions chosen at runtime.
+    const __int128 elements =
+        rank == 1 ? __int128(extent_maxima[0]) : __int128(extent_maxima[0]) * extent_maxima[1];
+    CHECK_SPAN(elements <= std::numeric_limits<int64_t>::max() / tensor.dtype_.GetByte(), span)
+        << "Authored GM scalar address may exceed the signed native byte offset";
   }
 
   bool NeedsHostScalarExtent(const TensorType& tensor, const MakeTuple& indices, const Span& span) const {
@@ -591,10 +662,12 @@ class LaneImporter {
 
   void ImportScalarGmRead(const CallPtr& call, const VarPtr& result) {
     const auto& owner = result_.input.owner;
-    CHECK_SPAN(owner->func_type_ == FunctionType::AIC && result_.input.hardware_target == "a2a3" && result &&
-                   call->args_.size() == 2 && call->kwargs_.empty(),
+    CHECK_SPAN((owner->func_type_ == FunctionType::AIC ||
+                (authored_acquire_ && owner->func_type_ == FunctionType::AIV)) &&
+                   result_.input.hardware_target == "a2a3" && result && call->args_.size() == 2 &&
+                   call->kwargs_.empty(),
                call->span_)
-        << "Peer scalar GM read requires a direct A2/A3 AIC scalar definition";
+        << "Peer scalar GM read requires a qualified direct A2/A3 scalar definition";
     const auto tensor = As<TensorType>(call->args_[0]->GetType());
     const auto root = gm_roots_.find(AsVarLike(call->args_[0]).get());
     CHECK_SPAN(root != gm_roots_.end() && tensor && !tensor->tensor_view_ &&
@@ -611,11 +684,14 @@ class LaneImporter {
                call->span_)
         << "Peer scalar GM read must preserve its original packed pointer and scalar dtype";
     RequireReadyTuple(call->args_[1], call->span_);
-    if (NeedsHostScalarExtent(*tensor, *As<MakeTuple>(call->args_[1]), call->span_)) {
-      gm_.host_extent_requirements.insert(root->second);
+    const auto indices = As<MakeTuple>(call->args_[1]);
+    if (authored_acquire_) {
+      CheckAuthoredScalarExtent(*tensor, *indices, call->span_);
+    } else if (NeedsHostScalarExtent(*tensor, *indices, call->span_)) {
+      Gm().host_extent_requirements.insert(root->second);
     }
-    gm_.formals.insert(root->second);
-    gm_.scalar_reads.insert(root->second);
+    Gm().formals.insert(root->second);
+    Gm().scalar_reads.insert(root->second);
     CHECK_SPAN(ready_.insert(result.get()).second, call->span_) << "Peer scalar GM result is defined twice";
     // The retained native read is a cacheable, blocking pointer dereference.
     // There is no asynchronous issue or cache-maintenance event to model.
@@ -1132,6 +1208,16 @@ class LaneImporter {
   }
 
   void QualifyWorkLoop(const ForStmtPtr& loop) const {
+    if (authored_acquire_) {
+      // The placed closed-prefix planner visits the original CFG until its
+      // finite reaching-effect state converges. Only the original loop step
+      // must be positive. No trip count or FIFO cursor is computed here.
+      CHECK_SPAN(Ready(loop->start_) && Ready(loop->stop_) && Ready(loop->step_) &&
+                     step_proof_.IsPositive(loop->step_),
+                 loop->span_)
+          << "Authored GM local loop requires ready bounds and a provably positive original step";
+      return;
+    }
     const auto start = Bounds(loop->start_);
     const auto stop = Bounds(loop->stop_);
     const auto step = Bounds(loop->step_);
@@ -1256,6 +1342,9 @@ class LaneImporter {
     const auto assignment = As<AssignStmt>(statement);
     const auto result = assignment ? assignment->var_ : nullptr;
     const auto call = GetCallFromStmt(statement);
+    if (authored_acquire_ && result && As<ScalarType>(result->GetType())) {
+      step_proof_.Define(result, assignment->value_);
+    }
     if (!call) {
       CHECK_SPAN(assignment, statement->span_) << "Peer local effects require bounded straight-line paths";
       BindAlias(result, assignment->value_);
@@ -1279,6 +1368,17 @@ class LaneImporter {
       return;
     }
     CHECK_SPAN(!As<GlobalVar>(call->op_), statement->span_) << "Unqualified outlined peer payload";
+    if (authored_acquire_ &&
+        (cross_core_pipe::IsAuthoredGMProtocolCall(call) || cross_core_pipe::IsHardMixedSyncAll(call))) {
+      CHECK_SPAN(IsA<EvalStmt>(statement), statement->span_)
+          << "Authored GM protocol requires standalone native commands";
+      if (statement.get() == authored_acquire_) {
+        authored_phase_ = 1;
+      }
+      // The peer owns the authored event and cache protocol. Preserve the
+      // command verbatim and do not credit it with any local storage completion.
+      return;
+    }
     CHECK_SPAN(!IsOp(call, "system.syncall"), statement->span_)
         << "Peer local hard MIX SYNCALL must be outside loops";
     CHECK_SPAN(call->attrs_.empty(), statement->span_)
@@ -1348,14 +1448,16 @@ class LaneImporter {
 
 PeerLocalEffects ImportPeerLocalEffects(const FunctionPtr& function, const PeerTransportEffects& transport,
                                         const std::string& target, const SyncParameterBounds& parameters,
-                                        const std::optional<SyncDispatchCoordinates>& dispatch) {
+                                        const std::optional<SyncDispatchCoordinates>& dispatch,
+                                        const Stmt* authored_acquire) {
   backend::RequireLocalSyncExecutionContract(target);
   CHECK(function &&
         (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV) &&
-        transport.unavailable.empty() && !transport.sites.empty())
+        transport.unavailable.empty() && (authored_acquire || !transport.sites.empty()))
       << "Peer local planning requires a device endpoint and its qualified transport effects";
   auto paths = LaneStatements(function);
   const bool buffer_ir = function->ir_stage_ == FunctionIRStage::Buffer;
+  CHECK(!authored_acquire || buffer_ir) << "Authored GM protocol requires placed Buffer endpoints";
   if (buffer_ir) {
     const BufferRuntimeValidAnalysis valid(function, /*collect_guards=*/false,
                                            /*check_payload_capacity=*/true);
@@ -1370,9 +1472,13 @@ PeerLocalEffects ImportPeerLocalEffects(const FunctionPtr& function, const PeerT
                                                                              /*resolve_peer_slots=*/true)
                                    : nullptr;
   PeerLocalEffects result;
-  const bool structured = buffer_ir && std::any_of(paths.begin(), paths.end(), [](const auto& path) {
-                            return std::any_of(path.begin(), path.end(), HasConditional);
-                          });
+  const bool structured =
+      authored_acquire || (buffer_ir && std::any_of(paths.begin(), paths.end(), [](const auto& path) {
+                             return std::any_of(path.begin(), path.end(), HasConditional);
+                           }));
+  if (authored_acquire) {
+    result.gm_phases.resize(2);
+  }
   if (structured) {
     const auto body = transform_utils::FlattenToStmts(function->body_);
     result.structured.emplace(
@@ -1381,7 +1487,8 @@ PeerLocalEffects ImportPeerLocalEffects(const FunctionPtr& function, const PeerT
   }
   for (const auto& path : paths) {
     LaneImporter importer(function, transport, target, parameters, result.gm, ranges, footprint.get(),
-                          result.structured ? &*result.structured : nullptr);
+                          result.structured ? &*result.structured : nullptr, authored_acquire,
+                          result.gm_phases);
     result.lanes.push_back(importer.Run(path));
   }
   return result;

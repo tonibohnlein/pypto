@@ -645,6 +645,28 @@ def test_reciprocal_rejects_equal_addresses_even_with_distinct_handles():
 
 
 @pytest.mark.parametrize(
+    ("destination_address", "error"),
+    [(0, "disjoint"), (512, "disjoint"), (1024, "disjoint"), (1536, None), (1537, "aligned base")],
+)
+def test_concat_destination_must_be_aligned_and_disjoint_from_both_inputs(destination_address, error):
+    # Distinct handles do not stop TCONCAT from overwriting subsequent source rows.
+    buffers = [
+        _var(name, ir.BufferType([16, cols], DataType.FP32, ir.MemorySpace.Vec))
+        for name, cols in (("left", 8), ("right", 16), ("destination", 24))
+    ]
+    statements: list[ir.Stmt] = [
+        ir.AssignStmt(value, _call("buffer.alloc", [ir.MakeTuple([], SPAN), _int(address)], value.type), SPAN)
+        for value, address in zip(buffers, [0, 512, destination_address], strict=True)
+    ]
+    statements.append(ir.EvalStmt(_call("buffer.concat", buffers), SPAN))
+    program = _program(ir.SeqStmts(statements, SPAN))
+    if error is not None:
+        _assert_error(program, error)
+    else:
+        assert _verify(program) == []
+
+
+@pytest.mark.parametrize(
     ("scratch_address", "error"),
     [
         (32, "requires disjoint placed"),

@@ -1187,7 +1187,7 @@ static const SimpleOpEntry kSimpleOps[] = {
     {"tile.matmul_bias",     "pto.tmatmul.bias",     3},
     // tile.gemv_acc has custom codegen (in-place accumulation)
     // Data movement/layout operations
-    {"tile.concat",          "pto.tconcat",          2},
+    {"tile.concat",          nullptr,               2},
     // tile.move has custom codegen (PTOAS same-handle elision and baked-address validation)
     {"tile.move_fp",         "pto.tmov.fp",          2},
     // tile.transpose has custom codegen (MakeTileTransposeCodegenPTO): pto.ttrans needs

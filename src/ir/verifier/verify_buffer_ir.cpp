@@ -301,7 +301,7 @@ class BufferIRVisitor : public IRVisitor {
           if (axis_recipe->axis == 0) {
             // A subview descriptor can hide its parent's wider row pitch.
             // Native column recipes here consume dense allocation geometry.
-            CheckDensePhysicalPitch(op);
+            CheckDensePhysicalPitch(op, IsOp(op, "buffer.col_expand_mul"));
           }
           const auto& destination = op->args_[axis_recipe->InputCount()];
           CheckWindowPair(op, op->args_[0], destination, !axis_recipe->reduction);
@@ -533,12 +533,17 @@ class BufferIRVisitor : public IRVisitor {
     }
   }
 
-  void CheckDensePhysicalPitch(const CallPtr& call) {
+  void CheckDensePhysicalPitch(const CallPtr& call, bool allow_single_row = false) {
     for (const auto& arg : call->args_) {
-      const auto window = windows_.find(AsVarLike(arg).get());
+      const auto var = AsVarLike(arg);
+      const auto window = windows_.find(var.get());
       const auto type = As<BufferType>(arg->GetType());
       const auto pitch = static_cast<uint64_t>(type->shape_[1]) * type->dtype_.GetByte();
-      if (window == windows_.end() || window->second.row_pitch != pitch) {
+      const bool single_row = allow_single_row && type->shape_[0] == 1 && type->valid_shape_ == type->shape_;
+      if (window == windows_.end() ||
+          (window->second.row_pitch != pitch &&
+           !(single_row && window->second.known_offset && !window->second.relabelled_strided &&
+             HasAlignedWindowBase(window->second, var)))) {
         Error(call->op_->name_ + " requires dense physical row pitch", call->span_);
       }
     }
@@ -603,6 +608,21 @@ class BufferIRVisitor : public IRVisitor {
   }
 
   void CheckRecipeWindows(const CallPtr& call, const backend::BufferElementwiseRecipe& recipe) {
+    if (recipe.types == backend::BufferElementwiseTypePolicy::DenseConcatVec) {
+      for (const auto& arg : call->args_) {
+        const auto type = As<BufferType>(arg->GetType());
+        const auto window = windows_.find(AsVarLike(arg).get());
+        const auto pitch = static_cast<uint64_t>(type->shape_[1]) * type->dtype_.GetByte();
+        if (window == windows_.end() || window->second.relabelled_strided ||
+            window->second.row_pitch != pitch) {
+          Error("buffer.concat requires dense physical row pitch", call->span_);
+          continue;
+        }
+        if (!HasAlignedWindowBase(window->second, AsVarLike(arg))) {
+          Error("buffer.concat requires a proven 32-byte aligned base", call->span_);
+        }
+      }
+    }
     const bool exact_allowed =
         recipe.destination_alias == backend::BufferDestinationAliasPolicy::ExactOrDisjoint;
     for (size_t i = 0; i < recipe.inputs.size(); ++i) {
@@ -632,13 +652,20 @@ class BufferIRVisitor : public IRVisitor {
       Error(call->op_->name_ + " workspace requires proven dense allocation geometry", call->span_);
       return;
     }
-    const auto root = allocations_.find(window->second.root);
-    constexpr uint64_t alignment = 32;
-    if (root == allocations_.end() || window->second.offset % alignment != 0 ||
-        (!root->second.symbolic &&
-         (!root->second.address || root->second.address->value_ % alignment != 0))) {
+    if (!HasAlignedWindowBase(window->second, var)) {
       Error(call->op_->name_ + " workspace requires a proven 32-byte aligned base", call->span_);
     }
+  }
+
+  bool HasAlignedWindowBase(const Window& window, const VarPtr& var) const {
+    constexpr uint64_t kNativeBlockBytes = 32;
+    const auto root = allocations_.find(window.root);
+    if ((!window.known_offset && view_handles_.count(var.get())) || root == allocations_.end() ||
+        window.offset % kNativeBlockBytes != 0) {
+      return false;
+    }
+    return root->second.symbolic ||
+           (root->second.address && root->second.address->value_ % kNativeBlockBytes == 0);
   }
 
   enum TypeFlags : uint8_t { kNone = 0, kTile = 1, kRawStorage = 2, kBuffer = 4 };

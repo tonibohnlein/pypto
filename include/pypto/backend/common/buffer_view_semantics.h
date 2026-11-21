@@ -28,6 +28,11 @@ std::optional<uint64_t> DenseBufferBytes(const ir::BufferTypePtr& type);
 /// fractal matrix layouts, whose physical extents are already whole boxes.
 std::optional<uint64_t> PhysicalBufferBytes(const ir::BufferTypePtr& type);
 
+/// A2/A3 Vec TMOV transfers aligned full columns per valid row in one burst.
+/// Runtime rows of a minimum-padded descriptor require a separate use proof.
+bool SupportsA2A3VecCopyDescriptor(const ir::BufferTypePtr& type);
+bool SupportsLogicalBufferVecCopy(const ir::CallPtr& call);
+
 /// Address-independent geometry at a native TPUSH/TPOP site. The caller binds
 /// a receive to its reserved ring; a pop does not allocate another local tile.
 /// capacity_bytes is the full box, including inactive rows/columns. It bounds

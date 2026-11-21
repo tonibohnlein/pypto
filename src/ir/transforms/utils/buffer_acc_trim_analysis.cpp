@@ -420,7 +420,12 @@ std::optional<arith::ConstIntBound> BoundBufferAccTrimScalar(const ExprPtr& expr
       if (const auto bound = self(self, cast->operand_)) {
         const auto [lo, hi] = MachineBounds(cast->operand_, *bound);
         const auto [min, max] = SignedLimits(expr);
-        if (lo >= min && hi <= max) result = *bound;
+        if (lo >= min && hi <= max) {
+          // Casts between signed representations preserve the represented
+          // range. A source-width sentinel is no longer unbounded once
+          // widened to an index or larger signed integer.
+          result = arith::ConstIntBound{static_cast<int64_t>(lo), static_cast<int64_t>(hi)};
+        }
       }
     } else if (const auto call = As<Call>(expr); call && call->args_.empty()) {
       if (IsOp(call, "buffer.get_block_idx") || IsOp(call, "tile.get_block_idx")) {
@@ -440,11 +445,15 @@ std::optional<arith::ConstIntBound> BoundBufferAccTrimScalar(const ExprPtr& expr
           result = arith::ConstIntBound{std::max(a->min_value, b->min_value),
                                         std::max(a->max_value, b->max_value)};
         } else if (As<FloorDiv>(expr) || As<FloorMod>(expr)) {
-          if (a->min_value >= 0 && a->max_value < arith::ConstIntBound::kPosInf && b->is_const() &&
-              b->min_value > 0) {
+          if (a->min_value > arith::ConstIntBound::kNegInf && a->max_value < arith::ConstIntBound::kPosInf &&
+              b->is_const() && b->min_value > 0) {
             const auto divisor = b->min_value;
-            result = As<FloorDiv>(expr) ? arith::ConstIntBound{a->min_value / divisor, a->max_value / divisor}
-                                        : arith::ConstIntBound{0, std::min(a->max_value, divisor - 1)};
+            if (As<FloorDiv>(expr)) {
+              const auto floor_min = a->min_value / divisor - (a->min_value % divisor < 0 ? 1 : 0);
+              result = arith::ConstIntBound{floor_min, a->max_value / divisor};
+            } else if (a->min_value >= 0) {
+              result = arith::ConstIntBound{0, std::min(a->max_value, divisor - 1)};
+            }
           }
         } else {
           result = BoundArithmetic(expr, binary, *a, *b, analyzer);
