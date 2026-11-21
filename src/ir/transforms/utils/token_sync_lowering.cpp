@@ -818,8 +818,9 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
   }
   FindLogical(true).VisitFunction(function);
   if (HasOnlyClosedPrefixSyntax(function)) {
-    if (auto closed = TryLowerClosedPrefixSync(function, target, eligible_ids, extra_reservations, parameters,
-                                               blocks)) {
+    if (auto closed =
+            TryLowerClosedPrefixSync(function, target, eligible_ids, extra_reservations, parameters, blocks,
+                                     nullptr, dry_run_only ? SyncSchedulePolicy{} : policy)) {
       if (dry_run_only) return {closed->function, closed->set_sites, closed->wait_sites, {}};
       CheckPhysicalSyncResult(closed->function);
       FinishSyncScheduleReceipt(closed->function, *closed, policy);

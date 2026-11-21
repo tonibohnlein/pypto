@@ -1458,6 +1458,21 @@ void AccumulateScheduleWork(PhysicalSyncRealization& result, const PhysicalSyncR
 constexpr std::array<const char*, 8> kScheduleModes{"guarded",           "case",     "boundary",
                                                     "case_boundary",     "periodic", "case_periodic",
                                                     "boundary_periodic", "combined"};
+constexpr auto kAutoBoundaryMode = "auto_boundary";
+constexpr unsigned kBoundaryMode = 2;
+constexpr int64_t kMinAutoBoundaryTrips = 4;
+constexpr size_t kMaxAutoBoundaryPhases = 3;
+
+bool IsAutomaticSchedule(const SyncSchedulePolicy& policy) {
+  return policy.mode == "auto" || policy.mode == kAutoBoundaryMode;
+}
+
+bool RequestsScheduleMode(const SyncSchedulePolicy& policy, unsigned mode) {
+  if (policy.mode == kAutoBoundaryMode) {
+    return mode == kBoundaryMode;
+  }
+  return policy.mode == "auto" || policy.mode == kScheduleModes[mode];
+}
 std::vector<PreparedSchedulePhase> PrepareLoopSchedule(const RegularLoopSchedule& plan, unsigned mode,
                                                        const AssignedRegionSchedule& assigned,
                                                        const CutInventory& domains,
@@ -1748,22 +1763,34 @@ class ScheduleTreeSize : public IRVisitor {
 };
 
 // Costs are accumulated by interval range additions over invocation cases.
-// Unsupported mixed predicates make automatic profitability unproved.
+// A mixed predicate can depend on an enclosing loop coordinate: its test
+// executes, while all source work in its arms is possible rather than certain.
 struct ScheduleCost {
   std::array<__int128, 6> value{};
+  std::array<__int128, 6> uncertainty{};
   bool valid = true;
+  bool Exact() const {
+    return valid && std::all_of(uncertainty.begin(), uncertainty.end(), [](__int128 n) { return n == 0; });
+  }
   __int128 Total() const { return std::accumulate(value.begin(), value.end(), __int128(0)); }
+  __int128 UpperTotal() const { return std::accumulate(uncertainty.begin(), uncertainty.end(), Total()); }
+  __int128 Tests(bool upper) const {
+    const auto known = value[3] + value[4];
+    return upper ? known + uncertainty[3] + uncertainty[4] : known;
+  }
 };
 struct ScheduleCostProfile {
   std::vector<ScheduleCost> difference;
   bool valid = true;
   explicit ScheduleCostProfile(size_t cases) : difference(cases + 1) {}
-  void Add(const ScheduleCost& cost, const Intervals& active) {
+  void Add(const ScheduleCost& cost, const Intervals& active, bool possible = false) {
     valid &= cost.valid;
     for (const auto& [lo, hi] : active)
       for (size_t i = 0; i < cost.value.size(); ++i) {
-        difference[lo].value[i] += cost.value[i];
-        difference[hi + 1].value[i] -= cost.value[i];
+        auto& first = possible ? difference[lo].uncertainty : difference[lo].value;
+        auto& end = possible ? difference[hi + 1].uncertainty : difference[hi + 1].value;
+        first[i] += cost.value[i];
+        end[i] -= cost.value[i];
       }
   }
 };
@@ -1882,19 +1909,16 @@ class ScheduleCostModel {
     return truth ? Range{*truth, *truth, 0} : std::optional<Range>{};
   }
   void Forest(const FrozenCommandForest& forest, ScheduleCostProfile& profile, __int128 weight,
-              const Intervals& active) {
-    if (active.empty()) return;
-    for (const auto& command : forest.commands) Visit(command, profile, weight, active);
-  }
-  void Visit(const FrozenCommand& command, ScheduleCostProfile& profile, __int128 weight,
-             const Intervals& active) {
-    if (active.empty()) return;
-    ++work_.schedule_inspected_descriptors;
-    const auto& node = command.original;
-    if (!command.condition_expr) {
-      if (command.body) Forest(*command.body, profile, weight, active);
+              const Intervals& active, bool possible = false) {
+    if (active.empty()) {
       return;
     }
+    for (const auto& command : forest.commands) {
+      Visit(command, profile, weight, active, possible);
+    }
+  }
+  std::optional<Intervals> ActiveArm(const FrozenCommand& command, const Intervals& active) {
+    const auto& node = command.original;
     Intervals yes;
     const auto condition = Evaluate(command.condition_expr);
     const bool is_split_wrapper =
@@ -1926,8 +1950,7 @@ class ScheduleCostModel {
           const auto phase_ap =
               AxisAP::MakeCanonical(first_, last_ + 1, stride_, arena->Axis(*loop_ax).count);
           if (!phase_ap) {
-            profile.valid = false;
-            return;
+            return std::nullopt;
           }
           specialized = RestrictGuardAxis(node->guard, *loop_ax, *phase_ap, arena);
         }
@@ -1939,8 +1962,7 @@ class ScheduleCostModel {
           }
         }
         if (!only_block) {
-          profile.valid = false;
-          return;
+          return std::nullopt;
         }
         if (specialized.IsTautology()) {
           yes = active;
@@ -1950,21 +1972,39 @@ class ScheduleCostModel {
           const auto partition = partition_->Partition(block_expr);
           work_.schedule_inspected_descriptors += work_.invocation_schedule_visits - before;
           if (!partition) {
-            profile.valid = false;
-            return;
+            return std::nullopt;
           }
           yes = InvocationCasePartition::Intersection(active, partition->yes);
         }
       } else {
-        profile.valid = false;
-        return;
+        return std::nullopt;
       }
     }
+    return yes;
+  }
+  void Visit(const FrozenCommand& command, ScheduleCostProfile& profile, __int128 weight,
+             const Intervals& active, bool possible) {
+    ++work_.schedule_inspected_descriptors;
+    if (!command.condition_expr) {
+      if (command.body) {
+        Forest(*command.body, profile, weight, active, possible);
+      }
+      return;
+    }
     ScheduleCost local;
-    for (size_t i = 0; i < command.scalar_cost.size(); ++i) local.value[i] = weight * command.scalar_cost[i];
-    profile.Add(local, active);
-    Forest(*command.body, profile, weight, yes);
-    Forest(*command.alternative, profile, weight, SubtractIntervals(active, yes));
+    for (size_t i = 0; i < command.scalar_cost.size(); ++i) {
+      local.value[i] = weight * command.scalar_cost[i];
+    }
+    profile.Add(local, active, possible);
+    if (const auto yes = ActiveArm(command, active)) {
+      Forest(*command.body, profile, weight, *yes, possible);
+      Forest(*command.alternative, profile, weight, SubtractIntervals(active, *yes), possible);
+    } else {
+      // Each arm can execute at most once for each test. Charge both to the
+      // upper bound without enumerating outer-loop visits or combinations.
+      Forest(*command.body, profile, weight, active, true);
+      Forest(*command.alternative, profile, weight, active, true);
+    }
   }
 
  public:
@@ -1980,13 +2020,13 @@ class ScheduleCostModel {
     return partition_ ? partition_->CaseIndices(ranges) : Intervals{};
   }
   void Add(const ControlForest& forest, int64_t first, int64_t last, int64_t stride, const Intervals& active,
-           ScheduleCostProfile& profile) {
+           ScheduleCostProfile& profile, bool possible = false) {
     if (first > last) return;
     first_ = first;
     last_ = last;
     stride_ = stride;
     const __int128 weight = (last - first) / stride + 1;
-    Forest(*FreezeCommandForest(forest, work_), profile, weight, active);
+    Forest(*FreezeCommandForest(forest, work_), profile, weight, active, possible);
   }
 };
 
@@ -2053,6 +2093,37 @@ CandidateSchedule PrepareCandidate(const RegularLoopSchedule& loop, unsigned mod
   return candidate;
 }
 
+CandidateSchedule PrepareOrderPreservingBoundary(const CandidateSchedule& baseline,
+                                                 const std::shared_ptr<GuardDomainArena>& arena) {
+  CandidateSchedule candidate;
+  const auto& loop = baseline.plan.loop;
+  candidate.plan.loop = loop;
+  candidate.plan.mode = kBoundaryMode;
+  const auto& guarded = baseline.plan.versions.front().front();
+  auto& phases = candidate.plan.versions.emplace_back();
+  const auto axis = arena->RegisterLoopFrame(SyncLoopFrame{loop.loop, loop.count, loop.start, loop.step, {}});
+  for (const auto& [first, end] : loop.phases) {
+    PreparedSchedulePhase phase{first, end, 1, false, {}};
+    auto& cuts = phase.visits.emplace_back(CopyScheduleCuts(guarded.visits.front()));
+    const AxisAP range{first, end, 1};
+    std::set<const PhysicalCuts*> seen;
+    for (auto& [anchor, cut] : cuts) {
+      if (!seen.insert(cut.get()).second) {
+        continue;
+      }
+      // Restrict the final guarded forest in place order. Normalizing a
+      // fresh forest after projection could commute independent commands
+      // whose guards now make that profitable, changing their source order.
+      cut->before = RestrictForestAxis(cut->before, axis, range, arena, candidate.work);
+      cut->after = RestrictForestAxis(cut->after, axis, range, arena, candidate.work);
+    }
+    phases.push_back(std::move(phase));
+  }
+  phases.front().entry = guarded.entry;
+  phases.back().exit = guarded.exit;
+  return candidate;
+}
+
 // This conservative expanded bound includes every payload operand occurrence,
 // not just descriptors or operation sites. Three times the command tree covers
 // sequence wrappers and first-use SSA bindings retained by the frozen scalar plan.
@@ -2102,9 +2173,21 @@ bool BoundCandidate(CandidateSchedule& candidate, const ScheduleTreeSize& body,
 }
 
 void MeasureCandidate(CandidateSchedule& candidate, const AssignedRegionSchedule& assigned,
-                      std::pair<int64_t, int64_t> blocks, ScheduleCostModel& model) {
+                      std::pair<int64_t, int64_t> blocks, ScheduleCostModel& model, bool bounded_model) {
   const auto& loop = candidate.plan.loop;
   ScheduleCostProfile profile(assigned.cases.size());
+  std::set<const Call*> initialization_anchors;
+  if (bounded_model) {
+    for (const auto& indices : loop.case_cuts) {
+      for (const auto index : indices) {
+        const auto& cut = assigned.cuts[index];
+        if (cut.continuation) {
+          initialization_anchors.insert(cut.original.get());
+          initialization_anchors.insert(cut.continuation.get());
+        }
+      }
+    }
+  }
   ControlForest dispatch;
   for (size_t i = candidate.plan.groups.size(); i > 1; --i) {
     const auto condition = InvocationGroupGuard(
@@ -2129,8 +2212,10 @@ void MeasureCandidate(CandidateSchedule& candidate, const AssignedRegionSchedule
       cost.value[0] += __int128(phase.period - 1) * visits;
       cost.value[5] += __int128(phase.period - 1) * visits;
       profile.Add(cost, active);
-      model.Add(phase.entry, phase.first, phase.first, 1, active, profile);
-      model.Add(phase.exit, phase.end - 1, phase.end - 1, 1, active, profile);
+      // A parent seam can share tests in a phase entry or exit with its
+      // neighbors. Use these costs only in the conservative upper bound.
+      model.Add(phase.entry, phase.first, phase.first, 1, active, profile, bounded_model);
+      model.Add(phase.exit, phase.end - 1, phase.end - 1, 1, active, profile, bounded_model);
       std::set<int64_t> boundaries{phase.first, phase.end};
       for (const auto& [first, end] : loop.phases) {
         if (phase.first < first && first < phase.end) boundaries.insert(first);
@@ -2151,7 +2236,10 @@ void MeasureCandidate(CandidateSchedule& candidate, const AssignedRegionSchedule
           std::set<const PhysicalCuts*> seen;
           for (const auto& [anchor, cut] : phase.visits[visit]) {
             if (!seen.insert(cut.get()).second) continue;
-            model.Add(cut->before, first, last, stride, active, profile);
+            // Emission can absorb a first-visit test into an original
+            // accumulator initialization branch at this cut.
+            model.Add(cut->before, first, last, stride, active, profile,
+                      initialization_anchors.count(anchor) != 0);
             model.Add(cut->after, first, last, stride, active, profile);
           }
         }
@@ -2164,22 +2252,27 @@ void MeasureCandidate(CandidateSchedule& candidate, const AssignedRegionSchedule
     std::array<int64_t, 6> row{};
     for (size_t i = 0; i < row.size(); ++i) {
       total.value[i] += profile.difference[c].value[i];
-      if (total.value[i] > std::numeric_limits<int64_t>::max() || total.value[i] < 0)
+      total.uncertainty[i] += profile.difference[c].uncertainty[i];
+      if (total.value[i] + total.uncertainty[i] > std::numeric_limits<int64_t>::max() || total.value[i] < 0 ||
+          total.uncertainty[i] < 0) {
         total.valid = false;
-      else
+      } else {
         row[i] = static_cast<int64_t>(total.value[i]);
+      }
     }
     candidate.receipt.model_cost.push_back(row);
     candidate.costs.push_back(total);
   }
   candidate.receipt.model_exact = std::all_of(candidate.costs.begin(), candidate.costs.end(),
-                                              [](const auto& cost) { return cost.valid; });
+                                              [](const auto& cost) { return cost.Exact(); });
 }
 
 bool Comparable(const CandidateSchedule& a, const CandidateSchedule& b) {
   if (a.costs.size() != b.costs.size()) return false;
   for (size_t i = 0; i < a.costs.size(); ++i) {
-    if (!a.costs[i].valid || !b.costs[i].valid) return false;
+    if (!a.costs[i].Exact() || !b.costs[i].Exact()) {
+      return false;
+    }
   }
   return true;
 }
@@ -2193,12 +2286,33 @@ bool Improves(const CandidateSchedule& candidate, const CandidateSchedule& basel
   return better;
 }
 
+bool ProvesBoundarySaving(const CandidateSchedule& candidate, const CandidateSchedule& baseline) {
+  if (candidate.costs.empty() || candidate.costs.size() != baseline.costs.size()) {
+    return false;
+  }
+  for (size_t c = 0; c < candidate.costs.size(); ++c) {
+    const auto& before = baseline.costs[c];
+    const auto& after = candidate.costs[c];
+    // Charge loop headers as well as decision sites, and require a strict
+    // saving even when every uncertain test in the candidate executes.
+    if (!before.valid || !after.valid || after.Tests(true) >= before.Tests(false) ||
+        after.UpperTotal() >= before.Total()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 class ScheduleLoopOrder : public IRVisitor {
+  size_t depth_ = 0;
+
  public:
-  std::vector<const ForStmt*> loops;
+  std::vector<std::pair<const ForStmt*, size_t>> loops;
   void VisitStmt_(const ForStmtPtr& loop) override {
-    loops.push_back(loop.get());
+    loops.emplace_back(loop.get(), depth_);
+    ++depth_;
     IRVisitor::VisitStmt_(loop);
+    --depth_;
   }
 };
 unsigned TransformCount(unsigned mode) { return (mode & 1) + ((mode >> 1) & 1) + ((mode >> 2) & 1); }
@@ -2206,14 +2320,15 @@ PreparedLoops PlanLoopSchedules(const AssignedRegionSchedule& assigned, const Cu
                                 const RegularSchedules& inventory, std::pair<int64_t, int64_t> blocks,
                                 PhysicalSyncRealization& work, const SyncSchedulePolicy& policy) {
   const auto requested = std::find(kScheduleModes.begin(), kScheduleModes.end(), policy.mode);
-  CHECK(policy.mode == "auto" || requested != kScheduleModes.end())
-      << "Unknown synchronization schedule mode";
+  const bool automatic = IsAutomaticSchedule(policy);
+  const bool boundary_auto = policy.mode == kAutoBoundaryMode;
+  CHECK(automatic || requested != kScheduleModes.end()) << "Unknown synchronization schedule mode";
   PreparedLoops selected;
   size_t payload_debit = 0, control_debit = 0;
   ScheduleLoopOrder order;
   order.VisitStmt(assigned.owner->body_);
   for (size_t ordinal = 0; ordinal < order.loops.size(); ++ordinal) {
-    const auto* key = order.loops[ordinal];
+    const auto [key, depth] = order.loops[ordinal];
     const auto found = inventory.find(key);
     if (found == inventory.end()) continue;
     const auto& loop = found->second;
@@ -2232,7 +2347,9 @@ PreparedLoops PlanLoopSchedules(const AssignedRegionSchedule& assigned, const Cu
       guarded.control_node_bound = std::numeric_limits<size_t>::max();
       work.schedule_choices.push_back(std::move(guarded));
       for (unsigned mode = 1; mode < kScheduleModes.size(); ++mode) {
-        if (policy.mode != "auto" && policy.mode != kScheduleModes[mode]) continue;
+        if (!RequestsScheduleMode(policy, mode)) {
+          continue;
+        }
         work.schedule_choices.push_back(
             {label, kScheduleModes[mode], "cost_unproved",
              "expanded size cannot certify the complete-candidate growth budget"});
@@ -2263,19 +2380,24 @@ PreparedLoops PlanLoopSchedules(const AssignedRegionSchedule& assigned, const Cu
       unproved_size();
       continue;
     }
-    MeasureCandidate(baseline, assigned, blocks, model);
+    MeasureCandidate(baseline, assigned, blocks, model, boundary_auto);
     baseline.receipt.model_comparable = Comparable(baseline, baseline);
     size_t chosen = 0;
     int64_t longest_boundary = 0;
     for (const auto& [first, end] : loop.phases) longest_boundary = std::max(longest_boundary, end - first);
     for (unsigned mode = 1; mode < kScheduleModes.size(); ++mode) {
-      if (policy.mode != "auto" && policy.mode != kScheduleModes[mode]) continue;
+      if (!RequestsScheduleMode(policy, mode)) {
+        continue;
+      }
       CandidateSchedule candidate;
       candidate.receipt = {label, kScheduleModes[mode], "ineligible", ""};
       if ((mode & 1) && (assigned.cases.size() < 2 || !assigned.block))
         candidate.receipt.reason = "case versioning needs multiple cases and a dominating launch binding";
       else if ((mode & 2) && loop.phases.size() < 2)
         candidate.receipt.reason = "no internal endpoint boundary";
+      else if (boundary_auto && (depth == 0 || loop.count < kMinAutoBoundaryTrips ||
+                                 loop.phases.size() > kMaxAutoBoundaryPhases))
+        candidate.receipt.reason = "outside the bounded boundary-specialization shape";
       else if ((mode & 4) && (loop.period <= 1 || ((mode & 2) ? longest_boundary : loop.count) < loop.period))
         candidate.receipt.reason = "no supported common nonunit period with a complete group";
       if (!candidate.receipt.reason.empty()) {
@@ -2292,7 +2414,8 @@ PreparedLoops PlanLoopSchedules(const AssignedRegionSchedule& assigned, const Cu
         candidates.push_back(std::move(candidate));
         continue;
       }
-      candidate = PrepareCandidate(loop, mode, assigned, domains, blocks, policy);
+      candidate = boundary_auto ? PrepareOrderPreservingBoundary(baseline, assigned.arena)
+                                : PrepareCandidate(loop, mode, assigned, domains, blocks, policy);
       candidate.receipt = {label, kScheduleModes[mode], "eligible", ""};
       if ((mode & 1) && candidate.plan.groups.size() < 2) {
         candidate.receipt.status = "ineligible";
@@ -2300,27 +2423,34 @@ PreparedLoops PlanLoopSchedules(const AssignedRegionSchedule& assigned, const Cu
       } else if (!BoundCandidate(candidate, body, assigned, blocks) ||
                  candidate.receipt.payload_sites > payload_limit ||
                  __int128(candidate.receipt.control_node_bound) >
-                     __int128(policy.max_extra_control_nodes) - control_debit) {
+                     __int128(policy.max_extra_control_nodes) - control_debit ||
+                 (boundary_auto && __int128(candidate.receipt.control_node_bound) >
+                                       2 * __int128(baseline.receipt.control_node_bound))) {
         candidate.receipt.status = "over_budget";
         candidate.receipt.reason = "expanded emitted-site bound exceeds remaining budget";
       } else {
-        MeasureCandidate(candidate, assigned, blocks, model);
+        MeasureCandidate(candidate, assigned, blocks, model, boundary_auto);
         candidate.receipt.model_comparable = Comparable(candidate, candidates.front());
-        const bool profitable = Improves(candidate, candidates.front());
-        if (policy.mode != "auto")
+        const bool profitable = boundary_auto ? ProvesBoundarySaving(candidate, candidates.front())
+                                              : Improves(candidate, candidates.front());
+        if (boundary_auto) {
+          candidate.receipt.model_comparable |= profitable;
+        }
+        if (!automatic) {
           chosen = candidates.size();
-        else if (profitable &&
-                 (chosen == 0 || Improves(candidate, candidates[chosen]) ||
-                  (Comparable(candidate, candidates[chosen]) &&
-                   std::equal(candidate.costs.begin(), candidate.costs.end(),
-                              candidates[chosen].costs.begin(),
-                              [](const auto& a, const auto& b) { return a.Total() == b.Total(); }) &&
-                   std::make_tuple(candidate.receipt.payload_sites, candidate.receipt.control_node_bound,
-                                   TransformCount(mode)) <
-                       std::make_tuple(candidates[chosen].receipt.payload_sites,
-                                       candidates[chosen].receipt.control_node_bound,
-                                       TransformCount(candidates[chosen].plan.mode)))))
+        } else if (profitable &&
+                   (chosen == 0 || Improves(candidate, candidates[chosen]) ||
+                    (Comparable(candidate, candidates[chosen]) &&
+                     std::equal(candidate.costs.begin(), candidate.costs.end(),
+                                candidates[chosen].costs.begin(),
+                                [](const auto& a, const auto& b) { return a.Total() == b.Total(); }) &&
+                     std::make_tuple(candidate.receipt.payload_sites, candidate.receipt.control_node_bound,
+                                     TransformCount(mode)) <
+                         std::make_tuple(candidates[chosen].receipt.payload_sites,
+                                         candidates[chosen].receipt.control_node_bound,
+                                         TransformCount(candidates[chosen].plan.mode))))) {
           chosen = candidates.size();
+        }
         if (!profitable) {
           candidate.receipt.status = candidate.receipt.model_comparable ? "not_profitable" : "cost_unproved";
           candidate.receipt.reason = candidate.receipt.model_comparable ? "no known per-case improvement"
@@ -2331,8 +2461,8 @@ PreparedLoops PlanLoopSchedules(const AssignedRegionSchedule& assigned, const Cu
     }
     auto& accepted = candidates[chosen];
     accepted.receipt.selected = true;
-    accepted.receipt.status = policy.mode == "auto" || chosen == 0 ? "selected" : "selected_forced";
-    if (policy.mode != "auto" && accepted.receipt.mode != policy.mode) {
+    accepted.receipt.status = automatic || chosen == 0 ? "selected" : "selected_forced";
+    if (!automatic && accepted.receipt.mode != policy.mode) {
       accepted.receipt.status = "fallback";
       accepted.receipt.reason = "guarded fallback; requested mode was not admissible";
     }
@@ -2364,13 +2494,15 @@ PreparedLoops PlanLoopSchedules(const AssignedRegionSchedule& assigned, const Cu
     if (chosen && accepted.receipt.model_comparable) {
       __int128 saving = std::numeric_limits<int64_t>::max();
       for (size_t c = 0; c < accepted.costs.size(); ++c)
-        saving = std::min(saving, candidates.front().costs[c].Total() - accepted.costs[c].Total());
+        saving = std::min(saving, candidates.front().costs[c].Total() - accepted.costs[c].UpperTotal());
       if (saving > 0 && saving <= std::numeric_limits<size_t>::max() - work.regular_schedule_model_saving)
         work.regular_schedule_model_saving += static_cast<size_t>(saving);
     }
     accepted.plan.receipt_label = label;
     selected.emplace(key, std::move(accepted.plan));
   }
+  work.schedule_payload_growth_debit = payload_debit;
+  work.schedule_control_growth_debit = control_debit;
   return selected;
 }
 
@@ -2420,6 +2552,8 @@ FunctionPtr CompileAssignedSyncSchedule(const FunctionPtr& owner, const std::vec
                                         std::pair<int64_t, int64_t> blocks,
                                         const SyncSchedulePolicy& policy) {
   AssignedRegionSchedule schedule(owner, cases);
+  // All invocation cases share one emitted body and one growth budget. Store
+  // the complete expenditure on its first case so callers charge it once.
   auto& work = *schedule.cases.front().work;
   CutInventory domains;
   AbsentLoops absent;
@@ -2475,20 +2609,23 @@ BoundarySchedules PlanCommandBoundaries(const FunctionPtr& owner, CutInventory& 
 
 }  // namespace physical
 
+using physical::IsAutomaticSchedule;
 using physical::kScheduleModes;
 using physical::ScheduleTreeSize;
 void FinishSyncScheduleReceipt(const FunctionPtr& function, PhysicalSyncRealization& work,
                                const SyncSchedulePolicy& policy) {
-  CHECK(policy.mode == "auto" ||
+  const bool automatic = IsAutomaticSchedule(policy);
+  CHECK(automatic ||
         std::find(kScheduleModes.begin(), kScheduleModes.end(), policy.mode) != kScheduleModes.end())
       << "Unknown synchronization schedule mode";
   if (work.schedule_choices.empty()) {
-    if (policy.mode != "auto" && policy.mode != "guarded")
+    if (!automatic && policy.mode != "guarded") {
       work.schedule_choices.push_back(
           {"<function>", policy.mode, "ineligible", "no qualified repeated loop"});
-    SyncScheduleCandidateReceipt identity{
-        "<function>", "guarded", policy.mode == "auto" || policy.mode == "guarded" ? "selected" : "fallback",
-        "no qualified repeated loop"};
+    }
+    SyncScheduleCandidateReceipt identity{"<function>", "guarded",
+                                          automatic || policy.mode == "guarded" ? "selected" : "fallback",
+                                          "no qualified repeated loop"};
     identity.selected = true;
     work.schedule_choices.push_back(std::move(identity));
   }

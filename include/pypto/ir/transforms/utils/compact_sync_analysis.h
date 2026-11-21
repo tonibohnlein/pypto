@@ -541,12 +541,12 @@ class AssignedSyncPlan {
       const CompactSyncInput&, std::vector<PhysicalSyncFamily>, const DirectSyncOrder&, const std::string&,
       const std::optional<std::vector<int>>&, const std::map<std::pair<PipeType, PipeType>, std::set<int>>&);
 };
-// Immutable defaults for production; explicit overrides are diagnostic inputs
-// to the same compiler. Forced modes bypass profitability, never qualification
+// Diagnostic callers default to no payload duplication. The ordinary pass
+// supplies its bounded automatic policy explicitly. Both use the same compiler.
+// Forced modes bypass profitability, never qualification
 // or these finite growth limits. Control bounds count expanded IR occurrences,
 // including cloned scalar definitions and payload operand expressions. These
 // caps are compiler policy, not device-derived weights or performance bounds.
-// Production defaults to no extra payload copies until duplication is calibrated.
 struct SyncSchedulePolicy {
   std::string mode = "auto";
   size_t max_extra_payload_sites = 4096;
@@ -605,6 +605,8 @@ struct PhysicalSyncRealization {
   std::vector<SyncScheduleParentGapReceipt> schedule_parent_gaps;
   size_t schedule_inspected_descriptors = 0, schedule_inspected_expressions = 0;
   size_t schedule_emitted_payload_sites = 0, schedule_emitted_control_nodes = 0;
+  // Growth debits are shared across retained children of the same owner.
+  size_t schedule_payload_growth_debit = 0, schedule_control_growth_debit = 0;
   size_t regular_schedule_candidates = 0, regular_schedule_loops = 0, regular_schedule_boundaries = 0;
   size_t regular_schedule_body_copies = 0, regular_schedule_payload_copies = 0,
          regular_schedule_model_saving = 0;

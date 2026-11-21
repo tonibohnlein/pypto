@@ -927,6 +927,9 @@ class LaneImporter {
     const auto selected = backend_.TryInferPipe(original);
     CHECK_SPAN(selected == implementation.Pipe() && implementation.ImplicitEffects().empty(), original->span_)
         << "Peer local operation has a different native pipe or unbound implicit storage";
+    if (structured_) {
+      structured_->calls.at(original.get()).has_native_claims = !implementation.Claims().empty();
+    }
     for (const auto& claim : implementation.Claims()) {
       auto& reserved = result_.reservations[{claim.pool.src, claim.pool.dst}];
       for (const auto id : claim.ids) reserved.insert(static_cast<int>(id));

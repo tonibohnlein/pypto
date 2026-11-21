@@ -15,6 +15,8 @@ from pypto import language as pl
 from pypto.ir.pass_manager import PassManager
 from pypto.pypto_core import testing
 
+from .sync_closed_command_oracle import ClosedCommands, opname
+
 pytestmark = pytest.mark.usefixtures("ascend_backend")
 
 
@@ -97,6 +99,8 @@ def _mixed_program(
     publish_table=False,
     acquire="pl.system.cacheinvalid()",
     rendezvous="pl.system.syncall(core_type=pl.KernelType.MIX)",
+    prefetch=False,
+    consume_latest=False,
 ):
     vec_actual = {"fresh": "vec_scratch", "different_formal": "vec_out", "same_formal": "table"}[writer]
     publication = (
@@ -105,6 +109,22 @@ def _mixed_program(
         if publish_table
         else "pass"
     )
+    lookahead = (
+        "next_lhs = pl.load(x, [0, 0], [16, 16], target_memory=pl.Mem.Mat)\n"
+        "        next_rhs = pl.load(x, [0, 0], [16, 16], target_memory=pl.Mem.Mat)"
+        if prefetch
+        else "pass"
+    )
+    next_rhs = "rhs" if consume_latest else "next_rhs"
+    later_work = (
+        "next_a = pl.move(next_lhs, target_memory=pl.Mem.Left)\n"
+        f"        next_b = pl.move({next_rhs}, target_memory=pl.Mem.Right)\n"
+        "        next_acc = pl.matmul(next_a, next_b)\n"
+        "        result = pl.store(next_acc, [0, 0], result)"
+        if prefetch
+        else "pass"
+    )
+    first_rhs = "next_rhs" if consume_latest else "rhs"
     return pl.parse_program(f"""
 @pl.program
 class AuthoredMixedGM:
@@ -118,10 +138,12 @@ class AuthoredMixedGM:
         pl.system.cacheinvalid()
         lhs = pl.load(x, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
         rhs = pl.load(x, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+        {lookahead}
         a = pl.move(lhs, target_memory=pl.Mem.Left)
-        b = pl.move(rhs, target_memory=pl.Mem.Right)
+        b = pl.move({first_rhs}, target_memory=pl.Mem.Right)
         acc = pl.matmul(a, b)
         result = pl.store(acc, [0, 0], out)
+        {later_work}
         pl.system.sync_set(1, pipe=pl.PipeType.FIX, ffts_mode=2, core_type=pl.KernelType.AIC)
         return result
 
@@ -188,6 +210,200 @@ def test_authored_gm_pair_requires_original_publication_and_readonly_storage(opt
         assert native.count("pto.cmo.cacheinvalid") == 4
         assert native.count("pto.sync.set") == 1
         assert native.count("pto.sync.wait") == 1
+
+
+class _AuthoredCommands(ClosedCommands):
+    """Replay local storage and event lifetimes while recording authored cuts."""
+
+    def __init__(self, function, *, scalar_memory=None):
+        super().__init__(function, {}, range(6), scalar_memory=scalar_memory)
+        self.authored = []
+
+    def assign(self, statement, env):
+        call = statement.value
+        if isinstance(call, ir.Call) and call.op.name == opname("buffer.gm_read"):
+            # Both scalar reads use the same independent byte map and S
+            # issue/completion model for this in-bounds rank-two coordinate.
+            call = ir.Call(ir.get_op("buffer.read"), call.args, call.type, call.span)
+            statement = ir.AssignStmt(statement.var, call, statement.span)
+        super().assign(statement, env)
+
+    def evaluate(self, statement, env):
+        call = statement.expr
+        if call.op.name in {
+            opname("system.set_ffts"),
+            opname("system.cacheinvalid"),
+            opname("system.fence"),
+            opname("system.syncall"),
+            opname("system.sync_set"),
+            opname("system.sync_wait"),
+        }:
+            self.authored.append((len(self.payloads), call.op.name, call.kwargs))
+            return
+        super().evaluate(statement, env)
+
+
+@pytest.mark.parametrize("consume_latest", [False, True])
+def test_authored_gm_prefix_capture_skips_only_independent_prefetches(consume_latest):
+    program = _mixed_program(prefetch=True, consume_latest=consume_latest)
+    baseline = _AuthoredCommands(_lower(program).get_function("cube"))
+    actual_leaf = _lower(program, autosync=True).get_function("cube")
+    assert actual_leaf is not None
+    assert actual_leaf.attrs["pypto_autosync"], actual_leaf.attrs
+    actual = _AuthoredCommands(actual_leaf)
+    baseline.run()
+    order = actual.run()
+    assert baseline.authored == actual.authored
+    assert baseline.payloads == actual.payloads
+    # Both lookahead loads are issued before the first multiply. Its first
+    # pair of moves needs the latest load only in the dependence control.
+    cube = ("payload", 6, "I")
+    assert actual.payloads[6][1] == ir.PipeType.M
+    assert (("payload", 0, "C"), cube) in order
+    for prefetch in (2, 3):
+        assert ((("payload", prefetch, "C"), cube) in order) == consume_latest
+    # A later consumer still needs both lookahead prefixes. Check all
+    # overlapping physical bytes independently of the compiler's domains.
+    for index, (_, _, reads, writes) in enumerate(actual.payloads):
+        for earlier, (_, pipe, old_reads, old_writes) in enumerate(actual.payloads[:index]):
+            if pipe == ir.PipeType.M and actual.payloads[index][1] == ir.PipeType.M:
+                continue
+            if old_writes & (reads | writes) or old_reads & writes:
+                assert (("payload", earlier, "C"), ("payload", index, "I")) in order
+
+
+def _guarded_vec_prefix_program(alias_tail):
+    program = _lower(_mixed_program())
+    vec = program.get_function("vec")
+    assert vec is not None and isinstance(vec.body, ir.SeqStmts)
+    span = vec.span
+    statements = vec.body.stmts
+    load_index, load = next(
+        (i, statement)
+        for i, statement in enumerate(statements)
+        if isinstance(statement, ir.EvalStmt)
+        and isinstance(statement.expr, ir.Call)
+        and statement.expr.op.name == opname("buffer.load")
+    )
+    read_index, read = next(
+        (i, statement)
+        for i, statement in enumerate(statements)
+        if isinstance(statement, ir.AssignStmt)
+        and isinstance(statement.value, ir.Call)
+        and statement.value.op.name == opname("buffer.gm_read")
+    )
+    assert isinstance(load.expr, ir.Call)
+    carrier = load.expr.args[3]
+    scratch = ir.Var("scratch", carrier.type, span)
+    index_type = ir.DataType.INDEX
+
+    def ci(value):
+        return ir.ConstInt(value, index_type, span)
+
+    def fill(buffer):
+        call = ir.Call(
+            ir.get_op("buffer.full"), [ir.ConstInt(0, ir.DataType.INT32, span), buffer], ir.VoidType(), span
+        )
+        return ir.EvalStmt(call, span)
+
+    carrier_alloc = next(
+        statement
+        for statement in statements[:load_index]
+        if isinstance(statement, ir.AssignStmt) and statement.var.same_as(carrier)
+    )
+    assert isinstance(carrier_alloc.value, ir.Call)
+    address = carrier_alloc.value.args[1] if alias_tail else ci(256)
+    alloc_call = ir.Call(ir.get_op("buffer.alloc"), [ir.MakeTuple([], span), address], carrier.type, span)
+    scratch_alloc = ir.AssignStmt(scratch, alloc_call, span)
+    visits = ir.Var("visits", ir.ScalarType(index_type), span)
+    define_visits = ir.AssignStmt(visits, ir.Cast(read.var, index_type, span), span)
+    induction = ir.Var("visit", ir.ScalarType(index_type), span)
+    step = ir.IfStmt(
+        ir.Lt(induction, visits, ir.DataType.BOOL, span),
+        ir.SeqStmts([load, fill(carrier)], span),
+        None,
+        [],
+        span,
+    )
+    loop = ir.ForStmt(
+        induction,
+        ci(0),
+        ir.Add(visits, ci(1), index_type, span),
+        ci(1),
+        [],
+        step,
+        [],
+        span,
+    )
+    store = next(
+        statement
+        for statement in statements[load_index:]
+        if isinstance(statement, ir.EvalStmt)
+        and isinstance(statement.expr, ir.Call)
+        and statement.expr.op.name == opname("buffer.store")
+    )
+    patched = ir.Function(
+        vec.name,
+        list(zip(vec.params, vec.param_directions, strict=True)),
+        vec.return_types,
+        ir.SeqStmts(
+            [
+                *statements[:read_index],
+                scratch_alloc,
+                read,
+                define_visits,
+                fill(carrier),
+                fill(scratch),
+                loop,
+                store,
+                statements[-1],
+            ],
+            span,
+        ),
+        span,
+        vec.func_type,
+        vec.level,
+        vec.role,
+        vec.attrs,
+        vec.requires_runtime_binding,
+        vec.ir_stage,
+    )
+    return ir.Program(
+        [patched if f.name == vec.name else f for f in program.functions.values()], program.name, program.span
+    )
+
+
+@pytest.mark.parametrize("alias_tail", [False, True])
+def test_authored_gm_first_loop_wait_keeps_only_the_needed_prefix(alias_tail):
+    program = _guarded_vec_prefix_program(alias_tail)
+    with passes.PassContext(
+        [],
+        enable_buffer_ir=True,
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+    ):
+        actual_leaf = passes.realize_sync()(program).get_function("vec")
+    assert actual_leaf is not None
+    assert actual_leaf.attrs["pypto_autosync"], actual_leaf.attrs
+    table = next(i for i, var in enumerate(actual_leaf.params) if var.name_hint.startswith("table"))
+    for trips in (-1, 0, 1, 3):
+        memory = {("gm", table * 4096 + byte): trips for byte in range(4)}
+        before = _AuthoredCommands(program.get_function("vec"), scalar_memory=memory)
+        actual = _AuthoredCommands(actual_leaf, scalar_memory=memory)
+        before.run()
+        order = actual.run()
+        assert before.authored == actual.authored
+        assert before.payloads == actual.payloads
+        loads = [i for i, (_, pipe, _, _) in enumerate(actual.payloads) if pipe == ir.PipeType.MTE2]
+        assert len(loads) == max(0, trips)
+        if loads:
+            assert (("payload", 1, "C"), ("payload", loads[0], "I")) in order
+            assert ((("payload", 2, "C"), ("payload", loads[0], "I")) in order) == alias_tail
+            for previous, current in zip(loads, loads[1:], strict=False):
+                assert (("payload", previous + 1, "C"), ("payload", current, "I")) in order
+        else:
+            assert ("acquire", ir.PipeType.V, ir.PipeType.MTE2) not in actual.trace
 
 
 @pytest.mark.parametrize("requested_extent,upper", [("pl.min(length, 16)", 16), ("signed_extent", 2**32 - 1)])

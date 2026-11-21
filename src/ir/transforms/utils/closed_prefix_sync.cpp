@@ -1694,7 +1694,7 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     const FunctionPtr& function, const std::string& target,
     const std::optional<std::vector<int>>& eligible_ids, const SyncNativeReservations& extra_reservations,
     const SyncParameterBounds& parameters, const std::optional<std::pair<int64_t, int64_t>>& blocks,
-    const ImportedLocalSync* imported) {
+    const ImportedLocalSync* imported, const SyncSchedulePolicy& schedule_policy) {
   const SyncControlRangeProver prover(function, parameters, blocks);
   Discover discovered(&prover);
   discovered.VisitFunction(function);
@@ -1721,6 +1721,7 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
           : std::optional<SyncRegionBindings>{std::in_place, function, target, parameters, blocks};
   const auto* ctx = PassContext::Current();
   const bool disjoint_gm = ctx && ctx->GetAutoSyncDisjointGM();
+  auto remaining_schedule = schedule_policy;
   for (const auto& child : discovered.children) {
     SyncExternalPolicy external_policy = SyncExternalPolicy::Geometry;
     if (child->HasAttr(kClosedSyncChildExternalPolicyAttr)) {
@@ -1771,8 +1772,8 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     // with per-direction parent reservations instead of a flat global subtraction.
     auto child_bounds = ProjectSyncParameterBounds(function, actual, parameters);
     child_bounds = ProjectEnclosingLoopBounds(context, bindings->Prover(), child, child_bounds);
-    auto lowered = LowerLogicalSync(actual, target, eligible_ids, child_bounds, blocks, {}, external_policy,
-                                    std::nullopt, assignment.Reservations());
+    auto lowered = LowerLogicalSync(actual, target, eligible_ids, child_bounds, blocks, remaining_schedule,
+                                    external_policy, std::nullopt, assignment.Reservations());
     const auto original_body = As<SeqStmts>(actual->body_);
     const auto lowered_body = As<SeqStmts>(lowered.function->body_);
     INTERNAL_CHECK(original_body && lowered_body) << "Internal error: child binding body is not a sequence";
@@ -1822,6 +1823,11 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
       child_barriers += plan.barrier_sites;
       child_lanes += plan.reserved_lanes;
       child_suffix_visits += plan.closed_prefix_suffix_visits;
+      INTERNAL_CHECK(plan.schedule_payload_growth_debit <= remaining_schedule.max_extra_payload_sites &&
+                     plan.schedule_control_growth_debit <= remaining_schedule.max_extra_control_nodes)
+          << "Child synchronization schedule exceeds its inherited growth budget";
+      remaining_schedule.max_extra_payload_sites -= plan.schedule_payload_growth_debit;
+      remaining_schedule.max_extra_control_nodes -= plan.schedule_control_growth_debit;
     }
   }
 
@@ -1836,6 +1842,10 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
   result.barrier_sites = assignment.Barriers() + child_barriers;
   result.reserved_lanes = assignment.Roles() + child_lanes;
   result.closed_prefix_suffix_visits = assignment.SuffixVisits() + child_suffix_visits;
+  result.schedule_payload_growth_debit =
+      schedule_policy.max_extra_payload_sites - remaining_schedule.max_extra_payload_sites;
+  result.schedule_control_growth_debit =
+      schedule_policy.max_extra_control_nodes - remaining_schedule.max_extra_control_nodes;
   result.native_reserved_ids = assignment.NativeClaimed();
   return result;
 }

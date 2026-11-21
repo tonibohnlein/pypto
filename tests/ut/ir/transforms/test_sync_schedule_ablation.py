@@ -19,8 +19,9 @@ import pytest
 from pypto import ir, passes, testing
 
 from .sync_control_metrics import COMMANDS, statements, trace_control
+from .sync_qwen_prefill_cases import capture_qwen_projection
 from .test_autosync_switch import clone
-from .test_parameterized_token_sync import check
+from .test_parameterized_token_sync import check, worker
 from .test_streamed_slot_composition import streamed_fixture
 from .test_sync_case_only_schedule import case_only_fixture
 from .test_sync_command_control import command, guarded, seq
@@ -286,6 +287,85 @@ def test_automatic_choice_does_not_increase_executed_source_work(count):
     after, selected_cost = emitted_work(result["function"])
     assert before.trace == after.trace
     assert sum(selected_cost) <= sum(baseline_cost)
+
+
+def projection_schedule_inputs(name, disjoint):
+    program = capture_qwen_projection(name, layers=2, hidden=5120, band=0)
+    original = next(f for f in program.functions.values() if f.func_type == ir.FunctionType.AIC)
+    with passes.PassContext(
+        [],
+        enable_pypto_autosync=True,
+        autosync_disjoint_gm=disjoint,
+        autosync_policy="exact" if disjoint else "conservative_prefix",
+        memory_planner=passes.MemoryPlanner.PYPTO,
+    ):
+        logical = worker(passes.optimize_sync()(passes.insert_sync()(program)), original.name)
+        optimized = worker(passes.realize_sync()(program), original.name)
+    evidence = testing.sync_invocation_evidence(program)
+    bounds = {
+        "parameter_bounds": evidence["parameters"][original.name],
+        "block_bounds": tuple(evidence["block_indices"][original.name]),
+    }
+    return logical, optimized, bounds
+
+
+@pytest.mark.parametrize("name,block", [("output", 0), ("gate_up", 7)])
+@pytest.mark.parametrize("disjoint", [True, False])
+def test_projection_production_boundary_phases_preserve_order_with_less_control(name, block, disjoint):
+    logical, optimized, bounds = projection_schedule_inputs(name, disjoint)
+    baseline = lower(logical, "guarded", **bounds)["function"]
+    before, before_work = emitted_work(baseline, {3: 0}, block=block)
+    after, after_work = emitted_work(optimized, {3: 0}, block=block)
+    # Production appends a drain. The remaining ordered commands, event IDs,
+    # and payload cuts must match guarded lowering through all phase edges.
+    assert after.trace[-1] == ("system.bar_all", before.payload_count)
+    assert before.trace == after.trace[:-1]
+    assert sum(after_work) < sum(before_work)
+    assert (
+        after.counts["conditions"] + after.counts["loop_header_work"]
+        < (before.counts["conditions"] + before.counts["loop_header_work"]) * 0.65
+    )
+    before_size, after_size = census(baseline), census(optimized)
+    assert 1 < after_size.payloads - before_size.payloads <= 57  # Includes the production drain.
+    assert after_size.nodes < 2 * before_size.nodes
+
+
+@pytest.mark.parametrize(
+    "budget", [{"no_clone": True}, {"max_extra_payload_sites": 0}, {"max_extra_control_nodes": 0}]
+)
+def test_projection_boundary_growth_limits_preserve_guarded_schedule(budget):
+    logical, _, bounds = projection_schedule_inputs("output", True)
+    baseline = lower(logical, "guarded", **bounds)["function"]
+    result = lower(logical, "auto_boundary", **({"no_clone": False} | bounds | budget))
+    ir.assert_structural_equal(result["function"], baseline)
+    assert all(row["mode"] == "guarded" for row in selected(result))
+    assert any(
+        row["mode"] == "boundary" and row["status"] == "over_budget" for row in result["schedule"]["choices"]
+    )
+
+
+def test_retained_projection_children_share_a_payload_growth_budget():
+    logical, _, bounds = projection_schedule_inputs("gate_up", False)
+    retained = [
+        s
+        for s in statements(logical.body)
+        if isinstance(s, ir.ForStmt) and "pypto.closed_sync_child" in s.attrs
+    ]
+    assert len(retained) > 1
+    baseline = lower(logical, "guarded", **bounds)["function"]
+    budget = 14
+    limited = lower(logical, "auto_boundary", max_extra_payload_sites=budget, **bounds)["function"]
+    assert 0 < census(limited).payloads - census(baseline).payloads <= budget
+    for block in (0, 7, 23):
+        assert trace_control(baseline, {3: 1}, block).trace == trace_control(limited, {3: 1}, block).trace
+
+
+@pytest.mark.parametrize("count", [2, 7])
+def test_boundary_auto_leaves_flat_or_short_repetition_guarded(count):
+    logical = _apply(passes.insert_sync, streamed_fixture(count))
+    result = lower(logical, "auto_boundary", no_clone=False)
+    assert all(row["mode"] == "guarded" for row in selected(result))
+    ir.assert_structural_equal(lower(logical, "guarded")["function"], result["function"])
 
 
 def test_no_clone_policy_keeps_static_payload_sites_for_every_mode():

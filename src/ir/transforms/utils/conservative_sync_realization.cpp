@@ -92,6 +92,16 @@ class Insert : public IRMutator {
     // producer's original branch and leaves no outstanding logical token.
     // Reusing the same static statement in two contexts requires
     // distinct original cut evidence and is refused rather than conflated.
+    std::map<const Stmt*, StmtPtr> records, waits;
+    for (const auto& site : analysis.Sites()) {
+      if (!site.precise_capture) continue;
+      const auto& [consumer, destination] = *site.precise_capture;
+      std::vector<StmtPtr> commands;
+      const auto token = Record(site.pipe, commands, site.cut->span_);
+      Wait(token, destination, commands, consumer->span_);
+      records.emplace(site.cut.get(), commands.front());
+      waits.emplace(consumer.get(), commands.back());
+    }
     for (const auto& site : analysis.Sites()) {
       const auto destination = site.pipe;
       std::vector<std::pair<PipeType, PipeType>> services;
@@ -103,7 +113,19 @@ class Insert : public IRMutator {
       const auto post = site.post_destination
                             ? std::make_optional(std::make_pair(destination, *site.post_destination))
                             : std::nullopt;
-      Wrap(site.cut, services, nullptr, post, phased);
+      const auto record = records.find(site.cut.get());
+      const auto wait = waits.find(site.cut.get());
+      StmtPtr capture = record == records.end() ? nullptr : record->second;
+      if (site.guarded_capture) {
+        std::vector<StmtPtr> commands;
+        const auto& span = site.cut->span_;
+        AppendPair(site.pipe, site.guarded_capture->destination, commands, span);
+        const auto guarded = std::make_shared<IfStmt>(site.guarded_capture->condition,
+                                                      SeqStmts::Flatten(std::move(commands), span),
+                                                      std::nullopt, std::vector<VarPtr>{}, span);
+        capture = capture ? SeqStmts::Flatten({capture, guarded}, span) : StmtPtr(guarded);
+      }
+      Wrap(site.cut, services, nullptr, post, phased, capture, wait == waits.end() ? nullptr : wait->second);
     }
     for (const auto& entry : analysis.ChildEntries()) {
       if (entry.inline_subblock) {
@@ -217,8 +239,10 @@ class Insert : public IRMutator {
       entry = std::make_shared<IfStmt>(MakeLt(loop->start_, loop->stop_, span), entry, std::nullopt,
                                        std::vector<VarPtr>{}, span);
     }
-    INTERNAL_CHECK(entries_.emplace(loop.get(), std::move(entry)).second)
-        << "Internal error: multiple entry plans for one loop";
+    if (!phase.entry_only.empty()) {
+      INTERNAL_CHECK(entries_.emplace(loop.get(), std::move(entry)).second)
+          << "Internal error: multiple entry plans for one loop";
+    }
     if (phase.backedge_only.empty()) return nullptr;
     return std::make_shared<IfStmt>(MakeNe(loop->loop_var_, loop->start_, span), pairs(phase.backedge_only),
                                     std::nullopt, std::vector<VarPtr>{}, span);
@@ -226,17 +250,19 @@ class Insert : public IRMutator {
 
   void Wrap(const StmtPtr& cut, const std::vector<std::pair<PipeType, PipeType>>& services,
             StmtPtr retained = nullptr, std::optional<std::pair<PipeType, PipeType>> post = std::nullopt,
-            StmtPtr phased = nullptr) {
+            StmtPtr phased = nullptr, StmtPtr record = nullptr, StmtPtr wait = nullptr) {
     std::vector<StmtPtr> statements;
     if (const auto recipe = As<SeqStmts>(retained)) {
       CHECK(!recipe->stmts_.empty()) << "Eventful child recipe has no whole invocation";
       statements.insert(statements.end(), recipe->stmts_.begin(), recipe->stmts_.end() - 1);
       retained = recipe->stmts_.back();
     }
+    if (wait) statements.push_back(std::move(wait));
     for (const auto& [source, destination] : services) {
       AppendPair(source, destination, statements, cut->span_);
     }
     if (phased) statements.push_back(std::move(phased));
+    if (record) statements.push_back(std::move(record));
     statements.push_back(retained ? std::move(retained) : cut);
     if (post) AppendPair(post->first, post->second, statements, cut->span_);
     CHECK(replacements_.emplace(cut.get(), std::make_shared<SeqStmts>(statements, cut->span_)).second)

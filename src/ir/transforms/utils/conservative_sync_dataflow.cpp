@@ -41,6 +41,7 @@
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 #include "src/ir/transforms/utils/sync_footprint_resolver.h"
 #include "src/ir/transforms/utils/sync_loop_trip_proof.h"
@@ -624,12 +625,14 @@ class DebtState {
   }
 
   // Batched 1-way relay from all sources in `sources_mask` to `dst` in one pass.
-  void DeliverSources(PipeMask sources_mask, PipeType dst) {
+  void DeliverSources(PipeMask sources_mask, PipeType dst, const DebtState* excluded = nullptr) {
     const PipeMask dst_mask = PipeToMask(dst);
     if (sources_mask == 0 || dst_mask == 0) return;
     for (auto it = pending_.begin(); it != pending_.end();) {
       const PipeMask ready = (~it->second & kAllPhysicalPipesMask) | PipeToMask(it->first.src);
-      if ((ready & sources_mask) != 0) it->second &= ~dst_mask;
+      if ((ready & sources_mask) != 0 && (!excluded || !excluded->pending_.count(it->first))) {
+        it->second &= ~dst_mask;
+      }
       if (it->second == 0) {
         it = pending_.erase(it);
       } else {
@@ -813,7 +816,7 @@ class Builder {
           const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful,
           bool retain_incoming_diagnostics, bool enable_refresh_kill, const SyncParameterBounds& parameters,
           const std::optional<std::pair<int64_t, int64_t>>& blocks, bool enable_loop_prefixes,
-          const ImportedLocalSync* imported)
+          const ImportedLocalSync* imported, bool enable_precise_captures)
       : function_(function),
         target_(std::move(target)),
         trip_prover_(function, parameters, blocks),
@@ -821,7 +824,8 @@ class Builder {
         retain_incoming_diagnostics_(retain_incoming_diagnostics),
         enable_refresh_kill_(enable_refresh_kill),
         enable_loop_prefixes_(enable_loop_prefixes),
-        imported_(imported) {
+        imported_(imported),
+        enable_precise_captures_(enable_precise_captures) {
     const auto* context = PassContext::Current();
     disjoint_gm_ = context && context->GetAutoSyncDisjointGM();
     scopes_.emplace_back();
@@ -1179,7 +1183,9 @@ class Builder {
     }
 
     if (!has_backedge) {
-      return SolveAcyclic(cfg, rpo, cfg_exit);
+      auto exit = SolveAcyclic(cfg, rpo, cfg_exit);
+      TryPreciseCaptures(cfg, rpo, rpo_pos, cfg_entry);
+      return exit;
     }
 
     std::vector<LiveStorageState> live_in, live_out;
@@ -1187,9 +1193,13 @@ class Builder {
     ExtractSourcePipeServices(cfg, rpo, live_in, live_out);
     const auto before_selection = cost;
     SelectAndCertifyDebts(cfg, rpo, rpo_pos, cfg_entry);
+    TryPreciseCaptures(cfg, rpo, rpo_pos, cfg_entry);
     if (enable_loop_prefixes_) {
       TryProducerPrefix(cfg, rpo, rpo_pos, cfg_entry, before_selection);
       TryLoopEntrySplit();
+    }
+    if (enable_precise_captures_ && !loop_capture_sources_.empty()) {
+      TryLoopEntrySplit(/*precise_captures=*/true);
     }
 
     return retain_incoming_diagnostics_ ? live_out[cfg_exit].ToAccessSet() : ConservativeAccessSet{};
@@ -1210,13 +1220,25 @@ class Builder {
     }
   }
 
-  struct LoopEntryPhase {
-    ForStmtPtr loop;
+  struct LoopEntryPhases {
+    struct Head {
+      size_t site;
+      PipeMask body_pipes;
+    };
+    std::map<ForStmtPtr, Head> heads;
     std::vector<std::optional<size_t>> first_sites;  // Original site index to first-visit analysis site.
+    std::vector<size_t> first_visit_copies;          // Original indices in the order they will be copied.
+  };
+
+  struct FirstPrefixCapture {
+    size_t record_site;
+    size_t wait_site;
+    ExprPtr condition;
+    DebtState displaced_effects;
   };
 
   size_t BuildSubCfg(const StmtPtr& statement, size_t entry, std::vector<CfgVertex>& cfg,
-                     const LoopEntryPhase* phase = nullptr, bool first_visit = false) const {
+                     const LoopEntryPhases* phases = nullptr, bool first_visit = false) const {
     if (const auto child = child_index_.find(statement.get()); child != child_index_.end()) {
       const size_t node = cfg.size();
       cfg.push_back({CfgVertex::Kind::Child, child->second, {}, {}});
@@ -1225,7 +1247,7 @@ class Builder {
     }
     if (const auto site = site_index_.find(statement.get()); site != site_index_.end()) {
       const size_t node = cfg.size();
-      const auto index = first_visit ? phase->first_sites[site->second].value() : site->second;
+      const auto index = first_visit ? phases->first_sites[site->second].value() : site->second;
       cfg.push_back({CfgVertex::Kind::Site, index, {}, {}});
       AddCfgEdge(cfg, entry, node);
       return node;
@@ -1234,7 +1256,9 @@ class Builder {
       size_t cur = entry;
       const auto wit = window_slices_by_seq_.find(seq.get());
       if (wit == window_slices_by_seq_.end() || wit->second.empty()) {
-        for (const auto& child : seq->stmts_) cur = BuildSubCfg(child, cur, cfg, phase, first_visit);
+        for (const auto& child : seq->stmts_) {
+          cur = BuildSubCfg(child, cur, cfg, phases, first_visit);
+        }
         return cur;
       }
       const auto& slices = wit->second;
@@ -1249,16 +1273,16 @@ class Builder {
           i = slices[slice_idx].end;
           ++slice_idx;
         } else {
-          cur = BuildSubCfg(seq->stmts_[i], cur, cfg, phase, first_visit);
+          cur = BuildSubCfg(seq->stmts_[i], cur, cfg, phases, first_visit);
           ++i;
         }
       }
       return cur;
     }
     if (const auto branch = As<IfStmt>(statement)) {
-      const size_t then_exit = BuildSubCfg(branch->then_body_, entry, cfg, phase, first_visit);
+      const size_t then_exit = BuildSubCfg(branch->then_body_, entry, cfg, phases, first_visit);
       const size_t else_exit =
-          branch->else_body_ ? BuildSubCfg(*branch->else_body_, entry, cfg, phase, first_visit) : entry;
+          branch->else_body_ ? BuildSubCfg(*branch->else_body_, entry, cfg, phases, first_visit) : entry;
       const size_t merge = cfg.size();
       cfg.push_back({CfgVertex::Kind::BranchMerge, 0, {}, {}});
       AddCfgEdge(cfg, then_exit, merge);
@@ -1276,10 +1300,10 @@ class Builder {
         AddCfgEdge(cfg, exit_node, exit_v);
         return exit_v;
       };
-      if (phase && phase->loop == loop) {
+      if (phases && phases->heads.count(loop) != 0) {
         // Only the first body uses distinct analysis sites. Both backedges
         // enter the steady-state header, and original IR emits each site once.
-        const size_t first_exit = BuildSubCfg(loop->body_, entry, cfg, phase, true);
+        const size_t first_exit = BuildSubCfg(loop->body_, entry, cfg, phases, true);
         const size_t steady_header = cfg.size();
         cfg.push_back({CfgVertex::Kind::Nop, 0, {}, {}});
         const size_t steady_exit = BuildSubCfg(loop->body_, steady_header, cfg);
@@ -1298,9 +1322,9 @@ class Builder {
       }
       if (!As<ConstInt>(loop->start_) && at_most_one) {
         if (positive) {
-          return wrap_exit(BuildSubCfg(loop->body_, entry, cfg));
+          return wrap_exit(BuildSubCfg(loop->body_, entry, cfg, phases));
         }
-        const size_t body_exit = BuildSubCfg(loop->body_, entry, cfg);
+        const size_t body_exit = BuildSubCfg(loop->body_, entry, cfg, phases);
         const size_t merge = cfg.size();
         cfg.push_back({CfgVertex::Kind::BranchMerge, 0, {}, {}});
         AddCfgEdge(cfg, entry, merge);
@@ -1308,7 +1332,7 @@ class Builder {
         return wrap_exit(merge);
       }
       if (IsSpmdAtMostOneTripFor(loop, ssa_defs_)) {
-        const size_t body_exit = BuildSubCfg(loop->body_, entry, cfg);
+        const size_t body_exit = BuildSubCfg(loop->body_, entry, cfg, phases);
         const size_t merge = cfg.size();
         cfg.push_back({CfgVertex::Kind::BranchMerge, 0, {}, {}});
         AddCfgEdge(cfg, entry, merge);
@@ -1318,7 +1342,7 @@ class Builder {
       const size_t header = cfg.size();
       cfg.push_back({CfgVertex::Kind::Nop, 0, {}, {}});
       AddCfgEdge(cfg, entry, header);
-      const size_t body_exit = BuildSubCfg(loop->body_, header, cfg);
+      const size_t body_exit = BuildSubCfg(loop->body_, header, cfg, phases);
       if (has_fibers) {
         const size_t backedge = cfg.size();
         cfg.push_back({CfgVertex::Kind::LoopBackedge, 0, {}, {}, loop.get()});
@@ -1333,7 +1357,7 @@ class Builder {
       const size_t header = cfg.size();
       cfg.push_back({CfgVertex::Kind::Nop, 0, {}, {}});
       AddCfgEdge(cfg, entry, header);
-      const size_t body_exit = BuildSubCfg(loop->body_, header, cfg);
+      const size_t body_exit = BuildSubCfg(loop->body_, header, cfg, phases);
       AddCfgEdge(cfg, body_exit, header);
       return header;
     }
@@ -1775,7 +1799,11 @@ class Builder {
       const auto& pipes = use_selected ? site.source_pipes : site.required_source_pipes;
       PipeMask sources_mask = 0;
       for (const auto source : pipes) sources_mask |= PipeToMask(source);
+      ApplyFirstPrefixCapture(state, vertex.index);
       state.DeliverSources(sources_mask, destination);
+      if (site.precise_capture) {
+        state.DeliverSources(PipeToMask(destination), site.precise_capture->destination);
+      }
       if (enable_refresh_kill_) {
         for (const auto& [space, domain, kill_fiber] : site_refresh_fibers_[vertex.index]) {
           state.KillDomain(space, domain, kill_fiber);
@@ -1879,6 +1907,7 @@ class Builder {
       if (cfg[u].kind == CfgVertex::Kind::Site) {
         auto& site = sites[cfg[u].index];
         const auto destination = site.pipe;
+        ApplyFirstPrefixCapture(cur_in, cfg[u].index);
         site.source_pipes =
             cur_in.Select(site.required_source_pipes, destination, site_effect_fibers_[cfg[u].index]);
       }
@@ -1898,6 +1927,7 @@ class Builder {
         auto& site = sites[cfg[u].index];
         const auto destination = site.pipe;
         DebtState after_services = sel_in[u];
+        ApplyFirstPrefixCapture(after_services, cfg[u].index);
         PipeMask sources_mask = 0;
         for (const auto source : site.source_pipes) sources_mask |= PipeToMask(source);
         after_services.DeliverSources(sources_mask, destination);
@@ -1932,6 +1962,7 @@ class Builder {
           size_t next = 0;
           const auto destination = selected.pipe;
           DebtState known = sel_in[u];
+          ApplyFirstPrefixCapture(known, cfg[u].index);
           PipeMask sources_mask = 0;
           for (const auto source : selected.required_source_pipes) {
             if (next < selected.source_pipes.size() && selected.source_pipes[next] == source) {
@@ -1962,6 +1993,207 @@ class Builder {
     size_t producer, consumer;
     std::vector<bool> can_relay_destination;
   };
+
+  void ApplyFirstPrefixCapture(DebtState& incoming, size_t site) const {
+    const auto found = first_prefix_deliveries_.find(site);
+    if (found == first_prefix_deliveries_.end()) return;
+    const auto& capture = found->second;
+    incoming.DeliverSources(PipeToMask(sites[capture.record_site].pipe), sites[site].pipe,
+                            &capture.displaced_effects);
+  }
+
+  bool NominateCapture(const std::vector<size_t>& source_run, const std::vector<size_t>& target_run) {
+    const auto consumer = target_run.front();
+    const auto src = sites[source_run.back()].pipe;
+    const auto dst = sites[consumer].pipe;
+    if (src == dst || src == PipeType::S || dst == PipeType::S ||
+        !std::binary_search(sites[consumer].source_pipes.begin(), sites[consumer].source_pipes.end(), src)) {
+      return false;
+    }
+    // A run of destination work shares a source prefix. Keep the last
+    // producer needed by any member in that prefix. Otherwise the next
+    // destination payload may need to restore the same broad capture.
+    LiveStorageState target_accesses;
+    for (const auto target : target_run) target_accesses.AddEffects(site_effect_fibers_[target]);
+    std::optional<size_t> record;
+    for (auto it = source_run.rbegin(); it != source_run.rend(); ++it) {
+      const auto producer = *it;
+      if (imported_->calls.at(sites[producer].operation.get()).has_native_claims) break;
+      const auto& effects = site_effect_fibers_[producer];
+      const auto conflicts = [&](const SiteEffectFiber& effect) {
+        return !target_accesses.QueryConflicts(effect, cost).empty();
+      };
+      if (std::any_of(effects.begin(), effects.end(), conflicts)) break;
+      record = producer;
+      const auto& incoming = sites[producer].required_source_pipes;
+      // A service reading the deferred destination could observe knowledge
+      // delivered there by the debt model before its actual wait. It may be
+      // included in the capture, since the record follows this site's services.
+      if (std::binary_search(incoming.begin(), incoming.end(), dst)) break;
+    }
+    if (!record) return false;
+    sites[*record].precise_capture = ConservativePrefixCapture{sites[consumer].cut, dst};
+    return true;
+  }
+
+  bool PrefixMetadata(const StmtPtr& statement, bool allow_peer_wait = false) const {
+    if (const auto call = transform_utils::GetCallFromStmt(statement)) {
+      // On this imported path an authored wait is wait_flag_dev, which
+      // blocks S and leaves both asynchronous queues untouched.
+      return (allow_peer_wait && IsOp(call, "system.sync_wait")) ||
+             backend::QualifyBufferSyncNonPayload(call, target_).has_value();
+    }
+    return static_cast<bool>(As<AssignStmt>(statement));
+  }
+
+  // Advance a record over an independently placed source-pipe suffix. Descriptors
+  // can stay between that payload and the consumer. Other native calls,
+  // especially authored peer commands, and changes of control scope end the
+  // straight-line window.
+  size_t NominatePreciseCaptures(const StmtPtr& statement) {
+    if (const auto seq = As<SeqStmts>(statement)) {
+      size_t count = 0;
+      std::vector<size_t> source_run, target_run;
+      const auto flush = [&]() {
+        if (!source_run.empty() && !target_run.empty()) count += NominateCapture(source_run, target_run);
+      };
+      for (const auto& child : seq->stmts_) {
+        if (const auto found = site_index_.find(child.get()); found != site_index_.end()) {
+          const auto current = found->second;
+          if (!target_run.empty() && sites[target_run.back()].pipe != sites[current].pipe) {
+            flush();
+            source_run.clear();
+            source_run.swap(target_run);
+          }
+          target_run.push_back(current);
+        } else if (PrefixMetadata(child)) {
+          continue;
+        } else {
+          flush();
+          if (const auto loop = As<ForStmt>(child); loop && !target_run.empty()) {
+            loop_capture_sources_.emplace(loop.get(), target_run);
+          }
+          source_run.clear();
+          target_run.clear();
+          count += NominatePreciseCaptures(child);
+        }
+      }
+      flush();
+      return count;
+    }
+    if (const auto branch = As<IfStmt>(statement)) {
+      return NominatePreciseCaptures(branch->then_body_) +
+             (branch->else_body_ ? NominatePreciseCaptures(*branch->else_body_) : 0);
+    }
+    if (const auto loop = As<ForStmt>(statement)) return NominatePreciseCaptures(loop->body_);
+    if (const auto loop = As<WhileStmt>(statement)) return NominatePreciseCaptures(loop->body_);
+    return 0;
+  }
+
+  void TryPreciseCaptures(const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo,
+                          const std::vector<size_t>& rpo_pos, size_t entry) {
+    if (!enable_precise_captures_) return;
+    const size_t captures = NominatePreciseCaptures(function_->body_);
+    if (captures == 0) return;
+    cost.services = 0;
+    cost.certificate_omissions = 0;
+    cost.suppressed_services = 0;
+    // Between the record and wait no commands read or issue on the destination
+    // pipe. Credit delivery before the displaced suffix so its newly issued
+    // effects keep their debts.
+    // Rerunning the fixed point restores required later services that had
+    // relied on the incidental completion of the displaced payload.
+    SelectAndCertifyDebts(cfg, rpo, rpo_pos, entry);
+    cost.services += captures;
+  }
+
+  StmtPtr FirstPrefixOperation(const StmtPtr& body) const {
+    if (const auto seq = As<SeqStmts>(body)) {
+      for (const auto& statement : seq->stmts_) {
+        if (!PrefixMetadata(statement, true)) return statement;
+      }
+      return nullptr;
+    }
+    return PrefixMetadata(body, true) ? nullptr : body;
+  }
+
+  size_t GuardAvailableAfter(const ExprPtr& guard) const {
+    size_t latest = 0;
+    CheckSyncScalarReadiness(guard, [&](const VarPtr& var) {
+      const auto found = definition_order_.find(var.get());
+      latest = std::max(
+          latest, found == definition_order_.end() ? std::numeric_limits<size_t>::max() : found->second);
+      return true;
+    });
+    return latest;
+  }
+
+  static bool IsPrefixBoundValue(const ExprPtr& expression) {
+    if (AsVarLike(expression) || As<ConstInt>(expression)) return true;
+    // An affine bound over already evaluated scalars may stay inline.
+    // Never duplicate division, a memory read, or any other operation
+    // originally evaluated only on a nonempty loop path.
+    const auto add = As<Add>(expression);
+    return add && (AsVarLike(add->left_) || As<ConstInt>(add->left_)) &&
+           (AsVarLike(add->right_) || As<ConstInt>(add->right_));
+  }
+
+  // Recognize a preheader source suffix and the first operation in an
+  // innermost loop. A one-sided leading IV test can only suppress the first
+  // consumer. Its exact first-visit predicate guards the early pair.
+  std::optional<FirstPrefixCapture> FindFirstPrefixCapture(const ForStmtPtr& loop) {
+    const auto source = loop_capture_sources_.find(loop.get());
+    if (source == loop_capture_sources_.end() || !CanDistinguishLoopEntry(loop) ||
+        !IsPrefixBoundValue(loop->stop_)) {
+      return std::nullopt;
+    }
+    auto head = FirstPrefixOperation(loop->body_);
+    auto guard = MakeLt(loop->start_, loop->stop_, loop->span_);
+    if (const auto branch = As<IfStmt>(head)) {
+      const auto test = As<Lt>(branch->condition_);
+      if (!test || test->left_ != loop->loop_var_ ||
+          (!AsVarLike(test->right_) && !As<ConstInt>(test->right_))) {
+        return std::nullopt;
+      }
+      guard = MakeAnd(guard, MakeLt(loop->start_, test->right_, test->span_), loop->span_);
+      head = FirstPrefixOperation(branch->then_body_);
+    }
+    const auto consumer = site_index_.find(head.get());
+    if (consumer == site_index_.end()) return std::nullopt;
+    const auto src = sites[source->second.back()].pipe;
+    const auto dst = sites[consumer->second].pipe;
+    const auto& services = sites[consumer->second].source_pipes;
+    if (src == dst || src == PipeType::S || dst == PipeType::S ||
+        !std::binary_search(services.begin(), services.end(), src)) {
+      return std::nullopt;
+    }
+    const auto guard_ready = GuardAvailableAfter(guard);
+    auto record = source->second.rend();
+    for (auto it = source->second.rbegin(); it != source->second.rend(); ++it) {
+      const auto producer = *it;
+      if (imported_->calls.at(sites[producer].operation.get()).has_native_claims ||
+          issue_order_.at(producer) <= guard_ready)
+        break;
+      DebtState added;
+      added.AddEffects(site_effect_fibers_[producer]);
+      if (!added.CoversConflicts(src, dst, site_effect_fibers_[consumer->second])) break;
+      record = it;
+      // Effects from another origin can become ready on the source pipe
+      // through a new wait. The record can follow that wait at this cut.
+      const auto& incoming = sites[producer].required_source_pipes;
+      const bool has_cross_pipe_wait =
+          std::any_of(incoming.begin(), incoming.end(), [src](PipeType pipe) { return pipe != src; });
+      if (has_cross_pipe_wait) {
+        break;
+      }
+    }
+    if (record == source->second.rend()) return std::nullopt;
+    DebtState displaced;
+    for (auto it = source->second.rbegin(); it != std::next(record); ++it) {
+      displaced.AddEffects(site_effect_fibers_[*it]);
+    }
+    return FirstPrefixCapture{*record, consumer->second, guard, std::move(displaced)};
+  }
 
   struct PathGuard {
     ExprPtr condition;
@@ -2196,40 +2428,131 @@ class Builder {
     return occupied;
   }
 
-  void TryLoopEntrySplit() {
-    if (!children.empty() || sites.empty()) return;
-    const auto loop = FindSingleTopLevelLoop();
-    if (!CanDistinguishLoopEntry(loop)) return;
-    const size_t original_count = sites.size();
-    std::vector<std::optional<PathGuard>> paths(original_count);
-    if (!CollectProducerPaths(loop->body_, {}, paths)) return;
-    const auto first =
-        std::find_if(paths.begin(), paths.end(), [](const auto& path) { return path.has_value(); });
-    // Only a direct first payload can capture the pre-loop prefix: no
-    // intervening producer on any native pipe, nor a skipped first use.
-    if (first == paths.end() || first == paths.begin() || (*first)->condition) return;
-    const size_t head = static_cast<size_t>(first - paths.begin());
-    if (sites[head].source_pipes.empty() || sites[head].pipe == PipeType::S) return;
+  void CollectLoopEntrySites(const StmtPtr& statement, bool conditional,
+                             std::vector<std::pair<size_t, bool>>& body_sites) const {
+    if (const auto seq = As<SeqStmts>(statement)) {
+      for (const auto& child : seq->stmts_) {
+        CollectLoopEntrySites(child, conditional, body_sites);
+      }
+    } else if (const auto branch = As<IfStmt>(statement)) {
+      CollectLoopEntrySites(branch->then_body_, true, body_sites);
+      if (branch->else_body_) {
+        CollectLoopEntrySites(*branch->else_body_, true, body_sites);
+      }
+    } else if (const auto found = site_index_.find(statement.get()); found != site_index_.end()) {
+      body_sites.emplace_back(found->second, conditional);
+    }
+  }
+
+  void AddLoopEntryPhase(const ForStmtPtr& loop, const ForStmtPtr& top_level, LoopEntryPhases& phases) {
+    if (!CanDistinguishLoopEntry(loop)) {
+      return;
+    }
+    std::vector<std::pair<size_t, bool>> body_sites;
+    CollectLoopEntrySites(loop->body_, false, body_sites);
+    // The first payload must issue on every nonempty invocation. Moving its
+    // wait to the entry then crosses only scalar and metadata operations.
+    if (body_sites.empty()) {
+      return;
+    }
+    if (enable_precise_captures_) {
+      if (auto capture = FindFirstPrefixCapture(loop)) {
+        SaveLoopEntryPhase(body_sites, phases);
+        phases.heads.emplace(loop, LoopEntryPhases::Head{capture->wait_site, 0});
+        first_prefix_deliveries_.emplace(phases.first_sites[capture->wait_site].value(), std::move(*capture));
+      }
+      return;
+    }
+    if (body_sites.front().second) return;
+    const size_t head = body_sites.front().first;
+    const auto& site = sites[head];
+    if (site.source_pipes.empty() || site.pipe == PipeType::S) {
+      return;
+    }
+    PipeMask body_pipes = 0;
+    for (const auto& [index, conditional] : body_sites) {
+      body_pipes |= PipeToMask(sites[index].pipe);
+    }
+    // A source that issues no payload in the loop may still relay another
+    // pipe's completion. The phase dataflow below certifies the full relay.
+    if (loop != top_level &&
+        std::all_of(site.source_pipes.begin(), site.source_pipes.end(),
+                    [&](PipeType source) { return (body_pipes & PipeToMask(source)) != 0; })) {
+      return;
+    }
+    phases.heads.emplace(loop, LoopEntryPhases::Head{head, body_pipes});
+    SaveLoopEntryPhase(body_sites, phases);
+  }
+
+  void SaveLoopEntryPhase(const std::vector<std::pair<size_t, bool>>& body_sites,
+                          LoopEntryPhases& phases) const {
+    for (const auto& [index, conditional] : body_sites) {
+      phases.first_sites[index] = sites.size() + phases.first_visit_copies.size();
+      phases.first_visit_copies.push_back(index);
+    }
+  }
+
+  // Split only loops with no loop in their body. Each original site then
+  // has at most two CFG occurrences, even under enclosing loops and branches.
+  bool CollectLoopEntryPhases(const StmtPtr& statement, const ForStmtPtr& top_level,
+                              LoopEntryPhases& phases) {
+    if (const auto seq = As<SeqStmts>(statement)) {
+      bool contains_loop = false;
+      for (const auto& child : seq->stmts_) {
+        contains_loop |= CollectLoopEntryPhases(child, top_level, phases);
+      }
+      return contains_loop;
+    }
+    if (const auto branch = As<IfStmt>(statement)) {
+      const bool then_has_loop = CollectLoopEntryPhases(branch->then_body_, top_level, phases);
+      const bool else_has_loop =
+          branch->else_body_ && CollectLoopEntryPhases(*branch->else_body_, top_level, phases);
+      return then_has_loop || else_has_loop;
+    }
+    if (const auto loop = As<ForStmt>(statement)) {
+      if (!CollectLoopEntryPhases(loop->body_, top_level, phases)) {
+        AddLoopEntryPhase(loop, top_level, phases);
+      }
+      return true;
+    }
+    if (const auto loop = As<WhileStmt>(statement)) {
+      CollectLoopEntryPhases(loop->body_, top_level, phases);
+      return true;
+    }
+    return false;
+  }
+
+  void TryLoopEntrySplit(bool precise_captures = false) {
+    if (!children.empty() || sites.empty()) {
+      return;
+    }
     // Producer-side captures have an independent proof and are never replayed
     // here. In particular the phase split does not delay a previously moved edge.
     const auto has_capture = [](const auto& site) { return site.post_destination.has_value(); };
-    if (std::any_of(sites.begin(), sites.end(), has_capture)) return;
+    if (std::any_of(sites.begin(), sites.end(), has_capture)) {
+      return;
+    }
 
-    const auto baseline_sites = sites;
+    const auto top_level = FindSingleTopLevelLoop();
+    const size_t original_count = sites.size();
+    LoopEntryPhases phases{{}, std::vector<std::optional<size_t>>(original_count), {}};
+    CollectLoopEntryPhases(function_->body_, top_level, phases);
+    if (phases.heads.empty()) {
+      return;
+    }
+
+    auto baseline_sites = sites;
     const auto baseline_cost = cost;
-    LoopEntryPhase phase{loop, std::vector<std::optional<size_t>>(original_count)};
-    for (size_t i = head; i < original_count; ++i) {
-      if (!paths[i]) continue;
-      phase.first_sites[i] = sites.size();
-      sites.push_back(baseline_sites[i]);
-      const auto effects = site_effect_fibers_[i];
-      const auto refreshed = site_refresh_fibers_[i];
+    for (const size_t index : phases.first_visit_copies) {
+      sites.push_back(baseline_sites[index]);
+      const auto effects = site_effect_fibers_[index];
+      const auto refreshed = site_refresh_fibers_[index];
       site_effect_fibers_.push_back(effects);
       site_refresh_fibers_.push_back(refreshed);
     }
     cost = {};
     std::vector<CfgVertex> cfg{{CfgVertex::Kind::Nop, 0, {}, {}}};
-    BuildSubCfg(function_->body_, 0, cfg, &phase);
+    BuildSubCfg(function_->body_, 0, cfg, &phases);
     std::vector<size_t> rpo, rpo_pos;
     ComputeRpo(cfg, 0, rpo, rpo_pos);
     std::vector<LiveStorageState> live_in, live_out;
@@ -2240,40 +2563,89 @@ class Builder {
     const auto subset = [](const auto& a, const auto& b) {
       return std::includes(b.begin(), b.end(), a.begin(), a.end());
     };
-    const auto& entry = sites[phase.first_sites[head].value()].source_pipes;
-    const auto& backedge = sites[head].source_pipes;
-    const auto& baseline = baseline_sites[head].source_pipes;
-    std::vector<PipeType> selected, entry_only, backedge_only;
-    std::set_union(entry.begin(), entry.end(), backedge.begin(), backedge.end(),
-                   std::back_inserter(selected));
-    std::set_difference(entry.begin(), entry.end(), backedge.begin(), backedge.end(),
-                        std::back_inserter(entry_only));
-    std::set_difference(backedge.begin(), backedge.end(), entry.begin(), entry.end(),
-                        std::back_inserter(backedge_only));
-
-    // Keep other sites' existing service lists. Every proved phase-specific
-    // prerequisite remains covered by those supersets, even if a conditional
-    // producer in the loop revives a prologue pipe's debt on the backedge.
-    bool accepted = !entry_only.empty() && backedge.size() < baseline.size();
+    // The replay certifies all phases together. Retaining original services
+    // at any unmodified cut must cover the replay on every visit to that cut.
+    bool accepted = true;
     for (size_t i = 0; accepted && i < original_count; ++i) {
       const auto& original = baseline_sites[i].source_pipes;
-      accepted = subset(sites[i].source_pipes, original) &&
-                 (!paths[i] || subset(sites[phase.first_sites[i].value()].source_pipes, original));
+      accepted =
+          subset(sites[i].source_pipes, original) &&
+          (!phases.first_sites[i] || subset(sites[phases.first_sites[i].value()].source_pipes, original));
     }
-
-    const auto occupied_entry =
-        accepted ? EntryPrefixPipes(baseline_sites, head, entry) : kAllPhysicalPipesMask;
+    if (precise_captures) {
+      for (const auto& [entry, capture] : first_prefix_deliveries_) {
+        const auto& incoming = sites[entry].source_pipes;
+        accepted &= !std::binary_search(incoming.begin(), incoming.end(), sites[capture.record_site].pipe);
+      }
+    }
     const auto replay_cost = cost;
-    sites = baseline_sites;
-    site_effect_fibers_.resize(original_count);
-    site_refresh_fibers_.resize(original_count);
     cost = baseline_cost;
     cost.dataflow_visits += replay_cost.dataflow_visits;
     cost.certificate_visits += replay_cost.certificate_visits;
     cost.conflict_queries += replay_cost.conflict_queries;
     cost.control_snapshot_facts += replay_cost.control_snapshot_facts;
     cost.control_merge_facts += replay_cost.control_merge_facts;
-    if (!accepted) return;
+    if (accepted) {
+      for (const auto& [loop, head] : phases.heads) {
+        if (precise_captures) {
+          const auto& capture = first_prefix_deliveries_.at(phases.first_sites[head.site].value());
+          InstallFirstPrefixCapture(loop, capture, baseline_sites);
+        } else {
+          InstallLoopEntrySplit(loop, head, loop == top_level, phases, baseline_sites);
+        }
+      }
+    }
+    first_prefix_deliveries_.clear();
+    sites = std::move(baseline_sites);
+    site_effect_fibers_.resize(original_count);
+    site_refresh_fibers_.resize(original_count);
+  }
+
+  void InstallFirstPrefixCapture(const ForStmtPtr& loop, const FirstPrefixCapture& capture,
+                                 std::vector<ConservativeSyncSite>& original) {
+    auto& record = original[capture.record_site];
+    auto& receiver = original[capture.wait_site];
+    record.guarded_capture = ConservativeGuardedCapture{capture.condition, receiver.pipe};
+    // Retain the original service on all later trips, even when the current
+    // analysis finds that only some of those trips require fresh completion.
+    receiver.loop_entry = ConservativeLoopEntryServices{loop, false, {}, {record.pipe}, {}};
+    ++cost.services;
+  }
+
+  void InstallLoopEntrySplit(const ForStmtPtr& loop, const LoopEntryPhases::Head& head, bool top_level,
+                             const LoopEntryPhases& phases,
+                             std::vector<ConservativeSyncSite>& baseline_sites) {
+    const auto& entry = sites[phases.first_sites[head.site].value()].source_pipes;
+    const auto& backedge = sites[head.site].source_pipes;
+    auto& baseline = baseline_sites[head.site];
+    const bool guard_nonempty = !trip_prover_.IsPositiveTrip(loop.get());
+    std::vector<PipeType> entry_only;
+    std::set_difference(entry.begin(), entry.end(), backedge.begin(), backedge.end(),
+                        std::back_inserter(entry_only));
+    if (!top_level) {
+      // Preserve the regular services at their unconditional cuts. A
+      // first-visit guard can hide a relay that closes physical event reuse.
+      entry_only.erase(
+          std::remove_if(entry_only.begin(), entry_only.end(),
+                         [&](PipeType pipe) { return (head.body_pipes & PipeToMask(pipe)) != 0; }),
+          entry_only.end());
+      if (!entry_only.empty()) {
+        baseline.loop_entry =
+            ConservativeLoopEntryServices{loop, guard_nonempty, std::move(entry_only), {}, {}};
+      }
+      return;
+    }
+    if (entry_only.empty() || backedge.size() >= baseline.source_pipes.size()) {
+      return;
+    }
+
+    std::vector<PipeType> selected, backedge_only;
+    std::set_union(entry.begin(), entry.end(), backedge.begin(), backedge.end(),
+                   std::back_inserter(selected));
+    std::set_difference(backedge.begin(), backedge.end(), entry.begin(), entry.end(),
+                        std::back_inserter(backedge_only));
+
+    const auto occupied_entry = EntryPrefixPipes(baseline_sites, head.site, entry);
     std::vector<PipeType> empty_entry;
     const auto captures_empty_prefix = [&](PipeType source) {
       return (occupied_entry & PipeToMask(source)) == 0;
@@ -2286,14 +2658,13 @@ class Builder {
     backedge_only.erase(std::remove_if(backedge_only.begin(), backedge_only.end(), captures_empty_prefix),
                         backedge_only.end());
 
-    const auto removed = baseline.size() - selected.size();
+    const auto removed = baseline.source_pipes.size() - selected.size();
     cost.services -= removed;
     cost.suppressed_services += removed;
     cost.certificate_omissions += removed;
-    sites[head].source_pipes = std::move(selected);
-    sites[head].loop_entry =
-        ConservativeLoopEntryServices{loop, !trip_prover_.IsPositiveTrip(loop.get()), std::move(entry_only),
-                                      std::move(backedge_only), std::move(empty_entry)};
+    baseline.source_pipes = std::move(selected);
+    baseline.loop_entry = ConservativeLoopEntryServices{loop, guard_nonempty, std::move(entry_only),
+                                                        std::move(backedge_only), std::move(empty_entry)};
   }
 
   void RefineStorage() {
@@ -2490,6 +2861,7 @@ class Builder {
     CHECK_SPAN(ready_.insert(variable.get()).second, variable->span_)
         << "Conservative synchronization: a ready SSA definition is redefined";
     scopes_.back().push_back(variable.get());
+    if (enable_precise_captures_) definition_order_.insert_or_assign(variable.get(), cost.statements);
   }
   void PopScope() {
     for (const auto* variable : scopes_.back()) ready_.erase(variable);
@@ -2514,8 +2886,20 @@ class Builder {
         const auto inserted = site_index_.emplace(cut.get(), sites.size()).second;
         CHECK_SPAN(inserted, cut->span_)
             << "Conservative synchronization: shared statement identity has ambiguous insertion cuts";
-        sites.push_back(
-            {cut, call, *local.pipe, std::nullopt, {}, {}, {}, {}, {}, std::nullopt, std::nullopt});
+        sites.push_back({cut,
+                         call,
+                         *local.pipe,
+                         std::nullopt,
+                         {},
+                         {},
+                         {},
+                         {},
+                         {},
+                         std::nullopt,
+                         std::nullopt,
+                         std::nullopt,
+                         std::nullopt});
+        issue_order_.push_back(cost.statements);
         inside_child_.push_back(false);
       }
       if (result) Bind(result);
@@ -2575,6 +2959,8 @@ class Builder {
                      {},
                      {},
                      {},
+                     std::nullopt,
+                     std::nullopt,
                      std::nullopt,
                      std::nullopt});
     inside_child_.push_back(native_child_depth_ != 0);
@@ -2721,6 +3107,11 @@ class Builder {
   bool enable_refresh_kill_;
   bool enable_loop_prefixes_;
   const ImportedLocalSync* imported_;
+  bool enable_precise_captures_;
+  std::vector<size_t> issue_order_;
+  std::unordered_map<const Var*, size_t> definition_order_;
+  std::unordered_map<const ForStmt*, std::vector<size_t>> loop_capture_sources_;
+  std::unordered_map<size_t, FirstPrefixCapture> first_prefix_deliveries_;
   std::unordered_map<const Expr*, ExprPtr> gm_roots_;
   std::unordered_map<const Var*, ExprPtr> ssa_defs_;
   std::vector<std::vector<const Var*>> scopes_;
@@ -2757,7 +3148,7 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
     const std::vector<std::shared_ptr<const EventfulSyncChild>>& eventful_children,
     bool retain_incoming_diagnostics, bool automatic_children, bool enable_refresh_kill,
     const SyncParameterBounds& parameters, const std::optional<std::pair<int64_t, int64_t>>& blocks,
-    bool enable_loop_prefixes, const ImportedLocalSync* imported) {
+    bool enable_loop_prefixes, const ImportedLocalSync* imported, bool enable_precise_captures) {
   CHECK(function && function->ir_stage_ == FunctionIRStage::Buffer)
       << "Conservative synchronization requires Buffer IR";
   CHECK(function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV)
@@ -2770,6 +3161,8 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
                       eventful_children.empty() && !enable_refresh_kill && !enable_loop_prefixes))
       << "Imported local synchronization requires its original owner without derived child or overwrite "
          "proofs";
+  INTERNAL_CHECK(!enable_precise_captures || imported)
+      << "Internal error: precise prefix captures require qualified imported effects";
   AutomaticSyncChildren selection;
   std::vector<std::shared_ptr<const EventfulSyncChild>> selected = eventful_children;
   if (automatic_children) {
@@ -2778,7 +3171,7 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
       if (attempt.child) selected.push_back(attempt.child);
   }
   Builder builder(function, target, children, selected, retain_incoming_diagnostics, enable_refresh_kill,
-                  parameters, blocks, enable_loop_prefixes, imported);
+                  parameters, blocks, enable_loop_prefixes, imported, enable_precise_captures);
   if (automatic_children && !selection.inline_subblocks.empty()) {
     builder.RegisterInlineSubblocks(selection.inline_subblocks);
   }

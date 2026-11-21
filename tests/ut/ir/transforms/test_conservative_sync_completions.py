@@ -566,5 +566,95 @@ def test_steady_wait_does_not_capture_independent_pre_loop_store():
     assert (("payload", 5, "C"), ("payload", 6, "I")) in actual.order
 
 
+def nested_loop_entry_fixture():
+    source = fixture()
+    alloc_x, alloc_z, _, load, read_x, store, ret = loop_fixture_parts(source)
+    span = source.span
+    idx = ir.ScalarType(ir.DataType.INDEX)
+    row, col, tail, rows, visits = (
+        ir.Var(name, idx, span) for name in ("row", "col", "tail", "rows", "visits")
+    )
+    zero, one, two, three = (ir.ConstInt(n, ir.DataType.INDEX, span) for n in range(4))
+
+    # Only the second loop issues stores, but an earlier row's store can
+    # still be reading x when the first loop starts overwriting it.
+    reduce = ir.ForStmt(col, zero, visits, one, [], ir.SeqStmts([load, read_x], span), [], span)
+    tail_load = ir.EvalStmt(load.expr, span)
+    tail_store = ir.EvalStmt(
+        ir.Call(ir.get_op("buffer.store"), [alloc_x.var, *store.args[1:]], ir.VoidType(), span),
+        span,
+    )
+    write = ir.ForStmt(tail, zero, two, one, [], ir.SeqStmts([tail_load, tail_store], span), [], span)
+    body = ir.IfStmt(
+        ir.Lt(row, rows, ir.DataType.BOOL, span), ir.SeqStmts([reduce, write], span), None, [], span
+    )
+    outer = ir.ForStmt(row, zero, three, one, [], body, [], span)
+    final_load = ir.EvalStmt(load.expr, span)
+    return ir.Function(
+        "nested_loop_entry",
+        [source.params[0], source.params[1], (source.params[2], ir.ParamDirection.InOut), rows, visits],
+        source.return_types,
+        ir.SeqStmts([alloc_x, alloc_z, outer, final_load, ret], span),
+        span,
+        ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+
+
+@pytest.mark.parametrize("disjoint", [False, True])
+def test_nested_loop_delivers_idle_store_completion_at_entry(disjoint):
+    plans = programs(nested_loop_entry_fixture(), disjoint)
+
+    flag_ops = {ir.get_op("system.set_flag").name, ir.get_op("system.wait_flag").name}
+
+    class FlagDirections(ir.IRVisitor):
+        def __init__(self):
+            super().__init__()
+            self.flags = []
+            self.conditionals = 0
+
+        def visit_if_stmt(self, op):
+            self.conditionals += 1
+            super().visit_if_stmt(op)
+
+        def visit_call(self, op):
+            if op.op.name in flag_ops:
+                self.flags.append((ir.PipeType(op.kwargs["src_pipe"]), ir.PipeType(op.kwargs["dst_pipe"])))
+
+    def find_reduction(stmt):
+        if isinstance(stmt, ir.ForStmt):
+            if stmt.loop_var.name_hint == "col":
+                yield stmt
+            yield from find_reduction(stmt.body)
+        elif isinstance(stmt, ir.IfStmt):
+            yield from find_reduction(stmt.then_body)
+            if stmt.else_body is not None:
+                yield from find_reduction(stmt.else_body)
+        elif isinstance(stmt, ir.SeqStmts):
+            for child in stmt.stmts:
+                yield from find_reduction(child)
+
+    (reduction,) = find_reduction(plans[-1].body)
+    commands = FlagDirections()
+    commands.visit_stmt(reduction.body)
+    # MTE3 delivers its prefix at entry and issues no payload here. The
+    # physical loop needs neither the forward flag nor its return ACK.
+    assert all(ir.PipeType.MTE3 not in direction for direction in commands.flags)
+    # The two V/MTE2 services continue to establish each other's event reuse.
+    # Guarding the first V wait would require a second V/MTE2 pair as an ACK.
+    assert commands.conditionals == 0
+    assert commands.flags.count((ir.PipeType.V, ir.PipeType.MTE2)) == 2
+    assert commands.flags.count((ir.PipeType.MTE2, ir.PipeType.V)) == 2
+    tensor_bases = None if disjoint else {2: 0}
+    for rows, visits in product((0, 1, 3), (0, 1, 5)):
+        execution = check_execution(plans, {3: rows, 4: visits}, tensor_bases=tensor_bases)[-1]
+        per_row = 2 * visits + 4
+        assert len(execution.payloads) == rows * per_row + 1
+        # Consecutive row blocks and the final load must respect the final
+        # store even when an inner loop or an outer arm executes zero trips.
+        for after_store in range(per_row, len(execution.payloads), per_row):
+            assert (("payload", after_store - 1, "C"), ("payload", after_store, "I")) in execution.order
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

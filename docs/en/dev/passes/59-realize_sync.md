@@ -111,14 +111,30 @@ replaces the original wait without adding another prerequisite service. When
 these checks fail it keeps the original placement. Physical lowering allocates
 events and supplies a return acknowledgment when reuse requires one.
 
+For qualified imported peer endpoints, a record can precede a contiguous
+suffix of independent source-pipe operations while its wait stays with the
+consuming operations. The debt check restores any later service that still
+needs the displaced work. A qualified first loop visit can acquire a preheader
+prefix under a guard built from already available values. The replay excludes
+the displaced effects from that first acquire and keeps the original service
+on later visits. Authored peer commands retain their original cuts, and
+operations with native event claims end the candidate suffix. The original
+schedule remains available if event allocation cannot realize the split.
+
 A loop head can reuse storage first touched in the prologue. The first
 overwrite may need a pre-loop reader to finish, while later overwrites need
-the previous iteration’s reader to finish. For an unconditional first payload
-of a qualified sequential counted loop, the planner analyzes the first visit
-separately from the backedge fixed point. It emits entry-only services once on
-the nonempty path, recurring services at the original payload cut, and
-backedge-only services there after the first iteration. If a backedge source
-pipe is provably empty at loop entry, its wait can execute on every visit.
+the previous iteration’s reader to finish. The planner separates the first
+visit from the backedge fixed point for the unconditional first payload of a
+qualified innermost sequential counted loop. This includes loops nested in
+branches or other loops. For example, a reduction can acquire the previous
+row’s store completion at entry and carry it across iterations as long as
+no iteration needs another completion from the store pipe. For nested loops
+and functions with multiple loops, the planner hoists only entry-only
+services from pipes that issue no payload in the loop. It keeps every other
+service at its original cut so it can still establish event reuse. A single
+top-level loop can additionally guard backedge-only services to execute after
+the first iteration. If a backedge source pipe is provably empty at that
+loop's entry, its wait can execute on every visit.
 The first wait then captures an empty prefix and the recurring event pair can
 acknowledge reuse without a separate return event. Both analyses use
 physical storage overlaps, including aliases. A conditional access can
@@ -279,6 +295,17 @@ loop, lowering can use first, last, previous-visit or next-visit predicates
 if they select the same physical commands in the same order in every case.
 Six-ID allocation uses the existing sufficient certificate. Unsupported
 coordinates, same-pipe mechanisms or resource evidence still delegate.
+
+Physical lowering can split a qualified innermost loop into up to three
+constant-bound phases at assigned endpoint boundaries. Each phase emits the
+original visits and the same allocated commands at their original payload
+cuts. With the residual enclosing-loop guards accounted for, the upper bound
+on the specialized loop's control work, including its loop headers, must be
+below the lower bound for guarded lowering in every launch case. The compiler
+charges each duplicated payload site and the full expanded replacement across
+the leaf, and preserves guarded emission when the growth budget does not fit.
+This selection does not expand invocation cases or period residues.
+
 See the [pipeline checkpoint](https://github.com/tonibohnlein/pypto/blob/365b803a45072f1c00e8eca5da9942bd9828685f/docs/en/dev/ir/18-qwen-prefill-pipeline.md) for exact
 premises, independent bounded checks and remaining selection limitations.
 This does not qualify arbitrary symbolic nesting, the full prefill model,

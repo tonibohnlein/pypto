@@ -92,6 +92,7 @@ struct ImportedLocalCut {
   const Stmt* statement;
   std::optional<PipeType> pipe;
   std::vector<ImportedLocalEffect> effects;
+  bool has_native_claims = false;
 };
 using ImportedLocalCuts = std::unordered_map<const Call*, ImportedLocalCut>;
 struct ImportedLocalSync {
@@ -107,6 +108,16 @@ struct ConservativeLoopEntryServices {
   std::vector<PipeType> backedge_only;
   // A steady service can be unguarded when its first publication is empty.
   std::vector<PipeType> empty_entry_sources;
+};
+
+struct ConservativePrefixCapture {
+  StmtPtr consumer;
+  PipeType destination;
+};
+
+struct ConservativeGuardedCapture {
+  ExprPtr condition;
+  PipeType destination;
 };
 
 struct ConservativeSyncSite {
@@ -127,6 +138,11 @@ struct ConservativeSyncSite {
   std::optional<PipeType> post_destination;
   // Phase-only subsets of source_pipes. All other services run on both paths.
   std::optional<ConservativeLoopEntryServices> loop_entry;
+  // Record before this payload and wait before the following independent
+  // consumer in the same straight-line statement sequence.
+  std::optional<ConservativePrefixCapture> precise_capture;
+  // A first-visit handoff whose guard guarantees that the receiver executes.
+  std::optional<ConservativeGuardedCapture> guarded_capture;
 };
 
 struct ConservativeSyncChildEntry {
@@ -192,7 +208,7 @@ class ConservativeSyncAnalysis {
       const FunctionPtr&, const std::string&, const std::vector<std::shared_ptr<const NativeSyncChild>>&,
       const std::vector<std::shared_ptr<const EventfulSyncChild>>&, bool, bool, bool,
       const SyncParameterBounds&, const std::optional<std::pair<int64_t, int64_t>>&, bool,
-      const ImportedLocalSync*);
+      const ImportedLocalSync*, bool);
   ConservativeSyncAnalysis(FunctionPtr function, std::vector<ConservativeSyncSite> sites,
                            ConservativeAccessSet exit, ConservativeSyncCost cost,
                            std::vector<ConservativeSyncChildEntry> children,
@@ -230,7 +246,7 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
     bool retain_incoming_diagnostics = false, bool automatic_children = false,
     bool enable_refresh_kill = true, const SyncParameterBounds& parameters = {},
     const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt, bool enable_loop_prefixes = true,
-    const ImportedLocalSync* imported = nullptr);
+    const ImportedLocalSync* imported = nullptr, bool enable_precise_captures = false);
 // Explicit policy construction. Acknowledgment-induced order is represented
 // here in logical tokens before LowerSync; no physical resource is assigned.
 FunctionPtr InsertConservativePrefixes(const ConservativeSyncAnalysis& analysis);

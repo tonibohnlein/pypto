@@ -50,6 +50,6 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     const std::optional<std::vector<int>>& eligible_ids,
     const SyncNativeReservations& extra_reservations = {}, const SyncParameterBounds& parameters = {},
     const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt,
-    const ImportedLocalSync* imported = nullptr);
+    const ImportedLocalSync* imported = nullptr, const SyncSchedulePolicy& schedule_policy = {});
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_CLOSED_PREFIX_SYNC_H_
