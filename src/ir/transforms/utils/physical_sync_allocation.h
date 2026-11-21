@@ -68,6 +68,9 @@ PhysicalSyncRealization AllocateDirectSync(const CompactSyncInput& input,
                                            const DirectSyncOrder& order, const std::string& target,
                                            const std::optional<std::vector<int>>& restricted,
                                            const SyncNativeReservations& extra_reservations = {});
+// Emit a single allocated plan after its client has verified boundary event reuse.
+void EmitAssignedSync(const CompactSyncInput& input, PhysicalSyncRealization& result,
+                      const SyncSchedulePolicy& policy);
 struct AssignedSyncCase {
   const CompactSyncInput* input;
   std::shared_ptr<const AssignedSyncPlan> assignment;

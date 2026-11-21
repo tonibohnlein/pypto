@@ -13,10 +13,12 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -34,13 +36,17 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/pass_context.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/type.h"
 #include "src/ir/transforms/utils/closed_prefix_sync.h"
 #include "src/ir/transforms/utils/conservative_sync_dataflow.h"
+#include "src/ir/transforms/utils/local_completion_relay.h"
+#include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/retained_sync_child.h"
 #include "src/ir/transforms/utils/sync_footprint_resolver.h"
 #include "src/ir/transforms/utils/sync_loop_trip_proof.h"
+#include "src/ir/transforms/utils/sync_transform_common.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -184,6 +190,307 @@ FunctionPtr MakeAicFn(const std::string& name, std::vector<VarPtr> params, std::
                                        std::nullopt, std::nullopt, decltype(Function::attrs_){}, false,
                                        FunctionIRStage::Buffer);
   return fn;
+}
+
+// Replay these small command graphs with one bit per payload completion or
+// WAIT consumption. Labels for payloads and flag lifetimes are independent,
+// so plans of different lengths can be compared at each original issue.
+struct RelayObservation {
+  unsigned payloads = 0, issues = 0;
+  uint64_t consumptions = 0;
+  void Include(const RelayObservation& other) {
+    payloads |= other.payloads;
+    issues |= other.issues;
+    consumptions |= other.consumptions;
+  }
+};
+using RelayProfile = std::vector<std::pair<unsigned, unsigned>>;  // completion and issue ancestry
+RelayProfile RelayPayloadPredecessors(const FunctionPtr& physical, const ImportedLocalCuts& imported,
+                                      bool taken, int trips, size_t* sets = nullptr) {
+  using Event = std::tuple<PipeType, PipeType, int>;
+  std::map<PipeType, RelayObservation> gates, completed, commands;
+  std::map<Event, RelayObservation> live;
+  std::map<Event, uint64_t> last_wait;
+  uint64_t next_wait = 1;
+  std::map<PipeType, unsigned> issued;
+  RelayProfile profile;
+  const auto visit = [&](const auto& self, const StmtPtr& stmt) -> void {
+    if (const auto sequence = As<SeqStmts>(stmt)) {
+      for (const auto& child : sequence->stmts_) self(self, child);
+    } else if (const auto branch = As<IfStmt>(stmt)) {
+      if (taken) self(self, branch->then_body_);
+    } else if (const auto loop = As<ForStmt>(stmt)) {
+      for (int n = 0; n < trips; ++n) self(self, loop->body_);
+    } else if (const auto eval = As<EvalStmt>(stmt)) {
+      const auto call = As<Call>(eval->expr_);
+      if (const auto cut = imported.find(call.get()); cut != imported.end() && cut->second.pipe) {
+        const auto p = *cut->second.pipe;
+        assert(profile.size() < std::numeric_limits<unsigned>::digits);
+        const auto label = 1U << profile.size();
+        const auto before_issue = gates[p].issues | issued[p];
+        profile.emplace_back(gates[p].payloads, before_issue);
+        issued[p] = before_issue | label;
+        completed[p].Include(gates[p]);
+        completed[p].issues |= issued[p];
+        completed[p].payloads |= label;
+      } else if (IsOp(call, "system.fence")) {
+        // DDR system fence observes commands, even when they only publish.
+        RelayObservation observed;
+        for (const auto p : {PipeType::MTE2, PipeType::MTE3, PipeType::FIX}) observed.Include(commands[p]);
+        profile.emplace_back(observed.payloads, observed.issues);
+      } else if (IsOp(call, "system.bar_all")) {
+        RelayObservation all;
+        for (const auto& [p, snapshot] : commands) all.Include(snapshot);
+        for (const auto& [p, snapshot] : completed) all.Include(snapshot);
+        for (const auto p : {PipeType::MTE2, PipeType::MTE1, PipeType::M, PipeType::FIX}) {
+          commands[p] = gates[p] = all;
+        }
+      } else {
+        const auto src = RequireSyncPipeKwarg(call, "src_pipe"), dst = RequireSyncPipeKwarg(call, "dst_pipe");
+        const auto key = std::make_tuple(src, dst, call->GetKwarg<int>("event_id"));
+        if (IsOp(call, "system.set_flag")) {
+          if (sets) ++*sets;
+          commands[src].Include(completed[src]);
+          commands[src].Include(gates[src]);
+          assert((commands[src].consumptions & last_wait[key]) == last_wait[key]);
+          assert(live.emplace(key, commands[src]).second);
+        } else {
+          assert(IsOp(call, "system.wait_flag") && next_wait != 0);
+          gates[dst].Include(live.at(key));
+          gates[dst].issues |= issued[dst];
+          gates[dst].consumptions |= next_wait;
+          commands[dst].Include(gates[dst]);
+          last_wait[key] = next_wait;
+          next_wait <<= 1;
+          live.erase(key);
+        }
+      }
+    }
+  };
+  visit(visit, physical->body_);
+  assert(live.empty());
+  return profile;
+}
+
+void TestPhysicalCompletionRelay() {
+  const auto carrier = PipeType::MTE2, consumer = PipeType::M;
+  const auto a = PipeType::MTE1, b = PipeType::FIX;
+  const auto mat = MatType(16, 16), left = LeftType(16, 16), acc = AccType(16, 16);
+  const auto right = std::make_shared<BufferType>(std::vector<int64_t>{16, 16}, DataType::FP16,
+                                                  MemorySpace::Right, std::vector<int64_t>{16, 16},
+                                                  TileLayout::col_major, TileLayout::row_major, 512);
+  const auto source = MakeVar("source", mat), slot0 = MakeVar("slot0", mat), slot1 = MakeVar("slot1", mat);
+  const auto lhs = MakeVar("lhs", left), rhs = MakeVar("rhs", right), dst = MakeVar("dst", acc);
+  const auto prior_lhs = MakeVar("prior_lhs", left), prior_dst = MakeVar("prior_dst", acc);
+  const auto input = MakeVar("input", MakeTensorType(16, 16, DataType::FP16));
+  const auto out = MakeVar("out", MakeTensorType(16, 16));
+  const auto gate = MakeVar("gate", BoolType()), visits = MakeVar("visits", IndexType());
+  const auto iv = MakeVar("iteration", IndexType());
+  const auto point = ConstTup({0, 0}), extent = ConstTup({16, 16});
+  const auto producer_a = EvalCall("buffer.copy", {source, lhs});
+  const auto producer_b = EvalCall("buffer.store", {dst, point, extent, out});
+  const auto consume = EvalCall("buffer.matmul", {lhs, rhs, dst});
+  const auto first_load = EvalCall("buffer.load", {input, point, extent, slot0});
+  const auto later_load = EvalCall("buffer.load", {input, point, extent, slot1});
+  const auto prior_matmul = EvalCall("buffer.matmul", {prior_lhs, rhs, prior_dst});
+  const auto fence = EvalCall("system.fence", {});
+  const auto pair = [&](std::vector<StmtPtr>& cuts, PipeType src, PipeType dst, int id) {
+    for (const auto* op : {"system.set_flag", "system.wait_flag"}) {
+      const auto call = OpRegistry::GetInstance().Create(op, {},
+                                                         {{"src_pipe", static_cast<int>(src)},
+                                                          {"dst_pipe", static_cast<int>(dst)},
+                                                          {"event_id", id},
+                                                          {"core_type", std::string("aic")}},
+                                                         kSpan);
+      cuts.push_back(std::make_shared<EvalStmt>(call, kSpan));
+    }
+  };
+  const auto function = [&](std::vector<StmtPtr> cuts) {
+    return MakeAicFn("relay", {input, out, gate, visits},
+                     {ParamDirection::In, ParamDirection::Out, ParamDirection::In, ParamDirection::In},
+                     std::move(cuts), FunctionType::AIC);
+  };
+  const auto ids = SyncEligibleIds(function({}), "a2a3", {carrier, consumer}, std::nullopt, {});
+  assert(ids.size() > 1);
+  const auto old_id = ids.front(), new_id = ids.back();
+  enum class Case {
+    Equal,
+    LaterCarrierPayload,
+    ConditionalAcquisition,
+    PendingDestination,
+    ReservedDirect,
+    ExhaustedIds,
+    LoopRearmed,
+    LoopHiddenRearm
+  };
+  for (const auto which :
+       {Case::Equal, Case::LaterCarrierPayload, Case::ConditionalAcquisition, Case::PendingDestination,
+        Case::ReservedDirect, Case::ExhaustedIds, Case::LoopRearmed, Case::LoopHiddenRearm}) {
+    const bool in_loop = which == Case::LoopRearmed || which == Case::LoopHiddenRearm;
+    ImportedLocalCuts imported;
+    for (const auto& [statement, pipe] : std::vector<std::pair<StmtPtr, PipeType>>{{first_load, carrier},
+                                                                                   {producer_a, a},
+                                                                                   {producer_b, b},
+                                                                                   {later_load, carrier},
+                                                                                   {prior_matmul, consumer},
+                                                                                   {consume, consumer}}) {
+      const auto call = As<Call>(As<EvalStmt>(statement)->expr_);
+      imported.emplace(call.get(), ImportedLocalCut{statement.get(), pipe, {}});
+    }
+    std::vector<StmtPtr> definitions{AllocBuf(source, 0, mat),       AllocBuf(slot0, 512, mat),
+                                     AllocBuf(slot1, 1024, mat),     AllocBuf(lhs, 0, left),
+                                     AllocBuf(rhs, 0, right),        AllocBuf(dst, 0, acc),
+                                     AllocBuf(prior_lhs, 512, left), AllocBuf(prior_dst, 1024, acc)};
+    if (which == Case::PendingDestination) {
+      // The opaque branch starts a new proof window while this earlier matrix
+      // payload can still be in flight. Its issue and completed prefix differ.
+      definitions.push_back(prior_matmul);
+      definitions.push_back(
+          std::make_shared<IfStmt>(gate, std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, kSpan),
+                                   std::nullopt, std::vector<VarPtr>{}, kSpan));
+    }
+    auto cuts = definitions;
+    cuts.push_back(first_load);
+    // Deliver the carrier's own last payload before the two producers. The
+    // following waits on the idle carrier then collect their independent completions.
+    pair(cuts, carrier, consumer, old_id);
+    cuts.push_back(producer_a);
+    cuts.push_back(producer_b);
+    if (which == Case::PendingDestination) pair(cuts, consumer, carrier, 0);
+    pair(cuts, a, carrier, 0);
+    if (which == Case::ConditionalAcquisition) {
+      std::vector<StmtPtr> arm;
+      pair(arm, b, carrier, 0);
+      cuts.push_back(std::make_shared<IfStmt>(gate, std::make_shared<SeqStmts>(arm, kSpan), std::nullopt,
+                                              std::vector<VarPtr>{}, kSpan));
+    } else {
+      pair(cuts, b, carrier, 0);
+    }
+    if (which == Case::LaterCarrierPayload) cuts.push_back(later_load);
+    const auto finish = [&](std::vector<StmtPtr> sequence) {
+      if (in_loop) {
+        // Every old directional ID has a return path before the next visit.
+        // The fresh relay can use the same physical consumption proof only
+        // when its destination→carrier return is in the unconditional suffix.
+        if (which == Case::LoopHiddenRearm) {
+          std::vector<StmtPtr> guarded;
+          pair(guarded, consumer, carrier, 0);
+          sequence.push_back(std::make_shared<IfStmt>(gate, std::make_shared<SeqStmts>(guarded, kSpan),
+                                                      std::nullopt, std::vector<VarPtr>{}, kSpan));
+          sequence.push_back(EvalCall("system.bar_all", {}));
+        } else {
+          pair(sequence, consumer, carrier, 0);
+        }
+        pair(sequence, carrier, a, 0);
+        pair(sequence, carrier, b, 0);
+        std::vector<StmtPtr> body(sequence.begin() + definitions.size(), sequence.end());
+        sequence = definitions;
+        sequence.push_back(SimpleFor(iv, CI(0), visits, CI(1), std::move(body)));
+      }
+      sequence.push_back(fence);
+      return function(std::move(sequence));
+    };
+    auto direct = cuts;
+    pair(direct, a, consumer, 0);
+    pair(direct, b, consumer, 0);
+    direct.push_back(consume);
+    const auto baseline = finish(std::move(direct));
+    // Keep the old ID available to the resource catalog. Republishing it
+    // would race its preceding WAIT. Only the fresh ID is usable here.
+    SyncNativeReservations reserved;
+    for (const auto id : ids) {
+      if (id != old_id && (which == Case::ExhaustedIds || id != new_id))
+        reserved[{carrier, consumer}].insert(id);
+    }
+    if (which == Case::ReservedDirect) reserved[{a, consumer}].insert(0);
+    const auto selected = SelectLocalCompletionRelays(baseline, imported, "a2a3", reserved);
+    // Replay the tempting one-pair alternative independently. In the late
+    // load case it would change both the matrix issue and the final DDR fence.
+    pair(cuts, carrier, consumer, new_id);
+    cuts.push_back(consume);
+    const auto relay = finish(std::move(cuts));
+    for (const int trips : (in_loop ? std::vector<int>{0, 2} : std::vector<int>{1})) {
+      for (const bool taken : {false, true}) {
+        const auto original_order = RelayPayloadPredecessors(baseline, imported, taken, trips);
+        assert(RelayPayloadPredecessors(selected, imported, taken, trips) == original_order);
+        const auto relay_order = RelayPayloadPredecessors(relay, imported, taken, trips);
+        if (which == Case::LaterCarrierPayload) {
+          assert(relay_order.back() != original_order.back());
+        }
+        const bool same = in_loop || which == Case::Equal || which == Case::ReservedDirect ||
+                          which == Case::ExhaustedIds || (which == Case::ConditionalAcquisition && taken);
+        assert((relay_order == original_order) == same);
+      }
+    }
+    if (which == Case::Equal || which == Case::LoopRearmed) {
+      // The exact expected command stream retains both the operand RAW and the accumulator WAR,
+      // and the already ordered load→matmul, saving one pair.
+      assert(structural_equal(selected->body_, relay->body_));
+    } else {
+      // An independent load or previous matmul may still overlap the consumer.
+      // A skipped acquisition loses the FIX→M WAR. An exhausted bank has no fresh ID.
+      assert(structural_equal(selected->body_, baseline->body_));
+    }
+    if (which == Case::Equal) {
+      // Exercise the actual allocator-to-selector boundary. The logical
+      // services below carry no event IDs or physical resource assignments.
+      auto logical = definitions;
+      const auto service = [&](PipeType src, PipeType dst) {
+        const auto record =
+            OpRegistry::GetInstance().Create("sync.record", {}, {{"pipe", static_cast<int>(src)}}, kSpan);
+        const auto token = MakeVar("prefix_" + std::to_string(logical.size()), record->GetType());
+        logical.push_back(std::make_shared<AssignStmt>(token, record, kSpan));
+        const auto wait = OpRegistry::GetInstance().Create("sync.wait", {token},
+                                                           {{"dst_pipe", static_cast<int>(dst)}}, kSpan);
+        logical.push_back(std::make_shared<EvalStmt>(wait, kSpan));
+      };
+      logical.push_back(first_load);
+      service(carrier, consumer);
+      logical.insert(logical.end(), {producer_a, producer_b});
+      service(a, carrier);
+      service(b, carrier);
+      service(a, consumer);
+      service(b, consumer);
+      logical.insert(logical.end(), {consume, fence});
+      auto payloads = definitions;
+      payloads.insert(payloads.end(), {first_load, producer_a, producer_b, consume, fence});
+      ImportedLocalSync evidence{function(std::move(payloads)), imported};
+      for (const auto& definition : definitions) {
+        const auto call = As<Call>(As<AssignStmt>(definition)->value_);
+        evidence.calls.emplace(call.get(), ImportedLocalCut{definition.get(), std::nullopt, {}});
+      }
+      evidence.calls.emplace(As<Call>(As<EvalStmt>(fence)->expr_).get(),
+                             ImportedLocalCut{fence.get(), std::nullopt, {}});
+      const auto allocated = TryLowerClosedPrefixSync(function(std::move(logical)), "a2a3", std::nullopt, {},
+                                                      {}, std::nullopt, &evidence);
+      assert(allocated);
+      const auto optimized = SelectLocalCompletionRelays(allocated->function, evidence.calls, "a2a3", {});
+      size_t before = 0, after = 0;
+      const auto allocated_profile =
+          RelayPayloadPredecessors(allocated->function, evidence.calls, true, 1, &before);
+      assert(RelayPayloadPredecessors(optimized, evidence.calls, true, 1, &after) == allocated_profile);
+      assert(before == 5 && after == 4);
+    }
+  }
+  // A redundant completion can still make a pending DMA *issue* visible
+  // to the DDR fence. Removing the second WAIT changes precisely that fact.
+  ImportedLocalCuts imported;
+  imported.emplace(As<Call>(As<EvalStmt>(first_load)->expr_).get(),
+                   ImportedLocalCut{first_load.get(), carrier, {}});
+  std::vector<StmtPtr> cut{AllocBuf(slot0, 512, mat)};
+  pair(cut, a, carrier, 0);
+  cut.push_back(first_load);
+  auto stripped = cut;
+  stripped.push_back(fence);
+  pair(cut, a, carrier, 1);
+  cut.push_back(fence);
+  const auto baseline = function(std::move(cut));
+  const auto selected = SelectLocalCompletionRelays(baseline, imported, "a2a3", {});
+  const auto full = RelayPayloadPredecessors(baseline, imported, true, 1);
+  const auto dropped = RelayPayloadPredecessors(function(std::move(stripped)), imported, true, 1);
+  assert(full.back().first == 0 && dropped.back().first == 0);
+  assert(full.back().second == 1 && dropped.back().second == 0);
+  assert(RelayPayloadPredecessors(selected, imported, true, 1) == full);
 }
 
 // ============================================================================
@@ -1434,6 +1741,7 @@ void TestRound2AuditAndCleanupFixes() {
 
 int main() {
   pypto::backend::BackendConfig::SetBackendType(pypto::backend::BackendType::Ascend910);
+  pypto::ir::sync::TestPhysicalCompletionRelay();
   pypto::ir::sync::TestPeerTransferBufferGeometry();
   pypto::ir::sync::TestB1SyncControlRangeProver();
   pypto::ir::sync::TestB1RangeUseCuts();

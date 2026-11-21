@@ -498,6 +498,47 @@ return out""",
         assert endpoint is not None
         assert endpoint.attrs.get(PYPTO_AUTOSYNC_ATTR), endpoint.attrs
 
+    # The second region reuses one Vec tile and one GM window. Its load,
+    # vector add and store form a chain, so the next load needs only the store.
+    vector = result.get_function("vector")
+    assert vector is not None and isinstance(vector.body, ir.SeqStmts)
+    branch = vector.body.stmts[-1]
+    assert isinstance(branch, ir.IfStmt) and isinstance(branch.then_body, ir.SeqStmts)
+    loop = [stmt for stmt in branch.then_body.stmts if isinstance(stmt, ir.ForStmt)][-1]
+    assert isinstance(loop.body, ir.SeqStmts)
+    calls: list[ir.Call] = []
+    for stmt in loop.body.stmts:
+        if isinstance(stmt, (ir.AssignStmt, ir.EvalStmt)):
+            call = stmt.value if isinstance(stmt, ir.AssignStmt) else stmt.expr
+            assert isinstance(call, ir.Call)
+            calls.append(call)
+    payload_pipes = {
+        opname("tile.load"): ir.PipeType.MTE2,
+        opname("tile.add"): ir.PipeType.V,
+        opname("tile.store"): ir.PipeType.MTE3,
+    }
+    store = next(i for i, call in enumerate(calls) if call.op.name == opname("tile.store"))
+    boundary = calls[store + 1 :]
+    assert [call.op.name for call in boundary] == [opname("system.set_flag"), opname("system.wait_flag")]
+    assert all(
+        (call.kwargs["src_pipe"], call.kwargs["dst_pipe"]) == (ir.PipeType.MTE3.value, ir.PipeType.MTE2.value)
+        for call in boundary
+    )
+
+    for keep_boundary in (True, False):
+        state = MatSlotCommands(vector, 2)
+        for _ in range(3):
+            for call in calls if keep_boundary else calls[: store + 1]:
+                if call.op.name in payload_pipes:
+                    state.issue_payload(call, payload_pipes[call.op.name])
+                else:
+                    state.physical(call)
+        order = closure(state.vertices, state.edges)
+        assert len(state.calls) == 9 and state.reuses and not state.live
+        for previous in (2, 5):
+            assert ((("done", previous), ("issue", previous + 1)) in order) == keep_boundary
+        assert all(edge in order for edge in state.reuses) == keep_boundary
+
 
 def _check_peer_region_fallback(source, reason):
     with passes.PassContext(

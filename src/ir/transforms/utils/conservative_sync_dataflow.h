@@ -95,6 +95,9 @@ struct ImportedLocalCut {
   std::optional<PipeType> pipe;
   std::vector<ImportedLocalEffect> effects;
   bool has_native_claims = false;
+  // The reported pipe describes only the data effect of a transport call.
+  // Its native ready/credit, cursor and queue operations are opaque here.
+  bool is_transport = false;
 };
 using ImportedLocalCuts = std::unordered_map<const Call*, ImportedLocalCut>;
 struct ImportedLocalSync {

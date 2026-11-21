@@ -848,7 +848,11 @@ class LaneImporter {
     }
     footprint_->RequireVecCopyPlacement(operation);
     footprint_->RequireWorkspaceSeparation(operation);
-    for (const auto& claim : implementation.Claims()) {
+    const auto claims = implementation.Claims();
+    if (structured_) {
+      structured_->calls.at(call.get()).has_native_claims = !claims.empty();
+    }
+    for (const auto& claim : claims) {
       auto& reserved = result_.reservations[{claim.pool.src, claim.pool.dst}];
       for (const auto id : claim.ids) {
         reserved.insert(static_cast<int>(id));
@@ -1368,6 +1372,7 @@ class LaneImporter {
     const auto peer = sites_.find(statement.get());
     if (peer != sites_.end()) {
       if (structured_) {
+        structured_->calls.at(call.get()).is_transport = true;
         for (const auto& argument : call->args_) {
           CheckSyncScalarReadiness(argument,
                                    [this](const VarPtr& var) { return ready_.count(var.get()) != 0; });

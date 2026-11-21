@@ -432,10 +432,18 @@ The planner analyzes the prefix, one work item, and the suffix separately.
 If each item advances a FIFO by `p` slots in a ring of depth `d`, successive
 entry slots differ by multiples of `gcd(d, p)`. The planner compares physical
 reads and writes across those possible rotations, including the direct path
-from prefix to suffix when the core receives no work. At each boundary it
-orders conflicting pipes and closes any events that the next item can reuse.
-It reserves the boundary events alongside native and within-item claims.
-The resulting plan applies to every qualified launch stride.
+from prefix to suffix when the core receives no work. After assigning events
+inside the item, the planner can shorten the boundary handoff when the
+existing commands already carry the required completions. For example, in
+a load → vector update → store loop, making the next load wait for the store
+can also carry the previous vector update. Each replacement must order
+conflicting accesses and the consumption of each event before its next
+publication, including events used by the handoff itself. If the planner
+cannot prove a shorter handoff, it keeps the conservative one. Boundary
+events are reserved alongside native and within-item claims. The proof
+bounds expansion of the finite body, counting payloads, accesses, and
+assigned command endpoints against an 8,192-step budget per region. Its cost
+is independent of the number of runtime work items.
 
 A Buffer endpoint can also use nested scalar conditionals in sequential
 loops. The importer requires each receive borrow to close within a

@@ -29,10 +29,15 @@ PhysicalSyncRealization RealizeDirectSync(const CompactSyncInput& input, std::ve
                                           const SyncSchedulePolicy& policy,
                                           const SyncNativeReservations& extra_reservations) {
   auto result = AllocateDirectSync(input, std::move(families), order, target, restricted, extra_reservations);
+  EmitAssignedSync(input, result, policy);
+  return result;
+}
+
+void EmitAssignedSync(const CompactSyncInput& input, PhysicalSyncRealization& result,
+                      const SyncSchedulePolicy& policy) {
   result.function = physical::CompileAssignedSyncSchedule(
       input.owner, {{&input, result.assignment, &result}},
       input.block_bounds.value_or(std::make_pair(static_cast<int64_t>(0), static_cast<int64_t>(0))), policy);
-  return result;
 }
 FunctionPtr EmitAssignedSyncCases(const FunctionPtr& owner, const SyncParameterBounds& parameters,
                                   std::pair<int64_t, int64_t> blocks,

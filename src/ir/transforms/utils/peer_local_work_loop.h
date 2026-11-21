@@ -13,6 +13,7 @@
 #define SRC_IR_TRANSFORMS_UTILS_PEER_LOCAL_WORK_LOOP_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <set>
 #include <utility>
@@ -22,19 +23,32 @@
 
 namespace pypto::ir::sync {
 
-// Conflict pairs are unordered. A seam closes both directions together;
-// a self pair needs current-prefix completion on that pipe only.
+// Conservative conflicts are unordered; realized boundary commands are directed
+// and kept in execution order. A self direction denotes a local barrier.
 using PeerWorkPairs = std::set<SyncDirection>;
 using PeerWorkRange = std::pair<size_t, size_t>;
 using PeerWorkSeamIds = std::map<SyncDirection, int>;
 
+struct PeerWorkAccess {
+  int64_t modulus, begin, end;
+};
+
+// Work-loop effects are byte intervals within a storage slot. Comparing
+// residues modulo this orbit also covers earlier items more than one trip away.
+PeerWorkAccess ProjectPeerWorkAccess(const CompactSyncInput& input, const PeerLocalWorkLoop& loop,
+                                     const SyncAccess& access);
+
 struct PeerWorkPlacement {
   const PeerLocalWorkLoop* loop;
-  PeerWorkPairs entry, exit;
+  std::vector<SyncDirection> entry, exit;
 };
 
 void AddPeerWorkConflicts(const CompactSyncInput& input, const PeerLocalWorkLoop& loop, PeerWorkRange earlier,
                           PeerWorkRange later, PeerWorkPairs& pairs);
+std::vector<SyncDirection> ClosePeerWorkPairs(const PeerWorkPairs& pairs);
+void SelectPeerWorkSeams(const CompactSyncInput& input, const PeerLocalRegion& region,
+                         const std::vector<const PhysicalSyncFamily*>& families, const PeerWorkSeamIds& ids,
+                         bool scalar_serial, PeerWorkPlacement& placement);
 FunctionPtr AddPeerWorkSeams(const FunctionPtr& function, const std::vector<PeerWorkPlacement>& placements,
                              const PeerWorkSeamIds& ids);
 

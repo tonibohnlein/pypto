@@ -130,6 +130,19 @@ the crossed commands for event reuse and rechecks the fixed services with
 the displaced payload effects excluded from the earlier prefix. If these
 checks or Buffer validity fail, the endpoint uses its original allocation.
 
+At a single cut in a structured endpoint, several generated SET/WAIT pairs
+can deliver completion to the same local pipe. For example, a third pipe
+that has already waited for two producers can deliver both completions in
+one pair. The planner compares the original batch with a smaller subset
+of its pairs and with a single relay. It accepts a saving only if every
+queue sees the same payload completions at subsequent issues and at fences
+that observe completed commands. It also checks that earlier event
+consumptions remain ordered before reuse. A new relay needs an available
+directional ID. Inside a loop, retained commands must carry its consumption
+back to the publishing pipe before the next visit. These checks use the
+original control flow and introduce no guards. If the relay would also
+deliver unrelated work, the original batch remains eligible.
+
 A loop head can reuse storage first touched in the prologue. The first
 overwrite may need a pre-loop reader to finish, while later overwrites need
 the previous iteration’s reader to finish. The planner separates the first

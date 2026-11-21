@@ -28,6 +28,7 @@
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "src/ir/transforms/utils/closed_prefix_sync.h"
 #include "src/ir/transforms/utils/conservative_sync_dataflow.h"
+#include "src/ir/transforms/utils/local_completion_relay.h"
 #include "src/ir/transforms/utils/peer_local_effects.h"
 #include "src/ir/transforms/utils/peer_local_work_loop.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
@@ -163,7 +164,8 @@ FunctionPtr PlanLane(const PeerLocalLane& lane, const backend::LocalSyncExecutio
     add_phase({work.first, work.end}, i);
     add_phase({work.end, region.end}, i);
     AnalyzePeerWorkSeams(input, region, phases[first], phases[first + 1], phases[first + 2]);
-    placements.push_back({&work, phases[first].seam, phases[first + 1].seam});
+    placements.push_back(
+        {&work, ClosePeerWorkPairs(phases[first].seam), ClosePeerWorkPairs(phases[first + 1].seam)});
   }
   DirectSyncOrder order;
   order.precedes = [&](const Occurrence& a, const Occurrence& b) {
@@ -205,12 +207,26 @@ FunctionPtr PlanLane(const PeerLocalLane& lane, const backend::LocalSyncExecutio
     policy.mode = "guarded";
     policy.boundary_motion = false;
   }
-  auto realized = RealizeDirectSync(input, std::move(families), order, input.hardware_target, std::nullopt,
-                                    policy, seam_reservations);
+  auto realized = AllocateDirectSync(input, std::move(families), order, input.hardware_target, std::nullopt,
+                                     seam_reservations);
   if (!placements.empty()) {
-    return AddPeerWorkSeams(realized.function, placements, ids);
+    std::vector<std::vector<const PhysicalSyncFamily*>> by_region(lane.regions.size());
+    for (const auto& family : realized.assignment->Families()) {
+      const auto region = phases[phase_by_segment[family.source_region]].region;
+      INTERNAL_CHECK(region == phases[phase_by_segment[family.target_region]].region)
+          << "A finite work-item event cannot cross a MIX region";
+      by_region[region].push_back(&family);
+    }
+    size_t placement = 0;
+    for (size_t region = 0; region < lane.regions.size(); ++region) {
+      if (lane.regions[region].work_loop) {
+        SelectPeerWorkSeams(input, lane.regions[region], by_region[region], ids,
+                            execution.scalar_prefix_serialized, placements[placement++]);
+      }
+    }
   }
-  return realized.function;
+  EmitAssignedSync(input, realized, policy);
+  return placements.empty() ? realized.function : AddPeerWorkSeams(realized.function, placements, ids);
 }
 
 // The importer has ruled out earlier exits. Visit each path separately so
@@ -310,11 +326,13 @@ FunctionPtr PlanStructuredEndpoint(const PeerLocalEffects& effects) {
     // The unmodified plan remains available for a supported original endpoint.
   }
   if (precise) {
-    return MoveEarlierPeerPrefixes(precise->first, precise->second, imported, target, effects.parameters);
+    const auto moved =
+        MoveEarlierPeerPrefixes(precise->first, precise->second, imported, target, effects.parameters);
+    return SelectLocalCompletionRelays(moved, imported.calls, target, reserved);
   }
   const auto physical = realize(false);
   CHECK(physical) << "No closed-prefix schedule for the imported peer endpoint";
-  return physical->first;
+  return SelectLocalCompletionRelays(physical->first, imported.calls, target, reserved);
 }
 
 }  // namespace

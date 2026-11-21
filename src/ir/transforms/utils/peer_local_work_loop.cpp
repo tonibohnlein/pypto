@@ -48,7 +48,6 @@ struct Effect {
 // uses the whole orbit so crossing analysis never enumerates loop trips.
 void CollectEffects(const CompactSyncInput& input, const PeerLocalWorkLoop& loop, PeerWorkRange range,
                     bool following, std::vector<Effect>& effects) {
-  const auto& advance = loop.ring_advance;
   for (size_t r = range.first; r < range.second; ++r) {
     const auto& segment = input.segments[r];
     if (!segment.count) {
@@ -56,16 +55,10 @@ void CollectEffects(const CompactSyncInput& input, const PeerLocalWorkLoop& loop
     }
     for (const auto& site : segment.sites) {
       for (const auto& access : site.accesses) {
-        INTERNAL_CHECK(access.row == 0 && access.rows == 1 && !access.row_step && !access.column_step &&
-                       access.column >= 0 && access.columns > 0);
-        const auto& storage = input.storage[access.storage];
-        INTERNAL_CHECK(access.column <= storage.columns && access.columns <= storage.columns - access.column);
-        const auto pop = advance.find(access.storage);
-        const auto modulus = std::gcd(storage.slot_count, pop == advance.end() ? 0 : pop->second);
+        const auto [modulus, begin, end] = ProjectPeerWorkAccess(input, loop, access);
         const auto slot =
             segment.count > 1 && access.slot_step % modulus ? kMovingSlot : access.slot_first % modulus;
-        effects.push_back({access.storage, slot, access.column, access.column + access.columns, site.pipe,
-                           access.write, following});
+        effects.push_back({access.storage, slot, begin, end, site.pipe, access.write, following});
       }
     }
   }
@@ -102,31 +95,15 @@ StmtPtr MakeFlag(const char* op, SyncDirection pipes, int id, const std::string&
   return std::make_shared<EvalStmt>(call, span);
 }
 
-// A seam transaction on A and B covers both directions. A sets, B consumes
-// and acknowledges, then A consumes the acknowledgement. The next A set is
-// queued after that acknowledgement wait, and the next B acknowledgement
-// follows the next A set. This closes each ID even when the loop repeats and
-// a queue can run ahead. Each unordered pair keeps one orientation and
-// dedicated IDs, so other pairs and interior schedules cannot rearm them.
-void AppendSeam(std::vector<StmtPtr>& stmts, const PeerWorkPairs& pairs, const PeerWorkSeamIds& ids,
-                FunctionType type, const Span& span) {
+void AppendSeam(std::vector<StmtPtr>& stmts, const std::vector<SyncDirection>& commands,
+                const PeerWorkSeamIds& ids, FunctionType type, const Span& span) {
   const std::string core = type == FunctionType::AIV ? "aiv" : "aic";
-  std::set<PipeType> already_completed;
-  for (const auto& [source, target] : pairs) {
-    if (source == target) {
-      continue;
-    }
-    const SyncDirection forward{source, target}, reverse{target, source};
-    stmts.push_back(MakeFlag("system.set_flag", forward, ids.at(forward), core, span));
-    stmts.push_back(MakeFlag("system.wait_flag", forward, ids.at(forward), core, span));
-    stmts.push_back(MakeFlag("system.set_flag", reverse, ids.at(reverse), core, span));
-    stmts.push_back(MakeFlag("system.wait_flag", reverse, ids.at(reverse), core, span));
-    // Only A consumes an acknowledgement of its own prefix. The first wait
-    // on B gates its future payloads on A's prefix, not its own.
-    already_completed.insert(source);
-  }
-  for (const auto& [source, target] : pairs) {
-    if (source == target && !already_completed.count(source)) {
+  for (const auto& direction : commands) {
+    const auto [source, target] = direction;
+    if (source != target) {
+      stmts.push_back(MakeFlag("system.set_flag", direction, ids.at(direction), core, span));
+      stmts.push_back(MakeFlag("system.wait_flag", direction, ids.at(direction), core, span));
+    } else {
       const auto op = RequireLocalSyncBarrier(source, type);
       INTERNAL_CHECK(op) << "Peer work-item seam must not request an explicit scalar barrier";
       const auto call = OpRegistry::GetInstance().Create(op, {}, {{"core_type", core}}, span);
@@ -157,7 +134,8 @@ class WorkLoopSeams : public SyncStatementMutator {
   const PeerWorkSeamIds& ids_;
   const FunctionType type_;
 
-  StmtPtr CompleteItem(const StmtPtr& original, const PeerWorkPairs& exit, const Span& span) const {
+  StmtPtr CompleteItem(const StmtPtr& original, const std::vector<SyncDirection>& exit,
+                       const Span& span) const {
     auto flattened = original;
     if (const auto seq = As<SeqStmts>(original)) {
       // A terminal yield can sit under arbitrarily nested transparent
@@ -199,6 +177,18 @@ class WorkLoopSeams : public SyncStatementMutator {
 
 }  // namespace
 
+PeerWorkAccess ProjectPeerWorkAccess(const CompactSyncInput& input, const PeerLocalWorkLoop& loop,
+                                     const SyncAccess& access) {
+  INTERNAL_CHECK(access.row == 0 && access.rows == 1 && !access.row_step && !access.column_step &&
+                 access.column >= 0 && access.columns > 0 && access.storage < input.storage.size());
+  const auto& storage = input.storage[access.storage];
+  INTERNAL_CHECK(access.column <= storage.columns && access.columns <= storage.columns - access.column);
+  const auto pop = loop.ring_advance.find(access.storage);
+  const auto modulus = std::gcd(storage.slot_count, pop == loop.ring_advance.end() ? 0 : pop->second);
+  INTERNAL_CHECK(modulus > 0 && access.slot_first >= 0 && access.slot_step >= 0);
+  return {modulus, access.column, access.column + access.columns};
+}
+
 void AddPeerWorkConflicts(const CompactSyncInput& input, const PeerLocalWorkLoop& loop, PeerWorkRange earlier,
                           PeerWorkRange later, PeerWorkPairs& pairs) {
   std::vector<Effect> effects;
@@ -221,6 +211,26 @@ void AddPeerWorkConflicts(const CompactSyncInput& input, const PeerLocalWorkLoop
     Remember(seen[exact], effect);
     Remember(seen[all], effect);
   }
+}
+
+std::vector<SyncDirection> ClosePeerWorkPairs(const PeerWorkPairs& pairs) {
+  std::vector<SyncDirection> commands;
+  std::set<PipeType> completed;
+  // A sets, B consumes and acknowledges, then A consumes the reply. Both
+  // flags can then be republished after another visit to this boundary.
+  for (const auto& [source, target] : pairs) {
+    if (source != target) {
+      commands.emplace_back(source, target);
+      commands.emplace_back(target, source);
+      completed.insert(source);
+    }
+  }
+  for (const auto& [source, target] : pairs) {
+    if (source == target && !completed.count(source)) {
+      commands.emplace_back(source, target);
+    }
+  }
+  return commands;
 }
 
 FunctionPtr AddPeerWorkSeams(const FunctionPtr& function, const std::vector<PeerWorkPlacement>& placements,
