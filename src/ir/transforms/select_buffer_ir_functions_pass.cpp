@@ -1311,7 +1311,8 @@ bool SupportsDelegatedPeerTransport(const FunctionPtr& function) {
 }
 
 FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper,
-                                 const sync::SyncParameterBounds* invocation_bounds) {
+                                 const sync::SyncParameterBounds& invocation_bounds,
+                                 bool& needs_caller_bounds) {
   if (!IsInCoreType(original->func_type_) || original->ir_stage_ == FunctionIRStage::Buffer ||
       original->HasAttr(kAttrBufferIrSelected)) {
     return original;
@@ -1331,19 +1332,18 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper
     if (context && context->GetEnableScalarGMDMA() && function->func_type_ == FunctionType::AIV)
       function = StageBufferScalarAccesses(function);
   }
-  const BufferAccTrimAnalysis acc_trims(function,
-                                        !context || context->GetMemoryPlanner() != MemoryPlanner::PtoAS);
+  const BufferAccTrimAnalysis acc_trims(
+      function, !context || context->GetMemoryPlanner() != MemoryPlanner::PtoAS, invocation_bounds);
+  needs_caller_bounds = acc_trims.NeedsCallerBounds();
   std::vector<int> positive_formals;
-  if (invocation_bounds) {
-    for (const auto& [index, range] : *invocation_bounds) {
-      if (index >= function->params_.size() || index > static_cast<size_t>(std::numeric_limits<int>::max()) ||
-          range.first <= 0) {
-        continue;
-      }
-      const auto scalar = As<ScalarType>(function->params_[index]->GetType());
-      if (scalar && (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt())) {
-        positive_formals.push_back(static_cast<int>(index));
-      }
+  for (const auto& [index, range] : invocation_bounds) {
+    if (index >= function->params_.size() || index > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        range.first <= 0) {
+      continue;
+    }
+    const auto scalar = As<ScalarType>(function->params_[index]->GetType());
+    if (scalar && (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt())) {
+      positive_formals.push_back(static_cast<int>(index));
     }
   }
   BufferKernelSupport support(function, acc_trims, positive_formals);
@@ -1547,17 +1547,20 @@ ProgramPtr SelectBufferFunctions(const ProgramPtr& program) {
   std::optional<sync::SyncInvocationEvidence> invocation;
   for (const auto& [global, function] : program->functions_) {
     const bool device_helper = helpers.count(function->name_) != 0;
-    auto candidate = SelectBufferFunction(function, device_helper, nullptr);
-    if (candidate->GetAttr<std::string>(kAttrBufferAdmissionProperty, "") ==
-        BufferAdmissionPropertyName(BufferAdmissionProperty::LoopStep)) {
-      // A plain local proof covers ordinary loops. Compute all caller bounds
-      // once only when a real admission reaches a step it cannot prove.
+    bool needs_caller_bounds = false;
+    auto candidate = SelectBufferFunction(function, device_helper, {}, needs_caller_bounds);
+    const auto refusal = candidate->GetAttr<std::string>(kAttrBufferAdmissionProperty, "");
+    if (refusal == BufferAdmissionPropertyName(BufferAdmissionProperty::LoopStep) ||
+        (needs_caller_bounds &&
+         refusal == BufferAdmissionPropertyName(BufferAdmissionProperty::TypeLayout))) {
+      // Most kernels are locally provable. Collect caller bounds once if
+      // selection reaches an unproved loop step or Acc row extent.
       if (!invocation) {
         invocation.emplace(sync::CollectSyncInvocationEvidence(program));
       }
       const auto bounds = invocation->parameters.find(function->name_);
       if (bounds != invocation->parameters.end()) {
-        candidate = SelectBufferFunction(function, device_helper, &bounds->second);
+        candidate = SelectBufferFunction(function, device_helper, bounds->second, needs_caller_bounds);
       }
     }
     selected.emplace(function->name_, std::move(candidate));

@@ -67,6 +67,7 @@
 #include "pypto/ir/transforms/utils/buffer_tuple_results.h"
 #include "pypto/ir/transforms/utils/buffer_valid_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_view_analysis.h"
+#include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/normalize_stmt_structure.h"
@@ -770,11 +771,13 @@ class TileToBufferMutator : public IRMutator {
  public:
   TileToBufferMutator(const StorageIndex& storage, bool guarded_valid,
                       const LocalAccumulatorIndex* local_accumulators, const StmtPtr& body, FunctionType core,
-                      const cross_core_pipe::PeerTransportEffects& transport)
+                      const cross_core_pipe::PeerTransportEffects& transport,
+                      const BufferAccTrimAnalysis& local_acc_trims)
       : storage_(storage),
         guarded_valid_(guarded_valid),
         core_(core),
         transport_(transport),
+        local_acc_trims_(local_acc_trims),
         local_accumulators_(local_accumulators),
         indexed_(body),
         tuples_(body) {
@@ -1182,6 +1185,14 @@ class TileToBufferMutator : public IRMutator {
         condition = condition ? MakeAnd(condition, positive, call->span_) : positive;
       }
     }
+    const auto caller_trim = store ? CallerQualifiedAccTrim(call->args_[0]) : nullptr;
+    if (caller_trim) {
+      const auto& rows = valid->elements_.front();
+      auto capacity =
+          std::make_shared<ConstInt>(caller_trim->shape_.front(), GetScalarDtype(rows), call->span_);
+      auto in_capacity = MakeLe(rows, capacity, call->span_);
+      condition = condition ? MakeAnd(condition, in_capacity, call->span_) : in_capacity;
+    }
     if (store && result) tensor_aliases_[result.get()] = VisitExpr(call->args_[2]);
     StmtPtr body = Empty(call->span_);
     if (!empty) {
@@ -1192,6 +1203,14 @@ class TileToBufferMutator : public IRMutator {
         use_definitions_.push_back(body);
         body = std::make_shared<SeqStmts>(use_definitions_, call->span_);
       }
+      if (caller_trim) {
+        // This bound is already true at all qualified calls. Keep the
+        // standalone Buffer body verifiable after it leaves the call graph,
+        // and restore the dynamic descriptor only on the admitted store path.
+        states.push_back(std::move(body));
+        body = SeqStmts::Flatten(states, call->span_);
+        states.clear();
+      }
       if (condition) {
         body = std::make_shared<IfStmt>(condition, body, std::nullopt, std::vector<VarPtr>{}, call->span_);
       }
@@ -1200,6 +1219,15 @@ class TileToBufferMutator : public IRMutator {
     // Establish output state even on an empty path, without touching its bytes.
     states.push_back(WithValidState(call, result, body));
     return std::make_shared<SeqStmts>(states, call->span_);
+  }
+
+  BufferTypePtr CallerQualifiedAccTrim(const ExprPtr& tile) {
+    const auto type = As<TileType>(tile->GetType());
+    if (core_ != FunctionType::AIC || !type || type->GetMemorySpace() != MemorySpace::Acc ||
+        !NeedsRuntimeBufferValid(type) || local_acc_trims_.Qualifies(type))
+      return nullptr;
+    const auto descriptor = As<BufferType>(Handle(tile)->GetType());
+    return backend::IsBufferAccRowTrimDescriptor(descriptor) ? descriptor : nullptr;
   }
 
   // A definition of a dynamic handle first states the valid extents it
@@ -1563,6 +1591,9 @@ class TileToBufferMutator : public IRMutator {
       // indexed static alias; a runtime result updates the shared handle.
       INTERNAL_CHECK_SPAN(result && call->args_.size() == 3, call->span_)
           << "Internal error: tile.set_validshape requires a tile, two extents and a result";
+      // The qualified alias has no metadata consumers beyond default stores,
+      // where lowering restores it under a locally checkable capacity guard.
+      if (CallerQualifiedAccTrim(result)) return Empty(call->span_);
       const auto handle = Handle(result);
       if (!HasDynamicValid(As<BufferType>(handle->GetType()))) return Empty(call->span_);
       CHECK_SPAN(!window_handles_.count(As<TileType>(result->GetType()).get()), call->span_)
@@ -1871,6 +1902,7 @@ class TileToBufferMutator : public IRMutator {
   bool guarded_valid_;
   FunctionType core_;
   const cross_core_pipe::PeerTransportEffects& transport_;
+  const BufferAccTrimAnalysis& local_acc_trims_;
   std::unordered_map<const Var*, VarPtr> peer_reserves_;
   std::unordered_map<const Var*, VarPtr> peer_borrows_;
   std::unordered_map<const TileType*, CallPtr> window_recipes_;
@@ -1907,6 +1939,7 @@ ProgramPtr TransformProgram(const ProgramPtr& program) {
   }
   std::vector<FunctionPtr> functions;
   functions.reserve(program->functions_.size());
+  std::optional<sync::SyncInvocationEvidence> invocation;
   for (const auto& [global, function] : program->functions_) {
     if (!IsInCoreType(function->func_type_) || function->ir_stage_ == FunctionIRStage::Buffer ||
         !IsBufferIRSelected(function)) {
@@ -1918,7 +1951,16 @@ ProgramPtr TransformProgram(const ProgramPtr& program) {
           << "LowerTileToBuffer: device Tile parameters require the Buffer helper ABI recipe";
     }
     const bool addressed = GetFunctionMemoryPlanner(function) != MemoryPlanner::PtoAS;
-    const BufferAccTrimAnalysis acc_trims(function, addressed);
+    const BufferAccTrimAnalysis local_acc_trims(function, addressed);
+    std::optional<BufferAccTrimAnalysis> caller_acc_trims;
+    if (local_acc_trims.NeedsCallerBounds()) {
+      if (!invocation) invocation.emplace(sync::CollectSyncInvocationEvidence(program));
+      if (const auto bounds = invocation->parameters.find(function->name_);
+          bounds != invocation->parameters.end()) {
+        caller_acc_trims.emplace(function, addressed, bounds->second);
+      }
+    }
+    const auto& acc_trims = caller_acc_trims ? *caller_acc_trims : local_acc_trims;
     StorageIndex storage(addressed, acc_trims);
     storage.VisitStmt(function->body_);
     storage.Finalize();
@@ -1930,7 +1972,7 @@ ProgramPtr TransformProgram(const ProgramPtr& program) {
     const auto transport = cross_core_pipe::AnalyzePeerTransportEffects(function);
     TileToBufferMutator mutator(storage, function->GetAttr<bool>(kAttrBufferIrSelected, false),
                                 local_accumulators ? &*local_accumulators : nullptr, function->body_,
-                                function->func_type_, transport);
+                                function->func_type_, transport, local_acc_trims);
     auto lowered = std::make_shared<Function>(*function);
     lowered->body_ = mutator.VisitStmt(function->body_);
     lowered->ir_stage_ = FunctionIRStage::Buffer;

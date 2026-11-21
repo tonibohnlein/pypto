@@ -12,9 +12,11 @@
 #define PYPTO_IR_TRANSFORMS_UTILS_BUFFER_ACC_TRIM_ANALYSIS_H_
 
 #include <functional>
+#include <map>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "pypto/ir/arith/analyzer.h"
@@ -62,13 +64,16 @@ bool IsBufferAccTrimTargetQualified();
 // proves payload completion, or supplies exact dynamic GM boundary selectors.
 class BufferAccTrimAnalysis {
  public:
-  BufferAccTrimAnalysis(const FunctionPtr& function, bool addressed);
+  BufferAccTrimAnalysis(const FunctionPtr& function, bool addressed,
+                        const std::map<size_t, std::pair<int64_t, int64_t>>& parameter_bounds = {});
   bool Qualifies(const TypePtr& type) const { return types_.count(type.get()) != 0; }
   bool Qualifies(const CallPtr& call) const { return setters_.count(call.get()) != 0; }
+  bool NeedsCallerBounds() const { return needs_caller_bounds_; }
 
  private:
   std::unordered_set<const Type*> types_;
   std::unordered_set<const Call*> setters_;
+  bool needs_caller_bounds_ = false;
 };
 }  // namespace pypto::ir
 #endif  // PYPTO_IR_TRANSFORMS_UTILS_BUFFER_ACC_TRIM_ANALYSIS_H_

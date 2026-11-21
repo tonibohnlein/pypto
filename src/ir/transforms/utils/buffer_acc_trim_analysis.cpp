@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <any>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -122,13 +123,24 @@ bool SameStorage(const TileTypePtr& source, const TileTypePtr& result) {
 // arithmetic must have a representable range even under dominating comparisons.
 class CandidateIndex : public IRVisitor {
  public:
-  explicit CandidateIndex(const FunctionPtr& function) : analyzer_(std::make_shared<arith::Analyzer>()) {
+  CandidateIndex(const FunctionPtr& function,
+                 const std::map<size_t, std::pair<int64_t, int64_t>>& parameter_bounds)
+      : analyzer_(std::make_shared<arith::Analyzer>()) {
     BindBufferAccTrimParameters(function, *analyzer_, ready_);
+    for (const auto& [index, range] : parameter_bounds) {
+      if (index >= function->params_.size()) continue;
+      const auto& parameter = function->params_[index];
+      if (!Integer(parameter)) continue;
+      const auto [min, max] = SignedLimits(parameter);
+      if (range.first >= min && range.second <= max && range.first <= range.second)
+        analyzer_->const_int_bound.Update(parameter, {range.first, range.second});
+    }
     VisitStmt(function->body_);
   }
   std::unordered_set<const Type*> types;
   std::unordered_set<const Call*> setters;
   std::unordered_set<const Expr*> values;
+  bool needs_caller_bounds = false;
   void VisitExpr(const ExprPtr&) override {}
 
  protected:
@@ -160,11 +172,14 @@ class CandidateIndex : public IRVisitor {
     if (!rows || !cols || !backend::SupportsBufferAccRowTrimCapacity(rows->value_, cols->value_) ||
         !Constant(call->args_[2], cols->value_))
       return;
-    const auto range = Bounds(call->args_[1]);
-    if (!range || range->min_value < 0 || range->max_value > rows->value_) return;
     const auto valid = b.valid_shape.empty() ? result->shape_ : b.valid_shape;
     if (valid.size() != 2 || !structural_equal(valid[0], call->args_[1]) || !Constant(valid[1], cols->value_))
       return;
+    const auto range = Bounds(call->args_[1]);
+    if (!range || range->min_value < 0 || range->max_value > rows->value_) {
+      needs_caller_bounds = true;
+      return;
+    }
     types.insert(result.get());
     types.insert(call->GetType().get());
     setters.insert(call.get());
@@ -513,7 +528,9 @@ bool IsBufferAccTrimTargetQualified() {
   return handler && handler->GetPtoTargetArch() == "a2a3";
 }
 
-BufferAccTrimAnalysis::BufferAccTrimAnalysis(const FunctionPtr& function, bool addressed) {
+BufferAccTrimAnalysis::BufferAccTrimAnalysis(
+    const FunctionPtr& function, bool addressed,
+    const std::map<size_t, std::pair<int64_t, int64_t>>& parameter_bounds) {
   if (!function || !addressed || function->func_type_ != FunctionType::AIC ||
       !IsBufferAccTrimTargetQualified())
     return;
@@ -528,7 +545,8 @@ BufferAccTrimAnalysis::BufferAccTrimAnalysis(const FunctionPtr& function, bool a
   } candidates;
   candidates.VisitStmt(function->body_);
   if (!candidates.found) return;
-  CandidateIndex index(function);
+  CandidateIndex index(function, parameter_bounds);
+  needs_caller_bounds_ = index.needs_caller_bounds;
   if (index.setters.empty()) return;
   Uses uses(index);
   uses.VisitFunction(function);

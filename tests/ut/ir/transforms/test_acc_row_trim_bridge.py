@@ -9,6 +9,8 @@
 
 """Acc row trims share bytes, but restore independently owned native metadata."""
 
+from textwrap import indent
+
 import pypto.language as pl
 import pytest
 from pypto import codegen, ir, passes, testing
@@ -133,9 +135,16 @@ class AccRows(ActiveRows):
             self.stores.append((gm_base, rows, columns, base, reads))
 
 
-def check_commands(original, logical, physical, parameters):
+def check_commands(original, logical, physical, parameters, *, output_rows=None):
     source, before, after = [
-        AccRows(function, parameters, range(2, 6, 3), BASES) for function in (original, logical, physical)
+        AccRows(
+            function,
+            parameters,
+            range(2, 6, 3),
+            BASES,
+            shape_parameters={} if output_rows is None else {function.params[2].type.shape[0]: output_rows},
+        )
+        for function in (original, logical, physical)
     ]
     for state in (source, before, after):
         state.run()
@@ -213,6 +222,85 @@ def selection_input(program):
     for transform in manager.passes[:boundary]:
         program = transform(program)
     return program
+
+
+def tiled_caller_program(variant):
+    tile = (1 << 63) - 8 if variant == "overflow" else 16
+    # Codegen resolves the free shape symbol to the scalar ABI argument when
+    # their emitted names coincide. That argument has the full signed range.
+    dimension = "launch_count" if variant == "shadowed-shape" else "ROWS"
+    scalar = ", launch_count: pl.Scalar[pl.INDEX]" if variant == "shadowed-shape" else ""
+    calls = f"""
+for chunk in pl.range((ROWS + {tile - 1}) // {tile}):
+    row0 = pl.cast(chunk * {tile}, pl.INDEX)
+    rows = pl.min(ROWS - row0, 16)
+    out, _ = pl.spmd_submit(self.grid, a, b, out, row0, rows, core_num=1)
+"""
+    if variant == "non-dominating":
+        # The same formula outside the loop is not protected by its IV domain.
+        calls += """
+row0 = 16
+rows = pl.min(ROWS - row0, 16)
+out, _ = pl.spmd_submit(self.grid, a, b, out, row0, rows, core_num=1)
+"""
+    if variant == "invalid-actual":
+        calls += "out, _ = pl.spmd_submit(self.grid, a, b, out, 0, 17, core_num=1)\n"
+    return pl.parse_program(f"""
+ROWS = pl.dynamic("{dimension}")
+
+@pl.program
+class TiledCaller:
+    @pl.function(type=pl.FunctionType.AIC)
+    def kernel(self, a: pl.Tensor[[16, 32], pl.FP16], b: pl.Tensor[[32, 32], pl.FP16],
+               out: pl.Out[pl.Tensor[[ROWS, 32], pl.FP32]], row0: pl.Scalar[pl.INDEX],
+               rows: pl.Scalar[pl.INDEX]) -> pl.Tensor[[ROWS, 32], pl.FP32]:
+        a_mat = pl.load(a, [0, 0], [16, 32], target_memory=pl.Mem.Mat)
+        b_mat = pl.load(b, [0, 0], [32, 32], target_memory=pl.Mem.Mat)
+        lhs = pl.move(a_mat, target_memory=pl.Mem.Left)
+        rhs = pl.move(b_mat, target_memory=pl.Mem.Right)
+        acc = pl.matmul(lhs, rhs)
+        r = rows
+        trim = pl.tile.set_validshape(acc, r, 32)
+        return pl.store(trim, [row0, 0], out)
+
+    @pl.function(type=pl.FunctionType.Spmd)
+    def grid(self, a: pl.Tensor[[16, 32], pl.FP16], b: pl.Tensor[[32, 32], pl.FP16],
+             out: pl.Out[pl.Tensor[[ROWS, 32], pl.FP32]], row0: pl.Scalar[pl.INDEX],
+             rows: pl.Scalar[pl.INDEX]) -> pl.Tensor[[ROWS, 32], pl.FP32]:
+        return self.kernel(a, b, out, row0, rows)
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(self, a: pl.Tensor[[16, 32], pl.FP16], b: pl.Tensor[[32, 32], pl.FP16],
+             out: pl.InOut[pl.Tensor[[ROWS, 32], pl.FP32]]{scalar}) -> pl.Tensor[[ROWS, 32], pl.FP32]:
+        with pl.manual_scope():
+{indent(calls.strip(), "            ")}
+        return out
+""")
+
+
+def test_tiled_spmd_caller_proves_acc_trim_and_preserves_store_order():
+    program = lower(tiled_caller_program("bounded"), passes.MemoryPlanner.PYPTO)
+    original = kernel(program)
+    assert original.ir_stage == ir.FunctionIRStage.Buffer
+    logical, physical = sync_pipeline(program)
+    # Each host iteration launches one tile or the final partial tile. The
+    # source-order interpreter receives concrete actuals and reads native
+    # metadata and command operands directly.
+    for batch in (1, 16, 17, 31, 32, 33):
+        for start in range(0, batch, 16):
+            rows = min(batch - start, 16)
+            state = check_commands(original, logical, physical, {3: start, 4: rows}, output_rows=batch)
+            assert [store[1:3] for store in state.stores] == [(rows, 32)]
+
+
+@pytest.mark.parametrize("variant", ["non-dominating", "overflow", "invalid-actual", "shadowed-shape"])
+def test_tiled_spmd_caller_requires_a_checked_window_at_every_call(variant):
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO, enable_buffer_ir=True):
+        program = selection_input(tiled_caller_program(variant))
+        original = kernel(program)
+        selected = kernel(passes.select_buffer_ir_functions()(program))
+    assert selected.attrs["buffer_ir_selected"] is False
+    ir.assert_structural_equal(original.body, selected.body, enable_auto_mapping=False)
 
 
 def add_runtime_matrix_consumer(program):

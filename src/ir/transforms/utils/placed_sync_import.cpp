@@ -42,8 +42,10 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/auto_name_utils.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
+#include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/verifier/verifier.h"
 #include "src/ir/transforms/utils/sync_footprint_resolver.h"
 #include "src/ir/transforms/utils/sync_matrix_byte_geometry.h"
@@ -2568,9 +2570,15 @@ StartupSummary QualifyStartupScopes(SyncRegion& region, const CompactSyncInput& 
 // parameters and data-loaded values remain unproved. No branch is sampled.
 class InvocationBounds : public IRVisitor {
   using Bound = std::pair<int64_t, int64_t>;
+  struct TiledLoop {
+    ExprPtr extent;
+    int64_t tile;
+  };
   std::shared_ptr<arith::Analyzer> analyzer_ = std::make_shared<arith::Analyzer>();
   std::vector<VarPtr> definitions_;
   std::set<const Expr*> unproved_definitions_;
+  std::unordered_map<const Var*, ExprPtr> scalar_definitions_;
+  std::unordered_map<const Var*, TiledLoop> tiled_loops_;
   const std::map<std::string, FunctionPtr>& functions_;
   std::map<std::string, std::map<size_t, std::optional<Bound>>>& evidence_;
   std::map<std::string, std::optional<Bound>>& launches_;
@@ -2580,6 +2588,35 @@ class InvocationBounds : public IRVisitor {
   SyncParameterWork& work_;
   std::unordered_map<const Expr*, std::optional<Bound>> ranges_;
   std::set<const Expr*> visited_;
+  void BindHostShapeSymbols() {
+    if (caller_->func_type_ != FunctionType::Orchestration) return;
+    // Orchestration emits an INDEX symbol from the uint32_t Tensor::shapes
+    // field only if its C++ name is not reserved by a scalar parameter or
+    // body definition. Mirror that precedence, including SSA name suffixes.
+    class LocalDefinitions : public var_collectors::VarDefUseCollector {
+      void VisitExpr(const ExprPtr&) override {}
+    } locals;
+    locals.VisitStmt(caller_->body_);
+    std::unordered_set<std::string> reserved;
+    for (const auto* definition : locals.var_defs)
+      reserved.insert(auto_name::GetCompatibleBaseName(definition->name_hint_));
+    for (const auto& parameter : caller_->params_) {
+      if (!AsTensorTypeLike(parameter->GetType()))
+        reserved.insert(auto_name::GetCompatibleBaseName(parameter->name_hint_));
+    }
+    for (const auto& parameter : caller_->params_) {
+      const auto tensor = AsTensorTypeLike(parameter->GetType());
+      if (!tensor) continue;
+      for (const auto& dimension : tensor->shape_) {
+        const auto symbol = As<Var>(dimension);
+        const auto scalar = symbol ? As<ScalarType>(symbol->GetType()) : nullptr;
+        if (scalar && scalar->dtype_ == DataType::INDEX &&
+            !reserved.count(auto_name::GetCompatibleBaseName(symbol->name_hint_))) {
+          analyzer_->const_int_bound.Update(symbol, {0, std::numeric_limits<uint32_t>::max()});
+        }
+      }
+    }
+  }
   // Expressions may be shared across scopes; cached unknowns and successes
   // both belong to the current bound environment, never to the entire program.
   void Invalidate() {
@@ -2594,6 +2631,52 @@ class InvocationBounds : public IRVisitor {
     auto result = ComputeRange(expression);
     ranges_.emplace(expression.get(), result);
     return result;
+  }
+  // Only definitions proved at their original cuts are expanded. Collapse
+  // aliases on insertion, so lookup does not replay earlier assignments.
+  ExprPtr Definition(const ExprPtr& expression) const {
+    if (const auto variable = As<Var>(expression)) {
+      if (const auto it = scalar_definitions_.find(variable.get()); it != scalar_definitions_.end())
+        return it->second;
+    }
+    return expression;
+  }
+  std::optional<TiledLoop> QualifyTiledLoop(const ForStmtPtr& loop) const {
+    if (!IsOrchestrationLike(caller_->func_type_) || loop->kind_ != ForKind::Sequential ||
+        GetScalarDtype(loop->loop_var_) != DataType::INDEX)
+      return std::nullopt;
+    const auto start = As<ConstInt>(Definition(loop->start_));
+    const auto step = As<ConstInt>(Definition(loop->step_));
+    const auto quotient = As<FloorDiv>(Definition(loop->stop_));
+    if (!start || start->value_ != 0 || !step || step->value_ != 1 || !quotient ||
+        !SameCoordinateType(loop->loop_var_, quotient))
+      return std::nullopt;
+    const auto tile = As<ConstInt>(Definition(quotient->right_));
+    const auto numerator = As<Add>(Definition(quotient->left_));
+    if (!tile || tile->value_ <= 0 || !numerator) return std::nullopt;
+    auto extent = numerator->left_;
+    auto bias = As<ConstInt>(Definition(numerator->right_));
+    if (!bias || bias->value_ != tile->value_ - 1) {
+      extent = numerator->right_;
+      bias = As<ConstInt>(Definition(numerator->left_));
+    }
+    if (!bias || bias->value_ != tile->value_ - 1) return std::nullopt;
+    return TiledLoop{Definition(extent), tile->value_};
+  }
+  bool IsRemainingTiledExtent(const ExprPtr& extent, const ExprPtr& origin) const {
+    if (tiled_loops_.empty()) return false;
+    const auto product = As<Mul>(Definition(origin));
+    if (!product) return false;
+    auto iv = As<Var>(Definition(product->left_));
+    auto tile = As<ConstInt>(Definition(product->right_));
+    if (!iv || !tile) {
+      iv = As<Var>(Definition(product->right_));
+      tile = As<ConstInt>(Definition(product->left_));
+    }
+    if (!iv || !tile) return false;
+    const auto active = tiled_loops_.find(iv.get());
+    return active != tiled_loops_.end() && tile->value_ == active->second.tile &&
+           Definition(extent) == active->second.extent;
   }
   static bool IsLaunchCapacity(const ExprPtr& expression) {
     const auto call = As<Call>(expression);
@@ -2649,6 +2732,12 @@ class InvocationBounds : public IRVisitor {
       left = mod->left_;
       right = mod->right_;
       modulo = true;
+    } else if (auto div = As<FloorDiv>(expression)) {
+      left = div->left_;
+      right = div->right_;
+    } else if (auto min = As<Min>(expression)) {
+      left = min->left_;
+      right = min->right_;
     } else {
       return std::nullopt;
     }
@@ -2659,6 +2748,11 @@ class InvocationBounds : public IRVisitor {
     // qualification. Correlation can prove a nonnegative subtraction even when
     // independent operand intervals overlap; no intermediate overflow is erased.
     if (subtract) {
+      // In an active [0, ceildiv(n, tile)) loop, tile*i < n. The
+      // original numerator, IV update and product have all passed range
+      // checks in their machine types before this relation is used.
+      if (GetScalarDtype(expression) == DataType::INDEX && IsRemainingTiledExtent(left, right))
+        return Bound{1, a->second};
       const auto result = analyzer_->const_int_bound(analyzer_->Simplify(expression));
       if (result.min_value < 0 || result.min_value > result.max_value ||
           result.max_value >= arith::ConstIntBound::kPosInf || result.max_value > *maximum)
@@ -2670,6 +2764,13 @@ class InvocationBounds : public IRVisitor {
     if (modulo) {
       if (b->first <= 0 || b->first != b->second) return std::nullopt;
       return a->second < b->first ? a : std::optional<Bound>{{0, b->first - 1}};
+    }
+    if (As<FloorDiv>(expression)) {
+      if (b->first <= 0 || b->first != b->second) return std::nullopt;
+      return Bound{a->first / b->first, a->second / b->first};
+    }
+    if (As<Min>(expression)) {
+      return Bound{std::min(a->first, b->first), std::min(a->second, b->second)};
     }
     const __int128 lo = multiply ? __int128(a->first) * b->first : __int128(a->first) + b->first;
     const __int128 hi = multiply ? __int128(a->second) * b->second : __int128(a->second) + b->second;
@@ -2692,6 +2793,7 @@ class InvocationBounds : public IRVisitor {
     while (definitions_.size() > first) {
       Unbind(definitions_.back());
       unproved_definitions_.erase(definitions_.back().get());
+      scalar_definitions_.erase(definitions_.back().get());
       definitions_.pop_back();
     }
   }
@@ -2768,6 +2870,8 @@ class InvocationBounds : public IRVisitor {
           if (launch_count && launch_count == argument) {
             bound = count_range;
           }
+          const auto maximum = SyncCoordinateMaximum(params[i]);
+          if (bound && (!maximum || bound->second > *maximum)) bound = std::nullopt;
           auto [it, inserted] = callee.emplace(i, bound);
           if (!inserted) {
             if (!it->second || !bound) {
@@ -2794,6 +2898,7 @@ class InvocationBounds : public IRVisitor {
         counts_(counts),
         caller_(std::move(caller)),
         work_(work) {
+    BindHostShapeSymbols();
     // Every predecessor has been processed before this environment is built.
     // Missing/unknown formal bounds are not inferred from a sample invocation.
     if (auto incoming = evidence.find(caller_->name_); incoming != evidence.end()) {
@@ -2815,6 +2920,14 @@ class InvocationBounds : public IRVisitor {
       IRVisitor::VisitExpr(expression);
     }
   }
+  void VisitStmt(const StmtPtr& statement) override {
+    const auto first = definitions_.size();
+    IRVisitor::VisitStmt(statement);
+    if (As<ScopeStmt>(statement)) {
+      ForgetDefinitions(first);
+      Invalidate();
+    }
+  }
 
  protected:
   void VisitVarLike_(const VarPtr&) override {}
@@ -2831,6 +2944,10 @@ class InvocationBounds : public IRVisitor {
     auto b = Range(statement->value_);
     definitions_.push_back(statement->var_);
     if (b && SameCoordinateType(statement->var_, statement->value_)) {
+      auto definition = Definition(statement->value_);
+      if (const auto cast = As<Cast>(definition); cast && SameCoordinateType(cast, cast->operand_))
+        definition = Definition(cast->operand_);
+      scalar_definitions_[statement->var_.get()] = definition;
       // This producer consumes only substitutions and constant bounds. Do not
       // populate transitive-comparison inventories which it never queries (and
       // whose per-definition removal scans the entire retained inventory).
@@ -2859,6 +2976,11 @@ class InvocationBounds : public IRVisitor {
       VisitBranch(*branch->else_body_, complement);
     }
   }
+  void VisitStmt_(const WhileStmtPtr& loop) override {
+    VisitExpr(loop->condition_);
+    for (const auto& argument : loop->iter_args_) VisitExpr(argument->initValue_);
+    VisitBranch(loop->body_, nullptr);
+  }
   void VisitStmt_(const ForStmtPtr& loop) override {
     // Calls in bounds and initial values execute outside the iteration domain.
     // Missing one such site could incorrectly retain a narrower callee range.
@@ -2875,6 +2997,9 @@ class InvocationBounds : public IRVisitor {
       if (start->first == start->second && stop->first == stop->second && step->first == step->second)
         last = start->first + (stop->first - start->first - 1) / step->first * step->first;
       analyzer_->const_int_bound.Update(loop->loop_var_, {start->first, last});
+      if (const auto tiled = QualifyTiledLoop(loop)) {
+        tiled_loops_.emplace(loop->loop_var_.get(), *tiled);
+      }
     } else {
       Unbind(loop->loop_var_);
       unproved_definitions_.insert(loop->loop_var_.get());
@@ -2886,6 +3011,7 @@ class InvocationBounds : public IRVisitor {
     VisitStmt(loop->body_);
     ForgetDefinitions(first);
     Unbind(loop->loop_var_);
+    tiled_loops_.erase(loop->loop_var_.get());
     unproved_definitions_.erase(loop->loop_var_.get());
     Invalidate();
   }

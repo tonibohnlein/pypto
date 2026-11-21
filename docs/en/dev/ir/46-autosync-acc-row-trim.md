@@ -39,6 +39,18 @@ allocation size. If existing arithmetic/metadata evidence cannot justify the
 needed range or readiness, keep the precise admission refusal. The design does
 not add shape samples or kernel-specific assumptions.
 
+An Acc row extent can also be proved at its original call or submit. A host
+loop over `range((extent + tile - 1) // tile)` with `tile > 0` proves
+`extent - tile * i >= 1` in its body once the numerator, loop increment and
+tile origin fit their original machine types. Clipping the remaining extent
+with `min` adds an upper bound. Host shape symbols use the unsigned 32-bit
+runtime tensor dimension field widened to INDEX. The compiler joins actual
+ranges at every call and through forwarding wrappers. An unknown actual or
+an aggregate range outside the Acc capacity leaves the kernel Functional.
+When a row bound depends on the caller, lowering recomputes it and guards
+the metadata update and store with both row limits. The emitted Buffer
+function can then be verified independently of its callers.
+
 Initially reject dynamic accumulator producers/carries, column trims, compact
 packing, offset/pitch/layout changes, views or escapes of the runtime alias,
 unsupported native consumers and addressless placement. Start with the existing
