@@ -675,6 +675,69 @@ void TestScheduleCasesAndHashing() {
   }
 }
 
+void TestRepeatedGapDecision() {
+  using pypto::ir::sync::physical::FactorCommandGap;
+  PhysicalSyncRealization work;
+  const auto span = Span::unknown();
+  auto loop = MakeTestLoop("i", 0, 8, 1);
+  auto arena = std::make_shared<GuardDomainArena>();
+  const auto axis = arena->RegisterLoopFrame({loop, 8, 0, 1, nullptr});
+  const auto guard = [&](AxisAP range) {
+    RadixBox box;
+    box.constraints.push_back({axis, range});
+    return RadixBoxGuard::FromBox(arena, box);
+  };
+  const auto even = guard(*AxisAP::MakeCanonical(0, 8, 2, 8));
+  const auto after_first = guard(*AxisAP::MakeCanonical(1, 8, 1, 8));
+  const auto flag = [&](const char* op, int id) {
+    return ControlCommand(MakeFlag(op, PipeType::MTE2, PipeType::M, id), span, work);
+  };
+  const auto set = ControlBranch(even, flag("system.set_flag", 0), flag("system.set_flag", 1), span, work);
+  const auto wait = ControlBranch(even, flag("system.wait_flag", 0), flag("system.wait_flag", 1), span, work);
+  const auto extra = flag("system.set_flag", 2);
+  const auto middle = ControlBranch(after_first, extra, std::nullopt, span, work);
+  auto original = ControlForest{extra, set, middle, wait, extra}, reduced = original;
+  assert(FactorCommandGap(reduced, work));
+  assert(reduced.front() == extra && reduced.back() == extra);
+  const auto trace = [&](const ControlForest& forest, int visit) {
+    std::pair<int, std::vector<ExprPtr>> result;
+    const auto walk = [&](const auto& self, const auto& commands) -> void {
+      for (const auto& node : commands) {
+        if (node.original->command) {
+          result.second.push_back(node.original->command);
+        } else if (node.condition_expr) {
+          ++result.first;
+          const bool taken = EvalBoolExpr(node.condition_expr, {{loop->loop_var_.get(), visit}});
+          self(self, (taken ? node.body : node.alternative)->commands);
+        } else {
+          self(self, node.body->commands);
+        }
+      }
+    };
+    walk(walk, FreezeCommandForest(forest, work)->commands);
+    return result;
+  };
+  const auto odd = guard(*AxisAP::MakeCanonical(1, 8, 2, 8));
+  ControlForest complement{
+      extra, set, middle,
+      ControlBranch(odd, flag("system.wait_flag", 1), flag("system.wait_flag", 0), span, work), extra};
+  assert(FactorCommandGap(complement, work));
+  for (int i = 0; i < 8; ++i) {
+    const auto before = trace(original, i), after = trace(reduced, i);
+    assert(before.second == after.second && after.first < before.first);
+    const auto inverted = trace(complement, i);
+    assert(inverted.second.size() == before.second.size() && inverted.first == after.first);
+    for (size_t j = 0; j < before.second.size(); ++j) {
+      assert(pypto::ir::sync::physical::SameControl(before.second[j], inverted.second[j]));
+    }
+  }
+  ControlForest over_budget{set, pypto::ir::sync::physical::ControlSequence({extra, extra}, span, work),
+                            wait};
+  assert(!FactorCommandGap(over_budget, work));
+  ControlForest different{set, middle, ControlBranch(after_first, extra, extra, span, work)};
+  assert(!FactorCommandGap(different, work));
+}
+
 void TestLaunchBlockCommutationFence() {
   using pypto::ir::sync::physical::ControlSequence;
   PhysicalSyncRealization work;
@@ -920,6 +983,7 @@ int main() {
   TestLargeTripScalingAndIsFirstIteration();
   TestNormalizeNodesLatentBugAndNonAdjacent();
   TestScheduleCasesAndHashing();
+  TestRepeatedGapDecision();
   TestLaunchBlockCommutationFence();
   TestRefactorAAuditFixes();
   return 0;

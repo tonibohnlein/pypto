@@ -13,6 +13,7 @@
 #define SRC_IR_TRANSFORMS_UTILS_CONSERVATIVE_SYNC_DATAFLOW_H_
 
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -76,7 +77,7 @@ struct ConservativeStorageDomain {
   size_t id;
   MemorySpace space;
   std::optional<backend::BufferSyncByteWindow> enclosure;
-  ExprPtr original_root;  // GM provenance qualified by the supplied disjoint contract.
+  ExprPtr original_root;  // Representative of a proven GM alias class.
 };
 using ConservativeAccessSet = std::set<ConservativeAccessFact>;
 
@@ -87,6 +88,7 @@ struct ImportedLocalEffect {
   MemorySpace space;
   bool write;
   std::optional<backend::BufferSyncByteWindow> enclosure;
+  std::optional<size_t> gm_formal = std::nullopt;
 };
 struct ImportedLocalCut {
   const Stmt* statement;
@@ -99,6 +101,8 @@ struct ImportedLocalSync {
   FunctionPtr owner;
   ImportedLocalCuts calls;
   const IfStmt* terminal_branch = nullptr;
+  // Populated only after every invocation has certified the GM partition.
+  std::map<size_t, ExprPtr> gm_domains{};
 };
 
 // An allocated SET may move before these producer effects. Its WAIT and all

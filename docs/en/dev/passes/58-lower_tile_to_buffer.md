@@ -438,6 +438,12 @@ scratch at the original launch and checks each raw read against all potentially
 aliased writes in its phase. The planner derives dependencies for the ordinary
 local payloads and leaves the authored cross-core event stream in place.
 
+For ordinary GM transfers in these endpoints, a Group argument gets its own storage domain
+when every reachable launch binds it to a fresh allocation distinct from all other accessed
+arguments. Views retain their allocation origin. The remaining arguments share a conservative
+domain, including external tensors that may alias. The local planner uses these domains when
+deciding which completions a transfer needs.
+
 ## Representation example
 
 The following notation abbreviates descriptors and scalar tuples:

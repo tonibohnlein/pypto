@@ -227,23 +227,30 @@ class RootInventory final : public IRVisitor {
   }
 
   void CheckAuthoredGM(const FunctionPtr& launch, size_t workspace_formal,
-                       const std::vector<PeerGmEffects>& phases, bool disjoint_gm) const {
+                       const std::vector<PeerGmEffects>& phases, const std::set<size_t>& ordinary,
+                       bool disjoint_gm, std::set<size_t>& isolated) const {
     const auto found = calls_.find(launch->name_);
     CHECK(found != calls_.end() && !found->second.empty())
         << "Authored GM synchronization requires an original root launch";
-    std::set<size_t> ordinary;
-    for (const auto& phase : phases) {
-      ordinary.insert(phase.formals.begin(), phase.formals.end());
-    }
     for (const auto& site : found->second) {
       CHECK_SPAN(site.qualified, site.span) << "Authored GM synchronization requires a direct root launch";
       const auto workspace = StorageOf(site.arguments.at(workspace_formal).value);
       CHECK_SPAN(workspace.kind == OriginKind::Fresh, site.span)
           << "Authored FFTS workspace requires a fresh root allocation";
+      std::unordered_map<const Var*, size_t> first_fresh;
       for (const auto formal : ordinary) {
         const auto actual = StorageOf(site.arguments.at(formal).value);
         CHECK_SPAN(actual.Known() && actual.root != workspace.root, site.span)
             << "Authored FFTS workspace lacks separation from an ordinary GM access";
+        if (actual.kind != OriginKind::Fresh) {
+          isolated.erase(formal);
+          continue;
+        }
+        const auto [prior, unique] = first_fresh.emplace(actual.root, formal);
+        if (!unique) {
+          isolated.erase(prior->second);
+          isolated.erase(formal);
+        }
       }
     }
     for (const auto& phase : phases) {
@@ -801,8 +808,15 @@ void PeerInvocationGmEvidence::CheckHostRankOneExtent(const FunctionPtr& group, 
   }
 }
 
-void PeerInvocationGmEvidence::CheckAuthoredGM(const FunctionPtr& group, size_t workspace_formal,
-                                               const std::vector<PeerGmEffects>& phases, bool disjoint_gm) {
+std::map<size_t, ExprPtr> PeerInvocationGmEvidence::CheckAuthoredGM(const FunctionPtr& group,
+                                                                    size_t workspace_formal,
+                                                                    const std::vector<PeerGmEffects>& phases,
+                                                                    bool disjoint_gm) {
+  std::set<size_t> ordinary;
+  for (const auto& phase : phases) ordinary.insert(phase.formals.begin(), phase.formals.end());
+  // A fresh allocation at one call cannot establish separation at a different
+  // call. A slice retains its origin, even when the two formals have disjoint names.
+  auto isolated = ordinary;
   const auto& callers = CallersOf(group->name_);
   CHECK(!callers.empty()) << "Authored GM group has no original root launch";
   for (const auto& caller : callers) {
@@ -822,9 +836,19 @@ void PeerInvocationGmEvidence::CheckAuthoredGM(const FunctionPtr& group, size_t 
       if (!inventory) {
         inventory = std::make_unique<RootInventory>(root, state_->launches, state_->program, true);
       }
-      inventory->CheckAuthoredGM(launch, workspace_formal, phases, disjoint_gm);
+      inventory->CheckAuthoredGM(launch, workspace_formal, phases, ordinary, disjoint_gm, isolated);
     }
   }
+  std::map<size_t, ExprPtr> domains;
+  if (!isolated.empty()) {
+    ExprPtr other;
+    for (const auto formal : ordinary) {
+      const auto& parameter = group->params_.at(formal);
+      if (!isolated.count(formal) && !other) other = parameter;
+      domains.emplace(formal, isolated.count(formal) ? parameter : other);
+    }
+  }
+  return domains;
 }
 
 void PeerInvocationGmEvidence::CheckScalarReads(const FunctionPtr& group, const PeerGmEffects& effects,

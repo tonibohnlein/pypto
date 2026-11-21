@@ -3843,6 +3843,53 @@ ControlForest ScheduleCommandCases(const ExprPtr& block, const Intervals& possib
   return CommandGuards().Build(target, work, false, false, RadixBoxGuard::True());
 }
 
+bool FactorCommandGap(ControlForest& gap, PhysicalSyncRealization& work) {
+  // Copy at most one intervening command per gap. The two mutually
+  // exclusive paths each execute that command at its original position.
+  for (size_t i = 0; i + 2 < gap.size(); ++i) {
+    const auto& left = gap[i];
+    const auto& middle = gap[i + 1];
+    const auto& right = gap[i + 2];
+    ++work.schedule_inspected_descriptors;
+    if (left->alternative.empty() || right->alternative.empty() || !left->guard.Arena() ||
+        left->guard.Arena() != right->guard.Arena() ||
+        (middle->guard.Arena() && left->guard.Arena() != middle->guard.Arena()) ||
+        !left->predicate_qualified || !right->predicate_qualified) {
+      continue;
+    }
+    const auto other = SubtractGuards(RadixBoxGuard::True(), left->guard);
+    if (!other) continue;
+    const bool matching = SameGuard(left->guard, right->guard);
+    if (!matching && !EquivalentGuardsInScope(*other, right->guard, RadixBoxGuard::True())) continue;
+    const CaseCodeSize middle_cost({middle});
+    if (middle_cost.commands != 1 || middle_cost.guards > 1 ||
+        CaseCodeSize({middle}, left->guard).guards > middle_cost.guards ||
+        CaseCodeSize({middle}, *other).guards > middle_cost.guards) {
+      continue;
+    }
+    const auto arm = [&](ControlForest first, const ControlForest& last) {
+      first.push_back(middle);
+      first.insert(first.end(), last.begin(), last.end());
+      return first;
+    };
+    // Both outer decisions execute unconditionally in this gap. Sharing
+    // them saves one test per visit even when static guard counts tie.
+    auto candidate = RebuildControl(
+        left, left->guard, nullptr, arm(left->body, matching ? right->body : right->alternative),
+        arm(left->alternative, matching ? right->alternative : right->body), work);
+    const CaseCodeSize old_size({left, middle, right}), new_size({candidate});
+    work.schedule_inspected_descriptors += old_size.statements + new_size.statements;
+    work.schedule_inspected_expressions += old_size.expressions + new_size.expressions;
+    if (new_size.guards > old_size.guards || new_size.expressions > old_size.expressions) continue;
+    work.shared_composed_guard_sites += old_size.guards - new_size.guards;
+    gap[i] = std::move(candidate);
+    gap.erase(gap.begin() + i + 1, gap.begin() + i + 3);
+    gap.frozen.reset();
+    return true;
+  }
+  return false;
+}
+
 ControlForest ShareCommandGuards(const ControlForest& commands, PhysicalSyncRealization& work, bool endpoint,
                                  bool pair_else_branches, const RadixBoxGuard& scope) {
   return CommandGuards().Build(commands, work, endpoint, pair_else_branches, scope);

@@ -9,6 +9,8 @@
 
 """Retain A3 programmer-authored GM protocol at its native cuts."""
 
+from textwrap import indent
+
 import pytest
 from pypto import codegen, ir, passes
 from pypto import language as pl
@@ -101,6 +103,7 @@ def _mixed_program(
     rendezvous="pl.system.syncall(core_type=pl.KernelType.MIX)",
     prefetch=False,
     consume_latest=False,
+    dma_launches=None,
 ):
     vec_actual = {"fresh": "vec_scratch", "different_formal": "vec_out", "same_formal": "table"}[writer]
     publication = (
@@ -125,6 +128,20 @@ def _mixed_program(
         else "pass"
     )
     first_rhs = "next_rhs" if consume_latest else "rhs"
+    if dma_launches is None:
+        vec_work = """item = pl.tensor.read(table, [0, 0])
+value = pl.load(data, [0, 0], [1, 8], target_memory=pl.Mem.Vec)
+pl.tile.write(value, [0, 0], item)
+return pl.store(value, [0, 0], out)"""
+        launches = f"self.unit(workspace, x, table, data, cube_scratch, {vec_actual})"
+    else:
+        # Keep value live across the second load so both use distinct UB bytes.
+        vec_work = """value = pl.load(data, [0, 0], [1, 8], target_memory=pl.Mem.Vec)
+out = pl.store(value, [0, 0], out)
+later = pl.load(table, [0, 0], [1, 8], target_memory=pl.Mem.Vec)
+total = pl.add(value, later)
+return pl.store(total, [0, 0], out)"""
+        launches = dma_launches
     return pl.parse_program(f"""
 @pl.program
 class AuthoredMixedGM:
@@ -158,10 +175,7 @@ class AuthoredMixedGM:
         {rendezvous}
         {acquire}
         pl.system.sync_wait(1, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
-        item = pl.tensor.read(table, [0, 0])
-        value = pl.load(data, [0, 0], [1, 8], target_memory=pl.Mem.Vec)
-        pl.tile.write(value, [0, 0], item)
-        return pl.store(value, [0, 0], out)
+{indent(vec_work, "        ")}
 
     @pl.function(type=pl.FunctionType.Group)
     def unit(self, workspace: pl.Tensor[[256], pl.INT64], x: pl.Tensor[[16, 16], pl.BF16],
@@ -176,7 +190,7 @@ class AuthoredMixedGM:
         workspace = pl.create_tensor([256], dtype=pl.INT64)
         cube_scratch = pl.create_tensor([16, 16], dtype=pl.FP32)
         vec_scratch = pl.create_tensor([1, 8], dtype=pl.INT32)
-        self.unit(workspace, x, table, data, cube_scratch, {vec_actual})
+{indent(launches, "        ")}
 """)
 
 
@@ -252,6 +266,50 @@ class _AuthoredCommands(ClosedCommands):
                 )
             )
         super().evaluate(statement, env)
+
+
+@pytest.mark.parametrize(
+    "launches,may_alias",
+    [
+        pytest.param("self.unit(workspace, x, table, data, cube_scratch, vec_scratch)", False, id="fresh"),
+        pytest.param("self.unit(workspace, x, table, data, cube_scratch, vec_out)", True, id="external"),
+        pytest.param(
+            "self.unit(workspace, x, vec_scratch, data, cube_scratch, vec_scratch)",
+            True,
+            id="same-allocation",
+        ),
+        pytest.param(
+            "self.unit(workspace, x, table, data, cube_scratch, vec_scratch)\n"
+            "other_cube = pl.create_tensor([16, 16], dtype=pl.FP32)\n"
+            "aliased = pl.create_tensor([1, 8], dtype=pl.INT32)\n"
+            "self.unit(workspace, x, aliased, data, other_cube, aliased)",
+            True,
+            id="second-call-aliases",
+        ),
+        pytest.param(
+            "allocation = pl.create_tensor([1, 16], dtype=pl.INT32)\n"
+            "a = pl.tensor.slice(allocation, [1, 8], [0, 0])\n"
+            "b = pl.tensor.slice(allocation, [1, 8], [0, 4])\n"
+            "self.unit(workspace, x, a, data, cube_scratch, b)",
+            True,
+            id="overlapping-views",
+        ),
+    ],
+)
+def test_authored_gm_store_completion_uses_all_callers(launches, may_alias):
+    source = _mixed_program(dma_launches=launches)
+    original = _AuthoredCommands(_lower(source).get_function("vec"))
+    leaf = _lower(source, autosync=True).get_function("vec")
+    assert leaf is not None and leaf.attrs["pypto_autosync"], leaf
+    candidate = _AuthoredCommands(leaf)
+    original.run()
+    order = candidate.run()
+    assert candidate.authored == original.authored
+    assert candidate.payloads == original.payloads
+    pipes = [pipe for _, pipe, _, _ in candidate.payloads]
+    store = pipes.index(ir.PipeType.MTE3)
+    load = pipes.index(ir.PipeType.MTE2, store + 1)
+    assert ((("payload", store, "C"), ("payload", load, "I")) in order) == may_alias
 
 
 @pytest.mark.parametrize("consume_latest", [False, True])

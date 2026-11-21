@@ -340,6 +340,9 @@ void FlattenControlSequence(const ControlPtr& node, ControlForest& commands, Phy
 ControlForest ShareCommandGuards(const ControlForest& commands, PhysicalSyncRealization& work,
                                  bool endpoint = true, bool pair_else_branches = true,
                                  const RadixBoxGuard& scope = RadixBoxGuard::True());
+// Share a repeated decision across a single intervening command in a gap
+// with no payload. Every path retains its literal command sequence.
+bool FactorCommandGap(ControlForest& normalized, PhysicalSyncRealization& work);
 void AppendCase(std::vector<CaseCommands>& cases, std::pair<int64_t, int64_t> blocks,
                 const ControlForest& commands, const Span& span, PhysicalSyncRealization& work);
 Intervals SubtractIntervals(const Intervals& domain, const Intervals& absent);

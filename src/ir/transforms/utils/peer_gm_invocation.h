@@ -13,6 +13,7 @@
 #define SRC_IR_TRANSFORMS_UTILS_PEER_GM_INVOCATION_H_
 
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -44,8 +45,9 @@ class PeerInvocationGmEvidence {
   // The authored publication seam does not imply that arbitrary external
   // GM tensors are disjoint. Check the raw readers against concurrent writes
   // in each phase and prove the hidden FFTS scratch is isolated.
-  void CheckAuthoredGM(const FunctionPtr& group, size_t workspace_formal,
-                       const std::vector<PeerGmEffects>& phases, bool disjoint_gm);
+  // Return a GM partition valid at every launch, keyed by Group formal.
+  std::map<size_t, ExprPtr> CheckAuthoredGM(const FunctionPtr& group, size_t workspace_formal,
+                                            const std::vector<PeerGmEffects>& phases, bool disjoint_gm);
 
  private:
   struct State;

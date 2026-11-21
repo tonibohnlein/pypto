@@ -316,6 +316,11 @@ charges each duplicated payload site and the full expanded replacement across
 the leaf, and preserves guarded emission when the growth budget does not fit.
 This selection does not expand invocation cases or period residues.
 
+Between two adjacent payloads, the scheduler can evaluate a shared slot or loop condition once
+for both synchronization decisions. It may copy one intervening local synchronization command
+into the two mutually exclusive arms. Each path executes that command in its original position
+and preserves every payload and event ID.
+
 See the [pipeline checkpoint](https://github.com/tonibohnlein/pypto/blob/365b803a45072f1c00e8eca5da9942bd9828685f/docs/en/dev/ir/18-qwen-prefill-pipeline.md) for exact
 premises, independent bounded checks and remaining selection limitations.
 This does not qualify arbitrary symbolic nesting, the full prefill model,

@@ -616,6 +616,14 @@ class DistinctIssueCuts : public SyncStatementMutator {
   }
 };
 
+using FormalPositions = std::unordered_map<const Var*, size_t>;
+
+FormalPositions IndexFormals(const FunctionPtr& group) {
+  FormalPositions positions;
+  for (size_t i = 0; i < group->params_.size(); ++i) positions.emplace(group->params_[i].get(), i);
+  return positions;
+}
+
 FunctionPtr PlanLocalEndpoint(const WrapperCallInfo& call, const FunctionPtr& group,
                               const SyncInvocationEvidence& invocation, PeerInvocationGmEvidence& gm,
                               codegen::gm_pipe::LayoutEvidence& layout, PeerGmEffects& group_effects) {
@@ -649,8 +657,7 @@ FunctionPtr PlanLocalEndpoint(const WrapperCallInfo& call, const FunctionPtr& gr
   if (fn->ir_stage_ == FunctionIRStage::Buffer) {
     coordinates = gm.TryLaunchCoordinates(group, workspace_formal);
   }
-  std::unordered_map<const Var*, size_t> positions;
-  for (size_t i = 0; i < group->params_.size(); ++i) positions.emplace(group->params_[i].get(), i);
+  const auto positions = IndexFormals(group);
   if (coordinates) {
     std::set<size_t> endpoint_widths;
     for (size_t i = 0; i < fn->params_.size(); ++i) {
@@ -695,23 +702,23 @@ FunctionPtr PlanLocalEndpoint(const WrapperCallInfo& call, const FunctionPtr& gr
   return RealizePeerLocalPlan(local);
 }
 
-size_t MapAuthoredFormal(const WrapperCallInfo& endpoint, const FunctionPtr& group, size_t index) {
+size_t MapAuthoredFormal(const WrapperCallInfo& endpoint, const FormalPositions& positions, size_t index) {
   const auto actual = AsVarLike(endpoint.inner_call->args_.at(index));
-  const auto found = std::find(group->params_.begin(), group->params_.end(), actual);
-  CHECK(found != group->params_.end()) << "Authored GM endpoint requires original Group tensor actuals";
-  return static_cast<size_t>(found - group->params_.begin());
+  const auto found = positions.find(actual.get());
+  CHECK(found != positions.end()) << "Authored GM endpoint requires original Group tensor actuals";
+  return found->second;
 }
 
-void MergeAuthoredGMEffects(const WrapperCallInfo& endpoint, const FunctionPtr& group,
+void MergeAuthoredGMEffects(const WrapperCallInfo& endpoint, const FormalPositions& positions,
                             const PeerGmEffects& local, PeerGmEffects& mixed) {
   for (const auto formal : local.formals) {
-    mixed.formals.insert(MapAuthoredFormal(endpoint, group, formal));
+    mixed.formals.insert(MapAuthoredFormal(endpoint, positions, formal));
   }
   for (const auto formal : local.writes) {
-    mixed.writes.insert(MapAuthoredFormal(endpoint, group, formal));
+    mixed.writes.insert(MapAuthoredFormal(endpoint, positions, formal));
   }
   for (const auto formal : local.scalar_reads) {
-    mixed.scalar_reads.insert(MapAuthoredFormal(endpoint, group, formal));
+    mixed.scalar_reads.insert(MapAuthoredFormal(endpoint, positions, formal));
   }
 }
 
@@ -719,6 +726,7 @@ std::vector<PeerLocalDecision> PlanAuthoredGMUnit(const PeerDispatch& dispatch,
                                                   const SyncInvocationEvidence& invocation,
                                                   PeerInvocationGmEvidence& gm, bool disjoint_gm) {
   CHECK(!dispatch.has_fifo) << "Combined authored GM and managed FIFO synchronization is unqualified";
+  const auto positions = IndexFormals(dispatch.group);
   std::vector<PeerLocalEffects> endpoints;
   std::vector<PeerGmEffects> phases(2);
   std::optional<size_t> workspace;
@@ -735,7 +743,7 @@ std::vector<PeerLocalDecision> PlanAuthoredGMUnit(const PeerDispatch& dispatch,
     const auto protocol = QualifyAuthoredGMEndpoint(fn);
     const auto formal = std::find(fn->params_.begin(), fn->params_.end(), protocol.workspace);
     CHECK(formal != fn->params_.end()) << "Authored FFTS setup requires a workspace formal";
-    const auto pos = MapAuthoredFormal(endpoint, dispatch.group, formal - fn->params_.begin());
+    const auto pos = MapAuthoredFormal(endpoint, positions, formal - fn->params_.begin());
     CHECK(!workspace || *workspace == pos) << "Authored FFTS endpoints must use the same Group workspace";
     workspace = pos;
     const auto parameters = invocation.parameters.find(fn->name_);
@@ -746,14 +754,23 @@ std::vector<PeerLocalDecision> PlanAuthoredGMUnit(const PeerDispatch& dispatch,
     for (size_t i = 0; i < phases.size(); ++i) {
       CHECK(local.gm_phases[i].host_extent_requirements.empty())
           << "Authored GM scalar address requires a bounded launch byte extent";
-      MergeAuthoredGMEffects(endpoint, dispatch.group, local.gm_phases[i], phases[i]);
+      MergeAuthoredGMEffects(endpoint, positions, local.gm_phases[i], phases[i]);
     }
     endpoints.push_back(std::move(local));
   }
   CHECK(workspace) << "Authored FFTS setup requires a Group workspace";
-  gm.CheckAuthoredGM(dispatch.group, *workspace, phases, disjoint_gm);
+  const auto domains = gm.CheckAuthoredGM(dispatch.group, *workspace, phases, disjoint_gm);
   std::vector<PeerLocalDecision> decisions;
-  for (const auto& endpoint : endpoints) {
+  for (size_t index = 0; index < endpoints.size(); ++index) {
+    auto& endpoint = endpoints[index];
+    if (!domains.empty()) {
+      for (const auto& phase : endpoint.gm_phases) {
+        for (const auto formal : phase.formals) {
+          const auto actual = MapAuthoredFormal(dispatch.endpoints[index], positions, formal);
+          endpoint.structured->gm_domains.emplace(formal, domains.at(actual));
+        }
+      }
+    }
     decisions.push_back({RealizePeerLocalPlan(endpoint), {}});
   }
   return decisions;

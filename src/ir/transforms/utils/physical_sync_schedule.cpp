@@ -1583,7 +1583,14 @@ class CommandSeams {
     joined.insert(joined.end(), before.begin(), before.end());
     const auto previous_shared = work_.shared_composed_guard_sites;
     auto shared = ShareCommandGuards(joined, work_, false, true);
-    const CaseCodeSize original(joined), replacement(shared);
+    const CaseCodeSize original(joined);
+    // Selected loop entry costs have already been charged. Only version a
+    // command in an ordinary gap, before the candidate is measured.
+    auto replacement = CaseCodeSize(shared);
+    const bool factored = selected_loop.empty() && replacement.commands == original.commands &&
+                          replacement.guards <= original.guards &&
+                          replacement.expressions <= original.expressions && FactorCommandGap(shared, work_);
+    if (factored) replacement = CaseCodeSize(shared);
     // Charge inspections even on refusal. Crossing a selected-candidate
     // boundary additionally preserves its charged raw descriptor bound. Ordinary
     // gap sharing keeps its existing policy: arm sequence wrappers can grow
@@ -1592,7 +1599,8 @@ class CommandSeams {
     work_.schedule_inspected_expressions += original.expressions + replacement.expressions;
     const bool within_budget = selected_loop.empty() || (replacement.expressions <= original.expressions &&
                                                          replacement.statements <= original.statements);
-    if (replacement.commands == original.commands && replacement.guards < original.guards && within_budget) {
+    if (factored || (replacement.commands == original.commands && replacement.guards < original.guards &&
+                     within_budget)) {
       if (!selected_loop.empty())
         work_.schedule_parent_gaps.push_back(
             {selected_loop,
@@ -1677,7 +1685,10 @@ class CommandSeams {
       pending_ = plan ? &plan->exit : nullptr;
       return;
     }
-    auto found = cuts_.find(SingletonCall(stmt));
+    // A value-producing payload has an after/before gap just like an
+    // effect-only call. Ordinary scalar definitions remain fences.
+    const auto assignment = As<AssignStmt>(stmt);
+    auto found = cuts_.find(assignment ? As<Call>(assignment->value_).get() : SingletonCall(stmt));
     const auto branch = As<IfStmt>(stmt);
     if (branch) {
       found = cuts_.find(SingletonCall(branch->then_body_));

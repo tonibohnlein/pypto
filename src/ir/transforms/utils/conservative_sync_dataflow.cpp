@@ -2801,7 +2801,11 @@ class Builder {
       if (imported_) {
         const auto& cut = imported_->calls.at(sites[site].operation.get());
         for (const auto& effect : cut.effects) {
-          raw[site].push_back({effect.space, *cut.pipe, effect.write, effect.enclosure, nullptr});
+          ExprPtr root;
+          if (effect.gm_formal && !imported_->gm_domains.empty()) {
+            root = imported_->gm_domains.at(*effect.gm_formal);
+          }
+          raw[site].push_back({effect.space, *cut.pipe, effect.write, effect.enclosure, root});
         }
         continue;
       }

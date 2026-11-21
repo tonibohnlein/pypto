@@ -565,7 +565,13 @@ class LaneImporter {
     if (write) {
       Gm().writes.insert(it->second);
     }
-    Access(site, {MemorySpace::DDR, 0, 1}, write);
+    if (structured_ && authored_acquire_) {
+      auto& cut = structured_->calls.at(site.original.get());
+      // The prefix shared by two lanes has already been exported on its first visit.
+      if (!cut.pipe) cut.effects.push_back({MemorySpace::DDR, write, std::nullopt, it->second});
+    } else {
+      Access(site, {MemorySpace::DDR, 0, 1}, write);
+    }
   }
 
   int64_t ScalarGmIndexMaximum(const ExprPtr& index, const ExprPtr& extent, const Span& span) const {
