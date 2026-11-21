@@ -16,11 +16,12 @@ from pypto.backend.pto_backend import _run_ptoas
 from pypto.pypto_core import ir as core_ir
 
 from .sync_closed_command_oracle import ClosedCommands
+from .test_runtime_valid_broadcast import diagnostics
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
 
 
-def scalar_payload_fixture():
+def scalar_payload_fixture(point="static", view="direct", stage=ir.FunctionIRStage.Buffer):
     span = ir.Span.unknown()
     index, fp = ir.DataType.INDEX, ir.DataType.FP32
 
@@ -43,14 +44,30 @@ def scalar_payload_fixture():
     count, visits = [var(name, ir.ScalarType(index)) for name in ("count", "visits")]
     local = ir.BufferType([2, 8], fp, ir.MemorySpace.Vec)
     x = var("x", local)
+    carrier = x
+    before = []
+    if view != "direct":
+        # Both view descriptors have 16 elements. Their actual source rows
+        # have a 64-byte pitch and cannot be flattened using the 32-byte pitch.
+        parent = var("parent", ir.BufferType([2, 16], fp, ir.MemorySpace.Vec))
+        carrier = var("narrow", local)
+        before = [
+            ir.AssignStmt(parent, call("buffer.alloc", [tup([]), ci(64)], parent.type), span),
+            ir.AssignStmt(carrier, call("buffer.subview", [parent, tup([0, 0])], carrier.type), span),
+        ]
+        if view == "relabel":
+            reshaped = var("relabelled", ir.BufferType([1, 16], fp, ir.MemorySpace.Vec))
+            before.append(ir.AssignStmt(reshaped, call("buffer.reshape", [carrier], reshaped.type), span))
+            carrier = reshaped
+    coordinates = ir.MakeTuple([ci(0), count if point == "unbounded" else ci(0)], span)
     scalar = var("loaded_control", ir.ScalarType(fp))
     body = ir.SeqStmts(
         [
-            ir.AssignStmt(scalar, call("buffer.read", [x, tup([0, 0])], scalar.type), span),
+            ir.AssignStmt(scalar, call("buffer.read", [carrier, coordinates], scalar.type), span),
             ir.IfStmt(
                 ir.Gt(scalar, ir.ConstFloat(0.0, fp, span), ir.DataType.BOOL, span),
-                op("buffer.write", [x, tup([0, 0]), ir.ConstFloat(-1.0, fp, span)]),
-                op("buffer.write", [x, tup([0, 0]), ir.ConstFloat(1.0, fp, span)]),
+                op("buffer.write", [carrier, coordinates, ir.ConstFloat(-1.0, fp, span)]),
+                op("buffer.write", [carrier, coordinates, ir.ConstFloat(1.0, fp, span)]),
                 [],
                 span,
             ),
@@ -68,6 +85,7 @@ def scalar_payload_fixture():
             [
                 ir.AssignStmt(x, call("buffer.alloc", [tup([]), ci(0)], local), span),
                 op("buffer.load", [a, tup([0, 0]), tup([2, 8]), x]),
+                *before,
                 outer,
                 op("buffer.store", [x, tup([0, 0]), tup([2, 8]), out]),
                 ir.ReturnStmt([out], span),
@@ -76,7 +94,7 @@ def scalar_payload_fixture():
         ),
         span,
         ir.FunctionType.AIV,
-        ir_stage=ir.FunctionIRStage.Buffer,
+        ir_stage=stage,
     )
 
 
@@ -148,6 +166,23 @@ def test_scalar_payload_rejects_unknown_metadata_or_nonlocal_storage():
         source = ir.Var("source", descriptor, span)
         with pytest.raises(ValueError, match="Buffer scalar"):
             core_ir._create_internal_op_call("buffer.read", [source, coords], {}, span)
+
+
+@pytest.mark.parametrize("stage", [ir.FunctionIRStage.Buffer, ir.FunctionIRStage.Functional])
+@pytest.mark.parametrize(
+    "point,view,reason",
+    [
+        ("unbounded", "direct", "proved in-range point"),
+        ("static", "subview", "require dense physical row pitch"),
+        ("static", "relabel", "require dense physical row pitch"),
+    ],
+)
+def test_raw_scalar_points_check_lexical_range_and_inherited_pitch(stage, point, view, reason):
+    function = scalar_payload_fixture(point, view, stage)
+    if stage == ir.FunctionIRStage.Buffer:
+        assert any(reason in issue.message for issue in diagnostics(function))
+    with pytest.raises(ValueError, match=reason):
+        codegen.PTOCodegen().generate(ir.Program([function], "RawScalarPoint", function.span))
 
 
 if __name__ == "__main__":

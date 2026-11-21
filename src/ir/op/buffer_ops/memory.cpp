@@ -232,11 +232,11 @@ TypePtr DeduceBufferTransfer(const std::vector<ExprPtr>& args, bool load) {
 
 TypePtr DeduceBufferScalarAccess(const std::vector<ExprPtr>& args, bool read) {
   CHECK(args.size() == (read ? 2 : 3))
-      << "Buffer scalar access requires a buffer, constant coordinates and an optional stored value";
+      << "Buffer scalar access requires a buffer, coordinates and an optional stored value";
   CHECK(args[0] && args[1] && (read || args[2])) << "Buffer scalar operands must not be missing";
   const auto buffer = As<BufferType>(args[0]->GetType());
-  CHECK(backend::BufferScalarPointOffset(buffer, args[1]).has_value())
-      << "Buffer scalar access requires a static in-bounds point on a dense rank-2 FP32/INT32 Vec "
+  CHECK(backend::GetBufferScalarPointLayout(buffer, args[1]).has_value())
+      << "Buffer scalar access requires signed coordinates on a dense rank-2 FP32/INT32 Vec "
          "descriptor within the native uint32 offset domain";
   if (read) return std::make_shared<ScalarType>(buffer->dtype_);
   const auto scalar = As<ScalarType>(args[2]->GetType());
@@ -544,7 +544,7 @@ REGISTER_OP("buffer.read")
     .set_ir_stage(OpIRStage::Buffer)
     .set_internal_only()
     .add_argument("src", "Source local Vec buffer")
-    .add_argument("indices", "Constant row and column inside the static active extent")
+    .add_argument("indices", "Proved in-range row and column inside the static active extent")
     .set_output_arity(1)
     .set_buffer_arg_effect(0, BufferAccess::Read, BufferAccess::Read)
     .set_buffer_non_memory_arg(1)
@@ -560,7 +560,7 @@ REGISTER_OP("buffer.write")
     .set_ir_stage(OpIRStage::Buffer)
     .set_internal_only()
     .add_argument("dst", "Destination local Vec buffer")
-    .add_argument("indices", "Constant row and column inside the static active extent")
+    .add_argument("indices", "Proved in-range row and column inside the static active extent")
     .add_argument("value", "Scalar with the destination element dtype")
     .set_output_arity(0)
     .set_buffer_arg_effect(0, BufferAccess::Write, BufferAccess::Read)

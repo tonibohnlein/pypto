@@ -188,7 +188,15 @@ class BufferIRVisitor : public IRVisitor {
       } else if (IsOp(call, "buffer.subview")) {
         RegisterSubviewWindow(op->var_, call, window->second);
       } else {
-        RegisterWindow(op->var_, window->second.root, window->second.offset, &window->second);
+        auto provenance = window->second;
+        const auto type = As<BufferType>(source->GetType());
+        // Equal descriptor byte counts do not make an inherited strided
+        // window contiguous. Retain this fact through subsequent relabels.
+        if (type && type->shape_.size() == 2) {
+          const auto pitch = static_cast<uint64_t>(type->shape_[1]) * type->dtype_.GetByte();
+          provenance.relabelled_strided |= provenance.row_pitch != pitch;
+        }
+        RegisterWindow(op->var_, provenance.root, provenance.offset, &provenance);
       }
     }
     if (As<ScalarType>(op->var_->GetType())) constants_[op->var_.get()] = ConstantAddress(op->value_);
@@ -233,13 +241,13 @@ class BufferIRVisitor : public IRVisitor {
         CheckPeerOperands(op);
         if (const auto* recipe = backend::FindBufferElementwiseRecipe(name)) CheckRecipeWindows(op, *recipe);
         if (IsOp(op, "buffer.read") || IsOp(op, "buffer.write")) {
-          // GetValue/SetValue flatten with the descriptor's column count. A
-          // narrow subview retains its parent's physical pitch, which the
-          // descriptor geometry alone cannot establish.
+          // The registry checks the native point layout. A narrow row-major
+          // subview retains its parent's pitch even through a later relabel.
           const auto type = As<BufferType>(op->args_[0]->GetType());
           const auto window = windows_.find(AsVarLike(op->args_[0]).get());
           const auto pitch = static_cast<uint64_t>(type->shape_[1]) * (type->dtype_.GetBit() / 8);
-          if (window == windows_.end() || window->second.row_pitch != pitch) {
+          if (window == windows_.end() || window->second.relabelled_strided ||
+              window->second.row_pitch != pitch) {
             Error("Scalar Buffer operations require dense physical row pitch", op->span_);
           }
         }
@@ -440,6 +448,7 @@ class BufferIRVisitor : public IRVisitor {
     uint64_t row_pitch;
     bool known_offset;
     const Var* borrow = nullptr;
+    bool relabelled_strided = false;
   };
 
   void CheckPeerOperands(const CallPtr& call) {
@@ -499,7 +508,8 @@ class BufferIRVisitor : public IRVisitor {
         static_cast<uint64_t>(view->shape_[0] - 1) * pitch + static_cast<uint64_t>(view->shape_[1]) * element,
         pitch,
         true,
-        source_window.borrow};
+        source_window.borrow,
+        source_window.relabelled_strided};
   }
 
   void RegisterWindow(const VarPtr& variable, const Var* root, uint64_t offset,
@@ -513,8 +523,13 @@ class BufferIRVisitor : public IRVisitor {
       // runtime-offset view. Keep its conservative bounds through relabels.
       const bool known_offset = !source_window || source_window->known_offset;
       const auto extent = known_offset ? *bytes : source_window->bytes;
-      windows_[variable.get()] =
-          Window{root, offset, extent, pitch, known_offset, source_window ? source_window->borrow : nullptr};
+      windows_[variable.get()] = Window{root,
+                                        offset,
+                                        extent,
+                                        pitch,
+                                        known_offset,
+                                        source_window ? source_window->borrow : nullptr,
+                                        source_window && source_window->relabelled_strided};
     }
   }
 

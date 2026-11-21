@@ -69,6 +69,16 @@ SSA for values, addresses or control. Carrier overwrite on a later visit also
 requires the existing causal reuse proof. Neither scalar native order nor closed
 notification matching establishes an unrelated payload's completion.
 
+The local scalar recipe also covers dense row-major FP32/INT32 tiles and
+packed FP32 column vectors on A2/A3 AIV. A signed runtime coordinate must stay
+inside the static valid extent at each use. The proof retains original
+integer widths and the visited range of a strided loop, including reverse
+scans. GetValue and SetValue take a uint32 element offset, so code generation
+uses the same checked layout strides as admission. A narrow subview keeps
+its inherited row pitch through relabelling. Full materialized padding may
+supply readable points. The synchronization planner encloses each local point
+in its storage window and treats a scalar write as a partial write.
+
 The implementation accepts only normalized direct assignments. A discarded or nested GM
 read, an effectful while predicate without an original statement cut, a write,
 a different dtype/core/target or unavailable source layout refuses. Do not hoist

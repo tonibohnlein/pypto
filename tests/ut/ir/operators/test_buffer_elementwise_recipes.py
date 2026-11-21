@@ -210,5 +210,23 @@ def test_transfer_types_do_not_implicitly_enable_arithmetic(suffix, dtype):
         _call(suffix, [_buffer(f"arg_{i}", dtype=dtype) for i in range(3)])
 
 
+@pytest.mark.parametrize("suffix", ["add", "mul"])
+@pytest.mark.parametrize("padded_operand", [0, 1, 2])
+def test_full_materialized_pad_preserves_native_elementwise_geometry(suffix, padded_operand):
+    args = [
+        _buffer(f"arg_{i}", pad=ir.PadValue.zero if i == padded_operand else ir.PadValue.null)
+        for i in range(3)
+    ]
+    assert isinstance(_call(suffix, args).type, ir.VoidType)
+
+
+@pytest.mark.parametrize("suffix", ["add", "mul"])
+@pytest.mark.parametrize("valid_shape", [[7, 32], [-1, 32]])
+def test_materialized_pad_does_not_qualify_partial_active_geometry(suffix, valid_shape):
+    args = [_buffer(f"arg_{i}", valid_shape=valid_shape, pad=ir.PadValue.zero) for i in range(3)]
+    with pytest.raises(ValueError, match="identical physical descriptors"):
+        _call(suffix, args)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

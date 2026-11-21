@@ -266,6 +266,21 @@ bool SupportsElementwiseDtype(const BufferElementwiseRecipe& recipe, DataType dt
   if (recipe.types == BufferElementwiseTypePolicy::DenseFillVec) return IsDenseBufferTransferDtype(dtype);
   return dtype == DataType::FP16 || dtype == DataType::FP32 || dtype == DataType::INT32;
 }
+
+bool SupportsFullPaddedOperand(const BufferElementwiseRecipe& recipe) {
+  return recipe.types == BufferElementwiseTypePolicy::MatchingVec;
+}
+
+bool MatchesFullPaddedGeometry(const ir::BufferTypePtr& a, const ir::BufferTypePtr& b) {
+  // For native add/mul a materialized pad is an ordinary value when all lanes
+  // are valid. Keep the full-valid and aligned row-major requirements on both
+  // operands. The native instructions require identical active extents.
+  const auto aligned_full = [](const ir::BufferTypePtr& type) {
+    return IsFullPaddedVec(type) ||
+           (IsAlignedDenseVecBufferGeometry(type) && type->valid_shape_ == type->shape_);
+  };
+  return aligned_full(a) && aligned_full(b) && a->shape_ == b->shape_ && a->dtype_ == b->dtype_;
+}
 }  // namespace
 
 bool SupportsLogicalBufferElementwise(const BufferElementwiseRecipe& recipe, const ir::CallPtr& call) {
@@ -287,7 +302,10 @@ bool SupportsLogicalBufferElementwise(const BufferElementwiseRecipe& recipe, con
   // geometry. A materialized pad value is already data in that geometry.
   const bool padded_exp =
       std::string_view(recipe.buffer_op) == "buffer.exp" && IsFullPaddedVec(destination, view);
-  if (!IsDenseVecBufferTile(destination, view) && !padded_exp) return false;
+  const bool padded_matching = SupportsFullPaddedOperand(recipe);
+  if (!IsDenseVecBufferTile(destination, view) && !padded_exp &&
+      !(padded_matching && IsFullPaddedVec(destination, view)))
+    return false;
   const auto& valid = view.valid_shape.empty() ? destination->shape_ : view.valid_shape;
   for (const auto& input : recipe.inputs) {
     if (input.logical_index >= call->args_.size()) return false;
@@ -319,6 +337,10 @@ bool SupportsLogicalBufferElementwise(const BufferElementwiseRecipe& recipe, con
       }
       const auto source_view = ir::tile_view_semantics::GetEffectiveTileView(*tile);
       if (padded_exp && source_view != view) return false;
+      if (padded_matching && (view.pad != ir::PadValue::null || source_view.pad != ir::PadValue::null) &&
+          !MatchesFullPaddedGeometry(StaticLogicalBufferDescriptor(tile, /*allow_full_pad=*/true),
+                                     StaticLogicalBufferDescriptor(destination, /*allow_full_pad=*/true)))
+        return false;
       const auto& source_valid = source_view.valid_shape.empty() ? tile->shape_ : source_view.valid_shape;
       if (valid.size() != source_valid.size()) return false;
       for (size_t i = 0; i < valid.size(); ++i) {
@@ -391,7 +413,12 @@ void ValidateBufferElementwiseOperands(const BufferElementwiseRecipe& recipe,
           << recipe.buffer_op
           << " runtime column elementwise operands require a qualified row-major axis interpretation";
     }
-    CHECK(ir::structural_equal(descriptor, buffer))
+    const bool padded_matching =
+        SupportsFullPaddedOperand(recipe) &&
+        (descriptor->pad_ != ir::PadValue::null || buffer->pad_ != ir::PadValue::null);
+    const bool compatible = padded_matching ? MatchesFullPaddedGeometry(descriptor, buffer)
+                                            : ir::structural_equal(descriptor, buffer);
+    CHECK(compatible)
         << recipe.buffer_op
         << " requires identical physical descriptors, including valid shape, layout and padding";
   }

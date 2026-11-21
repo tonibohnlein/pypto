@@ -26,23 +26,33 @@
 #include "pypto/ir/transforms/structural_comparison.h"
 
 namespace pypto::backend {
-std::optional<uint32_t> BufferScalarPointOffset(const ir::BufferTypePtr& buffer, const ir::ExprPtr& indices) {
-  if (!IsAlignedDenseVecBufferGeometry(buffer) ||
+std::optional<BufferScalarPointLayout> GetBufferScalarPointLayout(const ir::BufferTypePtr& buffer,
+                                                                  const ir::ExprPtr& indices) {
+  const bool column = IsColumnVectorBuffer(buffer);
+  if ((!column && !IsAlignedDenseVecBuffer(buffer) && !IsFullPaddedVec(buffer)) ||
       (buffer->dtype_ != DataType::FP32 && buffer->dtype_ != DataType::INT32))
     return std::nullopt;
   const auto tuple = ir::As<ir::MakeTuple>(indices);
   if (!tuple || tuple->elements_.size() != 2) return std::nullopt;
-  int64_t point[2];
   for (size_t axis = 0; axis < 2; ++axis) {
-    const auto index = ir::As<ir::ConstInt>(tuple->elements_[axis]);
-    if (!index || index->value_ < 0 || buffer->valid_shape_[axis] < 0 ||
-        index->value_ >= buffer->valid_shape_[axis])
+    const auto& coordinate = tuple->elements_[axis];
+    const auto type = coordinate ? ir::As<ir::ScalarType>(coordinate->GetType()) : nullptr;
+    const auto index = ir::As<ir::ConstInt>(coordinate);
+    if (!type || (type->dtype_ != DataType::INDEX && !type->dtype_.IsSignedInt()) ||
+        (index && (index->value_ < 0 || index->value_ >= buffer->valid_shape_[axis])))
       return std::nullopt;
-    point[axis] = index->value_;
   }
-  const __int128 flat = __int128(point[0]) * buffer->shape_[1] + point[1];
+  const BufferScalarPointLayout layout =
+      column ? BufferScalarPointLayout{1, buffer->shape_[0]} : BufferScalarPointLayout{buffer->shape_[1], 1};
+  // Constant axes can retain the original point-sized bound even when the
+  // rest of the descriptor does not fit the offset field.
+  const auto high = [&](size_t axis) {
+    const auto index = ir::As<ir::ConstInt>(tuple->elements_[axis]);
+    return index ? index->value_ : buffer->valid_shape_[axis] - 1;
+  };
+  const __int128 flat = __int128(high(0)) * layout.row_stride + __int128(high(1)) * layout.col_stride;
   if (flat > std::numeric_limits<uint32_t>::max()) return std::nullopt;
-  return static_cast<uint32_t>(flat);
+  return layout;
 }
 
 bool IsBufferScalarGMSource(const ir::TensorTypePtr& tensor) {
@@ -188,14 +198,14 @@ bool SupportsLogicalBufferScalar(const ir::CallPtr& call) {
     return false;
   for (const auto& arg : call->args_)
     if (!arg) return false;
-  const auto descriptor = StaticLogicalBufferDescriptor(call->args_[0]->GetType());
-  if (!BufferScalarPointOffset(descriptor, call->args_[1])) return false;
+  const auto descriptor = StaticLogicalBufferDescriptor(call->args_[0]->GetType(), /*allow_full_pad=*/true);
+  if (!GetBufferScalarPointLayout(descriptor, call->args_[1])) return false;
   if (read) {
     const auto scalar = ir::As<ir::ScalarType>(call->GetType());
     return scalar && scalar->dtype_ == descriptor->dtype_;
   }
   const auto scalar = ir::As<ir::ScalarType>(call->args_[2]->GetType());
-  const auto result = StaticLogicalBufferDescriptor(call->GetType());
+  const auto result = StaticLogicalBufferDescriptor(call->GetType(), /*allow_full_pad=*/true);
   return scalar && scalar->dtype_ == descriptor->dtype_ && result && ir::structural_equal(descriptor, result);
 }
 
@@ -203,8 +213,8 @@ bool LogicalScalarWriteSharesStorage(const ir::CallPtr& call, const ir::TypePtr&
   if (!SupportsLogicalBufferScalar(call) || !ir::IsOp(call, "tile.write")) return false;
   const auto source = ir::As<ir::TileType>(call->args_[0]->GetType());
   const auto result = ir::As<ir::TileType>(result_type);
-  const auto source_descriptor = StaticLogicalBufferDescriptor(source);
-  const auto result_descriptor = StaticLogicalBufferDescriptor(result);
+  const auto source_descriptor = StaticLogicalBufferDescriptor(source, /*allow_full_pad=*/true);
+  const auto result_descriptor = StaticLogicalBufferDescriptor(result, /*allow_full_pad=*/true);
   if (!source_descriptor || !result_descriptor || !ir::structural_equal(source_descriptor, result_descriptor))
     return false;
   const auto a = source ? source->memref_.value_or(nullptr) : nullptr;

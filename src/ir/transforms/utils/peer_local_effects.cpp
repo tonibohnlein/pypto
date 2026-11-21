@@ -1032,9 +1032,12 @@ class LaneImporter {
     const auto stop = Bounds(loop->stop_);
     const auto step = Bounds(loop->step_);
     const auto maximum = SyncCoordinateMaximum(loop->loop_var_);
-    CHECK_SPAN(start && stop && step && step->first > 0 && maximum && start->second <= *maximum &&
-                   stop->second <= *maximum && step->second <= *maximum &&
-                   (__int128(stop->second) - 1 + step->second <= *maximum),
+    const bool original_bounds = start && stop && step && step->first > 0 && maximum &&
+                                 start->second <= *maximum && stop->second <= *maximum &&
+                                 step->second <= *maximum &&
+                                 __int128(stop->second) - 1 + step->second <= *maximum;
+    CHECK_SPAN(Ready(loop->start_) && Ready(loop->stop_) && Ready(loop->step_) &&
+                   (original_bounds || (footprint_ && ranges_.HasSafeNonnegativeLoopBounds(loop.get()))),
                loop->span_)
         << "Peer runtime work loop requires ready nonnegative bounds and a proved positive, bounded stride";
   }
@@ -1144,6 +1147,8 @@ class LaneImporter {
       }
       return;
     }
+    CHECK_SPAN(!As<IfStmt>(statement), statement->span_)
+        << "Peer local planning needs an effect summary for this conditional region";
     const auto assignment = As<AssignStmt>(statement);
     const auto result = assignment ? assignment->var_ : nullptr;
     const auto call = GetCallFromStmt(statement);
@@ -1226,7 +1231,8 @@ class LaneImporter {
 }  // namespace
 
 PeerLocalEffects ImportPeerLocalEffects(const FunctionPtr& function, const PeerTransportEffects& transport,
-                                        const std::string& target, const SyncParameterBounds& parameters) {
+                                        const std::string& target, const SyncParameterBounds& parameters,
+                                        const std::optional<SyncDispatchCoordinates>& dispatch) {
   backend::RequireLocalSyncExecutionContract(target);
   CHECK(function &&
         (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV) &&
@@ -1243,7 +1249,7 @@ PeerLocalEffects ImportPeerLocalEffects(const FunctionPtr& function, const PeerT
   }
   const SyncControlRangeProver ranges(
       function, parameters, std::nullopt,
-      !buffer_ir && function->func_type_ == FunctionType::AIV ? RuntimeValidOperands : nullptr);
+      !buffer_ir && function->func_type_ == FunctionType::AIV ? RuntimeValidOperands : nullptr, dispatch);
   const auto footprint = buffer_ir ? std::make_unique<SyncFootprintResolver>(function, &ranges, true, target,
                                                                              /*resolve_peer_slots=*/true)
                                    : nullptr;

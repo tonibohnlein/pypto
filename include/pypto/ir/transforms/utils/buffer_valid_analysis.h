@@ -51,6 +51,17 @@ inline bool NeedsRuntimeBufferValid(const TypePtr& type) {
   return false;
 }
 
+inline bool HasFullStaticVecExtract(const CallPtr& call) {
+  if (!IsOp(call, "tile.extract") || call->args_.size() != 4) return false;
+  const auto source = backend::StaticLogicalBufferDescriptor(call->args_[0]->GetType(),
+                                                             /*allow_full_pad=*/true);
+  const auto target = backend::StaticLogicalBufferDescriptor(call->GetType());
+  // The selector handles offsets, pitch and layout. The data lowerer restores
+  // a shared handle before this extraction and types both native views with
+  // their full static extents. Unrelated runtime-valid handles are harmless.
+  return source && target && source->valid_shape_ == source->shape_ && target->valid_shape_ == target->shape_;
+}
+
 // Data consumers restore their logical operands' metadata; old SSA aliases
 // therefore remain usable after a setter. This bounded scan rejects operations
 // whose dynamic descriptors still have no conversion recipe. Region storage
@@ -118,8 +129,9 @@ class BufferValidAnalysis : public IRVisitor {
     }
     if ((IsOp(call, "tile.reshape") && !vector_reshape && !HasIndependentStaticReshape(call)) ||
         IsOp(call, "tile.reinterpret_view") || IsOp(call, "tile.assemble") || IsOp(call, "tile.move") ||
-        IsOp(call, "tile.extract") || IsOp(call, "tile.transpose_view") || IsOp(call, "tile.matmul") ||
-        IsOp(call, "tile.matmul_acc") || IsOp(call, "tile.transpose")) {
+        (IsOp(call, "tile.extract") && (!HasFullStaticVecExtract(call) || views_.IsWindow(call->args_[0]))) ||
+        IsOp(call, "tile.transpose_view") || IsOp(call, "tile.matmul") || IsOp(call, "tile.matmul_acc") ||
+        IsOp(call, "tile.transpose")) {
       restricted_ = true;
     }
     if (restricted_ && !restricted_operation_) {

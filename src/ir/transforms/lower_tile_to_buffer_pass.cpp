@@ -1160,7 +1160,7 @@ class TileToBufferMutator : public IRMutator {
     const auto* axis_recipe = backend::FindLogicalBufferAxisRecipe(call->op_->name_);
     const bool guarded_axis_op = axis_recipe && backend::SupportsLogicalBufferAxis(*axis_recipe, call);
     const bool data_operation = guarded_axis_op || store || IsOp(call, "tile.load") ||
-                                IsOp(call, "tile.move") ||
+                                IsOp(call, "tile.move") || HasFullStaticVecExtract(call) ||
                                 backend::FindLogicalBufferElementwiseRecipe(call) || guarded_conversion;
     if (!data_operation || (!store && !result)) {
       return WithValidState(call, result, LowerCall(call, result));
@@ -1326,7 +1326,7 @@ class TileToBufferMutator : public IRMutator {
                   ->GetPtoTargetArch() == "a2a3";
       CHECK_SPAN(core_ == FunctionType::AIV && scalar_target && backend::SupportsLogicalBufferScalar(call),
                  call->span_)
-          << "LowerTileToBuffer: scalar access needs a qualified A2/A3 AIV static Vec point";
+          << "LowerTileToBuffer: scalar access needs a qualified A2/A3 AIV Vec point";
       const bool read = IsOp(call, "tile.read");
       CHECK_SPAN(!read || result, call->span_)
           << "LowerTileToBuffer: scalar reads require an original SSA result";
@@ -1789,11 +1789,16 @@ class TileToBufferMutator : public IRMutator {
           << "Internal error: tile.extract requires source, offsets, shape and a result";
       const auto& entry = OpRegistry::GetInstance().GetEntry(call->op_->name_);
       ValidateKwargs(call->kwargs_, entry.GetOp()->GetAttrs(), call->op_->name_);
-      // The static window shape already selected the destination descriptor.
-      return Operation(
-          "buffer.extract",
-          {Handle(call->args_[0]), VisitExpr(call->args_[1]), VisitExpr(call->args_[2]), Handle(result)},
-          call->span_);
+      std::vector<StmtPtr> definitions;
+      const bool static_vec = HasFullStaticVecExtract(call);
+      // A static Vec extract may reuse a handle whose metadata is mutable.
+      // LowerDefinition has restored that state before these views execute.
+      const auto source = static_vec ? WindowHandle(call->args_[0], definitions) : Handle(call->args_[0]);
+      const auto destination = static_vec ? WindowHandle(result, definitions) : Handle(result);
+      definitions.push_back(Operation(
+          "buffer.extract", {source, VisitExpr(call->args_[1]), VisitExpr(call->args_[2]), destination},
+          call->span_));
+      return SeqStmts::Flatten(definitions, call->span_);
     }
     std::vector<std::pair<std::string, std::any>> matrix_kwargs;
     if (IsOp(call, "tile.matmul") || IsOp(call, "tile.matmul_acc")) {

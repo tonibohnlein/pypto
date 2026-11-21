@@ -300,7 +300,8 @@ class ClosedCommands:
                     self.storage[args[target]][2],
                     self.storage[args[target]][3],
                 )
-            pipe, reads, writes = ir.PipeType.MTE1, self.bytes(args[0], rect), self.bytes(args[target])
+            pipe = ir.PipeType.V if args[0].type.memory_space == ir.MemorySpace.Vec else ir.PipeType.MTE1
+            reads, writes = self.bytes(args[0], rect), self.bytes(args[target])
             signature = name, self.signature(args[0]), rect, self.signature(args[target])
         elif name == opname("buffer.full"):
             # The initialization writes its current active destination; its
@@ -321,7 +322,10 @@ class ClosedCommands:
             pipe = ir.PipeType.V
             reads, writes = self.bytes(args[0]), self.bytes(args[2])
             signature = name, self.signature(args[0]), value(args[1], env), self.signature(args[2])
-        elif name == opname("buffer.cast"):
+        elif name in (opname("buffer.cast"), opname("buffer.fillpad")):
+            # FillPad reads the live rectangle and defines the whole destination,
+            # including the materialized pad. The active-row interpreter supplies
+            # the exact current source extent from native metadata statements.
             pipe = ir.PipeType.V
             reads, writes = self.bytes(args[0]), self.bytes(args[1])
             signature = name, self.signature(args[0]), self.signature(args[1]), tuple(call.kwargs.items())

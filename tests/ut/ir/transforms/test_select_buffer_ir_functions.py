@@ -22,6 +22,8 @@ from pypto.language.parser.diagnostics import ParserTypeError
 from pypto.pypto_core import codegen
 from pypto.pypto_core import ir as core_ir
 
+from .test_runtime_valid_broadcast import check_runtime_commands
+
 pytestmark = pytest.mark.usefixtures("ascend_backend")
 
 _PLANNERS = [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP, passes.MemoryPlanner.PTOAS]
@@ -884,6 +886,118 @@ class BfloatMinPad:
 
 
 @pytest.mark.ptoas_compile
+@pytest.mark.parametrize("operation", ["add", "mul"])
+def test_full_binary_with_materialized_zero_tail_keeps_full_native_footprint(operation, tmp_path):
+    def program(materialize):
+        operand = "pl.fillpad(partial, pad_value=pl.PadValue.zero)" if materialize else "partial"
+        return pl.parse_program(f"""
+@pl.program
+class TailArithmetic:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, full: pl.Tensor[[16, 32], pl.FP32], tail: pl.Tensor[[16, 32], pl.FP32],
+               rows: pl.Scalar[pl.INDEX], out: pl.Out[pl.Tensor[[16, 32], pl.FP32]]
+               ) -> pl.Tensor[[16, 32], pl.FP32]:
+        lhs = pl.load(full, [0, 0], [16, 32])
+        partial = pl.load(tail, [0, 0], [16, 32], valid_shape=[rows, 32])
+        rhs = {operand}
+        return pl.store(pl.tile.{operation}(lhs, rhs), [0, 0], out)
+""")
+
+    refused = _kernel(_lower(program(False), passes.MemoryPlanner.PYPTO))
+    assert refused.ir_stage == ir.FunctionIRStage.Functional
+    assert refused.attrs["buffer_admission_operation"] == f"tile.{operation}"
+
+    authored = program(True)
+    original = _lower(authored, passes.MemoryPlanner.PYPTO)
+    with passes.PassContext([], autosync_policy="conservative_prefix"):
+        logical = passes.insert_sync()(original)
+    lowered = _run_autosync(authored)
+    text = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True, emit_source_loc=False)
+    assert "pto.tfillpad" in text and f"pto.t{operation}" in text and "pto.tstore" in text
+    _compile_dynamic_state_native(lowered, tmp_path, passes.MemoryPlanner.PYPTO)
+
+    namespace = {}
+    exec(torch_codegen(lowered), namespace)  # noqa: S102
+    lhs = torch.randn(16, 32)
+    for rows in (0, 1, 13, 16):
+        rhs = torch.rand_like(lhs)
+        rhs[rows:] = torch.nan
+        output = torch.empty_like(lhs)
+        namespace["kernel"](lhs, rhs, rows, output)
+        rhs[rows:] = 0
+        torch.testing.assert_close(output, _VECTOR[operation](lhs, rhs))
+        check_runtime_commands(_kernel(logical), _kernel(lowered), {2: rows})
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize("pitch,selected", [(32, True), (64, False)])
+def test_static_valid_cast_accepts_dense_window_and_preserves_physical_pitch(pitch, selected, tmp_path):
+    program = pl.parse_program(f"""
+@pl.program
+class WindowCast:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, source: pl.Tensor[[16, {pitch}], pl.FP32],
+               out: pl.Out[pl.Tensor[[16, 32], pl.BF16]]) -> pl.Tensor[[16, 32], pl.BF16]:
+        whole = pl.load(source, [0, 0], [16, {pitch}])
+        for row in pl.range(16):
+            window = pl.tile.slice(whole, [1, 32], [row, 0])
+            converted = pl.tile.cast(window, target_type=pl.BF16)
+            out = pl.store(converted, [row, 0], out)
+        return out
+""")
+    if not selected:
+        refused = _kernel(_lower(program, passes.MemoryPlanner.PYPTO))
+        assert refused.ir_stage == ir.FunctionIRStage.Functional
+        assert refused.attrs["buffer_admission_operation"] == "tile.cast"
+        return
+
+    lowered = _run_autosync(program)
+    text = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True, emit_source_loc=False)
+    assert "pto.subview" in text and "pto.tcvt" in text
+    _compile_dynamic_state_native(lowered, tmp_path, passes.MemoryPlanner.PYPTO)
+    namespace = {}
+    exec(torch_codegen(lowered), namespace)  # noqa: S102
+    source = torch.randn(16, pitch)
+    output = torch.empty(16, 32, dtype=torch.bfloat16)
+    namespace["kernel"](source, output)
+    torch.testing.assert_close(output, source.bfloat16())
+
+
+@pytest.mark.ptoas_compile
+def test_static_vec_extract_coexists_with_runtime_valid_load(tmp_path):
+    program = pl.parse_program("""
+@pl.program
+class ExtractPaddedRows:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, source: pl.Tensor[[16, 64], pl.FP32], rows: pl.Scalar[pl.INDEX],
+               out: pl.Out[pl.Tensor[[16, 32], pl.FP32]]) -> pl.Tensor[[16, 32], pl.FP32]:
+        partial = pl.load(source, [0, 0], [16, 64], valid_shape=[rows, 64])
+        padded = pl.fillpad(partial, pad_value=pl.PadValue.zero)
+        for row in pl.range(16):
+            if row < rows:
+                patch = pl.tile.extract(padded, row, 32, [1, 32], target_memory=pl.Mem.Vec)
+                out = pl.store(patch, [row, 0], out)
+        return out
+""")
+    original = _lower(program, passes.MemoryPlanner.PYPTO)
+    with passes.PassContext([], autosync_policy="conservative_prefix"):
+        logical = passes.insert_sync()(original)
+    lowered = _run_autosync(program)
+    text = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True, emit_source_loc=False)
+    assert "pto.set_validshape" in text and "pto.textract" in text
+    _compile_dynamic_state_native(lowered, tmp_path, passes.MemoryPlanner.PYPTO)
+    namespace = {}
+    exec(torch_codegen(lowered), namespace)  # noqa: S102
+    source = torch.randn(16, 64)
+    for rows in (0, 3, 16):
+        output = torch.full((16, 32), -123.0)
+        namespace["kernel"](source, rows, output)
+        torch.testing.assert_close(output[:rows], source[:rows, 32:])
+        assert torch.all(output[rows:] == -123.0)
+        check_runtime_commands(_kernel(logical), _kernel(lowered), {1: rows})
+
+
+@pytest.mark.ptoas_compile
 @pytest.mark.parametrize(
     "adjust,unknown_stride,selected",
     [(8, False, True), (0, False, False), (9, False, False), (8, True, False)],
@@ -913,6 +1027,40 @@ class MinimumPrefix:
         text = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True, emit_source_loc=False)
         assert "pto.tfillpad" in text and "pad=3" in text and "pto.set_validshape" in text
         _compile_dynamic_state_native(lowered, tmp_path, passes.MemoryPlanner.PYPTO)
+
+
+@pytest.mark.parametrize(
+    "limit, predicate, selected",
+    [
+        pytest.param(32, "columns > 0", True, id="exact-positive-observation"),
+        pytest.param(33, "columns > 0", False, id="cap-exceeds-capacity"),
+        pytest.param(32, "columns >= 0", False, id="zero-still-possible"),
+        pytest.param(32, "remaining > 0", False, id="guard-different-ssa"),
+    ],
+)
+def test_minimum_fillpad_uses_guarded_observed_width(limit, predicate, selected):
+    program = pl.parse_program(f"""
+@pl.program
+class GuardedWidth:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, source: pl.Tensor[[16, 32], pl.FP32], remaining: pl.Scalar[pl.INDEX],
+               origin: pl.Scalar[pl.INDEX],
+               output: pl.InOut[pl.Tensor[[16, 1], pl.FP32]]) -> pl.Tensor[[16, 1], pl.FP32]:
+        columns = pl.min({limit}, remaining - origin)
+        if {predicate}:
+            src = pl.load(source, [0, 0], [16, 32])
+            prefix = pl.set_validshape(src, 16, columns)
+            padded = pl.fillpad(prefix, pad_value=pl.PadValue.min)
+            scratch = pl.tile.create([16, 32], dtype=pl.FP32)
+            maximum = pl.row_max(padded, scratch)
+            output = pl.store(maximum, [0, 0], output)
+        return output
+""")
+    lowered = _lower(program, passes.MemoryPlanner.PYPTO)
+    assert (_kernel(lowered).ir_stage == ir.FunctionIRStage.Buffer) is selected
+    if selected:
+        text = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True, emit_source_loc=False)
+        assert "pto.tfillpad" in text and "pto.set_validshape" in text
 
 
 @pytest.mark.ptoas_compile
@@ -1596,6 +1744,34 @@ class WindowAlignment:
 """)
     expected = ir.FunctionIRStage.Buffer if offset_kind == "aligned" else ir.FunctionIRStage.Functional
     assert _kernel(_lower(program, planner)).ir_stage == expected
+
+
+@pytest.mark.parametrize("rows,col,selected", [(1, 0, True), (1, 8, True), (1, 1, False), (2, 0, False)])
+def test_assemble_narrow_row_requires_alignment_and_no_inter_row_stride(rows, col, selected):
+    program = pl.parse_program(f"""
+@pl.program
+class NarrowRowAssemble:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, x: pl.Tensor[[{rows}, 8], pl.FP32],
+               out: pl.Out[pl.Tensor[[8, 16], pl.FP32]]) -> pl.Tensor[[8, 16], pl.FP32]:
+        source = pl.load(x, [0, 0], [{rows}, 8])
+        canvas = pl.tile.full([8, 16], dtype=pl.FP32, value=-3.402823e38)
+        value = pl.tile.assemble(canvas, source, [0, {col}])
+        return pl.store(value, [0, 0], out)
+""")
+    lowered = _lower(program, passes.MemoryPlanner.PYPTO)
+    if not selected:
+        assert _kernel(lowered).ir_stage == ir.FunctionIRStage.Functional
+        assert _kernel(lowered).attrs["buffer_admission_property"] == "window_geometry"
+        return
+    assert _kernel(lowered).ir_stage == ir.FunctionIRStage.Buffer
+    assert "buffer.copy" in lowered.as_python()
+    with passes.PassContext([], autosync_policy="conservative_prefix", autosync_disjoint_gm=True):
+        logical = passes.insert_sync()(lowered)
+    with passes.PassContext([]):
+        physical = passes.lower_sync()(logical)
+    text = codegen.PTOCodegen().generate(physical, emit_tile_addr=True, emit_source_loc=False)
+    assert "pto.tmov ins(" in text
 
 
 @pytest.mark.parametrize("planner", _PLANNERS)

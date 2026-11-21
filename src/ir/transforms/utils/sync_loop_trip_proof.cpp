@@ -92,10 +92,12 @@ ExprPtr MakeConstInt(int64_t val, DataType dtype, const Span& span = Span::unkno
 class SyncControlRangeProver::Impl {
  public:
   Impl(const FunctionPtr& function, const SyncParameterBounds& parameters,
-       const std::optional<std::pair<int64_t, int64_t>>& blocks, ScalarBoundOperands scalar_bound_operands)
+       const std::optional<std::pair<int64_t, int64_t>>& blocks, ScalarBoundOperands scalar_bound_operands,
+       const std::optional<SyncDispatchCoordinates>& dispatch)
       : function_(function),
         parameters_(parameters),
         blocks_(blocks),
+        dispatch_(dispatch),
         scalar_bound_operands_(scalar_bound_operands) {
     if (!function || !function->body_) return;
     analyzer_ = std::make_shared<arith::Analyzer>();
@@ -128,6 +130,11 @@ class SyncControlRangeProver::Impl {
   bool IsAtMostOneTrip(const ForStmt* loop) const {
     const auto it = loop_proofs_.find(loop);
     return it != loop_proofs_.end() && it->second.is_at_most_one_trip;
+  }
+
+  bool HasSafeNonnegativeLoopBounds(const ForStmt* loop) const {
+    const auto it = loop_proofs_.find(loop);
+    return it != loop_proofs_.end() && !ambiguous_cuts_.count(loop) && it->second.has_safe_bounds;
   }
 
   bool IsPositiveTripCompatible(const ForStmt* loop) const {
@@ -243,6 +250,7 @@ class SyncControlRangeProver::Impl {
   struct LoopProof {
     bool is_positive_trip = false;
     bool is_at_most_one_trip = false;
+    bool has_safe_bounds = false;
   };
 
   struct Cut {
@@ -293,7 +301,11 @@ class SyncControlRangeProver::Impl {
   FunctionPtr function_;
   SyncParameterBounds parameters_;
   std::optional<std::pair<int64_t, int64_t>> blocks_;
+  std::optional<SyncDispatchCoordinates> dispatch_;
   ScalarBoundOperands scalar_bound_operands_;
+
+  enum class DispatchValue { Unknown, Index, Width };
+  std::unordered_map<const Var*, DispatchValue> dispatch_values_;
 
   arith::AnalyzerPtr analyzer_;
   std::unordered_set<const Var*> ready_;
@@ -432,6 +444,27 @@ class SyncControlRangeProver::Impl {
     }
   }
 
+  DispatchValue DispatchOrigin(const ExprPtr& expression) const {
+    auto value = expression;
+    while (const auto cast = As<Cast>(value)) {
+      value = cast->operand_;
+    }
+    if (const auto var = AsVarLike(value)) {
+      const auto found = dispatch_values_.find(var.get());
+      return found == dispatch_values_.end() ? DispatchValue::Unknown : found->second;
+    }
+    const auto call = As<Call>(value);
+    if (call && call->args_.empty() && call->kwargs_.empty() && call->attrs_.empty()) {
+      if (IsOp(call, "buffer.get_block_idx") || IsOp(call, "tile.get_block_idx")) {
+        return DispatchValue::Index;
+      }
+      if (IsOp(call, "buffer.get_block_num") || IsOp(call, "tile.get_block_num")) {
+        return DispatchValue::Width;
+      }
+    }
+    return DispatchValue::Unknown;
+  }
+
   std::optional<Bound128> BoundNonOverflowingScalar(
       const ExprPtr& expr, arith::Analyzer& az, const std::unordered_set<const Var*>& ready_set,
       std::unordered_map<const Expr*, std::optional<Bound128>>& cache) const {
@@ -459,7 +492,12 @@ class SyncControlRangeProver::Impl {
         }
       }
     } else if (const auto call = As<Call>(expr)) {
-      if (IsOp(call, "buffer.get_block_idx") && call->args_.empty()) {
+      const auto origin = dispatch_ ? DispatchOrigin(expr) : DispatchValue::Unknown;
+      if (origin == DispatchValue::Index) {
+        result = ClampToType(expr, 0, dispatch_->block_count.second - 1);
+      } else if (origin == DispatchValue::Width) {
+        result = ClampToType(expr, dispatch_->block_count.first, dispatch_->block_count.second);
+      } else if (IsOp(call, "buffer.get_block_idx") && call->args_.empty()) {
         if (blocks_) {
           result = ClampToType(expr, blocks_->first, blocks_->second);
         } else {
@@ -493,7 +531,13 @@ class SyncControlRangeProver::Impl {
         } else if (As<Sub>(expr)) {
           __int128 lo128 = alo - bhi;
           __int128 hi128 = ahi - blo;
-          if (az.CanProve(MakeGt(binary->left_, binary->right_))) {
+          // These operands have already passed the original machine-width
+          // checks, including any intervening casts. Intersect the independent
+          // bounds with the logical dispatch relation, without sampling lanes.
+          if (dispatch_ && DispatchOrigin(binary->left_) == DispatchValue::Width &&
+              DispatchOrigin(binary->right_) == DispatchValue::Index) {
+            lo128 = std::max<__int128>(lo128, 1);
+          } else if (az.CanProve(MakeGt(binary->left_, binary->right_))) {
             lo128 = std::max<__int128>(lo128, 1);
           } else if (az.CanProve(MakeGe(binary->left_, binary->right_))) {
             lo128 = std::max<__int128>(lo128, 0);
@@ -1128,6 +1172,14 @@ class SyncControlRangeProver::Impl {
       if (param) var_def_scope_[param.get()] = 0;
     }
     BindRoot(*analyzer_, ready_);
+    if (dispatch_) {
+      for (const auto index : dispatch_->width_parameters) {
+        const auto& parameter = function_->params_.at(index);
+        analyzer_->const_int_bound.Update(parameter,
+                                          {dispatch_->block_count.first, dispatch_->block_count.second});
+        dispatch_values_.emplace(parameter.get(), DispatchValue::Width);
+      }
+    }
     const auto remember_root = [&](const VarPtr& var) {
       if (var && ready_.count(var.get())) {
         root_bindings_.try_emplace(var.get(), analyzer_->const_int_bound(var));
@@ -1176,6 +1228,9 @@ class SyncControlRangeProver::Impl {
           ready_.insert(assign->var_.get());
           no_ov_expr = assign->value_;
           non_overflow_ssa_.insert(assign->var_.get());
+          if (dispatch_ && scalar && scalar->dtype_ == GetScalarDtype(assign->value_)) {
+            dispatch_values_.emplace(assign->var_.get(), DispatchOrigin(assign->value_));
+          }
           analyzer_->Bind(assign->var_, assign->value_);
           analyzer_->const_int_bound.Update(assign->var_, ToConstIntBound(*b));
         }
@@ -1274,6 +1329,12 @@ class SyncControlRangeProver::Impl {
         stop_b = BoundNonOverflowingScalar(loop->stop_, *analyzer_, ready_, cache);
 
         if (step_b && step_b->lo >= 1 && start_b && stop_b) {
+          // Check the increment after the last executed iteration as well as
+          // the values initially assigned to the loop's native coordinate.
+          const auto maximum = SyncCoordinateMaximum(loop->loop_var_);
+          proof.has_safe_bounds = maximum && start_b->lo >= 0 && stop_b->lo >= 0 && start_b->hi <= *maximum &&
+                                  stop_b->hi <= *maximum && step_b->hi <= *maximum &&
+                                  stop_b->hi - 1 + step_b->hi <= *maximum;
           // 1. Positive-trip proof (>= 1 trip).
           if (start_b->hi < stop_b->lo) {
             proof.is_positive_trip = true;
@@ -1396,8 +1457,9 @@ class SyncControlRangeProver::Impl {
 SyncControlRangeProver::SyncControlRangeProver(const FunctionPtr& function,
                                                const SyncParameterBounds& parameters,
                                                const std::optional<std::pair<int64_t, int64_t>>& blocks,
-                                               ScalarBoundOperands scalar_bound_operands)
-    : impl_(std::make_unique<Impl>(function, parameters, blocks, scalar_bound_operands)) {}
+                                               ScalarBoundOperands scalar_bound_operands,
+                                               const std::optional<SyncDispatchCoordinates>& dispatch)
+    : impl_(std::make_unique<Impl>(function, parameters, blocks, scalar_bound_operands, dispatch)) {}
 
 SyncControlRangeProver::~SyncControlRangeProver() = default;
 SyncControlRangeProver::SyncControlRangeProver(SyncControlRangeProver&&) noexcept = default;
@@ -1413,6 +1475,10 @@ bool SyncControlRangeProver::IsPositiveTrip(const ForStmt* loop) const {
 
 bool SyncControlRangeProver::IsAtMostOneTrip(const ForStmt* loop) const {
   return impl_ && impl_->IsAtMostOneTrip(loop);
+}
+
+bool SyncControlRangeProver::HasSafeNonnegativeLoopBounds(const ForStmt* loop) const {
+  return impl_ && impl_->HasSafeNonnegativeLoopBounds(loop);
 }
 
 bool SyncControlRangeProver::IsPositiveTripCompatible(const ForStmt* loop) const {

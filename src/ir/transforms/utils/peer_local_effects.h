@@ -23,6 +23,7 @@
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
+#include "src/ir/transforms/utils/sync_loop_trip_proof.h"
 
 namespace pypto::ir::sync {
 
@@ -63,7 +64,8 @@ struct PeerLocalEffects {
 // ValueError if any effective path, operation or placement is unqualified.
 PeerLocalEffects ImportPeerLocalEffects(const FunctionPtr& function,
                                         const cross_core_pipe::PeerTransportEffects& transport,
-                                        const std::string& target, const SyncParameterBounds& parameters);
+                                        const std::string& target, const SyncParameterBounds& parameters,
+                                        const std::optional<SyncDispatchCoordinates>& dispatch);
 
 }  // namespace pypto::ir::sync
 

@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -52,6 +53,14 @@ struct SyncControlRangeWork {
   size_t fallback_definitions = 0;
 };
 
+// Original scalar formals that equal the actual positive launch width at
+// every invocation. The same ABI gives each participating endpoint a logical
+// block index in [0, block_count).
+struct SyncDispatchCoordinates {
+  std::pair<int64_t, int64_t> block_count;
+  std::set<size_t> width_parameters;
+};
+
 // Shared non-wrapping __int128 range and trip-count prover for synchronization
 // consumers (SyncFootprintResolver, ConservativeSyncDataflow, ClosedPrefixSync).
 // Footprint operands are analyzed at the original cuts in a single scoped walk.
@@ -67,7 +76,8 @@ class SyncControlRangeProver {
 
   explicit SyncControlRangeProver(const FunctionPtr& function, const SyncParameterBounds& parameters = {},
                                   const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt,
-                                  ScalarBoundOperands scalar_bound_operands = nullptr);
+                                  ScalarBoundOperands scalar_bound_operands = nullptr,
+                                  const std::optional<SyncDispatchCoordinates>& dispatch = std::nullopt);
   ~SyncControlRangeProver();
   SyncControlRangeProver(SyncControlRangeProver&&) noexcept;
   SyncControlRangeProver& operator=(SyncControlRangeProver&&) noexcept;
@@ -78,6 +88,9 @@ class SyncControlRangeProver {
   bool IsPositiveTrip(const ForStmt* loop) const;
   // True iff `loop` is proved to execute <= 1 iteration on every entry (0 or 1 trip).
   bool IsAtMostOneTrip(const ForStmt* loop) const;
+  // Proved ready nonnegative start and stop, positive stride, and a final
+  // induction increment representable in the original coordinate type.
+  bool HasSafeNonnegativeLoopBounds(const ForStmt* loop) const;
 
   // Matches `loop` directly or, when `loop` is a realization clone, an original
   // ForStmt with identical loop_var_ and structurally equal bounds.

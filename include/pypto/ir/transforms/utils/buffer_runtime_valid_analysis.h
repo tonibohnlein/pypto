@@ -68,6 +68,10 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     }
   }
   const std::optional<Issue>& issue() const { return issue_; }
+  bool ProvesLogicalScalarPoint(const CallPtr& call) const {
+    const auto found = logical_scalar_points_.find(call.get());
+    return found != logical_scalar_points_.end() && found->second;
+  }
   bool ProvesLogicalMinimumFillPad(const CallPtr& call) const {
     const auto found = logical_minimum_padding_.find(call.get());
     return found != logical_minimum_padding_.end() && found->second;
@@ -138,7 +142,10 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     }
     if (const auto scalar = As<ScalarType>(statement->var_->GetType());
         scalar && (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt())) {
-      const auto range = Bounds(statement->value_);
+      auto range = Bounds(statement->value_);
+      if (!range) {
+        range = ObservedMinimum(statement, scalar->dtype_);
+      }
       if (range) {
         if (ready_.insert(statement->var_.get()).second) scalar_definitions_.push_back(statement->var_);
         analyzer_->const_int_bound.Update(statement->var_, *range);
@@ -220,6 +227,27 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
   std::optional<arith::ConstIntBound> Bounds(const ExprPtr& value) {
     return BoundBufferAccTrimScalar(
         value, *analyzer_, [this](const VarPtr& var) { return ready_.count(var.get()) != 0; }, &bound_cache_);
+  }
+  static std::optional<arith::ConstIntBound> ObservedMinimum(const AssignStmtPtr& statement, DataType dtype) {
+    const auto minimum = As<Min>(statement->value_);
+    if (!minimum || GetScalarDtype(minimum) != dtype || GetScalarDtype(minimum->left_) != dtype ||
+        GetScalarDtype(minimum->right_) != dtype) {
+      return std::nullopt;
+    }
+    auto cap = As<ConstInt>(minimum->right_);
+    if (!cap) {
+      cap = As<ConstInt>(minimum->left_);
+    }
+    const auto bits = dtype == DataType::INDEX ? 64 : dtype.GetBit();
+    const auto maximum = (uint64_t{1} << (bits - 1)) - 1;
+    if (!cap || cap->value_ < 0 || static_cast<uint64_t>(cap->value_) > maximum) {
+      return std::nullopt;
+    }
+    // The original scalar assignment and its operands still execute. An
+    // observed minimum cannot exceed its literal cap, even if the analysis
+    // cannot justify replaying that assignment's numerical expression.
+    const auto lo = bits == 64 ? arith::ConstIntBound::kNegInf : -static_cast<int64_t>(maximum) - 1;
+    return arith::ConstIntBound{lo, cap->value_};
   }
   bool Positive(const ExprPtr& extent) {
     if (AtomicInteger(extent) && analyzer_->const_int_bound(extent).min_value >= 1) return true;
@@ -305,6 +333,29 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     }
   }
   void CheckCall(const CallPtr& call) {
+    const bool logical_point = IsOp(call, "tile.read") || IsOp(call, "tile.write");
+    const bool physical_point = IsOp(call, "buffer.read") || IsOp(call, "buffer.write");
+    if ((logical_point || physical_point) && call->args_.size() >= 2) {
+      const auto type = logical_point ? backend::StaticLogicalBufferDescriptor(call->args_[0]->GetType(),
+                                                                               /*allow_full_pad=*/true)
+                                      : As<BufferType>(call->args_[0]->GetType());
+      const auto& point = call->args_[1];
+      bool proved = backend::GetBufferScalarPointLayout(type, point).has_value();
+      if (proved) {
+        const auto tuple = As<MakeTuple>(point);
+        for (size_t axis = 0; axis < 2 && proved; ++axis) {
+          const auto range = Bounds(tuple->elements_[axis]);
+          proved = range && range->min_value >= 0 && range->max_value < type->valid_shape_[axis];
+        }
+      }
+      if (logical_point) {
+        auto [entry, inserted] = logical_scalar_points_.emplace(call.get(), proved);
+        if (!inserted) entry->second &= proved;
+      } else if (!proved) {
+        Refuse(call, "Buffer scalar coordinates require a proved in-range point at this use");
+      }
+      return;
+    }
     if (IsOp(call, "tile.fillpad") && call->args_.size() == 1 &&
         call->GetKwarg<PadValue>("pad_value", PadValue::zero) == PadValue::min) {
       auto [entry, inserted] = logical_minimum_padding_.emplace(call.get(), true);
@@ -508,6 +559,7 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
   std::unordered_map<const Var*, State> states_;
   std::unordered_map<const Var*, std::array<ExprPtr, 2>> immutable_rank_one_extents_;
   std::optional<Issue> issue_;
+  std::unordered_map<const Call*, bool> logical_scalar_points_;
   std::unordered_map<const Call*, bool> logical_minimum_padding_;
   bool collect_guards_;
   bool check_payload_capacity_;

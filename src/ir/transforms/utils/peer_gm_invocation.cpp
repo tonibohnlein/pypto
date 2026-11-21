@@ -25,9 +25,11 @@
 #include <vector>
 
 #include "pypto/codegen/gm_pipe_layout_evidence.h"
+#include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/memref.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/alloc_batching.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
@@ -84,7 +86,27 @@ struct Site {
   std::vector<Actual> arguments;
   bool runtime_cluster_count;
   const Var* cluster_count_binding;
+  ExprPtr effective_count;
 };
+
+// A formal carries the dispatch width only if all incoming sites agree.
+void JoinCoordinates(std::optional<SyncDispatchCoordinates>& coordinates, int64_t minimum, int64_t maximum,
+                     std::set<size_t> formals) {
+  if (!coordinates) {
+    coordinates = SyncDispatchCoordinates{{minimum, maximum}, std::move(formals)};
+    return;
+  }
+  coordinates->block_count.first = std::min(coordinates->block_count.first, minimum);
+  coordinates->block_count.second = std::max(coordinates->block_count.second, maximum);
+  auto& common = coordinates->width_parameters;
+  for (auto it = common.begin(); it != common.end();) {
+    if (!formals.count(*it)) {
+      it = common.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
 
 // An identical physical base can expose an already-known external alias.
 // Unequal bases do not imply separation of externally supplied tensors.
@@ -127,8 +149,39 @@ class RootInventory final : public IRVisitor {
     for (const auto& site : found->second) {
       CHECK_SPAN(site.qualified, site.span)
           << "Peer Group GM proof requires a direct root invocation with explicit tensor actuals";
-      CheckSite(launch, site, ordinary_formals, workspace_formal, elements, invocation, sharded);
+      CheckArguments(site, ordinary_formals, workspace_formal);
+      CheckSite(launch, site, workspace_formal, elements, invocation, sharded);
     }
+  }
+
+  std::optional<SyncDispatchCoordinates> LaunchCoordinates(const FunctionPtr& launch,
+                                                           const SyncInvocationEvidence& invocation) const {
+    const auto found = calls_.find(launch->name_);
+    if (found == calls_.end() || launch->func_type_ != FunctionType::Spmd) return std::nullopt;
+    std::optional<SyncDispatchCoordinates> coordinates;
+    for (const auto& site : found->second) {
+      const auto& count = site.effective_count;
+      if (!site.qualified || !count ||
+          (site.cluster_count_binding && definitions_.at(site.cluster_count_binding) != 1)) {
+        return std::nullopt;
+      }
+      const auto maximum = MaxLaunchCount(launch, count, site, invocation);
+      if (maximum <= 0 || maximum > std::numeric_limits<int16_t>::max()) return std::nullopt;
+      // The dispatch accepts a nonempty positive width. Only a representable
+      // width can also denote the original scalar after LaunchSpec conversion.
+      const int64_t minimum = transform_utils::EvalConstInt(count).value_or(1);
+      std::set<size_t> formals;
+      if (const auto variable = AsVarLike(count)) {
+        for (size_t i = 0; i < site.arguments.size(); ++i) {
+          if (site.arguments[i].value == variable.get() && As<ScalarType>(launch->params_[i]->GetType()) &&
+              GetScalarDtype(launch->params_[i]) == GetScalarDtype(variable)) {
+            formals.insert(i);
+          }
+        }
+      }
+      JoinCoordinates(coordinates, minimum, maximum, std::move(formals));
+    }
+    return coordinates;
   }
 
   void CheckScalarReads(const FunctionPtr& launch, const PeerGmEffects& effects, bool disjoint_gm) const {
@@ -149,6 +202,13 @@ class RootInventory final : public IRVisitor {
         CHECK_SPAN(disjoint_gm || read_origin.kind == OriginKind::Fresh || !writes_formal, site.span)
             << "Peer scalar GM read may alias a GM write without a disjoint GM contract";
       }
+    }
+  }
+
+  void CheckArguments(const FunctionPtr& launch, const std::set<size_t>& ordinary_formals,
+                      size_t workspace_formal) const {
+    for (const auto& site : calls_.at(launch->name_)) {
+      CheckArguments(site, ordinary_formals, workspace_formal);
     }
   }
 
@@ -407,7 +467,7 @@ class RootInventory final : public IRVisitor {
     const auto global = As<GlobalVar>(call->op_);
     if (!global || !launches_.count(global->name_)) return;
     const auto callee = program_->GetFunction(global->name_);
-    Site site{original->span_, qualified_ && original == direct_, statement_, {}, false, nullptr};
+    Site site{original->span_, qualified_ && original == direct_, statement_, {}, false, nullptr, nullptr};
     if (site.qualified) {
       for (size_t i = 0; i < callee->params_.size(); ++i) {
         const auto* value = LiveVar(transform_utils::CallerSuppliedArg(call, callee, i));
@@ -421,6 +481,7 @@ class RootInventory final : public IRVisitor {
         site.arguments.push_back({value, std::move(managed_create)});
       }
       auto count = alloc_batching::EffectiveCoreNum(call, callee);
+      site.effective_count = count;
       if (auto variable = LiveVar(count)) {
         const auto definition = assignments_.find(variable);
         if (definition != assignments_.end()) {
@@ -450,18 +511,21 @@ class RootInventory final : public IRVisitor {
     return maximum;
   }
 
-  void CheckSite(const FunctionPtr& launch, const Site& site, const std::set<size_t>& ordinary_formals,
-                 size_t workspace_formal, int64_t elements, const SyncInvocationEvidence& invocation,
-                 bool sharded) const {
-    const auto& workspace_arg = site.arguments[workspace_formal];
-    const auto* workspace = workspace_arg.value;
+  void CheckArguments(const Site& site, const std::set<size_t>& ordinary_formals,
+                      size_t workspace_formal) const {
     for (const auto formal : ordinary_formals) {
       const auto actual = StorageOf(site.arguments[formal].value);
       CHECK_SPAN(actual.Known(), site.span)
           << "Peer Group GM tensor must forward an original root formal or fresh allocation";
-      CHECK_SPAN(actual.root != workspace, site.span)
+      CHECK_SPAN(actual.root != site.arguments[workspace_formal].value, site.span)
           << "Peer Group managed workspace aliases an ordinary root tensor";
     }
+  }
+
+  void CheckSite(const FunctionPtr& launch, const Site& site, size_t workspace_formal, int64_t elements,
+                 const SyncInvocationEvidence& invocation, bool sharded) const {
+    const auto& workspace_arg = site.arguments[workspace_formal];
+    const auto* workspace = workspace_arg.value;
     const auto uses = uses_.find(workspace);
     const auto definitions = definitions_.find(workspace);
     CHECK_SPAN(workspace_arg.managed_create && uses != uses_.end() && uses->second == 1 &&
@@ -487,10 +551,12 @@ class RootInventory final : public IRVisitor {
 // tensor. A conditional or another call could change the concrete consumer.
 bool DirectForwarding(const FunctionPtr& wrapper, const FunctionPtr& group) {
   const auto body = transform_utils::FlattenToStmts(wrapper->body_);
-  if (body.size() != 2 || !As<ReturnStmt>(body.back())) return false;
+  if (body.size() < 2 || !As<ReturnStmt>(body.back())) return false;
   ExprPtr expression;
+  VarPtr result;
   if (const auto assignment = As<AssignStmt>(body.front())) {
     expression = assignment->value_;
+    result = assignment->var_;
   } else if (const auto evaluation = As<EvalStmt>(body.front())) {
     expression = evaluation->expr_;
   }
@@ -501,8 +567,24 @@ bool DirectForwarding(const FunctionPtr& wrapper, const FunctionPtr& group) {
       wrapper->params_.size() != group->params_.size() || call->args_.size() != group->params_.size()) {
     return false;
   }
+  // Outlined multi-result wrappers can retain pure output projections, even
+  // when returning the existing output formals instead of these locals.
+  const auto tuple = result ? As<TupleType>(result->GetType()) : nullptr;
+  for (size_t i = 1; i + 1 < body.size(); ++i) {
+    const auto assignment = As<AssignStmt>(body[i]);
+    const auto item = assignment ? As<TupleGetItemExpr>(assignment->value_) : nullptr;
+    if (!item || !tuple || item->tuple_ != result || item->index_ < 0 ||
+        static_cast<size_t>(item->index_) >= tuple->types_.size()) {
+      return false;
+    }
+  }
   for (size_t i = 0; i < call->args_.size(); ++i) {
     if (call->args_[i] != wrapper->params_[i]) return false;
+    if (const auto scalar = As<ScalarType>(wrapper->params_[i]->GetType());
+        scalar && (!As<ScalarType>(group->params_[i]->GetType()) ||
+                   scalar->dtype_ != GetScalarDtype(group->params_[i]))) {
+      return false;
+    }
   }
   return true;
 }
@@ -539,6 +621,7 @@ struct PeerInvocationGmEvidence::State {
   std::map<std::string, std::unique_ptr<RootInventory>> roots;
   std::map<std::string, std::vector<std::pair<RootInventory*, FunctionPtr>>> qualified;
   std::map<std::string, bool> sharding;
+  std::map<std::string, std::optional<SyncDispatchCoordinates>> coordinates;
 
   State(const ProgramPtr& owner, const SyncInvocationEvidence& proof)
       : program(owner), invocation(proof), layout(owner) {
@@ -576,11 +659,18 @@ void PeerInvocationGmEvidence::Check(const FunctionPtr& group, const std::set<si
           IsPlainTensor(group->params_[formal]))
         << "Peer Group has no distinct ordinary GM tensor formal";
   }
+  if (const auto checked = state_->qualified.find(group->name_); checked != state_->qualified.end()) {
+    for (const auto& [inventory, launch] : checked->second) {
+      inventory->CheckArguments(launch, ordinary_formals, workspace_formal);
+    }
+    return;
+  }
   const auto& callers = CallersOf(group->name_);
   CHECK(!callers.empty()) << "Peer Group has no root managed workspace allocation";
   const auto group_layout = state_->layout.BindRoot(group);
-  auto& qualified = state_->qualified[group->name_];
-  qualified.clear();
+  std::vector<std::pair<RootInventory*, FunctionPtr>> qualified;
+  std::optional<SyncDispatchCoordinates> coordinates;
+  bool complete_coordinates = true;
   for (const auto& caller : callers) {
     const auto enclosing = state_->program->GetFunction(caller);
     CHECK(enclosing) << "Peer Group GM forwarding has no enclosing function";
@@ -611,9 +701,41 @@ void PeerInvocationGmEvidence::Check(const FunctionPtr& group, const std::set<si
       if (!inventory) inventory = std::make_unique<RootInventory>(root, state_->launches, state_->program);
       inventory->Check(launch, ordinary_formals, workspace_formal, launch_layout->Layout().Elements(),
                        state_->invocation, sharded);
+      if (complete_coordinates) {
+        if (auto evidence = inventory->LaunchCoordinates(launch, state_->invocation)) {
+          JoinCoordinates(coordinates, evidence->block_count.first, evidence->block_count.second,
+                          std::move(evidence->width_parameters));
+        } else {
+          complete_coordinates = false;
+        }
+      }
       qualified.emplace_back(inventory.get(), launch);
     }
   }
+  state_->qualified.emplace(group->name_, std::move(qualified));
+  if (complete_coordinates) {
+    state_->coordinates.emplace(group->name_, std::move(coordinates));
+  }
+}
+
+std::optional<SyncDispatchCoordinates> PeerInvocationGmEvidence::TryLaunchCoordinates(
+    const FunctionPtr& group, size_t workspace_formal) {
+  const auto& callers = CallersOf(group->name_);
+  if (callers.empty() || !std::all_of(callers.begin(), callers.end(), [&](const auto& caller) {
+        const auto function = state_->program->GetFunction(caller);
+        return function && function->func_type_ == FunctionType::Spmd;
+      })) {
+    return std::nullopt;
+  }
+  try {
+    // Optional loop evidence cannot report a workspace refusal before the
+    // definitive verification knows all of this endpoint's ordinary operands.
+    Check(group, {}, workspace_formal);
+  } catch (const ValueError&) {
+    return std::nullopt;
+  }
+  const auto found = state_->coordinates.find(group->name_);
+  return found == state_->coordinates.end() ? std::nullopt : found->second;
 }
 
 void PeerInvocationGmEvidence::CheckScalarReads(const FunctionPtr& group, const PeerGmEffects& effects,

@@ -14,10 +14,12 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 
 #include "pypto/ir/program.h"
+#include "src/ir/transforms/utils/sync_loop_trip_proof.h"
 
 namespace pypto::ir::sync {
 
@@ -34,6 +36,8 @@ class PeerInvocationGmEvidence {
 
   const std::set<std::string>& CallersOf(const std::string& callee) const;
   void Check(const FunctionPtr& group, const std::set<size_t>& ordinary_formals, size_t workspace_formal);
+  std::optional<SyncDispatchCoordinates> TryLaunchCoordinates(const FunctionPtr& group,
+                                                              size_t workspace_formal);
   void CheckScalarReads(const FunctionPtr& group, const PeerGmEffects& effects, bool disjoint_gm) const;
 
  private:

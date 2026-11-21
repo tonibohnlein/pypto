@@ -28,6 +28,7 @@
 #include "pypto/codegen/gm_pipe_layout_evidence.h"
 #include "pypto/core/error.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -539,16 +540,34 @@ FunctionPtr PlanLocalEndpoint(const WrapperCallInfo& call, const FunctionPtr& gr
     CHECK(borrow.unavailable.empty()) << borrow.unavailable;
   }
 
-  const auto parameters = invocation.parameters.find(fn->name_);
-  const auto local = ImportPeerLocalEffects(
-      fn, transport, "a2a3",
-      parameters == invocation.parameters.end() ? SyncParameterBounds{} : parameters->second);
   const auto workspace = std::find_if(group->params_.begin(), group->params_.end(), [](const VarPtr& formal) {
     return formal->name_hint_ == "__gm_pipe_buffer";
   });
   CHECK(workspace != group->params_.end()) << "Group has no managed GM workspace";
+  const auto workspace_formal = static_cast<size_t>(workspace - group->params_.begin());
+  std::optional<SyncDispatchCoordinates> coordinates;
+  if (fn->ir_stage_ == FunctionIRStage::Buffer) {
+    coordinates = gm.TryLaunchCoordinates(group, workspace_formal);
+  }
   std::unordered_map<const Var*, size_t> positions;
   for (size_t i = 0; i < group->params_.size(); ++i) positions.emplace(group->params_[i].get(), i);
+  if (coordinates) {
+    std::set<size_t> endpoint_widths;
+    for (size_t i = 0; i < fn->params_.size(); ++i) {
+      const auto input = AsVarLike(call.inner_call->args_[i]);
+      const auto formal = positions.find(input.get());
+      if (formal != positions.end() && coordinates->width_parameters.count(formal->second) &&
+          As<ScalarType>(fn->params_[i]->GetType()) &&
+          GetScalarDtype(fn->params_[i]) == GetScalarDtype(input)) {
+        endpoint_widths.insert(i);
+      }
+    }
+    coordinates->width_parameters = std::move(endpoint_widths);
+  }
+  const auto parameters = invocation.parameters.find(fn->name_);
+  const auto local = ImportPeerLocalEffects(
+      fn, transport, "a2a3",
+      parameters == invocation.parameters.end() ? SyncParameterBounds{} : parameters->second, coordinates);
   std::set<size_t> touched;
   for (const auto index : local.gm.formals) {
     const auto root = AsVarLike(call.inner_call->args_.at(index));
@@ -563,7 +582,7 @@ FunctionPtr PlanLocalEndpoint(const WrapperCallInfo& call, const FunctionPtr& gr
       group_effects.writes.insert(pos->second);
     }
   }
-  gm.Check(group, touched, static_cast<size_t>(workspace - group->params_.begin()));
+  gm.Check(group, touched, workspace_formal);
   return RealizePeerLocalPlan(local);
 }
 

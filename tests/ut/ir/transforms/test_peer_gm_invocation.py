@@ -23,16 +23,55 @@ pytestmark = pytest.mark.usefixtures("ascend_backend")
 
 
 def _peer_program(
-    root_call: str, *, rhs_rows: int = 16, spmd: bool = False, uses_block_index: bool = True
+    root_call: str,
+    *,
+    rhs_rows: int = 16,
+    spmd: bool = False,
+    uses_block_index: bool = True,
+    runtime_loop: bool = False,
+    projects_result: bool = False,
+    guarded_transport: bool = False,
 ) -> ir.Program:
-    out_rows = 64 if spmd else 16
+    out_rows = 384 if runtime_loop else (64 if spmd else 16)
     row = "pl.get_block_idx() * 16" if spmd and uses_block_index else "0"
+    width_formal = ", width: pl.Scalar[pl.INT32]" if runtime_loop else ""
+    width_actual = ", width" if runtime_loop else ""
+    cube_work = f"""received: pl.Tile[[16, 16], pl.FP16, pl.Mem.Mat] = pl.tpop_from_aiv(split=0)
+left = pl.move(received, target_memory=pl.Mem.Left)
+pl.tfree_to_aiv(received)
+product = pl.matmul(left, right)
+out = pl.store(product, [{row}, 0], out)"""
+    vector_work = "pl.tpush_to_aic(data, split=0)"
+    if runtime_loop:
+        # A 3-item grid-stride scan has zero trips on lanes past item 2.
+        # Without the exact width relation the subtraction admits negative values.
+        header = """core = pl.tile.get_block_idx()
+wide = pl.cast(width, pl.INDEX)
+trips = (wide - core + 2) // wide
+for _ in pl.range(trips):
+"""
+        if guarded_transport:
+            # Proving the outer loop's extent does not qualify a branch that
+            # conditionally changes the number of issued FIFO operations.
+            cube_work = "if width < 8:\n" + indent(cube_work, "    ")
+            vector_work = "if width < 8:\n" + indent(vector_work, "    ")
+        cube_work = header + indent(cube_work, "    ")
+        vector_work = header + indent(vector_work, "    ")
+    output = f"pl.Tensor[[{out_rows}, 16], pl.FP32]"
+    group_output = f"tuple[{output}, {output}]" if projects_result else output
+    group_return = "result, out" if projects_result else "result"
+    call = f"self.paired(rhs, x, out{width_actual})"
+    wrapper_return = (
+        f"pair = {call}\n        ignored = pair[1]\n        return pair[0]"
+        if projects_result
+        else f"return {call}"
+    )
     wrapper = (
         f"""
     @pl.function(type=pl.FunctionType.Spmd)
     def grid(self, rhs: pl.Tensor[[16, 16], pl.FP16], x: pl.Tensor[[16, 16], pl.FP16],
-             out: pl.Out[pl.Tensor[[{out_rows}, 16], pl.FP32]]) -> pl.Tensor[[{out_rows}, 16], pl.FP32]:
-        return self.paired(rhs, x, out)
+             out: pl.Out[{output}]{width_formal}) -> {output}:
+        {wrapper_return}
 """
         if spmd
         else ""
@@ -42,30 +81,27 @@ def _peer_program(
 class PeerInvocations:
     @pl.function(type=pl.FunctionType.AIC)
     def cube(self, rhs: pl.Tensor[[16, 16], pl.FP16],
-             out: pl.Out[pl.Tensor[[{out_rows}, 16], pl.FP32]]) -> pl.Tensor[[{out_rows}, 16], pl.FP32]:
+             out: pl.Out[{output}]{width_formal}) -> {output}:
         fifo = pl.reserve_buffer(name="inbox", size=2048, base=0)
         pl.aic_initialize_pipe(pl.const(0, pl.INT32), fifo, dir_mask=2, slot_size=1024, slot_num=2)
         matrix = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
         right = pl.move(matrix, target_memory=pl.Mem.Right)
-        received: pl.Tile[[16, 16], pl.FP16, pl.Mem.Mat] = pl.tpop_from_aiv(split=0)
-        left = pl.move(received, target_memory=pl.Mem.Left)
-        pl.tfree_to_aiv(received)
-        product = pl.matmul(left, right)
-        return pl.store(product, [{row}, 0], out)
+{indent(cube_work, "        ")}
+        return out
 
     @pl.function(type=pl.FunctionType.AIV)
-    def vector(self, x: pl.Tensor[[16, 16], pl.FP16]):
+    def vector(self, x: pl.Tensor[[16, 16], pl.FP16]{width_formal}):
         peer = pl.import_peer_buffer(name="inbox", peer_func="cube")
         pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer, dir_mask=2, slot_size=1024, slot_num=2)
         data = pl.load(x, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
-        pl.tpush_to_aic(data, split=0)
+{indent(vector_work, "        ")}
 
     @pl.function(type=pl.FunctionType.Group)
     def paired(self, rhs: pl.Tensor[[16, 16], pl.FP16], x: pl.Tensor[[16, 16], pl.FP16],
-               out: pl.Out[pl.Tensor[[{out_rows}, 16], pl.FP32]]) -> pl.Tensor[[{out_rows}, 16], pl.FP32]:
-        result = self.cube(rhs, out)
-        self.vector(x)
-        return result
+               out: pl.Out[pl.Tensor[[{out_rows}, 16], pl.FP32]]{width_formal}) -> {group_output}:
+        result = self.cube(rhs, out{width_actual})
+        self.vector(x{width_actual})
+        return {group_return}
 {wrapper}
     @pl.function(type=pl.FunctionType.Orchestration)
     def main(self, rhs: pl.Tensor[[{rhs_rows}, 16], pl.FP16], x: pl.Tensor[[16, 16], pl.FP16],
@@ -143,6 +179,65 @@ def test_peer_group_workspace_follows_spmd_launch(
     )
     with _autosync_context([]):
         lowered = PassManager(ir.OptimizationStrategy.Default).run_passes(original)
+    _assert_outcome(lowered, refusal)
+
+
+@pytest.mark.parametrize(
+    "actuals, projects_result, guarded_transport, refusal",
+    [
+        pytest.param(("width",), False, False, None, id="same-launch-width"),
+        pytest.param(("width",), True, False, None, id="tuple-result-projection"),
+        pytest.param(
+            ("pl.const(1, pl.INT32)",), False, False, "ready nonnegative bounds", id="unrelated-scalar"
+        ),
+        pytest.param(
+            ("width", "pl.const(1, pl.INT32)"),
+            False,
+            False,
+            "ready nonnegative bounds",
+            id="one-of-two-launches-disagrees",
+        ),
+        pytest.param(
+            ("width",),
+            False,
+            True,
+            "needs an effect summary for this conditional region",
+            id="data-dependent-transport",
+        ),
+    ],
+)
+def test_peer_work_loop_uses_original_dispatch_width(
+    actuals, projects_result, guarded_transport, refusal
+) -> None:
+    calls = ["width = pl.system.available_cluster_count()", "with pl.manual_scope():"]
+    source = "out"
+    for idx, actual in enumerate(actuals):
+        target = f"out_{idx}"
+        calls.append(
+            f"    {target}, _ = pl.spmd_submit(self.grid, rhs, x, {source}, {actual}, core_num=width)"
+        )
+        source = target
+    calls.append(f"return {source}")
+    original = _peer_program(
+        "\n".join(calls),
+        spmd=True,
+        runtime_loop=True,
+        projects_result=projects_result,
+        guarded_transport=guarded_transport,
+    )
+    with _autosync_context([]):
+        lowered = PassManager(ir.OptimizationStrategy.Default).run_passes(original)
+    for name in ("cube", "vector"):
+        endpoint = lowered.get_function(name)
+        assert endpoint is not None and endpoint.attrs["buffer_ir_selected"]
+        if guarded_transport:
+            authored = original.get_function(name)
+            assert authored is not None and isinstance(authored.body, ir.SeqStmts)
+            loop = next(stmt for stmt in authored.body.stmts if isinstance(stmt, ir.ForStmt))
+            nested = loop.body.stmts if isinstance(loop.body, ir.SeqStmts) else [loop.body]
+            branch = next(stmt for stmt in nested if isinstance(stmt, ir.IfStmt))
+            diagnostic = endpoint.attrs[AUTOSYNC_FALLBACK_REASON_ATTR].splitlines()[0]
+            assert f"[{branch.span.to_string()}]" in diagnostic
     _assert_outcome(lowered, refusal)
 
 

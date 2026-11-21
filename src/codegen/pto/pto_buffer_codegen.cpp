@@ -160,6 +160,7 @@ void CheckBufferTensorParameter(const ir::TensorTypePtr& tensor, const ir::Span&
 class BufferFunctionDetector : public ir::IRVisitor {
  public:
   bool found = false;
+  bool has_scalar_points = false;
 
   void VisitFunction(const ir::FunctionPtr& function) override {
     for (const auto& type : function->return_types_) VisitType(type);
@@ -200,6 +201,7 @@ class BufferFunctionDetector : public ir::IRVisitor {
       // diagnoses them instead of falling through the legacy Tile emitter.
       found |= name.rfind("buffer.", 0) == 0 ||
                (registry.IsRegistered(name) && registry.GetEntry(name).GetIRStage() == ir::OpIRStage::Buffer);
+      has_scalar_points |= ir::IsOp(call, "buffer.read") || ir::IsOp(call, "buffer.write");
     }
     IRVisitor::VisitExpr_(call);
   }
@@ -456,9 +458,12 @@ class BufferEmissionPreflight : public ir::IRVisitor {
     }
     uses_spmd_blocks |= ir::IsOp(call, "buffer.get_block_idx") || ir::IsOp(call, "buffer.get_block_num");
     uses_spmd_subblock |= ir::IsOp(call, "buffer.get_subblock_idx");
-    if (ir::IsOp(call, "buffer.gm_read")) {
-      CHECK_SPAN(conversion_supported_ && function_->func_type_ == ir::FunctionType::AIC, call->span_)
-          << "Direct Buffer GM scalar read requires A2/A3 AIC";
+    if (ir::IsOp(call, "buffer.read") || ir::IsOp(call, "buffer.write") || ir::IsOp(call, "buffer.gm_read")) {
+      const bool gm_read = ir::IsOp(call, "buffer.gm_read");
+      const auto core = gm_read ? ir::FunctionType::AIC : ir::FunctionType::AIV;
+      CHECK_SPAN(conversion_supported_ && function_->func_type_ == core, call->span_)
+          << (gm_read ? "Direct Buffer GM scalar read requires A2/A3 AIC"
+                      : "Direct Buffer local scalar access requires A2/A3 AIV");
       IRVisitor::VisitExpr_(call);
       return;
     }
@@ -490,7 +495,6 @@ class BufferEmissionPreflight : public ir::IRVisitor {
                    ir::IsOp(call, "buffer.copy") || ir::IsOp(call, "buffer.subview") ||
                    ir::IsOp(call, "buffer.reshape") || ir::IsOp(call, "buffer.load") ||
                    ir::IsOp(call, "buffer.store") || ir::IsOp(call, "buffer.set_validshape") ||
-                   ir::IsOp(call, "buffer.read") || ir::IsOp(call, "buffer.write") ||
                    ir::IsOp(call, "buffer.get_block_idx") || ir::IsOp(call, "buffer.get_block_num") ||
                    ir::IsOp(call, "buffer.get_subblock_idx") || ir::IsOp(call, "buffer.matmul") ||
                    ir::IsOp(call, "buffer.matmul_acc") || ir::IsOp(call, "buffer.extract") ||
@@ -607,8 +611,20 @@ bool PTOCodegen::UsesBufferIR(const ir::FunctionPtr& func) {
 }
 
 void PTOCodegen::GenerateBufferFunction(const ir::FunctionPtr& func) {
+  auto verified = func;
+  if (func->ir_stage_ != ir::FunctionIRStage::Buffer) {
+    BufferFunctionDetector detector;
+    detector.VisitFunction(func);
+    if (detector.has_scalar_points) {
+      // Legacy unmarked scalar bodies still need lexical and storage proofs.
+      // Mark only the verifier's copy so other legacy paths are unchanged.
+      auto explicit_buffer = std::make_shared<ir::Function>(*func);
+      explicit_buffer->ir_stage_ = ir::FunctionIRStage::Buffer;
+      verified = explicit_buffer;
+    }
+  }
   auto program =
-      std::make_shared<ir::Program>(std::vector<ir::FunctionPtr>{func}, "BufferCodegen", func->span_);
+      std::make_shared<ir::Program>(std::vector<ir::FunctionPtr>{verified}, "BufferCodegen", func->span_);
   std::vector<Diagnostic> diagnostics;
   ir::CreateBufferIRPropertyVerifier()->Verify(program, diagnostics);
   for (const auto& diagnostic : diagnostics) {
@@ -826,7 +842,8 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
     backend::pto_ops_detail::EmitScalarTensorRead(call, *this, name);
     BindVarToMlir(result, name);
   } else if (ir::IsOp(call, "buffer.read") || ir::IsOp(call, "buffer.write")) {
-    // Registry validation proves dense layout and constant active coordinates.
+    // Registry validation proves physical layout and native offset capacity.
+    // Function preflight proves range for each runtime coordinate.
     // Keep the exact payload cut: the result is a blocking S value, not a
     // speculative descriptor read or a cacheable GM scalar load.
     registry.ValidateBufferCall(call);
@@ -835,9 +852,36 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
         << "Internal error: scalar Buffer result binding disagrees with its operation";
     const auto type = As<ir::BufferType>(call->args_[0]->GetType());
     const auto indices = As<ir::MakeTuple>(call->args_[1]);
-    const int64_t offset = As<ir::ConstInt>(indices->elements_[0])->value_ * type->shape_[1] +
-                           As<ir::ConstInt>(indices->elements_[1])->value_;
-    const auto index = GetOrEmitConstant(offset, DataType::INDEX);
+    const auto layout = backend::GetBufferScalarPointLayout(type, indices);
+    INTERNAL_CHECK_SPAN(layout, call->span_) << "Internal error: missing checked scalar point layout";
+    const auto scaled = [&](const ir::ExprPtr& coordinate, int64_t stride) {
+      if (const auto constant = As<ir::ConstInt>(coordinate)) {
+        return constant->value_ == 0 ? std::string{}
+                                     : GetOrEmitConstant(constant->value_ * stride, DataType::INDEX);
+      }
+      const auto value = EmitBufferIntegerOperand(coordinate, DataType::INDEX);
+      if (stride == 1) return value;
+      const auto factor = GetOrEmitConstant(stride, DataType::INDEX);
+      const auto result = NewTemp();
+      Emit(result + " = arith.muli " + value + ", " + factor + " : index");
+      return result;
+    };
+    const auto row = As<ir::ConstInt>(indices->elements_[0]);
+    const auto col = As<ir::ConstInt>(indices->elements_[1]);
+    std::string index;
+    if (row && col) {
+      index = GetOrEmitConstant(row->value_ * layout->row_stride + col->value_ * layout->col_stride,
+                                DataType::INDEX);
+    } else {
+      const auto row_offset = scaled(indices->elements_[0], layout->row_stride);
+      const auto col_offset = scaled(indices->elements_[1], layout->col_stride);
+      if (row_offset.empty() || col_offset.empty()) {
+        index = row_offset.empty() ? col_offset : row_offset;
+      } else {
+        index = NewTemp();
+        Emit(index + " = arith.addi " + row_offset + ", " + col_offset + " : index");
+      }
+    }
     const auto source = GetExprAsCode(call->args_[0]);
     const auto descriptor = GetExprTypeAnnotation(call->args_[0]);
     if (read) {

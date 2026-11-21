@@ -703,6 +703,13 @@ class BufferKernelSupport : public IRVisitor {
                             (!IsOp(call, "tile.read") || scalar_definition_ == call.get()) &&
                             views_.HasDenseRowPitch(call->args_[0]),
                         BufferAdmissionProperty::OperationRecipe);
+      if (admission.supported()) {
+        if (!logical_validity_) {
+          logical_validity_.emplace(function_, false, false, required_positive_formals);
+        }
+        admission.Require(logical_validity_->ProvesLogicalScalarPoint(call),
+                          BufferAdmissionProperty::OperationRecipe);
+      }
       // A qualified SetValue initializes the point consumed by a staged
       // scalar store; that leaf need not contain an unrelated load or fill.
       has_scalar_write |= admission.supported() && IsOp(call, "tile.write");
@@ -731,8 +738,17 @@ class BufferKernelSupport : public IRVisitor {
         admission.Require(logical_validity_->ProvesLogicalMinimumFillPad(call),
                           BufferAdmissionProperty::DynamicValidRecipe);
       }
-      for (const auto& arg : call->args_)
-        admission.Require(!views_.IsWindow(arg), BufferAdmissionProperty::OperationRecipe);
+      for (const auto& arg : call->args_) {
+        // A statically valid dense window has the same native cast geometry
+        // as a standalone tile. Its provenance still participates in memory
+        // reuse constraints and placed Buffer alias verification.
+        const bool dense_cast_window = conversion->kind == backend::BufferConversionKind::Cast &&
+                                       !NeedsRuntimeBufferValid(arg->GetType()) &&
+                                       !NeedsRuntimeBufferValid(call->GetType()) &&
+                                       views_.HasDenseRowPitch(arg);
+        admission.Require(!views_.IsWindow(arg) || dense_cast_window,
+                          BufferAdmissionProperty::OperationRecipe);
+      }
     } else if (IsOp(call, "tile.transpose")) {
       admission.Require(backend::SupportsLogicalBufferTranspose(call),
                         BufferAdmissionProperty::OperationRecipe);
@@ -910,11 +926,13 @@ class BufferKernelSupport : public IRVisitor {
                             !GetKwargOr<bool>(call->kwargs_, "pre_relu", false) &&
                             GetIntKwarg(call->kwargs_, "cache", 0) == 0,
                         BufferAdmissionProperty::WindowGeometry);
-      // Native Vec TMOV preserves row stride; copying a strided window into
-      // a destination with a different pitch needs a separate transfer recipe.
+      // Native Vec TMOV starts at each window's base. A one-row window has
+      // no second row to reach, so different parent pitches are harmless.
+      // Multiple rows still require the existing matching-pitch recipe.
       const auto source_view = views_.Get(call->args_[1]);
+      const bool single_row = ConstantEquals(window->shape_[0], 1);
       admission.Require(source_view.row_bytes &&
-                            source_view.row_bytes == views_.Get(call->args_[0]).row_bytes &&
+                            (single_row || source_view.row_bytes == views_.Get(call->args_[0]).row_bytes) &&
                             (!source_view.window || (source_view.root && source_view.slice)),
                         BufferAdmissionProperty::WindowGeometry);
     }
@@ -1025,15 +1043,18 @@ class BufferKernelSupport : public IRVisitor {
             break;
           }
         }
-        admission.Require(
-            call->args_.size() == 4 && valid_kwargs && source->shape_.size() == 2 &&
-                destination->shape_.size() == 2 && StaticShape(source->shape_) &&
-                StaticShape(destination->shape_) && source->dtype_ == destination->dtype_ &&
-                !views_.IsWindow(call->args_[0]) &&
-                backend::IsDenseVecBufferTile(source, tile_view_semantics::GetEffectiveTileView(*source)) &&
-                backend::IsDenseVecBufferTile(destination,
-                                              tile_view_semantics::GetEffectiveTileView(*destination)),
-            BufferAdmissionProperty::OperationRecipe);
+        const auto source_view = tile_view_semantics::GetEffectiveTileView(*source);
+        // In a full-valid materialized pad tile the native Vec extract
+        // reads ordinary lanes at the selected coordinates.
+        admission.Require(call->args_.size() == 4 && valid_kwargs && source->shape_.size() == 2 &&
+                              destination->shape_.size() == 2 && StaticShape(source->shape_) &&
+                              StaticShape(destination->shape_) && source->dtype_ == destination->dtype_ &&
+                              !views_.IsWindow(call->args_[0]) &&
+                              (backend::IsDenseVecBufferTile(source, source_view) ||
+                               backend::IsFullPaddedVec(source, source_view)) &&
+                              backend::IsDenseVecBufferTile(
+                                  destination, tile_view_semantics::GetEffectiveTileView(*destination)),
+                          BufferAdmissionProperty::OperationRecipe);
         if (!admission.supported()) return;
         const int64_t elem_bytes = source->dtype_.GetBit() / 8;
         const auto col_residue = WindowOffsetResidue(call->args_[2], elem_bytes);

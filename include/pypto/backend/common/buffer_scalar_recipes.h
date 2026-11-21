@@ -20,10 +20,15 @@
 #include "pypto/ir/type.h"
 
 namespace pypto::backend {
-// Geometry for the selected native GetValue/SetValue family. Missing means
-// unsupported/unproved, never an empty memory effect. No native target, scalar
-// readiness or allocation ownership is inferred from this descriptor proof.
-std::optional<uint32_t> BufferScalarPointOffset(const ir::BufferTypePtr& buffer, const ir::ExprPtr& indices);
+// Element strides for the native GetValue/SetValue offset. The proved static
+// capacity of each requested axis fits the native uint32_t offset domain.
+// Dynamic coordinates require a lexical proof that each axis stays active.
+struct BufferScalarPointLayout {
+  int64_t row_stride;
+  int64_t col_stride;
+};
+std::optional<BufferScalarPointLayout> GetBufferScalarPointLayout(const ir::BufferTypePtr& buffer,
+                                                                  const ir::ExprPtr& indices);
 bool SupportsLogicalBufferScalar(const ir::CallPtr& call);
 // Packed rank-one or rank-two ABI for point staging. This proves geometry, not input
 // address validity, external publication, alias disjointness or scalar readiness.

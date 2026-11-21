@@ -9,6 +9,11 @@
 
 """Frontend scalar Tile operations use shared Buffer point contracts."""
 
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
 import pytest
 from pypto import codegen, ir, passes
 from pypto import language as pl
@@ -313,3 +318,134 @@ def test_nested_scalar_tile_read_requires_an_original_ssa_definition(planner):
     assert function is not None and previous is not None and not function.attrs["buffer_ir_selected"]
     ir.assert_structural_equal(function.body, previous.body, enable_auto_mapping=False)
     assert ir.serialize(nested) == snapshot
+
+
+def reverse_scalar_program(last_col, family="fp32_column"):
+    dtype = "INT32" if family == "int32_row" else "FP32"
+    reduction = (
+        """
+        scratch = pl.create_tile([8,16], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+        maximum = pl.tile.row_max(source, scratch)"""
+        if family == "fp32_column"
+        else ""
+    )
+    operands = "maximum, [row,0]" if family == "fp32_column" else "source, [row,2]"
+    return pl.parse_program(f"""
+@pl.program
+class ReverseScalarPoints:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, x: pl.Tensor[[8,16], pl.{dtype}],
+               out: pl.InOut[pl.Tensor[[8,16], pl.{dtype}]]) -> pl.Tensor[[8,16], pl.{dtype}]:
+        source = pl.load(x, [0,0], [8,16]){reduction}
+        for i in pl.range(0, 8, 2):
+            row = 6 - i
+            col = pl.cast({last_col} - i, pl.INT32)
+            value = pl.tile.read({operands})
+            pl.tile.write(source, [row,col], value)
+        out = pl.store(source, [0,0], out)
+        return out
+""")
+
+
+@pytest.mark.parametrize("last_col", [15, 16])
+def test_reverse_local_scalar_points_require_a_lexical_bound(last_col):
+    program = lower(reverse_scalar_program(last_col), passes.MemoryPlanner.PYPTO)
+    function = program.get_function("kernel")
+    assert function is not None
+    if last_col == 16:
+        # The first iteration is out of range even though the scan then enters the tile.
+        assert function.ir_stage == ir.FunctionIRStage.Functional
+        assert calls(program, "tile.write")
+        return
+    assert function.ir_stage == ir.FunctionIRStage.Buffer
+    assert not diagnostics(function)
+    (read,) = calls(program, "buffer.read")
+    assert list(read.args[0].type.shape) == [8, 1]
+    (write,) = calls(program, "buffer.write")
+    assert list(write.args[0].type.shape) == [8, 16]
+    emitted = codegen.PTOCodegen().generate(program, emit_source_loc=False)
+    assert "pto.tgetval" in emitted and "pto.tsetval" in emitted
+    # The dense row-major write has two nonzero coordinates and needs a
+    # flattened index. The reduction column needs only its runtime row.
+    assert "arith.muli" in emitted and "arith.addi" in emitted
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize("family", ["fp32_column", "fp32_row", "int32_row"])
+def test_reverse_local_scalar_points_compile_with_native_sync(tmp_path, family):
+    if find_ptoas_binary() is None:
+        pytest.skip("PTOAS is not available")
+    program = lower(reverse_scalar_program(15, family), passes.MemoryPlanner.PYPTO)
+    with passes.PassContext([], autosync_policy="conservative_prefix", autosync_disjoint_gm=True):
+        logical = passes.insert_sync()(program)
+    with passes.PassContext([]):
+        physical = passes.lower_sync()(logical)
+    source, output = tmp_path / "reverse.pto", tmp_path / "reverse.cpp"
+    source.write_text(codegen.PTOCodegen().generate(physical, emit_tile_addr=True, emit_source_loc=False))
+    _run_ptoas(str(source), str(output), ["--pto-level=level3", "--pto-arch=a2"])
+    cpp = output.read_text()
+    assert ("TROWMAX(" in cpp) == (family == "fp32_column")
+    assert ".GetValue(" in cpp and ".SetValue(" in cpp
+    assert "pipe_barrier(PIPE_S)" not in cpp
+    _check_native_scalar_values(cpp, family, tmp_path)
+
+
+def _check_native_scalar_values(cpp, family, tmp_path):
+    """Execute PTOAS's generated GetValue/SetValue with the real CPU ISA headers."""
+    compiler = shutil.which("g++-15") or shutil.which("g++")
+    isa_root = os.environ.get("PTO_ISA_ROOT")
+    if compiler is None or not isa_root:
+        return
+    major = subprocess.check_output([compiler, "-dumpversion"], text=True).split(".")[0]
+    if int(major) < 15:
+        return
+    include = Path(isa_root) / "include"
+    assert (include / "pto/pto-inst.hpp").is_file()
+    ctype = "int32_t" if family == "int32_row" else "float"
+    input_col = 15 if family == "fp32_column" else 2
+    # Each row has distinct values, so using the logical column as a flat
+    # offset or skipping the loop stride changes the final tile.
+    source = tmp_path / "probe.cpp"
+    source.write_text(
+        "#include <array>\n#include <cstdint>\n"
+        + cpp
+        + f"""
+int main() {{
+    pto::NPU_MEMORY_INIT();
+    std::array<{ctype}, 128> input{{}}, output{{}}, expected{{}};
+    for (int j = 0; j < 128; ++j) input[j] = j;
+    expected = input;
+    for (int i = 0; i < 8; i += 2) {{
+        int row = 6 - i, col = 15 - i;
+        expected[row * 16 + col] = input[row * 16 + {input_col}];
+    }}
+    kernel(input.data(), output.data());
+    return output == expected ? 0 : 1;
+}}
+"""
+    )
+    binary = tmp_path / "probe"
+    result = subprocess.run(
+        [
+            compiler,
+            "-std=c++23",
+            "-pthread",
+            "-D__CPU_SIM",
+            "-D__DAV_VEC__",
+            "-DPTO_CPU_MAX_THREADS=1",
+            f"-I{include}",
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    subprocess.run([str(binary)], check=True, timeout=30)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
