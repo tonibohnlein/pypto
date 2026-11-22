@@ -213,7 +213,8 @@ class StorageIndex : public IRVisitor {
     // Call retains its logical deduced type and is not an allocation identity.
     auto variable = AsVarLike(expr);
     if (auto tile = variable ? As<TileType>(variable->GetType()) : nullptr;
-        tile && !windows.count(tile.get()) && types_.insert(tile.get()).second) {
+        tile && !identity_sources_.count(variable.get()) && !windows.count(tile.get()) &&
+        types_.insert(tile.get()).second) {
       auto memory = GetDefinedMemRef(tile);
       CHECK_SPAN(memory && memory->base_ && !memory->is_pinned_, expr->span_)
           << "LowerTileToBuffer: tile storage must be planned";
@@ -230,6 +231,11 @@ class StorageIndex : public IRVisitor {
   // The resulting aliases are ordinary SSA definitions, not an IR side table.
   void Finalize() {
     for (auto& [base, storage] : roots) FinalizeRoot(base, storage);
+  }
+
+  ExprPtr IdentitySource(const ExprPtr& value) const {
+    const auto source = identity_sources_.find(AsVarLike(value).get());
+    return source == identity_sources_.end() ? value : source->second;
   }
 
   std::unordered_map<const Var*, BufferStorage> roots;
@@ -253,17 +259,22 @@ class StorageIndex : public IRVisitor {
     if (auto call = As<Call>(assign->value_); call && IsOp(call, "tile.matmul_acc")) {
       IndexProductView(call, assign->var_);
     }
+    const auto call = As<Call>(assign->value_);
     const bool identity_slice = IsIdentityTileSlice(assign);
-    if (!identity_slice && IsWindowDefinition(assign->value_)) {
+    if (identity_slice) {
+      // Record the ultimate source in lexical definition order. An identity
+      // has no allocation or subview of its own, even when its parent does.
+      identity_sources_.emplace(assign->var_.get(), IdentitySource(call->args_[0]));
+    }
+    if (IsWindowDefinition(identity_slice ? call->args_[0] : assign->value_)) {
       if (auto tile = As<TileType>(assign->var_->GetType())) windows.insert(tile.get());
     }
-    if (auto call = As<Call>(assign->value_);
-        call && ((!identity_slice && IsOp(call, "tile.slice")) || IsOp(call, "tile.assemble"))) {
-      const auto& source = IsOp(call, "tile.slice") ? call->args_[0] : ExprPtr(assign->var_);
+    if ((!identity_slice && IsOp(call, "tile.slice")) || IsOp(call, "tile.assemble")) {
+      const auto source = IsOp(call, "tile.slice") ? IdentitySource(call->args_[0]) : ExprPtr(assign->var_);
       if (auto tile = As<TileType>(source->GetType())) window_sources_.insert(tile.get());
     }
-    if (const auto call = As<Call>(assign->value_); IsOp(call, "tile.gather_compare")) {
-      if (const auto scratch = As<TileType>(call->args_[2]->GetType())) {
+    if (IsOp(call, "tile.gather_compare")) {
+      if (const auto scratch = As<TileType>(IdentitySource(call->args_[2])->GetType())) {
         gather_workspaces_.insert(scratch.get());
       }
     }
@@ -740,6 +751,7 @@ class StorageIndex : public IRVisitor {
   // Tiles that windows are cut from. PTOAS cannot legalize a subview of a
   // byte-root relabel, so in addressed storage they get their own allocation.
   std::unordered_set<const TileType*> window_sources_;
+  std::unordered_map<const Var*, ExprPtr> identity_sources_;
   std::unordered_set<const TileType*> gather_workspaces_;
   std::unordered_set<const TileType*> types_;
   std::unordered_map<const Var*, CallPtr> declarations_;
@@ -889,15 +901,11 @@ class TileToBufferMutator : public IRMutator {
     // names for those same planned storage windows.
     if (tuples_.IsProjection(assign)) return Empty(assign->span_);
     if (auto call = As<Call>(assign->value_)) {
-      if (IsIdentityTileSlice(assign)) {
-        CHECK_SPAN(Handle(assign->var_) == Handle(call->args_[0]), assign->span_)
-            << "LowerTileToBuffer: an identity slice must share the source buffer";
-        return Empty(assign->span_);
-      }
+      if (storage_.IdentitySource(assign->var_) != assign->var_) return Empty(assign->span_);
       return LowerDefinition(call, assign->var_);
     }
     if (As<TileType>(assign->var_->GetType())) {
-      auto source = AsVarLike(assign->value_);
+      auto source = AsVarLike(storage_.IdentitySource(assign->value_));
       if (source) {
         if (const auto borrow = peer_borrows_.find(source.get()); borrow != peer_borrows_.end()) {
           peer_borrows_.emplace(assign->var_.get(), borrow->second);
@@ -1069,7 +1077,10 @@ class TileToBufferMutator : public IRMutator {
 
   static StmtPtr Empty(const Span& span) { return std::make_shared<SeqStmts>(std::vector<StmtPtr>{}, span); }
 
-  VarPtr Handle(const ExprPtr& value) {
+  VarPtr Handle(const ExprPtr& operand) {
+    // Resolve at use so deferred windows are emitted within the consumer's
+    // guard and peer borrows retain the handle of their original pop.
+    const auto value = storage_.IdentitySource(operand);
     auto tile = As<TileType>(value->GetType());
     INTERNAL_CHECK_SPAN(tile, value->span_) << "Internal error: Buffer conversion expected a Tile operand";
     if (const auto borrow = peer_borrows_.find(AsVarLike(value).get()); borrow != peer_borrows_.end()) {
@@ -1180,7 +1191,7 @@ class TileToBufferMutator : public IRMutator {
       }
     }
     if (result && IsOp(call, "tile.set_validshape") && storage_.windows.count(result_type.get())) {
-      const auto source_type = As<TileType>(call->args_[0]->GetType());
+      const auto source_type = As<TileType>(storage_.IdentitySource(call->args_[0])->GetType());
       const auto recipe = window_recipes_.find(source_type.get());
       CHECK_SPAN(recipe != window_recipes_.end(), call->span_)
           << "LowerTileToBuffer: window setter requires an unrelabelled slice source";

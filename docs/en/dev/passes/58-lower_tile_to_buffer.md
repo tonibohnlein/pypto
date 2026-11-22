@@ -263,6 +263,9 @@ before lowering; scalar yields assign simultaneously, including swaps in Torch
 numerical debugging. Block and subblock queries use their existing Buffer recipes.
 
 Vec slices with static or runtime offsets, including nested slices, keep their parent's row pitch.
+A full-valid slice with the same shape, zero offsets, and identical view and storage
+aliases its source directly. Subsequent slices and valid-shape setters retain that source's
+window provenance.
 Reshape and reinterpret preserve equal physical bytes and require dense source
 row pitch, including single-row sources. Vec assemble requires a non-window target and matching source/target
 row pitches. An overlapping source is preserved by an explicit copy of its

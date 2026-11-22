@@ -295,6 +295,83 @@ def _compile(tmp_path: Path, program: ir.Program, backend: BackendType, addresse
     return text
 
 
+@pytest.mark.parametrize("planner", _PLANNERS)
+def test_identity_slice_reuses_the_window_for_stores_and_nested_slices(tmp_path, ascend_backend, planner):
+    @pl.program
+    class IdentityWindow:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self, source: pl.Tensor[[16, 8], pl.FP32], output: pl.Out[pl.Tensor[[16, 8], pl.FP32]]
+        ) -> pl.Tensor[[16, 8], pl.FP32]:
+            whole = pl.load(source, [0, 0], [16, 8])
+            window = pl.tile.slice(whole, [8, 8], [1, 0])
+            first = pl.tile.slice(window, [8, 8], [0, 0])
+            alias = pl.tile.slice(first, [8, 8], [0, 0])
+            child = pl.tile.slice(alias, [4, 8], [2, 0])
+            output = pl.store(alias, [0, 0], output)
+            return pl.store(child, [8, 0], output)
+
+    with passes.PassContext([], memory_planner=planner):
+        result = PassManager(OptimizationStrategy.Default).run_passes(IdentityWindow)
+    kernel = result.get_function("kernel")
+    assert kernel is not None and kernel.ir_stage == ir.FunctionIRStage.Buffer
+    result = _verify_round_trip(result)
+    # The identity chain contributes no subviews. The child uses the original
+    # window as its parent, preserving the original nonzero base offset.
+    window, child = [
+        stmt
+        for stmt in statements(result)
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == ir.get_op("buffer.subview").name
+    ]
+    store, child_store = _calls(result, "buffer.store")
+    assert isinstance(child.value, ir.Call) and isinstance(window.value, ir.Call)
+    assert child.value.args[0].same_as(window.var)
+    assert store.args[0].same_as(window.var)
+    assert child_store.args[0].same_as(child.var)
+    for offset, row in ((window.value.args[1], 1), (child.value.args[1], 2)):
+        assert isinstance(offset, ir.MakeTuple)
+        assert all(
+            isinstance(value, ir.ConstInt) and value.value == expected
+            for value, expected in zip(offset.elements, [row, 0], strict=True)
+        )
+    assert len(_calls(result, "buffer.alloc")) == 1
+    _compile(tmp_path, result, ascend_backend, planner != passes.MemoryPlanner.PTOAS)
+
+
+def test_identity_slice_preserves_the_window_recipe_for_runtime_validity(tmp_path, ascend_backend):
+    @pl.program
+    class ValidWindowAlias:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            source: pl.Tensor[[16, 8], pl.FP32],
+            cols: pl.Scalar[pl.INDEX],
+            output: pl.Out[pl.Tensor[[16, 8], pl.FP32]],
+        ) -> pl.Tensor[[16, 8], pl.FP32]:
+            whole = pl.load(source, [0, 0], [16, 8])
+            window = pl.tile.slice(whole, [8, 8], [1, 0])
+            alias = pl.tile.slice(window, [8, 8], [0, 0])
+            prefix = pl.tile.set_validshape(alias, 8, cols)
+            output = pl.store(prefix, [0, 0], output)
+            return pl.store(alias, [8, 0], output)
+
+    result = PassManager(OptimizationStrategy.Default).run_passes(ValidWindowAlias)
+    kernel = result.get_function("kernel")
+    assert kernel is not None and kernel.ir_stage == ir.FunctionIRStage.Buffer
+    result = _verify_round_trip(result)
+    # The setter creates an independent, guarded subview with the same parent
+    # and row offset. The identity keeps its original full validity.
+    window, prefix = _calls(result, "buffer.subview")
+    assert window.args[0].same_as(prefix.args[0])
+    ir.assert_structural_equal(window.args[1], prefix.args[1])
+    assert list(_buffer_type(window).valid_shape) == [8, 8]
+    assert list(_buffer_type(prefix).valid_shape) == [8, -1]
+    assert not _calls(result, "buffer.set_validshape")
+    _compile(tmp_path, result, ascend_backend, addressed=True)
+
+
 @pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
 @pytest.mark.parametrize("planner", _PLANNERS)
 def test_slice_and_assemble_become_use_site_windows(
