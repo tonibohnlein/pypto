@@ -19,6 +19,7 @@ from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 from .sync_closed_command_oracle import ClosedCommands, check_closed_commands, opname
 from .sync_logical_oracle import value
+from .sync_physical_oracle import checked_payload_calls
 from .test_closed_prefix_sync import lower
 from .test_conservative_sync_dataflow import conservative_fixture
 from .test_implicit_sync_effects import independent_broadcasts
@@ -448,6 +449,84 @@ class StoreBeforeScalarWrite:
     assert not unordered, f"store completion must precede scalar overwrite issue: {unordered}"
     (write,) = [site for site in summary["sites"] if site["pipe"] == ir.PipeType.S]
     assert (ir.PipeType.MTE3 in write["required_source_pipes"]) == (view != "disjoint")
+
+
+@pytest.mark.parametrize(("rows", "shared_elements"), [(32, 512), (64, 256), (96, 0)])
+def test_affine_matrix_slices_depend_on_the_native_layout(rows: int, shared_elements: int) -> None:
+    # Memory reuse places source and replacement at the same Mat address. A
+    # 64-row NZ tile's bottom rows share a fractal with the 32-row tile's top
+    # rows because their column-block strides differ. Row indices alone would
+    # declare those accesses disjoint and let FIX overwrite an active MTE1 read.
+    program = pl.parse_program(f"""
+@pl.program
+class MatrixFiberReuse:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[{rows}, 32], pl.FP16],
+               seed_a: pl.Tensor[[16, 32], pl.FP16],
+               seed_b: pl.Tensor[[32, 32], pl.FP16],
+               out: pl.Out[pl.Tensor[[32, 16], pl.FP32]]) -> pl.Tensor[[32, 16], pl.FP32]:
+        seed_l1 = pl.tile.load(seed_a, [0, 0], [16, 32], target_memory=pl.Mem.Mat)
+        seed_r1 = pl.tile.load(seed_b, [0, 0], [32, 32], target_memory=pl.Mem.Mat)
+        seed_l0 = pl.tile.move(seed_l1, target_memory=pl.Mem.Left)
+        seed_r0 = pl.tile.move(seed_r1, target_memory=pl.Mem.Right)
+        seed = pl.tile.matmul(seed_l0, seed_r0)
+        for i in pl.range(2):
+            source = pl.tile.load(a, [0, 0], [{rows}, 32], target_memory=pl.Mem.Mat)
+            left = pl.tile.extract(source, {rows - 32} + 16 * i, 0, [16, 32], target_memory=pl.Mem.Left)
+            replacement = pl.tile.create([32, 32], pl.FP16, target_memory=pl.Mem.Mat)
+            replacement = pl.tile.assemble(replacement, seed, [16 * i, 0])
+            transposed = pl.tile.transpose_view(replacement)
+            right = pl.tile.extract(transposed, 0, 16 * i, [32, 16], target_memory=pl.Mem.Right)
+            result = pl.tile.matmul(left, right)
+            out = pl.tile.store(result, [16 * i, 0], out)
+        return out
+""")
+    placed = []
+
+    def capture(transform, before):
+        if transform.get_name() == "RealizeSync":
+            placed.append(before.get_function("kernel"))
+
+    with passes.PassContext(
+        [passes.CallbackInstrument(before_pass=capture, name="capture_matrix_fibers")],
+        enable_buffer_ir=True,
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+    ):
+        lowered = PassManager(OptimizationStrategy.Default).run_passes(program)
+    (original,) = placed
+    function = lowered.get_function("kernel")
+    assert function is not None and function.attrs[PYPTO_AUTOSYNC_ATTR]
+    calls, emitted_calls = checked_payload_calls(original, function)
+
+    class MatrixCommands(ClosedCommands):
+        def assign(self, statement, env):
+            if isinstance(statement.var.type, ir.ScalarType):
+                super().assign(statement, env)
+
+        def memory_footprint(self, call, env):
+            # The geometry interpreter above has already compared the source
+            # and emitted operands, including the NZ/ZN descriptor alias.
+            index = len(self.payloads)
+            assert emitted_calls[index][0].op.name == call.op.name
+            _, _, pipe, reads, writes = calls[index]
+            return pipe, reads, writes, call.op.name, None
+
+    execution = MatrixCommands(function, {}, range(8))
+    order = execution.run()
+    assert len(execution.payloads) == len(calls)
+    checked = 0
+    for index, (read, write) in enumerate(zip(calls[:-1], calls[1:], strict=True)):
+        if read[0].op.name != opname("buffer.extract") or write[0].op.name != opname("buffer.insert"):
+            continue
+        assert read[2] == ir.PipeType.MTE1 and write[2] == ir.PipeType.FIX
+        shared = {address for space, address in read[3] & write[4] if space == ir.MemorySpace.Mat}
+        assert len(shared) == shared_elements
+        if shared:
+            assert (("payload", index, "C"), ("payload", index + 1, "I")) in order
+        checked += 1
+    assert checked == 2
 
 
 @pytest.mark.parametrize("count", [8, 32, 128])

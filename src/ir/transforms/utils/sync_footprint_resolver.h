@@ -117,6 +117,21 @@ struct MatrixBoxFootprint {
                          const std::vector<SyncCanonicalRoot>& roots);
 };
 
+// An overlap domain can contain multiple native layouts and slot partitions.
+// A fiber's integer offsets can be compared only in the same physical basis.
+struct IterationFiberBasis {
+  enum class Kind : uint8_t { Unknown, VecBytes, SlotPartition, MatrixSlot };
+  Kind kind = Kind::Unknown;
+  MemorySpace space = MemorySpace::DDR;
+  size_t matrix_root = 0;   // Canonical descriptor defining matrix row/column axes.
+  int64_t byte_origin = 0;  // Partition base or fixed matrix slot base, within `space`.
+  int64_t slot_stride = 0;  // Byte distance between slots in a partition.
+
+  auto Fields() const { return std::tie(kind, space, matrix_root, byte_origin, slot_stride); }
+  bool operator==(const IterationFiberBasis& other) const { return Fields() == other.Fields(); }
+  bool operator<(const IterationFiberBasis& other) const { return Fields() < other.Fields(); }
+};
+
 // Intra-loop iteration fiber wrt an enclosing sequential ForStmt `frame`.
 struct IterationFiber {
   enum class Kind : uint8_t { Wildcard, ModularSlot, AffineSlice, CompletedPast };
@@ -128,8 +143,11 @@ struct IterationFiber {
   int64_t extent = 0;      // Slice width (1 for ModularSlot)
   uint8_t slice_axis = 0;  // 0 = byte / matrix row, 1 = matrix col
   ExprPtr symbolic_base;
+  IterationFiberBasis basis;
 
   static IterationFiber Wildcard() { return {}; }
+  bool HasComparableCoordinates(const IterationFiber& other) const;
+  bool MayOverlap(const IterationFiber& other) const;
 };
 
 // O(1) per-SSA-handle resolved view provenance.
@@ -170,6 +188,9 @@ struct ResolvedOperandFootprint {
   std::optional<StridedByteFootprint> vec_lattice;
   std::optional<MatrixBoxFootprint> matrix_box;
   IterationFiber fiber;
+
+  bool MayOverlap(const ResolvedOperandFootprint& other, const std::vector<SyncCanonicalRoot>& roots) const;
+  bool DefinitelyOverwrites(const ResolvedOperandFootprint& other) const;
 };
 
 // Single O(N) unified storage, view, slot, and subtile resolver shared by

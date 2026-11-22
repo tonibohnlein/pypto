@@ -35,6 +35,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/verifier/verifier.h"
 #include "src/ir/transforms/utils/sync_transform_common.h"
 
@@ -74,6 +75,7 @@ IterationFiber MakeVecAffineFiber(const SymbolicIntRange& axis, int64_t stride_b
   fiber.coeff = static_cast<int64_t>(coeff);
   fiber.offset = static_cast<int64_t>(origin);
   fiber.extent = static_cast<int64_t>(extent);
+  fiber.basis = {IterationFiberBasis::Kind::VecBytes, MemorySpace::Vec};
   if (axis.symbolic_base) {
     const auto& span = axis.symbolic_base->span_;
     fiber.symbolic_base = MakeMul(axis.symbolic_base, MakeIndexConst(stride_bytes, span), span);
@@ -212,6 +214,74 @@ bool MatrixBoxFootprint::MayOverlap(const MatrixBoxFootprint& a, const MatrixBox
   const __int128 b_begin = __int128(rb.address) + __int128(b.slot_lo) * rb.slot_bytes;
   const __int128 b_end = __int128(rb.address) + __int128(b.slot_hi + 1) * rb.slot_bytes;
   return a_begin < b_end && b_begin < a_end;
+}
+
+bool IterationFiber::HasComparableCoordinates(const IterationFiber& other) const {
+  if (!frame || frame != other.frame || kind != other.kind || coeff != other.coeff ||
+      basis.kind == IterationFiberBasis::Kind::Unknown || !(basis == other.basis)) {
+    return false;
+  }
+  if (kind == Kind::ModularSlot) {
+    return modulus > 0 && modulus == other.modulus;
+  }
+  if (kind != Kind::AffineSlice || slice_axis != other.slice_axis || extent <= 0 || other.extent <= 0) {
+    return false;
+  }
+  if (symbolic_base == other.symbolic_base) {
+    return true;
+  }
+  if (!symbolic_base || !other.symbolic_base) {
+    return false;
+  }
+  try {
+    return structural_equal(symbolic_base, other.symbolic_base, false);
+  } catch (const StructuralComparisonUnsupported&) {
+    return false;
+  }
+}
+
+bool IterationFiber::MayOverlap(const IterationFiber& other) const {
+  if (!HasComparableCoordinates(other)) {
+    return true;
+  }
+  if (kind == Kind::ModularSlot) {
+    return offset == other.offset;
+  }
+  return offset < __int128(other.offset) + other.extent && other.offset < __int128(offset) + extent;
+}
+
+bool ResolvedOperandFootprint::MayOverlap(const ResolvedOperandFootprint& other,
+                                          const std::vector<SyncCanonicalRoot>& roots) const {
+  if (space != other.space) {
+    return false;
+  }
+  if (space == MemorySpace::DDR) {
+    return !gm_root || !other.gm_root || gm_root == other.gm_root;
+  }
+  if (!byte_hull || !other.byte_hull) {
+    return true;
+  }
+  if (byte_hull->end <= other.byte_hull->begin || other.byte_hull->end <= byte_hull->begin) {
+    return false;
+  }
+  if (vec_lattice && other.vec_lattice &&
+      !StridedByteFootprint::MayOverlap(*vec_lattice, *other.vec_lattice)) {
+    return false;
+  }
+  if (matrix_box && other.matrix_box &&
+      !MatrixBoxFootprint::MayOverlap(*matrix_box, *other.matrix_box, roots)) {
+    return false;
+  }
+  return fiber.MayOverlap(other.fiber);
+}
+
+bool ResolvedOperandFootprint::DefinitelyOverwrites(const ResolvedOperandFootprint& other) const {
+  // ResolveOperand grants this only to a static exact whole window (or an exact
+  // whole matrix slot). Requiring containment in that window is a coverage
+  // proof, even when the other's accesses move within it.
+  return candidate_full_overwrite && write && !read && space == other.space && root_id != 0 &&
+         root_id == other.root_id && byte_hull && other.byte_hull &&
+         byte_hull->begin <= other.byte_hull->begin && other.byte_hull->end <= byte_hull->end;
 }
 
 std::array<ExprPtr, 2> FootprintRangeOperands(const CallPtr& call) {
@@ -627,6 +697,8 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
       view.fiber.coeff = idx_range->affine_coeff;
       view.fiber.offset = idx_range->affine_base;
       view.fiber.extent = 1;
+      view.fiber.basis = {IterationFiberBasis::Kind::SlotPartition, root.space, 0, root.address,
+                          root.slot_bytes};
     }
 
     views_.emplace(var.get(), std::move(view));
@@ -1005,6 +1077,10 @@ ResolvedOperandFootprint SyncFootprintResolver::ResolveOperand(const Stmt* cut, 
           out.fiber.offset = c_opt->affine_base;
           out.fiber.extent = sub_cols;
           out.fiber.slice_axis = 1;
+        }
+        if (out.fiber.kind == IterationFiber::Kind::AffineSlice) {
+          out.fiber.basis = {IterationFiberBasis::Kind::MatrixSlot, root.space, root.id,
+                             view->base_byte_offset};
         }
       }
     }

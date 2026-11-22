@@ -32,7 +32,6 @@
 #include "pypto/ir/sync.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
-#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/parent_stmt_analysis.h"
 #include "pypto/ir/transforms/utils/signature_symbols.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
@@ -949,12 +948,8 @@ std::optional<InlineExactSubBlock> TryPrepareInlineExactSubBlock(
     // Accept iff there is at least one `(v_stmt, pipe_u)` where Conservative has an un-killed hazard
     // at a strictly later `u_stmt` than `exact_max(v_stmt, pipe_u)` (or where `exact_max` has none).
     const SyncFootprintResolver& resolver = ensure_resolver();
-    struct SiteAccess {
-      ResolvedOperandFootprint fp;
-      bool implicit = false;
-    };
     std::vector<PipeType> site_pipes(seg.sites.size());
-    std::vector<std::vector<SiteAccess>> site_accesses(seg.sites.size());
+    std::vector<std::vector<ResolvedOperandFootprint>> site_accesses(seg.sites.size());
     for (size_t s = 0; s < seg.sites.size(); ++s) {
       const CallPtr& call = seg.sites[s].original;
       const Stmt* cut = seq->stmts_[win_a + site_to_stmt[s]].get();
@@ -966,81 +961,25 @@ std::optional<InlineExactSubBlock> TryPrepareInlineExactSubBlock(
         const auto arg_type = call->args_[arg_idx]->GetType();
         MemorySpace space = MemorySpace::DDR;
         if (const auto buf = As<BufferType>(arg_type)) space = buf->memory_space_;
-        site_accesses[s].push_back({resolver.ResolveOperand(cut, call, arg_idx, mode, space,
-                                                            /*enable_refresh_kill=*/true, disjoint_gm),
-                                    false});
+        site_accesses[s].push_back(resolver.ResolveOperand(cut, call, arg_idx, mode, space,
+                                                           /*enable_refresh_kill=*/true, disjoint_gm));
       }
       for (const auto& eff : op.Implementation().ImplicitEffects()) {
         ResolvedOperandFootprint fp;
         fp.space = eff.space;
         fp.read = (eff.data == BufferAccess::Read || eff.data == BufferAccess::ReadWrite);
         fp.write = (eff.data == BufferAccess::Write || eff.data == BufferAccess::ReadWrite);
-        site_accesses[s].push_back({std::move(fp), true});
+        site_accesses[s].push_back(std::move(fp));
       }
     }
 
-    auto access_conflicts = [&](const SiteAccess& sa, const SiteAccess& sb) -> bool {
-      const auto& a = sa.fp;
-      const auto& b = sb.fp;
-      if (!a.write && !b.write) return false;
-      if (a.space != b.space) return false;
-      if (a.space == MemorySpace::DDR) {
-        if (disjoint_gm && a.gm_root && b.gm_root) return a.gm_root.get() == b.gm_root.get();
-        return true;
-      }
-      if (sa.implicit || sb.implicit || !a.byte_hull || !b.byte_hull) return true;
-      if (__int128(a.byte_hull->begin) >= __int128(b.byte_hull->end) ||
-          __int128(b.byte_hull->begin) >= __int128(a.byte_hull->end)) {
-        return false;
-      }
-      if (a.space == MemorySpace::Vec && a.vec_lattice && b.vec_lattice &&
-          !StridedByteFootprint::MayOverlap(*a.vec_lattice, *b.vec_lattice)) {
-        return false;
-      }
-      if (a.space != MemorySpace::Vec && a.matrix_box && b.matrix_box &&
-          !MatrixBoxFootprint::MayOverlap(*a.matrix_box, *b.matrix_box, resolver.Roots())) {
-        return false;
-      }
-      if (a.fiber.kind == IterationFiber::Kind::ModularSlot &&
-          b.fiber.kind == IterationFiber::Kind::ModularSlot && a.fiber.frame == b.fiber.frame &&
-          a.fiber.modulus > 0 && a.fiber.modulus == b.fiber.modulus && a.fiber.coeff == b.fiber.coeff &&
-          a.fiber.offset != b.fiber.offset) {
-        return false;
-      }
-      if (a.fiber.kind == IterationFiber::Kind::AffineSlice &&
-          b.fiber.kind == IterationFiber::Kind::AffineSlice && a.fiber.frame == b.fiber.frame &&
-          a.fiber.slice_axis == b.fiber.slice_axis && a.fiber.coeff == b.fiber.coeff) {
-        bool same_sym = (!a.fiber.symbolic_base && !b.fiber.symbolic_base);
-        if (!same_sym && a.fiber.symbolic_base && b.fiber.symbolic_base) {
-          if (a.fiber.symbolic_base.get() == b.fiber.symbolic_base.get()) {
-            same_sym = true;
-          } else {
-            try {
-              same_sym = structural_equal(a.fiber.symbolic_base, b.fiber.symbolic_base, false);
-            } catch (const StructuralComparisonUnsupported&) {
-              same_sym = false;
-            }
-          }
-        }
-        if (same_sym) {
-          const __int128 a_end = __int128(a.fiber.offset) + a.fiber.extent;
-          const __int128 b_end = __int128(b.fiber.offset) + b.fiber.extent;
-          if (a_end <= b.fiber.offset || b_end <= a.fiber.offset) return false;
-        }
-      }
-      return true;
-    };
-
-    auto killed_between = [&](size_t i, size_t j, const SiteAccess& sa) -> bool {
-      if (sa.implicit || sa.fp.space == MemorySpace::DDR || sa.fp.root_id == 0 || !sa.fp.byte_hull) {
+    auto killed_between = [&](size_t i, size_t j, const ResolvedOperandFootprint& access) -> bool {
+      if (access.root_id == 0 || !access.byte_hull) {
         return false;
       }
       for (size_t k = i + 1; k < j; ++k) {
-        for (const auto& sk : site_accesses[k]) {
-          if (sk.implicit || !sk.fp.candidate_full_overwrite || !sk.fp.write || sk.fp.read) continue;
-          if (sk.fp.space != sa.fp.space || sk.fp.root_id != sa.fp.root_id || !sk.fp.byte_hull) continue;
-          if (sk.fp.byte_hull->begin <= sa.fp.byte_hull->begin &&
-              sk.fp.byte_hull->end >= sa.fp.byte_hull->end && access_conflicts(sa, sk)) {
+        for (const auto& overwrite : site_accesses[k]) {
+          if (overwrite.DefinitelyOverwrites(access)) {
             return true;
           }
         }
@@ -1059,7 +998,7 @@ std::optional<InlineExactSubBlock> TryPrepareInlineExactSubBlock(
         for (const auto& sa : site_accesses[i]) {
           bool pair_conflicts = false;
           for (const auto& sb : site_accesses[j]) {
-            if (access_conflicts(sa, sb)) {
+            if ((sa.write || sb.write) && sa.MayOverlap(sb, resolver.Roots())) {
               pair_conflicts = true;
               break;
             }

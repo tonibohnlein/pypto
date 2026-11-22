@@ -299,20 +299,21 @@ struct FiberKey {
   int64_t extent = 0;
   int64_t coeff = 0;
   uint8_t slice_axis = 0;
+  IterationFiberBasis basis;
 
   static FiberKey Wildcard() { return {}; }
   static FiberKey From(const IterationFiber& f) {
     if (f.kind == IterationFiber::Kind::Wildcard || !f.frame) return {};
-    return {f.kind, f.frame, f.modulus, f.offset, f.extent, f.coeff, f.slice_axis};
+    return {f.kind, f.frame, f.modulus, f.offset, f.extent, f.coeff, f.slice_axis, f.basis};
   }
 
   bool operator==(const FiberKey& o) const {
     return kind == o.kind && frame == o.frame && modulus == o.modulus && offset == o.offset &&
-           extent == o.extent && coeff == o.coeff && slice_axis == o.slice_axis;
+           extent == o.extent && coeff == o.coeff && slice_axis == o.slice_axis && basis == o.basis;
   }
   bool operator<(const FiberKey& o) const {
-    return std::tie(kind, frame, modulus, offset, extent, coeff, slice_axis) <
-           std::tie(o.kind, o.frame, o.modulus, o.offset, o.extent, o.coeff, o.slice_axis);
+    return std::tie(kind, frame, modulus, offset, extent, coeff, slice_axis, basis) <
+           std::tie(o.kind, o.frame, o.modulus, o.offset, o.extent, o.coeff, o.slice_axis, o.basis);
   }
 };
 
@@ -332,7 +333,7 @@ bool FibersConflict(const FiberKey& a, const FiberKey& b) {
   if (a.kind == IterationFiber::Kind::Wildcard || b.kind == IterationFiber::Kind::Wildcard) {
     return true;
   }
-  if (a.frame != b.frame) return true;
+  if (a.frame != b.frame || !(a.basis == b.basis)) return true;
   if (a.kind == IterationFiber::Kind::CompletedPast || b.kind == IterationFiber::Kind::CompletedPast) {
     return false;
   }
@@ -350,7 +351,7 @@ bool FibersConflict(const FiberKey& a, const FiberKey& b) {
 bool MustCoverFiber(const FiberKey& kill_fiber, const FiberKey& target_fiber) {
   if (kill_fiber.kind == IterationFiber::Kind::Wildcard) return true;
   if (target_fiber.kind == IterationFiber::Kind::Wildcard) return false;
-  if (kill_fiber.frame != target_fiber.frame) return false;
+  if (kill_fiber.frame != target_fiber.frame || !(kill_fiber.basis == target_fiber.basis)) return false;
   if (kill_fiber.kind == IterationFiber::Kind::ModularSlot &&
       target_fiber.kind == IterationFiber::Kind::ModularSlot) {
     return kill_fiber.modulus == target_fiber.modulus && kill_fiber.offset == target_fiber.offset;
@@ -380,11 +381,11 @@ FiberKey TransformFiberOnBackedge(MemorySpace space, size_t domain, const FiberK
     const __int128 next_off = __int128(f.offset) - f.coeff;
     if (f.coeff > 0) {
       if (next_off + f.extent <= bit->second.first) {
-        return {IterationFiber::Kind::CompletedPast, loop, 0, 0, 0, 0, 0};
+        return {IterationFiber::Kind::CompletedPast, loop, 0, 0, 0, 0, 0, f.basis};
       }
     } else {
       if (next_off >= bit->second.second) {
-        return {IterationFiber::Kind::CompletedPast, loop, 0, 0, 0, 0, 0};
+        return {IterationFiber::Kind::CompletedPast, loop, 0, 0, 0, 0, 0, f.basis};
       }
     }
     if (next_off < std::numeric_limits<int64_t>::min() || next_off > std::numeric_limits<int64_t>::max() ||
@@ -2961,15 +2962,14 @@ class Builder {
     StorageClasses classes;
     classes.Build(raw, resolver_.Roots());
 
-    // Normalize IterationFibers per (space, domain, loop) enforcing #86 Section 1.1 preconditions.
+    // A history group can expire old affine offsets only if all of its moving
+    // accesses share an origin, unit, and coordinate mapping. The physical
+    // overlap classes can merge incompatible matrix layouts or slot partitions.
+    // Such a group uses wildcards, so an offset from one view cannot expire
+    // accesses that still overlap bytes touched by another view.
     struct FiberGroup {
       bool valid = true;
-      IterationFiber::Kind kind = IterationFiber::Kind::Wildcard;
-      int64_t modulus = 0;
-      int64_t coeff = 0;
-      uint8_t slice_axis = 0;
-      ExprPtr symbolic_base;
-      bool has_sym = false;
+      IterationFiber coordinates;
       int64_t min_b = std::numeric_limits<int64_t>::max();
       int64_t max_e = std::numeric_limits<int64_t>::min();
     };
@@ -2983,41 +2983,12 @@ class Builder {
         }
         auto& g = groups[{effect.space, domain, effect.fiber.frame}];
         if (!g.valid) continue;
-        if (g.kind == IterationFiber::Kind::Wildcard) {
-          g.kind = effect.fiber.kind;
-          g.modulus = effect.fiber.modulus;
-          g.coeff = effect.fiber.coeff;
-          g.slice_axis = effect.fiber.slice_axis;
-          g.symbolic_base = effect.fiber.symbolic_base;
-          g.has_sym = static_cast<bool>(effect.fiber.symbolic_base);
-          if (g.kind == IterationFiber::Kind::ModularSlot) {
-            if (g.modulus <= 0 || g.modulus > kMaxModularFiberModulus || g.coeff == 0) g.valid = false;
-          } else if (g.kind == IterationFiber::Kind::AffineSlice) {
-            if (g.coeff == 0 || effect.fiber.extent <= 0) g.valid = false;
-          } else {
-            g.valid = false;
-          }
-        } else {
-          if (g.kind != effect.fiber.kind || g.coeff != effect.fiber.coeff ||
-              g.modulus != effect.fiber.modulus ||
-              (g.kind == IterationFiber::Kind::AffineSlice && g.slice_axis != effect.fiber.slice_axis)) {
-            g.valid = false;
-          } else if (g.kind == IterationFiber::Kind::AffineSlice) {
-            const bool cur_has_sym = static_cast<bool>(effect.fiber.symbolic_base);
-            if (cur_has_sym != g.has_sym) {
-              g.valid = false;
-            } else if (g.has_sym) {
-              try {
-                if (!structural_equal(g.symbolic_base, effect.fiber.symbolic_base, false)) {
-                  g.valid = false;
-                }
-              } catch (const StructuralComparisonUnsupported&) {
-                g.valid = false;
-              }
-            }
-          }
+        if (g.coordinates.kind == IterationFiber::Kind::Wildcard) {
+          g.coordinates = effect.fiber;
+          g.valid = g.coordinates.coeff != 0 && g.coordinates.modulus <= kMaxModularFiberModulus;
         }
-        if (g.valid && g.kind == IterationFiber::Kind::AffineSlice) {
+        g.valid = g.valid && g.coordinates.HasComparableCoordinates(effect.fiber);
+        if (g.valid && g.coordinates.kind == IterationFiber::Kind::AffineSlice) {
           const __int128 end = __int128(effect.fiber.offset) + effect.fiber.extent;
           if (end > std::numeric_limits<int64_t>::max()) {
             g.valid = false;
@@ -3032,8 +3003,9 @@ class Builder {
     loops_with_fibers_.clear();
     for (auto& [key, g] : groups) {
       if (!g.valid) continue;
-      if (g.kind == IterationFiber::Kind::AffineSlice) {
-        const __int128 abs_c = g.coeff > 0 ? g.coeff : -__int128(g.coeff);
+      if (g.coordinates.kind == IterationFiber::Kind::AffineSlice) {
+        const auto coeff = g.coordinates.coeff;
+        const __int128 abs_c = coeff > 0 ? coeff : -__int128(coeff);
         const __int128 span_elems = __int128(g.max_e) - 1 - g.min_b;
         const __int128 s_trips = span_elems < 0 ? 1 : (span_elems / abs_c + 1);
         if (s_trips > kMaxAffineFiberSpan) {
