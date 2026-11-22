@@ -625,11 +625,19 @@ class DebtState {
   }
 
   // Batched 1-way relay from all sources in `sources_mask` to `dst` in one pass.
-  void DeliverSources(PipeMask sources_mask, PipeType dst, const DebtState* excluded = nullptr) {
+  void DeliverSources(PipeMask sources_mask, PipeType dst, const DebtState* excluded = nullptr,
+                      const DebtState* capture = nullptr) {
     const PipeMask dst_mask = PipeToMask(dst);
     if (sources_mask == 0 || dst_mask == 0) return;
     for (auto it = pending_.begin(); it != pending_.end();) {
-      const PipeMask ready = (~it->second & kAllPhysicalPipesMask) | PipeToMask(it->first.src);
+      auto pending = it->second;
+      if (capture) {
+        const auto recorded = capture->pending_.find(it->first);
+        // An absent key had no outstanding obligations at the record.
+        // Any new issue of the key since the record is in excluded.
+        pending = recorded == capture->pending_.end() ? 0 : recorded->second;
+      }
+      const PipeMask ready = (~pending & kAllPhysicalPipesMask) | PipeToMask(it->first.src);
       if ((ready & sources_mask) != 0 && (!excluded || !excluded->pending_.count(it->first))) {
         it->second &= ~dst_mask;
       }
@@ -1285,6 +1293,7 @@ class Builder {
   struct EarlierPrefixDelivery {
     PipeType source;
     DebtState excluded;
+    std::vector<size_t> capture_path;  // Empty for legacy sibling and latch moves.
   };
 
   bool InstallEarlierPrefixProof(const EarlierPeerPrefix& move, const LoopEntryPhases& phases) {
@@ -1298,12 +1307,24 @@ class Builder {
       return false;
     }
     DebtState displaced;
+    std::vector<size_t> path;
+    const auto record = site_index_.find(move.reader_record);
+    if (move.reader_record &&
+        (record == site_index_.end() || sites[record->second].pipe != move.source || move.backedge_iv)) {
+      return false;
+    }
     for (const auto* statement : move.displaced) {
       const auto site = site_index_.find(statement);
-      if (site == site_index_.end() || sites[site->second].pipe != move.source) {
+      if (site == site_index_.end() || (!move.reader_record && sites[site->second].pipe != move.source)) {
         return false;
       }
       displaced.AddEffects(site_effect_fibers_[site->second]);
+      if (move.reader_record) {
+        path.push_back(site->second);
+      }
+    }
+    if (move.reader_record) {
+      path.push_back(record->second);
     }
     const auto first = phases.first_sites[consumer];
     if (move.backedge_iv) {
@@ -1313,10 +1334,51 @@ class Builder {
       }
       displaced.ApplyLoopBackedge(loop->second.first, affine_domain_bounds_);
     } else if (first) {
-      earlier_deliveries_.emplace(*first, EarlierPrefixDelivery{move.source, displaced});
+      std::vector<size_t> first_path;
+      for (const auto index : path) {
+        if (!phases.first_sites[index]) {
+          return false;
+        }
+        first_path.push_back(*phases.first_sites[index]);
+      }
+      earlier_deliveries_.emplace(*first,
+                                  EarlierPrefixDelivery{move.source, displaced, std::move(first_path)});
     }
-    return earlier_deliveries_.emplace(consumer, EarlierPrefixDelivery{move.source, std::move(displaced)})
+    return earlier_deliveries_
+        .emplace(consumer, EarlierPrefixDelivery{move.source, std::move(displaced), std::move(path)})
         .second;
+  }
+
+  bool MapReaderRecordVertices(const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo) {
+    for (const auto vertex : rpo) {
+      if (cfg[vertex].kind != CfgVertex::Kind::Site) {
+        continue;
+      }
+      const auto index = cfg[vertex].index;
+      const auto delivery = earlier_deliveries_.find(index);
+      if (delivery == earlier_deliveries_.end() || delivery->second.capture_path.empty()) {
+        continue;
+      }
+      // Each wait is paired with its matching CFG occurrence of the record.
+      // Follow the exact same-sequence payload cuts, with no intervening merge,
+      // loop edge or opaque child changing the lifetime of the snapshot.
+      auto record = vertex;
+      for (const auto previous : delivery->second.capture_path) {
+        const auto& predecessors = cfg[record].preds;
+        if (predecessors.size() != 1) {
+          return false;
+        }
+        record = predecessors.front();
+        if (cfg[record].kind != CfgVertex::Kind::Site || cfg[record].index != previous) {
+          return false;
+        }
+      }
+      if (!reader_record_vertices_.emplace(index, record).second) {
+        return false;
+      }
+      reader_record_dependents_[record].push_back(vertex);
+    }
+    return true;
   }
 
   bool CheckFixedPrefixDebts(const LoopEntryPhases& phases) {
@@ -1324,6 +1386,9 @@ class Builder {
     BuildSubCfg(function_->body_, 0, cfg, &phases);
     std::vector<size_t> rpo, rpo_pos;
     ComputeRpo(cfg, 0, rpo, rpo_pos);
+    if (!MapReaderRecordVertices(cfg, rpo)) {
+      return false;
+    }
     std::vector<DebtState> in, out;
     std::vector<bool> visited;
     SolveDebtFixedPoint(/*use_selected=*/true, cfg, rpo, rpo_pos, in, out, visited);
@@ -1334,7 +1399,7 @@ class Builder {
       const auto index = cfg[vertex].index;
       const auto& site = sites[index];
       auto known = std::move(in[vertex]);
-      ApplySelectedDeliveries(known, index, site.source_pipes);
+      ApplySelectedDeliveries(known, index, site.source_pipes, &out);
       for (const auto required : site.required_source_pipes) {
         if (!known.CoversConflicts(required, site.pipe, site_effect_fibers_[index])) {
           return false;
@@ -1894,7 +1959,8 @@ class Builder {
     }
   }
 
-  DebtState TransferDebt(const CfgVertex& vertex, DebtState state, bool use_selected) const {
+  DebtState TransferDebt(const CfgVertex& vertex, DebtState state, bool use_selected,
+                         const std::vector<DebtState>* debt_out = nullptr) const {
     if (vertex.kind == CfgVertex::Kind::Child) {
       const auto& entry = children[vertex.index];
       state.ApplyServiceMatrix(child_service_matrices_[vertex.index]);
@@ -1904,7 +1970,7 @@ class Builder {
       const auto& site = sites[vertex.index];
       const auto destination = site.pipe;
       ApplySelectedDeliveries(state, vertex.index,
-                              use_selected ? site.source_pipes : site.required_source_pipes);
+                              use_selected ? site.source_pipes : site.required_source_pipes, debt_out);
       if (site.precise_capture) {
         state.DeliverSources(PipeToMask(destination), site.precise_capture->destination);
       }
@@ -1934,11 +2000,14 @@ class Builder {
                         std::greater<std::pair<size_t, size_t>>>
         worklist;
     std::vector<bool> in_queue(n, false);
-    for (const size_t u : initial_dirty) {
+    const auto enqueue = [&](size_t u) {
       if (!in_queue[u]) {
         worklist.emplace(rpo_pos[u], u);
         in_queue[u] = true;
       }
+    };
+    for (const size_t u : initial_dirty) {
+      enqueue(u);
     }
     while (!worklist.empty()) {
       const size_t u = worklist.top().second;
@@ -1948,7 +2017,7 @@ class Builder {
       for (const size_t p : cfg[u].preds) {
         if (visited[p]) in_u.MergeFrom(debt_out[p]);
       }
-      const DebtState out_u = TransferDebt(cfg[u], in_u, use_selected);
+      const DebtState out_u = TransferDebt(cfg[u], in_u, use_selected, &debt_out);
       const bool in_changed = !visited[u] || (in_u != debt_in[u]);
       const bool out_changed = !visited[u] || (out_u != debt_out[u]);
       if (!in_changed && !out_changed) continue;
@@ -1957,9 +2026,15 @@ class Builder {
       debt_out[u] = std::move(out_u);
       if (out_changed) {
         for (const size_t v : cfg[u].succs) {
-          if (!in_queue[v]) {
-            worklist.emplace(rpo_pos[v], v);
-            in_queue[v] = true;
+          enqueue(v);
+        }
+        // Intervening transfers can absorb a change at the record without
+        // changing the consumer's ordinary predecessor. Refresh its separate
+        // snapshot dependency as well.
+        if (const auto captures = reader_record_dependents_.find(u);
+            captures != reader_record_dependents_.end()) {
+          for (const auto v : captures->second) {
+            enqueue(v);
           }
         }
       }
@@ -1982,7 +2057,7 @@ class Builder {
         if (visited[p]) in_u.MergeFrom(debt_out[p]);
       }
       debt_in[u] = in_u;
-      const DebtState out_u = TransferDebt(cfg[u], std::move(in_u), use_selected);
+      const DebtState out_u = TransferDebt(cfg[u], std::move(in_u), use_selected, &debt_out);
       visited[u] = true;
       debt_out[u] = out_u;
       for (const size_t v : cfg[u].succs) {
@@ -2106,7 +2181,8 @@ class Builder {
                             &capture.displaced_effects);
   }
 
-  void ApplySelectedDeliveries(DebtState& state, size_t index, const std::vector<PipeType>& pipes) const {
+  void ApplySelectedDeliveries(DebtState& state, size_t index, const std::vector<PipeType>& pipes,
+                               const std::vector<DebtState>* debt_out = nullptr) const {
     ApplyFirstPrefixCapture(state, index);
     const auto destination = sites[index].pipe;
     PipeMask mask = 0;
@@ -2115,7 +2191,14 @@ class Builder {
     }
     if (const auto move = earlier_deliveries_.find(index); move != earlier_deliveries_.end()) {
       const auto early = PipeToMask(move->second.source);
-      state.DeliverSources(mask & early, destination, &move->second.excluded);
+      const auto record = reader_record_vertices_.find(index);
+      const DebtState* snapshot = nullptr;
+      if (record != reader_record_vertices_.end()) {
+        INTERNAL_CHECK(debt_out && record->second < debt_out->size())
+            << "Internal error: reader release has no record debt";
+        snapshot = &(*debt_out)[record->second];
+      }
+      state.DeliverSources(mask & early, destination, &move->second.excluded, snapshot);
       mask &= ~early;
     }
     state.DeliverSources(mask, destination);
@@ -3267,6 +3350,8 @@ class Builder {
   bool rechecking_prefixes_ = false;
   std::unordered_map<const Var*, std::pair<const ForStmt*, size_t>> prefix_phase_loops_;
   std::unordered_map<size_t, EarlierPrefixDelivery> earlier_deliveries_;
+  std::unordered_map<size_t, size_t> reader_record_vertices_;
+  std::unordered_map<size_t, std::vector<size_t>> reader_record_dependents_;
   std::unordered_map<const Expr*, ExprPtr> gm_roots_;
   std::unordered_map<const Var*, ExprPtr> ssa_defs_;
   std::vector<std::vector<const Var*>> scopes_;

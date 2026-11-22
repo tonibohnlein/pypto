@@ -127,6 +127,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/peer_local_plan.cpp
     src/ir/transforms/utils/peer_local_work_loop.cpp
     src/ir/transforms/utils/peer_local_work_completion.cpp
+    src/ir/transforms/utils/regional_sync_handoff.cpp
     src/ir/transforms/utils/peer_prefix_capture.cpp
     src/ir/transforms/utils/local_completion_relay.cpp
     src/ir/transforms/utils/peer_fifo_pair.cpp

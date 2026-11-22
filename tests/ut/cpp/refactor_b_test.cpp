@@ -39,6 +39,7 @@
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 #include "src/ir/transforms/utils/closed_prefix_sync.h"
 #include "src/ir/transforms/utils/conservative_sync_dataflow.h"
@@ -729,6 +730,129 @@ void TestIndependentPhysicalCaptures() {
   }
   const auto exhausted = RefineLocalCompletionPlan(baseline, evidence, "a2a3", reserved);
   assert(structural_equal(exhausted->body_, baseline->body_));
+}
+
+void TestEarlierReaderReleases() {
+  const auto input = MakeVar("input", MakeTensorType(16, 16, DataType::FP16));
+  const auto gate = MakeVar("gate", BoolType());
+  const auto mat = MatType(16, 16), left = LeftType(16, 16);
+  const auto slot0 = MakeVar("slot0", mat), slot1 = MakeVar("slot1", mat);
+  const auto spare = MakeVar("spare", mat);
+  const auto lhs0 = MakeVar("lhs0", left), lhs1 = MakeVar("lhs1", left),
+             spare_lhs = MakeVar("spare_lhs", left);
+  const backend::BufferSyncByteWindow mat0{0, 512}, mat1{512, 1024}, mat2{1024, 1536};
+  const auto point = ConstTup({0, 0}), extent = ConstTup({16, 16});
+  const auto load = [&](const VarPtr& target) {
+    return EvalCall("buffer.load", {input, point, extent, target});
+  };
+  const auto read0 = EvalCall("buffer.copy", {slot0, lhs0});
+  const auto read1 = EvalCall("buffer.copy", {slot1, lhs1});
+  const auto noise = EvalCall("buffer.copy", {spare, spare_lhs});
+  const auto rearm = EvalCall("buffer.copy", {slot0, spare_lhs});
+  const auto overwrite0 = load(slot0), overwrite1 = load(slot1);
+  // Imported effects model an independent producer whose completion enters
+  // MTE1 between the readers, and a later MTE2 observer of that completion.
+  const auto producer = load(spare), observer = load(spare);
+  const backend::BufferSyncByteWindow third_party{0, 1024};
+  const auto call_of = [](const StmtPtr& stmt) { return As<Call>(As<EvalStmt>(stmt)->expr_); };
+  const auto branch = [&](const StmtPtr& operation) {
+    return std::make_shared<IfStmt>(gate, operation, std::nullopt, std::vector<VarPtr>{}, kSpan);
+  };
+  enum class Case { Single, Shared, KeepsRelay, DownstreamReader, DownstreamRelay, Opaque, LostRearm };
+  for (const auto which : {Case::Single, Case::Shared, Case::KeepsRelay, Case::DownstreamReader,
+                           Case::DownstreamRelay, Case::Opaque, Case::LostRearm}) {
+    std::vector<StmtPtr> body{AllocBuf(slot0, 0, mat),    AllocBuf(slot1, 512, mat),
+                              AllocBuf(spare, 1024, mat), AllocBuf(lhs0, 0, left),
+                              AllocBuf(lhs1, 512, left),  AllocBuf(spare_lhs, 1024, left)};
+    ImportedLocalSync evidence;
+    for (const auto& definition : body) {
+      const auto call = As<Call>(As<AssignStmt>(definition)->value_);
+      evidence.calls.emplace(call.get(), ImportedLocalCut{definition.get(), std::nullopt, {}});
+    }
+    const auto add = [&](const StmtPtr& operation, PipeType pipe, std::vector<ImportedLocalEffect> effects) {
+      evidence.calls.emplace(call_of(operation).get(),
+                             ImportedLocalCut{operation.get(), pipe, std::move(effects)});
+    };
+    const bool keeps_relay = which == Case::KeepsRelay;
+    std::vector<ImportedLocalEffect> first_read{{MemorySpace::Mat, false, mat0}};
+    if (keeps_relay) {
+      first_read.push_back({MemorySpace::Acc, false, third_party});
+    }
+    add(read0, PipeType::MTE1, std::move(first_read));
+    add(read1, PipeType::MTE1, {{MemorySpace::Mat, false, mat1}, {MemorySpace::Acc, false, third_party}});
+    add(noise, PipeType::MTE1, {{MemorySpace::Mat, false, mat2}});
+    add(producer, PipeType::M, {{MemorySpace::Acc, true, third_party}});
+    add(overwrite0, PipeType::MTE2, {{MemorySpace::Mat, true, mat0}});
+    if (which == Case::LostRearm) {
+      // The second publication can reuse the first event only once the
+      // overwrite's completion has reached rearm on the publishing pipe.
+      add(rearm, PipeType::MTE1, {{MemorySpace::Mat, false, mat0}});
+      add(overwrite1, PipeType::MTE2, {{MemorySpace::Mat, true, mat1}});
+      body.insert(body.end(), {read0, overwrite0, read1, rearm, overwrite1});
+    } else if (keeps_relay) {
+      body.insert(body.end(), {producer, read0, read1, noise, overwrite0});
+    } else {
+      body.insert(body.end(), {read0, producer, read1, noise, overwrite0});
+    }
+    if (which == Case::Shared || which == Case::DownstreamReader) {
+      add(overwrite1, PipeType::MTE2, {{MemorySpace::Mat, true, mat1}});
+      body.push_back(which == Case::Shared ? overwrite1 : branch(overwrite1));
+    } else if (which == Case::DownstreamRelay || keeps_relay) {
+      add(observer, PipeType::MTE2, {{MemorySpace::Acc, false, third_party}});
+      body.push_back(branch(observer));
+    } else if (which == Case::Opaque) {
+      evidence.calls.at(call_of(read1).get()).has_native_claims = true;
+    }
+    evidence.owner = MakeAicFn("reader_release", {input, gate}, {ParamDirection::In, ParamDirection::In},
+                               std::move(body), FunctionType::AIC);
+    const auto analysis = AnalyzeConservativeSync(evidence.owner, "a2a3", {}, {}, false, false, false, {},
+                                                  std::nullopt, false, &evidence, false);
+    const auto logical = InsertConservativePrefixes(analysis);
+    const auto original =
+        TryLowerClosedPrefixSync(logical, "a2a3", std::nullopt, {}, {}, std::nullopt, &evidence);
+    assert(original);
+    const auto selected = TryEarlierReaderReleases(*original, analysis, evidence, "a2a3", {}, {});
+    const bool shared = which == Case::Shared;
+    if (shared || keeps_relay || which == Case::Single) {
+      assert(selected && selected->moves.size() == 1);
+      size_t original_sets = 0, selected_sets = 0;
+      const auto before =
+          RelayPayloadPredecessors(original->function, evidence.calls, true, 0, &original_sets);
+      const auto after =
+          RelayPayloadPredecessors(selected->function, evidence.calls, true, 0, &selected_sets);
+      assert(original_sets == selected_sets);
+      const unsigned head = 1U << (keeps_relay ? 1 : 0), middle = 1U << 2, late = 1U << 3;
+      assert((before[4].first & (head | middle | late)) == (head | middle | late));
+      assert((after[4].first & (head | middle | late)) == (shared ? (head | middle) : head));
+      if (shared) {
+        assert((after[5].first & middle) != 0);
+      }
+      if (keeps_relay) {
+        // The observer inherits the third-party completion captured by the
+        // first reader before publication. Merely crediting the source fails.
+        assert((after[5].first & 1U) != 0);
+      }
+    } else {
+      if (which == Case::DownstreamReader || which == Case::DownstreamRelay) {
+        // The branch payload's conflicting predecessor was supplied by the
+        // original release. It has no independent flag to repair a lost edge.
+        assert(analysis.Sites().back().source_pipes.empty());
+      }
+      if (which == Case::LostRearm) {
+        assert(original->set_sites == 3);
+        std::set<int> release_ids;
+        for (const auto& statement : transform_utils::FlattenToStmts(original->function->body_)) {
+          const auto eval = As<EvalStmt>(statement);
+          if (const auto call = eval ? As<Call>(eval->expr_) : nullptr;
+              IsOp(call, "system.set_flag") && RequireSyncPipeKwarg(call, "src_pipe") == PipeType::MTE1) {
+            release_ids.insert(call->GetKwarg<int>("event_id"));
+          }
+        }
+        assert(release_ids.size() == 1);
+      }
+      assert(!selected);
+    }
+  }
 }
 
 // ============================================================================
@@ -1983,6 +2107,7 @@ int main() {
   pypto::ir::sync::TestBoundedWorkGuards();
   pypto::ir::sync::TestSplitLongConsumerRun();
   pypto::ir::sync::TestIndependentPhysicalCaptures();
+  pypto::ir::sync::TestEarlierReaderReleases();
   pypto::ir::sync::TestPeerTransferBufferGeometry();
   pypto::ir::sync::TestB1SyncControlRangeProver();
   pypto::ir::sync::TestB1RangeUseCuts();

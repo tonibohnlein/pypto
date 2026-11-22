@@ -301,7 +301,7 @@ FunctionPtr PlanStructuredEndpoint(const PeerLocalEffects& effects) {
       reserved[direction].insert(ids.begin(), ids.end());
     }
   }
-  using Plan = std::pair<FunctionPtr, ConservativeSyncAnalysis>;
+  using Plan = std::pair<PhysicalSyncRealization, ConservativeSyncAnalysis>;
   const auto realize = [&](bool precise_captures) -> std::optional<Plan> {
     auto analysis = AnalyzeConservativeSync(
         imported.owner, target, {}, {}, /*retain_incoming_diagnostics=*/false,
@@ -314,25 +314,37 @@ FunctionPtr PlanStructuredEndpoint(const PeerLocalEffects& effects) {
     if (!physical) {
       return std::nullopt;
     }
-    return Plan{std::move(physical->function), std::move(analysis)};
+    return Plan{std::move(*physical), std::move(analysis)};
   };
   // Separating record and wait may keep more event slots live. Use the same
   // allocator and its consumption proof, with the original adjacent-prefix
   // schedule available when the directional palette cannot hold both.
-  std::optional<Plan> precise;
+  std::optional<Plan> plan;
   try {
-    precise = realize(true);
+    plan = realize(true);
   } catch (const pypto::ValueError&) {
     // The unmodified plan remains available for a supported original endpoint.
   }
-  if (precise) {
-    const auto moved =
-        MoveEarlierPeerPrefixes(precise->first, precise->second, imported, target, effects.parameters);
-    return RefineLocalCompletionPlan(moved, imported.calls, target, reserved);
+  const bool precise = plan.has_value();
+  if (!plan) {
+    plan = realize(false);
   }
-  const auto physical = realize(false);
-  CHECK(physical) << "No closed-prefix schedule for the imported peer endpoint";
-  return RefineLocalCompletionPlan(physical->first, imported.calls, target, reserved);
+  CHECK(plan) << "No closed-prefix schedule for the imported peer endpoint";
+  const auto refine = [&](const FunctionPtr& physical, const std::vector<EarlierPeerPrefix>& moves) {
+    const auto moved =
+        precise ? MoveEarlierPeerPrefixes(physical, plan->second, imported, target, effects.parameters, moves)
+                : physical;
+    return RefineLocalCompletionPlan(moved, imported.calls, target, reserved);
+  };
+  const auto baseline = refine(plan->first.function, {});
+  if (const auto release = TryEarlierReaderReleases(plan->first, plan->second, imported, target, reserved,
+                                                    effects.parameters)) {
+    const auto candidate = refine(release->function, release->moves);
+    if (OnlyAdvancesReaderRelease(baseline, candidate)) {
+      return candidate;
+    }
+  }
+  return baseline;
 }
 
 }  // namespace

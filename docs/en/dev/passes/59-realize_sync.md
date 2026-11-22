@@ -130,6 +130,14 @@ the crossed commands for event reuse and rechecks the fixed services with
 the displaced payload effects excluded from the earlier prefix. If these
 checks or Buffer validity fail, the endpoint uses its original allocation.
 
+A storage overwrite can also use an earlier release from the pipe that last
+read its slots. When a single wait protects several slots, the planner places
+the record after the last reader contributing to that shared wait. It checks
+the completion facts available at the record against subsequent requirements
+on the original control flow, including event reuse. It keeps the candidate
+only when it can realize the release with the existing flag budget and wait
+placement.
+
 A shared wait can order independent operands. For example, the left matrix
 move needs the earlier query load while the right move needs the later page
 load. The planner can keep the original page publication, deliver the earlier
@@ -161,6 +169,15 @@ directional ID. Inside a loop, retained commands must carry its consumption
 back to the publishing pipe before the next visit. These checks use the
 original control flow and introduce no guards. If the relay would also
 deliver unrelated work, the original batch remains eligible.
+
+Two successive retained child loops can transfer completion through an
+existing event. For a bounded invocation with known control flow, the
+planner replays the generated pairs and local barriers at the second
+child's entry against the complete physical schedule. It can drop a pair
+or barrier when every payload still sees the same completed prefix on each
+pipe at issue, every event is consumed before reuse, and all events are
+consumed at exit. An unknown branch, an opaque native effect, or a replay
+that exceeds the work budget keeps the original handoff.
 
 A loop head can reuse storage first touched in the prologue. The first
 overwrite may need a pre-loop reader to finish, while later overwrites need

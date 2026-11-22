@@ -804,7 +804,8 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
                                     std::optional<std::pair<int64_t, int64_t>> blocks,
                                     const SyncSchedulePolicy& policy, SyncExternalPolicy external_policy,
                                     std::optional<int64_t> launch_count,
-                                    const SyncNativeReservations& extra_reservations, bool dry_run_only) {
+                                    const SyncNativeReservations& extra_reservations, bool dry_run_only,
+                                    bool complete_invocation) {
   CheckLogicalSync(function);
   RequireBufferSyncScalarLayout(function);
   RequireBufferRuntimeValid(function);
@@ -818,9 +819,9 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
   }
   FindLogical(true).VisitFunction(function);
   if (HasOnlyClosedPrefixSyntax(function)) {
-    if (auto closed =
-            TryLowerClosedPrefixSync(function, target, eligible_ids, extra_reservations, parameters, blocks,
-                                     nullptr, dry_run_only ? SyncSchedulePolicy{} : policy)) {
+    if (auto closed = TryLowerClosedPrefixSync(function, target, eligible_ids, extra_reservations, parameters,
+                                               blocks, nullptr, dry_run_only ? SyncSchedulePolicy{} : policy,
+                                               complete_invocation && !dry_run_only)) {
       if (dry_run_only) return {closed->function, closed->set_sites, closed->wait_sites, {}};
       CheckPhysicalSyncResult(closed->function);
       FinishSyncScheduleReceipt(closed->function, *closed, policy);

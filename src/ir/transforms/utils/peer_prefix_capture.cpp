@@ -9,7 +9,9 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -28,12 +30,22 @@
 #include "src/ir/transforms/utils/conservative_sync_dataflow.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
 #include "src/ir/transforms/utils/sync_transform_common.h"
+#include "src/ir/transforms/utils/token_sync_lowering.h"
 
 namespace pypto::ir::sync {
 namespace {
 using Event = std::tuple<PipeType, PipeType, int>;
 using Ready = std::unordered_set<const Var*>;
 using Cuts = std::vector<StmtPtr>;
+
+bool IsLocalPrefixMetadata(const StmtPtr& statement, const std::string& target) {
+  if (const auto call = transform_utils::GetCallFromStmt(statement)) {
+    return backend::QualifyBufferSyncNonPayload(call, target).has_value();
+  }
+  // The imported route has qualified scalar readiness. A pure definition
+  // affects neither asynchronous queue.
+  return static_cast<bool>(As<AssignStmt>(statement));
+}
 
 std::optional<Event> Flag(const StmtPtr& statement, bool publish) {
   const auto eval = As<EvalStmt>(statement);
@@ -140,15 +152,7 @@ class Nominate {
            IsOp(transform_utils::GetCallFromStmt(statement), "system.sync_wait");
   }
 
-  bool Metadata(const StmtPtr& statement) const {
-    const auto call = transform_utils::GetCallFromStmt(statement);
-    if (!call) {
-      // All source scalar expressions on the imported route have passed its
-      // readiness checks. A pure definition changes neither queue.
-      return static_cast<bool>(As<AssignStmt>(statement));
-    }
-    return backend::QualifyBufferSyncNonPayload(call, target_).has_value();
-  }
+  bool Metadata(const StmtPtr& statement) const { return IsLocalPrefixMetadata(statement, target_); }
 
   // Every existing consume-before-republish path reaching the old SET must
   // already reach its source pipe here. In particular there is no native
@@ -451,16 +455,265 @@ class Rewrite final : public SyncStatementMutator {
   std::unordered_set<const Stmt*> removed_;
   std::unordered_map<const Stmt*, StmtPtr> inserted_;
 };
+
+using Sites = std::vector<const ConservativeSyncSite*>;
+
+bool HasService(const ConservativeSyncSite& site, PipeType source) {
+  return std::binary_search(site.source_pipes.begin(), site.source_pipes.end(), source);
+}
+
+struct ReleaseContribution {
+  bool conflicting = false;
+  bool releases_reader = false;
+};
+
+ReleaseContribution ContributesToRelease(const ConservativeSyncSite& producer,
+                                         const ConservativeAccessSet& consumers) {
+  ReleaseContribution result;
+  for (const auto& [space, pipe, write, domain] : producer.effects) {
+    (void)pipe;
+    for (const auto& [target_space, target_pipe, target_write, target_domain] : consumers) {
+      (void)target_pipe;
+      if (space != target_space || (!write && !target_write) ||
+          (domain != 0 && target_domain != 0 && domain != target_domain)) {
+        continue;
+      }
+      result.conflicting = true;
+      result.releases_reader |= !write && target_write && space != MemorySpace::DDR;
+    }
+  }
+  return result;
+}
+
+class ReaderReleases final : public IRVisitor {
+ public:
+  ReaderReleases(const ConservativeSyncAnalysis& analysis, const ImportedLocalSync& imported,
+                 const std::string& target)
+      : imported_(imported), target_(target) {
+    for (const auto& site : analysis.Sites()) {
+      sites_.emplace(site.cut.get(), &site);
+    }
+  }
+
+  std::vector<EarlierReaderRelease> Run(const FunctionPtr& owner) {
+    VisitStmt(owner->body_);
+    return std::move(releases_);
+  }
+
+ protected:
+  void VisitExpr(const ExprPtr&) override {}
+
+  void VisitStmt_(const SeqStmtsPtr& sequence) override {
+    Sites window;
+    const auto body = transform_utils::FlattenToStmts(sequence);
+    for (const auto& statement : body) {
+      if (const auto site = Payload(statement)) {
+        window.push_back(site);
+      } else if (!IsLocalPrefixMetadata(statement, target_)) {
+        Scan(window);
+        window.clear();
+        VisitStmt(statement);
+      }
+    }
+    Scan(window);
+  }
+
+ private:
+  const ConservativeSyncSite* Payload(const StmtPtr& statement) const {
+    const auto found = sites_.find(statement.get());
+    if (found == sites_.end()) {
+      return nullptr;
+    }
+    const auto site = found->second;
+    const auto imported = imported_.calls.find(site->operation.get());
+    return imported != imported_.calls.end() && !imported->second.HasOpaqueProtocol() &&
+                   site->pipe != PipeType::S
+               ? site
+               : nullptr;
+  }
+
+  // Bounded lookahead selects a cut for a single shared release. Destination
+  // writes can be separated by payloads on other pipes. The later full-CFG
+  // debt check covers every use of the original prefix beyond this window.
+  static constexpr size_t kMaxPayloads = 24;
+  static ConservativeAccessSet Consumers(const Sites& window, size_t consumer, PipeType source) {
+    const auto destination = window[consumer]->pipe;
+    const auto end = consumer + std::min(window.size() - consumer, kMaxPayloads);
+    ConservativeAccessSet effects;
+    for (size_t at = consumer; at < end; ++at) {
+      const auto& site = *window[at];
+      if (site.pipe != destination) {
+        continue;
+      }
+      if (at != consumer && !site.loop_entry && HasService(site, source)) {
+        break;
+      }
+      effects.insert(site.effects.begin(), site.effects.end());
+    }
+    return effects;
+  }
+
+  static std::optional<EarlierReaderRelease> Find(const Sites& window, size_t consumer, PipeType source) {
+    const auto targets = Consumers(window, consumer, source);
+    const auto begin = consumer - std::min(consumer, kMaxPayloads);
+    EarlierPeerPrefix proof{window[consumer]->cut.get(), source, {}};
+    bool displaced_source = false;
+    for (size_t at = consumer; at > begin;) {
+      const auto& site = *window[--at];
+      if (site.pipe == source) {
+        const auto contribution = ContributesToRelease(site, targets);
+        if (contribution.conflicting) {
+          if (contribution.releases_reader && displaced_source) {
+            proof.reader_record = site.cut.get();
+            return EarlierReaderRelease{site.cut.get(), std::move(proof)};
+          }
+          break;
+        }
+        displaced_source = true;
+      }
+      proof.displaced.push_back(site.cut.get());
+    }
+    return std::nullopt;
+  }
+
+  void Scan(const Sites& window) {
+    for (size_t consumer = 0; consumer < window.size(); ++consumer) {
+      const auto& site = *window[consumer];
+      if (site.loop_entry) {
+        continue;
+      }
+      for (const auto source : site.source_pipes) {
+        if (source == site.pipe || source == PipeType::S) {
+          continue;
+        }
+        if (auto release = Find(window, consumer, source)) {
+          releases_.push_back(std::move(*release));
+          break;
+        }
+      }
+    }
+  }
+
+  const ImportedLocalSync& imported_;
+  const std::string& target_;
+  std::unordered_map<const Stmt*, const ConservativeSyncSite*> sites_;
+  std::vector<EarlierReaderRelease> releases_;
+};
+
+// A moved logical record can change physical reuse, triggering an ACK or
+// another directional ID. Check the final schedule by control arm, using
+// every non-SET statement as an anchor and matching SET occurrences by ID.
+class EventCuts final : public IRVisitor {
+ public:
+  explicit EventCuts(const FunctionPtr& function) { VisitStmt(function->body_); }
+
+  bool AdvancesTo(const EventCuts& other) const {
+    if (!SameAnchors(other) || publications_.size() != other.publications_.size()) {
+      return false;
+    }
+    bool advanced = false;
+    for (const auto& [event, cuts] : publications_) {
+      const auto found = other.publications_.find(event);
+      if (found == other.publications_.end() || cuts.size() != found->second.size()) {
+        return false;
+      }
+      for (size_t i = 0; i < cuts.size(); ++i) {
+        if (found->second[i] > cuts[i]) {
+          return false;
+        }
+        advanced |= found->second[i] < cuts[i];
+      }
+    }
+    return advanced;
+  }
+
+  void VisitStmt(const StmtPtr& statement) override {
+    if (As<SeqStmts>(statement) || As<IfStmt>(statement) || As<ForStmt>(statement) ||
+        As<WhileStmt>(statement)) {
+      IRVisitor::VisitStmt(statement);
+    } else if (const auto set = Flag(statement, true)) {
+      publications_[{scope_, *set}].push_back(scopes_[scope_].anchors.size());
+    } else {
+      scopes_[scope_].anchors.emplace_back(Control::Leaf, statement);
+    }
+  }
+
+ protected:
+  void VisitStmt_(const IfStmtPtr& branch) override {
+    scopes_[scope_].anchors.emplace_back(Control::Then, nullptr);
+    VisitScope(branch->then_body_, Control::Then, branch->condition_);
+    if (branch->else_body_) {
+      VisitScope(*branch->else_body_, Control::Else, branch->condition_);
+    }
+  }
+  void VisitStmt_(const ForStmtPtr& loop) override {
+    scopes_[scope_].anchors.emplace_back(Control::For, nullptr);
+    VisitScope(loop->body_, Control::For, loop->loop_var_);
+  }
+  void VisitStmt_(const WhileStmtPtr& loop) override {
+    scopes_[scope_].anchors.emplace_back(Control::While, nullptr);
+    VisitScope(loop->body_, Control::While, loop->condition_);
+  }
+
+ private:
+  enum class Control { Leaf, Then, Else, For, While };
+  struct Scope {
+    size_t parent;
+    Control kind;
+    ExprPtr condition;
+    std::vector<std::pair<Control, StmtPtr>> anchors;
+  };
+
+  bool SameAnchors(const EventCuts& other) const {
+    if (scopes_.size() != other.scopes_.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < scopes_.size(); ++i) {
+      const auto& a = scopes_[i];
+      const auto& b = other.scopes_[i];
+      if (a.parent != b.parent || a.kind != b.kind || a.anchors.size() != b.anchors.size() ||
+          (a.condition != b.condition && !structural_equal(a.condition, b.condition))) {
+        return false;
+      }
+      for (size_t j = 0; j < a.anchors.size(); ++j) {
+        const auto& [kind, statement] = a.anchors[j];
+        const auto& [other_kind, other_statement] = b.anchors[j];
+        if (kind != other_kind ||
+            (statement != other_statement && !structural_equal(statement, other_statement))) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  void VisitScope(const StmtPtr& body, Control control, const ExprPtr& condition) {
+    const auto parent = scope_;
+    scope_ = scopes_.size();
+    scopes_.push_back({parent, control, condition, {}});
+    VisitStmt(body);
+    scope_ = parent;
+  }
+
+  size_t scope_ = 0;
+  std::vector<Scope> scopes_{{0, Control::Leaf, nullptr, {}}};
+  std::map<std::pair<size_t, Event>, std::vector<size_t>> publications_;
+};
 }  // namespace
+
+bool OnlyAdvancesReaderRelease(const FunctionPtr& baseline, const FunctionPtr& candidate) {
+  return EventCuts(baseline).AdvancesTo(EventCuts(candidate));
+}
 
 FunctionPtr MoveEarlierPeerPrefixes(const FunctionPtr& physical, const ConservativeSyncAnalysis& baseline,
                                     const ImportedLocalSync& imported, const std::string& target,
-                                    const SyncParameterBounds& parameters) {
+                                    const SyncParameterBounds& parameters,
+                                    const std::vector<EarlierPeerPrefix>& prior_moves) {
   const auto moves = Nominate(imported, target, physical->func_type_).Run(physical);
   if (moves.empty() || !HasUniqueMoveCuts(physical, moves)) {
     return physical;
   }
-  std::vector<EarlierPeerPrefix> proofs;
+  auto proofs = prior_moves;
   for (const auto& move : moves) {
     proofs.push_back(move.proof);
   }
@@ -474,6 +727,40 @@ FunctionPtr MoveEarlierPeerPrefixes(const FunctionPtr& physical, const Conservat
     return physical;
   }
   return candidate;
+}
+
+std::optional<PhysicalReaderReleasePlan> TryEarlierReaderReleases(const PhysicalSyncRealization& baseline,
+                                                                  const ConservativeSyncAnalysis& analysis,
+                                                                  const ImportedLocalSync& imported,
+                                                                  const std::string& target,
+                                                                  const SyncNativeReservations& reserved,
+                                                                  const SyncParameterBounds& parameters) {
+  const auto candidates = ReaderReleases(analysis, imported, target).Run(analysis.Function());
+  if (candidates.empty()) {
+    return std::nullopt;
+  }
+  std::vector<EarlierPeerPrefix> proofs;
+  proofs.reserve(candidates.size());
+  for (const auto& release : candidates) {
+    proofs.push_back(release.delivery);
+  }
+  if (!CertifyEarlierPeerPrefixes(analysis, imported, target, parameters, proofs)) {
+    return std::nullopt;
+  }
+  const auto logical = InsertConservativePrefixes(analysis, candidates);
+  CheckGeneratedLogicalSync(logical);
+  std::optional<PhysicalSyncRealization> physical;
+  try {
+    physical = TryLowerClosedPrefixSync(logical, target, std::nullopt, reserved, parameters, std::nullopt,
+                                        &imported);
+  } catch (const pypto::ValueError&) {
+    // The earlier capture can require a new rearming path or a larger palette.
+    return std::nullopt;
+  }
+  if (!physical || !OnlyAdvancesReaderRelease(baseline.function, physical->function)) {
+    return std::nullopt;
+  }
+  return PhysicalReaderReleasePlan{std::move(physical->function), std::move(proofs)};
 }
 
 }  // namespace pypto::ir::sync

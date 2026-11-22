@@ -63,11 +63,12 @@ LoweredLogicalSync LowerStructuredLogicalSync(
     const std::optional<std::vector<int>>& eligible_ids, const SyncParameterBounds& parameters = {},
     std::optional<std::pair<int64_t, int64_t>> blocks = std::nullopt, const SyncSchedulePolicy& policy = {},
     SyncExternalPolicy external_policy = SyncExternalPolicy::Geometry,
-    std::optional<int64_t> launch_count = std::nullopt,
-    const SyncNativeReservations& extra_reservations = {}, bool dry_run_only = false);
+    std::optional<int64_t> launch_count = std::nullopt, const SyncNativeReservations& extra_reservations = {},
+    bool dry_run_only = false);
 // Interpret actual logical token uses without substituting minimum demands.
 // The finite adapter keeps actual command cuts and has no payload families;
 // canonical structured transport certifies and retains direct-cut families.
+// complete_invocation is reserved for callers that add the terminal drain.
 LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::string& target,
                                     const std::optional<std::vector<int>>& eligible_ids,
                                     const SyncParameterBounds& parameters = {},
@@ -76,6 +77,6 @@ LoweredLogicalSync LowerLogicalSync(const FunctionPtr& function, const std::stri
                                     SyncExternalPolicy external_policy = SyncExternalPolicy::Geometry,
                                     std::optional<int64_t> launch_count = std::nullopt,
                                     const SyncNativeReservations& extra_reservations = {},
-                                    bool dry_run_only = false);
+                                    bool dry_run_only = false, bool complete_invocation = false);
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_TOKEN_SYNC_LOWERING_H_

@@ -86,12 +86,20 @@ class FreshChildTokens : public IRMutator {
 
 class Insert : public IRMutator {
  public:
-  explicit Insert(const ConservativeSyncAnalysis& analysis) : names_(analysis.Function()) {
+  Insert(const ConservativeSyncAnalysis& analysis, const std::vector<EarlierReaderRelease>& releases)
+      : names_(analysis.Function()) {
     // Build the full replacement inventory first. Ordinary services use
     // the consumer's current cut. A certified eager service runs in its
     // producer's original branch and leaves no outstanding logical token.
     // Reusing the same static statement in two contexts requires
     // distinct original cut evidence and is refused rather than conflated.
+    for (const auto& release : releases) {
+      const auto& delivery = release.delivery;
+      const auto token =
+          Record(delivery.source, release_records_[release.record_after], release.record_after->span_);
+      INTERNAL_CHECK(release_waits_.emplace(std::make_pair(delivery.consumer, delivery.source), token).second)
+          << "Internal error: reader release replaces the same service twice";
+    }
     std::map<const Stmt*, StmtPtr> records, waits;
     for (const auto& site : analysis.Sites()) {
       if (!site.precise_capture) continue;
@@ -222,6 +230,8 @@ class Insert : public IRMutator {
   SyncTokenNames names_;
   std::map<const Stmt*, StmtPtr> replacements_;
   std::map<const ForStmt*, StmtPtr> entries_;
+  std::unordered_map<const Stmt*, std::vector<StmtPtr>> release_records_;
+  std::map<std::pair<const Stmt*, PipeType>, VarPtr> release_waits_;
   static bool IsPhaseOnly(const ConservativeLoopEntryServices& phase, PipeType source) {
     return std::binary_search(phase.entry_only.begin(), phase.entry_only.end(), source) ||
            std::binary_search(phase.backedge_only.begin(), phase.backedge_only.end(), source);
@@ -259,12 +269,20 @@ class Insert : public IRMutator {
     }
     if (wait) statements.push_back(std::move(wait));
     for (const auto& [source, destination] : services) {
-      AppendPair(source, destination, statements, cut->span_);
+      const auto release = release_waits_.find({cut.get(), source});
+      if (release != release_waits_.end()) {
+        Wait(release->second, destination, statements, cut->span_);
+      } else {
+        AppendPair(source, destination, statements, cut->span_);
+      }
     }
     if (phased) statements.push_back(std::move(phased));
     if (record) statements.push_back(std::move(record));
     statements.push_back(retained ? std::move(retained) : cut);
     if (post) AppendPair(post->first, post->second, statements, cut->span_);
+    if (const auto records = release_records_.find(cut.get()); records != release_records_.end()) {
+      statements.insert(statements.end(), records->second.begin(), records->second.end());
+    }
     CHECK(replacements_.emplace(cut.get(), std::make_shared<SeqStmts>(statements, cut->span_)).second)
         << "Conservative prefix entries require distinct original static cuts";
   }
@@ -289,8 +307,9 @@ class Insert : public IRMutator {
 };
 }  // namespace
 
-FunctionPtr InsertConservativePrefixes(const ConservativeSyncAnalysis& analysis) {
-  const auto result = Insert(analysis).VisitFunction(analysis.Function());
+FunctionPtr InsertConservativePrefixes(const ConservativeSyncAnalysis& analysis,
+                                       const std::vector<EarlierReaderRelease>& releases) {
+  const auto result = Insert(analysis, releases).VisitFunction(analysis.Function());
   CheckLogicalSync(result);
   auto reported = std::make_shared<Function>(*result);
   reported->attrs_.emplace_back(kAttrAutosyncAnalysisPolicy, std::string("conservative_prefix"));

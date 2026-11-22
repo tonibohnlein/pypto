@@ -27,7 +27,6 @@
 #include <utility>
 #include <vector>
 
-#include "pypto/ir/arith/const_fold.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
@@ -35,6 +34,7 @@
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "src/ir/transforms/utils/peer_local_work_loop.h"
 #include "src/ir/transforms/utils/physical_sync_schedule.h"
+#include "src/ir/transforms/utils/sync_coordinate_eval.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
 #include "src/ir/transforms/utils/sync_token_names.h"
 
@@ -59,11 +59,6 @@ bool IsLocalCommand(const CallPtr& call) {
   return call && call->args_.empty() &&
          (IsOp(call, "system.set_flag") || IsOp(call, "system.wait_flag") ||
           core_affinity::IsPipeBarrier(call));
-}
-
-bool IsCoordinateScalar(const ExprPtr& expr) {
-  const auto scalar = As<ScalarType>(expr->GetType());
-  return scalar && (scalar->dtype_ == DataType::INDEX || scalar->dtype_ == DataType::BOOL);
 }
 
 // Inventory allowed statement shapes and count operand occurrences as well as
@@ -164,33 +159,13 @@ class VisitGuardFacts {
   std::unordered_map<const Expr*, ExprPtr> expressions_;
 
   ExprPtr Fold(const ExprPtr& expr) {
-    if (!IsCoordinateScalar(expr)) {
-      return nullptr;
-    }
-    if (const auto var = As<Var>(expr)) {
-      const auto it = bindings_.find(var.get());
-      return it == bindings_.end() ? nullptr : it->second;
-    }
-    if (As<ConstInt>(expr) || As<ConstBool>(expr)) {
-      return expr;
-    }
-    if (const auto bin = As<BinaryExpr>(expr)) {
-      if (!physical::IsCommandCoordinateBinary(expr)) {
-        return nullptr;
+    return FoldCoordinate(expr, [&](const ExprPtr& operand) -> ExprPtr {
+      if (const auto var = As<Var>(operand)) {
+        const auto it = bindings_.find(var.get());
+        return it == bindings_.end() ? nullptr : it->second;
       }
-      const auto lhs = Evaluate(bin->left_), rhs = Evaluate(bin->right_);
-      if (!lhs || !rhs) {
-        return nullptr;
-      }
-      if (As<FloorDiv>(expr) || As<FloorMod>(expr)) {
-        const auto divisor = As<ConstInt>(rhs);
-        if (!divisor || divisor->value_ <= 0) {
-          return nullptr;
-        }
-      }
-      return arith::TryConstFoldBinary(expr->GetKind(), lhs, rhs, GetScalarDtype(expr));
-    }
-    return nullptr;
+      return Evaluate(operand);
+    });
   }
 
   ExprPtr Evaluate(const ExprPtr& expr) {

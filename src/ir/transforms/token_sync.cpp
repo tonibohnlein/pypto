@@ -454,7 +454,8 @@ Pass LowerSync(bool require_whole_module) {
           const auto launch_count = FixedLaunchCount(evidence, global->name_);
           const auto lower = [&](sync::SyncExternalPolicy policy) {
             return sync::LowerLogicalSync(function, target, std::nullopt, parameters, blocks,
-                                          sync::physical::LocalSyncSchedulePolicy(), policy, launch_count);
+                                          sync::physical::LocalSyncSchedulePolicy(), policy, launch_count, {},
+                                          /*dry_run_only=*/false, /*complete_invocation=*/true);
           };
           const auto result = [&] {
             try {
@@ -564,7 +565,8 @@ Pass RealizeSync(bool require_whole_module) {
       sync::CheckGeneratedLogicalSync(optimized);
       const auto physical =
           sync::LowerLogicalSync(optimized, target, std::nullopt, bounds, block_bounds,
-                                 sync::physical::LocalSyncSchedulePolicy(), policy, block_count);
+                                 sync::physical::LocalSyncSchedulePolicy(), policy, block_count, {},
+                                 /*dry_run_only=*/false, /*complete_invocation=*/true);
       // PTOAS recognizes literal flags, not empty plans or barriers, as manual
       // ownership. Do not fabricate a dummy flag or mix partial ownership.
       if (!require_whole_module && (!physical.set_sites || !physical.wait_sites))

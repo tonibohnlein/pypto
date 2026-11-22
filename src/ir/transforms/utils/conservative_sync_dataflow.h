@@ -118,6 +118,20 @@ struct EarlierPeerPrefix {
   PipeType source;
   std::vector<const Stmt*> displaced;
   const Var* backedge_iv = nullptr;
+  // A same-sequence reader release captures immediately after this payload.
+  // Its displaced list names every later payload up to the consumer in
+  // reverse order, including payloads on other queues.
+  const Stmt* reader_record = nullptr;
+};
+
+struct EarlierReaderRelease {
+  const Stmt* record_after;
+  EarlierPeerPrefix delivery;
+};
+
+struct PhysicalReaderReleasePlan {
+  FunctionPtr function;
+  std::vector<EarlierPeerPrefix> moves;
 };
 
 struct ConservativeLoopEntryServices {
@@ -268,13 +282,22 @@ ConservativeSyncAnalysis AnalyzeConservativeSync(
     const ImportedLocalSync* imported = nullptr, bool enable_precise_captures = false);
 // Explicit policy construction. Acknowledgment-induced order is represented
 // here in logical tokens before LowerSync; no physical resource is assigned.
-FunctionPtr InsertConservativePrefixes(const ConservativeSyncAnalysis& analysis);
+FunctionPtr InsertConservativePrefixes(const ConservativeSyncAnalysis& analysis,
+                                       const std::vector<EarlierReaderRelease>& releases = {});
 bool CertifyEarlierPeerPrefixes(const ConservativeSyncAnalysis& baseline, const ImportedLocalSync& imported,
                                 const std::string& target, const SyncParameterBounds& parameters,
                                 const std::vector<EarlierPeerPrefix>& moves);
+std::optional<PhysicalReaderReleasePlan> TryEarlierReaderReleases(const PhysicalSyncRealization& baseline,
+                                                                  const ConservativeSyncAnalysis& analysis,
+                                                                  const ImportedLocalSync& imported,
+                                                                  const std::string& target,
+                                                                  const SyncNativeReservations& reserved,
+                                                                  const SyncParameterBounds& parameters);
+bool OnlyAdvancesReaderRelease(const FunctionPtr& baseline, const FunctionPtr& candidate);
 FunctionPtr MoveEarlierPeerPrefixes(const FunctionPtr& physical, const ConservativeSyncAnalysis& baseline,
                                     const ImportedLocalSync& imported, const std::string& target,
-                                    const SyncParameterBounds& parameters);
+                                    const SyncParameterBounds& parameters,
+                                    const std::vector<EarlierPeerPrefix>& prior_moves = {});
 CompletionSummary SummarizeStraightLineLogicalCompletion(const StmtPtr& body, FunctionType func_type,
                                                          const std::string& target);
 }  // namespace pypto::ir::sync

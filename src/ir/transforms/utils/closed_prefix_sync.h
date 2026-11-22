@@ -44,12 +44,14 @@ bool QualifyLocalSyncInvocation(const FunctionPtr& function, const std::string& 
 // Interpret actual four-command logical transactions at original structured
 // cuts. Absence means the token language is not this class; a qualified-looking
 // program with unavailable native/resource evidence refuses before any emission.
-// No required-order analysis or numerical occurrence inventory is consulted.
+// No memory-derived demand analysis is consulted. An owner providing terminal
+// completion may reduce generated entry handoffs with bounded physical replay.
 std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
     const FunctionPtr& function, const std::string& target,
     const std::optional<std::vector<int>>& eligible_ids,
     const SyncNativeReservations& extra_reservations = {}, const SyncParameterBounds& parameters = {},
     const std::optional<std::pair<int64_t, int64_t>>& blocks = std::nullopt,
-    const ImportedLocalSync* imported = nullptr, const SyncSchedulePolicy& schedule_policy = {});
+    const ImportedLocalSync* imported = nullptr, const SyncSchedulePolicy& schedule_policy = {},
+    bool complete_invocation = false);
 }  // namespace pypto::ir::sync
 #endif  // SRC_IR_TRANSFORMS_UTILS_CLOSED_PREFIX_SYNC_H_
