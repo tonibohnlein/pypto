@@ -21,7 +21,7 @@ from pypto.ir.pass_manager import PassManager
 from .buffer_test_utils import statements
 from .sync_closed_command_oracle import opname
 from .sync_logical_oracle import value
-from .sync_matmul_oracle import address_set
+from .sync_matmul_oracle import address_set, protected_accumulator_pairs
 from .test_runtime_valid_broadcast import ActiveRows
 
 pytestmark = pytest.mark.usefixtures("ascend_backend")
@@ -140,7 +140,7 @@ def check_commands(original, logical, physical, parameters, *, output_rows=None)
         AccRows(
             function,
             parameters,
-            range(2, 6, 3),
+            range(8),
             BASES,
             shape_parameters={} if output_rows is None else {function.params[2].type.shape[0]: output_rows},
         )
@@ -155,13 +155,16 @@ def check_commands(original, logical, physical, parameters, *, output_rows=None)
     assert {(a, b) for a, b in before.order if a in common and b in common} == {
         (a, b) for a, b in after.order if a in common and b in common
     }
+    # A2/A3 protects qualified accumulator hazards in the matrix hardware.
+    # Check this exemption against the original calls before requiring an event edge.
+    protected = protected_accumulator_pairs(original, source.calls)
     for i, (_, _, reads, writes) in enumerate(before.payloads):
         for j, (_, _, old_reads, old_writes) in enumerate(before.payloads[:i]):
-            if old_writes & (reads | writes) or old_reads & writes:
+            if (old_writes & (reads | writes) or old_reads & writes) and (j, i) not in protected:
                 assert (("payload", j, "C"), ("payload", i, "I")) in after.order
     assert all(pair in after.order for pair in after.reuses)
     assert not after.live
-    assert all(ids <= {2, 5} for ids in after.ids.values())
+    assert all(ids <= set(range(8)) for ids in after.ids.values())
     return after
 
 
@@ -169,10 +172,8 @@ def sync_pipeline(program, *, disjoint=False):
     with passes.PassContext([], autosync_policy="conservative_prefix", autosync_disjoint_gm=disjoint):
         logical = passes.insert_sync()(program)
         optimized = passes.optimize_sync()(logical)
-    # Lower actual tokens with the same allocator and a noncontiguous pool.
-    # Public insertion is exercised above; the existing testing wrapper only
-    # supplies explicit allocator IDs to the shared production lowerer.
-    physical = testing.lower_sync_schedule(kernel(optimized), eligible_ids=[2, 5])["function"]
+    # Exercise the production palette used for qualified accumulator trims.
+    physical = kernel(passes.lower_sync()(optimized))
     return kernel(logical), physical
 
 

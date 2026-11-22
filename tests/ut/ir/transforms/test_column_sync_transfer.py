@@ -85,6 +85,7 @@ def test_packed_column_original_accesses_covers_and_reuse(
     # writes across a reset require a distinct regional membership export below.
     program = column_program(rows, visits, reduction, replay, start, stream)
     functions = []
+    original_program = None
     for enabled in [False, True]:
         with passes.PassContext(
             [],
@@ -98,8 +99,21 @@ def test_packed_column_original_accesses_covers_and_reuse(
         assert function is not None
         assert function.ir_stage == ir.FunctionIRStage.Buffer
         functions.append(function)
+        if not enabled:
+            original_program = lowered
     original, emitted = functions
-    assert dict(emitted.attrs)[PYPTO_AUTOSYNC_ATTR]
+    if reduction and visits > 1 and replay > 1:
+        # The cross-reset reduction closes its plan with barriers. The
+        # per-function route needs a literal SET/WAIT marker for PTOAS, while
+        # whole-module ownership can publish this complete plan as it stands.
+        assert emitted.attrs[PYPTO_AUTOSYNC_ATTR] is False
+        assert "no SET/WAIT marker" in emitted.attrs[AUTOSYNC_FALLBACK_REASON_ATTR]
+        assert original_program is not None
+        with passes.PassContext([], enable_pypto_autosync=True, autosync_disjoint_gm=True):
+            owned_program = passes.realize_sync(require_whole_module=True)(original_program)
+        emitted = owned_program.get_function("kernel")
+        assert emitted is not None
+    assert emitted.attrs[PYPTO_AUTOSYNC_ATTR], emitted.attrs.get(AUTOSYNC_FALLBACK_REASON_ATTR)
     retained = testing.analyze_placed_sync(original, True)
     # This interprets addresses from original Buffer IR, not compiler cells.
     validate(original, retained)

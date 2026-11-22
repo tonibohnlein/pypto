@@ -47,9 +47,9 @@ struct TensorParameterView {
 
 // Plan only entry GM views, in original parameter order. Raw pointers used by
 // runtime workspaces are excluded before any view is emitted.
-bool IsGMPipeWorkspaceParameter(const ir::VarPtr& parameter);
 std::vector<TensorParameterView> PrepareTensorParameterViews(const ir::Function& func,
-                                                             const std::set<const ir::Var*>& ffts_workspaces);
+                                                             const std::set<const ir::Var*>& ffts_workspaces,
+                                                             const ir::Var* gm_pipe_workspace);
 
 }  // namespace pypto::codegen
 

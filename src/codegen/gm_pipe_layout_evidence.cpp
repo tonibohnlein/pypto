@@ -183,6 +183,7 @@ struct WorkspaceContext::Data {
   ir::FunctionPtr root;
   std::shared_ptr<const LayoutResult> layout;
   std::unordered_set<size_t> admitted;
+  std::unordered_set<size_t> requires_workspace;
 };
 
 struct LayoutEvidence::State {
@@ -281,6 +282,7 @@ struct LayoutEvidence::State {
 namespace {
 struct WorkspaceProof {
   std::unordered_set<size_t> functions;
+  std::unordered_set<size_t> requires_workspace;
   std::string error;
 };
 
@@ -291,7 +293,7 @@ WorkspaceProof ProveWorkspace(const LayoutSource& source, size_t root,
   WorkspaceProof proof;
   std::vector<size_t> pending{root};
   std::unordered_map<size_t, std::vector<size_t>> parents;
-  std::unordered_set<size_t> required;
+  auto& required = proof.requires_workspace;
   while (!pending.empty()) {
     const auto index = pending.back();
     pending.pop_back();
@@ -391,6 +393,7 @@ std::shared_ptr<const WorkspaceContext> LayoutEvidence::BindRoot(const ir::Funct
       data->root = root;
       data->layout = layout;
       data->admitted = std::move(proof.functions);
+      data->requires_workspace = std::move(proof.requires_workspace);
       binding.context = std::shared_ptr<const WorkspaceContext>(new WorkspaceContext(std::move(data)));
     }
   }
@@ -421,6 +424,8 @@ std::shared_ptr<const WorkspaceContext> LayoutEvidence::InferCodegenContext() {
       data->layout = layout;
     }
     data->admitted.insert(bound->data_->admitted.begin(), bound->data_->admitted.end());
+    data->requires_workspace.insert(bound->data_->requires_workspace.begin(),
+                                    bound->data_->requires_workspace.end());
   }
   if (!data->layout) data->layout = std::make_shared<LayoutResult>();
   // Equal offsets and total bytes do not alone establish equal native ring
@@ -437,6 +442,14 @@ WorkspaceContext::WorkspaceContext(std::shared_ptr<const Data> data) : data_(std
 WorkspaceContext::~WorkspaceContext() = default;
 const LayoutResult& WorkspaceContext::Layout() const { return *data_->layout; }
 const ir::FunctionPtr& WorkspaceContext::Root() const { return data_->root; }
+const ir::Var* WorkspaceContext::WorkspaceParameter(const ir::FunctionPtr& function) const {
+  const auto found = data_->source->identities.find(function.get());
+  if (found == data_->source->identities.end() || !data_->requires_workspace.count(found->second)) {
+    return nullptr;
+  }
+  const auto& fact = data_->source->functions[found->second];
+  return fact.function->params_[*fact.workspace].get();
+}
 std::string WorkspaceContext::ValidateProgram(const ir::ProgramPtr& program) const {
   if (!program) return "GM workspace context requires an emission Program";
   for (const auto& [name, function] : program->functions_) {
@@ -468,8 +481,28 @@ const SetupEvidence* LayoutEvidence::SetupAt(const ir::FunctionPtr& function, co
   return &state_->source->setups[found->second];
 }
 bool LayoutEvidence::HasWorkspaceFormal() const {
-  for (const auto& fact : state_->source->functions) {
-    if (fact.workspace) return true;
+  const auto& source = *state_->source;
+  if (source.setups.empty()) return false;
+  // A standalone tensor can reuse the workspace spelling. Only look for the
+  // injected formal along original call paths leading to active GM setups.
+  std::vector<size_t> pending;
+  for (const auto& setup : source.setups) {
+    if (Geometry(setup).slot_bytes > 0) pending.push_back(source.identities.at(setup.function.get()));
+  }
+  std::vector<std::vector<size_t>> parents(source.functions.size());
+  for (size_t index = 0; index < source.functions.size(); ++index) {
+    for (const auto& callee : source.functions[index].callees) {
+      const auto found = source.names.find(callee);
+      if (found != source.names.end()) parents[found->second].push_back(index);
+    }
+  }
+  std::unordered_set<size_t> visited;
+  while (!pending.empty()) {
+    const auto index = pending.back();
+    pending.pop_back();
+    if (!visited.insert(index).second) continue;
+    if (source.functions[index].workspace) return true;
+    pending.insert(pending.end(), parents[index].begin(), parents[index].end());
   }
   return false;
 }

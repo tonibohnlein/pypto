@@ -225,6 +225,12 @@ def test_unmanaged_direct_spelling_has_no_managed_pointer_or_offsets(gm_backend)
     conflict = _function("conflict", [], [_setup(3, 1024)])
     with pytest.raises(ValueError, match="inconsistent slot_size"):
         generator.generate(_program([first, conflict]))
+    # An unrelated tensor with the same name does not put this setup on the
+    # managed path. The direct-Buffer native test covers the live tensor view.
+    unrelated = _function("unrelated", [_workspace()], [])
+    unrelated_text = generator.generate(_program([first, unrelated]), emit_source_loc=False)
+    assert "gm_slot_buffer" not in unrelated_text
+    assert "pto.addptr" not in unrelated_text
     # A mixed module cannot use the unmanaged compatibility path.
     managed = _function("managed", [_workspace()], [_setup(0, 1024)])
     with pytest.raises(ValueError, match="one original injected formal"):

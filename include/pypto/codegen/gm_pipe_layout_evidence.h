@@ -78,8 +78,8 @@ class LayoutEvidence {
   // bundled definitions, not shared launch ownership or peer synchronization.
   // It never silently unions incompatible workspaces.
   std::shared_ptr<const WorkspaceContext> InferCodegenContext();
-  // Includes ambiguous or malformed occurrences of the managed formal role.
-  // Absence permits legacy spelling only, never a managed layout certificate.
+  // Detects candidate workspace formals on a path to a GM setup. Candidates
+  // may be malformed and still require a managed layout proof before emission.
   bool HasWorkspaceFormal() const;
   const SetupEvidence* SetupAt(const ir::FunctionPtr& function, const ir::StmtPtr& cut) const;
   const LayoutWork& Work() const;
@@ -96,6 +96,9 @@ class WorkspaceContext {
   ~WorkspaceContext();
   const LayoutResult& Layout() const;
   const ir::FunctionPtr& Root() const;
+  // Only original formals required by the proven GM setup and forwarding
+  // closure are emitted as raw workspace pointers.
+  const ir::Var* WorkspaceParameter(const ir::FunctionPtr& function) const;
   // A reduced module may reuse original Function objects, never merely names.
   std::string ValidateProgram(const ir::ProgramPtr& program) const;
 

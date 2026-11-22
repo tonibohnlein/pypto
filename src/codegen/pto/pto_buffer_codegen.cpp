@@ -730,7 +730,7 @@ void PTOCodegen::GenerateBufferFunction(const ir::FunctionPtr& func) {
   }
   // Reserve every ABI name before assigning view names.
   for (const auto& param : parameters) {
-    if (As<ir::TensorType>(param->GetType()) && !IsGMPipeWorkspaceParameter(param)) {
+    if (As<ir::TensorType>(param->GetType()) && param.get() != fs_.gm_pipe_workspace_parameter) {
       BindTensorView(param, NewNamedTemp(param->name_hint_ + "_view"));
     }
   }

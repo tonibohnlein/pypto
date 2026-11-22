@@ -1,8 +1,7 @@
 # RealizeSync (experimental)
 
-This optional pass tries PyPTO synchronization per whole kernel after storage
-lowering. **PTOAS autosync remains enabled in both modes.** Default compilation
-continues to delegate synchronization to PTOAS.
+This optional pass tries PyPTO synchronization after storage lowering. Default
+compilation continues to delegate synchronization to PTOAS.
 
 ```python
 from pypto import passes
@@ -36,8 +35,7 @@ The transaction collects caller evidence once. Logical insertion preserves the
 original call graph, signatures, scalar definitions and payload control, so its
 own lowering can reuse that evidence. Standalone `LowerSync` re-establishes it
 from its current Program, including serialized or edited tokens. A later failure
-publishes no intermediate token IR. Empty or barrier-only candidates retain the
-existing whole-kernel delegation policy.
+publishes no intermediate token IR.
 
 Caller-range recovery retains qualified SSA definitions and scoped integer
 comparisons through the existing arithmetic analyzer. Correlated expressions
@@ -48,23 +46,37 @@ escape its arm, and an unqualified caller invalidates a joined parameter bound.
 This exports numerical intervals, not a general relational shape contract.
 
 A successful attempt publishes its complete body and the boolean
-`pypto_autosync=True` attribute. PTOAS skips insertion independently for each
-function containing explicit SET/WAIT or record/wait events. Thus a module can
-contain both PyPTO-synchronized and delegated functions. **Barriers alone do not
-trigger this skip.** Empty or barrier-only PyPTO candidates are discarded and the
-original body is delegated; the pass never manufactures a dummy flag. The pass
-never publishes partial synchronization on a failed attempt. Already present
-user synchronization remains governed by PTOAS's existing skip rule, rather
-than being completed or independently validated by this switch.
+`pypto_autosync=True` attribute. With per-function ownership, the compiler runs
+PTOAS with insertion enabled. PTOAS skips each function containing explicit
+SET/WAIT or record/wait events and can still insert synchronization in other
+functions in the same module. A candidate with only barriers or no commands
+delegates the original body because PTOAS requires a flag event for this skip.
+Existing user synchronization on this route follows the same PTOAS rule.
 
-For an opted-in compilation, `report/autosync.json` lists each attempted kernel's
-selected route (`pypto` or `ptoas`) and the fallback reason. This is selection
-metadata, not a certificate that PTOAS inserted commands or that compilation
-succeeded. External-source, builtin-template and runtime-bound functions retain
-their external ownership and are not included in this report. Do not edit owned
-bodies or forge the attribute: like physical addresses, it is trusted compiler
-output, not a proof checker for arbitrary user edits. Reapplying the pass to an
-owned plan is refused.
+With `autosync_policy="conservative_prefix"` and PyPTO-placed storage on A2/A3,
+PyPTO can also plan a qualified AIC/AIV peer unit together. The managed GM FIFO
+route retains the native transport and verifies local readiness and release
+ordering in Buffer IR or through qualified Functional IR borrows. The authored
+GM route requires both endpoints in Buffer IR. It preserves the original
+communication and qualifies local synchronization and shared-GM visibility.
+A refusal delegates both endpoints to the shared PTOAS invocation. The exact
+policy uses the per-function route. Standalone passes also expose
+`require_whole_module=True` to require ownership of all local Buffer domains.
+
+For whole-unit ownership, the compiler checks that every emitted domain,
+including linked peers, has complete ownership and that there are no generated
+helpers. Qualified empty and barrier-only plans can participate. The backend
+validates `ptoas/<unit>.sync.json` against the emitted PTO before compiling the
+unit with `--enable-insert-sync=false`. Keep the PTO and its manifest together
+for an ownership-aware rebuild. Editing the emitted PTO requires a fresh IR
+compile to establish ownership again.
+
+For an opted-in compilation, `report/autosync.json` records each attempted
+kernel's selected planning route (`pypto` or `ptoas`) and reason. The unit
+manifest records the downstream insertion policy. External-source,
+builtin-template and runtime-bound functions retain external ownership and
+are omitted from the planning report. Preserve owned IR bodies and their
+compiler-generated attributes. Reapplying the pass to an owned plan is refused.
 
 The toggle and disjointness contract are part of JIT cache identity. Dumping and
 profiling preserve them. A `PassManager` cannot change either after construction.

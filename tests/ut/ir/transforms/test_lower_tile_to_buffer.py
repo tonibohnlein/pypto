@@ -165,22 +165,21 @@ def test_buffer_roundtrip_rejects_lost_stage_and_operands(monkeypatch):
 @pytest.mark.parametrize("planner", _PLANNERS)
 def test_lowering_never_falls_back_to_legacy_codegen_for_an_unimplemented_recipe(planner):
     @pl.program
-    class ColumnSum:
+    class MaskedGather:
         @pl.function(type=pl.FunctionType.InCore)
         def kernel(
             self,
-            source: pl.Tensor[[16, 32], pl.FP32],
-            output: pl.Out[pl.Tensor[[1, 32], pl.FP32]],
-        ) -> pl.Tensor[[1, 32], pl.FP32]:
-            value: pl.Tile[[16, 32], pl.FP32] = pl.load(source, [0, 0], [16, 32])
-            result: pl.Tile[[1, 32], pl.FP32] = pl.tile.col_sum(value)
-            out: pl.Tensor[[1, 32], pl.FP32] = pl.store(result, [0, 0], output)
-            return out
+            source: pl.Tensor[[1, 32], pl.FP32],
+            output: pl.Out[pl.Tensor[[1, 16], pl.FP32]],
+        ) -> pl.Tensor[[1, 16], pl.FP32]:
+            value = pl.load(source, [0, 0], [1, 32])
+            selected = pl.tile.gather_mask(value, pl.tile.MaskPattern.P0101)
+            return pl.store(selected, [0, 0], output)
 
     with passes.PassContext([], passes.VerificationLevel.NONE, memory_planner=planner, enable_buffer_ir=True):
         manager = buffer_recipe_pipeline()
-        with pytest.raises(ValueError, match="no conversion recipe for 'tile.col_sum'"):
-            manager.run(ColumnSum)
+        with pytest.raises(ValueError, match="no conversion recipe for 'tile.gather_mask'"):
+            manager.run(MaskedGather)
 
 
 @pl.program
@@ -617,7 +616,12 @@ def test_buffer_selection_preserves_nondefault_cache_policy(load_hint, store_hin
             return out
 
     if force_buffer:
-        with pytest.raises(ValueError, match="non-default cache requires a Buffer transfer recipe"):
+        diagnostic = (
+            r"tile\.load cache requires DEFAULT or BYPASS policy"
+            if load_hint is not None
+            else "non-default cache requires a Buffer transfer recipe"
+        )
+        with pytest.raises(ValueError, match=diagnostic):
             _lower(passes.MemoryPlanner.PYPTO, program=Hinted)
     else:
         with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):

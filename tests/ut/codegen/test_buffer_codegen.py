@@ -1041,7 +1041,7 @@ def test_matrix_descriptor_renders_its_space_and_fractal_layout(space, dtype, lo
 
 def test_matrix_descriptor_rejects_types_the_cube_cannot_hold():
     _, allocation = _alloc("operand", _matrix_type(ir.MemorySpace.Acc, (32, 64), DataType.FP16))
-    with pytest.raises(ValueError, match="cube operands or FP32/INT32 accumulators in Acc"):
+    with pytest.raises(ValueError, match="qualified rank-2 cube operand or accumulator geometry in Acc"):
         _emit(_program([allocation], ir_stage=ir.FunctionIRStage.Buffer))
 
 

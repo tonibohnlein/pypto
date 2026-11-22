@@ -10,7 +10,6 @@
 """Closed current-prefix protocols: actual commands, matching and causal reuse."""
 
 from itertools import product
-import time
 
 import pytest
 from pypto import ir, passes, testing
@@ -455,7 +454,10 @@ def test_straight_line_and_branch_one_way_tokens_lower_to_two_commands():
     t1 = ir.Var("t1", ir.SyncTokenType(ir.PipeType.V), SPAN)
     branch = ir.IfStmt(
         cond,
-        seq(ir.AssignStmt(t1, sync.record(ir.PipeType.V), SPAN), ir.EvalStmt(sync.wait(t1, ir.PipeType.MTE3), SPAN)),
+        seq(
+            ir.AssignStmt(t1, sync.record(ir.PipeType.V), SPAN),
+            ir.EvalStmt(sync.wait(t1, ir.PipeType.MTE3), SPAN),
+        ),
         None,
         [],
         SPAN,
@@ -600,8 +602,22 @@ def test_parent_child_per_direction_reservations_allow_disjoint_direction_id_reu
         ci(1),
         [c_carry],
         seq(
-            ir.IfStmt(ir.Gt(iv, ci(0), ir.DataType.BOOL, SPAN), ir.EvalStmt(sync.wait(c_carry, ir.PipeType.MTE2), SPAN), None, [], SPAN),
-            ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [a, ir.MakeTuple([ci(0), ci(0)], SPAN), ir.MakeTuple([ci(2), ci(8)], SPAN), buf], ir.VoidType(), SPAN), SPAN),
+            ir.IfStmt(
+                ir.Gt(iv, ci(0), ir.DataType.BOOL, SPAN),
+                ir.EvalStmt(sync.wait(c_carry, ir.PipeType.MTE2), SPAN),
+                None,
+                [],
+                SPAN,
+            ),
+            ir.EvalStmt(
+                ir.Call(
+                    ir.get_op("buffer.load"),
+                    [a, ir.MakeTuple([ci(0), ci(0)], SPAN), ir.MakeTuple([ci(2), ci(8)], SPAN), buf],
+                    ir.VoidType(),
+                    SPAN,
+                ),
+                SPAN,
+            ),
             ir.AssignStmt(c_tok, sync.record(ir.PipeType.MTE2), SPAN),
             ir.EvalStmt(sync.wait(c_tok, ir.PipeType.V), SPAN),
             ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [buf, out_buf], ir.VoidType(), SPAN), SPAN),
@@ -617,8 +633,14 @@ def test_parent_child_per_direction_reservations_allow_disjoint_direction_id_reu
         [a, (out_gm, ir.ParamDirection.InOut)],
         [out_gm.type],
         seq(
-            ir.AssignStmt(buf, ir.Call(ir.get_op("buffer.alloc"), [ir.MakeTuple([], SPAN), ci(0)], vec_t, SPAN), SPAN),
-            ir.AssignStmt(out_buf, ir.Call(ir.get_op("buffer.alloc"), [ir.MakeTuple([], SPAN), ci(128)], vec_t, SPAN), SPAN),
+            ir.AssignStmt(
+                buf, ir.Call(ir.get_op("buffer.alloc"), [ir.MakeTuple([], SPAN), ci(0)], vec_t, SPAN), SPAN
+            ),
+            ir.AssignStmt(
+                out_buf,
+                ir.Call(ir.get_op("buffer.alloc"), [ir.MakeTuple([], SPAN), ci(128)], vec_t, SPAN),
+                SPAN,
+            ),
             ir.AssignStmt(p0, sync.record(ir.PipeType.MTE2), SPAN),
             ir.AssignStmt(p1, sync.record(ir.PipeType.MTE2), SPAN),
             ir.EvalStmt(sync.wait(p0, ir.PipeType.MTE3), SPAN),
@@ -643,13 +665,14 @@ def test_parent_child_per_direction_reservations_allow_disjoint_direction_id_reu
     assert after.ids[ir.PipeType.MTE2, ir.PipeType.V].issubset({0, 1})
 
 
-
 def test_zero_trip_loop_prevents_post_loop_id_reuse():
     span = ir.Span.unknown()
     idx = ir.DataType.INDEX
     n = ir.Var("n", ir.ScalarType(idx), span)
     k = ir.Var("k", ir.ScalarType(idx), span)
-    ci = lambda v: ir.ConstInt(v, idx, span)
+
+    def ci(v):
+        return ir.ConstInt(v, idx, span)
 
     t0 = ir.Var("t0", ir.SyncTokenType(ir.PipeType.MTE2), span)
     t_loop = ir.Var("t_loop", ir.SyncTokenType(ir.PipeType.V), span)
@@ -710,7 +733,9 @@ def test_unbalanced_bare_unwaited_and_carried_syntax_routed_safely():
     idx = ir.DataType.INDEX
     cond = ir.Var("cond", ir.ScalarType(ir.DataType.BOOL), span)
     k = ir.Var("k", ir.ScalarType(idx), span)
-    ci = lambda v: ir.ConstInt(v, idx, span)
+
+    def ci(v):
+        return ir.ConstInt(v, idx, span)
 
     # 1a. Bare EvalStmt(sync.wait) directly inside IfStmt (no SeqStmts wrapper) must be flagged unsupported.
     t0 = ir.Var("t0", ir.SyncTokenType(ir.PipeType.MTE2), span)
@@ -742,7 +767,7 @@ def test_unbalanced_bare_unwaited_and_carried_syntax_routed_safely():
         with passes.PassContext([]):
             passes.lower_sync()(ir.Program([bare_if], "BareArmWait", span))
 
-    # 1b. Cross-control record/wait (record outside IfStmt, wait inside SeqStmts arm) routes to fallback cleanly.
+    # 1b. A record outside the IfStmt and a wait inside its SeqStmts arm require fallback.
     t_cross = ir.Var("t_cross", ir.SyncTokenType(ir.PipeType.MTE2), span)
     cross_if = ir.Function(
         "cross_arm_wait",
@@ -803,7 +828,10 @@ def test_unbalanced_bare_unwaited_and_carried_syntax_routed_safely():
     out = ir.Var("out", gm_t, span)
     x = ir.Var("x", idx_vec, span)
     y = ir.Var("y", idx_vec, span)
-    tup = lambda vals: ir.MakeTuple([ci(v) for v in vals], span)
+
+    def tup(vals):
+        return ir.MakeTuple([ci(v) for v in vals], span)
+
     t_init = ir.Var("t_init", ir.SyncTokenType(ir.PipeType.MTE2), span)
     t_iter = ir.IterArg("t_iter", ir.SyncTokenType(ir.PipeType.MTE2), t_init, span)
     t_out = ir.Var("t_out", ir.SyncTokenType(ir.PipeType.MTE2), span)
@@ -827,7 +855,15 @@ def test_unbalanced_bare_unwaited_and_carried_syntax_routed_safely():
                         [
                             ir.EvalStmt(sync.wait(t_iter, ir.PipeType.V), span),
                             ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [x, y], ir.VoidType(), span), span),
-                            ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+                            ir.EvalStmt(
+                                ir.Call(
+                                    ir.get_op("buffer.load"),
+                                    [src, tup([0, 0]), tup([2, 8]), x],
+                                    ir.VoidType(),
+                                    span,
+                                ),
+                                span,
+                            ),
                             ir.AssignStmt(t_next, sync.record(ir.PipeType.MTE2), span),
                             ir.YieldStmt([t_next], span),
                         ],
@@ -838,7 +874,12 @@ def test_unbalanced_bare_unwaited_and_carried_syntax_routed_safely():
                 ),
                 ir.EvalStmt(sync.wait(t_out, ir.PipeType.V), span),
                 ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [x, y], ir.VoidType(), span), span),
-                ir.EvalStmt(ir.Call(ir.get_op("buffer.store"), [y, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span), span),
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.get_op("buffer.store"), [y, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span
+                    ),
+                    span,
+                ),
                 ir.ReturnStmt([out], span),
             ],
             span,
@@ -886,7 +927,9 @@ def test_intra_loop_set_wait_ack_reuses_ids_without_exhaustion():
     idx = ir.DataType.INDEX
     n = ir.Var("n", ir.ScalarType(idx), span)
     k = ir.Var("k", ir.ScalarType(idx), span)
-    ci = lambda v: ir.ConstInt(v, idx, span)
+
+    def ci(v):
+        return ir.ConstInt(v, idx, span)
 
     # 10 open MTE2 -> V edges inside one loop body exceed the 8-ID hardware pool without intra-loop reuse.
     stmts = []
@@ -925,8 +968,13 @@ def test_intra_loop_set_wait_ack_reuses_ids_without_exhaustion():
 def test_loop_if_else_cross_arm_payloads_and_open_edges_never_collide():
     span = ir.Span.unknown()
     idx = ir.DataType.INDEX
-    ci = lambda v: ir.ConstInt(v, idx, span)
-    tup = lambda vals: ir.MakeTuple([ci(v) for v in vals], span)
+
+    def ci(v):
+        return ir.ConstInt(v, idx, span)
+
+    def tup(vals):
+        return ir.MakeTuple([ci(v) for v in vals], span)
+
     vec_t = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
     gm_t = ir.TensorType([2, 8], ir.DataType.FP32)
 
@@ -953,12 +1001,22 @@ def test_loop_if_else_cross_arm_payloads_and_open_edges_never_collide():
             ir.IfStmt(
                 cond,
                 seq(
-                    ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), z], ir.VoidType(), span), span),
+                    ir.EvalStmt(
+                        ir.Call(
+                            ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), z], ir.VoidType(), span
+                        ),
+                        span,
+                    ),
                     ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [z, w], ir.VoidType(), span), span),
                 ),
                 seq(
                     ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [x, y], ir.VoidType(), span), span),
-                    ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+                    ir.EvalStmt(
+                        ir.Call(
+                            ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span
+                        ),
+                        span,
+                    ),
                 ),
                 [],
                 span,
@@ -977,9 +1035,15 @@ def test_loop_if_else_cross_arm_payloads_and_open_edges_never_collide():
             ir.AssignStmt(y, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(128)], vec_t, span), span),
             ir.AssignStmt(z, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(256)], vec_t, span), span),
             ir.AssignStmt(w, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(384)], vec_t, span), span),
-            ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+            ir.EvalStmt(
+                ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span),
+                span,
+            ),
             payload_loop,
-            ir.EvalStmt(ir.Call(ir.get_op("buffer.store"), [w, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span), span),
+            ir.EvalStmt(
+                ir.Call(ir.get_op("buffer.store"), [w, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span),
+                span,
+            ),
             ir.ReturnStmt([out], span),
         ),
         span,
@@ -1038,7 +1102,9 @@ def test_loop_if_else_cross_arm_payloads_and_open_edges_never_collide():
     )
     phys_open = lower(open_fn, [0, 1])
     for n_val, ch_val in product((0, 1, 2, 4), (0, 1)):
-        _, after = check_closed_commands(open_fn, phys_open, {0: n_val, 1: ch_val}, [0, 1], compare_commands=False)
+        _, after = check_closed_commands(
+            open_fn, phys_open, {0: n_val, 1: ch_val}, [0, 1], compare_commands=False
+        )
         assert not after.live
 
 
@@ -1046,7 +1112,10 @@ def test_loop_if_else_cross_arm_payloads_and_open_edges_never_collide():
 def test_ten_sequential_unpromoted_loops_reuse_single_event_id(kind):
     span = ir.Span.unknown()
     idx = ir.DataType.INDEX
-    ci = lambda v: ir.ConstInt(v, idx, span)
+
+    def ci(v):
+        return ir.ConstInt(v, idx, span)
+
     n = ir.Var("n", ir.ScalarType(idx), span)
 
     loops: list[ir.Stmt] = []
@@ -1061,9 +1130,7 @@ def test_ten_sequential_unpromoted_loops_reuse_single_event_id(kind):
             final = ir.Var(f"fin_{li}", ir.ScalarType(idx), span)
             body_stmts.append(ir.YieldStmt([ir.Add(iv, ci(1), idx, span)], span))
             loops.append(
-                ir.WhileStmt(
-                    ir.Lt(iv, n, ir.DataType.BOOL, span), [iv], seq(*body_stmts), [final], span
-                )
+                ir.WhileStmt(ir.Lt(iv, n, ir.DataType.BOOL, span), [iv], seq(*body_stmts), [final], span)
             )
         else:
             iv = ir.Var(f"i_{li}", ir.ScalarType(idx), span)
@@ -1090,8 +1157,13 @@ def test_ten_sequential_unpromoted_loops_reuse_single_event_id(kind):
 def test_closed_prefix_refuses_stale_same_pipe_barrier_with_intervening_payload(control):
     span = ir.Span.unknown()
     idx = ir.DataType.INDEX
-    ci = lambda v: ir.ConstInt(v, idx, span)
-    tup = lambda vals: ir.MakeTuple([ci(v) for v in vals], span)
+
+    def ci(v):
+        return ir.ConstInt(v, idx, span)
+
+    def tup(vals):
+        return ir.MakeTuple([ci(v) for v in vals], span)
+
     vec_t = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
     gm_t = ir.TensorType([2, 8], ir.DataType.FP32)
 
@@ -1103,7 +1175,9 @@ def test_closed_prefix_refuses_stale_same_pipe_barrier_with_intervening_payload(
 
     stale_seq = seq(
         ir.AssignStmt(tok, sync.record(ir.PipeType.MTE2), span),
-        ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), z], ir.VoidType(), span), span),
+        ir.EvalStmt(
+            ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), z], ir.VoidType(), span), span
+        ),
         ir.EvalStmt(sync.wait(tok, ir.PipeType.MTE2), span),
     )
     if control == "straight":
@@ -1120,7 +1194,10 @@ def test_closed_prefix_refuses_stale_same_pipe_barrier_with_intervening_payload(
         seq(
             ir.AssignStmt(x, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(0)], vec_t, span), span),
             ir.AssignStmt(z, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(128)], vec_t, span), span),
-            ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+            ir.EvalStmt(
+                ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span),
+                span,
+            ),
             middle,
             ir.ReturnStmt([], span),
         ),
@@ -1419,9 +1496,7 @@ def test_interleaved_loop_records_require_return_ack_and_reviewer_probes():
                 SPAN,
             ),
             ir.EvalStmt(
-                ir.Call(
-                    ir.get_op("buffer.extract"), [v_src, ci(8), ci(16), v_dst], {}, ir.VoidType(), SPAN
-                ),
+                ir.Call(ir.get_op("buffer.extract"), [v_src, ci(8), ci(16), v_dst], {}, ir.VoidType(), SPAN),
                 SPAN,
             ),
             ir.ReturnStmt([], SPAN),
@@ -1436,7 +1511,6 @@ def test_interleaved_loop_records_require_return_ack_and_reviewer_probes():
     assert ext_site["physical_intervals"][0] is None
 
     # 6. Conservative solver scaling on 512 independent windows
-    t0 = time.perf_counter()
     gm_512 = ir.Var("source", ir.TensorType([2, 8], ir.DataType.FP32), SPAN)
     local_512 = ir.BufferType([2, 8], ir.DataType.FP32, ir.MemorySpace.Vec)
     stmts_512 = []
@@ -1474,6 +1548,8 @@ def test_interleaved_loop_records_require_return_ack_and_reviewer_probes():
     res_512 = testing.analyze_conservative_sync(
         fn_512, automatic_children=False, retain_incoming_diagnostics=False
     )
-    dt = time.perf_counter() - t0
-    assert res_512["cost"]["retained_facts"] == 2048
-    assert dt < 0.25
+    cost = res_512["cost"]
+    # Two commands with two access facts each per independent window.
+    assert cost["retained_facts"] == 4 * 512
+    assert cost["conflict_queries"] == 4 * 512
+    assert cost["incoming_diagnostic_facts"] == 0

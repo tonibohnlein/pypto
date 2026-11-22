@@ -1447,6 +1447,9 @@ void PTOCodegen::EmitUrmaTransferAdapterDeclarations() {
 void PTOCodegen::PrepareFunctionEmission(const FunctionPtr& func) {
   fs_.Reset();
   fs_.current_function = func;
+  if (gm_workspace_context_) {
+    fs_.gm_pipe_workspace_parameter = gm_workspace_context_->WorkspaceParameter(func);
+  }
   fs_.truncating_floor_div_mod = PrepareScalarFloorDivMod(func->body_, func->params_);
   const bool has_local_receive_ring = IsAIVFunction() && GetBackendHandler()->SupportsLocalPipeDepth();
   if (has_local_receive_ring && !func->GetAttr<bool>(ir::kAttrPyptoAutosync)) {
@@ -1457,7 +1460,7 @@ void PTOCodegen::PrepareFunctionEmission(const FunctionPtr& func) {
 }
 
 bool PTOCodegen::BindGMPipeWorkspace(const VarPtr& parameter) {
-  if (!IsGMPipeWorkspaceParameter(parameter)) {
+  if (parameter.get() != fs_.gm_pipe_workspace_parameter) {
     return false;
   }
   const auto type = ir::AsTensorTypeLike(parameter->GetType());
@@ -1554,7 +1557,8 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   const bool uses_l2_cache_offset =
       collector.UsesL2BypassLoad() && backend_->GetHandler()->GetPtoTargetArch() == "a2a3";
   const auto& ffts_workspace_vars = collector.GetFFTSWorkspaceVars();
-  const auto tensor_views = PrepareTensorParameterViews(*func, ffts_workspace_vars);
+  const auto tensor_views =
+      PrepareTensorParameterViews(*func, ffts_workspace_vars, fs_.gm_pipe_workspace_parameter);
   if (uses_sdma_workspace) {
     fs_.used_ssa_names.insert("arg" + std::to_string(func->params_.size() + dyn_vars.size()));
   }
