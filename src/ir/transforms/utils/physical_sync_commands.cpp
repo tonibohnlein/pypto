@@ -38,6 +38,13 @@
 namespace pypto::ir::sync {
 namespace physical {
 
+bool IsCommandCoordinateBinary(const ExprPtr& expression) {
+  return As<Add>(expression) || As<Sub>(expression) || As<Mul>(expression) || As<FloorDiv>(expression) ||
+         As<FloorMod>(expression) || As<Eq>(expression) || As<Ne>(expression) || As<Lt>(expression) ||
+         As<Le>(expression) || As<Gt>(expression) || As<Ge>(expression) || As<And>(expression) ||
+         As<Or>(expression);
+}
+
 namespace {
 ExprPtr MakeInt(int64_t value, const Span& span) {
   return std::make_shared<ConstInt>(value, DataType::INDEX, span);
@@ -99,9 +106,7 @@ std::vector<const Var*> PredicateInputs(const ExprPtr& predicate, PhysicalSyncRe
     }
     if (As<ConstInt>(value) || As<ConstBool>(value)) return;
     const auto binary = As<BinaryExpr>(value);
-    CHECK(binary && (As<Add>(value) || As<Sub>(value) || As<Mul>(value) || As<FloorDiv>(value) ||
-                     As<FloorMod>(value) || As<Eq>(value) || As<Ne>(value) || As<Lt>(value) ||
-                     As<Le>(value) || As<Gt>(value) || As<Ge>(value) || As<And>(value) || As<Or>(value)))
+    CHECK(binary && IsCommandCoordinateBinary(value))
         << "Command predicate is not a pure supported coordinate expression";
     if (As<FloorDiv>(value) || As<FloorMod>(value)) {
       const auto divisor = As<ConstInt>(binary->right_);

@@ -281,6 +281,8 @@ std::shared_ptr<const FrozenCommandForest> FreezeCommandForest(
 std::vector<StmtPtr> MaterializeFrozenCommands(const ControlForest& forest, SyncTokenNames& names,
                                                PhysicalSyncRealization& work,
                                                const RadixBoxGuard& scope = RadixBoxGuard::True());
+// Arithmetic and Boolean binary operations supported by command coordinate guards.
+bool IsCommandCoordinateBinary(const ExprPtr& expression);
 struct CommandPredicateScope {
   FunctionPtr owner;
   // Share entry facts once per owner, rather than copying every formal at

@@ -123,6 +123,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/invocation_sync_analysis.cpp
     src/ir/transforms/utils/peer_gm_invocation.cpp
     src/ir/transforms/utils/peer_local_effects.cpp
+    src/ir/transforms/utils/peer_local_guard_specialization.cpp
     src/ir/transforms/utils/peer_local_plan.cpp
     src/ir/transforms/utils/peer_local_work_loop.cpp
     src/ir/transforms/utils/peer_local_work_completion.cpp

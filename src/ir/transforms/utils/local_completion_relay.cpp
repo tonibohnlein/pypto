@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -124,6 +125,16 @@ struct Flag {
   bool publish;
 };
 
+StmtPtr MakeFlag(bool publish, SyncDirection direction, int id, const std::string& core, const Span& span) {
+  const auto call = OpRegistry::GetInstance().Create(publish ? "system.set_flag" : "system.wait_flag", {},
+                                                     {{"src_pipe", static_cast<int>(direction.first)},
+                                                      {"dst_pipe", static_cast<int>(direction.second)},
+                                                      {"event_id", id},
+                                                      {"core_type", core}},
+                                                     span);
+  return std::make_shared<EvalStmt>(call, span);
+}
+
 std::optional<Flag> ReadFlag(const StmtPtr& statement) {
   const auto eval = As<EvalStmt>(statement);
   const auto call = eval ? As<Call>(eval->expr_) : nullptr;
@@ -133,6 +144,30 @@ std::optional<Flag> ReadFlag(const StmtPtr& statement) {
   return Flag{{RequireSyncPipeKwarg(call, "src_pipe"), RequireSyncPipeKwarg(call, "dst_pipe")},
               call->GetKwarg<int>("event_id"),
               publish};
+}
+
+std::optional<Flag> GeneratedFlag(const StmtPtr& stmt, const ImportedLocalCuts& cuts,
+                                  const SyncNativeReservations& native) {
+  if (cuts.count(transform_utils::GetCallFromStmt(stmt).get())) return std::nullopt;
+  const auto flag = ReadFlag(stmt);
+  if (!flag) return std::nullopt;
+  const auto [source, destination] = flag->direction;
+  if (source == destination || !IsAsyncPipe(source) || !IsAsyncPipe(destination)) return std::nullopt;
+  const auto claimed = native.find(flag->direction);
+  if (claimed != native.end() && claimed->second.count(flag->id)) return std::nullopt;
+  return flag;
+}
+
+std::optional<SyncDirection> GeneratedPair(const std::vector<StmtPtr>& body, size_t at, size_t end,
+                                           const ImportedLocalCuts& cuts,
+                                           const SyncNativeReservations& native) {
+  if (end - at < 2) return std::nullopt;
+  const auto set = GeneratedFlag(body[at], cuts, native);
+  if (!set || !set->publish) return std::nullopt;
+  const auto wait = GeneratedFlag(body[at + 1], cuts, native);
+  return wait && !wait->publish && wait->id == set->id && wait->direction == set->direction
+             ? std::optional<SyncDirection>(set->direction)
+             : std::nullopt;
 }
 
 class AllocatedEvents final : public IRVisitor {
@@ -231,7 +266,7 @@ class SelectRelays final : public SyncStatementMutator {
       const auto imported = cuts_.find(call.get());
       if (imported != cuts_.end()) {
         const auto& cut = imported->second;
-        if (cut.statement != body[i].get() || cut.has_native_claims || cut.is_transport) continue;
+        if (cut.statement != body[i].get() || cut.HasOpaqueProtocol()) continue;
         if (cut.pipe && IsAsyncPipe(*cut.pipe)) {
           steps[i] = {Step::Kind::Payload, {*cut.pipe, *cut.pipe}};
         } else if (!cut.pipe && backend::QualifyBufferSyncNonPayload(call, target_)) {
@@ -239,16 +274,8 @@ class SelectRelays final : public SyncStatementMutator {
         }
         continue;
       }
-      const auto set = ReadFlag(body[i]);
-      if (!set || !set->publish || i + 1 == body.size()) continue;
-      const auto [source, destination] = set->direction;
-      if (!IsAsyncPipe(source) || !IsAsyncPipe(destination) || source == destination) continue;
-      const auto claimed = native_.find(set->direction);
-      if (claimed != native_.end() && claimed->second.count(set->id)) continue;
-      const auto wait = ReadFlag(body[i + 1]);
-      if (wait && !wait->publish && wait->direction == set->direction && wait->id == set->id &&
-          cuts_.count(transform_utils::GetCallFromStmt(body[i + 1]).get()) == 0) {
-        steps[i] = {Step::Kind::Pair, set->direction};
+      if (const auto pair = GeneratedPair(body, i, body.size(), cuts_, native_)) {
+        steps[i] = {Step::Kind::Pair, *pair};
         ++i;
       }
     }
@@ -342,8 +369,8 @@ class SelectRelays final : public SyncStatementMutator {
       allocated_[direction].insert(id);
       queues = replacement;
       const auto& span = body[begin]->span_;
-      output.push_back(Command("system.set_flag", direction, id, span));
-      output.push_back(Command("system.wait_flag", direction, id, span));
+      output.push_back(MakeFlag(true, direction, id, core_, span));
+      output.push_back(MakeFlag(false, direction, id, core_, span));
       protected_end = *rearm;
       return true;
     }
@@ -374,16 +401,6 @@ class SelectRelays final : public SyncStatementMutator {
     return true;
   }
 
-  StmtPtr Command(const char* name, SyncDirection direction, int id, const Span& span) const {
-    const auto call = OpRegistry::GetInstance().Create(name, {},
-                                                       {{"src_pipe", static_cast<int>(direction.first)},
-                                                        {"dst_pipe", static_cast<int>(direction.second)},
-                                                        {"event_id", id},
-                                                        {"core_type", core_}},
-                                                       span);
-    return std::make_shared<EvalStmt>(call, span);
-  }
-
   const FunctionPtr& owner_;
   const ImportedLocalCuts& cuts_;
   const std::string& target_;
@@ -392,16 +409,220 @@ class SelectRelays final : public SyncStatementMutator {
   SyncNativeReservations allocated_;
   size_t loop_depth_ = 0;
 };
+
+bool Conflicts(const ImportedLocalCut& producer, const ImportedLocalCut& consumer) {
+  for (const auto& from : producer.effects) {
+    for (const auto& to : consumer.effects) {
+      if (from.space != to.space || (!from.write && !to.write)) {
+        continue;
+      }
+      // DDR roots can alias. For local memory a missing enclosure is a
+      // wildcard and a present enclosure covers every reachable placement.
+      if (from.space == MemorySpace::DDR || !from.enclosure || !to.enclosure ||
+          (from.enclosure->begin < to.enclosure->end && to.enclosure->begin < from.enclosure->end)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Split an already allocated capture across two consumers on the same
+// queue. The original publication is kept, so later consumers still see
+// the exact same source prefix. An existing reverse handoff at the head
+// of each disjoint window orders consumption of the new event (from any
+// preceding window or visit) before its next publication.
+class SplitCaptures final : public SyncStatementMutator {
+ public:
+  SplitCaptures(const FunctionPtr& owner, const ImportedLocalCuts& cuts, const std::string& target,
+                const SyncNativeReservations& native)
+      : owner_(owner),
+        cuts_(cuts),
+        native_(native),
+        target_(target),
+        core_(owner->func_type_ == FunctionType::AIC ? "aic" : "aiv"),
+        occupied_(native) {
+    occupied_.VisitStmt(owner->body_);
+  }
+
+ protected:
+  StmtPtr VisitStmt_(const SeqStmtsPtr& sequence) override {
+    const auto& body = sequence->stmts_;
+    std::vector<StmtPtr> output;
+    output.reserve(body.size());
+    bool changed = false;
+    for (size_t at = 0; at < body.size();) {
+      if (const auto split = FindSplit(body, at)) {
+        if (const auto id = Allocate(split->direction)) {
+          AppendSplit(body, at, *split, *id, output);
+          at = split->right + 1;
+          changed = true;
+          continue;
+        }
+      }
+      auto result = VisitStmt(body[at]);
+      changed = changed || result != body[at];
+      output.push_back(std::move(result));
+      ++at;
+    }
+    return changed ? std::make_shared<SeqStmts>(std::move(output), sequence->span_) : sequence;
+  }
+
+ private:
+  struct Split {
+    SyncDirection direction;
+    size_t record;
+    size_t wait;
+    size_t right;
+  };
+
+  const ImportedLocalCut* Payload(const StmtPtr& stmt, PipeType pipe) const {
+    const auto found = cuts_.find(transform_utils::GetCallFromStmt(stmt).get());
+    if (found == cuts_.end()) {
+      return nullptr;
+    }
+    const auto& cut = found->second;
+    return cut.statement == stmt.get() && cut.pipe == pipe && !cut.HasOpaqueProtocol() && !cut.effects.empty()
+               ? &cut
+               : nullptr;
+  }
+
+  bool Metadata(const StmtPtr& stmt) const {
+    if (const auto call = transform_utils::GetCallFromStmt(stmt)) {
+      return backend::QualifyBufferSyncNonPayload(call, target_).has_value();
+    }
+    return static_cast<bool>(As<AssignStmt>(stmt));
+  }
+
+  std::optional<Split> FindSplit(const std::vector<StmtPtr>& body, size_t begin) const {
+    constexpr size_t kMaxWindowStatements = 64;
+    const auto end = begin + std::min(kMaxWindowStatements, body.size() - begin);
+    const auto reverse = GeneratedPair(body, begin, end, cuts_, native_);
+    if (!reverse) {
+      return std::nullopt;
+    }
+    const auto [destination, source] = *reverse;
+    const SyncDirection direction{source, destination};
+    // No commands acquire another queue's completion between the two
+    // publications. Producer payloads in this gap are the only possible
+    // difference in the completion facts received by the first consumer.
+    std::vector<size_t> producers;
+    std::optional<int> published;
+    for (size_t at = begin + 2; at < end; ++at) {
+      if (const auto flag = GeneratedFlag(body[at], cuts_, native_); flag && flag->direction == direction) {
+        if (flag->publish && !published && !producers.empty()) {
+          published = flag->id;
+          continue;
+        }
+        if (!flag->publish && flag->id == published) {
+          return MatchConsumers(body, at, end, direction, producers);
+        }
+        break;
+      }
+      if (Payload(body[at], source)) {
+        if (!published) {
+          producers.push_back(at);
+        }
+      } else if (!Metadata(body[at])) {
+        break;
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::optional<Split> MatchConsumers(const std::vector<StmtPtr>& body, size_t wait, size_t end,
+                                      SyncDirection direction, const std::vector<size_t>& producers) const {
+    const auto [source, destination] = direction;
+    const ImportedLocalCut* first = nullptr;
+    for (size_t at = wait + 1; at < end; ++at) {
+      if (Metadata(body[at])) {
+        continue;
+      }
+      if (const auto consumer = Payload(body[at], destination)) {
+        if (first) {
+          const auto record = IndependentSuffix(body, source, *first, *consumer, producers);
+          return record ? std::optional<Split>{{direction, *record, wait, at}} : std::nullopt;
+        }
+        first = consumer;
+        continue;
+      }
+      // Independent inputs to the first consumer stay at their existing
+      // positions. A read of the destination queue, or any other observable
+      // command between the consumers, could observe the delayed completion.
+      const auto pair = GeneratedPair(body, at, end, cuts_, native_);
+      if (first || !pair || pair->second != destination || pair->first == source) {
+        break;
+      }
+      ++at;
+    }
+    return std::nullopt;
+  }
+
+  std::optional<size_t> IndependentSuffix(const std::vector<StmtPtr>& body, PipeType source,
+                                          const ImportedLocalCut& first, const ImportedLocalCut& second,
+                                          const std::vector<size_t>& producers) const {
+    std::optional<size_t> record;
+    bool helps = false;
+    for (auto it = producers.rbegin(); it != producers.rend(); ++it) {
+      const auto* producer = Payload(body[*it], source);
+      if (!producer || Conflicts(*producer, first)) {
+        break;
+      }
+      helps = helps || Conflicts(*producer, second);
+      record = *it;
+    }
+    return helps ? record : std::nullopt;
+  }
+
+  std::optional<int> Allocate(SyncDirection direction) {
+    const auto [found, inserted] = split_events_.try_emplace(direction);
+    if (inserted) {
+      const auto ids = SyncEligibleIds(owner_, target_, direction, std::nullopt, occupied_.used);
+      if (!ids.empty()) {
+        found->second = ids.front();
+      }
+    }
+    return found->second;
+  }
+
+  void AppendSplit(const std::vector<StmtPtr>& body, size_t begin, const Split& split, int id,
+                   std::vector<StmtPtr>& output) const {
+    for (size_t at = begin; at <= split.right; ++at) {
+      if (at == split.record) {
+        output.push_back(MakeFlag(true, split.direction, id, core_, body[at]->span_));
+      }
+      if (at == split.wait) {
+        output.push_back(MakeFlag(false, split.direction, id, core_, body[at]->span_));
+        continue;
+      }
+      if (at == split.right) {
+        output.push_back(body[split.wait]);
+      }
+      output.push_back(body[at]);
+    }
+  }
+
+  const FunctionPtr& owner_;
+  const ImportedLocalCuts& cuts_;
+  const SyncNativeReservations& native_;
+  const std::string& target_;
+  const std::string core_;
+  AllocatedEvents occupied_;
+  std::map<SyncDirection, std::optional<int>> split_events_;
+};
 }  // namespace
 
-FunctionPtr SelectLocalCompletionRelays(const FunctionPtr& physical, const ImportedLocalCuts& cuts,
-                                        const std::string& target,
-                                        const SyncNativeReservations& native_reservations) {
+FunctionPtr RefineLocalCompletionPlan(const FunctionPtr& physical, const ImportedLocalCuts& cuts,
+                                      const std::string& target,
+                                      const SyncNativeReservations& native_reservations) {
   auto selector = SelectRelays(physical, cuts, target, native_reservations);
   const auto body = selector.VisitStmt(physical->body_);
-  if (body == physical->body_) return physical;
-  auto result = MutableCopy(physical);
-  result->body_ = body;
-  return result;
+  FunctionPtr selected = physical;
+  if (body != physical->body_) {
+    auto result = MutableCopy(physical);
+    result->body_ = body;
+    selected = std::move(result);
+  }
+  return SplitCaptures(selected, cuts, target, native_reservations).VisitFunction(selected);
 }
 }  // namespace pypto::ir::sync

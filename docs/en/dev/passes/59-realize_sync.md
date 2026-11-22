@@ -130,6 +130,25 @@ the crossed commands for event reuse and rechecks the fixed services with
 the displaced payload effects excluded from the earlier prefix. If these
 checks or Buffer validity fail, the endpoint uses its original allocation.
 
+A shared wait can order independent operands. For example, the left matrix
+move needs the earlier query load while the right move needs the later page
+load. The planner can keep the original page publication, deliver the earlier
+prefix to the first move on a free directional event, and postpone the page
+wait until the second move. It checks physical byte overlap, native
+reservations, intervening commands and the reverse handoff that orders
+consumption before the event's next publication. In a longer run of consumers
+the conservative dataflow can also nominate an earlier capture and restore
+the remaining prerequisites when a later consumer first needs them.
+
+For a verified work loop on one core, the compiler can simplify synchronization
+conditions in a small child loop with constant bounds. It evaluates each
+eligible condition at its original iteration coordinates and can split the loop
+into two successive ranges or group two successive iterations. A candidate
+must save control work and fit the same per-function growth limits used for
+local scheduling. The compiler charges the extra payload sites and the whole
+replacement control tree. Payloads,
+local commands and authored FIFO operations keep their execution order.
+
 At a single cut in a structured endpoint, several generated SET/WAIT pairs
 can deliver completion to the same local pipe. For example, a third pipe
 that has already waited for two producers can deliver both completions in

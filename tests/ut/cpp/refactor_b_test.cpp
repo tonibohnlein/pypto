@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <iostream>
@@ -42,6 +43,7 @@
 #include "src/ir/transforms/utils/closed_prefix_sync.h"
 #include "src/ir/transforms/utils/conservative_sync_dataflow.h"
 #include "src/ir/transforms/utils/local_completion_relay.h"
+#include "src/ir/transforms/utils/peer_local_work_loop.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
 #include "src/ir/transforms/utils/retained_sync_child.h"
 #include "src/ir/transforms/utils/sync_footprint_resolver.h"
@@ -403,7 +405,7 @@ void TestPhysicalCompletionRelay() {
         reserved[{carrier, consumer}].insert(id);
     }
     if (which == Case::ReservedDirect) reserved[{a, consumer}].insert(0);
-    const auto selected = SelectLocalCompletionRelays(baseline, imported, "a2a3", reserved);
+    const auto selected = RefineLocalCompletionPlan(baseline, imported, "a2a3", reserved);
     // Replay the tempting one-pair alternative independently. In the late
     // load case it would change both the matrix issue and the final DDR fence.
     pair(cuts, carrier, consumer, new_id);
@@ -464,7 +466,7 @@ void TestPhysicalCompletionRelay() {
       const auto allocated = TryLowerClosedPrefixSync(function(std::move(logical)), "a2a3", std::nullopt, {},
                                                       {}, std::nullopt, &evidence);
       assert(allocated);
-      const auto optimized = SelectLocalCompletionRelays(allocated->function, evidence.calls, "a2a3", {});
+      const auto optimized = RefineLocalCompletionPlan(allocated->function, evidence.calls, "a2a3", {});
       size_t before = 0, after = 0;
       const auto allocated_profile =
           RelayPayloadPredecessors(allocated->function, evidence.calls, true, 1, &before);
@@ -485,12 +487,248 @@ void TestPhysicalCompletionRelay() {
   pair(cut, a, carrier, 1);
   cut.push_back(fence);
   const auto baseline = function(std::move(cut));
-  const auto selected = SelectLocalCompletionRelays(baseline, imported, "a2a3", {});
+  const auto selected = RefineLocalCompletionPlan(baseline, imported, "a2a3", {});
   const auto full = RelayPayloadPredecessors(baseline, imported, true, 1);
   const auto dropped = RelayPayloadPredecessors(function(std::move(stripped)), imported, true, 1);
   assert(full.back().first == 0 && dropped.back().first == 0);
   assert(full.back().second == 1 && dropped.back().second == 0);
   assert(RelayPayloadPredecessors(selected, imported, true, 1) == full);
+}
+
+// A later vector consumer needs the last load in a batch. Earlier consumers
+// can acquire the first load while that last one is still in flight.
+void TestSplitLongConsumerRun() {
+  const auto src = MakeVar("src", MakeTensorType(1, 8));
+  const auto a = MakeVar("a", VecType(1, 8)), b = MakeVar("b", VecType(1, 8));
+  const auto out = MakeVar("out", VecType(1, 8));
+  const auto load_a = EvalCall("buffer.load", {src, ConstTup({0, 0}), ConstTup({1, 8}), a});
+  const auto load_b = EvalCall("buffer.load", {src, ConstTup({0, 0}), ConstTup({1, 8}), b});
+  std::vector<StmtPtr> body{load_a, load_b};
+  for (const auto& input : {a, a, a, b}) body.push_back(EvalCall("buffer.abs", {input, out}));
+  auto fn =
+      MakeAicFn("consumer_run", {src, a, b, out},
+                {ParamDirection::In, ParamDirection::In, ParamDirection::In, ParamDirection::Out}, body);
+  ImportedLocalSync imported{fn, {}};
+  for (size_t i = 0; i < body.size(); ++i) {
+    const bool load = i < 2;
+    const auto begin = (i == 1 || i == 5) ? 32 : 0;
+    const auto call = As<Call>(As<EvalStmt>(body[i])->expr_);
+    std::vector<ImportedLocalEffect> effects{
+        {MemorySpace::Vec, load, backend::BufferSyncByteWindow{begin, begin + 32}}};
+    if (load) {
+      effects.push_back({MemorySpace::DDR, false, std::nullopt});
+    } else {
+      effects.push_back({MemorySpace::Vec, true, backend::BufferSyncByteWindow{64, 96}});
+    }
+    imported.calls.emplace(
+        call.get(), ImportedLocalCut{body[i].get(), load ? PipeType::MTE2 : PipeType::V, std::move(effects)});
+  }
+  const auto analyze = [&]() {
+    return AnalyzeConservativeSync(fn, "a2a3", {}, {}, false, false, false, {}, std::nullopt, false,
+                                   &imported, true);
+  };
+  const auto analysis = analyze();
+  const auto& sites = analysis.Sites();
+  assert(sites.size() == 6 && sites[1].precise_capture && sites[1].precise_capture->consumer == body[2]);
+  const auto waits_for_load = [](const auto& site) {
+    return std::find(site.source_pipes.begin(), site.source_pipes.end(), PipeType::MTE2) !=
+           site.source_pipes.end();
+  };
+  assert(!waits_for_load(sites[2]) && waits_for_load(sites[5]));
+  // A data pipe describes only the transfer performed by native FIFO calls.
+  // Neither its hidden protocol nor native event claims may be crossed.
+  for (const size_t index : {1U, 2U}) {
+    auto& cut = imported.calls.at(As<Call>(As<EvalStmt>(body[index])->expr_).get());
+    for (bool transport : {false, true}) {
+      cut.is_transport = transport;
+      cut.has_native_claims = !transport;
+      assert(!analyze().Sites()[1].precise_capture);
+    }
+    cut.is_transport = cut.has_native_claims = false;
+  }
+  // An unknown first-consumer footprint also admits overlap with the late load.
+  imported.calls.at(As<Call>(As<EvalStmt>(body[2])->expr_).get()).effects[0].enclosure.reset();
+  assert(!analyze().Sites()[1].precise_capture);
+}
+
+void TestBoundedWorkGuards() {
+  const auto work = MakeVar("work", IndexType()), iv = MakeVar("i", IndexType());
+  const auto point = MakeVar("point", MakeTensorType(32, 8)), buf = MakeVar("buf", VecType(1, 8));
+  // Trace the address coordinate at every payload and the relative barrier
+  // positions. This interpreter only needs the expressions used by the fixture.
+  const auto trace = [&](const FunctionPtr& f) {
+    std::map<const Var*, int64_t> env;
+    std::vector<int64_t> tape;
+    const auto value = [&](const auto& self, const ExprPtr& expr) -> int64_t {
+      if (const auto i = As<ConstInt>(expr)) return i->value_;
+      if (const auto v = As<Var>(expr)) return env.at(v.get());
+      const auto bin = As<BinaryExpr>(expr);
+      assert(bin);
+      const auto l = self(self, bin->left_), r = self(self, bin->right_);
+      if (As<Eq>(expr)) return l == r;
+      if (As<FloorMod>(expr)) return l % r;
+      assert(As<Add>(expr));
+      return l + r;
+    };
+    const auto walk = [&](const auto& self, const StmtPtr& stmt) -> void {
+      if (const auto seq = As<SeqStmts>(stmt)) {
+        for (const auto& child : seq->stmts_) self(self, child);
+      } else if (const auto loop = As<ForStmt>(stmt)) {
+        for (auto i = value(value, loop->start_); i < value(value, loop->stop_);
+             i += value(value, loop->step_)) {
+          env[loop->loop_var_.get()] = i;
+          self(self, loop->body_);
+        }
+      } else if (const auto b = As<IfStmt>(stmt)) {
+        if (value(value, b->condition_)) self(self, b->then_body_);
+      } else if (const auto assign = As<AssignStmt>(stmt)) {
+        env[assign->var_.get()] = value(value, assign->value_);
+      } else if (const auto eval = As<EvalStmt>(stmt)) {
+        const auto call = As<Call>(eval->expr_);
+        if (IsOp(call, "buffer.load")) {
+          tape.push_back(value(value, As<MakeTuple>(call->args_[1])->elements_[0]));
+        } else {
+          assert(IsOp(call, "system.bar_v"));
+          tape.push_back(-1);
+        }
+      } else {
+        assert(As<YieldStmt>(stmt));
+      }
+    };
+    walk(walk, f->body_);
+    return tape;
+  };
+  for (const int trips : {3, 8, 17}) {
+    auto condition = trips == 3 ? MakeEq(iv, CI(2)) : MakeEq(MakeFloorMod(iv, CI(2)), CI(0));
+    std::vector<StmtPtr> body;
+    for (size_t i = 0; i < 4; ++i) {
+      body.push_back(std::make_shared<IfStmt>(condition, EvalCall("system.bar_v", {}), std::nullopt,
+                                              std::vector<VarPtr>{}, kSpan));
+      body.push_back(EvalCall("buffer.load", {point, MakeTup({iv, CI(0)}), ConstTup({1, 8}), buf}));
+    }
+    auto inner = SimpleFor(iv, CI(2), CI(2 + trips), CI(1), std::move(body));
+    auto original = MakeAicFn("work_guards", {point, buf}, {ParamDirection::In, ParamDirection::Out},
+                              {SimpleFor(work, CI(0), CI(2), CI(1), {inner})});
+    auto selected = SpecializePeerWorkGuards(original, {work.get()});
+    assert((!structural_equal(original->body_, selected->body_)) == (trips <= 16));
+    assert(trace(selected) == trace(original));
+    assert(SpecializePeerWorkGuards(original, {}) == original);
+  }
+  // The same IR branch can be reached on different subsets of visits.
+  // Its pointer alone cannot identify an arm-specific folding decision.
+  const auto pred = MakeEq(MakeFloorMod(iv, CI(2)), CI(0));
+  const auto shared = std::make_shared<IfStmt>(pred, EvalCall("system.bar_v", {}), std::nullopt,
+                                               std::vector<VarPtr>{}, kSpan);
+  const auto both = std::make_shared<IfStmt>(pred, shared, shared, std::vector<VarPtr>{}, kSpan);
+  const auto inner = SimpleFor(iv, CI(0), CI(8), CI(1), {both});
+  const auto dag = MakeAicFn("shared_guard", {}, {}, {SimpleFor(work, CI(0), CI(1), CI(1), {inner})});
+  assert(structural_equal(dag->body_, SpecializePeerWorkGuards(dag, {work.get()})->body_));
+
+  // The statement inventory charges operand occurrences. Refuse an assignment
+  // above that budget without walking its exponentially large expanded tree.
+  ExprPtr rhs = iv;
+  for (int depth = 0; depth < 32; ++depth) rhs = MakeAdd(rhs, rhs);
+  const auto assign = std::make_shared<AssignStmt>(MakeVar("offset", IndexType()), rhs, kSpan);
+  const auto large = SimpleFor(iv, CI(0), CI(8), CI(1), {assign, shared});
+  const auto budget = MakeAicFn("shared_coordinate", {}, {}, {SimpleFor(work, CI(0), CI(1), CI(1), {large})});
+  const auto unchanged_work = [&](const FunctionPtr& fn) {
+    const auto actual = SpecializePeerWorkGuards(fn, {work.get()});
+    return As<SeqStmts>(actual->body_)->stmts_.front() == As<SeqStmts>(fn->body_)->stmts_.front();
+  };
+  assert(unchanged_work(budget));
+
+  std::vector<StmtPtr> wide_body{shared};
+  for (size_t i = 0; i < 57; ++i) {
+    wide_body.push_back(EvalCall("buffer.load", {point, MakeTup({iv, CI(0)}), ConstTup({1, 8}), buf}));
+  }
+  const auto wide = SimpleFor(iv, CI(0), CI(8), CI(1), std::move(wide_body));
+  assert(unchanged_work(MakeAicFn("payload_budget", {point, buf}, {ParamDirection::In, ParamDirection::Out},
+                                  {SimpleFor(work, CI(0), CI(1), CI(1), {wide})})));
+}
+
+void TestIndependentPhysicalCaptures() {
+  constexpr auto source = PipeType::MTE2;
+  constexpr auto destination = PipeType::MTE1;
+  const SyncDirection forward{source, destination};
+  const SyncDirection reverse{destination, source};
+  const auto input = MakeVar("input", MakeTensorType(16, 16, DataType::FP16));
+  const auto gate = MakeVar("gate", BoolType());
+  const auto visits = MakeVar("visits", IndexType());
+  const auto iv = MakeVar("iteration", IndexType());
+  const auto mat = MatType(16, 16), left = LeftType(16, 16);
+  const auto shared = MakeVar("shared", mat), page = MakeVar("page", mat);
+  const auto lhs = MakeVar("lhs", left), rhs = MakeVar("rhs", left);
+  const auto point = ConstTup({0, 0}), extent = ConstTup({16, 16});
+  const auto load_shared = EvalCall("buffer.load", {input, point, extent, shared});
+  const auto load_page = EvalCall("buffer.load", {input, point, extent, page});
+  const auto read_shared = EvalCall("buffer.copy", {shared, lhs});
+  const auto read_page = EvalCall("buffer.copy", {page, rhs});
+  const auto flag = [&](bool publish, SyncDirection dir, int id) {
+    const auto call = OpRegistry::GetInstance().Create(publish ? "system.set_flag" : "system.wait_flag", {},
+                                                       {{"src_pipe", static_cast<int>(dir.first)},
+                                                        {"dst_pipe", static_cast<int>(dir.second)},
+                                                        {"event_id", id},
+                                                        {"core_type", std::string("aic")}},
+                                                       kSpan);
+    return std::make_shared<EvalStmt>(call, kSpan);
+  };
+  const auto arm = std::make_shared<SeqStmts>(
+      std::vector<StmtPtr>{flag(true, reverse, 0), flag(false, reverse, 0), load_page, flag(true, forward, 0),
+                           flag(false, forward, 0), read_shared, read_page},
+      kSpan);
+  const auto branch = std::make_shared<IfStmt>(gate, arm, std::nullopt, std::vector<VarPtr>{}, kSpan);
+  const auto baseline =
+      MakeAicFn("independent_captures", {input, gate, visits},
+                {ParamDirection::In, ParamDirection::In, ParamDirection::In},
+                {load_shared, SimpleFor(iv, CI(0), visits, CI(1), {branch}), EvalCall("system.fence", {})},
+                FunctionType::AIC);
+  const auto call_of = [](const StmtPtr& stmt) { return As<Call>(As<EvalStmt>(stmt)->expr_); };
+  const backend::BufferSyncByteWindow shared_window{0, 512}, page_window{512, 1024};
+  ImportedLocalCuts evidence{
+      {call_of(load_shared).get(), {load_shared.get(), source, {{MemorySpace::Mat, true, shared_window}}}},
+      {call_of(load_page).get(), {load_page.get(), source, {{MemorySpace::Mat, true, page_window}}}},
+      {call_of(read_shared).get(),
+       {read_shared.get(), destination, {{MemorySpace::Mat, false, shared_window}}}},
+      {call_of(read_page).get(), {read_page.get(), destination, {{MemorySpace::Mat, false, page_window}}}}};
+  const auto selected = RefineLocalCompletionPlan(baseline, evidence, "a2a3", {});
+  for (bool taken : {false, true}) {
+    for (int trips : {0, 1, 3}) {
+      size_t original_sets = 0, split_sets = 0;
+      auto original = RelayPayloadPredecessors(baseline, evidence, taken, trips, &original_sets);
+      const auto split = RelayPayloadPredecessors(selected, evidence, taken, trips, &split_sets);
+      assert(split.size() == original.size());
+      assert(split_sets == original_sets + (taken ? trips : 0));
+      if (taken) {
+        for (int trip = 0; trip < trips; ++trip) {
+          const auto load = 1 + trip * 3;
+          const auto page_completion = 1U << load;
+          // The only difference is that each shared-input move can issue
+          // before the same visit's page transfer finishes. Row identities,
+          // page consumers, event reuse and the exit observation all agree.
+          assert(original[load + 1].first & page_completion);
+          assert(original[load + 2].first & page_completion);
+          assert(original[load + 1].first & 1U);
+          original[load + 1].first &= ~page_completion;
+          original[load + 1].second &= ~page_completion;
+        }
+      }
+      assert(split == original);
+    }
+  }
+
+  auto may_alias = evidence;
+  may_alias.at(call_of(read_shared).get()).effects.front().enclosure.reset();
+  const auto aliased = RefineLocalCompletionPlan(baseline, may_alias, "a2a3", {});
+  assert(structural_equal(aliased->body_, baseline->body_));
+
+  SyncNativeReservations reserved;
+  for (const auto id : SyncEligibleIds(baseline, "a2a3", forward, std::nullopt, {})) {
+    if (id != 0) {
+      reserved[forward].insert(id);
+    }
+  }
+  const auto exhausted = RefineLocalCompletionPlan(baseline, evidence, "a2a3", reserved);
+  assert(structural_equal(exhausted->body_, baseline->body_));
 }
 
 // ============================================================================
@@ -1742,6 +1980,9 @@ void TestRound2AuditAndCleanupFixes() {
 int main() {
   pypto::backend::BackendConfig::SetBackendType(pypto::backend::BackendType::Ascend910);
   pypto::ir::sync::TestPhysicalCompletionRelay();
+  pypto::ir::sync::TestBoundedWorkGuards();
+  pypto::ir::sync::TestSplitLongConsumerRun();
+  pypto::ir::sync::TestIndependentPhysicalCaptures();
   pypto::ir::sync::TestPeerTransferBufferGeometry();
   pypto::ir::sync::TestB1SyncControlRangeProver();
   pypto::ir::sync::TestB1RangeUseCuts();

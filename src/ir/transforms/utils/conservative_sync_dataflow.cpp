@@ -2129,26 +2129,39 @@ class Builder {
         !std::binary_search(sites[consumer].source_pipes.begin(), sites[consumer].source_pipes.end(), src)) {
       return false;
     }
-    // A run of destination work shares a source prefix. Keep the last
-    // producer needed by any member in that prefix. Otherwise the next
-    // destination payload may need to restore the same broad capture.
+    // Find the earliest record before a producer that can remain in flight.
+    // A producer may acquire from the deferred destination. Place the record
+    // after that service so it cannot observe a delivery before its actual wait.
+    const auto find_record = [&](const LiveStorageState& accesses) -> std::optional<size_t> {
+      std::optional<size_t> record;
+      for (auto it = source_run.rbegin(); it != source_run.rend(); ++it) {
+        const auto producer = *it;
+        const auto& effects = site_effect_fibers_[producer];
+        if (std::any_of(effects.begin(), effects.end(), [&](const SiteEffectFiber& effect) {
+              return !accesses.QueryConflicts(effect, cost).empty();
+            })) {
+          break;
+        }
+        record = producer;
+        const auto& incoming = sites[producer].required_source_pipes;
+        if (std::binary_search(incoming.begin(), incoming.end(), dst)) break;
+      }
+      return record;
+    };
     LiveStorageState target_accesses;
     for (const auto target : target_run) target_accesses.AddEffects(site_effect_fibers_[target]);
-    std::optional<size_t> record;
-    for (auto it = source_run.rbegin(); it != source_run.rend(); ++it) {
-      const auto producer = *it;
-      if (imported_->calls.at(sites[producer].operation.get()).has_native_claims) break;
-      const auto& effects = site_effect_fibers_[producer];
-      const auto conflicts = [&](const SiteEffectFiber& effect) {
-        return !target_accesses.QueryConflicts(effect, cost).empty();
-      };
-      if (std::any_of(effects.begin(), effects.end(), conflicts)) break;
-      record = producer;
-      const auto& incoming = sites[producer].required_source_pipes;
-      // A service reading the deferred destination could observe knowledge
-      // delivered there by the debt model before its actual wait. It may be
-      // included in the capture, since the record follows this site's services.
-      if (std::binary_search(incoming.begin(), incoming.end(), dst)) break;
+    auto record = find_record(target_accesses);
+    // Prefer a single capture for the entire destination run. When the tail
+    // needs the full source prefix, a second service costs at least a SET and
+    // WAIT. Consider that trade only when more destination payloads than
+    // those two commands can issue before a late producer completes.
+    constexpr size_t kSplitPrefixPayloads = 3;
+    if (!record && target_run.size() > kSplitPrefixPayloads) {
+      LiveStorageState early_accesses;
+      for (size_t i = 0; i < kSplitPrefixPayloads; ++i) {
+        early_accesses.AddEffects(site_effect_fibers_[target_run[i]]);
+      }
+      record = find_record(early_accesses);
     }
     if (!record) return false;
     sites[*record].precise_capture = ConservativePrefixCapture{sites[consumer].cut, dst};
@@ -2179,6 +2192,12 @@ class Builder {
       for (const auto& child : seq->stmts_) {
         if (const auto found = site_index_.find(child.get()); found != site_index_.end()) {
           const auto current = found->second;
+          if (imported_->calls.at(sites[current].operation.get()).HasOpaqueProtocol()) {
+            flush();
+            source_run.clear();
+            target_run.clear();
+            continue;
+          }
           if (!target_run.empty() && sites[target_run.back()].pipe != sites[current].pipe) {
             flush();
             source_run.clear();
@@ -2278,7 +2297,10 @@ class Builder {
       head = FirstPrefixOperation(branch->then_body_);
     }
     const auto consumer = site_index_.find(head.get());
-    if (consumer == site_index_.end()) return std::nullopt;
+    if (consumer == site_index_.end() ||
+        imported_->calls.at(sites[consumer->second].operation.get()).HasOpaqueProtocol()) {
+      return std::nullopt;
+    }
     const auto src = sites[source->second.back()].pipe;
     const auto dst = sites[consumer->second].pipe;
     const auto& services = sites[consumer->second].source_pipes;
@@ -2290,9 +2312,7 @@ class Builder {
     auto record = source->second.rend();
     for (auto it = source->second.rbegin(); it != source->second.rend(); ++it) {
       const auto producer = *it;
-      if (imported_->calls.at(sites[producer].operation.get()).has_native_claims ||
-          issue_order_.at(producer) <= guard_ready)
-        break;
+      if (issue_order_.at(producer) <= guard_ready) break;
       DebtState added;
       added.AddEffects(site_effect_fibers_[producer]);
       if (!added.CoversConflicts(src, dst, site_effect_fibers_[consumer->second])) break;

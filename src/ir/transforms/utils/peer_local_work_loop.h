@@ -49,6 +49,9 @@ std::vector<SyncDirection> ClosePeerWorkPairs(const PeerWorkPairs& pairs);
 void SelectPeerWorkSeams(const CompactSyncInput& input, const PeerLocalRegion& region,
                          const std::vector<const PhysicalSyncFamily*>& families, const PeerWorkSeamIds& ids,
                          bool scalar_serial, PeerWorkPlacement& placement);
+// Copy only literal child visits inside the verified work item. The selected
+// local sync guards are constant at every original coordinate for each copy.
+FunctionPtr SpecializePeerWorkGuards(const FunctionPtr& owner, const std::set<const Var*>& work_ivs);
 FunctionPtr AddPeerWorkSeams(const FunctionPtr& function, const std::vector<PeerWorkPlacement>& placements,
                              const PeerWorkSeamIds& ids);
 

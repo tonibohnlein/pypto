@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
@@ -24,6 +25,13 @@
 #include "src/ir/transforms/utils/physical_sync_commands.h"
 
 namespace pypto::ir::sync::physical {
+inline SyncSchedulePolicy LocalSyncSchedulePolicy() {
+  // Boundary specialization only clones qualified innermost bodies. Charge
+  // every additional payload site and the entire expanded replacement across
+  // the leaf. Diagnostic callers retain the strict no-clone policy by default.
+  return {"auto_boundary", 56, 4096, false, true};
+}
+
 // Read-only handoff from complete candidate selection to the single materializer.
 struct RegularLoopSchedule {
   ForStmtPtr loop;

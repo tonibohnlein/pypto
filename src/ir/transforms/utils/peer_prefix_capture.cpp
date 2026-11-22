@@ -136,7 +136,7 @@ class Nominate {
 
   bool IsPeerWait(const StmtPtr& statement) const {
     const auto imported = Imported(statement);
-    return imported && !imported->pipe && !imported->has_native_claims &&
+    return imported && !imported->pipe && !imported->HasOpaqueProtocol() &&
            IsOp(transform_utils::GetCallFromStmt(statement), "system.sync_wait");
   }
 
@@ -166,7 +166,7 @@ class Nominate {
       return *set != moving;
     }
     if (const auto imported = Imported(statement); imported && imported->pipe) {
-      return *imported->pipe == source && !imported->has_native_claims;
+      return *imported->pipe == source && !imported->HasOpaqueProtocol();
     }
     const auto call = transform_utils::GetCallFromStmt(statement);
     const auto barrier = RequireLocalSyncBarrier(source, core_);
@@ -184,7 +184,8 @@ class Nominate {
     for (size_t i = 0; i < body.size(); ++i) {
       const auto& statement = body[i];
       if (const auto imported = Imported(statement); imported && imported->pipe) {
-        if (author_wait && event && !imported->has_native_claims && *imported->pipe == std::get<1>(*event)) {
+        if (author_wait && event && !imported->HasOpaqueProtocol() &&
+            *imported->pipe == std::get<1>(*event)) {
           prefix.resize(publication_prefix_size);
           return Receiver{*event, publication, statement, steady_guard, std::move(prefix)};
         }

@@ -20,12 +20,12 @@
 
 namespace pypto::ir::sync {
 
-// Reduce generated commands in an already allocated local plan only where
-// both payload order and physical event consumption are preserved. The adapter
-// supplies qualified native cuts and their protected directional reservations.
-FunctionPtr SelectLocalCompletionRelays(const FunctionPtr& physical, const ImportedLocalCuts& cuts,
-                                        const std::string& target,
-                                        const SyncNativeReservations& native_reservations);
+// First remove redundant completion services using equivalent relays, then
+// separate captures that unnecessarily delay an independent consumer. Both
+// steps preserve required payload order and consuming-event reuse.
+FunctionPtr RefineLocalCompletionPlan(const FunctionPtr& physical, const ImportedLocalCuts& cuts,
+                                      const std::string& target,
+                                      const SyncNativeReservations& native_reservations);
 
 }  // namespace pypto::ir::sync
 

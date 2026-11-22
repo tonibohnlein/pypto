@@ -328,11 +328,11 @@ FunctionPtr PlanStructuredEndpoint(const PeerLocalEffects& effects) {
   if (precise) {
     const auto moved =
         MoveEarlierPeerPrefixes(precise->first, precise->second, imported, target, effects.parameters);
-    return SelectLocalCompletionRelays(moved, imported.calls, target, reserved);
+    return RefineLocalCompletionPlan(moved, imported.calls, target, reserved);
   }
   const auto physical = realize(false);
   CHECK(physical) << "No closed-prefix schedule for the imported peer endpoint";
-  return SelectLocalCompletionRelays(physical->first, imported.calls, target, reserved);
+  return RefineLocalCompletionPlan(physical->first, imported.calls, target, reserved);
 }
 
 }  // namespace
@@ -365,6 +365,15 @@ FunctionPtr RealizePeerLocalPlan(const PeerLocalEffects& effects) {
     completed->body_ = CompletePeerPath(plan->func_type_, execution.terminal_completion_op).Run(plan->body_);
     plan = completed;
   }
+  std::set<const Var*> work_ivs;
+  for (const auto& lane : effects.lanes) {
+    for (const auto& region : lane.regions) {
+      if (region.work_loop) {
+        work_ivs.insert(region.work_loop->original->loop_var_.get());
+      }
+    }
+  }
+  plan = SpecializePeerWorkGuards(plan, work_ivs);
   CheckPhysicalSyncResult(plan);
   return plan;
 }

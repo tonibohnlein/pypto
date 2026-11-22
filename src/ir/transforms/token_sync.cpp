@@ -37,6 +37,7 @@
 #include "src/ir/transforms/utils/conservative_sync_dataflow.h"
 #include "src/ir/transforms/utils/peer_fifo_pair.h"
 #include "src/ir/transforms/utils/physical_sync_allocation.h"
+#include "src/ir/transforms/utils/physical_sync_schedule.h"
 #include "src/ir/transforms/utils/scoped_logical_sync.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
 #include "src/ir/transforms/utils/token_sync_lowering.h"
@@ -77,12 +78,6 @@ bool IsOwnedLeaf(const FunctionPtr& function) {
   return (function->func_type_ == FunctionType::AIC || function->func_type_ == FunctionType::AIV) &&
          !function->requires_runtime_binding_ && !function->HasAttr(kAttrExternalSource) &&
          !function->HasAttr(kAttrBuiltinTemplateDir);
-}
-sync::SyncSchedulePolicy LocalSyncSchedulePolicy() {
-  // Boundary specialization only clones qualified innermost bodies. Charge
-  // every additional payload site and the entire expanded replacement across
-  // the leaf. Diagnostic callers retain the strict no-clone policy by default.
-  return {"auto_boundary", 56, 4096, false, true};
 }
 // Explicit whole-module requests are atomic and deliberately narrower than
 // per-leaf delegation. Orchestration/group wrappers are not local PTO bodies;
@@ -459,7 +454,7 @@ Pass LowerSync(bool require_whole_module) {
           const auto launch_count = FixedLaunchCount(evidence, global->name_);
           const auto lower = [&](sync::SyncExternalPolicy policy) {
             return sync::LowerLogicalSync(function, target, std::nullopt, parameters, blocks,
-                                          LocalSyncSchedulePolicy(), policy, launch_count);
+                                          sync::physical::LocalSyncSchedulePolicy(), policy, launch_count);
           };
           const auto result = [&] {
             try {
@@ -567,8 +562,9 @@ Pass RealizeSync(bool require_whole_module) {
       sync::CheckGeneratedLogicalSync(logical);
       const auto optimized = sync::OptimizeLogicalSync(logical);
       sync::CheckGeneratedLogicalSync(optimized);
-      const auto physical = sync::LowerLogicalSync(optimized, target, std::nullopt, bounds, block_bounds,
-                                                   LocalSyncSchedulePolicy(), policy, block_count);
+      const auto physical =
+          sync::LowerLogicalSync(optimized, target, std::nullopt, bounds, block_bounds,
+                                 sync::physical::LocalSyncSchedulePolicy(), policy, block_count);
       // PTOAS recognizes literal flags, not empty plans or barriers, as manual
       // ownership. Do not fabricate a dummy flag or mix partial ownership.
       if (!require_whole_module && (!physical.set_sites || !physical.wait_sites))
