@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "pypto/backend/common/buffer_type_support.h"
+#include "pypto/backend/common/buffer_view_semantics.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
@@ -144,11 +145,18 @@ TypePtr DeduceBufferExtract(const std::vector<ExprPtr>& args) {
   return GetVoidType();
 }
 
-// FIXPIPE Acc(FP32) -> Mat(BF16/FP16) insertion at a fractal-aligned offset.
 TypePtr DeduceBufferInsert(const std::vector<ExprPtr>& args) {
   CHECK(args.size() == 4) << "buffer.insert requires source, row offset, column offset and destination, got "
                           << args.size() << " operands";
   CHECK(args[0] && args[3]) << "buffer.insert buffer operands must not be null";
+  const auto vec_source = As<BufferType>(args[0]->GetType());
+  if (vec_source && vec_source->memory_space_ == MemorySpace::Vec) {
+    const auto destination = As<BufferType>(args[3]->GetType());
+    CHECK(backend::SupportsA2A3VecInsert(vec_source, destination, args[1], args[2]))
+        << "buffer.insert requires supported static-valid A2/A3 ND Vec insertion geometry";
+    return GetVoidType();
+  }
+  // FIXPIPE Acc(FP32) -> Mat(BF16/FP16) insertion at a fractal-aligned offset.
   auto source = MatrixOperand(args, 0, MemorySpace::Acc, "buffer.insert");
   auto destination = MatrixOperand(args, 3, MemorySpace::Mat, "buffer.insert");
   CHECK(source->dtype_ == DataType::FP32 &&
@@ -234,14 +242,14 @@ REGISTER_OP("buffer.extract")
     });
 
 REGISTER_OP("buffer.insert")
-    .set_description("Write a static-shape Acc buffer into a Mat buffer at fractal-aligned offsets")
+    .set_description("Write a source rectangle into a Mat or dense Vec buffer at an explicit offset")
     .set_op_category("BufferOp")
     .set_ir_stage(OpIRStage::Buffer)
     .set_internal_only()
-    .add_argument("src", "Acc source buffer")
+    .add_argument("src", "Acc or dense Vec source buffer")
     .add_argument("row", "Row offset of the window in destination elements")
     .add_argument("col", "Column offset of the window in destination elements")
-    .add_argument("dst", "Mat destination buffer containing the inserted window")
+    .add_argument("dst", "Mat or dense Vec destination buffer containing the inserted window")
     .set_output_arity(0)
     .set_buffer_arg_effect(0, BufferAccess::Read, BufferAccess::Read)
     .set_buffer_non_memory_arg(1)

@@ -320,8 +320,14 @@ class BufferIRVisitor : public IRVisitor {
                                         view_handles_.count(AsVarLike(op->args_[1]).get()))) {
           CheckWindowPair(op, op->args_[0], op->args_[1], true);
         }
-        if (IsOp(op, "buffer.extract") || IsOp(op, "buffer.insert"))
+        if (IsOp(op, "buffer.insert") &&
+            As<BufferType>(op->args_[0]->GetType())->memory_space_ == MemorySpace::Vec) {
+          CheckDenseAlignedWindow(op, op->args_[0], "source");
+          CheckDenseAlignedWindow(op, op->args_[3], "destination");
+        }
+        if (IsOp(op, "buffer.extract") || IsOp(op, "buffer.insert")) {
           CheckWindowPair(op, op->args_[0], op->args_[3], false);
+        }
         if (IsOp(op, "buffer.set_validshape") && view_handles_.count(AsVarLike(op->args_[0]).get())) {
           Error("buffer.set_validshape cannot mutate static view metadata", op->span_);
         }
@@ -629,7 +635,7 @@ class BufferIRVisitor : public IRVisitor {
       if (recipe.inputs[i].kind == backend::BufferElementwiseOperandKind::Buffer) {
         CheckWindowPair(call, call->args_[i], call->args_.back(), exact_allowed);
       } else if (recipe.inputs[i].kind == backend::BufferElementwiseOperandKind::Workspace) {
-        CheckElementwiseWorkspaceWindow(call, call->args_[i]);
+        CheckDenseAlignedWindow(call, call->args_[i], "workspace");
         CheckWindowPair(call, call->args_[i], call->args_.back(), false);
         for (size_t j = 0; j < recipe.inputs.size(); ++j) {
           if (j != i && recipe.inputs[j].kind != backend::BufferElementwiseOperandKind::ElementScalar) {
@@ -640,7 +646,7 @@ class BufferIRVisitor : public IRVisitor {
     }
   }
 
-  void CheckElementwiseWorkspaceWindow(const CallPtr& call, const ExprPtr& operand) {
+  void CheckDenseAlignedWindow(const CallPtr& call, const ExprPtr& operand, const char* role) {
     const auto var = AsVarLike(operand);
     const auto window = windows_.find(var.get());
     const auto type = As<BufferType>(operand->GetType());
@@ -649,11 +655,11 @@ class BufferIRVisitor : public IRVisitor {
     // selectors already have a proved aligned stride from their physical tile.
     if (window == windows_.end() || window->second.row_pitch != pitch ||
         (!window->second.known_offset && view_handles_.count(var.get()))) {
-      Error(call->op_->name_ + " workspace requires proven dense allocation geometry", call->span_);
+      Error(call->op_->name_ + " " + role + " requires proven dense allocation geometry", call->span_);
       return;
     }
     if (!HasAlignedWindowBase(window->second, var)) {
-      Error(call->op_->name_ + " workspace requires a proven 32-byte aligned base", call->span_);
+      Error(call->op_->name_ + " " + role + " requires a proven 32-byte aligned base", call->span_);
     }
   }
 

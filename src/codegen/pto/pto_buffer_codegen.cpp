@@ -504,6 +504,11 @@ class BufferEmissionPreflight : public ir::IRVisitor {
       CHECK_SPAN(conversion_supported_ && function_->func_type_ == ir::FunctionType::AIV, call->span_)
           << "Direct Buffer concat requires the qualified A2/A3 AIV implementation";
     }
+    if (ir::IsOp(call, "buffer.insert") &&
+        As<ir::BufferType>(call->args_[0]->GetType())->memory_space_ == ir::MemorySpace::Vec) {
+      CHECK_SPAN(conversion_supported_ && function_->func_type_ == ir::FunctionType::AIV, call->span_)
+          << "Direct Buffer Vec insertion requires the qualified A2/A3 AIV implementation";
+    }
     CHECK_SPAN(recipe || backend::FindBufferAxisRecipe(call->op_->name_) ||
                    backend::FindBufferConversionRecipe(call->op_->name_) ||
                    backend::FindBufferIndexedRecipe(call->op_->name_) || ir::IsOp(call, "buffer.alloc") ||
@@ -655,7 +660,7 @@ void PTOCodegen::GenerateBufferFunction(const ir::FunctionPtr& func) {
   BufferEmissionPreflight preflight(func, GetBackendHandler()->GetPtoTargetArch() == "a2a3", backend_);
   preflight.VisitFunction(func);
   preflight.CheckReturns();
-  const auto tensor_views = PrepareTensorParameterViews(*func, {});
+  const auto tensor_views = PrepareTensorParameterViews(*func, {}, fs_.gm_pipe_workspace_parameter);
 
   ir::CanonicalSlotCollector canonical_slots;
   canonical_slots.VisitFunction(func);

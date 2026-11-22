@@ -47,6 +47,7 @@
 #include "pypto/ir/transforms/utils/l0c_footprint.h"
 #include "pypto/ir/transforms/utils/loop_step_qualification.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
+#include "pypto/ir/transforms/utils/signature_symbols.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "src/ir/transforms/utils/sync_footprint_resolver.h"
 #include "src/ir/transforms/utils/sync_loop_trip_proof.h"
@@ -302,6 +303,13 @@ class LaneImporter {
         CHECK_SPAN(false, parameter->span_) << "Unqualified peer endpoint parameter type";
       }
     }
+    // A bare symbol in a formal tensor's physical shape has an ABI binding
+    // supplied by the kernel wrapper from Tensor::shapes. Repeated dimensions
+    // bind the same SSA identity. A symbol used only inside a shape expression
+    // may be impossible to reconstruct, so use only direct bindings here.
+    // Readiness supplies neither a numeric bound nor GM disjointness.
+    const auto signature_dims = CollectParamDimSymbols(function->params_);
+    ready_.insert(signature_dims.begin(), signature_dims.end());
   }
 
   PeerLocalLane Run(const std::vector<StmtPtr>& statements) {
@@ -846,7 +854,7 @@ class LaneImporter {
       ImportScalarGmRead(call, result);
       return;
     }
-    footprint_->RequireVecCopyPlacement(operation);
+    footprint_->RequireVecTransferPlacement(operation);
     footprint_->RequireWorkspaceSeparation(operation);
     const auto claims = implementation.Claims();
     if (structured_) {

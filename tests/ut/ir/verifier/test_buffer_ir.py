@@ -705,6 +705,26 @@ def test_elementwise_recipe_accepts_proven_disjoint_allocations(suffix, addresse
     assert _verify(_placed_recipe_program(suffix, *addresses)) == []
 
 
+@pytest.mark.parametrize("destination_address", [32, 256], ids=["overlapping", "disjoint"])
+def test_vec_insert_checks_effective_addresses_of_distinct_roots(destination_address):
+    source_type = ir.BufferType([2, 32], DataType.FP32, ir.MemorySpace.Vec, [2, 27])
+    destination_type = ir.BufferType([4, 32], DataType.FP32, ir.MemorySpace.Vec)
+    source = _var("source", source_type)
+    destination = _var("destination", destination_type)
+    body: list[ir.Stmt] = [
+        ir.AssignStmt(
+            buffer, _call("buffer.alloc", [ir.MakeTuple([], SPAN), _int(address)], buffer.type), SPAN
+        )
+        for buffer, address in [(source, 0), (destination, destination_address)]
+    ]
+    body.append(ir.EvalStmt(_call("buffer.insert", [source, _int(0), _int(0), destination]), SPAN))
+    result = _program(ir.SeqStmts(body, SPAN), func_type=ir.FunctionType.AIV)
+    if destination_address == 32:
+        _assert_error(result, "buffer.insert requires disjoint placed source and destination ranges")
+    else:
+        assert _verify(result) == []
+
+
 def test_constant_scalar_address_definition_is_proved_without_mutating_ir():
     address = _var("address", ir.ScalarType(DataType.INT32))
     expression = ir.Add(

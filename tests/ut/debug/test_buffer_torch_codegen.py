@@ -175,6 +175,46 @@ def test_buffer_storage_views_alias_bytes_and_destination_writes():
     torch.testing.assert_close(output, source * 2)
 
 
+def test_buffer_scalar_read_keeps_its_value_after_an_overwrite():
+    span = ir.Span.unknown()
+    tensor_type = ir.TensorType([2, 8], pl.FP32)
+    buffer_type = ir.BufferType([2, 8], pl.FP32, ir.MemorySpace.Vec)
+    source = ir.Var("source", tensor_type, span)
+    output = ir.Var("output", tensor_type, span)
+    buffer = ir.Var("buffer", buffer_type, span)
+    saved = ir.Var("saved", ir.ScalarType(pl.FP32), span)
+
+    def dims(*values):
+        return ir.MakeTuple([ir.ConstInt(value, pl.INDEX, span) for value in values], span)
+
+    def effect(name, *args):
+        return ir.EvalStmt(ir.Call(ir.get_op(name), list(args), {}, ir.VoidType(), span), span)
+
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(buffer, ir.Call(ir.get_op("buffer.alloc"), [dims()], {}, buffer_type, span), span),
+            effect("buffer.load", source, dims(0, 0), dims(2, 8), buffer),
+            ir.AssignStmt(
+                saved, ir.Call(ir.get_op("buffer.read"), [buffer, dims(0, 1)], {}, saved.type, span), span
+            ),
+            effect("buffer.write", buffer, dims(0, 1), ir.ConstFloat(43.0, pl.FP32, span)),
+            effect("buffer.write", buffer, dims(1, 3), saved),
+            effect("buffer.store", buffer, dims(0, 0), dims(2, 8), output),
+        ],
+        span,
+    )
+    function = ir.Function("kernel", [source, output], [], body, span, ir_stage=ir.FunctionIRStage.Buffer)
+    namespace = {}
+    exec(torch_codegen(function), namespace)  # noqa: S102
+    inputs = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+    actual = torch.empty_like(inputs)
+    namespace["kernel"](inputs, actual)
+    expected = inputs.clone()
+    expected[0, 1] = 43.0
+    expected[1, 3] = inputs[0, 1]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.usefixtures("ascend_backend")
 @pytest.mark.parametrize(
     "valid, count, load_offset, store_offset",

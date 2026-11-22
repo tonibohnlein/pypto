@@ -253,7 +253,13 @@ yield 与结果的 valid 表达式保持相同。变化的有效尺寸通过普�
 选择或携带尺寸，在使用点对规范存储应用 `set_validshape`。标量交换同时生效，
 零次循环保留初始标量状态。DSL 拒绝将 Tile 重赋值为不同 valid-shape 类型；转换
 不创建 Buffer-valued phi，也不导出分支局部视图。窗口 Tile carry、嵌套动态 valid
-窗口及动态 valid 的 relabel/assemble 仍不在默认选择范围内。
+窗口及动态 valid 的 relabel 仍不在默认选择范围内。
+
+A2/A3 的 Vec `assemble` 可以将运行时有效的前缀写入全有效目标。源和目标必须使用连续的块对齐行，
+且存储范围互不重叠。两个偏移均为常量，列偏移须按块对齐，源的完整物理范围必须能放入目标。
+对于 FP16、BF16 和 FP32 源，lowering 可根据标量 SSA 分支 yield 推导至多四种有效矩形。
+每个非空分支使用具有常量有效范围的源视图，并生成 `TINSERT`。块复制和带掩码的尾部复制保留目标中未写入的元素。
+空分支保留目标原值。无法证明的有效范围以及单元素原生标量情形仍使用 Tile IR。
 
 原生标量交换依赖当前固定的 PTOAS 版本保持循环 yield 的并行拷贝（parallel-copy）语义。
 见 [PTOAS #1622](https://github.com/hw-native-sys/PTOAS/issues/1622)。

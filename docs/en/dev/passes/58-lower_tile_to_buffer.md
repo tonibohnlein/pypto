@@ -364,8 +364,18 @@ apply `set_validshape` to canonical storage at the use site. Scalar swaps are
 simultaneous, and zero loop iterations preserve the initial scalar state.
 The DSL rejects reassignment of a Tile to a different valid-shape type; conversion
 does not invent a Buffer-valued phi or export a branch-local view. Window Tile
-carries, nested dynamic-valid windows and dynamic-valid relabels/assemble remain
-outside default selection.
+carries, nested dynamic-valid windows and dynamic-valid relabels remain outside
+default selection.
+
+An A2/A3 Vec `assemble` can insert a runtime-valid prefix into a full-valid target
+when both tiles have dense block-aligned rows and disjoint storage. Both offsets
+are literal and the column offset is block aligned. The full source capacity must
+fit at those offsets. For FP16, BF16, and FP32 sources, lowering can specialize up
+to four valid rectangles inferred from scalar SSA branch yields. Each nonempty
+case uses a source view with literal valid extents and emits `TINSERT`. Its block
+copies and masked tail preserve every untouched destination element. Empty cases
+leave the target intact. Unproved extents and the one-element native scalar case
+retain Tile IR.
 
 Native scalar swaps rely on the pinned PTOAS release to preserve parallel-copy
 semantics for loop yields ([PTOAS #1622](https://github.com/hw-native-sys/PTOAS/issues/1622)). Acceptance checks execute the generated kernels: correct

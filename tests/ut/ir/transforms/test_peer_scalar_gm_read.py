@@ -33,6 +33,7 @@ def _program(
     columns: str = "16",
     fresh_writer: bool = False,
     rank_one_extent: str = "length",
+    rhs_rows: str = "32",
 ) -> ir.Program:
     source = (
         f"pl.Tensor[[16, {columns}], pl.FP32]" if rank_two else f"pl.Tensor[[{rank_one_extent}], pl.INT32]"
@@ -49,11 +50,12 @@ def _program(
     allocation = "scratch = pl.create_tensor([16, 16], dtype=pl.FP32)" if fresh_writer else ""
     return pl.parse_program(f"""
 length = pl.dynamic("length")
+rows = pl.dynamic("rows")
 
 @pl.program
 class PeerScalarRead:
     @pl.function(type=pl.FunctionType.AIC)
-    def cube(self, table: {source}, rhs: pl.Tensor[[32, 16], pl.FP16],
+    def cube(self, table: {source}, rhs: pl.Tensor[[{rhs_rows}, 16], pl.FP16],
              position: pl.Scalar[pl.{position_type}]):
         fifo = pl.reserve_buffer(name="inbox", size=2048, base=0)
         pl.aic_initialize_pipe(pl.const(0, pl.INT32), fifo, dir_mask=2, slot_size=1024, slot_num=2)
@@ -74,14 +76,14 @@ class PeerScalarRead:
         pl.tpush_to_aic(data, split=0){update}
 
     @pl.function(type=pl.FunctionType.Group)
-    def paired(self, table: {source}, rhs: pl.Tensor[[32, 16], pl.FP16],
+    def paired(self, table: {source}, rhs: pl.Tensor[[{rhs_rows}, 16], pl.FP16],
                x: pl.Tensor[[16, 16], pl.FP16], out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
                position: pl.Scalar[pl.{position_type}]):
         self.cube(table, rhs, position)
         self.vector(x, {vector_actual})
 
     @pl.function(type=pl.FunctionType.Orchestration)
-    def main(self, table: {source}, rhs: pl.Tensor[[32, 16], pl.FP16],
+    def main(self, table: {source}, rhs: pl.Tensor[[{rhs_rows}, 16], pl.FP16],
              x: pl.Tensor[[16, 16], pl.FP16], out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
              position: pl.Scalar[pl.{position_type}]):
         {allocation}
@@ -231,7 +233,20 @@ def test_known_external_base_alias_overrides_disjoint_contract():
         assert "aliases a GM write" in endpoint.attrs[AUTOSYNC_FALLBACK_REASON_ATTR]
 
 
-def test_realize_sync_keeps_placed_functional_peer_compatibility():
+@pytest.mark.parametrize(
+    "rhs_rows,rank_one_extent,refusal",
+    [
+        pytest.param("32", "length", None, id="static"),
+        pytest.param("rows", "length", None, id="direct-abi-dimension"),
+        pytest.param("rows", "rows", None, id="shared-abi-dimension"),
+        pytest.param(
+            "rows // 2", "length", "Peer GM tensor shape is unavailable", id="nonreconstructible-dimension"
+        ),
+    ],
+)
+def test_realize_sync_keeps_placed_functional_peer_compatibility(
+    rhs_rows: str, rank_one_extent: str, refusal: str | None
+) -> None:
     placed = []
 
     def capture(transform, current):
@@ -240,11 +255,15 @@ def test_realize_sync_keeps_placed_functional_peer_compatibility():
 
     instrument = passes.CallbackInstrument(before_pass=capture)
     with _context(False, [instrument], enable_buffer_ir=False):
-        PassManager(ir.OptimizationStrategy.Default).run_passes(_program())
+        PassManager(ir.OptimizationStrategy.Default).run_passes(
+            _program(rhs_rows=rhs_rows, rank_one_extent=rank_one_extent)
+        )
     with _context(False):
         owned = passes.realize_sync()(placed[0])
     for name in ("cube", "vector"):
         endpoint = owned.get_function(name)
         assert endpoint is not None
         assert endpoint.ir_stage == ir.FunctionIRStage.Functional
-        assert endpoint.attrs[PYPTO_AUTOSYNC_ATTR], endpoint.attrs
+        assert endpoint.attrs[PYPTO_AUTOSYNC_ATTR] == (refusal is None), endpoint.attrs
+        if refusal is not None:
+            assert refusal in endpoint.attrs[AUTOSYNC_FALLBACK_REASON_ATTR]

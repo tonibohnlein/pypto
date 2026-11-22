@@ -62,6 +62,7 @@
 #include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/buffer_acc_trim_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_indexed_analysis.h"
+#include "pypto/ir/transforms/utils/buffer_insert_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_ir_selection.h"
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_tuple_results.h"
@@ -832,6 +833,7 @@ class TileToBufferMutator : public IRMutator {
         transport_(transport),
         local_acc_trims_(local_acc_trims),
         local_accumulators_(local_accumulators),
+        inserts_(body),
         indexed_(body),
         tuples_(body) {
     canonical_slots_.VisitStmt(body);
@@ -1181,6 +1183,10 @@ class TileToBufferMutator : public IRMutator {
       return SeqStmts::Flatten(states, call->span_);
     }
     if (!guarded_valid_) return WithValidState(call, result, LowerCall(call, result));
+    if (result && core_ == FunctionType::AIV && IsOp(call, "tile.assemble")) {
+      const auto cases = inserts_.Cases(call);
+      if (!cases.empty()) return LowerVecInsert(call, result, cases);
+    }
     const auto result_type = result ? As<TileType>(result->GetType()) : nullptr;
     if (result && IsOp(call, "tile.slice")) {
       window_recipes_[result_type.get()] = call;
@@ -1337,6 +1343,57 @@ class TileToBufferMutator : public IRMutator {
     if (structural_equal(handle->GetType(), descriptor)) return handle;
     return DefineWindow(handle->name_hint_ + "_valid_window", handle, ZeroOffsets(tile->span_), descriptor,
                         Valid(tile), out, tile->span_);
+  }
+
+  StmtPtr LowerVecInsert(const CallPtr& call, const VarPtr& result,
+                         const std::vector<BufferInsertAnalysis::ExtentPair>& cases) {
+    const auto& span = call->span_;
+    std::vector<StmtPtr> out;
+    const auto destination = WindowHandle(result, out);
+    if (Handle(call->args_[0]) != Handle(result)) {
+      const auto target = WindowHandle(call->args_[0], out);
+      out.push_back(Operation("buffer.copy", {target, destination}, span));
+    }
+    const auto source = Handle(call->args_[1]);
+    const auto offsets = Offsets(call->args_[2]);
+    const auto valid = Valid(call->args_[1]);
+    const auto source_type = As<BufferType>(source->GetType());
+    StmtPtr remaining;
+    for (auto entry = cases.rbegin(); entry != cases.rend(); ++entry) {
+      const auto& extents = *entry;
+      if (extents[0] == 0 || extents[1] == 0) {
+        remaining = Empty(span);
+        continue;
+      }
+      std::vector<StmtPtr> body;
+      std::vector<ExprPtr> literals;
+      ExprPtr guard;
+      for (size_t axis = 0; axis < extents.size(); ++axis) {
+        const auto active = valid->elements_[axis];
+        auto constant = std::make_shared<ConstInt>(extents[axis], GetScalarDtype(active), span);
+        literals.push_back(constant);
+        if (remaining && !As<ConstInt>(active)) {
+          const auto equal = MakeEq(active, constant, span);
+          guard = guard ? MakeAnd(guard, equal, span) : equal;
+        }
+      }
+      // The native source's template valid fields must be static. The subview
+      // aliases the full physical pitch while specializing only the prefix.
+      const auto type =
+          std::make_shared<BufferType>(source_type->shape_, source_type->dtype_, source_type->memory_space_,
+                                       std::vector<int64_t>(extents.begin(), extents.end()));
+      const auto active_source =
+          DefineWindow(source->name_hint_ + "_insert_source", source, ZeroOffsets(span), type,
+                       std::make_shared<MakeTuple>(std::move(literals), span), body, span);
+      body.push_back(Operation(
+          "buffer.insert", {active_source, offsets->elements_[0], offsets->elements_[1], destination}, span));
+      StmtPtr block = SeqStmts::Flatten(std::move(body), span);
+      // Every possible extent appears once. The last arm needs no comparison.
+      remaining =
+          guard ? std::make_shared<IfStmt>(guard, block, remaining, std::vector<VarPtr>{}, span) : block;
+    }
+    out.push_back(std::move(remaining));
+    return SeqStmts::Flatten(std::move(out), span);
   }
 
   StmtPtr Operation(const std::string& name, const std::vector<ExprPtr>& args, const Span& span,
@@ -1971,6 +2028,7 @@ class TileToBufferMutator : public IRMutator {
   std::unordered_map<const TileType*, VarPtr> use_windows_;
   std::vector<StmtPtr> use_definitions_;
   const LocalAccumulatorIndex* local_accumulators_;
+  BufferInsertAnalysis inserts_;
   BufferIndexedAnalysis indexed_;
   BufferTupleResults tuples_;
   std::unordered_map<const Stmt*, std::vector<StmtPtr>> local_definitions_;

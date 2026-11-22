@@ -1891,7 +1891,7 @@ class Importer {
       const auto& s = result.storage[sid];
       const auto& t = result.storage[tid];
       if (!extract && implementation.Pipe() == PipeType::V) {
-        resolver->RequireVecCopyPlacement(operation);
+        resolver->RequireVecTransferPlacement(operation);
         const auto type = As<BufferType>(call->args_[0]->GetType());
         if (type->valid_shape_ == type->shape_) {
           whole(0, false);
@@ -1983,7 +1983,7 @@ class Importer {
       const auto& s = result.storage[sid];
       const auto& t = result.storage[tid];
       CHECK(s.space == MemorySpace::Acc && t.space == MemorySpace::Mat)
-          << "Only Acc to Mat FIXPIPE insertion is qualified";
+          << "Exact insertion currently requires Acc to Mat FIXPIPE geometry";
       auto row = Coordinate(call->args_[1], segment);
       auto column = Coordinate(call->args_[2], segment);
       CHECK(row.parameters.empty() && column.parameters.empty() && !row.block && !column.block)

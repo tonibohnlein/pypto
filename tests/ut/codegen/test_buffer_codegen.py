@@ -1187,5 +1187,43 @@ def test_buffer_load_bypass_and_buffer_insert_emit_pto():
     assert "pto.tinsert ins(" in mlir_text
 
 
+@pytest.mark.parametrize(
+    "ascend_backend,func_type",
+    [(BackendType.Ascend950, ir.FunctionType.AIV), (BackendType.Ascend910, ir.FunctionType.AIC)],
+    indirect=["ascend_backend"],
+)
+def test_direct_buffer_vec_insert_rejects_unqualified_target_or_core(ascend_backend, func_type):
+    source_type = ir.BufferType([2, 32], DataType.FP32, ir.MemorySpace.Vec, [2, 27])
+    source, source_alloc = _alloc("source", source_type, address=_int(0))
+    target, target_alloc = _alloc("target", _type((4, 32)), address=_int(256))
+    program = _program(
+        [source_alloc, target_alloc, _eval("buffer.insert", source, _int(1), _int(0), target)],
+        ir_stage=ir.FunctionIRStage.Buffer,
+        func_type=func_type,
+    )
+    with pytest.raises(ValueError, match="Direct Buffer Vec insertion requires the qualified A2/A3 AIV"):
+        _emit(program)
+
+
+@pytest.mark.parametrize("invalid", ["narrow_coordinate", "partial_destination"])
+def test_direct_buffer_vec_insert_rejects_unqualified_geometry(invalid):
+    source_type = ir.BufferType([2, 32], DataType.FP32, ir.MemorySpace.Vec, [2, 27])
+    target_valid = [4, 159] if invalid == "partial_destination" else [4, 160]
+    target_type = ir.BufferType([4, 160], DataType.FP32, ir.MemorySpace.Vec, target_valid)
+    source, source_alloc = _alloc("source", source_type, address=_int(0))
+    target, target_alloc = _alloc("target", target_type, address=_int(256))
+    # 128 elements is block aligned and in bounds. It cannot be represented
+    # by the actual signed i8 instruction operand.
+    column = ir.ConstInt(128, DataType.INT8, SPAN) if invalid == "narrow_coordinate" else _int(128)
+    insert = _eval("buffer.insert", source, _int(0), column, target)
+    program = _program(
+        [source_alloc, target_alloc, insert],
+        ir_stage=ir.FunctionIRStage.Buffer,
+        func_type=ir.FunctionType.AIV,
+    )
+    with pytest.raises(ValueError, match="buffer.insert requires supported static-valid A2/A3 ND Vec"):
+        _emit(program)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

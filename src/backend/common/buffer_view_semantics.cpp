@@ -23,6 +23,7 @@
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/arith/const_fold.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memory_space.h"
@@ -108,6 +109,43 @@ bool SupportsLogicalBufferVecCopy(const ir::CallPtr& call) {
     }
   }
   return true;
+}
+
+bool SupportsA2A3VecInsert(const ir::BufferTypePtr& source, const ir::BufferTypePtr& destination,
+                           const ir::ExprPtr& row, const ir::ExprPtr& column) {
+  constexpr int64_t kBlockBytes = 32;
+  // A2/A3 block DMA uses a 12-bit burst count and 16-bit lengths/gaps.
+  // The unaligned tail uses vector repeat strides measured in 32-byte blocks.
+  constexpr int64_t kMaxBurstCount = 4095;
+  constexpr int64_t kMaxRepeatStride = 255;
+  constexpr int64_t kMaxU16 = std::numeric_limits<uint16_t>::max();
+  const auto src_bytes = DenseBufferBytes(source);
+  if (!src_bytes || !DenseBufferBytes(destination) || source->memory_space_ != ir::MemorySpace::Vec ||
+      destination->memory_space_ != ir::MemorySpace::Vec || source->shape_.size() != 2 ||
+      destination->shape_.size() != 2 || source->dtype_ != destination->dtype_ ||
+      destination->valid_shape_ != destination->shape_) {
+    return false;
+  }
+  const auto dtype = source->dtype_;
+  if (dtype != DataType::FP16 && dtype != DataType::BF16 && dtype != DataType::FP32) {
+    return false;
+  }
+  const auto per_block = kBlockBytes / dtype.GetByte();
+  const auto row_offset = ir::As<ir::ConstInt>(row);
+  const auto col_offset = ir::As<ir::ConstInt>(column);
+  return row_offset && col_offset && row_offset->value_ >= 0 && col_offset->value_ >= 0 &&
+         ir::arith::detail::ConstIntFitsDtype(row_offset->value_, row_offset->dtype()) &&
+         ir::arith::detail::ConstIntFitsDtype(col_offset->value_, col_offset->dtype()) &&
+         row_offset->value_ <= kMaxU16 && col_offset->value_ <= kMaxU16 &&
+         row_offset->value_ <= destination->shape_[0] - source->shape_[0] &&
+         col_offset->value_ <= destination->shape_[1] - source->shape_[1] &&
+         col_offset->value_ % per_block == 0 && source->shape_[1] % per_block == 0 &&
+         destination->shape_[1] % per_block == 0 && source->shape_[0] <= kMaxBurstCount &&
+         destination->shape_[0] <= kMaxU16 && source->shape_[1] <= kMaxRepeatStride * per_block &&
+         destination->shape_[1] <= kMaxRepeatStride * per_block && *src_bytes / kBlockBytes <= kMaxU16 &&
+         source->valid_shape_[0] > 0 && source->valid_shape_[0] <= source->shape_[0] &&
+         source->valid_shape_[1] > 0 && source->valid_shape_[1] <= source->shape_[1] &&
+         (source->valid_shape_[0] != 1 || source->valid_shape_[1] != 1);
 }
 
 std::optional<PeerTransferBuffer> DescribePeerTransferBuffer(const ir::TileTypePtr& tile) {

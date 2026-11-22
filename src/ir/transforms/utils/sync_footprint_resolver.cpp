@@ -117,6 +117,9 @@ bool IsFullOverwriteOpOperand(const CallPtr& call, BufferAccess mode, MemorySpac
     const auto buf = As<BufferType>(operand->GetType());
     return buf && buf->shape_.size() >= 2;
   }
+  // A Vec insertion writes only the source prefix at the requested offset.
+  // Its conservative footprint covers the destination without killing it.
+  if (name == "buffer.insert" && space == MemorySpace::Vec) return false;
   if (name == "buffer.copy" || name == "buffer.extract" || name == "buffer.insert" ||
       name == "buffer.matmul") {
     return mode == BufferAccess::Write;
@@ -397,10 +400,12 @@ void SyncFootprintResolver::RequireWorkspaceSeparation(const backend::BufferSync
                                                 [this](const ExprPtr& value) { return ByteHull(value); });
 }
 
-void SyncFootprintResolver::RequireVecCopyPlacement(const backend::BufferSyncOperation& operation) const {
+void SyncFootprintResolver::RequireVecTransferPlacement(const backend::BufferSyncOperation& operation) const {
   const auto& call = operation.Operation();
-  if (!IsOp(call, "buffer.copy") || operation.Implementation().Pipe() != PipeType::V) return;
+  const bool insert = IsOp(call, "buffer.insert");
+  if ((!insert && !IsOp(call, "buffer.copy")) || operation.Implementation().Pipe() != PipeType::V) return;
   constexpr int64_t kBlockBytes = 32;
+  const char* name = insert ? "Vec insertion" : "Vec copy";
   const auto full_window = [&](const ExprPtr& operand) {
     const auto type = As<BufferType>(operand->GetType());
     const auto* view = ViewOf(operand);
@@ -409,20 +414,31 @@ void SyncFootprintResolver::RequireVecCopyPlacement(const backend::BufferSyncOpe
     // but does not certify a whole-window overwrite.
     const bool row_prefix =
         backend::IsMinimumPaddedVecRowGeometry(type) || backend::IsColumnVectorBufferGeometry(type);
-    const auto window = row_prefix && view && view->kind == SyncViewKind::PlacedLocal && !view->peer_borrow
-                            ? view->byte_hull
-                            : ExactFullWindow(operand);
+    auto window = row_prefix && view && view->kind == SyncViewKind::PlacedLocal && !view->peer_borrow
+                      ? view->byte_hull
+                      : ExactFullWindow(operand);
+    if (insert) {
+      // TINSERT consumes a partial-valid source but requires the same fixed
+      // dense physical pitch. Native placement does not certify a full write.
+      window.reset();
+      const int64_t width = type->shape_[1] * type->dtype_.GetByte();
+      if (view && !view->peer_borrow && view->byte_hull && view->vec_lattice &&
+          view->vec_lattice->base == view->byte_hull->begin && view->vec_lattice->pitch == width &&
+          view->vec_lattice->width == width && view->vec_lattice->rows == type->shape_[0]) {
+        window = view->byte_hull;
+      }
+    }
     const auto bytes = backend::PhysicalBufferBytes(type);
     CHECK_SPAN(window && bytes && window->begin % kBlockBytes == 0 &&
                    __int128(window->end) - window->begin == *bytes,
                call->span_)
-        << "Vec copy needs an aligned, static contiguous placed byte window for each operand";
+        << name << " needs an aligned, static contiguous placed byte window for each operand";
     return *window;
   };
   const auto source = full_window(call->args_[0]);
-  const auto destination = full_window(call->args_[1]);
+  const auto destination = full_window(call->args_[insert ? 3 : 1]);
   CHECK_SPAN(source.end <= destination.begin || destination.end <= source.begin, call->span_)
-      << "Vec copy requires physically disjoint source and destination windows";
+      << name << " requires physically disjoint source and destination windows";
 }
 
 void SyncFootprintResolver::PrescanDynamicValidTargets(const StmtPtr& stmt) {

@@ -1561,6 +1561,10 @@ def _register_ops() -> None:  # noqa: PLR0915
     # --- Default Buffer rollout: explicit destination writes ---
     m["buffer.load"] = lambda a, _kw: f"_buffer_load({', '.join(a)})"
     m["buffer.store"] = lambda a, kw: f"_buffer_store({', '.join(a)}, atomic={int(kw.get('atomic', 0))})"
+    # Scalar access is Vec-only. Indexing returns a view in Torch, so a read
+    # needs a snapshot that survives later writes to the same storage.
+    m["buffer.read"] = lambda a, _kw: f"_buffer_active({a[0]})[{a[1]}].clone()"
+    m["buffer.write"] = lambda a, _kw: f"_write_and_return(_buffer_active({a[0]}), {a[1]}, {a[2]})"
     m["buffer.set_validshape"] = lambda a, _kw: f"_buffer_set_valid({a[0]}, {a[1]})"
     m["buffer.copy"] = lambda a, _kw: f"_buffer_copy({', '.join(a)})"
     m["buffer.extract"] = lambda a, _kw: f"_buffer_extract({', '.join(a)})"
@@ -1894,7 +1898,13 @@ class TorchCodegen(_ir.IRVisitor):
         """Emit an indented suite, including pass when its IR emits no statements."""
         self._indent += 1
         start = len(self._lines)
-        self.visit_stmt(stmt)
+        # A bare nested branch can re-enter the Python IF callback while the
+        # C++ trampoline is already dispatching it. Call it directly so its
+        # condition and both suites survive, including an empty final else.
+        if isinstance(stmt, _ir.IfStmt):
+            self.visit_if_stmt(stmt)
+        else:
+            self.visit_stmt(stmt)
         if len(self._lines) == start:
             self._emit("pass")
         self._indent -= 1

@@ -1451,7 +1451,7 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper
     support.admission.Require(slots.unsupported_bases.empty(), BufferAdmissionProperty::CanonicalSlots);
   }
   if (support.admission.supported()) {
-    const BufferValidAnalysis valid(function->body_, &acc_trims);
+    const BufferValidAnalysis valid(function->body_, &acc_trims, function->func_type_ == FunctionType::AIV);
     auto valid_context = support.admission.At(valid.first_obligation()
                                                   ? static_cast<const IRNode*>(valid.first_obligation().get())
                                                   : function.get());

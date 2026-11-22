@@ -209,7 +209,7 @@ class SyncFootprintResolver {
 
   std::optional<backend::BufferSyncByteWindow> ByteHull(const ExprPtr& expr) const;
   std::optional<backend::BufferSyncByteWindow> ExactFullWindow(const ExprPtr& expr) const;
-  void RequireVecCopyPlacement(const backend::BufferSyncOperation& operation) const;
+  void RequireVecTransferPlacement(const backend::BufferSyncOperation& operation) const;
   void RequireWorkspaceSeparation(const backend::BufferSyncOperation& operation) const;
 
   ResolvedOperandFootprint ResolveOperand(const Stmt* cut, const CallPtr& call, size_t arg_idx,

@@ -171,11 +171,19 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
   } else if (IsOp(call, "buffer.insert")) {
     const auto source = As<BufferType>(call->args_[0]->GetType());
     const auto destination = As<BufferType>(call->args_[3]->GetType());
-    CHECK(source && destination && source->memory_space_ == MemorySpace::Acc &&
-          destination->memory_space_ == MemorySpace::Mat)
-        << "Only Acc to Mat FIXPIPE insertion is qualified";
-    result.pipe_ = PipeType::FIX;
-    result.acc_to_mat_insert_ = true;
+    if (source && source->memory_space_ == MemorySpace::Vec) {
+      CHECK(core == FunctionType::AIV && target == "a2a3" &&
+            SupportsA2A3VecInsert(source, destination, call->args_[1], call->args_[2]))
+          << "Vec insertion requires qualified A2/A3 AIV ND geometry";
+      // ND TINSERT uses PIPE_V block copies and a masked PIPE_V tail.
+      result.pipe_ = PipeType::V;
+    } else {
+      CHECK(source && destination && source->memory_space_ == MemorySpace::Acc &&
+            destination->memory_space_ == MemorySpace::Mat)
+          << "Only static ND Vec and Acc to Mat FIXPIPE insertions are qualified";
+      result.pipe_ = PipeType::FIX;
+      result.acc_to_mat_insert_ = true;
+    }
   } else if (IsOp(call, "buffer.matmul") || IsOp(call, "buffer.matmul_acc")) {
     result.pipe_ = PipeType::M;
     const auto lhs = As<BufferType>(call->args_[0]->GetType());

@@ -372,6 +372,77 @@ def test_identity_slice_preserves_the_window_recipe_for_runtime_validity(tmp_pat
     _compile(tmp_path, result, ascend_backend, addressed=True)
 
 
+def test_default_runtime_vec_insert_specializes_prefix_without_overwriting_tail(tmp_path, ascend_backend):
+    @pl.program
+    class RuntimeVecInsert:
+        @pl.function(type=pl.FunctionType.AIV)
+        def kernel(
+            self,
+            source: pl.Tensor[[2, 512], pl.FP32],
+            mode: pl.Scalar[pl.INDEX],
+            output: pl.Out[pl.Tensor[[4, 512], pl.FP32]],
+        ) -> pl.Tensor[[4, 512], pl.FP32]:
+            loaded = pl.load(source, [0, 0], [2, 512])
+            if mode == 0:
+                cols = 0
+            elif mode == 1:
+                cols = 389
+            else:
+                cols = 512
+            prefix = pl.tile.set_validshape(loaded, 2, cols)
+            canvas = pl.tile.full([4, 512], dtype=pl.FP32, value=-777.0)
+            inserted = pl.tile.assemble(canvas, prefix, [1, 0])
+            return pl.store(inserted, [0, 0], output)
+
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
+        result = PassManager(OptimizationStrategy.Default).run_passes(RuntimeVecInsert)
+    kernel = result.get_function("kernel")
+    assert kernel is not None and kernel.ir_stage == ir.FunctionIRStage.Buffer
+    result = _verify_round_trip(result)
+    inserts = _calls(result, "buffer.insert")
+    # The native implementation receives literal active widths. 389 columns
+    # require block copies and a masked tail, and the empty branch has no insert.
+    for call, width in zip(inserts, (389, 512), strict=True):
+        source_type = call.args[0].type
+        assert isinstance(source_type, ir.BufferType) and list(source_type.valid_shape) == [2, width]
+        row, column = call.args[1:3]
+        assert isinstance(row, ir.ConstInt) and row.value == 1
+        assert isinstance(column, ir.ConstInt) and column.value == 0
+    source = torch.arange(1024, dtype=torch.float32).reshape(2, 512)
+    namespace = {}
+    exec(torch_codegen(result), namespace)  # noqa: S102
+    for mode, cols in enumerate((0, 389, 512)):
+        output = torch.zeros((4, 512))
+        expect = torch.full_like(output, -777.0)
+        expect[1:3, :cols] = source[:, :cols]
+        namespace["kernel"](source, mode, output)
+        torch.testing.assert_close(output, expect, rtol=0, atol=0)
+    native = _compile(tmp_path, result, ascend_backend, addressed=True)
+    assert native.count("pto.tinsert ins(") == 2
+
+
+def test_default_vec_insert_requires_proved_finite_runtime_validity():
+    @pl.program
+    class UnprovedVecInsert:
+        @pl.function(type=pl.FunctionType.AIV)
+        def kernel(
+            self,
+            source: pl.Tensor[[2, 16], pl.FP32],
+            cols: pl.Scalar[pl.INDEX],
+            output: pl.Out[pl.Tensor[[4, 16], pl.FP32]],
+        ) -> pl.Tensor[[4, 16], pl.FP32]:
+            loaded = pl.load(source, [0, 0], [2, 16])
+            prefix = pl.tile.set_validshape(loaded, 2, cols)
+            canvas = pl.tile.full([4, 16], dtype=pl.FP32, value=-777.0)
+            inserted = pl.tile.assemble(canvas, prefix, [1, 0])
+            return pl.store(inserted, [0, 0], output)
+
+    result = PassManager(OptimizationStrategy.Default).run_passes(UnprovedVecInsert)
+    kernel = result.get_function("kernel")
+    assert kernel is not None and kernel.ir_stage == ir.FunctionIRStage.Functional
+    assert kernel.attrs["buffer_admission_operation"] == "tile.assemble"
+
+
 @pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910, BackendType.Ascend950], indirect=True)
 @pytest.mark.parametrize("planner", _PLANNERS)
 def test_slice_and_assemble_become_use_site_windows(

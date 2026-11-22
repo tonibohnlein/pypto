@@ -3127,7 +3127,7 @@ class Builder {
       return;
     }
     auto operation = backend::QualifyBufferSyncOperation(call, function_->func_type_, target_);
-    resolver_.RequireVecCopyPlacement(operation);
+    resolver_.RequireVecTransferPlacement(operation);
     resolver_.RequireWorkspaceSeparation(operation);
     const bool ready_result = operation.Implementation().ProducesReadyScalar();
     CHECK_SPAN((!result && operation.Result().behavior == BufferResultBehavior::None) ||

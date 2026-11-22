@@ -33,6 +33,11 @@ std::optional<uint64_t> PhysicalBufferBytes(const ir::BufferTypePtr& type);
 bool SupportsA2A3VecCopyDescriptor(const ir::BufferTypePtr& type);
 bool SupportsLogicalBufferVecCopy(const ir::CallPtr& call);
 
+/// Static native ND Vec insertion. Both widths are physically block aligned;
+/// valid columns may end within a block and use the native masked tail.
+bool SupportsA2A3VecInsert(const ir::BufferTypePtr& source, const ir::BufferTypePtr& destination,
+                           const ir::ExprPtr& row, const ir::ExprPtr& column);
+
 /// Address-independent geometry at a native TPUSH/TPOP site. The caller binds
 /// a receive to its reserved ring; a pop does not allocate another local tile.
 /// capacity_bytes is the full box, including inactive rows/columns. It bounds
