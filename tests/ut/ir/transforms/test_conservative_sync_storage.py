@@ -19,6 +19,7 @@ from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 from .sync_closed_command_oracle import ClosedCommands, check_closed_commands, opname
 from .sync_logical_oracle import value
+from .sync_matmul_oracle import hardware_reference
 from .sync_physical_oracle import checked_payload_calls
 from .test_closed_prefix_sync import lower
 from .test_conservative_sync_dataflow import conservative_fixture
@@ -451,12 +452,30 @@ class StoreBeforeScalarWrite:
     assert (ir.PipeType.MTE3 in write["required_source_pipes"]) == (view != "disjoint")
 
 
-@pytest.mark.parametrize(("rows", "shared_elements"), [(32, 512), (64, 256), (96, 0)])
-def test_affine_matrix_slices_depend_on_the_native_layout(rows: int, shared_elements: int) -> None:
+@pytest.mark.parametrize(
+    ("rows", "trips", "reverse", "shared_elements"),
+    [
+        (32, 2, False, 512),
+        (48, 2, False, 0),
+        (64, 2, False, 256),
+        (80, 2, False, 0),
+        (96, 2, False, 0),
+        (48, 2, True, 0),
+        (192, 8, False, 0),
+        (208, 9, False, 0),
+    ],
+)
+def test_affine_matrix_slices_depend_on_the_native_layout(
+    rows: int, trips: int, reverse: bool, shared_elements: int
+) -> None:
     # Memory reuse places source and replacement at the same Mat address. A
     # 64-row NZ tile's bottom rows share a fractal with the 32-row tile's top
     # rows because their column-block strides differ. Row indices alone would
     # declare those accesses disjoint and let FIX overwrite an active MTE1 read.
+    height = trips * 16
+    # Reverse the direction and use a nonzero loop origin in the control.
+    start = 3 if reverse else 0
+    row = f"16 * ({start + trips - 1} - i)" if reverse else "16 * i"
     program = pl.parse_program(f"""
 @pl.program
 class MatrixFiberReuse:
@@ -464,21 +483,21 @@ class MatrixFiberReuse:
     def kernel(self, a: pl.Tensor[[{rows}, 32], pl.FP16],
                seed_a: pl.Tensor[[16, 32], pl.FP16],
                seed_b: pl.Tensor[[32, 32], pl.FP16],
-               out: pl.Out[pl.Tensor[[32, 16], pl.FP32]]) -> pl.Tensor[[32, 16], pl.FP32]:
+               out: pl.Out[pl.Tensor[[{height}, 16], pl.FP32]]) -> pl.Tensor[[{height}, 16], pl.FP32]:
         seed_l1 = pl.tile.load(seed_a, [0, 0], [16, 32], target_memory=pl.Mem.Mat)
         seed_r1 = pl.tile.load(seed_b, [0, 0], [32, 32], target_memory=pl.Mem.Mat)
         seed_l0 = pl.tile.move(seed_l1, target_memory=pl.Mem.Left)
         seed_r0 = pl.tile.move(seed_r1, target_memory=pl.Mem.Right)
         seed = pl.tile.matmul(seed_l0, seed_r0)
-        for i in pl.range(2):
+        for i in pl.range({start}, {start + trips}):
             source = pl.tile.load(a, [0, 0], [{rows}, 32], target_memory=pl.Mem.Mat)
-            left = pl.tile.extract(source, {rows - 32} + 16 * i, 0, [16, 32], target_memory=pl.Mem.Left)
-            replacement = pl.tile.create([32, 32], pl.FP16, target_memory=pl.Mem.Mat)
-            replacement = pl.tile.assemble(replacement, seed, [16 * i, 0])
+            left = pl.tile.extract(source, {rows - height} + {row}, 0, [16, 32], target_memory=pl.Mem.Left)
+            replacement = pl.tile.create([{height}, 32], pl.FP16, target_memory=pl.Mem.Mat)
+            replacement = pl.tile.assemble(replacement, seed, [{row}, 0])
             transposed = pl.tile.transpose_view(replacement)
-            right = pl.tile.extract(transposed, 0, 16 * i, [32, 16], target_memory=pl.Mem.Right)
+            right = pl.tile.extract(transposed, 0, {row}, [32, 16], target_memory=pl.Mem.Right)
             result = pl.tile.matmul(left, right)
-            out = pl.tile.store(result, [16 * i, 0], out)
+            out = pl.tile.store(result, [{row}, 0], out)
         return out
 """)
     placed = []
@@ -523,18 +542,18 @@ class MatrixFiberReuse:
         assert read[2] == ir.PipeType.MTE1 and write[2] == ir.PipeType.FIX
         shared = {address for space, address in read[3] & write[4] if space == ir.MemorySpace.Mat}
         assert len(shared) == shared_elements
-        assert ((("payload", index, "C"), ("payload", index + 1, "I")) in order) == bool(shared)
+        edge = (("payload", index, "C"), ("payload", index + 1, "I"))
+        if shared or trips <= 8:
+            assert (edge in order) == bool(shared)
         checked += 1
-    assert checked == 2
-    # Refinement can only remove order for disjoint effects. Check Mat hazards
-    # across both visits, including reuse by the next visit's full load.
-    for index, (_, _, pipe, reads, writes) in enumerate(calls):
-        for earlier, (_, _, old_pipe, old_reads, old_writes) in enumerate(calls[:index]):
-            if old_pipe == pipe:
-                continue
-            overlap = (old_writes & (reads | writes)) | (old_reads & writes)
-            if any(space == ir.MemorySpace.Mat for space, _ in overlap):
-                assert (("payload", earlier, "C"), ("payload", index, "I")) in order
+    assert checked == trips
+    # Check every required completion-to-issue edge from the original payload
+    # geometry, including prior visits and accesses outside Mat. The command
+    # interpreter separately checks flag closure and consumption before reuse.
+    required = hardware_reference(original, calls)[2]
+    for (producer, completed), (consumer, issued_as_completion) in required:
+        if completed and not issued_as_completion:
+            assert (("payload", producer, "C"), ("payload", consumer, "I")) in order
 
     if rows == 96:
         summary = testing.analyze_conservative_sync(original)

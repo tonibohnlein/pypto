@@ -315,6 +315,51 @@ std::optional<std::vector<backend::BufferSyncByteWindow>> TryMatrixByteWindows(
   return windows;
 }
 
+MatrixVisitFootprint::Mask MatrixVisitFootprint::VisitsOverlapping(
+    const backend::BufferSyncByteWindow& atom) const {
+  Mask mask = 0;
+  for (size_t i = 0; i < visits.size(); ++i) {
+    const auto& runs = visits[i];
+    const auto first = std::lower_bound(runs.begin(), runs.end(), atom.begin,
+                                        [](const auto& run, int64_t begin) { return run.end <= begin; });
+    if (first != runs.end() && first->begin < atom.end) mask |= Mask{1} << i;
+  }
+  return mask;
+}
+
+std::optional<MatrixVisitFootprint> TryMatrixVisitFootprint(const SyncCanonicalRoot& root,
+                                                            const MatrixBoxFootprint& box,
+                                                            const MatrixSubtileFootprint& subtile) {
+  if (subtile.rows <= 0 || subtile.columns <= 0) return std::nullopt;
+  const auto* frame = subtile.row.affine_frame ? subtile.row.affine_frame : subtile.col.affine_frame;
+  const auto loop = LiteralIndexLoop::From(frame, std::numeric_limits<MatrixVisitFootprint::Mask>::digits);
+  if (!loop) return std::nullopt;
+
+  const auto coordinate = [&](const SymbolicIntRange& axis, int64_t visit) -> std::optional<int64_t> {
+    if (axis.is_const()) return axis.lo;
+    if (axis.affine_frame != frame || axis.modulus || axis.symbolic_base) return std::nullopt;
+    const __int128 value = __int128(axis.affine_base) + __int128(axis.affine_coeff) * visit;
+    if (value < axis.lo || value > axis.hi) return std::nullopt;
+    return static_cast<int64_t>(value);
+  };
+  MatrixVisitFootprint result{frame, {}};
+  for (int64_t i = 0; i < loop->count; ++i) {
+    const auto row = coordinate(subtile.row, i), col = coordinate(subtile.col, i);
+    if (!row || !col || *row < box.row_begin || __int128(*row) + subtile.rows > box.row_end ||
+        *col < box.col_begin || __int128(*col) + subtile.columns > box.col_end)
+      return std::nullopt;
+    auto occurrence = box;
+    occurrence.row_begin = *row;
+    occurrence.row_end = *row + subtile.rows;
+    occurrence.col_begin = *col;
+    occurrence.col_end = *col + subtile.columns;
+    auto runs = TryMatrixByteWindows(root, occurrence);
+    if (!runs) return std::nullopt;
+    result.visits.push_back(std::move(*runs));
+  }
+  return result;
+}
+
 void CanonicalizeMatrixSyncStorage(CompactSyncInput& input) {
   std::vector<StorageMapping> mapping(input.storage.size());
   auto groups = FindOverlaps(input.storage, mapping);

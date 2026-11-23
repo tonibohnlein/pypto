@@ -1454,6 +1454,29 @@ class SyncControlRangeProver::Impl {
   }
 };
 
+std::optional<LiteralIndexLoop> LiteralIndexLoop::From(const ForStmt* loop, int64_t max_visits) {
+  if (!loop || loop->kind_ != ForKind::Sequential) return std::nullopt;
+  const auto start = As<ConstInt>(loop->start_), stop = As<ConstInt>(loop->stop_),
+             step = As<ConstInt>(loop->step_);
+  const auto type = As<ScalarType>(loop->loop_var_->GetType());
+  if (!start || !stop || !step || !type || type->dtype_ != DataType::INDEX ||
+      start->dtype() != DataType::INDEX || stop->dtype() != DataType::INDEX ||
+      step->dtype() != DataType::INDEX || start->value_ >= stop->value_ || step->value_ <= 0) {
+    return std::nullopt;
+  }
+  const auto count = (__int128(stop->value_) - start->value_ + step->value_ - 1) / step->value_;
+  if (count > max_visits ||
+      __int128(start->value_) + count * step->value_ > std::numeric_limits<int64_t>::max()) {
+    return std::nullopt;
+  }
+  return LiteralIndexLoop{start->value_, step->value_, static_cast<int64_t>(count)};
+}
+
+ExprPtr LiteralIndexLoop::At(int64_t ordinal, const Span& span) const {
+  return std::make_shared<ConstInt>(static_cast<int64_t>(__int128(start) + __int128(ordinal) * step),
+                                    DataType::INDEX, span);
+}
+
 SyncControlRangeProver::SyncControlRangeProver(const FunctionPtr& function,
                                                const SyncParameterBounds& parameters,
                                                const std::optional<std::pair<int64_t, int64_t>>& blocks,

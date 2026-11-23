@@ -280,8 +280,12 @@ When qualified placed Mat descriptors overlap across different layouts or
 extents, conservative dataflow splits the region at physical byte boundaries.
 A full-tile load participates in every region it covers. An extract and an
 insert can overlap in time when their possible byte sets are disjoint, even
-when a full load spans both sets. The regions track possible reads and writes
-across all visits. They retain prior history through moving and partial writes.
+when a full load spans both sets. For affine subtiles in a constant sequential loop of up to
+eight visits, each physical region can also carry the visits on which an operand
+touches it. The backedge advances pending reads and writes by one visit. The
+loop exit retains their possible bytes for later consumers. Longer loops and
+unknown coordinates use the region spanning all visits. A possible touch
+never establishes a full overwrite.
 Clusters with unsupported layouts or too many physical byte runs use the
 coarser enclosure.
 

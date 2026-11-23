@@ -12,6 +12,7 @@
 #ifndef SRC_IR_TRANSFORMS_UTILS_SYNC_MATRIX_BYTE_GEOMETRY_H_
 #define SRC_IR_TRANSFORMS_UTILS_SYNC_MATRIX_BYTE_GEOMETRY_H_
 
+#include <cstdint>
 #include <optional>
 #include <vector>
 
@@ -21,6 +22,7 @@
 
 namespace pypto::ir::sync {
 struct MatrixBoxFootprint;
+struct MatrixSubtileFootprint;
 struct SyncCanonicalRoot;
 
 bool IsSyncMatrixSpace(MemorySpace space);
@@ -29,6 +31,18 @@ bool IsSyncMatrixSpace(MemorySpace space);
 // An unsupported layout, extent, or run count has no qualified projection.
 std::optional<std::vector<backend::BufferSyncByteWindow>> TryMatrixByteWindows(const SyncCanonicalRoot& root,
                                                                                const MatrixBoxFootprint& box);
+
+// Physical may-touch windows indexed by normalized loop visit. Each bit in a
+// byte atom's mask denotes a visit on which the operation may touch that atom.
+struct MatrixVisitFootprint {
+  using Mask = uint8_t;
+  const ForStmt* frame;
+  std::vector<std::vector<backend::BufferSyncByteWindow>> visits;
+  Mask VisitsOverlapping(const backend::BufferSyncByteWindow& atom) const;
+};
+std::optional<MatrixVisitFootprint> TryMatrixVisitFootprint(const SyncCanonicalRoot& root,
+                                                            const MatrixBoxFootprint& box,
+                                                            const MatrixSubtileFootprint& subtile);
 
 // Change only overlapping placed matrix domains. Original rectangles must have
 // been qualified against their own layouts; an unsupported component refuses

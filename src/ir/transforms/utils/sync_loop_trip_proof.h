@@ -27,6 +27,14 @@
 
 namespace pypto::ir::sync {
 
+// Positive-step sequential INDEX loop with literal bounds and a representable
+// final increment. Clients supply their own bound on enumerated visits.
+struct LiteralIndexLoop {
+  int64_t start, step, count;
+  static std::optional<LiteralIndexLoop> From(const ForStmt* loop, int64_t max_visits);
+  ExprPtr At(int64_t ordinal, const Span& span) const;
+};
+
 // Symbolic integer range + optional affine/modular decomposition wrt one enclosing
 // sequential ForStmt `affine_frame`.
 struct SymbolicIntRange {

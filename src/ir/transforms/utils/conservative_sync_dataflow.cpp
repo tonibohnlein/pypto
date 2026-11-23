@@ -75,17 +75,24 @@ struct RawEffect {
   std::optional<StridedByteFootprint> vec_lattice;
   std::optional<MatrixBoxFootprint> matrix_box;
   IterationFiber fiber;
+  std::shared_ptr<const MatrixSubtileFootprint> matrix_subtile;
 };
 
 class StorageClasses {
   using Member = std::pair<size_t, size_t>;
 
-  struct EffectDomains {
-    size_t single = 0;
-    std::vector<size_t> atoms;
+  struct DomainAccess {
+    size_t domain = 0;
+    const ForStmt* frame = nullptr;
+    MatrixVisitFootprint::Mask visits = 0;
+  };
 
-    const size_t* begin() const { return atoms.empty() ? &single : atoms.data(); }
-    const size_t* end() const { return begin() + (atoms.empty() ? 1 : atoms.size()); }
+  struct EffectDomains {
+    DomainAccess single;
+    std::vector<DomainAccess> atoms;
+
+    const DomainAccess* begin() const { return atoms.empty() ? &single : atoms.data(); }
+    const DomainAccess* end() const { return begin() + (atoms.empty() ? 1 : atoms.size()); }
   };
 
   // Bound both geometry and emitted access facts for an entire byte cluster,
@@ -97,7 +104,6 @@ class StorageClasses {
                           const std::vector<MatrixBoxFootprint>& boxes,
                           const std::vector<std::vector<RawEffect>>& sites,
                           const std::vector<SyncCanonicalRoot>& roots) {
-    using Window = backend::BufferSyncByteWindow;
     std::vector<std::vector<Window>> windows;
     std::vector<int64_t> boundaries;
     for (const auto& box : boxes) {
@@ -114,13 +120,56 @@ class StorageClasses {
       }
       windows.push_back(std::move(*runs));
     }
+    // Keep the static catalog as a fallback if extra visit boundaries exceed
+    // either budget. AssignMatrixAtoms publishes only after every check passes.
+    std::vector<int64_t> visit_boundaries;
+    auto visits = CollectVisitFootprints(members, sites, roots, visit_boundaries);
+    if (!visits.empty()) {
+      visit_boundaries.insert(visit_boundaries.end(), boundaries.begin(), boundaries.end());
+      if (AssignMatrixAtoms(members, member_gid, sites, windows, visit_boundaries, visits)) return true;
+    }
+    return AssignMatrixAtoms(members, member_gid, sites, windows, boundaries, {});
+  }
+
+  using Window = backend::BufferSyncByteWindow;
+  using VisitFootprints = std::map<size_t, MatrixVisitFootprint>;
+
+  static VisitFootprints CollectVisitFootprints(const std::vector<Member>& members,
+                                                const std::vector<std::vector<RawEffect>>& sites,
+                                                const std::vector<SyncCanonicalRoot>& roots,
+                                                std::vector<int64_t>& boundaries) {
+    VisitFootprints visits;
+    if (members.size() > kMaxMatrixClusterMemberships) return visits;
+    for (size_t i = 0; i < members.size(); ++i) {
+      const auto [site, operand] = members[i];
+      const auto& effect = sites[site][operand];
+      if (!effect.matrix_subtile) continue;
+      const auto& box = *effect.matrix_box;
+      auto projection = TryMatrixVisitFootprint(roots[box.root_id - 1], box, *effect.matrix_subtile);
+      if (!projection) continue;
+      for (const auto& runs : projection->visits) {
+        if (runs.size() > kMaxMatrixClusterRuns - boundaries.size() / 2) return {};
+        for (const auto& run : runs) {
+          boundaries.push_back(run.begin);
+          boundaries.push_back(run.end);
+        }
+      }
+      visits.emplace(i, std::move(*projection));
+    }
+    return visits;
+  }
+
+  bool AssignMatrixAtoms(const std::vector<Member>& members, const std::vector<size_t>& member_gid,
+                         const std::vector<std::vector<RawEffect>>& sites,
+                         const std::vector<std::vector<Window>>& windows, std::vector<int64_t>& boundaries,
+                         const VisitFootprints& visits) {
     std::sort(boundaries.begin(), boundaries.end());
     boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
 
     // Adjacent endpoints bound atoms that are covered by precisely the same
     // may effects. A full-tile access joins every atom it covers without
     // merging otherwise disjoint partial accesses into one history.
-    std::vector<std::vector<size_t>> atom_indices(boxes.size());
+    std::vector<std::vector<size_t>> atom_indices(windows.size());
     std::vector<bool> occupied(boundaries.size() - 1, false);
     for (size_t box = 0; box < windows.size(); ++box) {
       for (const auto& run : windows[box]) {
@@ -133,8 +182,8 @@ class StorageClasses {
         }
       }
     }
-    if (std::all_of(atom_indices.begin(), atom_indices.end(),
-                    [&](const auto& atoms) { return atoms == atom_indices.front(); })) {
+    if (visits.empty() && std::all_of(atom_indices.begin(), atom_indices.end(),
+                                      [&](const auto& atoms) { return atoms == atom_indices.front(); })) {
       // Identical coverage offers no separation. Preserve the original
       // catalog and its possible loop refinements in this case.
       return false;
@@ -166,8 +215,15 @@ class StorageClasses {
     for (size_t i = 0; i < members.size(); ++i) {
       const auto [si, ei] = members[i];
       auto& assigned = effect_domains_[si][ei].atoms;
+      const auto projection = visits.find(i);
       for (auto atom : atom_indices[member_gid[i]]) {
-        assigned.push_back(ids[atom]);
+        if (projection != visits.end()) {
+          const auto& footprint = projection->second;
+          const auto mask = footprint.VisitsOverlapping({boundaries[atom], boundaries[atom + 1]});
+          if (mask) assigned.push_back({ids[atom], footprint.frame, mask});
+        } else {
+          assigned.push_back({ids[atom]});
+        }
       }
     }
     return true;
@@ -224,7 +280,7 @@ class StorageClasses {
           const size_t id = domains.size() + 1;
           domains.push_back({id, space, hull, nullptr});
           domain_uniform_geom.push_back(uniform_geom);
-          for (const auto& [si, ei] : members) effect_domains_[si][ei].single = id;
+          for (const auto& [si, ei] : members) effect_domains_[si][ei].single.domain = id;
         };
 
         if (cluster.members.size() == 1) {
@@ -370,14 +426,14 @@ class StorageClasses {
             domains.push_back({id, effect.space, {}, effect.original_root});
             domain_uniform_geom.push_back(false);
           }
-          effect_domains_[s][e].single = it->second;
+          effect_domains_[s][e].single.domain = it->second;
         }
       }
     }
   }
 
   size_t SingleDomain(size_t site_idx, size_t effect_idx) const {
-    return effect_domains_[site_idx][effect_idx].single;
+    return effect_domains_[site_idx][effect_idx].single.domain;
   }
   const EffectDomains& Domains(size_t site_idx, size_t effect_idx) const {
     return effect_domains_[site_idx][effect_idx];
@@ -408,7 +464,18 @@ struct FiberKey {
   uint8_t slice_axis = 0;
   IterationFiberBasis basis;
 
+  // For a bounded visit history, the key describes the visits on which this
+  // physical atom may be pending at the current CFG cut. An engaged zero
+  // mask can still reach a consumer outside this loop after exit widening.
+  std::optional<MatrixVisitFootprint::Mask> visits = std::nullopt;
+
   static FiberKey Wildcard() { return {}; }
+  static FiberKey OnVisits(const ForStmt* loop, MatrixVisitFootprint::Mask mask) {
+    FiberKey key;
+    key.frame = loop;
+    key.visits = mask;
+    return key;
+  }
   static FiberKey From(const IterationFiber& f) {
     if (f.kind == IterationFiber::Kind::Wildcard || !f.frame) return {};
     return {f.kind, f.frame, f.modulus, f.offset, f.extent, f.coeff, f.slice_axis, f.basis};
@@ -416,11 +483,12 @@ struct FiberKey {
 
   bool operator==(const FiberKey& o) const {
     return kind == o.kind && frame == o.frame && modulus == o.modulus && offset == o.offset &&
-           extent == o.extent && coeff == o.coeff && slice_axis == o.slice_axis && basis == o.basis;
+           extent == o.extent && coeff == o.coeff && slice_axis == o.slice_axis && basis == o.basis &&
+           visits == o.visits;
   }
   bool operator<(const FiberKey& o) const {
-    return std::tie(kind, frame, modulus, offset, extent, coeff, slice_axis, basis) <
-           std::tie(o.kind, o.frame, o.modulus, o.offset, o.extent, o.coeff, o.slice_axis, o.basis);
+    return std::tie(kind, frame, modulus, offset, extent, coeff, slice_axis, basis, visits) <
+           std::tie(o.kind, o.frame, o.modulus, o.offset, o.extent, o.coeff, o.slice_axis, o.basis, o.visits);
   }
 };
 
@@ -436,6 +504,9 @@ using AffineDomainFrameKey = std::tuple<MemorySpace, size_t, const ForStmt*>;
 using AffineDomainBoundsMap = std::map<AffineDomainFrameKey, std::pair<int64_t, int64_t>>;
 
 bool FibersConflict(const FiberKey& a, const FiberKey& b) {
+  if (a.visits || b.visits) {
+    return !a.visits || !b.visits || a.frame != b.frame || (*a.visits & *b.visits) != 0;
+  }
   // Wildcard conflicts with ALL fibers including CompletedPast(L).
   if (a.kind == IterationFiber::Kind::Wildcard || b.kind == IterationFiber::Kind::Wildcard) {
     return true;
@@ -456,6 +527,7 @@ bool FibersConflict(const FiberKey& a, const FiberKey& b) {
 }
 
 bool MustCoverFiber(const FiberKey& kill_fiber, const FiberKey& target_fiber) {
+  if (kill_fiber.visits) return false;  // May-touch evidence cannot kill an outstanding obligation.
   if (kill_fiber.kind == IterationFiber::Kind::Wildcard) return true;
   if (target_fiber.kind == IterationFiber::Kind::Wildcard) return false;
   if (kill_fiber.frame != target_fiber.frame || !(kill_fiber.basis == target_fiber.basis)) return false;
@@ -475,7 +547,13 @@ bool MustCoverFiber(const FiberKey& kill_fiber, const FiberKey& target_fiber) {
 
 FiberKey TransformFiberOnBackedge(MemorySpace space, size_t domain, const FiberKey& f, const ForStmt* loop,
                                   const AffineDomainBoundsMap& bounds) {
-  if (f.kind == IterationFiber::Kind::Wildcard || f.frame != loop) return f;
+  if (f.frame != loop) return f;
+  if (f.visits) {
+    auto next = f;
+    next.visits = static_cast<MatrixVisitFootprint::Mask>(*f.visits << 1);
+    return next;
+  }
+  if (f.kind == IterationFiber::Kind::Wildcard) return f;
   if (f.kind == IterationFiber::Kind::CompletedPast) return f;
   if (f.kind == IterationFiber::Kind::ModularSlot && f.modulus > 0) {
     FiberKey next = f;
@@ -507,7 +585,7 @@ FiberKey TransformFiberOnBackedge(MemorySpace space, size_t domain, const FiberK
 }
 
 FiberKey TransformFiberOnExit(const FiberKey& f, const ForStmt* loop) {
-  if (f.kind != IterationFiber::Kind::Wildcard && f.frame == loop) {
+  if (f.frame == loop && (f.visits || f.kind != IterationFiber::Kind::Wildcard)) {
     return FiberKey::Wildcard();
   }
   return f;
@@ -3010,15 +3088,18 @@ class Builder {
     std::vector<std::vector<RawEffect>> raw(sites.size());
     for (size_t site = 0; site < sites.size(); ++site) {
       const auto append = [&](PipeType pipe, const ResolvedOperandFootprint& resolved) {
+        const auto subtile = resolved.matrix_subtile
+                                 ? std::make_shared<const MatrixSubtileFootprint>(*resolved.matrix_subtile)
+                                 : nullptr;
         if (resolved.read) {
           raw[site].push_back({resolved.space, pipe, false, resolved.byte_hull, resolved.gm_root, false,
-                               resolved.vec_lattice, resolved.matrix_box, resolved.HistoryFiber()});
+                               resolved.vec_lattice, resolved.matrix_box, resolved.HistoryFiber(), subtile});
         }
         if (resolved.write) {
           const bool refresh =
               enable_refresh_kill_ && resolved.DefinitelyOverwritesWindow(resolved.byte_hull);
           raw[site].push_back({resolved.space, pipe, true, resolved.byte_hull, resolved.gm_root, refresh,
-                               resolved.vec_lattice, resolved.matrix_box, resolved.HistoryFiber()});
+                               resolved.vec_lattice, resolved.matrix_box, resolved.HistoryFiber(), subtile});
         }
       };
       if (imported_) {
@@ -3144,9 +3225,12 @@ class Builder {
             fkey = FiberKey::From(effect.fiber);
           }
         }
-        for (const auto domain : classes.Domains(site, ei)) {
-          effects.emplace(effect.space, effect.pipe, effect.write, domain);
-          site_effect_fibers_[site].push_back({effect.space, effect.pipe, effect.write, domain, fkey});
+        for (const auto& access : classes.Domains(site, ei)) {
+          const auto history = access.frame ? FiberKey::OnVisits(access.frame, access.visits) : fkey;
+          if (access.frame) loops_with_fibers_.insert(access.frame);
+          effects.emplace(effect.space, effect.pipe, effect.write, access.domain);
+          site_effect_fibers_[site].push_back(
+              {effect.space, effect.pipe, effect.write, access.domain, history});
         }
         if (effect.candidate_full_overwrite && classes.HasUniformGeometry(single)) {
           refreshed.emplace(effect.space, single);

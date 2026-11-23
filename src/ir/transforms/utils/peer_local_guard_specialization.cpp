@@ -35,6 +35,7 @@
 #include "src/ir/transforms/utils/peer_local_work_loop.h"
 #include "src/ir/transforms/utils/physical_sync_schedule.h"
 #include "src/ir/transforms/utils/sync_coordinate_eval.h"
+#include "src/ir/transforms/utils/sync_loop_trip_proof.h"
 #include "src/ir/transforms/utils/sync_statement_rewrite.h"
 #include "src/ir/transforms/utils/sync_token_names.h"
 
@@ -278,34 +279,6 @@ void Consider(Candidate& best, const StmtPtr& body, const GuardFacts& facts, Vis
   }
 }
 
-struct LiteralFrame {
-  int64_t start, step, count;
-
-  ExprPtr At(int64_t ordinal, const Span& span) const {
-    return std::make_shared<ConstInt>(static_cast<int64_t>(__int128(start) + __int128(ordinal) * step),
-                                      DataType::INDEX, span);
-  }
-};
-
-std::optional<LiteralFrame> FiniteFrame(const ForStmtPtr& loop) {
-  const auto start = As<ConstInt>(loop->start_), stop = As<ConstInt>(loop->stop_),
-             step = As<ConstInt>(loop->step_);
-  const auto type = As<ScalarType>(loop->loop_var_->GetType());
-  if (!start || !stop || !step || !type || type->dtype_ != DataType::INDEX ||
-      start->dtype() != DataType::INDEX || stop->dtype() != DataType::INDEX ||
-      step->dtype() != DataType::INDEX || start->value_ >= stop->value_ || step->value_ <= 0 ||
-      loop->kind_ != ForKind::Sequential || !loop->iter_args_.empty() || !loop->return_vars_.empty() ||
-      !loop->attrs_.empty() || loop->hardware_loop_policy_ != HardwareLoopPolicy::Auto) {
-    return std::nullopt;
-  }
-  const auto count = (__int128(stop->value_) - start->value_ + step->value_ - 1) / step->value_;
-  if (count < 2 || count > kMaxTrips ||
-      __int128(start->value_) + count * step->value_ > std::numeric_limits<int64_t>::max()) {
-    return std::nullopt;
-  }
-  return LiteralFrame{start->value_, step->value_, static_cast<int64_t>(count)};
-}
-
 class SpecializedLoop {
   const ForStmtPtr& loop_;
   SyncTokenNames& names_;
@@ -331,7 +304,7 @@ class SpecializedLoop {
  public:
   SpecializedLoop(const ForStmtPtr& loop, SyncTokenNames& names) : loop_(loop), names_(names) {}
 
-  StmtPtr Run(const LiteralFrame& frame, const Candidate& candidate, const StmtPtr& body,
+  StmtPtr Run(const LiteralIndexLoop& frame, const Candidate& candidate, const StmtPtr& body,
               const YieldStmtPtr& yield) const {
     const auto& span = loop_->span_;
     const auto append_yield = [&](std::vector<StmtPtr> statements) {
@@ -358,8 +331,10 @@ class SpecializedLoop {
 };
 
 StmtPtr SpecializeLeaf(const ForStmtPtr& loop, SyncTokenNames& names, GrowthBudget& remaining) {
-  const auto frame = FiniteFrame(loop);
-  if (!frame || remaining.nodes <= kLoopGrowthAllowance) {
+  const auto frame = LiteralIndexLoop::From(loop.get(), kMaxTrips);
+  if (!frame || frame->count < 2 || !loop->iter_args_.empty() || !loop->return_vars_.empty() ||
+      !loop->attrs_.empty() || loop->hardware_loop_policy_ != HardwareLoopPolicy::Auto ||
+      remaining.nodes <= kLoopGrowthAllowance) {
     return loop;
   }
   // Both candidate layouts emit at most two complete copies. Charge the
