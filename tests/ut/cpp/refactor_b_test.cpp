@@ -548,7 +548,7 @@ void TestSplitLongConsumerRun() {
     cut.is_transport = cut.has_native_claims = false;
   }
   // An unknown first-consumer footprint also admits overlap with the late load.
-  imported.calls.at(As<Call>(As<EvalStmt>(body[2])->expr_).get()).effects[0].enclosure.reset();
+  imported.calls.at(As<Call>(As<EvalStmt>(body[2])->expr_).get()).effects[0].footprint.byte_hull.reset();
   assert(!analyze().Sites()[1].precise_capture);
 }
 
@@ -718,7 +718,7 @@ void TestIndependentPhysicalCaptures() {
   }
 
   auto may_alias = evidence;
-  may_alias.at(call_of(read_shared).get()).effects.front().enclosure.reset();
+  may_alias.at(call_of(read_shared).get()).effects.front().footprint.byte_hull.reset();
   const auto aliased = RefineLocalCompletionPlan(baseline, may_alias, "a2a3", {});
   assert(structural_equal(aliased->body_, baseline->body_));
 
@@ -1154,6 +1154,63 @@ void TestB3IterationFiberRefinement() {
   // Site 2 (post_store on MTE3): LoopExit projects CompletedPast -> Wildcard -> must sync with V!
   assert(std::find(analysis.Sites()[2].source_pipes.begin(), analysis.Sites()[2].source_pipes.end(),
                    PipeType::V) != analysis.Sites()[2].source_pipes.end());
+}
+
+void TestIndependentSlotAndSubtileFrames() {
+  const auto pool_type = MultiMatType(2, 32, 32);
+  const auto mat = pool_type->element_type_;
+  const auto left = LeftType(32, 16);
+  const auto input = MakeVar("input", MakeTensorType(32, 32, DataType::FP16));
+  const auto pool = MakeVar("pool", pool_type);
+  const auto slot = MakeVar("slot", mat), alias = MakeVar("alias", mat);
+  const auto fixed = MakeVar("fixed", mat);
+  const auto dest = MakeVar("dest", left);
+  const auto outer_iv = MakeVar("outer", IndexType()), inner_iv = MakeVar("inner", IndexType());
+  const auto load_slot = [&](const VarPtr& handle) {
+    return EvalCall("buffer.load", {input, ConstTup({0, 0}), ConstTup({32, 32}), handle});
+  };
+  const auto load = load_slot(slot), fixed_load = load_slot(fixed);
+  const auto extract = EvalCall("buffer.extract", {alias, CI(0), MakeMul(inner_iv, CI(16)), dest});
+  const auto inner = SimpleFor(inner_iv, CI(0), CI(2), CI(1), {extract});
+  const auto outer = SimpleFor(outer_iv, CI(1), CI(10), CI(3),
+                               {BufferSlot(slot, pool, MakeFloorMod(outer_iv, CI(2)), mat),
+                                std::make_shared<AssignStmt>(alias, slot, kSpan), load, inner});
+  const auto fn = MakeAicFn("slot_and_subtile", {input}, {ParamDirection::In},
+                            {AllocBuf(pool, 0, pool_type, "buffer.alloc_multi"), AllocBuf(dest, 0, left),
+                             BufferSlot(fixed, pool, CI(0), mat), fixed_load, outer},
+                            FunctionType::AIC);
+  const SyncFootprintResolver resolver(fn);
+  const auto resolve = [&](const StmtPtr& statement, size_t arg, BufferAccess access) {
+    return resolver.ResolveOperand(statement.get(), As<Call>(As<EvalStmt>(statement)->expr_), arg, access,
+                                   MemorySpace::Mat);
+  };
+  const auto write = resolve(load, 3, BufferAccess::Write);
+  const auto read = resolve(extract, 0, BufferAccess::Read);
+  const auto static_write = resolve(fixed_load, 3, BufferAccess::Write);
+
+  // The reaching read follows both original frames through an SSA alias.
+  // A rotating load writes one slot even though its possible touches span both.
+  assert(read.root_id == write.root_id && read.root_id == static_write.root_id);
+  assert(write.slot_fiber.frame == outer.get() && write.slot_fiber.modulus == 2);
+  assert(write.slot_fiber.offset == 1 && write.slot_fiber.coeff == 1);
+  assert(read.slot_fiber.HasComparableCoordinates(write.slot_fiber));
+  assert(read.fiber.frame == inner.get() && read.fiber.coeff == 16 && read.fiber.extent == 16);
+  assert(read.matrix_subtile && read.matrix_subtile->col.affine_frame == inner.get());
+  assert(read.matrix_subtile->rows == 32 && read.matrix_subtile->columns == 16);
+  assert(write.byte_hull && write.byte_hull->begin == 0 && write.byte_hull->end == 4096);
+  assert(!write.definite_overwrite && !write.DefinitelyOverwrites(read));
+  assert(static_write.definite_overwrite && static_write.definite_overwrite->end == 2048);
+  assert(!static_write.DefinitelyOverwrites(read));
+
+  // A projection can refresh an enclosure only when its write covers the
+  // entire window. Partial or read-modify-write evidence must retain history.
+  auto projected = static_write;
+  assert(projected.DefinitelyOverwritesWindow(projected.byte_hull));
+  projected.definite_overwrite = backend::BufferSyncByteWindow{0, 1024};
+  assert(!projected.DefinitelyOverwritesWindow(projected.byte_hull));
+  assert(projected.DefinitelyOverwritesWindow(projected.definite_overwrite));
+  projected.read = true;
+  assert(!projected.DefinitelyOverwritesWindow(projected.definite_overwrite));
 }
 
 void TestAffineVecPhysicalByteOrigins() {
@@ -2030,8 +2087,8 @@ void TestRound2AuditAndCleanupFixes() {
                          std::make_shared<ReturnStmt>(std::vector<ExprPtr>{}, kSpan)},
                         FunctionType::AIV);
     SyncFootprintResolver resolver(fn);
-    assert(resolver.ViewOf(s0) && resolver.ViewOf(s0)->fiber.kind == IterationFiber::Kind::ModularSlot);
-    assert(resolver.ViewOf(s0)->fiber.modulus == 4 && resolver.ViewOf(s0)->fiber.coeff == 2);
+    assert(resolver.ViewOf(s0) && resolver.ViewOf(s0)->slot_fiber.kind == IterationFiber::Kind::ModularSlot);
+    assert(resolver.ViewOf(s0)->slot_fiber.modulus == 4 && resolver.ViewOf(s0)->slot_fiber.coeff == 2);
   }
 
   // Sequential ForStmts with Class-B InlineExactSubBlock reuse (MTE2 -> V) IDs after loop exit to scope 0.
@@ -2114,6 +2171,7 @@ int main() {
   pypto::ir::sync::TestB1PositiveTripCompletionAndRelay();
   pypto::ir::sync::TestB2StridedVecAndMatStorageClasses();
   pypto::ir::sync::TestB3IterationFiberRefinement();
+  pypto::ir::sync::TestIndependentSlotAndSubtileFrames();
   pypto::ir::sync::TestAffineVecPhysicalByteOrigins();
   pypto::ir::sync::TestB4InitGuardAndSubblockPromotion();
   pypto::ir::sync::TestRound1AuditFixes();

@@ -1377,12 +1377,17 @@ class Importer {
     }
     return true;
   }
-  void SelectSlot(const AssignStmtPtr& assign, const SyncSegment& segment) {
-    auto call = As<Call>(assign->value_);
-    OpRegistry::GetInstance().ValidateBufferCall(call);
-    const auto id = Storage(call->args_[0]);
-    const auto count = result.storage[id].slot_count;
-    RequireIndex(call->args_[1]);
+  static ForStmtPtr OccurrenceFrame(const SyncSegment& segment, const ForStmt* frame) {
+    if (segment.original_loop.get() == frame) return segment.original_loop;
+    for (const auto& parent : segment.nested_frames) {
+      if (parent.loop.get() == frame) return parent.loop;
+    }
+    return nullptr;
+  }
+  SlotSelection SlotCoordinates(const AssignStmtPtr& assign, const CallPtr& call, const SyncSegment& segment,
+                                int64_t count) {
+    auto scope = segment.original_loop;
+    if (!scope && !segment.nested_frames.empty()) scope = segment.nested_frames.back().loop;
     ExprPtr index = coordinates.SlotExpression(call->args_[1]);
     bool modulo = false;
     if (auto mod = As<FloorMod>(index)) {
@@ -1392,6 +1397,15 @@ class Importer {
       index = mod->left_;
       modulo = true;
     }
+    if (const auto* view = resolver->ViewOf(assign->var_);
+        modulo && view && view->slot_fiber.modulus == count) {
+      const auto& fiber = view->slot_fiber;
+      const auto frame = OccurrenceFrame(segment, fiber.frame);
+      CHECK(frame) << "Slot selection has no original occurrence frame";
+      return {fiber.offset, fiber.coeff, frame, scope};
+    }
+    // Exact source admission also supports cases outside the shared normalized
+    // proof, including selectors in bodies of statically empty loops.
     const auto coordinate = Coordinate(index, segment);
     CHECK(coordinate.parameters.empty() && !coordinate.block)
         << "Parameterized slot phase requires an explicit phase certificate";
@@ -1403,18 +1417,21 @@ class Importer {
     if (!frames.empty()) {
       const auto [selected, coefficient] = *frames.begin();
       stride = coefficient;
-      if (segment.original_loop.get() == selected) frame = segment.original_loop;
-      for (const auto& parent : segment.nested_frames)
-        if (parent.loop.get() == selected) frame = parent.loop;
+      frame = OccurrenceFrame(segment, selected);
       CHECK(frame) << "Slot selection has no original occurrence frame";
     }
     CHECK(modulo || (!stride && coordinate.first < count))
         << "Slot selection must be a constant in range or a proved nonnegative affine rotation";
-    auto scope = segment.original_loop;
-    if (!scope && !segment.nested_frames.empty()) scope = segment.nested_frames.back().loop;
+    return {coordinate.first % count, stride % count, frame, scope};
+  }
+  void SelectSlot(const AssignStmtPtr& assign, const SyncSegment& segment) {
+    auto call = As<Call>(assign->value_);
+    OpRegistry::GetInstance().ValidateBufferCall(call);
+    const auto id = Storage(call->args_[0]);
+    RequireIndex(call->args_[1]);
     objects[assign->var_.get()] = id;
     if (transposed_mat.count(call->args_[0].get())) transposed_mat.insert(assign->var_.get());
-    slots[assign->var_.get()] = {coordinate.first % count, stride % count, frame, scope};
+    slots[assign->var_.get()] = SlotCoordinates(assign, call, segment, result.storage[id].slot_count);
   }
   void QualifySlot(const ExprPtr& handle, const SyncSegment& segment) const {
     if (auto slot = slots.find(handle.get()); slot != slots.end()) {
@@ -1490,6 +1507,9 @@ class Importer {
             << "Exact synchronization only supports layout-compatible or transposed Matrix reshapes";
         const auto sid = Storage(call->args_[0]);
         objects[assign->var_.get()] = sid;
+        if (const auto selected = slots.find(call->args_[0].get()); selected != slots.end()) {
+          slots.emplace(assign->var_.get(), selected->second);
+        }
         if (resolved->axis_swapped) transposed_mat.insert(assign->var_.get());
         return;
       }
@@ -1717,7 +1737,18 @@ class Importer {
     }
   }
 
-  SyncSite Site(const CallPtr& call, const SyncSegment& segment) {
+  static std::optional<AffineCoordinate> SubtileCoordinate(const SymbolicIntRange& range) {
+    if (range.is_const()) return AffineCoordinate{range.lo, 0};
+    if (!range.affine_frame || range.modulus || range.symbolic_base || range.affine_base < 0 ||
+        range.affine_coeff < 0) {
+      return std::nullopt;
+    }
+    AffineCoordinate coordinate{range.affine_base, 0};
+    coordinate.frames.emplace(range.affine_frame, range.affine_coeff);
+    return coordinate;
+  }
+
+  SyncSite Site(const CallPtr& call, const SyncSegment& segment, const Stmt* cut) {
     const auto operation =
         backend::QualifyBufferSyncOperation(call, result.owner->func_type_, result.hardware_target);
     const auto& implementation = operation.Implementation();
@@ -1753,6 +1784,17 @@ class Importer {
         return;
       }
       const auto& s = result.storage[id];
+      if (IsSyncMatrixSpace(s.space)) {
+        const auto mode = write ? BufferAccess::Write : BufferAccess::Read;
+        const auto footprint = resolver->ResolveOperand(cut, call, arg, mode, s.space);
+        if (const auto& box = footprint.matrix_box) {
+          site.accesses.push_back(Access(id, write, {box->row_begin, 0}, {box->col_begin, 0},
+                                         box->row_end - box->row_begin, box->col_end - box->col_begin,
+                                         segment));
+          ApplySlot(site.accesses.back(), call->args_[arg], segment);
+          return;
+        }
+      }
       site.accesses.push_back(Access(id, write, {0, 0}, {0, 0}, s.rows, s.columns, segment));
       ApplySlot(site.accesses.back(), call->args_[arg], segment);
     };
@@ -1945,14 +1987,30 @@ class Importer {
       } else {
         CHECK(s.space == MemorySpace::Mat && (t.space == MemorySpace::Left || t.space == MemorySpace::Right))
             << "Only Mat to operand-buffer or Vec to Vec movement is qualified";
-        auto row = extract ? Coordinate(call->args_[1], segment) : AffineCoordinate{};
-        auto column = extract ? Coordinate(call->args_[2], segment) : AffineCoordinate{};
-        CHECK(row.parameters.empty() && column.parameters.empty() && !row.block && !column.block)
-            << "Parameterized local extraction needs a separate membership and alignment certificate";
         const bool transposed = transposed_mat.count(call->args_[0].get()) != 0;
-        const int64_t ext_rows = transposed ? t.columns : t.rows;
-        const int64_t ext_cols = transposed ? t.rows : t.columns;
-        if (transposed) std::swap(row, column);
+        int64_t ext_rows = transposed ? t.columns : t.rows;
+        int64_t ext_cols = transposed ? t.rows : t.columns;
+        AffineCoordinate row, column;
+        if (extract) {
+          RequireIndex(call->args_[1]);
+          RequireIndex(call->args_[2]);
+          const auto footprint = resolver->ResolveOperand(cut, call, 0, BufferAccess::Read, MemorySpace::Mat);
+          const auto& subtile = footprint.matrix_subtile;
+          const auto shared_row = subtile ? SubtileCoordinate(subtile->row) : std::nullopt;
+          const auto shared_col = subtile ? SubtileCoordinate(subtile->col) : std::nullopt;
+          if (shared_row && shared_col) {
+            row = *shared_row;
+            column = *shared_col;
+            ext_rows = subtile->rows;
+            ext_cols = subtile->columns;
+          } else {
+            row = Coordinate(call->args_[1], segment);
+            column = Coordinate(call->args_[2], segment);
+            if (transposed) std::swap(row, column);
+          }
+          CHECK(row.parameters.empty() && column.parameters.empty() && !row.block && !column.block)
+              << "Parameterized local extraction needs a separate membership and alignment certificate";
+        }
         if (!extract) CHECK(s.rows == ext_rows && s.columns == ext_cols) << "Partial copy is not qualified";
         if (s.layout->slayout_ != TileLayout::none_box) {
           const auto box = s.layout->fractal_ / (16 * s.layout->dtype_.GetByte());
@@ -2156,7 +2214,7 @@ class Importer {
     }
     return site;
   }
-  CallPtr InitializationCall(const StmtPtr& statement, const SyncSegment& segment) {
+  EvalStmtPtr InitializationCut(const StmtPtr& statement, const SyncSegment& segment) {
     auto statements = Statements(statement);
     // A void original branch may terminate with the explicit empty yield
     // introduced by Buffer lowering. It carries no payload/result and is not
@@ -2181,7 +2239,7 @@ class Importer {
     CHECK(eval) << "Conditional synchronization body must end in one payload evaluation";
     const auto call = As<Call>(eval->expr_);
     CHECK(call) << "Submit/indirect execution is outside the synchronization prototype";
-    return call;
+    return eval;
   }
   bool SameInitializationOperand(const ExprPtr& a, const ExprPtr& b) const {
     // Matrix operands currently admit allocations and explicit slots, not
@@ -2231,7 +2289,7 @@ class Importer {
       } else if (auto eval = As<EvalStmt>(s)) {
         auto call = As<Call>(eval->expr_);
         CHECK(call) << "Submit or non-call payload is not qualified";
-        segment.sites.push_back(Site(call, segment));
+        segment.sites.push_back(Site(call, segment, s.get()));
         preceding_matrix |= segment.sites.back().pipe == PipeType::M;
       } else if (auto branch = As<IfStmt>(s)) {
         QualifyBranchCondition(branch->condition_, segment);
@@ -2310,21 +2368,23 @@ class Importer {
           CHECK(found != first_visits.end() && found->second == frames[f].start)
               << "Initialization guard must test consecutive first-visit frames";
         }
-        auto first = InitializationCall(branch->then_body_, segment);
-        auto later = InitializationCall(*branch->else_body_, segment);
+        const auto first_cut = InitializationCut(branch->then_body_, segment);
+        const auto later_cut = InitializationCut(*branch->else_body_, segment);
+        const auto first = As<Call>(first_cut->expr_);
+        const auto later = As<Call>(later_cut->expr_);
         CHECK(IsOp(first, "buffer.matmul") && IsOp(later, "buffer.matmul_acc") &&
               first->args_.size() == later->args_.size() &&
               std::equal(first->args_.begin(), first->args_.end(), later->args_.begin(),
                          [&](const auto& a, const auto& b) { return SameInitializationOperand(a, b); }))
             << "Conditional payloads must preserve operands and destination";
         if (has_parameter_guard) {
-          auto site = Site(later, segment);
+          auto site = Site(later, segment, later_cut.get());
           site.continuation = first;
           preceding_matrix = true;
           segment.sites.push_back(std::move(site));
         } else {
-          auto site = Site(first, segment);
-          auto continuation = Site(later, segment);
+          auto site = Site(first, segment, first_cut.get());
+          auto continuation = Site(later, segment, later_cut.get());
           site.continuation = later;
           if (frames[first_frame].loop != segment.original_loop)
             site.initialization_scope = frames[first_frame].loop;

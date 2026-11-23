@@ -55,6 +55,9 @@ struct SyncCanonicalRoot {
   BufferTypePtr canonical_layout;  // Canonical BufferType (nullptr for Vec byte space / DDR)
   ExprPtr gm_root;                 // Formal Tensor parameter or MemRef::base_ for DDR
   bool touched_by_set_validshape = false;
+  // A borrowed root has slot-relative geometry and must never canonicalize
+  // with an ordinary placed allocation or another pop's descriptor.
+  const Var* peer_borrow = nullptr;
 };
 
 enum class SyncViewKind : uint8_t {
@@ -173,7 +176,17 @@ struct SyncResolvedView {
   std::optional<backend::BufferSyncByteWindow> peer_reserve;
   std::optional<StridedByteFootprint> vec_lattice;
   std::optional<MatrixBoxFootprint> matrix_box;
+  IterationFiber slot_fiber;
   IterationFiber fiber;
+};
+
+// Within-slot rectangle in canonical matrix axes. Its origin may move with
+// an occurrence frame independent of the selected slot's frame.
+struct MatrixSubtileFootprint {
+  SymbolicIntRange row;
+  SymbolicIntRange col;
+  int64_t rows;
+  int64_t columns;
 };
 
 // Unified per-operand payload effect resolved at a call site.
@@ -181,15 +194,27 @@ struct ResolvedOperandFootprint {
   MemorySpace space = MemorySpace::DDR;
   bool read = false;
   bool write = false;
-  bool candidate_full_overwrite = false;
   size_t root_id = 0;
   ExprPtr gm_root;
+  // Possible touches span all proved visits. A definite overwrite denotes
+  // bytes written on every execution of this cut, even when a selector moves.
   std::optional<backend::BufferSyncByteWindow> byte_hull;
+  std::optional<backend::BufferSyncByteWindow> definite_overwrite;
   std::optional<StridedByteFootprint> vec_lattice;
   std::optional<MatrixBoxFootprint> matrix_box;
+  std::optional<MatrixSubtileFootprint> matrix_subtile;
+  IterationFiber slot_fiber;
   IterationFiber fiber;
 
+  // Conservative histories currently track one normalized frame per effect.
+  // Retain the slot history for a nested slice and use its ranged matrix box
+  // to enclose the within-slot coordinates.
+  const IterationFiber& HistoryFiber() const {
+    return slot_fiber.kind == IterationFiber::Kind::Wildcard ? fiber : slot_fiber;
+  }
   bool MayOverlap(const ResolvedOperandFootprint& other, const std::vector<SyncCanonicalRoot>& roots) const;
+  // The window must use the same physical byte coordinates as the footprint.
+  bool DefinitelyOverwritesWindow(const std::optional<backend::BufferSyncByteWindow>& window) const;
   bool DefinitelyOverwrites(const ResolvedOperandFootprint& other) const;
 };
 
@@ -213,8 +238,7 @@ class SyncFootprintResolver {
   void RequireWorkspaceSeparation(const backend::BufferSyncOperation& operation) const;
 
   ResolvedOperandFootprint ResolveOperand(const Stmt* cut, const CallPtr& call, size_t arg_idx,
-                                          BufferAccess mode, MemorySpace space,
-                                          bool enable_refresh_kill = true, bool disjoint_gm = false,
+                                          BufferAccess mode, MemorySpace space, bool disjoint_gm = false,
                                           bool peer_slot_relative = false) const;
 
   bool OverlapsDynamicValid(MemorySpace space, const backend::BufferSyncByteWindow& window) const;

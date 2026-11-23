@@ -10,8 +10,10 @@
 """Slot recognition checks; no reduction is inferred from successful import."""
 
 import pytest
-from pypto import ir, testing
+from pypto import ir, passes, testing
+from pypto._function_attrs import PYPTO_AUTOSYNC_ATTR
 
+from .sync_closed_command_oracle import ClosedCommands, opname
 from .sync_matmul_cases import staged_fixture
 from .sync_matmul_oracle import check_imported_accesses, interpret, sequence_stmts
 from .test_indexed_sync_analysis import indexed_fixture
@@ -108,6 +110,76 @@ def test_exact_interval_evidence_retains_physical_aliases(count, slots):
     assert description["interval_access_visits"] == visits
     assert description["qualified_intervals"] == visits
     assert not description["analysis_available"]
+
+
+def test_slot_reuse_waits_for_both_readers_and_leaves_the_other_slot_available():
+    original = slot_fixture(count=1, slots=2)
+    allocation, loop, ret = sequence_stmts(original.body)
+    select, _, load, vector, store, _ = sequence_stmts(loop.body)
+    group = allocation.var
+    span = original.span
+    ty = select.var.type
+
+    def ci(x):
+        return ir.ConstInt(x, ir.DataType.INDEX, span)
+
+    def payload(template, args):
+        return ir.EvalStmt(ir.Call(template.expr.op, args, template.expr.type, span), span)
+
+    slots = [select.var, ir.Var("other", ty, span)]
+    definitions = [allocation]
+    for i, slot in enumerate(slots):
+        definitions.append(ir.AssignStmt(slot, ir.Call(select.value.op, [group, ci(i)], ty, span), span))
+    scratch = ir.Var("result", ty, span)
+    alloc = ir.Call(ir.get_op("buffer.alloc"), [allocation.value.args[0], ci(256)], ty, span)
+    definitions.append(ir.AssignStmt(scratch, alloc, span))
+    payloads = [
+        payload(load, [*load.expr.args[:-1], slots[0]]),
+        payload(vector, [slots[0], scratch]),
+        payload(store, [slots[0], *store.expr.args[1:]]),
+        payload(load, [*load.expr.args[:-1], slots[1]]),
+        payload(load, [*load.expr.args[:-1], slots[0]]),
+    ]
+    function = ir.Function(
+        original.name,
+        original.params,
+        original.return_types,
+        ir.SeqStmts([*definitions, *payloads, ret], span),
+        span,
+        ir.FunctionType.AIV,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    program = ir.Program([function], "slot_wrap", span)
+    with passes.PassContext(
+        [], enable_pypto_autosync=True, autosync_policy="conservative_prefix", autosync_disjoint_gm=True
+    ):
+        result = passes.realize_sync()(program)[function.name]
+    assert result.attrs[PYPTO_AUTOSYNC_ATTR]
+    commands = ClosedCommands(result, {}, range(8), tensor_bases={0: 0, 1: 4096})
+    order = commands.run()
+    complete = [("payload", i, "C") for i in (1, 2)]
+    assert [item[1] for item in commands.payloads[1:3]] == [ir.PipeType.V, ir.PipeType.MTE3]
+    # Both readers touch slot zero. The next issue can use slot one while
+    # they run, but wrapping to slot zero must wait for both completions.
+    assert all((reader, ("payload", 3, "I")) not in order for reader in complete)
+    assert all((reader, ("payload", 4, "I")) in order for reader in complete)
+
+    class DropRelease(ClosedCommands):
+        def __init__(self, source):
+            super().__init__(result, {}, range(8), tensor_bases={0: 0, 1: 4096})
+            self.source = source
+
+        def physical(self, call):
+            if call.op.name in (opname("system.set_flag"), opname("system.wait_flag")):
+                if (ir.PipeType(call.kwargs["src_pipe"]), ir.PipeType(call.kwargs["dst_pipe"])) == (
+                    self.source,
+                    ir.PipeType.MTE2,
+                ):
+                    return
+            super().physical(call)
+
+    for source, reader in zip((ir.PipeType.V, ir.PipeType.MTE3), complete, strict=True):
+        assert (reader, ("payload", 4, "I")) not in DropRelease(source).run()
 
 
 def interval_extract_fixture(major, boxed, shape, offset):
@@ -511,7 +583,8 @@ def test_slot_selection_with_coupled_enclosing_coordinates_stays_unavailable():
 
 
 @pytest.mark.parametrize("boxed", [False, True])
-def test_framed_moving_slot_rectangle_is_exact_without_an_interval_export(boxed):
+@pytest.mark.parametrize("start, step", [(0, 1), (1, 3)])
+def test_framed_moving_slot_rectangle_is_exact_without_an_interval_export(boxed, start, step):
     original = interval_extract_fixture(ir.TileLayout.row_major, boxed, (32, 16), (0, 0))
     span, index = original.span, ir.DataType.INDEX
     source_alloc, target_alloc, load, extract, result = sequence_stmts(original.body)
@@ -544,9 +617,9 @@ def test_framed_moving_slot_rectangle_is_exact_without_an_interval_export(boxed)
     )
     outer = ir.ForStmt(
         outer_iv,
-        ci(0),
-        ci(3),
-        ci(1),
+        ci(start),
+        ci(start + 3 * step),
+        ci(step),
         [],
         ir.SeqStmts([select, load, inner, ir.YieldStmt([], span)], span),
         [],

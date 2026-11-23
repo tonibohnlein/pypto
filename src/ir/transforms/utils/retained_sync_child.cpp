@@ -961,8 +961,7 @@ std::optional<InlineExactSubBlock> TryPrepareInlineExactSubBlock(
         const auto arg_type = call->args_[arg_idx]->GetType();
         MemorySpace space = MemorySpace::DDR;
         if (const auto buf = As<BufferType>(arg_type)) space = buf->memory_space_;
-        site_accesses[s].push_back(resolver.ResolveOperand(cut, call, arg_idx, mode, space,
-                                                           /*enable_refresh_kill=*/true, disjoint_gm));
+        site_accesses[s].push_back(resolver.ResolveOperand(cut, call, arg_idx, mode, space, disjoint_gm));
       }
       for (const auto& eff : op.Implementation().ImplicitEffects()) {
         ResolvedOperandFootprint fp;

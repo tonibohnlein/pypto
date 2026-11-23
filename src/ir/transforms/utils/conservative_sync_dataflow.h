@@ -29,6 +29,7 @@
 #include "pypto/ir/stmt.h"
 #include "src/ir/transforms/utils/conservative_sync_completion.h"
 #include "src/ir/transforms/utils/retained_sync_child.h"
+#include "src/ir/transforms/utils/sync_footprint_resolver.h"
 
 namespace pypto::ir::sync {
 
@@ -85,9 +86,17 @@ using ConservativeAccessSet = std::set<ConservativeAccessFact>;
 // complete original owner. A call without a pipe has no asynchronous issue
 // at this cut. Actual transfer and ready/credit commands remain in the IR.
 struct ImportedLocalEffect {
-  MemorySpace space;
-  bool write;
-  std::optional<backend::BufferSyncByteWindow> enclosure;
+  ImportedLocalEffect(MemorySpace space, bool write, std::optional<backend::BufferSyncByteWindow> enclosure,
+                      std::optional<size_t> formal = std::nullopt)
+      : gm_formal(formal) {
+    footprint.space = space;
+    footprint.read = !write;
+    footprint.write = write;
+    footprint.byte_hull = enclosure;
+  }
+  explicit ImportedLocalEffect(ResolvedOperandFootprint resolved) : footprint(std::move(resolved)) {}
+
+  ResolvedOperandFootprint footprint;
   std::optional<size_t> gm_formal = std::nullopt;
 };
 struct ImportedLocalCut {
@@ -108,6 +117,8 @@ struct ImportedLocalSync {
   const IfStmt* terminal_branch = nullptr;
   // Populated only after every invocation has certified the GM partition.
   std::map<size_t, ExprPtr> gm_domains{};
+  // Numeric matrix roots in resolved effects are scoped to this catalogue.
+  std::vector<SyncCanonicalRoot> local_roots{};
 };
 
 // An allocated SET may move before these producer effects. Its WAIT and all

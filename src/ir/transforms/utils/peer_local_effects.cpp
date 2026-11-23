@@ -319,7 +319,6 @@ class LaneImporter {
         << "Peer local path with results requires a terminal return";
     if (structured_) {
       ImportStructuredSequence(statements, /*endpoint=*/true);
-      ExportStructuredEffects();
       return std::move(result_);
     }
     for (size_t i = 0; i < statements.size(); ++i) {
@@ -424,29 +423,44 @@ class LaneImporter {
     ordinals_ = entry;
   }
 
-  void ExportStructuredEffects() {
-    for (const auto& site : result_.input.segments.front().sites) {
+  void AddSite(SyncSite site, const std::map<size_t, ResolvedOperandFootprint>& placed_effects = {}) {
+    CHECK_SPAN(payload_calls_.insert(site.original.get()).second, site.original->span_)
+        << "A shared call cannot identify two independent physical payload cuts";
+    if (structured_) {
       auto& cut = structured_->calls.at(site.original.get());
       // The common prefix is imported in each lane at the same original cuts.
       if (cut.pipe) {
         INTERNAL_CHECK(*cut.pipe == site.pipe);
-        continue;
-      }
-      cut.pipe = site.pipe;
-      for (const auto& access : site.accesses) {
-        const auto& storage = result_.input.storage[access.storage];
-        std::optional<backend::BufferSyncByteWindow> interval;
-        if (storage.space != MemorySpace::DDR) {
-          // Reaching definitions across control may choose different slots.
-          // Enclose every possible slot, and never certify a full overwrite
-          // of that enclosure from a single receive.
-          interval = storage.slot_bytes > 0
-                         ? backend::BufferSyncByteWindow{storage.address, storage.address + storage.bytes}
-                         : backend::BufferSyncByteWindow{access.column, access.column + access.columns};
+      } else {
+        cut.pipe = site.pipe;
+        for (size_t i = 0; i < site.accesses.size(); ++i) {
+          const auto& access = site.accesses[i];
+          const auto& storage = result_.input.storage[access.storage];
+          if (const auto found = placed_effects.find(i); found != placed_effects.end()) {
+            auto resolved = found->second;
+            // A read-modify-write remains a dependence even when recorded
+            // as two effects. Its separate write must preserve that history.
+            if (resolved.read) {
+              resolved.definite_overwrite.reset();
+            }
+            resolved.read = !access.write;
+            resolved.write = access.write;
+            cut.effects.emplace_back(std::move(resolved));
+            continue;
+          }
+          std::optional<backend::BufferSyncByteWindow> interval;
+          if (storage.space != MemorySpace::DDR) {
+            // Reaching definitions across control may choose different slots.
+            // One receive cannot overwrite this entire possible byte set.
+            interval = storage.slot_bytes > 0
+                           ? backend::BufferSyncByteWindow{storage.address, storage.address + storage.bytes}
+                           : backend::BufferSyncByteWindow{access.column, access.column + access.columns};
+          }
+          cut.effects.push_back({storage.space, access.write, interval});
         }
-        cut.effects.push_back({storage.space, access.write, interval});
       }
     }
+    result_.input.segments.back().sites.push_back(std::move(site));
   }
 
   void ImportSyncAll(const StmtPtr& statement) {
@@ -794,12 +808,6 @@ class LaneImporter {
     }
   }
 
-  void AddSite(SyncSite site) {
-    CHECK_SPAN(payload_calls_.insert(site.original.get()).second, site.original->span_)
-        << "A shared call cannot identify two independent physical payload cuts";
-    result_.input.segments.back().sites.push_back(std::move(site));
-  }
-
   void CheckReceiveReserveSeparation(const TileWindow& window, const Span& span) const {
     if (const auto found = reserves_.find(window.space); found != reserves_.end()) {
       const auto next = found->second.lower_bound(window.end);
@@ -867,6 +875,7 @@ class LaneImporter {
       }
     }
     SyncSite site{call, nullptr, implementation.Pipe(), {}};
+    std::map<size_t, ResolvedOperandFootprint> placed_effects;
     for (size_t i = 0; i < operation.ArgumentEffects().size(); ++i) {
       const auto mode = operation.ArgumentEffects()[i].data;
       if (mode == BufferAccess::None) {
@@ -875,7 +884,7 @@ class LaneImporter {
       const auto& operand = call->args_[i];
       const auto type = As<BufferType>(operand->GetType());
       const auto space = type ? type->memory_space_ : MemorySpace::DDR;
-      const auto resolved = footprint_->ResolveOperand(statement.get(), call, i, mode, space, true, false,
+      const auto resolved = footprint_->ResolveOperand(statement.get(), call, i, mode, space, false,
                                                        /*peer_slot_relative=*/true);
       if (space == MemorySpace::DDR) {
         if (resolved.read) {
@@ -887,10 +896,14 @@ class LaneImporter {
       } else {
         const auto window = ResolveBufferWindow(statement, operand, resolved);
         if (resolved.read) {
+          if (structured_ && !window.pop) placed_effects.emplace(site.accesses.size(), resolved);
           Access(site, window, false);
         }
         if (resolved.write) {
-          Access(site, window, true, resolved.candidate_full_overwrite);
+          if (structured_ && !window.pop) placed_effects.emplace(site.accesses.size(), resolved);
+          // Receive rebasing translates both the enclosure and its write
+          // evidence equally. Check coverage in the resolver's coordinates.
+          Access(site, window, true, resolved.DefinitelyOverwritesWindow(resolved.byte_hull));
         }
       }
     }
@@ -914,7 +927,7 @@ class LaneImporter {
     if (result) {
       ready_.insert(result.get());
     }
-    AddSite(std::move(site));
+    AddSite(std::move(site), placed_effects);
   }
 
   void ImportBufferDefinition(const StmtPtr& statement, const CallPtr& call, const VarPtr& result) {
@@ -1140,7 +1153,7 @@ class LaneImporter {
             footprint_ ? ResolveBufferWindow(
                              transfer.statement, transfer.tile,
                              footprint_->ResolveOperand(transfer.statement.get(), call, 0, BufferAccess::Read,
-                                                        transfer.memory_space, false, false, true))
+                                                        transfer.memory_space, false, true))
                        : Window(transfer.tile, call->span_);
         CHECK_SPAN(
             window.space == transfer.memory_space && window.end - window.begin >= transfer.capacity_bytes,
@@ -1505,6 +1518,7 @@ PeerLocalEffects ImportPeerLocalEffects(const FunctionPtr& function, const PeerT
     const auto body = transform_utils::FlattenToStmts(function->body_);
     result.structured.emplace(
         ImportedLocalSync{function, {}, paths.size() == 2 ? As<IfStmt>(body.back()).get() : nullptr});
+    result.structured->local_roots = footprint->Roots();
     result.parameters = parameters;
   }
   for (const auto& path : paths) {

@@ -411,15 +411,17 @@ class SelectRelays final : public SyncStatementMutator {
 };
 
 bool Conflicts(const ImportedLocalCut& producer, const ImportedLocalCut& consumer) {
-  for (const auto& from : producer.effects) {
-    for (const auto& to : consumer.effects) {
+  for (const auto& produced : producer.effects) {
+    const auto& from = produced.footprint;
+    for (const auto& consumed : consumer.effects) {
+      const auto& to = consumed.footprint;
       if (from.space != to.space || (!from.write && !to.write)) {
         continue;
       }
       // DDR roots can alias. For local memory a missing enclosure is a
       // wildcard and a present enclosure covers every reachable placement.
-      if (from.space == MemorySpace::DDR || !from.enclosure || !to.enclosure ||
-          (from.enclosure->begin < to.enclosure->end && to.enclosure->begin < from.enclosure->end)) {
+      if (from.space == MemorySpace::DDR || !from.byte_hull || !to.byte_hull ||
+          (from.byte_hull->begin < to.byte_hull->end && to.byte_hull->begin < from.byte_hull->end)) {
         return true;
       }
     }

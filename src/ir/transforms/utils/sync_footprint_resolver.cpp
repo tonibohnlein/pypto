@@ -275,16 +275,18 @@ bool ResolvedOperandFootprint::MayOverlap(const ResolvedOperandFootprint& other,
       !MatrixBoxFootprint::MayOverlap(*matrix_box, *other.matrix_box, roots)) {
     return false;
   }
-  return fiber.MayOverlap(other.fiber);
+  return slot_fiber.MayOverlap(other.slot_fiber) && fiber.MayOverlap(other.fiber);
+}
+
+bool ResolvedOperandFootprint::DefinitelyOverwritesWindow(
+    const std::optional<backend::BufferSyncByteWindow>& window) const {
+  return write && !read && definite_overwrite && window && window->begin < window->end &&
+         definite_overwrite->begin <= window->begin && window->end <= definite_overwrite->end;
 }
 
 bool ResolvedOperandFootprint::DefinitelyOverwrites(const ResolvedOperandFootprint& other) const {
-  // ResolveOperand grants this only to a static exact whole window (or an exact
-  // whole matrix slot). Requiring containment in that window is a coverage
-  // proof, even when the other's accesses move within it.
-  return candidate_full_overwrite && write && !read && space == other.space && root_id != 0 &&
-         root_id == other.root_id && byte_hull && other.byte_hull &&
-         byte_hull->begin <= other.byte_hull->begin && other.byte_hull->end <= byte_hull->end;
+  return space == other.space && root_id != 0 && root_id == other.root_id &&
+         DefinitelyOverwritesWindow(other.byte_hull);
 }
 
 std::array<ExprPtr, 2> FootprintRangeOperands(const CallPtr& call) {
@@ -587,9 +589,9 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
     // Find matching co-addressed canonical root (including Mat NZ <-> ZN transpose views).
     size_t root_id = 0;
     bool axis_swapped = false;
-    if (IsMatrixSpace(elem_type->memory_space_)) {
+    if (!peer_pop && IsMatrixSpace(elem_type->memory_space_)) {
       for (const auto& root : roots_) {
-        if (!root.placed || root.address != *address || root.bytes != total_bytes ||
+        if (!root.placed || root.peer_borrow || root.address != *address || root.bytes != total_bytes ||
             root.slot_count != slot_count)
           continue;
         if (IsIdenticalMatLayout(root, elem_type)) {
@@ -617,6 +619,7 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
       root.rows = rows;
       root.columns = cols;
       root.canonical_layout = IsMatrixSpace(elem_type->memory_space_) ? elem_type : nullptr;
+      root.peer_borrow = peer_pop ? var.get() : nullptr;
       roots_.push_back(std::move(root));
     }
 
@@ -707,14 +710,16 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
     }
 
     if (!is_const_slot && idx_range->affine_frame != nullptr && idx_range->modulus > 0) {
-      view.fiber.kind = IterationFiber::Kind::ModularSlot;
-      view.fiber.frame = idx_range->affine_frame;
-      view.fiber.modulus = idx_range->modulus;
-      view.fiber.coeff = idx_range->affine_coeff;
-      view.fiber.offset = idx_range->affine_base;
-      view.fiber.extent = 1;
-      view.fiber.basis = {IterationFiberBasis::Kind::SlotPartition, root.space, 0, root.address,
-                          root.slot_bytes};
+      view.slot_fiber = {
+          IterationFiber::Kind::ModularSlot,
+          idx_range->affine_frame,
+          idx_range->modulus,
+          idx_range->affine_coeff,
+          idx_range->affine_base,
+          1,
+          0,
+          nullptr,
+          {IterationFiberBasis::Kind::SlotPartition, root.space, 0, root.address, root.slot_bytes}};
     }
 
     views_.emplace(var.get(), std::move(view));
@@ -738,6 +743,7 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
     view.row_pitch_bytes = parent->row_pitch_bytes;
     view.slot_selector = parent->slot_selector;
     view.raw_slot_expr = parent->raw_slot_expr;
+    view.slot_fiber = parent->slot_fiber;
     view.peer_borrow = parent->peer_borrow;
     view.peer_reserve = parent->peer_reserve;
     view.axis_swapped = parent->axis_swapped;
@@ -974,8 +980,7 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
 
 ResolvedOperandFootprint SyncFootprintResolver::ResolveOperand(const Stmt* cut, const CallPtr& call,
                                                                size_t arg_idx, BufferAccess mode,
-                                                               MemorySpace space, bool enable_refresh_kill,
-                                                               bool disjoint_gm,
+                                                               MemorySpace space, bool disjoint_gm,
                                                                bool peer_slot_relative) const {
   ResolvedOperandFootprint out;
   out.space = space;
@@ -1001,6 +1006,7 @@ ResolvedOperandFootprint SyncFootprintResolver::ResolveOperand(const Stmt* cut, 
   }
   out.root_id = view->root_id;
   out.byte_hull = view->byte_hull;
+  out.slot_fiber = view->slot_fiber;
   out.fiber = view->fiber;
 
   if (space == MemorySpace::Vec) {
@@ -1009,9 +1015,8 @@ ResolvedOperandFootprint SyncFootprintResolver::ResolveOperand(const Stmt* cut, 
       out.vec_lattice = StridedByteFootprint{out.byte_hull->begin, out.byte_hull->end - out.byte_hull->begin,
                                              1, out.byte_hull->end - out.byte_hull->begin, false};
     }
-    if (enable_refresh_kill && IsFullOverwriteOpOperand(call, mode, space, operand) &&
-        ExactFullWindow(operand).has_value()) {
-      out.candidate_full_overwrite = true;
+    if (IsFullOverwriteOpOperand(call, mode, space, operand) && ExactFullWindow(operand).has_value()) {
+      out.definite_overwrite = out.byte_hull;
       if (out.vec_lattice) out.vec_lattice->exact = true;
     } else if (out.vec_lattice && !IsFullOverwriteOpOperand(call, mode, space, operand)) {
       // Partial scalar writes (e.g. buffer.write) or indexed reads are not exact full overwrites.
@@ -1070,9 +1075,14 @@ ResolvedOperandFootprint SyncFootprintResolver::ResolveOperand(const Stmt* cut, 
                              (!out.byte_hull || !OverlapsDynamicValid(space, *out.byte_hull));
       out.matrix_box =
           MatrixBoxFootprint{view->root_id, slot_lo, slot_hi, r_begin, r_end, c_begin, c_end, box_exact};
+      if (r_opt && c_opt && r_opt->lo >= 0 && c_opt->lo >= 0 && r_opt->hi <= root.rows - sub_rows &&
+          c_opt->hi <= root.columns - sub_cols) {
+        out.matrix_subtile = MatrixSubtileFootprint{*r_opt, *c_opt, sub_rows, sub_cols};
+      }
 
-      // If single-axis affine subtile movement and constant other axis, attach AffineSlice fiber!
-      if (out.fiber.kind == IterationFiber::Kind::Wildcard && single_slot) {
+      // A comparable within-slot row or column fiber can coexist with the
+      // modular slot fiber. The slot partition origin defines the matrix axes.
+      if (out.matrix_subtile && out.fiber.kind == IterationFiber::Kind::Wildcard) {
         if (r_opt && r_opt->affine_frame && r_opt->modulus == 0 && r_opt->affine_coeff != 0 &&
             ((c_opt && !c_opt->affine_frame && c_opt->is_const()) || root.columns == sub_cols) &&
             !r_opt->symbolic_base && c_begin == 0 && c_end == root.columns &&
@@ -1096,18 +1106,18 @@ ResolvedOperandFootprint SyncFootprintResolver::ResolveOperand(const Stmt* cut, 
         }
         if (out.fiber.kind == IterationFiber::Kind::AffineSlice) {
           out.fiber.basis = {IterationFiberBasis::Kind::MatrixSlot, root.space, root.id,
-                             view->base_byte_offset};
+                             single_slot ? view->base_byte_offset : root.address};
         }
       }
     }
   }
 
-  if (enable_refresh_kill && IsFullOverwriteOpOperand(call, mode, space, operand) && out.matrix_box &&
-      out.matrix_box->exact && out.matrix_box->slot_lo == out.matrix_box->slot_hi &&
-      out.matrix_box->row_begin == 0 && out.matrix_box->row_end == root.rows &&
-      out.matrix_box->col_begin == 0 && out.matrix_box->col_end == root.columns &&
+  if (IsFullOverwriteOpOperand(call, mode, space, operand) && out.matrix_box && out.matrix_box->exact &&
+      out.matrix_box->slot_lo == out.matrix_box->slot_hi && out.matrix_box->row_begin == 0 &&
+      out.matrix_box->row_end == root.rows && out.matrix_box->col_begin == 0 &&
+      out.matrix_box->col_end == root.columns &&
       (!out.byte_hull || !OverlapsDynamicValid(space, *out.byte_hull))) {
-    out.candidate_full_overwrite = true;
+    out.definite_overwrite = out.byte_hull;
   }
 
   return out;

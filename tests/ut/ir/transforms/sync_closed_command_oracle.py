@@ -418,7 +418,24 @@ class ClosedCommands:
 
     def assign(self, statement, env):
         call = statement.value
-        if isinstance(call, ir.Call) and call.op.name == opname("buffer.alloc"):
+        if isinstance(call, ir.Call) and call.op.name == opname("buffer.alloc_multi"):
+            kind = statement.var.type
+            assert isinstance(kind, ir.MultiBufferType)
+            env[statement.var] = value(call.args[1], env)
+        elif isinstance(call, ir.Call) and call.op.name == opname("buffer.slot"):
+            group, index = call.args
+            kind = statement.var.type
+            assert isinstance(kind, ir.BufferType) and kind.memory_space == ir.MemorySpace.Vec
+            rows, columns = kind.shape
+            item_bytes = kind.dtype.get_byte()
+            stride = rows * columns * item_bytes
+            slot = value(index, env)
+            assert stride % 32 == 0 and 0 <= slot < group.type.slot_count
+            address = env[group] + slot * stride
+            self.storage[statement.var] = (kind.memory_space, address, rows, columns, item_bytes)
+            self.layouts[statement.var] = kind
+            self.descriptors.append(self.signature(statement.var))
+        elif isinstance(call, ir.Call) and call.op.name == opname("buffer.alloc"):
             kind = statement.var.type
             assert isinstance(kind, ir.BufferType)
             self.storage[statement.var] = (

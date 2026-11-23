@@ -2902,48 +2902,46 @@ class Builder {
   void RefineStorage() {
     std::vector<std::vector<RawEffect>> raw(sites.size());
     for (size_t site = 0; site < sites.size(); ++site) {
+      const auto append = [&](PipeType pipe, const ResolvedOperandFootprint& resolved) {
+        if (resolved.read) {
+          raw[site].push_back({resolved.space, pipe, false, resolved.byte_hull, resolved.gm_root, false,
+                               resolved.vec_lattice, resolved.matrix_box, resolved.HistoryFiber()});
+        }
+        if (resolved.write) {
+          const bool refresh =
+              enable_refresh_kill_ && resolved.DefinitelyOverwritesWindow(resolved.byte_hull);
+          raw[site].push_back({resolved.space, pipe, true, resolved.byte_hull, resolved.gm_root, refresh,
+                               resolved.vec_lattice, resolved.matrix_box, resolved.HistoryFiber()});
+        }
+      };
       if (imported_) {
         const auto& cut = imported_->calls.at(sites[site].operation.get());
         for (const auto& effect : cut.effects) {
-          ExprPtr root;
+          auto resolved = effect.footprint;
           if (effect.gm_formal && !imported_->gm_domains.empty()) {
-            root = imported_->gm_domains.at(*effect.gm_formal);
+            resolved.gm_root = imported_->gm_domains.at(*effect.gm_formal);
           }
-          raw[site].push_back({effect.space, *cut.pipe, effect.write, effect.enclosure, root});
+          append(*cut.pipe, resolved);
         }
         continue;
       }
       const auto& operation = *sites[site].buffer_operation;
       const auto& call = operation.Operation();
       const auto pipe = operation.Implementation().Pipe();
-      const auto append = [&](MemorySpace space, BufferAccess mode,
-                              std::optional<backend::BufferSyncByteWindow> enclosure, ExprPtr root,
-                              bool candidate_full_overwrite, std::optional<StridedByteFootprint> vec_lattice,
-                              std::optional<MatrixBoxFootprint> matrix_box, IterationFiber fiber) {
-        if (mode == BufferAccess::Read || mode == BufferAccess::ReadWrite) {
-          raw[site].push_back({space, pipe, false, enclosure, root, false, vec_lattice, matrix_box, fiber});
-        }
-        if (mode == BufferAccess::Write || mode == BufferAccess::ReadWrite) {
-          raw[site].push_back({space, pipe, true, enclosure, root, candidate_full_overwrite,
-                               std::move(vec_lattice), std::move(matrix_box), std::move(fiber)});
-        }
-      };
       for (size_t index = 0; index < operation.ArgumentEffects().size(); ++index) {
         const auto mode = operation.ArgumentEffects()[index].data;
         if (mode == BufferAccess::None) continue;
         const auto& operand = call->args_[index];
         const auto space = Space(operand);
         if (space != MemorySpace::DDR) ++cost.enclosure_lookups;
-        auto resolved = resolver_.ResolveOperand(sites[site].cut.get(), call, index, mode, space,
-                                                 enable_refresh_kill_, disjoint_gm_);
+        auto resolved =
+            resolver_.ResolveOperand(sites[site].cut.get(), call, index, mode, space, disjoint_gm_);
         if (space == MemorySpace::DDR && disjoint_gm_ && !resolved.gm_root) {
           if (const auto found = gm_roots_.find(operand.get()); found != gm_roots_.end()) {
             resolved.gm_root = found->second;
           }
         }
-        append(space, mode, resolved.byte_hull, std::move(resolved.gm_root),
-               resolved.candidate_full_overwrite, std::move(resolved.vec_lattice),
-               std::move(resolved.matrix_box), std::move(resolved.fiber));
+        append(pipe, resolved);
       }
       for (const auto& effect : operation.Implementation().ImplicitEffects()) {
         std::optional<backend::BufferSyncByteWindow> enclosure;
@@ -2955,12 +2953,17 @@ class Builder {
                                                effect.end - effect.begin, false};
           }
         }
-        append(effect.space, effect.data, enclosure, nullptr, false, std::move(vec_lattice), std::nullopt,
-               IterationFiber::Wildcard());
+        ResolvedOperandFootprint resolved;
+        resolved.space = effect.space;
+        resolved.read = effect.data == BufferAccess::Read || effect.data == BufferAccess::ReadWrite;
+        resolved.write = effect.data == BufferAccess::Write || effect.data == BufferAccess::ReadWrite;
+        resolved.byte_hull = enclosure;
+        resolved.vec_lattice = vec_lattice;
+        append(pipe, resolved);
       }
     }
     StorageClasses classes;
-    classes.Build(raw, resolver_.Roots());
+    classes.Build(raw, imported_ ? imported_->local_roots : resolver_.Roots());
 
     // A history group can expire old affine offsets only if all of its moving
     // accesses share an origin, unit, and coordinate mapping. The physical

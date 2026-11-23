@@ -256,9 +256,17 @@ general overlapping rectangles can still produce quadratic C. `class_tests` coun
 analysis still enforces its existing per-visit membership and refresh premises
 before using a compact repeated result.
 
-Dynamic valid-state updates, runtime view offsets, rotating slot selections and
-noncontiguous reshapes lack the required importer/readiness certificates and
-remain delegated. GM view/stride support remains subject to the existing
+Qualified rotating placements use a shared footprint resolver. It records the
+slot selector separately from the rectangle inside a slot. For example, an
+outer visit can select `outer % 2` while an inner visit reads the columns
+starting at `inner * 16`. Exact import retains both frames. Conservative
+dataflow tracks the slot history and encloses the inner visits in a ranged
+matrix box. For an ambiguous peer receive, the possible bytes cover the whole
+ring and the receive supplies no definite whole-ring overwrite.
+
+Dynamic valid-state updates, runtime view offsets, unproved selectors and
+noncontiguous reshapes require their own importer and readiness proofs. GM
+view/stride support remains subject to the existing
 importer and emitter contracts: this extension does not turn a pitched GM view
 into a packed one or infer alias guarantees from SSA identity. Static full-valid
 local views do not establish general dynamic metadata support.
