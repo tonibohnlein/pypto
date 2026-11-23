@@ -18,7 +18,6 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,6 +31,7 @@
 #include "src/ir/transforms/utils/closed_prefix_sync.h"
 #include "src/ir/transforms/utils/physical_sync_replay.h"
 #include "src/ir/transforms/utils/sync_coordinate_eval.h"
+#include "src/ir/transforms/utils/sync_statement_rewrite.h"
 
 namespace pypto::ir::sync {
 namespace {
@@ -47,6 +47,7 @@ using Units = std::vector<std::vector<StmtPtr>>;
 constexpr size_t kReplayWorkLimit = 32768;
 constexpr size_t kReplayCandidateLimit = 32;
 constexpr size_t kReplayDepthLimit = 128;
+constexpr size_t kReplayVisitChoiceLimit = 5;
 
 std::optional<Step> ReadCommand(const CallPtr& call, FunctionType type) {
   if (!call || !call->args_.empty()) return std::nullopt;
@@ -103,17 +104,18 @@ Units ReadHandoff(const std::vector<StmtPtr>& handoff, FunctionType type) {
 struct TapeStep {
   Step step;
   uint32_t candidate = 0;
+  uint32_t required_visits = 0;
   Ranks original_prefix{};
 };
 
-// Evaluate only concrete control. Unknown caller-dependent branches, loop
-// bounds, scalar carries, early returns and opaque native commands all retain
-// the original plan. A finite trace with unknown payload operands is safe:
-// the backend proves native pipe ownership independently of their values.
+// Replay concrete control and loops proved to execute at most once. An unknown
+// induction value is sufficient when the body's command sequence is still known:
+// the backend proves native pipe ownership independently of payload operands.
 class InvocationTape {
  public:
-  InvocationTape(FunctionType core, const std::string& target, const std::map<const Stmt*, uint32_t>& bits)
-      : core_(core), target_(target), bits_(bits) {}
+  InvocationTape(FunctionType core, const std::string& target, const std::map<const Stmt*, uint32_t>& bits,
+                 const std::map<const ForStmt*, HandoffReplayTrip>& single_visit_loops)
+      : core_(core), target_(target), bits_(bits), single_visit_loops_(single_visit_loops) {}
 
   bool Build(const SeqStmtsPtr& body) {
     if (!body || body->stmts_.empty()) return false;
@@ -127,14 +129,18 @@ class InvocationTape {
     return true;
   }
 
+  size_t PathCount() const { return size_t{1} << visit_choices_; }
   std::vector<TapeStep> steps;
 
  private:
   FunctionType core_;
   const std::string& target_;
   const std::map<const Stmt*, uint32_t>& bits_;
+  const std::map<const ForStmt*, HandoffReplayTrip>& single_visit_loops_;
   std::map<const Var*, ExprPtr> coordinates_;
   size_t work_ = 0;
+  size_t visit_choices_ = 0;
+  uint32_t active_visits_ = 0;
   std::map<const Call*, std::optional<Step>> calls_;
 
   // Memoize subtree costs by identity so operand DAGs are inspected once.
@@ -255,7 +261,12 @@ class InvocationTape {
     const auto start = As<ConstInt>(Evaluate(loop->start_));
     const auto stop = As<ConstInt>(Evaluate(loop->stop_));
     const auto step = As<ConstInt>(Evaluate(loop->step_));
-    if (!start || !stop || !step || step->value_ <= 0) return false;
+    if (!start || !stop || !step) {
+      return ReadSingleVisit(loop, body_depth, start);
+    }
+    if (step->value_ <= 0) {
+      return false;
+    }
     for (__int128 iv = start->value_; iv < stop->value_; iv += step->value_) {
       // Reject the overflowing final update as well as oversized tapes.
       if (++work_ > kReplayWorkLimit || iv + step->value_ > std::numeric_limits<int64_t>::max()) return false;
@@ -265,6 +276,33 @@ class InvocationTape {
     }
     coordinates_.erase(loop->loop_var_.get());
     return true;
+  }
+
+  bool ReadSingleVisit(const ForStmtPtr& loop, size_t body_depth, const ConstIntPtr& start) {
+    const auto fact = single_visit_loops_.find(loop.get());
+    if (fact == single_visit_loops_.end() || !PlainExpression(loop->start_) ||
+        !PlainExpression(loop->stop_) || !PlainExpression(loop->step_)) {
+      return false;
+    }
+    const auto enclosing_visits = active_visits_;
+    if (fact->second == HandoffReplayTrip::ZeroOrOne) {
+      if (visit_choices_ == kReplayVisitChoiceLimit) {
+        return false;
+      }
+      active_visits_ |= uint32_t{1} << visit_choices_++;
+    }
+    if (start) {
+      coordinates_.insert_or_assign(loop->loop_var_.get(), start);
+    } else {
+      coordinates_.erase(loop->loop_var_.get());
+    }
+    // A skipped visit contributes no commands. Bindings defined inside the
+    // body cannot escape a loop without carries, so following cuts use the
+    // same scalar environment regardless of the visit.
+    const bool supported = Read(loop->body_, body_depth);
+    coordinates_.erase(loop->loop_var_.get());
+    active_visits_ = enclosing_visits;
+    return supported;
   }
 
   bool ReadCall(const CallPtr& call, const StmtPtr& stmt) {
@@ -287,7 +325,7 @@ class InvocationTape {
     }
     if (found->second) {
       const auto candidate = bits_.find(stmt.get());
-      steps.push_back({*found->second, candidate == bits_.end() ? 0 : candidate->second, {}});
+      steps.push_back({*found->second, candidate == bits_.end() ? 0 : candidate->second, active_visits_, {}});
     }
     return true;
   }
@@ -301,6 +339,29 @@ bool CaptureBaseline(std::vector<TapeStep>& tape, bool scalar_serial) {
     if (!queues.Apply(item.step)) return false;
   }
   return queues.AllConsumed();
+}
+
+std::optional<std::vector<std::vector<TapeStep>>> CapturePaths(const InvocationTape& tape,
+                                                               bool scalar_serial) {
+  const auto paths = tape.PathCount();
+  if (tape.steps.size() > kReplayWorkLimit / paths) {
+    return std::nullopt;
+  }
+  std::vector<std::vector<TapeStep>> baselines(paths);
+  // Independent choices may include infeasible combinations. Every feasible
+  // path is present, and skipped loops leave the entering queues untouched.
+  for (size_t path = 0; path < paths; ++path) {
+    auto& baseline = baselines[path];
+    for (const auto& item : tape.steps) {
+      if ((path & item.required_visits) == item.required_visits) {
+        baseline.push_back(item);
+      }
+    }
+    if (!CaptureBaseline(baseline, scalar_serial)) {
+      return std::nullopt;
+    }
+  }
+  return baselines;
 }
 
 bool PreservesOrder(const std::vector<TapeStep>& tape, uint32_t removed, bool scalar_serial) {
@@ -318,10 +379,46 @@ bool PreservesOrder(const std::vector<TapeStep>& tape, uint32_t removed, bool sc
   return queues.AllConsumed();
 }
 
+class RemoveHandoffCommands : public SyncStatementMutator {
+ public:
+  RemoveHandoffCommands(const std::map<const Stmt*, uint32_t>& bits, uint32_t removed)
+      : bits_(bits), removed_(removed) {}
+
+  size_t RemovedSites() const { return removed_sites_; }
+
+ protected:
+  StmtPtr VisitStmt_(const SeqStmtsPtr& sequence) override {
+    std::vector<StmtPtr> preserved;
+    preserved.reserve(sequence->stmts_.size());
+    bool changed = false;
+    for (const auto& stmt : sequence->stmts_) {
+      const auto bit = bits_.find(stmt.get());
+      if (bit != bits_.end() && (bit->second & removed_) != 0) {
+        ++removed_sites_;
+        changed = true;
+        continue;
+      }
+      auto next = VisitStmt(stmt);
+      changed |= next != stmt;
+      preserved.push_back(std::move(next));
+    }
+    if (!changed) {
+      return sequence;
+    }
+    return std::make_shared<SeqStmts>(std::move(preserved), sequence->span_);
+  }
+
+ private:
+  const std::map<const Stmt*, uint32_t>& bits_;
+  uint32_t removed_;
+  size_t removed_sites_ = 0;
+};
+
 }  // namespace
 
 void ReduceRegionalSyncHandoffs(PhysicalSyncRealization& result, const std::string& target,
-                                const std::vector<std::vector<StmtPtr>>& handoffs) {
+                                const std::vector<std::vector<StmtPtr>>& handoffs,
+                                const std::map<const ForStmt*, HandoffReplayTrip>& single_visit_loops) {
   if (handoffs.empty()) return;
   const auto body = As<SeqStmts>(result.function->body_);
   if (!body) return;
@@ -344,16 +441,16 @@ void ReduceRegionalSyncHandoffs(PhysicalSyncRealization& result, const std::stri
       if (!bits.emplace(stmt.get(), uint32_t{1} << i).second) return;
     }
   }
-  std::set<const Stmt*> seen;
-  for (const auto& stmt : body->stmts_) {
-    if (bits.count(stmt.get()) && !seen.insert(stmt.get()).second) return;
-  }
-  if (seen.size() != bits.size()) return;
-
-  InvocationTape tape(core, target, bits);
+  InvocationTape tape(core, target, bits, single_visit_loops);
   try {
-    if (!tape.Build(body) || !CaptureBaseline(tape.steps, serial)) return;
+    if (!tape.Build(body)) {
+      return;
+    }
   } catch (const pypto::ValueError&) {
+    return;
+  }
+  auto baselines = CapturePaths(tape, serial);
+  if (!baselines) {
     return;
   }
 
@@ -372,7 +469,9 @@ void ReduceRegionalSyncHandoffs(PhysicalSyncRealization& result, const std::stri
     // Keep a complete literal flag ownership marker for the optional leaf
     // path. Deleting the last pair would send the original owner to PTOAS.
     return removed_pairs < result.set_sites && removed_pairs < result.wait_sites &&
-           PreservesOrder(tape.steps, mask, serial);
+           std::all_of(
+               baselines->begin(), baselines->end(),
+               [&](const auto& path) { return PreservesOrder(path, mask, serial); });
   };
   auto removed = static_cast<uint32_t>(all);
   if (!accepts(removed)) {
@@ -390,23 +489,28 @@ void ReduceRegionalSyncHandoffs(PhysicalSyncRealization& result, const std::stri
   }
   if (!removed) return;
 
-  std::vector<StmtPtr> preserved;
-  for (const auto& stmt : body->stmts_) {
-    const auto bit = bits.find(stmt.get());
-    if (bit == bits.end() || (bit->second & removed) == 0) preserved.push_back(stmt);
-  }
+  size_t removed_pairs = 0;
+  size_t removed_barriers = 0;
   for (size_t i = 0; i < candidates.size(); ++i) {
     if ((removed & (uint32_t{1} << i)) == 0) continue;
     if (candidates[i].size() == 1) {
-      --result.barrier_sites;
+      ++removed_barriers;
     } else {
-      --result.set_sites;
-      --result.wait_sites;
+      ++removed_pairs;
     }
   }
+  RemoveHandoffCommands rewrite(bits, removed);
+  auto reduced_body = rewrite.VisitStmt(body);
+  if (rewrite.RemovedSites() != 2 * removed_pairs + removed_barriers ||
+      removed_barriers > result.barrier_sites) {
+    return;
+  }
   auto function = MutableCopy(result.function);
-  function->body_ = std::make_shared<SeqStmts>(std::move(preserved), body->span_);
+  function->body_ = std::move(reduced_body);
   result.function = std::move(function);
+  result.set_sites -= removed_pairs;
+  result.wait_sites -= removed_pairs;
+  result.barrier_sites -= removed_barriers;
 }
 
 }  // namespace pypto::ir::sync

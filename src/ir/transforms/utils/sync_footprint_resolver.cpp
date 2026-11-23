@@ -683,7 +683,6 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
     view.base_byte_offset = static_cast<int64_t>(begin);
     view.row_pitch_bytes = parent->row_pitch_bytes;
     view.slot_selector = *idx_range;
-    view.raw_slot_expr = call->args_[1];
     view.axis_swapped = parent->axis_swapped;
     view.valid_matrix_coords = parent->valid_matrix_coords && IsMatrixSpace(dst_type->memory_space_);
     const bool is_const_slot = idx_range->is_const();
@@ -742,7 +741,6 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
     view.base_byte_offset = parent->base_byte_offset;
     view.row_pitch_bytes = parent->row_pitch_bytes;
     view.slot_selector = parent->slot_selector;
-    view.raw_slot_expr = parent->raw_slot_expr;
     view.slot_fiber = parent->slot_fiber;
     view.peer_borrow = parent->peer_borrow;
     view.peer_reserve = parent->peer_reserve;
@@ -779,9 +777,6 @@ void SyncFootprintResolver::ResolveAssign(const AssignStmtPtr& assign) {
           c_hi = max_c;
         }
       }
-      if (r_opt) view.view_offsets[0] = *r_opt;
-      if (c_opt) view.view_offsets[1] = *c_opt;
-
       // A moving parent's base_byte_offset is only a lower bound. For a chained
       // subview, require a lattice of exactly the parent's static shape: any
       // movement in the lattice adds rows or widens its byte intervals.

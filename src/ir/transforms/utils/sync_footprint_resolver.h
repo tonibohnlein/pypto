@@ -165,8 +165,6 @@ struct SyncResolvedView {
   int64_t base_byte_offset = 0;  // Static/min byte offset in `space` (Vec) or slot 0
   int64_t row_pitch_bytes = 0;   // Inherited physical row stride in bytes (Vec)
   std::optional<SymbolicIntRange> slot_selector;
-  ExprPtr raw_slot_expr;
-  std::array<SymbolicIntRange, 2> view_offsets{};
   bool axis_swapped = false;         // True when handle views `root_id` through NZ <-> ZN transpose
   bool valid_matrix_coords = false;  // True when handle coordinates map to canonical root_id rows/cols
   bool static_full_valid = false;    // Full static valid_shape & untouched by buffer.set_validshape

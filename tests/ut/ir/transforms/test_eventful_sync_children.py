@@ -205,11 +205,13 @@ def test_missing_child_entry_rearm_or_capacity_is_an_explicit_refusal():
                             isinstance(publication, ir.AssignStmt)
                             and isinstance(publication.value, ir.Call)
                             and publication.value.op.name == ir.get_op("sync.record").name
-                            and publication.value.kwargs["pipe"] in (int(ir.PipeType.MTE1), int(ir.PipeType.M))
+                            and publication.value.kwargs["pipe"]
+                            in (int(ir.PipeType.MTE1), int(ir.PipeType.M))
                             and isinstance(acquisition, ir.EvalStmt)
                             and isinstance(acquisition.expr, ir.Call)
                             and acquisition.expr.op.name == ir.get_op("sync.wait").name
-                            and acquisition.expr.kwargs["dst_pipe"] in (int(ir.PipeType.MTE1), int(ir.PipeType.M))
+                            and acquisition.expr.kwargs["dst_pipe"]
+                            in (int(ir.PipeType.MTE1), int(ir.PipeType.M))
                             and acquisition.expr.kwargs["dst_pipe"] != publication.value.kwargs["pipe"]
                             and acquisition.expr.args[0] is publication.var
                         ):
@@ -498,7 +500,7 @@ def test_command_only_child_pipes_require_their_own_entry_evidence():
     assert ir.serialize(logical) == before
 
 
-def readonly_external_fixture(count=3, *, local_offset=False):
+def readonly_external_fixture(count=3, *, local_offset_scale=None):
     function, previous = eventful_fixture(count)
     span = function.span
     root = list(sequence_stmts(function.body))
@@ -519,7 +521,9 @@ def readonly_external_fixture(count=3, *, local_offset=False):
         return ir.MakeTuple(values, span)
 
     body: list[ir.Stmt] = [
-        ir.AssignStmt(address, ir.Mul(outer.loop_var, ci(0), ir.DataType.INDEX, span), span),
+        ir.AssignStmt(
+            address, ir.Mul(outer.loop_var, ci(local_offset_scale or 0), ir.DataType.INDEX, span), span
+        ),
         payload(
             "buffer.load",
             [function.params[0], rectangle([address, ci(0)]), rectangle([ci(64), ci(32)]), handles[0]],
@@ -530,7 +534,7 @@ def readonly_external_fixture(count=3, *, local_offset=False):
         ),
         *sequence_stmts(previous.body),
     ]
-    if local_offset:
+    if local_offset_scale is not None:
         body[3] = payload("buffer.extract", [handles[0], address, ci(0), handles[2]])
     child = ir.ForStmt(
         previous.loop_var, previous.start, previous.stop, previous.step, [], ir.SeqStmts(body, span), [], span
@@ -597,8 +601,26 @@ def test_readonly_external_projection_retains_exact_local_math_and_unavailable_g
                 )
 
 
+def test_zero_scaled_external_coordinate_proves_the_local_matrix_address():
+    original, scope, oracle = readonly_external_fixture(3, local_offset_scale=0)
+    child, _, _ = construct(original, scope)
+    retained = testing.inspect_eventful_sync_child(child)
+    unavailable = [
+        i for i, domain in enumerate(retained.describe()["storage"]) if not domain["boundary_available"]
+    ]
+    checked = validate(
+        oracle,
+        retained,
+        parameters={3: 2, 4: True, 5: 1},
+        unavailable_boundaries=unavailable,
+        readonly_external_projection=True,
+    )
+    assert checked["payloads"] == 15
+
+
 def test_opaque_external_coordinate_cannot_supply_a_local_numeric_proof():
-    original, scope, _ = readonly_external_fixture(3, local_offset=True)
+    # A nonzero, fractal-aligned scale preserves the unknown outer coordinate.
+    original, scope, _ = readonly_external_fixture(3, local_offset_scale=16)
     before = ir.serialize(original)
     with passes.PassContext([]):
         with pytest.raises(ValueError, match="caller range|synchronization access|affine"):
@@ -777,7 +799,12 @@ def test_eventful_child_preserves_preexisting_debt_across_partial_completion():
         [],
         ir.SeqStmts(
             [
-                ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span
+                    ),
+                    span,
+                ),
                 ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [x, y], ir.VoidType(), span), span),
                 ir.YieldStmt([], span),
             ],
@@ -795,9 +822,19 @@ def test_eventful_child_preserves_preexisting_debt_across_partial_completion():
                 ir.AssignStmt(x, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(0)], vec_t, span), span),
                 ir.AssignStmt(y, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(128)], vec_t, span), span),
                 # Prior MTE2 write on y (must remain live for MTE3 store even across child).
-                ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), y], ir.VoidType(), span), span),
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), y], ir.VoidType(), span
+                    ),
+                    span,
+                ),
                 ir.IfStmt(flag, child, None, [], span),
-                ir.EvalStmt(ir.Call(ir.get_op("buffer.store"), [y, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span), span),
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.get_op("buffer.store"), [y, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span
+                    ),
+                    span,
+                ),
                 ir.ReturnStmt([out], span),
             ],
             span,
@@ -859,8 +896,18 @@ def test_eventful_child_does_not_claim_post_record_write_complete():
         [],
         ir.SeqStmts(
             [
-                ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), a], ir.VoidType(), span), span),
-                ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), c], ir.VoidType(), span), span),
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), a], ir.VoidType(), span
+                    ),
+                    span,
+                ),
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), c], ir.VoidType(), span
+                    ),
+                    span,
+                ),
                 ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [a, b], ir.VoidType(), span), span),
                 ir.YieldStmt([], span),
             ],
@@ -881,7 +928,12 @@ def test_eventful_child_does_not_claim_post_record_write_complete():
                 ir.AssignStmt(z, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(384)], vec_t, span), span),
                 child,
                 ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [c, z], ir.VoidType(), span), span),
-                ir.EvalStmt(ir.Call(ir.get_op("buffer.store"), [z, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span), span),
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.get_op("buffer.store"), [z, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span
+                    ),
+                    span,
+                ),
                 ir.ReturnStmt([out], span),
             ],
             span,
@@ -937,7 +989,12 @@ def test_eventful_child_preserves_unrelated_self_pipe_debt():
         [],
         ir.SeqStmts(
             [
-                ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span), span),
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), x], ir.VoidType(), span
+                    ),
+                    span,
+                ),
                 ir.YieldStmt([], span),
             ],
             span,
@@ -955,11 +1012,21 @@ def test_eventful_child_preserves_unrelated_self_pipe_debt():
                 ir.AssignStmt(x, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(128)], vec_t, span), span),
                 ir.AssignStmt(y, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(256)], vec_t, span), span),
                 ir.AssignStmt(z, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(384)], vec_t, span), span),
-                ir.EvalStmt(ir.Call(ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), a], ir.VoidType(), span), span),
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.get_op("buffer.load"), [src, tup([0, 0]), tup([2, 8]), a], ir.VoidType(), span
+                    ),
+                    span,
+                ),
                 ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [a, y], ir.VoidType(), span), span),
                 child,
                 ir.EvalStmt(ir.Call(ir.get_op("buffer.abs"), [y, z], ir.VoidType(), span), span),
-                ir.EvalStmt(ir.Call(ir.get_op("buffer.store"), [z, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span), span),
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.get_op("buffer.store"), [z, tup([0, 0]), tup([2, 8]), out], ir.VoidType(), span
+                    ),
+                    span,
+                ),
                 ir.ReturnStmt([out], span),
             ],
             span,
@@ -1060,12 +1127,8 @@ def test_readonly_child_binds_if_return_var_scalars():
         [out.type],
         ir.SeqStmts(
             [
-                ir.AssignStmt(
-                    x_buf, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(0)], vec_t, span), span
-                ),
-                ir.AssignStmt(
-                    y, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(8192)], vec_t, span), span
-                ),
+                ir.AssignStmt(x_buf, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(0)], vec_t, span), span),
+                ir.AssignStmt(y, ir.Call(ir.get_op("buffer.alloc"), [tup([]), ci(8192)], vec_t, span), span),
                 branch,
                 ir.AssignStmt(m0, ir.Mul(row_phi, ci(16), idx, span), span),
                 child,

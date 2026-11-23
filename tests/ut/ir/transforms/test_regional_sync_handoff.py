@@ -20,7 +20,9 @@ from .test_vec_sync_analysis import vec_fixture
 pytestmark = pytest.mark.usefixtures("ascend_backend")
 
 
-@pytest.mark.parametrize("mode", ["concrete", "unknown_guard", "reuse"])
+@pytest.mark.parametrize(
+    "mode", ["concrete", "unknown_guard", "reuse", "nested", "nested_reuse", "nested_iv_guard"]
+)
 def test_retained_region_handoff_preserves_selected_payload_order(mode):
     original = vec_fixture(operation="buffer.abs")
     span = original.span
@@ -45,17 +47,52 @@ def test_retained_region_handoff_preserves_selected_payload_order(mode):
         )
 
     first, second = region("produce", load), region("consume", compute)
-    statements = [
-        *allocations,
-        first,
+    reuse = mode in ("reuse", "nested_reuse")
+    nested = mode.startswith("nested")
+    successor = [
         *services.closed(consumer, consumer),
         *services.closed(source, consumer),
         second,
-        *(services.closed(source, consumer) if mode == "reuse" else []),
+        *(services.closed(source, consumer) if reuse else []),
         *services.closed(consumer, output),
         store,
     ]
-    parameters = list(zip(original.params, original.param_directions))
+    parameters = list(zip(original.params, original.param_directions, strict=True))
+    if nested:
+        # Each enclosing loop executes zero or one visit. The producer runs
+        # for two worker residues; the consumer runs only for the first.
+        worker = ir.Var("worker", ir.ScalarType(ir.DataType.INDEX), span)
+        parameters.append((worker, ir.ParamDirection.In))
+        iv = ir.Var("work_item", worker.type, span)
+        if mode == "nested_iv_guard":
+            # On one legal visit the source publishes a second event. The
+            # trip bound alone cannot prove the reverse relay redundant.
+            repeat = ir.IfStmt(
+                ir.Eq(iv, ci(1), ir.DataType.BOOL, span),
+                ir.SeqStmts(services.closed(source, consumer), span),
+                None,
+                [],
+                span,
+            )
+            successor.append(repeat)
+
+        def optional_work(binder, stop, body):
+            return ir.ForStmt(
+                binder,
+                ir.FloorMod(worker, ci(3), ir.DataType.INDEX, span),
+                ci(stop),
+                ci(3),
+                [],
+                ir.SeqStmts([*body, ir.YieldStmt([], span)], span),
+                [],
+                span,
+            )
+
+        # Offset 1 must also reach the conditional republication above.
+        # Use the same two active residues in that control.
+        first = optional_work(ir.Var("producer_work", worker.type, span), 2, [first])
+        successor = [optional_work(iv, 2 if mode == "nested_iv_guard" else 1, successor)]
+    statements = [*allocations, first, *successor]
     if mode == "unknown_guard":
         coordinate = ir.Var("caller_coordinate", ir.ScalarType(ir.DataType.INDEX), span)
         parameters.append((coordinate, ir.ParamDirection.In))
@@ -79,11 +116,19 @@ def test_retained_region_handoff_preserves_selected_payload_order(mode):
         physical = next(iter(passes.lower_sync()(program).functions.values()))
     assert physical.attrs["pypto_autosync"] is True
 
-    def handoff(function):
+    def successor_body(function):
         body = list(sequence_stmts(function.body))
-        before, after = [i for i, stmt in enumerate(body) if isinstance(stmt, ir.ForStmt)]
+        if nested:
+            outer = next(stmt for stmt in reversed(body) if isinstance(stmt, ir.ForStmt))
+            return list(sequence_stmts(outer.body))
+        return body
+
+    def handoff(function):
+        body = successor_body(function)
+        loops = [i for i, stmt in enumerate(body) if isinstance(stmt, ir.ForStmt)]
+        first, last = (-1, loops[0]) if nested else loops
         commands = []
-        for stmt in body[before + 1 : after]:
+        for stmt in body[first + 1 : last]:
             assert isinstance(stmt, ir.EvalStmt) and isinstance(stmt.expr, ir.Call)
             commands.append(stmt.expr)
         return commands
@@ -98,12 +143,14 @@ def test_retained_region_handoff_preserves_selected_payload_order(mode):
         assert optimized_names == baseline_handoff
         return
 
-    if mode == "reuse":
+    if mode == "nested_iv_guard":
+        assert optimized_names == baseline_handoff
+    elif reuse:
         # Both publications use the same MTE2→V bank. The reverse relay
         # conveys consumption of the first wait to the second publication.
         forward_ids = [
             call.kwargs["event_id"]
-            for stmt in sequence_stmts(physical.body)
+            for stmt in successor_body(physical)
             if isinstance(stmt, ir.EvalStmt)
             and isinstance(call := stmt.expr, ir.Call)
             and call.op.name == set_flag
@@ -120,4 +167,6 @@ def test_retained_region_handoff_preserves_selected_payload_order(mode):
             call.kwargs["src_pipe"] == int(source) and call.kwargs["dst_pipe"] == int(consumer)
             for call in optimized_handoff
         )
-    check_closed_commands(baseline, physical, {}, compare_commands=False)
+    inputs = [{len(parameters) - 1: n} for n in (-1, 0, 1, 2, 3)] if nested else [{}]
+    for params in inputs:
+        check_closed_commands(baseline, physical, params, compare_commands=False)

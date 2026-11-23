@@ -1403,16 +1403,16 @@ class Assignment {
 class Emit : public SyncStatementMutator {
  public:
   Emit(const Assignment& assignment, FunctionType core, const std::map<const ForStmt*, StmtPtr>& children,
-       bool collect_handoffs)
+       const SyncControlRangeProver* handoff_prover)
       : assignment_(assignment),
         core_(core == FunctionType::AIV ? "aiv" : "aic"),
         children_(children),
-        collect_handoffs_(collect_handoffs) {}
+        handoff_prover_(handoff_prover) {}
 
   std::vector<std::vector<StmtPtr>> handoffs;
+  std::map<const ForStmt*, HandoffReplayTrip> single_visit_loops;
 
   FunctionPtr Rewrite(const FunctionPtr& function) {
-    if (collect_handoffs_) top_level_ = As<SeqStmts>(function->body_).get();
     const auto body = VisitStmt(function->body_);
     return std::make_shared<Function>(function->name_, function->params_, function->param_directions_,
                                       function->return_types_, body, function->span_, function->func_type_,
@@ -1425,18 +1425,20 @@ class Emit : public SyncStatementMutator {
     std::vector<StmtPtr> rewritten;
     rewritten.reserve(sequence->stmts_.size());
     std::vector<StmtPtr> generated_tail;
-    bool previous_child = false;
     for (const auto& statement : sequence->stmts_) {
+      const bool had_child = seen_child_;
       auto next = VisitStmt(statement);
-      // Keep provenance through emission. Only adjacent generated parent
-      // commands at an entry between retained children may be removed.
-      if (sequence.get() == top_level_) {
+      // A later retained child may be inside a different control region. Keep
+      // each contiguous run of generated commands at its own entry, and leave
+      // reaching paths and cross-visit reuse to the physical replay.
+      if (handoff_prover_ && had_child) {
         const auto loop = As<ForStmt>(statement);
         if (loop && children_.count(loop.get())) {
-          if (previous_child && !generated_tail.empty()) handoffs.push_back(std::move(generated_tail));
-          previous_child = true;
+          if (!generated_tail.empty()) {
+            handoffs.push_back(std::move(generated_tail));
+          }
           generated_tail.clear();
-        } else if (previous_child && assignment_.Find(statement)) {
+        } else if (assignment_.Find(statement)) {
           if (const auto commands = As<SeqStmts>(next))
             generated_tail.insert(generated_tail.end(), commands->stmts_.begin(), commands->stmts_.end());
           else
@@ -1456,7 +1458,19 @@ class Emit : public SyncStatementMutator {
 
   StmtPtr VisitStmt_(const ForStmtPtr& loop) override {
     const auto found = children_.find(loop.get());
-    return found == children_.end() ? SyncStatementMutator::VisitStmt_(loop) : found->second;
+    if (found != children_.end()) {
+      seen_child_ = true;
+      return found->second;
+    }
+    auto rewritten = SyncStatementMutator::VisitStmt_(loop);
+    if (handoff_prover_ && handoff_prover_->HasSafeNonnegativeLoopBounds(loop.get()) &&
+        handoff_prover_->IsAtMostOneTrip(loop.get())) {
+      // The statement mutator copies the loop with the same bounds and binder.
+      const auto trip = handoff_prover_->IsPositiveTrip(loop.get()) ? HandoffReplayTrip::ExactlyOne
+                                                                    : HandoffReplayTrip::ZeroOrOne;
+      single_visit_loops.emplace(As<ForStmt>(rewritten).get(), trip);
+    }
+    return rewritten;
   }
 
   StmtPtr VisitStmt_(const AssignStmtPtr& statement) override {
@@ -1513,8 +1527,8 @@ class Emit : public SyncStatementMutator {
   const Assignment& assignment_;
   std::string core_;
   const std::map<const ForStmt*, StmtPtr>& children_;
-  bool collect_handoffs_;
-  const SeqStmts* top_level_ = nullptr;
+  const SyncControlRangeProver* handoff_prover_;
+  bool seen_child_ = false;
 };
 
 }  // namespace
@@ -1935,7 +1949,7 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
       complete_invocation && !imported && discovered.children.size() > 1 &&
       function->HasAttr(kAttrAutosyncAnalysisPolicy) &&
       function->GetAttr<std::string>(kAttrAutosyncAnalysisPolicy) == "conservative_prefix";
-  Emit emit(assignment, function->func_type_, children, reduce_handoffs);
+  Emit emit(assignment, function->func_type_, children, reduce_handoffs ? &prover : nullptr);
   result.function = emit.Rewrite(function);
   result.set_sites = assignment.OneWaySites() + assignment.OneWayFallbackSites() + child_sets;
   result.wait_sites = assignment.OneWaySites() + assignment.OneWayFallbackSites() + child_waits;
@@ -1947,7 +1961,9 @@ std::optional<PhysicalSyncRealization> TryLowerClosedPrefixSync(
   result.schedule_control_growth_debit =
       schedule_policy.max_extra_control_nodes - remaining_schedule.max_extra_control_nodes;
   result.native_reserved_ids = assignment.NativeClaimed();
-  if (reduce_handoffs) ReduceRegionalSyncHandoffs(result, target, emit.handoffs);
+  if (reduce_handoffs) {
+    ReduceRegionalSyncHandoffs(result, target, emit.handoffs, emit.single_visit_loops);
+  }
   return result;
 }
 }  // namespace pypto::ir::sync

@@ -188,14 +188,14 @@ back to the publishing pipe before the next visit. These checks use the
 original control flow and introduce no guards. If the relay would also
 deliver unrelated work, the original batch remains eligible.
 
-Two successive retained child loops can transfer completion through an
-existing event. For a bounded invocation with known control flow, the
-planner replays the generated pairs and local barriers at the second
-child's entry against the complete physical schedule. It can drop a pair
-or barrier when every payload still sees the same completed prefix on each
-pipe at issue, every event is consumed before reuse, and all events are
-consumed at exit. An unknown branch, an opaque native effect, or a replay
-that exceeds the work budget keeps the original handoff.
+A later retained child can inherit completion from an earlier region, including
+when the child is nested in a work loop. For an enclosing loop proved to run
+at most once, the planner checks both the skipped and taken paths unless a
+visit is guaranteed. It removes generated entry commands only when every
+payload on every path sees the original completed pipe prefixes at issue,
+each event is consumed before reuse, and all events are consumed at exit.
+Unresolved command-dependent control, opaque native effects, or exhausted
+replay budgets preserve the original handoff.
 
 A loop head can reuse storage first touched in the prologue. The first
 overwrite may need a pre-loop reader to finish, while later overwrites need

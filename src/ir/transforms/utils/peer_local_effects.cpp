@@ -423,45 +423,58 @@ class LaneImporter {
     ordinals_ = entry;
   }
 
-  void AddSite(SyncSite site, const std::map<size_t, ResolvedOperandFootprint>& placed_effects = {}) {
-    CHECK_SPAN(payload_calls_.insert(site.original.get()).second, site.original->span_)
+  struct SiteBuilder {
+    SyncSite physical;
+    ImportedLocalCut* structured = nullptr;
+  };
+
+  SiteBuilder StartSite(const CallPtr& call, PipeType pipe) {
+    CHECK_SPAN(payload_calls_.insert(call.get()).second, call->span_)
         << "A shared call cannot identify two independent physical payload cuts";
+    SiteBuilder site{{call, nullptr, pipe, {}}};
     if (structured_) {
-      auto& cut = structured_->calls.at(site.original.get());
+      auto& cut = structured_->calls.at(call.get());
       // The common prefix is imported in each lane at the same original cuts.
       if (cut.pipe) {
-        INTERNAL_CHECK(*cut.pipe == site.pipe);
+        INTERNAL_CHECK(*cut.pipe == pipe);
       } else {
-        cut.pipe = site.pipe;
-        for (size_t i = 0; i < site.accesses.size(); ++i) {
-          const auto& access = site.accesses[i];
-          const auto& storage = result_.input.storage[access.storage];
-          if (const auto found = placed_effects.find(i); found != placed_effects.end()) {
-            auto resolved = found->second;
-            // A read-modify-write remains a dependence even when recorded
-            // as two effects. Its separate write must preserve that history.
-            if (resolved.read) {
-              resolved.definite_overwrite.reset();
-            }
-            resolved.read = !access.write;
-            resolved.write = access.write;
-            cut.effects.emplace_back(std::move(resolved));
-            continue;
-          }
-          std::optional<backend::BufferSyncByteWindow> interval;
-          if (storage.space != MemorySpace::DDR) {
-            // Reaching definitions across control may choose different slots.
-            // One receive cannot overwrite this entire possible byte set.
-            interval = storage.slot_bytes > 0
-                           ? backend::BufferSyncByteWindow{storage.address, storage.address + storage.bytes}
-                           : backend::BufferSyncByteWindow{access.column, access.column + access.columns};
-          }
-          cut.effects.push_back({storage.space, access.write, interval});
-        }
+        cut.pipe = pipe;
+        site.structured = &cut;
       }
     }
-    result_.input.segments.back().sites.push_back(std::move(site));
+    return site;
   }
+
+  void AppendAccess(SiteBuilder& site, SyncAccess access, const ResolvedOperandFootprint* placed = nullptr) {
+    if (site.structured) {
+      auto& effects = site.structured->effects;
+      if (placed) {
+        auto resolved = *placed;
+        // A read-modify-write remains a dependence even when recorded
+        // as two effects. Its separate write must preserve that history.
+        if (resolved.read) {
+          resolved.definite_overwrite.reset();
+        }
+        resolved.read = !access.write;
+        resolved.write = access.write;
+        effects.emplace_back(std::move(resolved));
+      } else {
+        const auto& storage = result_.input.storage[access.storage];
+        std::optional<backend::BufferSyncByteWindow> interval;
+        if (storage.space != MemorySpace::DDR) {
+          // Reaching definitions across control may choose different slots.
+          // One receive cannot overwrite this entire possible byte set.
+          interval = storage.slot_bytes > 0
+                         ? backend::BufferSyncByteWindow{storage.address, storage.address + storage.bytes}
+                         : backend::BufferSyncByteWindow{access.column, access.column + access.columns};
+        }
+        effects.push_back({storage.space, access.write, interval});
+      }
+    }
+    site.physical.accesses.push_back(std::move(access));
+  }
+
+  void AddSite(SiteBuilder site) { result_.input.segments.back().sites.push_back(std::move(site.physical)); }
 
   void ImportSyncAll(const StmtPtr& statement) {
     const auto call = GetCallFromStmt(statement);
@@ -541,7 +554,8 @@ class LaneImporter {
     return entry->second;
   }
 
-  void Access(SyncSite& site, const TileWindow& window, bool write, bool exact = false) {
+  void Access(SiteBuilder& site, const TileWindow& window, bool write, bool exact = false,
+              const ResolvedOperandFootprint* resolved = nullptr) {
     if (window.begin == window.end) return;
     if (window.pop) {
       const auto id = window.pop->pipe_id;
@@ -571,16 +585,18 @@ class LaneImporter {
       const auto repeated = pops_per_visit_.find(id);
       access.slot_step = repeated == pops_per_visit_.end() ? 0 : repeated->second % ring.local_slots;
       if (access.slot_step) access.slot_coordinate_frame = result_.input.segments.back().original_loop;
-      site.accesses.push_back(std::move(access));
+      AppendAccess(site, std::move(access));
       return;
     }
-    site.accesses.push_back({Storage(window.space, window.end), write, 0, window.begin, 0, 0, 1,
-                             window.end - window.begin, false, exact});
+    AppendAccess(site,
+                 {Storage(window.space, window.end), write, 0, window.begin, 0, 0, 1,
+                  window.end - window.begin, false, exact},
+                 resolved);
   }
 
   PeerGmEffects& Gm() { return authored_acquire_ ? gm_phases_.at(authored_phase_) : gm_; }
 
-  void GmAccess(SyncSite& site, const StmtPtr& statement, const ExprPtr& value, bool write) {
+  void GmAccess(SiteBuilder& site, const StmtPtr& statement, const ExprPtr& value, bool write) {
     const auto it = gm_roots_.find(AsVarLike(value).get());
     CHECK_SPAN(it != gm_roots_.end(), statement->span_) << "Peer GM transfer has no original formal root";
     Gm().formals.insert(it->second);
@@ -588,9 +604,9 @@ class LaneImporter {
       Gm().writes.insert(it->second);
     }
     if (structured_ && authored_acquire_) {
-      auto& cut = structured_->calls.at(site.original.get());
-      // The prefix shared by two lanes has already been exported on its first visit.
-      if (!cut.pipe) cut.effects.push_back({MemorySpace::DDR, write, std::nullopt, it->second});
+      if (site.structured) {
+        site.structured->effects.push_back({MemorySpace::DDR, write, std::nullopt, it->second});
+      }
     } else {
       Access(site, {MemorySpace::DDR, 0, 1}, write);
     }
@@ -874,8 +890,7 @@ class LaneImporter {
         reserved.insert(static_cast<int>(id));
       }
     }
-    SyncSite site{call, nullptr, implementation.Pipe(), {}};
-    std::map<size_t, ResolvedOperandFootprint> placed_effects;
+    auto site = StartSite(call, implementation.Pipe());
     for (size_t i = 0; i < operation.ArgumentEffects().size(); ++i) {
       const auto mode = operation.ArgumentEffects()[i].data;
       if (mode == BufferAccess::None) {
@@ -896,14 +911,12 @@ class LaneImporter {
       } else {
         const auto window = ResolveBufferWindow(statement, operand, resolved);
         if (resolved.read) {
-          if (structured_ && !window.pop) placed_effects.emplace(site.accesses.size(), resolved);
-          Access(site, window, false);
+          Access(site, window, false, /*exact=*/false, &resolved);
         }
         if (resolved.write) {
-          if (structured_ && !window.pop) placed_effects.emplace(site.accesses.size(), resolved);
           // Receive rebasing translates both the enclosure and its write
           // evidence equally. Check coverage in the resolver's coordinates.
-          Access(site, window, true, resolved.DefinitelyOverwritesWindow(resolved.byte_hull));
+          Access(site, window, true, resolved.DefinitelyOverwritesWindow(resolved.byte_hull), &resolved);
         }
       }
     }
@@ -927,7 +940,7 @@ class LaneImporter {
     if (result) {
       ready_.insert(result.get());
     }
-    AddSite(std::move(site), placed_effects);
+    AddSite(std::move(site));
   }
 
   void ImportBufferDefinition(const StmtPtr& statement, const CallPtr& call, const VarPtr& result) {
@@ -965,7 +978,7 @@ class LaneImporter {
       auto& reserved = result_.reservations[{claim.pool.src, claim.pool.dst}];
       for (const auto id : claim.ids) reserved.insert(static_cast<int>(id));
     }
-    SyncSite site{original, nullptr, implementation.Pipe(), {}};
+    auto site = StartSite(original, implementation.Pipe());
     for (size_t index = 0; index < operands.size(); ++index) {
       const auto access = operation.ArgumentEffects()[index].data;
       if (access == BufferAccess::None) continue;
@@ -1127,7 +1140,7 @@ class LaneImporter {
           << "Peer TFREE cannot be bound to its live local borrow";
       return;
     }
-    SyncSite site{call, nullptr, transfer.data_pipe, {}};
+    auto site = StartSite(call, transfer.data_pipe);
     if (transfer.kind == PeerTransportKind::Pop) {
       CHECK_SPAN(binding.receive && binding.receive->placed_base, call->span_)
           << "Peer local receive reserve has no placed base";
