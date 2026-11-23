@@ -264,6 +264,21 @@ dataflow tracks the slot history and encloses the inner visits in a ranged
 matrix box. For an ambiguous peer receive, the possible bytes cover the whole
 ring and the receive supplies no definite whole-ring overwrite.
 
+Mat extracts and Acc-to-Mat inserts use the same canonical rectangle. A
+transposed Mat view maps its offsets and extents back to the allocation's
+axes before dependence analysis. Exact admission still checks the original
+native alignment for each transfer and keeps a rotating slot selector
+independent of the insert's within-slot offset.
+
+When qualified placed Mat descriptors overlap across different layouts or
+extents, conservative dataflow splits the region at physical byte boundaries.
+A full-tile load participates in every region it covers. An extract and an
+insert can overlap in time when their possible byte sets are disjoint, even
+when a full load spans both sets. The regions track possible reads and writes
+across all visits. They retain prior history through moving and partial writes.
+Clusters with unsupported layouts or too many physical byte runs use the
+coarser enclosure.
+
 Dynamic valid-state updates, runtime view offsets, unproved selectors and
 noncontiguous reshapes require their own importer and readiness proofs. GM
 view/stride support remains subject to the existing

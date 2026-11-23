@@ -523,10 +523,32 @@ class MatrixFiberReuse:
         assert read[2] == ir.PipeType.MTE1 and write[2] == ir.PipeType.FIX
         shared = {address for space, address in read[3] & write[4] if space == ir.MemorySpace.Mat}
         assert len(shared) == shared_elements
-        if shared:
-            assert (("payload", index, "C"), ("payload", index + 1, "I")) in order
+        assert ((("payload", index, "C"), ("payload", index + 1, "I")) in order) == bool(shared)
         checked += 1
     assert checked == 2
+    # Refinement can only remove order for disjoint effects. Check Mat hazards
+    # across both visits, including reuse by the next visit's full load.
+    for index, (_, _, pipe, reads, writes) in enumerate(calls):
+        for earlier, (_, _, old_pipe, old_reads, old_writes) in enumerate(calls[:index]):
+            if old_pipe == pipe:
+                continue
+            overlap = (old_writes & (reads | writes)) | (old_reads & writes)
+            if any(space == ir.MemorySpace.Mat for space, _ in overlap):
+                assert (("payload", earlier, "C"), ("payload", index, "I")) in order
+
+    if rows == 96:
+        summary = testing.analyze_conservative_sync(original)
+        sites = summary["sites"]
+        insert_op = opname("buffer.insert")
+        insert = next(i for i, site in enumerate(sites) if site["operation"].op.name == insert_op)
+
+        def mat_domains(site):
+            return {effect["domain"] for effect in site["effects"] if effect["space"] == "Mat"}
+
+        cover, read, write = (mat_domains(site) for site in sites[insert - 2 : insert + 1])
+        assert read and write and read.isdisjoint(write)
+        assert cover >= read | write
+        assert sites[insert]["refreshed_domains"] == []
 
 
 @pytest.mark.parametrize("count", [8, 32, 128])

@@ -45,6 +45,7 @@
 #include "pypto/ir/type.h"
 #include "src/ir/transforms/utils/sync_footprint_resolver.h"
 #include "src/ir/transforms/utils/sync_loop_trip_proof.h"
+#include "src/ir/transforms/utils/sync_matrix_byte_geometry.h"
 #include "src/ir/transforms/utils/sync_scalar_readiness.h"
 #include "src/ir/transforms/utils/sync_transform_common.h"
 
@@ -62,8 +63,8 @@ MemorySpace Space(const ExprPtr& operand) {
   return MemorySpace::DDR;
 }
 
-// Each catalog entry is a conservative connected component of overlapping
-// enclosures / fine 2D or strided descriptors. Unknown effects are wildcards.
+// Effects start with possible enclosing storage and optional finer geometry.
+// The catalog refines that geometry into domains. Unknown effects are wildcards.
 struct RawEffect {
   MemorySpace space;
   PipeType pipe;
@@ -77,13 +78,108 @@ struct RawEffect {
 };
 
 class StorageClasses {
+  using Member = std::pair<size_t, size_t>;
+
+  struct EffectDomains {
+    size_t single = 0;
+    std::vector<size_t> atoms;
+
+    const size_t* begin() const { return atoms.empty() ? &single : atoms.data(); }
+    const size_t* end() const { return begin() + (atoms.empty() ? 1 : atoms.size()); }
+  };
+
+  // Bound both geometry and emitted access facts for an entire byte cluster,
+  // including repeated accesses to one shared matrix view.
+  static constexpr size_t kMaxMatrixClusterRuns = 128;
+  static constexpr size_t kMaxMatrixClusterMemberships = 4096;
+
+  bool TryEmitMatrixAtoms(const std::vector<Member>& members, const std::vector<size_t>& member_gid,
+                          const std::vector<MatrixBoxFootprint>& boxes,
+                          const std::vector<std::vector<RawEffect>>& sites,
+                          const std::vector<SyncCanonicalRoot>& roots) {
+    using Window = backend::BufferSyncByteWindow;
+    std::vector<std::vector<Window>> windows;
+    std::vector<int64_t> boundaries;
+    for (const auto& box : boxes) {
+      if (box.root_id == 0 || box.root_id > roots.size()) {
+        return false;
+      }
+      auto runs = TryMatrixByteWindows(roots[box.root_id - 1], box);
+      if (!runs || runs->size() > kMaxMatrixClusterRuns - boundaries.size() / 2) {
+        return false;
+      }
+      for (const auto& run : *runs) {
+        boundaries.push_back(run.begin);
+        boundaries.push_back(run.end);
+      }
+      windows.push_back(std::move(*runs));
+    }
+    std::sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+
+    // Adjacent endpoints bound atoms that are covered by precisely the same
+    // may effects. A full-tile access joins every atom it covers without
+    // merging otherwise disjoint partial accesses into one history.
+    std::vector<std::vector<size_t>> atom_indices(boxes.size());
+    std::vector<bool> occupied(boundaries.size() - 1, false);
+    for (size_t box = 0; box < windows.size(); ++box) {
+      for (const auto& run : windows[box]) {
+        auto boundary = std::lower_bound(boundaries.begin(), boundaries.end(), run.begin);
+        const auto end = std::lower_bound(boundary, boundaries.end(), run.end);
+        for (; boundary != end; ++boundary) {
+          const auto atom = static_cast<size_t>(boundary - boundaries.begin());
+          atom_indices[box].push_back(atom);
+          occupied[atom] = true;
+        }
+      }
+    }
+    if (std::all_of(atom_indices.begin(), atom_indices.end(),
+                    [&](const auto& atoms) { return atoms == atom_indices.front(); })) {
+      // Identical coverage offers no separation. Preserve the original
+      // catalog and its possible loop refinements in this case.
+      return false;
+    }
+
+    size_t memberships = 0;
+    for (size_t i = 0; i < members.size(); ++i) {
+      const auto [si, ei] = members[i];
+      const auto gid = member_gid[i];
+      const auto& hull = *sites[si][ei].enclosure;
+      if (windows[gid].front().begin < hull.begin || windows[gid].back().end > hull.end ||
+          atom_indices[gid].size() > kMaxMatrixClusterMemberships - memberships) {
+        return false;
+      }
+      memberships += atom_indices[gid].size();
+    }
+
+    std::vector<size_t> ids(occupied.size(), 0);
+    for (size_t atom = 0; atom < occupied.size(); ++atom) {
+      if (occupied[atom]) {
+        ids[atom] = domains.size() + 1;
+        domains.push_back(
+            {ids[atom], MemorySpace::Mat, Window{boundaries[atom], boundaries[atom + 1]}, nullptr});
+        // The atom partition describes possible touches across all visits.
+        // It does not establish a per-visit write or compatible loop basis.
+        domain_uniform_geom.push_back(false);
+      }
+    }
+    for (size_t i = 0; i < members.size(); ++i) {
+      const auto [si, ei] = members[i];
+      auto& assigned = effect_domains_[si][ei].atoms;
+      for (auto atom : atom_indices[member_gid[i]]) {
+        assigned.push_back(ids[atom]);
+      }
+    }
+    return true;
+  }
+
  public:
   static constexpr size_t kMaxFineClusterDescriptors = 32;
 
   void Build(const std::vector<std::vector<RawEffect>>& sites, const std::vector<SyncCanonicalRoot>& roots) {
     effect_domains_.assign(sites.size(), {});
     for (size_t s = 0; s < sites.size(); ++s) {
-      effect_domains_[s].assign(sites[s].size(), 0);
+      effect_domains_[s].resize(sites[s].size());
     }
 
     struct IndexedEffect {
@@ -121,14 +217,14 @@ class StorageClasses {
         }
       }
 
-      // Stage 2: Intra-cluster fine partitioning (2D MatrixBox & GCD StridedByteFootprint).
+      // Stage 2: refine overlap within each cluster using byte atoms, 2D boxes, or strided lattices.
       for (const auto& cluster : clusters) {
         auto emit_single = [&](const backend::BufferSyncByteWindow& hull, bool uniform_geom,
                                const std::vector<std::pair<size_t, size_t>>& members) {
           const size_t id = domains.size() + 1;
           domains.push_back({id, space, hull, nullptr});
           domain_uniform_geom.push_back(uniform_geom);
-          for (const auto& [si, ei] : members) effect_domains_[si][ei] = id;
+          for (const auto& [si, ei] : members) effect_domains_[si][ei].single = id;
         };
 
         if (cluster.members.size() == 1) {
@@ -248,6 +344,12 @@ class StorageClasses {
             emit_single(cluster.hull, all_have && uniq.size() == 1, cluster.members);
             continue;
           }
+          const bool mixed_roots = std::any_of(
+              uniq.begin(), uniq.end(), [&](const auto& box) { return box.root_id != uniq[0].root_id; });
+          if (space == MemorySpace::Mat && mixed_roots &&
+              TryEmitMatrixAtoms(cluster.members, member_gid, uniq, sites, roots)) {
+            continue;
+          }
           partition_and_emit(uniq.size(), member_gid, [&](size_t i, size_t j) {
             return MatrixBoxFootprint::MayOverlap(uniq[i], uniq[j], roots);
           });
@@ -268,13 +370,18 @@ class StorageClasses {
             domains.push_back({id, effect.space, {}, effect.original_root});
             domain_uniform_geom.push_back(false);
           }
-          effect_domains_[s][e] = it->second;
+          effect_domains_[s][e].single = it->second;
         }
       }
     }
   }
 
-  size_t Domain(size_t site_idx, size_t effect_idx) const { return effect_domains_[site_idx][effect_idx]; }
+  size_t SingleDomain(size_t site_idx, size_t effect_idx) const {
+    return effect_domains_[site_idx][effect_idx].single;
+  }
+  const EffectDomains& Domains(size_t site_idx, size_t effect_idx) const {
+    return effect_domains_[site_idx][effect_idx];
+  }
   bool HasUniformGeometry(size_t domain_id) const {
     return domain_id > 0 && domain_id <= domain_uniform_geom.size() && domain_uniform_geom[domain_id - 1];
   }
@@ -283,7 +390,7 @@ class StorageClasses {
   std::vector<bool> domain_uniform_geom;
 
  private:
-  std::vector<std::vector<size_t>> effect_domains_;
+  std::vector<std::vector<EffectDomains>> effect_domains_;
   std::unordered_map<const Expr*, size_t> roots_;
 };
 
@@ -2980,7 +3087,7 @@ class Builder {
     for (size_t site = 0; site < sites.size(); ++site) {
       for (size_t ei = 0; ei < raw[site].size(); ++ei) {
         const auto& effect = raw[site][ei];
-        const size_t domain = classes.Domain(site, ei);
+        const size_t domain = classes.SingleDomain(site, ei);
         if (domain == 0 || effect.fiber.kind == IterationFiber::Kind::Wildcard || !effect.fiber.frame) {
           continue;
         }
@@ -3029,19 +3136,21 @@ class Builder {
       std::set<std::tuple<MemorySpace, size_t, FiberKey>> refreshed_fibers;
       for (size_t ei = 0; ei < raw[site].size(); ++ei) {
         const auto& effect = raw[site][ei];
-        const size_t domain = classes.Domain(site, ei);
-        effects.emplace(effect.space, effect.pipe, effect.write, domain);
+        const size_t single = classes.SingleDomain(site, ei);
         FiberKey fkey = FiberKey::Wildcard();
-        if (domain > 0 && effect.fiber.kind != IterationFiber::Kind::Wildcard && effect.fiber.frame) {
-          const auto git = groups.find({effect.space, domain, effect.fiber.frame});
+        if (single > 0 && effect.fiber.kind != IterationFiber::Kind::Wildcard && effect.fiber.frame) {
+          const auto git = groups.find({effect.space, single, effect.fiber.frame});
           if (git != groups.end() && git->second.valid) {
             fkey = FiberKey::From(effect.fiber);
           }
         }
-        site_effect_fibers_[site].push_back({effect.space, effect.pipe, effect.write, domain, fkey});
-        if (effect.candidate_full_overwrite && domain > 0 && classes.HasUniformGeometry(domain)) {
-          refreshed.emplace(effect.space, domain);
-          refreshed_fibers.emplace(effect.space, domain, fkey);
+        for (const auto domain : classes.Domains(site, ei)) {
+          effects.emplace(effect.space, effect.pipe, effect.write, domain);
+          site_effect_fibers_[site].push_back({effect.space, effect.pipe, effect.write, domain, fkey});
+        }
+        if (effect.candidate_full_overwrite && classes.HasUniformGeometry(single)) {
+          refreshed.emplace(effect.space, single);
+          refreshed_fibers.emplace(effect.space, single, fkey);
         }
       }
       sites[site].refreshed_domains.assign(refreshed.begin(), refreshed.end());

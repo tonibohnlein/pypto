@@ -1105,6 +1105,58 @@ void TestB2StridedVecAndMatStorageClasses() {
   assert(MatrixBoxFootprint::MayOverlap(box_b, box_c, roots));
 }
 
+void TestMatrixAtomProjectionBudget() {
+  const auto nz = [](int64_t rows, int64_t columns) {
+    return MatType(rows, columns, DataType::FP16, TileLayout::col_major, TileLayout::row_major);
+  };
+  for (const int64_t columns : {1008, 1024}) {
+    const auto wide = nz(96, 2 * columns), narrow = nz(32, columns);
+    const auto input = MakeVar("input", MakeTensorType(96, 2 * columns, DataType::FP16));
+    const auto source = MakeVar("source", wide), destination = MakeVar("destination", narrow);
+    const auto left = MakeVar("left", LeftType(16, columns));
+    const auto acc = MakeVar("acc", AccType(16, columns));
+    const auto load = EvalCall("buffer.load", {input, ConstTup({0, 0}), ConstTup({96, 2 * columns}), source});
+    const auto extract = EvalCall("buffer.extract", {source, CI(64), CI(columns), left});
+    const auto insert = EvalCall("buffer.insert", {acc, CI(0), CI(0), destination});
+    const auto function =
+        MakeAicFn("mat_atom_budget", {input}, {ParamDirection::In},
+                  {AllocBuf(source, 0, wide), AllocBuf(destination, 0, narrow),
+                   AllocBuf(left, 0, left->GetType()), AllocBuf(acc, 0, acc->GetType()), load, extract,
+                   insert, std::make_shared<ReturnStmt>(std::vector<ExprPtr>{}, kSpan)},
+                  FunctionType::AIC);
+    const auto analysis = AnalyzeConservativeSync(function, "a2a3");
+    assert(analysis.Sites().size() == 3);
+    const auto mat_domains = [&](size_t index) {
+      std::set<size_t> result;
+      for (const auto& [space, pipe, write, domain] : analysis.Sites()[index].effects) {
+        if (space == MemorySpace::Mat) {
+          result.insert(domain);
+        }
+      }
+      return result;
+    };
+    const auto cover = mat_domains(0), read = mat_domains(1), write = mat_domains(2);
+    assert(std::includes(cover.begin(), cover.end(), read.begin(), read.end()));
+    assert(std::includes(cover.begin(), cover.end(), write.begin(), write.end()));
+    assert(analysis.Sites()[2].refreshed_domains.empty());
+    const auto& required = analysis.Sites()[2].source_pipes;
+    const bool waits_for_reader =
+        std::find(required.begin(), required.end(), PipeType::MTE1) != required.end();
+    if (columns == 1008) {
+      // 63 runs for each subtile and one full-width run fit the cluster
+      // budget. The full load covers the two sets without merging them.
+      assert(read.size() == 63 && write.size() == 63);
+      assert(std::none_of(read.begin(), read.end(), [&](size_t domain) { return write.count(domain); }));
+      assert(!waits_for_reader);
+    } else {
+      // Each 64-run subtile still qualifies individually. Together with
+      // the full-width load they exceed the aggregate budget.
+      assert(cover.size() == 1 && cover == read && read == write);
+      assert(waits_for_reader);
+    }
+  }
+}
+
 // ============================================================================
 // B3: IterationFiber ModularSlot & AffineSlice
 // ============================================================================
@@ -1160,25 +1212,29 @@ void TestIndependentSlotAndSubtileFrames() {
   const auto pool_type = MultiMatType(2, 32, 32);
   const auto mat = pool_type->element_type_;
   const auto left = LeftType(32, 16);
+  const auto acc_type = AccType(32, 16);
   const auto input = MakeVar("input", MakeTensorType(32, 32, DataType::FP16));
   const auto pool = MakeVar("pool", pool_type);
   const auto slot = MakeVar("slot", mat), alias = MakeVar("alias", mat);
   const auto fixed = MakeVar("fixed", mat);
   const auto dest = MakeVar("dest", left);
+  const auto acc = MakeVar("acc", acc_type);
   const auto outer_iv = MakeVar("outer", IndexType()), inner_iv = MakeVar("inner", IndexType());
   const auto load_slot = [&](const VarPtr& handle) {
     return EvalCall("buffer.load", {input, ConstTup({0, 0}), ConstTup({32, 32}), handle});
   };
   const auto load = load_slot(slot), fixed_load = load_slot(fixed);
   const auto extract = EvalCall("buffer.extract", {alias, CI(0), MakeMul(inner_iv, CI(16)), dest});
-  const auto inner = SimpleFor(inner_iv, CI(0), CI(2), CI(1), {extract});
+  const auto insert = EvalCall("buffer.insert", {acc, CI(0), MakeMul(inner_iv, CI(16)), alias});
+  const auto inner = SimpleFor(inner_iv, CI(0), CI(2), CI(1), {extract, insert});
   const auto outer = SimpleFor(outer_iv, CI(1), CI(10), CI(3),
                                {BufferSlot(slot, pool, MakeFloorMod(outer_iv, CI(2)), mat),
                                 std::make_shared<AssignStmt>(alias, slot, kSpan), load, inner});
-  const auto fn = MakeAicFn("slot_and_subtile", {input}, {ParamDirection::In},
-                            {AllocBuf(pool, 0, pool_type, "buffer.alloc_multi"), AllocBuf(dest, 0, left),
-                             BufferSlot(fixed, pool, CI(0), mat), fixed_load, outer},
-                            FunctionType::AIC);
+  const auto fn =
+      MakeAicFn("slot_and_subtile", {input}, {ParamDirection::In},
+                {AllocBuf(pool, 0, pool_type, "buffer.alloc_multi"), AllocBuf(dest, 0, left),
+                 AllocBuf(acc, 0, acc_type), BufferSlot(fixed, pool, CI(0), mat), fixed_load, outer},
+                FunctionType::AIC);
   const SyncFootprintResolver resolver(fn);
   const auto resolve = [&](const StmtPtr& statement, size_t arg, BufferAccess access) {
     return resolver.ResolveOperand(statement.get(), As<Call>(As<EvalStmt>(statement)->expr_), arg, access,
@@ -1186,6 +1242,7 @@ void TestIndependentSlotAndSubtileFrames() {
   };
   const auto write = resolve(load, 3, BufferAccess::Write);
   const auto read = resolve(extract, 0, BufferAccess::Read);
+  const auto inserted = resolve(insert, 3, BufferAccess::Write);
   const auto static_write = resolve(fixed_load, 3, BufferAccess::Write);
 
   // The reaching read follows both original frames through an SSA alias.
@@ -1197,6 +1254,10 @@ void TestIndependentSlotAndSubtileFrames() {
   assert(read.fiber.frame == inner.get() && read.fiber.coeff == 16 && read.fiber.extent == 16);
   assert(read.matrix_subtile && read.matrix_subtile->col.affine_frame == inner.get());
   assert(read.matrix_subtile->rows == 32 && read.matrix_subtile->columns == 16);
+  assert(inserted.root_id == read.root_id && inserted.slot_fiber.HasComparableCoordinates(read.slot_fiber));
+  assert(inserted.matrix_subtile && inserted.matrix_subtile->col.affine_frame == inner.get());
+  assert(inserted.matrix_subtile->rows == 32 && inserted.matrix_subtile->columns == 16);
+  assert(!inserted.definite_overwrite && !inserted.DefinitelyOverwritesWindow(inserted.byte_hull));
   assert(write.byte_hull && write.byte_hull->begin == 0 && write.byte_hull->end == 4096);
   assert(!write.definite_overwrite && !write.DefinitelyOverwrites(read));
   assert(static_write.definite_overwrite && static_write.definite_overwrite->end == 2048);
@@ -2170,6 +2231,7 @@ int main() {
   pypto::ir::sync::TestB1RangeUseCuts();
   pypto::ir::sync::TestB1PositiveTripCompletionAndRelay();
   pypto::ir::sync::TestB2StridedVecAndMatStorageClasses();
+  pypto::ir::sync::TestMatrixAtomProjectionBudget();
   pypto::ir::sync::TestB3IterationFiberRefinement();
   pypto::ir::sync::TestIndependentSlotAndSubtileFrames();
   pypto::ir::sync::TestAffineVecPhysicalByteOrigins();

@@ -1737,8 +1737,13 @@ class Importer {
     }
   }
 
-  static std::optional<AffineCoordinate> SubtileCoordinate(const SymbolicIntRange& range) {
-    if (range.is_const()) return AffineCoordinate{range.lo, 0};
+  static std::optional<AffineCoordinate> SubtileCoordinate(const SymbolicIntRange& range, bool insert) {
+    // FIXPIPE admission checks the original stride even when a particular
+    // cut proves a singleton range. Recover that expression via the fallback.
+    if (range.is_const()) {
+      if (!insert || As<ConstInt>(range.expr)) return AffineCoordinate{range.lo, 0};
+      return std::nullopt;
+    }
     if (!range.affine_frame || range.modulus || range.symbolic_base || range.affine_base < 0 ||
         range.affine_coeff < 0) {
       return std::nullopt;
@@ -1746,6 +1751,68 @@ class Importer {
     AffineCoordinate coordinate{range.affine_base, 0};
     coordinate.frames.emplace(range.affine_frame, range.affine_coeff);
     return coordinate;
+  }
+
+  static bool AlignedSubtileAxis(const AffineCoordinate& origin, int64_t extent, int64_t alignment) {
+    return origin.first % alignment == 0 && origin.second % alignment == 0 && extent % alignment == 0 &&
+           std::all_of(origin.frames.begin(), origin.frames.end(),
+                       [&](const auto& entry) { return entry.second % alignment == 0; });
+  }
+
+  static void CheckMatrixSubtileAlignment(const SyncStorage& mat, const AffineCoordinate& row,
+                                          const AffineCoordinate& column, int64_t rows, int64_t columns,
+                                          bool insert) {
+    const bool boxed = mat.layout->slayout_ != TileLayout::none_box;
+    if (!boxed && !insert) return;
+    const auto box = boxed ? mat.layout->fractal_ / (16 * mat.layout->dtype_.GetByte()) : 16;
+    // FIXPIPE additionally needs 16-column alignment. Extraction uses the
+    // native fractal width, which can differ with the Mat descriptor.
+    CHECK(AlignedSubtileAxis(row, rows, 16) && AlignedSubtileAxis(column, columns, box) &&
+          (!insert || AlignedSubtileAxis(column, columns, 16)))
+        << (insert ? "Unaligned boxed insertion" : "Unaligned boxed extraction")
+        << " requires a separate footprint contract";
+  }
+
+  SyncAccess MatrixSubtileAccess(const CallPtr& call, const Stmt* cut, const SyncSegment& segment,
+                                 bool insert) {
+    const size_t mat_arg = insert ? 3 : 0;
+    const auto& handle = call->args_[mat_arg];
+    const auto mat_id = Storage(handle);
+    const auto& mat = result.storage[mat_id];
+    const auto& sub = result.storage[Storage(call->args_[insert ? 0 : 3])];
+    RequireIndex(call->args_[1]);
+    RequireIndex(call->args_[2]);
+    const auto mode = insert ? BufferAccess::Write : BufferAccess::Read;
+    const auto footprint = resolver->ResolveOperand(cut, call, mat_arg, mode, MemorySpace::Mat);
+    const auto& subtile = footprint.matrix_subtile;
+    const auto shared_row = subtile ? SubtileCoordinate(subtile->row, insert) : std::nullopt;
+    const auto shared_col = subtile ? SubtileCoordinate(subtile->col, insert) : std::nullopt;
+    AffineCoordinate row, column;
+    int64_t rows = sub.rows, columns = sub.columns;
+    if (shared_row && shared_col) {
+      row = *shared_row;
+      column = *shared_col;
+      rows = subtile->rows;
+      columns = subtile->columns;
+    } else {
+      // Exact import still has its original coordinate proof for cases
+      // outside the shared range model, such as statically empty loops.
+      row = Coordinate(call->args_[1], segment);
+      column = Coordinate(call->args_[2], segment);
+      if (transposed_mat.count(handle.get())) {
+        std::swap(row, column);
+        std::swap(rows, columns);
+      }
+    }
+    CHECK(row.parameters.empty() && column.parameters.empty() && !row.block && !column.block)
+        << (insert ? "Parameterized local insertion" : "Parameterized local extraction")
+        << " needs a separate membership and alignment certificate";
+    CheckMatrixSubtileAlignment(mat, row, column, rows, columns, insert);
+    // Canonical geometry stays exact for both directions even if a moving
+    // or boxed subtile has no stationary contiguous byte interval.
+    auto access = Access(mat_id, insert, row, column, rows, columns, segment);
+    ApplySlot(access, handle, segment);
+    return access;
   }
 
   SyncSite Site(const CallPtr& call, const SyncSegment& segment, const Stmt* cut) {
@@ -1987,83 +2054,26 @@ class Importer {
       } else {
         CHECK(s.space == MemorySpace::Mat && (t.space == MemorySpace::Left || t.space == MemorySpace::Right))
             << "Only Mat to operand-buffer or Vec to Vec movement is qualified";
-        const bool transposed = transposed_mat.count(call->args_[0].get()) != 0;
-        int64_t ext_rows = transposed ? t.columns : t.rows;
-        int64_t ext_cols = transposed ? t.rows : t.columns;
-        AffineCoordinate row, column;
         if (extract) {
-          RequireIndex(call->args_[1]);
-          RequireIndex(call->args_[2]);
-          const auto footprint = resolver->ResolveOperand(cut, call, 0, BufferAccess::Read, MemorySpace::Mat);
-          const auto& subtile = footprint.matrix_subtile;
-          const auto shared_row = subtile ? SubtileCoordinate(subtile->row) : std::nullopt;
-          const auto shared_col = subtile ? SubtileCoordinate(subtile->col) : std::nullopt;
-          if (shared_row && shared_col) {
-            row = *shared_row;
-            column = *shared_col;
-            ext_rows = subtile->rows;
-            ext_cols = subtile->columns;
-          } else {
-            row = Coordinate(call->args_[1], segment);
-            column = Coordinate(call->args_[2], segment);
-            if (transposed) std::swap(row, column);
+          auto access = MatrixSubtileAccess(call, cut, segment, /*insert=*/false);
+          if (recover_accesses) {
+            site.accesses.push_back(std::move(access));
           }
-          CHECK(row.parameters.empty() && column.parameters.empty() && !row.block && !column.block)
-              << "Parameterized local extraction needs a separate membership and alignment certificate";
+          modes[0].first = true;
+        } else {
+          const bool transposed = transposed_mat.count(call->args_[0].get()) != 0;
+          CHECK(s.rows == (transposed ? t.columns : t.rows) && s.columns == (transposed ? t.rows : t.columns))
+              << "Partial copy is not qualified";
+          CheckMatrixSubtileAlignment(s, {}, {}, s.rows, s.columns, /*insert=*/false);
+          whole(0, false);
         }
-        if (!extract) CHECK(s.rows == ext_rows && s.columns == ext_cols) << "Partial copy is not qualified";
-        if (s.layout->slayout_ != TileLayout::none_box) {
-          const auto box = s.layout->fractal_ / (16 * s.layout->dtype_.GetByte());
-          const auto aligned_frames = [](const auto& frames, int64_t alignment) {
-            return std::all_of(frames.begin(), frames.end(),
-                               [&](const auto& entry) { return entry.second % alignment == 0; });
-          };
-          CHECK(row.first % 16 == 0 && row.second % 16 == 0 && ext_rows % 16 == 0 &&
-                column.first % box == 0 && column.second % box == 0 && ext_cols % box == 0 &&
-                aligned_frames(row.frames, 16) && aligned_frames(column.frames, box))
-              << "Unaligned boxed extraction requires a separate footprint contract";
-        }
-        auto source_access = Access(sid, false, row, column, ext_rows, ext_cols, segment);
-        // The retained rectangle and physical layout are exact even when a
-        // moving or boxed slice has no stationary contiguous interval export.
-        // Consumers qualify their own representation: the periodic extractor
-        // still refuses unsupported moving shared geometry; numerical phase
-        // snapshots may specialize original coordinates before partitioning it.
-        ApplySlot(source_access, call->args_[0], segment);
-        if (recover_accesses) {
-          site.accesses.push_back(std::move(source_access));
-        }
-        modes[0].first = true;
         whole(target, true);
       }
     } else if (IsOp(call, "buffer.insert")) {
-      const auto sid = Storage(call->args_[0]), tid = Storage(call->args_[3]);
-      const auto& s = result.storage[sid];
-      const auto& t = result.storage[tid];
-      CHECK(s.space == MemorySpace::Acc && t.space == MemorySpace::Mat)
+      CHECK(result.storage[Storage(call->args_[0])].space == MemorySpace::Acc &&
+            result.storage[Storage(call->args_[3])].space == MemorySpace::Mat)
           << "Exact insertion currently requires Acc to Mat FIXPIPE geometry";
-      auto row = Coordinate(call->args_[1], segment);
-      auto column = Coordinate(call->args_[2], segment);
-      CHECK(row.parameters.empty() && column.parameters.empty() && !row.block && !column.block)
-          << "Parameterized local insertion needs a separate membership and alignment certificate";
-      const bool transposed = transposed_mat.count(call->args_[3].get()) != 0;
-      const int64_t ins_rows = transposed ? s.columns : s.rows;
-      const int64_t ins_cols = transposed ? s.rows : s.columns;
-      if (transposed) std::swap(row, column);
-      const auto aligned_frames = [](const auto& frames, int64_t alignment) {
-        return std::all_of(frames.begin(), frames.end(),
-                           [&](const auto& entry) { return entry.second % alignment == 0; });
-      };
-      const auto box = t.layout->slayout_ != TileLayout::none_box
-                           ? t.layout->fractal_ / (16 * t.layout->dtype_.GetByte())
-                           : 16;
-      CHECK(row.first % 16 == 0 && row.second % 16 == 0 && ins_rows % 16 == 0 && column.first % 16 == 0 &&
-            column.second % 16 == 0 && ins_cols % 16 == 0 && column.first % box == 0 &&
-            column.second % box == 0 && ins_cols % box == 0 && aligned_frames(row.frames, 16) &&
-            aligned_frames(column.frames, 16) && aligned_frames(column.frames, box))
-          << "Unaligned boxed insertion requires a separate footprint contract";
-      auto target_access = Access(tid, true, row, column, ins_rows, ins_cols, segment);
-      ApplySlot(target_access, call->args_[3], segment);
+      auto target_access = MatrixSubtileAccess(call, cut, segment, /*insert=*/true);
       whole(0, false);
       if (recover_accesses) {
         site.accesses.push_back(std::move(target_access));

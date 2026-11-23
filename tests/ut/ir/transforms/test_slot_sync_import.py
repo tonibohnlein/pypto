@@ -16,6 +16,7 @@ from pypto._function_attrs import PYPTO_AUTOSYNC_ATTR
 from .sync_closed_command_oracle import ClosedCommands, opname
 from .sync_matmul_cases import staged_fixture
 from .sync_matmul_oracle import check_imported_accesses, interpret, sequence_stmts
+from .sync_physical_oracle import run_physical
 from .test_indexed_sync_analysis import indexed_fixture
 from .test_vec_sync_analysis import vec_fixture
 
@@ -263,6 +264,137 @@ def test_interval_unavailability_preserves_enclosed_and_moving_effects():
                         assert access[6] > 0 and access[7] > 0
                         counts[kind] += 1
     assert all(counts)
+
+
+def matrix_insert_fixture(*, rotating=False, transposed=False, overlaps=True, inner_count=2, stride=16):
+    # Reuse the original staged matmul as a producer so the FIXPIPE source
+    # is initialized by M, with no preceding FIXPIPE drain to serialize it.
+    seed = staged_fixture(count=1, stages=1, n=32 if rotating else 16)
+    span = seed.span
+    *definitions, product, _, _ = sequence_stmts(seed.body)
+    acc = definitions[-1].var
+
+    def ci(value):
+        return ir.ConstInt(value, ir.DataType.INDEX, span)
+
+    def call(name, args, kind=None):
+        return ir.Call(ir.get_op(name), args, kind or ir.VoidType(), span)
+
+    def payload(name, args):
+        return ir.EvalStmt(call(name, args), span)
+
+    def tup(values):
+        return ir.MakeTuple([ci(value) for value in values], span)
+
+    def alloc(var, address, name="buffer.alloc"):
+        return ir.AssignStmt(var, call(name, [tup([]), ci(address)], var.type), span)
+
+    def loop(iv, start, stop, step, body):
+        block = ir.SeqStmts([*body, ir.YieldStmt([], span)], span)
+        return ir.ForStmt(iv, ci(start), ci(stop), ci(step), [], block, [], span)
+
+    fp16 = ir.DataType.FP16
+    mat = ir.MemorySpace.Mat
+    nz = (ir.TileLayout.col_major, ir.TileLayout.row_major)
+    storage_shape = (32, 32)
+    if rotating:
+        storage_shape = (32, 64) if transposed else (64, 32)
+
+    def buffer_type(shape, space, order=nz):
+        return ir.BufferType(shape, fp16, space, blayout=order[0], slayout=order[1], fractal=512)
+
+    ty = buffer_type(storage_shape, mat)
+    selected = ir.Var("insert_target", ty, span)
+    source = ir.Var("initial", ir.TensorType(storage_shape, fp16), span)
+    load = payload("buffer.load", [source, tup([0, 0]), tup(storage_shape), selected])
+    if rotating:
+        outer, inner = [ir.Var(name, ir.ScalarType(ir.DataType.INDEX), span) for name in ("outer", "inner")]
+        ring = ir.Var("insert_ring", ir.MultiBufferType(ty, 2), span)
+        definitions.append(alloc(ring, 16384, "buffer.alloc_multi"))
+        slot = ir.FloorMod(outer, ci(2), ir.DataType.INDEX, span)
+        select = ir.AssignStmt(selected, call("buffer.slot", [ring, slot], ty), span)
+        dest = selected
+        body = [select, load]
+        if transposed:
+            transposed_type = buffer_type(storage_shape[::-1], mat, nz[::-1])
+            dest = ir.Var("transposed_destination", transposed_type, span)
+            body.append(ir.AssignStmt(dest, call("buffer.reshape", [selected], transposed_type), span))
+        offset = ir.Mul(inner, ci(stride), ir.DataType.INDEX, span)
+        insert = payload("buffer.insert", [acc, offset, ci(0), dest])
+        inner_loop = loop(inner, 0, inner_count, 1, [insert])
+        outer_loop = loop(outer, 1, 10, 3, [*body, inner_loop])
+        statements = [product, outer_loop]
+    else:
+        left = ir.Var("reader", buffer_type((16, 16), ir.MemorySpace.Left), span)
+        definitions.extend([alloc(left, 16384), alloc(selected, 16384)])
+        read = payload("buffer.extract", [selected, ci(0), ci(0), left])
+        offset = ci(0 if overlaps else 16)
+        insert = payload("buffer.insert", [acc, offset, offset, selected])
+        statements = [product, load, read, insert]
+        outer_loop = inner_loop = None
+    function = ir.Function(
+        "mat_insert",
+        [*seed.params[:2], source],
+        [],
+        ir.SeqStmts([*definitions, *statements, ir.ReturnStmt([], span)], span),
+        span,
+        ir.FunctionType.AIC,
+        ir_stage=ir.FunctionIRStage.Buffer,
+    )
+    return function, insert, outer_loop, inner_loop
+
+
+@pytest.mark.parametrize("transposed", [False, True])
+def test_moving_insert_bytes_respect_rotating_slot_and_transpose(transposed):
+    function, insert, outer, inner = matrix_insert_fixture(rotating=True, transposed=transposed)
+    description = testing.describe_placed_sync_input(function, True)
+    storage, calls = interpret(function)
+    check_imported_accesses(description, storage, calls)
+    writes = [writes for call, _, _, _, writes in calls if call.same_as(insert.expr)]
+    assert len(writes) == 6
+    for visit, elements in enumerate(writes):
+        outer_visit, inner_visit = divmod(visit, 2)
+        base = 16384 + (1 + 3 * outer_visit) % 2 * 4096
+        # NZ stores one 16-by-16 FP16 box in 512 bytes. The transpose
+        # advances across column blocks while the other case advances rows.
+        boxes = (2 * inner_visit, 2 * inner_visit + 1) if transposed else (inner_visit, inner_visit + 4)
+        expected_bytes = {base + box * 512 + byte for box in boxes for byte in range(512)}
+        actual_bytes = {address + lane for _, address in elements for lane in (0, 1)}
+        assert actual_bytes == expected_bytes
+    target = next(
+        site
+        for region in description["regions"]
+        for site in region["sites"]
+        if site["original"].same_as(insert.expr)
+    )
+    access = next(i for i, access in enumerate(target["accesses"]) if access[1])
+    assert target["access_precision"][access] == "exact"
+    assert target["physical_intervals"][access] is None
+    assert target["slot_frames"][access].same_as(outer)
+    assert target["access_frames"][access].same_as(inner)
+    expected = (0, 16, 32, 16) if transposed else (16, 0, 16, 32)
+    assert target["accesses"][access][4:8] == expected
+
+
+@pytest.mark.parametrize("overlaps", [False, True])
+def test_exact_insert_orders_only_overlapping_mte1_reader(overlaps):
+    function, _, _, _ = matrix_insert_fixture(overlaps=overlaps)
+    retained = testing.analyze_placed_sync(function, True)
+    physical = retained.realize_physical("a2a3", list(range(6)))
+    state, order, _ = run_physical(function, physical["function"], range(6))
+    *_, read, write = state.original_calls
+    assert (read[2], write[2]) == (ir.PipeType.MTE1, ir.PipeType.FIX)
+    assert bool(read[3] & write[4]) == overlaps
+    before_insert = ((len(state.original_calls) - 2, True), (len(state.original_calls) - 1, False))
+    assert (before_insert in order) == overlaps
+
+
+def test_insert_singleton_range_preserves_native_stride_check():
+    function, _, _, _ = matrix_insert_fixture(rotating=True, inner_count=1, stride=8)
+    # Every executed row is zero, but exact admission still requires the
+    # inserted coordinate expression to have a native-aligned stride.
+    with pytest.raises(ValueError, match="Unaligned boxed insertion"):
+        testing.describe_placed_sync_input(function, True)
 
 
 def test_interval_offsets_preserve_strided_view_gaps():

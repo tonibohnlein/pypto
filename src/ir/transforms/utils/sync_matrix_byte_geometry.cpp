@@ -26,6 +26,7 @@
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/transforms/pass_context.h"
+#include "src/ir/transforms/utils/sync_footprint_resolver.h"
 
 namespace pypto::ir::sync {
 bool IsSyncMatrixSpace(MemorySpace space) {
@@ -56,37 +57,50 @@ struct ByteLayout {
   bool columns_outer;
 };
 
-ByteLayout QualifyByteLayout(const SyncStorage& storage) {
+std::optional<ByteLayout> TryByteLayout(const SyncStorage& storage, const char** failure = nullptr) {
+  const auto refuse = [&](const char* reason) -> std::optional<ByteLayout> {
+    if (failure) {
+      *failure = reason;
+    }
+    return std::nullopt;
+  };
   const auto* context = PassContext::Current();
   const auto* target = context ? context->GetBackend() : backend::GetBackend();
   const auto alignment = target ? target->GetMemAlignment(storage.space) : 0;
   const auto& type = storage.layout;
-  CHECK(storage.slot_count == 1 && alignment && storage.address >= 0 &&
+  if (!(storage.slot_count == 1 && alignment && storage.address >= 0 &&
         static_cast<uint64_t>(storage.address) % alignment == 0 && type && storage.rows > 0 &&
         storage.columns > 0 && type->valid_shape_ == type->shape_ && type->compact_ == CompactMode::null &&
-        backend::SupportsMatrixBufferPadding(storage.space, type->dtype_, type->pad_, true))
-      << "Overlapping placed buffers need an aligned, fully valid single-slot partition";
-  CHECK(type->blayout_ == TileLayout::col_major || type->blayout_ == TileLayout::row_major)
-      << "Overlapping placed buffers have an unsupported outer layout";
-  const auto bytes = CheckedByteCount(type->dtype_.GetByte());
-  CHECK(bytes > 0 && type->dtype_.GetBit() % 8 == 0) << "Overlapping placed buffers need whole-byte elements";
+        backend::SupportsMatrixBufferPadding(storage.space, type->dtype_, type->pad_, true))) {
+    return refuse("Overlapping placed buffers need an aligned, fully valid single-slot partition");
+  }
+  if (type->blayout_ != TileLayout::col_major && type->blayout_ != TileLayout::row_major) {
+    return refuse("Overlapping placed buffers have an unsupported outer layout");
+  }
+  const auto bytes = static_cast<int64_t>(type->dtype_.GetByte());
+  if (bytes <= 0 || type->dtype_.GetBit() % 8 != 0) {
+    return refuse("Overlapping placed buffers need whole-byte elements");
+  }
   const bool columns_outer = type->blayout_ == TileLayout::col_major;
   if (type->slayout_ == TileLayout::none_box) {
-    return {1, 1, bytes, columns_outer};
+    return ByteLayout{1, 1, bytes, columns_outer};
   }
   const bool inner_columns = type->slayout_ == TileLayout::col_major;
-  CHECK(type->slayout_ == TileLayout::row_major || (inner_columns && !columns_outer))
-      << "Overlapping placed buffers require a native NZ, ZN or ZZ layout";
+  if (type->slayout_ != TileLayout::row_major && !(inner_columns && !columns_outer)) {
+    return refuse("Overlapping placed buffers require a native NZ, ZN or ZZ layout");
+  }
   const auto fractal = type->fractal_;
-  CHECK((fractal == kStandardFractalBytes && kFractalRowBytes % bytes == 0) ||
-        (fractal == kAccumulatorFractalBytes && bytes == 4))
-      << "Overlapping placed buffers require an accounted native fractal size";
+  if (!((fractal == kStandardFractalBytes && kFractalRowBytes % bytes == 0) ||
+        (fractal == kAccumulatorFractalBytes && bytes == 4))) {
+    return refuse("Overlapping placed buffers require an accounted native fractal size");
+  }
   const auto minor = fractal == kAccumulatorFractalBytes ? kFractalAxis : kFractalRowBytes / bytes;
   const auto rows = inner_columns ? minor : kFractalAxis;
   const auto cols = inner_columns ? kFractalAxis : minor;
-  CHECK(storage.rows % rows == 0 && storage.columns % cols == 0)
-      << "Overlapping placed buffers require fully tiled physical layouts";
-  return {rows, cols, rows * cols * bytes, columns_outer};
+  if (storage.rows % rows || storage.columns % cols) {
+    return refuse("Overlapping placed buffers require fully tiled physical layouts");
+  }
+  return ByteLayout{rows, cols, rows * cols * bytes, columns_outer};
 }
 
 struct Axis {
@@ -97,6 +111,26 @@ Axis InBoxes(int64_t first, int64_t step, int64_t count, int64_t box) {
   CHECK(first >= 0 && count > 0 && step >= 0 && first % box == 0 && count % box == 0 && step % box == 0)
       << "Overlapping placed buffers need whole-box access offsets, extents, and steps";
   return {first / box, step / box, count / box};
+}
+
+struct ByteRuns {
+  int64_t count;
+  // All coordinates are in boxes. Defer multiplication by the box size
+  // until the caller has checked the integer range of the coordinates.
+  __int128 start, step, pitch, width;
+};
+
+ByteRuns DescribeByteRuns(const SyncStorage& storage, const ByteLayout& layout, const Axis& row,
+                          const Axis& col) {
+  const auto [major, minor] = layout.columns_outer ? std::pair{col, row} : std::pair{row, col};
+  const int64_t pitch =
+      layout.columns_outer ? storage.rows / layout.box_rows : storage.columns / layout.box_columns;
+  const bool contiguous = minor.count == pitch;
+  const auto index = [&](int64_t major_digit, int64_t minor_digit) {
+    return __int128(major_digit) * pitch + minor_digit;
+  };
+  return {contiguous ? 1 : major.count, index(major.first, minor.first), index(major.step, minor.step), pitch,
+          contiguous ? __int128(major.count) * minor.count : minor.count};
 }
 
 void AppendByteRuns(const SyncAccess& access, const SyncStorage& original, const ByteLayout& layout,
@@ -111,22 +145,17 @@ void AppendByteRuns(const SyncAccess& access, const SyncStorage& original, const
   }
   const auto row = InBoxes(access.row, access.row_step, access.rows, layout.box_rows);
   const auto col = InBoxes(access.column, access.column_step, access.columns, layout.box_columns);
-  const auto [major, minor] = layout.columns_outer ? std::pair{col, row} : std::pair{row, col};
-  const int64_t pitch =
-      layout.columns_outer ? original.rows / layout.box_rows : original.columns / layout.box_columns;
-  const bool contiguous = minor.count == pitch;
-  const int64_t runs = contiguous ? 1 : major.count;
-  CHECK(runs <= kMaxByteRunsPerEffect)
+  const auto runs = DescribeByteRuns(original, layout, row, col);
+  CHECK(runs.count <= kMaxByteRunsPerEffect)
       << "Overlapping placed buffers exceed the exact physical-byte run limit";
-  const auto box_index = [&](int64_t major_digit, int64_t minor_digit) {
-    return CheckedByteCount(__int128(major_digit) * pitch + minor_digit);
+  const auto bytes = [&](const __int128 boxes) {
+    return __int128(CheckedByteCount(boxes)) * layout.box_bytes;
   };
-  const auto start = CheckedByteCount(__int128(original.address - group_address) +
-                                      __int128(box_index(major.first, minor.first)) * layout.box_bytes);
-  const auto step = CheckedByteCount(__int128(box_index(major.step, minor.step)) * layout.box_bytes);
-  const auto pitch_bytes = CheckedByteCount(__int128(pitch) * layout.box_bytes);
-  const auto run_bytes = CheckedByteCount(__int128(minor.count) * layout.box_bytes);
-  for (int64_t run = 0; run < runs; ++run) {
+  const auto start = CheckedByteCount(__int128(original.address) - group_address + bytes(runs.start));
+  const auto step = CheckedByteCount(bytes(runs.step));
+  const auto pitch_bytes = CheckedByteCount(bytes(runs.pitch));
+  const auto width = CheckedByteCount(bytes(runs.width));
+  for (int64_t run = 0; run < runs.count; ++run) {
     auto bytes = access;
     bytes.storage = storage;
     bytes.row = 0;
@@ -134,7 +163,7 @@ void AppendByteRuns(const SyncAccess& access, const SyncStorage& original, const
     bytes.rows = 1;
     bytes.column = CheckedByteCount(__int128(start) + __int128(run) * pitch_bytes);
     bytes.column_step = step;
-    bytes.columns = contiguous ? CheckedByteCount(__int128(major.count) * run_bytes) : run_bytes;
+    bytes.columns = width;
     output.push_back(std::move(bytes));
   }
 }
@@ -189,7 +218,9 @@ std::vector<OverlapGroup> FindOverlaps(const std::vector<SyncStorage>& storage,
       for (size_t i = begin; i < after; ++i) {
         auto& entry = mapping[sorted[i]];
         entry.group = groups.size();
-        entry.layout = QualifyByteLayout(storage[sorted[i]]);
+        const char* reason = nullptr;
+        entry.layout = TryByteLayout(storage[sorted[i]], &reason);
+        CHECK(entry.layout) << reason;
       }
       groups.push_back({first, head.address, end, std::nullopt});
     }
@@ -245,6 +276,44 @@ void RewriteSiteStorage(SyncSite& site, const std::vector<SyncStorage>& original
 }
 
 }  // namespace
+
+std::optional<std::vector<backend::BufferSyncByteWindow>> TryMatrixByteWindows(
+    const SyncCanonicalRoot& root, const MatrixBoxFootprint& box) {
+  if (!root.placed || root.peer_borrow || root.touched_by_set_validshape || root.slot_count != 1 ||
+      box.slot_lo != 0 || box.slot_hi != 0 || box.root_id != root.id || box.row_begin < 0 ||
+      box.row_begin >= box.row_end || box.row_end > root.rows || box.col_begin < 0 ||
+      box.col_begin >= box.col_end || box.col_end > root.columns) {
+    return std::nullopt;
+  }
+  const SyncStorage storage{"",           root.space, root.address,         root.rows,
+                            root.columns, root.bytes, root.canonical_layout};
+  const auto layout = TryByteLayout(storage);
+  if (!layout || box.row_begin % layout->box_rows || box.row_end % layout->box_rows ||
+      box.col_begin % layout->box_columns || box.col_end % layout->box_columns) {
+    return std::nullopt;
+  }
+  const auto root_boxes = __int128(root.rows / layout->box_rows) * (root.columns / layout->box_columns);
+  if (root.bytes <= 0 || root.bytes % layout->box_bytes != 0 ||
+      root_boxes != root.bytes / layout->box_bytes ||
+      __int128(root.address) + root.bytes > std::numeric_limits<int64_t>::max()) {
+    return std::nullopt;
+  }
+  const Axis row{box.row_begin / layout->box_rows, 0, (box.row_end - box.row_begin) / layout->box_rows};
+  const Axis col{box.col_begin / layout->box_columns, 0, (box.col_end - box.col_begin) / layout->box_columns};
+  const auto runs = DescribeByteRuns(storage, *layout, row, col);
+  if (runs.count <= 0 || runs.count > kMaxByteRunsPerEffect ||
+      runs.start + __int128(runs.count - 1) * runs.pitch + runs.width > root_boxes) {
+    return std::nullopt;
+  }
+  std::vector<backend::BufferSyncByteWindow> windows;
+  windows.reserve(runs.count);
+  for (int64_t run = 0; run < runs.count; ++run) {
+    const auto start = __int128(root.address) + (runs.start + run * runs.pitch) * layout->box_bytes;
+    windows.push_back(
+        {static_cast<int64_t>(start), static_cast<int64_t>(start + runs.width * layout->box_bytes)});
+  }
+  return windows;
+}
 
 void CanonicalizeMatrixSyncStorage(CompactSyncInput& input) {
   std::vector<StorageMapping> mapping(input.storage.size());
