@@ -11,9 +11,11 @@
 
 #include <algorithm>
 #include <any>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -73,11 +75,22 @@ namespace {
 
 using ir::As;
 
+ir::ConstFloatPtr NonFiniteFullTileSplat(const ir::CallPtr& call) {
+  if (!ir::IsOp(call, "buffer.full")) return nullptr;
+  const auto literal = As<ir::ConstFloat>(call->args_[0]);
+  const auto type = As<ir::BufferType>(call->args_[1]->GetType());
+  return literal && !std::isfinite(literal->value_) && type->dtype_.IsFloat() &&
+                 type->shape_ == type->valid_shape_
+             ? literal
+             : nullptr;
+}
+
 // BufferType is already a physical descriptor; no logical shape, layout, or
 // packing is inferred. Vec descriptors are dense row-major or FP32 reduction
 // column vectors; Mat/Left/Right/Acc
 // descriptors carry their resolved fractal layout and must be whole boxes.
-std::string BufferTypeString(const ir::BufferTypePtr& type, const ir::Span& span) {
+std::string BufferTypeString(const ir::BufferTypePtr& type, const ir::Span& span,
+                             std::optional<DataType> bitcast_dtype = std::nullopt) {
   CHECK_SPAN(type->shape_.size() == 1 || type->shape_.size() == 2, span)
       << "Direct Buffer IR codegen supports only rank-1 or rank-2 buffers";
   const auto space = type->memory_space_;
@@ -117,7 +130,9 @@ std::string BufferTypeString(const ir::BufferTypePtr& type, const ir::Span& span
   components.slayout = type->slayout_;
   components.fractal = type->fractal_;
   CheckBoxedTileExtents(type->dtype_, space, components, &span);
-  return FormatTileBufTypeString(MemorySpaceToMLIR(space), DataTypeToMLIR(type->dtype_), rows, cols,
+  INTERNAL_CHECK(!bitcast_dtype || bitcast_dtype->GetBit() == type->dtype_.GetBit());
+  return FormatTileBufTypeString(MemorySpaceToMLIR(space),
+                                 DataTypeToMLIR(bitcast_dtype.value_or(type->dtype_)), rows, cols,
                                  type->blayout_, type->slayout_, type->fractal_, type->pad_, type->compact_,
                                  valid_rows, valid_cols, valid_rows == -1, valid_cols == -1);
 }
@@ -1068,6 +1083,23 @@ bool PTOCodegen::TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& re
     Emit(load ? operation + " ins(" + tensor_operand + ") outs(" + buffer_operand + ")" + attributes
               : operation + " ins(" + buffer_operand + ") outs(" + tensor_operand + ")" + attributes);
     backend::pto_ops_detail::EndNonEmptyRegion(guarded, *this);
+  } else if (const auto literal = NonFiniteFullTileSplat(call)) {
+    // PTOAS 0.77 prints non-finite floating immediates as invalid C++ literals.
+    // A full-tile splat can write their exact IEEE bits through a same-width
+    // integer view using the same V instruction, address and write footprint.
+    const auto& destination = call->args_[1];
+    const auto type = As<ir::BufferType>(destination->GetType());
+    const auto integer = type->dtype_ == DataType::FP32 ? DataType::INT32 : DataType::INT16;
+    const auto scalar = NewTemp();
+    const auto view = NewTemp();
+    const auto integer_type = DataTypeToMLIR(integer);
+    const auto native_view = BufferTypeString(type, call->span_, integer);
+    Emit(scalar + " = arith.constant " + FormatFloatConstant(literal->value_, type->dtype_) + " : " +
+         integer_type);
+    Emit(view + " = pto.bitcast " + GetExprAsCode(destination) + " : " + GetExprTypeAnnotation(destination) +
+         " -> " + native_view);
+    Emit(std::string(backend::BufferNativeOperation(call)) + " " +
+         backend::pto_ops_detail::FormatInsOutsClause({{scalar, integer_type}}, {{view, native_view}}, ""));
   } else if (ir::IsOp(call, "buffer.ci") || ir::IsOp(call, "buffer.ci_workspace")) {
     const std::string start = GetExprAsCode(call->args_[0]);
     const std::string start_type = GetExprTypeAnnotation(call->args_[0]);

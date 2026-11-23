@@ -9,6 +9,7 @@
 
 """Caller-local correlations refine numerical evidence without ABI assumptions."""
 
+import pypto.language as pl
 import pytest
 from pypto import ir, passes, testing
 
@@ -206,6 +207,58 @@ def test_unknown_second_call_still_poisons_joined_evidence():
     statements = [f.call("child", f.binary(ir.Sub, f.binary(ir.Add, f.iv, f.ci(16)), f.iv))]
     unknown_call = f.call("child", f.external)
     assert _bounds(f.program(statements, after=[unknown_call]), "child") == {}
+
+
+@pytest.mark.parametrize(
+    "case,expected",
+    [
+        ("signed_table_value", {0: (0, 2**24 + 7)}),
+        ("unknown_second_caller", {}),
+        ("overflowing_numerator", {}),
+        ("negative_loop_stop", {}),
+    ],
+)
+def test_widened_signed_loop_stop_reaches_every_forwarded_caller(
+    case: str, expected: dict[int, tuple[int, int]]
+) -> None:
+    # The first caller's evaluated INT32 scalar can have either sign. On
+    # executed visits its widened ceiling quotient bounds the INDEX page. A
+    # second caller contributes to the same hull through both forwarding hops.
+    observed = "pl.const(-128, pl.INT32)" if case == "negative_loop_stop" else "left + right"
+    bias = 2**63 - 1 if case == "overflowing_numerator" else 127
+    second = "unknown" if case == "unknown_second_caller" else str(2**24 + 7)
+    program = pl.parse_program(f"""
+@pl.program
+class SignedLoopCallers:
+    @pl.function(type=pl.FunctionType.AIV)
+    def worker(self, page: pl.Scalar[pl.INDEX]):
+        return
+
+    @pl.function(type=pl.FunctionType.Group)
+    def group(self, page: pl.Scalar[pl.INDEX]):
+        self.worker(page)
+
+    @pl.function(type=pl.FunctionType.Spmd)
+    def launch(self, page: pl.Scalar[pl.INDEX]):
+        self.group(page)
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(self, table: pl.Tensor[[2], pl.INT32]):
+        left = pl.tensor.read(table, [0])
+        right = pl.tensor.read(table, [1])
+        observed = {observed}
+        numerator = pl.cast(observed, pl.INDEX) + {bias}
+        stop = numerator // 128
+        for page in pl.range(stop):
+            self.launch(page)
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def alternate(self, unknown: pl.Scalar[pl.INDEX]):
+        self.launch({second})
+""")
+    evidence = testing.sync_parameter_bounds(program)
+    for name in ("launch", "group", "worker"):
+        assert evidence.get(name, {}) == expected
 
 
 def test_unknown_predicate_does_not_create_caller_assumptions():

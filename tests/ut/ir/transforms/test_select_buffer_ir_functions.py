@@ -842,12 +842,10 @@ class MinPad:
         maximum = pl.row_max(observed, scratch)
         return pl.store(maximum, [0, 0], output)
 """)
-    if width is None:
-        assert _kernel(_lower(program, passes.MemoryPlanner.PYPTO)).ir_stage == ir.FunctionIRStage.Functional
-        return
     lowered = _run_autosync(program)
     pto = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True, emit_source_loc=False)
     assert "pto.tfillpad" in pto and "pad=3" in pto and "pto.trowmax" in pto
+    assert ("pto.texpands" in pto) is (width is None)
     if convert:
         assert pto.count("pto.tcvt") == 2 and "pto.texp " in pto
         assert any("dtype=bf16" in line and "pad=3" in line for line in pto.splitlines())
@@ -861,6 +859,7 @@ class MinPad:
     namespace = {}
     exec(torch_codegen(lowered), namespace)  # noqa: S102
     source = -torch.arange(1, 513, dtype=torch.float32).reshape(16, 32)
+    width = 5 if width is None else width
     source[:, width:] = 1
     output = torch.empty(16, 1)
     namespace["kernel"](source, width, output)
@@ -887,7 +886,10 @@ class BfloatMinPad:
 
 @pytest.mark.ptoas_compile
 @pytest.mark.parametrize("operation", ["add", "mul"])
-def test_full_binary_with_materialized_zero_tail_keeps_full_native_footprint(operation, tmp_path):
+@pytest.mark.parametrize("explicit_padding", [False, True])
+def test_full_binary_with_materialized_zero_tail_keeps_full_native_footprint(
+    operation, explicit_padding, tmp_path
+):
     def program(materialize):
         operand = "pl.fillpad(partial, pad_value=pl.PadValue.zero)" if materialize else "partial"
         return pl.parse_program(f"""
@@ -903,12 +905,14 @@ class TailArithmetic:
         return pl.store(pl.tile.{operation}(lhs, rhs), [0, 0], out)
 """)
 
-    refused = _kernel(_lower(program(False), passes.MemoryPlanner.PYPTO))
-    assert refused.ir_stage == ir.FunctionIRStage.Functional
-    assert refused.attrs["buffer_admission_operation"] == f"tile.{operation}"
-
-    authored = program(True)
+    authored = program(explicit_padding)
     original = _lower(authored, passes.MemoryPlanner.PYPTO)
+    if operation == "mul" and not explicit_padding:
+        refused = _kernel(original)
+        assert refused.ir_stage == ir.FunctionIRStage.Functional
+        assert refused.attrs["buffer_admission_operation"] == "tile.mul"
+        return
+    assert _kernel(original).ir_stage == ir.FunctionIRStage.Buffer
     with passes.PassContext([], autosync_policy="conservative_prefix"):
         logical = passes.insert_sync()(original)
     lowered = _run_autosync(authored)
@@ -999,10 +1003,10 @@ class ExtractPaddedRows:
 
 @pytest.mark.ptoas_compile
 @pytest.mark.parametrize(
-    "adjust,unknown_stride,selected",
-    [(8, False, True), (0, False, False), (9, False, False), (8, True, False)],
+    "adjust,unknown_stride,guarded",
+    [(8, False, False), (0, False, True), (9, False, True), (8, True, False)],
 )
-def test_minimum_fillpad_checks_runtime_column_prefix(adjust, unknown_stride, selected, tmp_path):
+def test_minimum_fillpad_checks_runtime_column_prefix(adjust, unknown_stride, guarded, tmp_path):
     step = "unproved" if unknown_stride else "pl.tile.get_block_num()"
     program = pl.parse_program(f"""
 @pl.program
@@ -1022,15 +1026,16 @@ class MinimumPrefix:
 """)
     lowered = _lower(program, passes.MemoryPlanner.PYPTO)
     actual = _kernel(lowered)
-    assert (actual.ir_stage == ir.FunctionIRStage.Buffer) is selected
-    if selected:
+    assert (actual.ir_stage == ir.FunctionIRStage.Buffer) is not unknown_stride
+    if not unknown_stride:
         text = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True, emit_source_loc=False)
         assert "pto.tfillpad" in text and "pad=3" in text and "pto.set_validshape" in text
+        assert ("pto.texpands" in text) is guarded
         _compile_dynamic_state_native(lowered, tmp_path, passes.MemoryPlanner.PYPTO)
 
 
 @pytest.mark.parametrize(
-    "limit, predicate, selected",
+    "limit, predicate, proved",
     [
         pytest.param(32, "columns > 0", True, id="exact-positive-observation"),
         pytest.param(33, "columns > 0", False, id="cap-exceeds-capacity"),
@@ -1038,7 +1043,7 @@ class MinimumPrefix:
         pytest.param(32, "remaining > 0", False, id="guard-different-ssa"),
     ],
 )
-def test_minimum_fillpad_uses_guarded_observed_width(limit, predicate, selected):
+def test_minimum_fillpad_uses_guarded_observed_width(limit, predicate, proved):
     program = pl.parse_program(f"""
 @pl.program
 class GuardedWidth:
@@ -1057,10 +1062,10 @@ class GuardedWidth:
         return output
 """)
     lowered = _lower(program, passes.MemoryPlanner.PYPTO)
-    assert (_kernel(lowered).ir_stage == ir.FunctionIRStage.Buffer) is selected
-    if selected:
-        text = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True, emit_source_loc=False)
-        assert "pto.tfillpad" in text and "pto.set_validshape" in text
+    assert _kernel(lowered).ir_stage == ir.FunctionIRStage.Buffer
+    text = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True, emit_source_loc=False)
+    assert "pto.tfillpad" in text and "pto.set_validshape" in text
+    assert ("pto.texpands" in text) is not proved
 
 
 @pytest.mark.parametrize(
@@ -1098,19 +1103,23 @@ class GuardedBox:
 
 
 @pytest.mark.parametrize(
-    ("case", "selected"),
+    ("case", "proved"),
     [
         ("matching", True),
         ("different_extent", False),
         ("different_divisor", False),
         ("shadowed_quotient", False),
-        ("unproved_formal", False),
+        ("narrow_formal", True),
+        ("unbounded_index", False),
     ],
 )
-def test_minimum_fillpad_uses_the_matching_ceil_div_tile_guard(case, selected):
-    # A narrow scalar formal without the qualified scalar-read range remains
-    # outside this tail proof.
-    read_extent = "formal" if case == "unproved_formal" else "pl.tensor.read(extent_values, [0])"
+def test_minimum_fillpad_uses_the_matching_ceil_div_tile_guard(case, proved):
+    # Either the ABI or a signed table read supplies an INT32 range. An
+    # unrestricted INDEX can overflow before the ceiling division.
+    read_extent = (
+        "formal" if case in ("narrow_formal", "unbounded_index") else "pl.tensor.read(extent_values, [0])"
+    )
+    formal_dtype = "INDEX" if case == "unbounded_index" else "INT32"
     tail_source = "other" if case == "different_extent" else "extent"
     divisor = 16 if case == "different_divisor" else 32
     shadow = "tiles = pl.cast(other, pl.INDEX)" if case == "shadowed_quotient" else ""
@@ -1119,7 +1128,7 @@ def test_minimum_fillpad_uses_the_matching_ceil_div_tile_guard(case, selected):
 class GuardedTail:
     @pl.function(type=pl.FunctionType.AIV)
     def kernel(self, source: pl.Tensor[[16, 32], pl.FP32], extent_values: pl.Tensor[[1], pl.INT32],
-               other_values: pl.Tensor[[1], pl.INT32], formal: pl.Scalar[pl.INT32],
+               other_values: pl.Tensor[[1], pl.INT32], formal: pl.Scalar[pl.{formal_dtype}],
                output: pl.InOut[pl.Tensor[[16, 1], pl.FP32]]) -> pl.Tensor[[16, 1], pl.FP32]:
         extent = {read_extent}
         other = pl.tensor.read(other_values, [0])
@@ -1137,8 +1146,175 @@ class GuardedTail:
         return output
 """)
     with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO, enable_scalar_gm_dma=True):
-        actual = _kernel(PassManager(OptimizationStrategy.Default).run_passes(program))
-    assert (actual.ir_stage == ir.FunctionIRStage.Buffer) is selected, str(actual)
+        lowered = PassManager(OptimizationStrategy.Default).run_passes(program)
+    assert _kernel(lowered).ir_stage == ir.FunctionIRStage.Buffer
+    text = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True, emit_source_loc=False)
+    assert ("pto.texpands" in text) is not proved
+
+
+@pytest.mark.parametrize(
+    "case,proved",
+    [
+        ("matching", True),
+        ("different_page", False),
+        ("unproved_product_range", False),
+        ("unproved_numerator_range", False),
+    ],
+)
+def test_minimum_fillpad_tail_proof_uses_bounded_original_scalar_values(case: str, proved: bool) -> None:
+    # Floor division gives the same tail implication for negative pages.
+    # These pages do not index either tensor. A width proof still requires range
+    # evidence for the arithmetic before the guard and within the taken arm.
+    ordinal = "unbounded" if case == "unproved_product_range" else "pl.cast(table_page, pl.INDEX) - 1"
+    extent = "unbounded" if case == "unproved_numerator_range" else "pl.cast(table_extent, pl.INDEX) + 1"
+    product = "page + 1" if case == "different_page" else "page"
+    program = pl.parse_program(f"""
+@pl.program
+class SignedGuardedTail:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, source: pl.Tensor[[16, 32], pl.FP32], table: pl.Tensor[[2], pl.INT32],
+               unbounded: pl.Scalar[pl.INDEX],
+               output: pl.InOut[pl.Tensor[[16, 1], pl.FP32]]) -> pl.Tensor[[16, 1], pl.FP32]:
+        table_page = pl.tensor.read(table, [0])
+        table_extent = pl.tensor.read(table, [1])
+        page = {ordinal}
+        extent = {extent}
+        pages = (extent + 31) // 32
+        if page < pages:
+            origin = ({product}) * 32
+            remaining = extent - origin
+            columns = pl.min(remaining, 32)
+            src = pl.load(source, [0, 0], [16, 32])
+            prefix = pl.set_validshape(src, 16, columns)
+            padded = pl.fillpad(prefix, pad_value=pl.PadValue.min)
+            workspace = pl.tile.create([16, 32], dtype=pl.FP32)
+            maximum = pl.row_max(padded, workspace)
+            output = pl.store(maximum, [0, 0], output)
+        return output
+""")
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO, enable_scalar_gm_dma=True):
+        lowered = PassManager(OptimizationStrategy.Default).run_passes(program)
+    assert _kernel(lowered).ir_stage == ir.FunctionIRStage.Buffer
+    text = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True, emit_source_loc=False)
+    assert "arith.floordivsi" in text and "pto.tfillpad" in text
+    assert ("pto.texpands" in text) is not proved
+
+
+@pytest.mark.ptoas_compile
+@pytest.mark.parametrize("unknown_call", [False, True])
+def test_minimum_fillpad_prefers_proved_caller_bounds(tmp_path, unknown_call):
+    # Every caller uses the same standalone leaf. An unrestricted caller
+    # requires the guarded form. When every caller proves the tail bounds,
+    # the leaf emits a single native fillpad.
+    other_base = "unbounded" if unknown_call else "0"
+    program = pl.parse_program(f"""
+@pl.program
+class CallerBoundedFillpad:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, source: pl.Tensor[[16, 32], pl.FP32], table: pl.Tensor[[2], pl.INT32],
+               page_base: pl.Scalar[pl.INDEX],
+               output: pl.InOut[pl.Tensor[[16, 1], pl.FP32]]) -> pl.Tensor[[16, 1], pl.FP32]:
+        table_page = pl.tensor.read(table, [0])
+        table_extent = pl.tensor.read(table, [1])
+        page = page_base + pl.cast(table_page, pl.INDEX)
+        extent = pl.cast(table_extent, pl.INDEX) + 1
+        pages = (extent + 31) // 32
+        if page < pages:
+            origin = page * 32
+            remaining = extent - origin
+            columns = pl.min(remaining, 32)
+            src = pl.load(source, [0, 0], [16, 32])
+            prefix = pl.set_validshape(src, 16, columns)
+            padded = pl.fillpad(prefix, pad_value=pl.PadValue.min)
+            workspace = pl.tile.create([16, 32], dtype=pl.FP32)
+            maximum = pl.row_max(padded, workspace)
+            output = pl.store(maximum, [0, 0], output)
+        return output
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(self, source: pl.Tensor[[16, 32], pl.FP32], table: pl.Tensor[[2], pl.INT32],
+             unbounded: pl.Scalar[pl.INDEX],
+             output: pl.InOut[pl.Tensor[[16, 1], pl.FP32]]) -> pl.Tensor[[16, 1], pl.FP32]:
+        total = pl.tensor.read(table, [0])
+        blocks = (pl.cast(total, pl.INDEX) + 127) // 128
+        for base in pl.range(blocks):
+            output = self.kernel(source, table, base, output)
+        return self.kernel(source, table, {other_base}, output)
+""")
+    snapshots = []
+
+    def capture(transform, current):
+        if transform.get_name() == "SelectBufferIRFunctions":
+            snapshots.append(current.get_function("main"))
+
+    instrument = passes.CallbackInstrument(before_pass=capture, after_pass=capture, name="capture_selection")
+    planner = passes.MemoryPlanner.PYPTO
+    with passes.PassContext([instrument], memory_planner=planner, enable_scalar_gm_dma=True):
+        lowered = PassManager(OptimizationStrategy.Default).run_passes(program)
+    original, selected = snapshots
+    function = _kernel(lowered)
+    ir.assert_structural_equal(original.body, selected.body, enable_auto_mapping=True)
+    assert function.ir_stage == ir.FunctionIRStage.Buffer
+    standalone = ir.Program([function], "CallerBoundedFillpadStandalone", function.span)
+    serialized = ir.deserialize(ir.serialize(standalone))
+    ir.assert_structural_equal(standalone, serialized, enable_auto_mapping=True)
+
+    class WidthWitness(ir.IRVisitor):
+        def __init__(self):
+            super().__init__()
+            self.extent = None
+
+        def visit_assign_stmt(self, op):
+            name = "fillpad_width" if unknown_call else "columns"
+            if op.var.name_hint.startswith(name) and isinstance(op.value, ir.Max):
+                self.extent = op.value
+            super().visit_assign_stmt(op)
+
+    witness = WidthWitness()
+    witness.visit_function(_kernel(serialized))
+    assert isinstance(witness.extent, ir.Max)
+    assert isinstance(witness.extent.right, ir.ConstInt) and witness.extent.right.value == 1
+    minimum = witness.extent.left
+    assert isinstance(minimum, ir.Min)
+    assert any(isinstance(arg, ir.ConstInt) and arg.value == 32 for arg in (minimum.left, minimum.right))
+    text = codegen.PTOCodegen().generate(serialized, emit_tile_addr=True, emit_source_loc=False)
+    assert text.count("pto.tfillpad") == 1 and "arith.maxsi" in text
+    assert ("pto.texpands" in text) is unknown_call
+    _compile_dynamic_state_native(serialized, tmp_path, planner)
+
+
+@pytest.mark.parametrize("check_width", [False, True], ids=["group-end-only", "element-width-checked"])
+def test_single_page_group_end_does_not_bound_first_fill_width(check_width, tmp_path):
+    # end=31 and origin=-1 for a full group of 32 positions pass the page
+    # guard, but its first score width is zero. The two table values have
+    # independent INT32 representations even when supplied by the same caller.
+    predicate = "0 < width and width <= 32" if check_width else "True"
+    program = pl.parse_program(f"""
+@pl.program
+class SinglePage:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, source: pl.Tensor[[16, 32], pl.FP32], lengths: pl.Tensor[[2], pl.INT32],
+               output: pl.InOut[pl.Tensor[[16, 32], pl.FP32]]) -> pl.Tensor[[16, 32], pl.FP32]:
+        end = pl.tensor.read(lengths, [0])
+        group = pl.tensor.read(lengths, [1])
+        origin = pl.cast(end, pl.INDEX) - pl.cast(group, pl.INDEX)
+        if (origin + 32 + 31) // 32 == 1:
+            for position in pl.range(32):
+                width = origin + position + 1
+                if {predicate}:
+                    tile = pl.load(source, [0, 0], [16, 32])
+                    prefix = pl.set_validshape(tile, 16, width)
+                    padded = pl.fillpad(prefix, pad_value=pl.PadValue.min)
+                    output = pl.store(padded, [0, 0], output)
+        return output
+""")
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO, enable_scalar_gm_dma=True):
+        lowered = PassManager(OptimizationStrategy.Default).run_passes(program)
+    function = _kernel(lowered)
+    assert function.ir_stage == ir.FunctionIRStage.Buffer, str(dict(function.attrs))
+    text = codegen.PTOCodegen().generate(lowered, emit_tile_addr=True, emit_source_loc=False)
+    assert ("pto.texpands" in text) is not check_width
+    _compile_dynamic_state_native(lowered, tmp_path, passes.MemoryPlanner.PYPTO)
 
 
 @pytest.mark.parametrize("prefix_cols", ["32", "columns"])

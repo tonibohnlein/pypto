@@ -48,6 +48,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
@@ -58,6 +59,7 @@
 #include "pypto/ir/transforms/utils/buffer_active_domain_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_indexed_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_ir_selection.h"
+#include "pypto/ir/transforms/utils/buffer_minimum_fillpad_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_scalar_staging.h"
 #include "pypto/ir/transforms/utils/buffer_tuple_results.h"
@@ -111,6 +113,7 @@ class BufferKernelSupport : public IRVisitor {
   bool has_scalar_write = false;
   bool has_peer_setup = false;
   bool has_peer_payload = false;
+  bool guarded_minimum_fillpad = false;
   std::vector<int> required_positive_formals;
 
   static bool ConstantEquals(const ExprPtr& value, int64_t expected) {
@@ -759,8 +762,14 @@ class BufferKernelSupport : public IRVisitor {
         if (!logical_validity_) {
           logical_validity_.emplace(function_, false, false, required_positive_formals);
         }
-        admission.Require(logical_validity_->ProvesLogicalMinimumFillPad(call),
-                          BufferAdmissionProperty::DynamicValidRecipe);
+        if (!logical_validity_->ProvesLogicalMinimumFillPad(call)) {
+          if (!minimum_fills_) {
+            minimum_fills_.emplace(body_);
+          }
+          const bool supported = minimum_fills_->Handles(call);
+          admission.Require(supported, BufferAdmissionProperty::DynamicValidRecipe);
+          guarded_minimum_fillpad |= supported;
+        }
       }
       for (const auto& arg : call->args_) {
         // A statically valid dense window has the same native cast geometry
@@ -1262,6 +1271,7 @@ class BufferKernelSupport : public IRVisitor {
   const BufferAccTrimAnalysis& acc_trims_;
   const FunctionPtr& function_;
   std::optional<BufferRuntimeValidAnalysis> logical_validity_;
+  std::optional<BufferMinimumFillPadAnalysis> minimum_fills_;
   FunctionType core_;
   StmtPtr body_;
   std::pair<ReturnStmtPtr, ReturnStmtPtr> lane_returns_;
@@ -1382,9 +1392,38 @@ bool SupportsDelegatedPeerTransport(const FunctionPtr& function) {
   });
 }
 
+// Preserve a successful caller proof in executable scalar IR. At every
+// original invocation max(width, 1) is the identity. The independent Buffer
+// verifier sees the complete [1, capacity] clamp without caller metadata.
+FunctionPtr MaterializeFillTailBounds(const FunctionPtr& function, const sync::SyncParameterBounds& bounds) {
+  BufferRuntimeValidAnalysis proof(function, false, false, {}, bounds);
+  if (!proof.HasCheckedTails()) return function;
+  class Rewriter : public IRMutator {
+   public:
+    explicit Rewriter(const BufferRuntimeValidAnalysis& proof) : proof_(proof) {}
+    ExprPtr VisitExpr(const ExprPtr& expr) override { return expr; }
+    StmtPtr VisitStmt_(const AssignStmtPtr& statement) override {
+      if (!proof_.HasFillTailWitness(statement)) return statement;
+      const auto one = std::make_shared<ConstInt>(1, GetScalarDtype(statement->value_), statement->span_);
+      return std::make_shared<AssignStmt>(statement->var_, MakeMax(statement->value_, one, statement->span_),
+                                          statement->span_);
+    }
+
+   private:
+    const BufferRuntimeValidAnalysis& proof_;
+  };
+  return Rewriter(proof).VisitFunction(function);
+}
+
+struct SelectionRequirements {
+  bool caller_acc_bounds = false;
+  bool guarded_minimum_fillpad = false;
+};
+
 FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper,
                                  const sync::SyncParameterBounds& invocation_bounds,
-                                 bool& needs_caller_bounds) {
+                                 SelectionRequirements& requirements, bool materialize_fill_tails = false) {
+  requirements = {};
   if (!IsInCoreType(original->func_type_) || original->ir_stage_ == FunctionIRStage::Buffer ||
       original->HasAttr(kAttrBufferIrSelected)) {
     return original;
@@ -1404,9 +1443,10 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper
     if (context && context->GetEnableScalarGMDMA() && function->func_type_ == FunctionType::AIV)
       function = StageBufferScalarAccesses(function);
   }
+  if (materialize_fill_tails) function = MaterializeFillTailBounds(function, invocation_bounds);
   const BufferAccTrimAnalysis acc_trims(
       function, !context || context->GetMemoryPlanner() != MemoryPlanner::PtoAS, invocation_bounds);
-  needs_caller_bounds = acc_trims.NeedsCallerBounds();
+  requirements.caller_acc_bounds = acc_trims.NeedsCallerBounds();
   std::vector<int> positive_formals;
   for (const auto& [index, range] : invocation_bounds) {
     if (index >= function->params_.size() || index > static_cast<size_t>(std::numeric_limits<int>::max()) ||
@@ -1467,6 +1507,7 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper
         (support.has_load || support.has_fill || support.has_scalar_write) && support.has_store,
         BufferAdmissionProperty::KernelShape);
   }
+  requirements.guarded_minimum_fillpad = support.admission.supported() && support.guarded_minimum_fillpad;
   auto selected = std::make_shared<Function>(support.admission.supported() ? *function : *original);
   auto& step_formals = support.required_positive_formals;
   if (support.admission.supported() && !step_formals.empty()) {
@@ -1621,20 +1662,36 @@ ProgramPtr SelectBufferFunctions(const ProgramPtr& program) {
   std::optional<sync::SyncInvocationEvidence> invocation;
   for (const auto& [global, function] : program->functions_) {
     const bool device_helper = helpers.count(function->name_) != 0;
-    bool needs_caller_bounds = false;
-    auto candidate = SelectBufferFunction(function, device_helper, {}, needs_caller_bounds);
+    SelectionRequirements requirements;
+    auto candidate = SelectBufferFunction(function, device_helper, {}, requirements);
     const auto refusal = candidate->GetAttr<std::string>(kAttrBufferAdmissionProperty, "");
-    if (refusal == BufferAdmissionPropertyName(BufferAdmissionProperty::LoopStep) ||
-        (needs_caller_bounds &&
+    const auto needs_fill_tail = [&]() {
+      return requirements.guarded_minimum_fillpad ||
+             (candidate->GetAttr<std::string>(kAttrBufferAdmissionProperty, "") ==
+                  BufferAdmissionPropertyName(BufferAdmissionProperty::DynamicValidRecipe) &&
+              candidate->GetAttr<std::string>(kAttrBufferAdmissionOperation, "") == "tile.fillpad");
+    };
+    if (needs_fill_tail() || refusal == BufferAdmissionPropertyName(BufferAdmissionProperty::LoopStep) ||
+        (requirements.caller_acc_bounds &&
          refusal == BufferAdmissionPropertyName(BufferAdmissionProperty::TypeLayout))) {
       // Most kernels are locally provable. Collect caller bounds once if
-      // selection reaches an unproved loop step or Acc row extent.
+      // selection reaches an unproved loop step, Acc row extent, or fill width.
       if (!invocation) {
         invocation.emplace(sync::CollectSyncInvocationEvidence(program));
       }
       const auto bounds = invocation->parameters.find(function->name_);
       if (bounds != invocation->parameters.end()) {
-        candidate = SelectBufferFunction(function, device_helper, bounds->second, needs_caller_bounds);
+        if (!needs_fill_tail()) {
+          candidate = SelectBufferFunction(function, device_helper, bounds->second, requirements);
+        }
+        if (needs_fill_tail()) {
+          SelectionRequirements proved_requirements;
+          auto proved = SelectBufferFunction(function, device_helper, bounds->second, proved_requirements,
+                                             /*materialize_fill_tails=*/true);
+          if (IsBufferIRSelected(proved)) {
+            candidate = std::move(proved);
+          }
+        }
       }
     }
     selected.emplace(function->name_, std::move(candidate));

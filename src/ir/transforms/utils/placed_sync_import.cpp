@@ -43,6 +43,7 @@
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
+#include "pypto/ir/transforms/utils/buffer_acc_trim_analysis.h"
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
@@ -2642,8 +2643,9 @@ StartupSummary QualifyStartupScopes(SyncRegion& region, const CompactSyncInput& 
   return out;
 }
 // Reuse PyPTO's bound environment, but qualify integer operations before
-// accepting mathematical bounds as machine-index evidence. Saturation, unknown
-// parameters and data-loaded values remain unproved. No branch is sampled.
+// accepting mathematical bounds as machine-index evidence. An observed narrow
+// signed value can bound a loop stop after widening even when its sign and
+// mathematical definition are unknown. Exported coordinates remain nonnegative.
 class InvocationBounds : public IRVisitor {
   using Bound = std::pair<int64_t, int64_t>;
   struct TiledLoop {
@@ -2653,6 +2655,7 @@ class InvocationBounds : public IRVisitor {
   std::shared_ptr<arith::Analyzer> analyzer_ = std::make_shared<arith::Analyzer>();
   std::vector<VarPtr> definitions_;
   std::set<const Expr*> unproved_definitions_;
+  std::unordered_set<const Var*> bounded_scalars_;
   std::unordered_map<const Var*, ExprPtr> scalar_definitions_;
   std::unordered_map<const Var*, MakeTuplePtr> tensor_slice_shapes_;
   std::unordered_map<const Var*, TiledLoop> tiled_loops_;
@@ -2664,7 +2667,47 @@ class InvocationBounds : public IRVisitor {
   std::optional<Bound> block_index_, block_count_;
   SyncParameterWork& work_;
   std::unordered_map<const Expr*, std::optional<Bound>> ranges_;
+  BufferAccTrimBoundCache machine_ranges_;
   std::set<const Expr*> visited_;
+
+  void BindScalar(const VarPtr& var, const arith::ConstIntBound& range) {
+    bounded_scalars_.insert(var.get());
+    analyzer_->const_int_bound.Update(var, range);
+  }
+
+  std::optional<arith::ConstIntBound> MachineRange(const ExprPtr& expression) {
+    const auto before = machine_ranges_.size();
+    const auto range = BoundBufferAccTrimScalar(
+        expression, *analyzer_, [this](const VarPtr& var) { return bounded_scalars_.count(var.get()) != 0; },
+        &machine_ranges_);
+    work_.range_visits += machine_ranges_.size() - before;
+    return range;
+  }
+
+  void BindObservedScalar(const AssignStmtPtr& statement) {
+    if (!SameCoordinateType(statement->var_, statement->value_)) {
+      return;
+    }
+    if (const auto range = MachineRange(statement->value_)) {
+      BindScalar(statement->var_, *range);
+    } else if (const auto range = NarrowSignedRepresentation(statement->var_)) {
+      BindScalar(statement->var_, *range);
+    }
+  }
+
+  std::optional<Bound> SignedLoopStop(const ForStmtPtr& loop) {
+    if (loop->kind_ != ForKind::Sequential || !SameCoordinateType(loop->loop_var_, loop->stop_)) {
+      return std::nullopt;
+    }
+    const auto stop = MachineRange(loop->stop_);
+    if (!stop || stop->max_value >= arith::ConstIntBound::kPosInf) {
+      return std::nullopt;
+    }
+    // With a nonnegative start and positive stride, a negative stop only
+    // contributes zero visits. The upper bound protects the final increment.
+    return Bound{std::max<int64_t>(0, stop->min_value), std::max<int64_t>(0, stop->max_value)};
+  }
+
   void BindHostShapeSymbols() {
     if (caller_->func_type_ != FunctionType::Orchestration) return;
     // Orchestration emits an INDEX symbol from the uint32_t Tensor::shapes
@@ -2689,7 +2732,7 @@ class InvocationBounds : public IRVisitor {
         const auto scalar = symbol ? As<ScalarType>(symbol->GetType()) : nullptr;
         if (scalar && scalar->dtype_ == DataType::INDEX &&
             !reserved.count(auto_name::GetCompatibleBaseName(symbol->name_hint_))) {
-          analyzer_->const_int_bound.Update(symbol, {0, std::numeric_limits<uint32_t>::max()});
+          BindScalar(symbol, {0, std::numeric_limits<uint32_t>::max()});
         }
       }
     }
@@ -2698,6 +2741,7 @@ class InvocationBounds : public IRVisitor {
   // both belong to the current bound environment, never to the entire program.
   void Invalidate() {
     ranges_.clear();
+    machine_ranges_.clear();
     visited_.clear();
   }
   std::optional<Bound> Range(const ExprPtr& expression) {
@@ -2898,6 +2942,7 @@ class InvocationBounds : public IRVisitor {
            Range(comparison->right_);
   }
   void Unbind(const VarPtr& var) {
+    bounded_scalars_.erase(var.get());
     analyzer_->const_int_bound.Unbind(var);
     analyzer_->rewrite_simplify.Update(var, nullptr);
   }
@@ -3012,12 +3057,18 @@ class InvocationBounds : public IRVisitor {
         caller_(std::move(caller)),
         work_(work) {
     BindHostShapeSymbols();
+    for (const auto& parameter : caller_->params_) {
+      if (const auto range = NarrowSignedRepresentation(parameter)) {
+        BindScalar(parameter, *range);
+      }
+    }
     // Every predecessor has been processed before this environment is built.
     // Missing/unknown formal bounds are not inferred from a sample invocation.
     if (auto incoming = evidence.find(caller_->name_); incoming != evidence.end()) {
       for (const auto& [index, bound] : incoming->second) {
-        if (bound)
-          analyzer_->const_int_bound.Update(caller_->params_.at(index), {bound->first, bound->second});
+        if (bound) {
+          BindScalar(caller_->params_.at(index), {bound->first, bound->second});
+        }
       }
     }
     if (auto count = counts.find(caller_->name_); count != counts.end()) {
@@ -3077,10 +3128,13 @@ class InvocationBounds : public IRVisitor {
       }
       // Preserve specialized bounds for calls such as get_block_idx which the
       // generic arithmetic analyzer intentionally treats as opaque.
-      analyzer_->const_int_bound.Update(statement->var_, {b->first, b->second});
+      BindScalar(statement->var_, {b->first, b->second});
     } else {
       Unbind(statement->var_);
       unproved_definitions_.insert(statement->var_.get());
+      // Retain a machine range for loop-stop recovery only. Do not install an
+      // arithmetic substitution or make this definition a qualified argument.
+      BindObservedScalar(statement);
     }
     Invalidate();
   }
@@ -3107,7 +3161,9 @@ class InvocationBounds : public IRVisitor {
     VisitExpr(loop->stop_);
     VisitExpr(loop->step_);
     for (const auto& argument : loop->iter_args_) VisitExpr(argument->initValue_);
-    auto start = Range(loop->start_), stop = Range(loop->stop_), step = Range(loop->step_);
+    const auto start = Range(loop->start_), step = Range(loop->step_);
+    const auto coordinate_stop = Range(loop->stop_);
+    const auto stop = coordinate_stop ? coordinate_stop : SignedLoopStop(loop);
     const auto maximum = SyncCoordinateMaximum(loop->loop_var_);
     if (maximum && start && stop && step && step->first > 0 && stop->second > start->first &&
         __int128(stop->second) - 1 + step->second < arith::ConstIntBound::kPosInf &&
@@ -3115,9 +3171,11 @@ class InvocationBounds : public IRVisitor {
       int64_t last = stop->second - 1;
       if (start->first == start->second && stop->first == stop->second && step->first == step->second)
         last = start->first + (stop->first - start->first - 1) / step->first * step->first;
-      analyzer_->const_int_bound.Update(loop->loop_var_, {start->first, last});
-      if (const auto tiled = QualifyTiledLoop(loop)) {
-        tiled_loops_.emplace(loop->loop_var_.get(), *tiled);
+      BindScalar(loop->loop_var_, {start->first, last});
+      if (coordinate_stop) {
+        if (const auto tiled = QualifyTiledLoop(loop)) {
+          tiled_loops_.emplace(loop->loop_var_.get(), *tiled);
+        }
       }
     } else {
       Unbind(loop->loop_var_);

@@ -10,6 +10,7 @@
 """Emit executable PyTorch code from PyPTO IR for debugging and numerical verification."""
 
 import keyword
+import math
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -574,6 +575,9 @@ def _coerce_shape(shape):
 def _pad_scalar(tensor, pad_mode):
     if pad_mode == "zero":
         return 0
+    if tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
+        # PTO-ISA's minimum and maximum pad patterns encode IEEE infinities.
+        return float("-inf") if pad_mode == "min" else float("inf")
     if tensor.dtype.is_floating_point:
         finfo = torch.finfo(tensor.dtype)
         return finfo.min if pad_mode == "min" else finfo.max
@@ -2015,7 +2019,8 @@ class TorchCodegen(_ir.IRVisitor):
         self._expr_result = str(op.value)
 
     def visit_const_float(self, op: _ir.ConstFloat) -> None:
-        self._expr_result = repr(op.value)
+        literal = repr(op.value)
+        self._expr_result = literal if math.isfinite(op.value) else f"float({literal!r})"
 
     def visit_const_bool(self, op: _ir.ConstBool) -> None:
         self._expr_result = "True" if op.value else "False"

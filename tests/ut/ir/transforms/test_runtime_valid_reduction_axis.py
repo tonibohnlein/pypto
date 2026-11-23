@@ -180,9 +180,8 @@ def recurrence_program(
 ):
     """The generic full-seed/prefix recurrence used by post-normalization.
 
-    The full-observation variant deliberately matches the missing value-domain
-    obligation in rms_recip: a partial recurrence followed by a full column store.
-    Neither its store nor its caller contract may be silently narrowed.
+    The full-observation variant matches rms_recip: a partial recurrence
+    contribution followed by a full column store.
     """
     active = "pl.min(rows, visit % 8)" if varying else "rows"
     load_active = "pl.min(active, k % 8)" if inner_bound else "active"
@@ -274,12 +273,11 @@ def test_prefix_recurrence_values_matching_and_reset_visits(varying, aliases, tm
         assert cpp.is_file()
 
 
-@pytest.mark.parametrize("kind", ["full_observation", "inner_bound"])
-def test_prefix_recurrence_unproved_observations_preserve_original_body(kind):
+def test_prefix_recurrence_unproved_inner_bound_preserves_original_body():
     with passes.PassContext([], enable_buffer_ir=True, memory_planner=passes.MemoryPlanner.PYPTO):
         manager = PassManager.get_strategy(ir.OptimizationStrategy.Default)
         boundary = manager.get_pass_names().index("SelectBufferIRFunctions")
-        program = recurrence_program(**{kind: True})
+        program = recurrence_program(inner_bound=True)
         for transform in manager.passes[:boundary]:
             program = transform(program)
         original = program.get_function("kernel")
@@ -472,20 +470,28 @@ def test_plain_prefix_alias_metadata_observation_retains_original(aliases):
     ir.assert_structural_equal(source.body, selected.body, enable_auto_mapping=False)
 
 
-@pytest.mark.parametrize("aliases", [1, 3])
-def test_plain_prefix_aliases_full_observation_retains_original(aliases):
-    # A plain alias does not license narrowing a store that still observes the
-    # full declared value, including inactive elements of the recurrence.
+@pytest.mark.parametrize("aliases", [0, 1, 3])
+def test_full_observation_preserves_recurrence_seed_through_aliases(aliases):
+    # A zero-extended contribution leaves the defined seed in the inactive
+    # lanes. The store still observes their values through each alias.
+    input_program = recurrence_program(full_observation=True, aliases=aliases)
     with passes.PassContext([], enable_buffer_ir=True, memory_planner=passes.MemoryPlanner.PYPTO):
-        original = _selection_input(recurrence_program(full_observation=True, aliases=aliases))
-        source = original.get_function("kernel")
-        assert source is not None
+        original = _selection_input(input_program)
         saved = ir.serialize(original)
-        report = testing.normalize_buffer_active_domains(source)
         selected = passes.select_buffer_ir_functions()(original).get_function("kernel")
-    assert not report["changed"] and ir.serialize(original) == saved
-    assert selected is not None and selected.attrs["buffer_ir_selected"] is False
-    ir.assert_structural_equal(source.body, selected.body, enable_auto_mapping=False)
+    assert ir.serialize(original) == saved
+    assert selected is not None and selected.attrs["buffer_ir_selected"] is True
+    program, _ = lower(input_program)
+    namespace = {}
+    exec(torch_codegen(program), namespace)
+    x = torch.arange(128, dtype=torch.float32).reshape(8, 16) / 32
+    for rows in [0, 1, 7, 8]:
+        out = torch.full_like(x, -777)
+        seed = torch.full((8, 1), -777.0)
+        namespace["kernel"](x, rows, 3, 0, out, seed)
+        expected = torch.full_like(seed, 2.0)
+        expected[:rows] += 1.5 * x[:rows].square().sum(dim=1, keepdim=True)
+        torch.testing.assert_close(seed, expected)
 
 
 def _is_static_row_vector(tile: ir.Type) -> bool:

@@ -46,6 +46,7 @@ const std::vector<BufferConversionRecipe>& GetBufferConversionRecipes();
 const BufferConversionRecipe* FindLogicalBufferConversionRecipe(const std::string& name);
 const BufferConversionRecipe* FindBufferConversionRecipe(const std::string& name);
 bool SupportsLogicalBufferConversion(const BufferConversionRecipe& recipe, const ir::CallPtr& call);
+bool SupportsZeroFillPadColumnPrefix(const ir::BufferTypePtr& type);
 void ValidateBufferConversionOperands(const BufferConversionRecipe& recipe,
                                       const std::vector<ir::ExprPtr>& args,
                                       const std::vector<std::pair<std::string, std::any>>& kwargs);

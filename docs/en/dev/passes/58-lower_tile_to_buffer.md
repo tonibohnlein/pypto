@@ -67,8 +67,22 @@ placed storage from the PYPTO or DSA_RP planner and accounts for reads within
 the complete source allocation and writes to the complete destination.
 
 Minimum `fillpad` accepts runtime rows and columns proved positive and within capacity.
-A matching ceiling-division tile guard can prove a positive tail width. For full-column
-padded row prefixes, row max/sum, row broadcast subtract, exp, Vec copy and BF16/FP32
+For a full FP32 Vec source narrowed by `set_validshape` to a fixed positive row count
+and an unproved signed width, the compiler can defer the setter if the narrowed
+alias feeds only minimum fills. The same kernel checks the original width. A positive
+width copies the prefix up to the physical column capacity and pads the remaining cells.
+A nonpositive width fills the entire destination with the native minimum value, negative
+infinity. The empty path reads no source data and issues no native valid-shape update.
+A matching ceiling-division guard can prove a positive tail width for a signed tile
+ordinal when the original numerator, product and subtraction fit their machine types.
+Tensor addressing still requires its own index bounds.
+An outlined leaf prefers the direct native fill when every caller proves the width's range.
+For a guarded tail whose width depends on that range, selection retains the original capped width and takes its maximum
+with one. This equals the original value on every admitted call and lets standalone Buffer
+verification recover the bounds from the scalar IR. A caller with an unknown range prevents
+this specialization.
+
+For full-column padded row prefixes, row max/sum, row broadcast subtract, exp, Vec copy and BF16/FP32
 cast preserve the active rows. Vec copy uses one aligned vector-pipe burst on disjoint placed buffers, rounding contiguous FP32 column copies to whole blocks.
 
 Scalar parameters use the existing scalar ABI; element operands receive explicit
@@ -343,6 +357,22 @@ from the table above. Standalone setters retain Tile IR because conversion needs
 an explicit logical result. Valid expressions must match structurally across
 arithmetic operands and result; two `-1` descriptor dimensions alone do not prove
 matching runtime values.
+
+For FP32 row-prefix loads, guarded full-width single-row consumers can qualify
+same-shape binary operations such as multiply and maximum over a dense zero-filled copy. Each
+observed row must be proved nonnegative and below the original valid row count
+at its use. The GM load keeps its original valid extent, and the ordinary Vec
+layout checks still apply to pitched inputs. Unguarded rows, full-result stores,
+and unqualified uses of shared storage fall outside this guarded-row proof.
+
+A full-valid FP32 `add` can consume a right operand with an unspecified
+tail when its prefix comes from a fresh partial load through zero-preserving
+cast, square, row sum, or contiguous reshape operations. The Buffer candidate
+materializes a separate zero-padded operand at the addition and keeps the
+original producer extent and full destination extent. A clipped view of a
+previously defined value does not qualify. Zero padding supports a dense row
+prefix or a column prefix within one FP32 row of at most one vector repeat.
+An empty prefix produces a full tile of zeros without reading the source.
 
 A logical vector of capacity `[C]` uses a physical Vec tile of shape `[1,C]`,
 including when reshape produces the vector. A rank-one GM transfer of `n`

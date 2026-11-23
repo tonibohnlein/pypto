@@ -56,16 +56,18 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     CallPtr call;
     std::string message;
   };
-  explicit BufferRuntimeValidAnalysis(const FunctionPtr& function, bool collect_guards = false,
-                                      bool check_payload_capacity = false,
-                                      const std::vector<int>& positive_loop_parameters = {})
+  explicit BufferRuntimeValidAnalysis(
+      const FunctionPtr& function, bool collect_guards = false, bool check_payload_capacity = false,
+      const std::vector<int>& positive_loop_parameters = {},
+      const std::map<size_t, std::pair<int64_t, int64_t>>& parameter_bounds = {})
       : analyzer_(std::make_shared<arith::Analyzer>()),
+        collect_tail_bounds_(!parameter_bounds.empty()),
         collect_guards_(collect_guards),
         check_payload_capacity_(check_payload_capacity) {
     if (function) {
       core_ = function->func_type_;
       dual_aiv_ = core_ == FunctionType::AIV && function->GetAttr<bool>(kAttrDualAivDispatch);
-      BindBufferAccTrimParameters(function, *analyzer_, ready_, positive_loop_parameters);
+      BindBufferAccTrimParameters(function, *analyzer_, ready_, positive_loop_parameters, parameter_bounds);
       if (function->body_) VisitStmt(function->body_);
     }
   }
@@ -78,6 +80,13 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     const auto found = logical_minimum_padding_.find(call.get());
     return found != logical_minimum_padding_.end() && found->second;
   }
+  // Only definitions proved positive on every occurrence and actually used as
+  // minimum-fill extents need a witness when the leaf is outlined.
+  bool HasFillTailWitness(const AssignStmtPtr& statement) const {
+    const auto found = checked_tails_.find(statement.get());
+    return found != checked_tails_.end() && found->second && fill_extents_.count(statement->var_.get());
+  }
+  bool HasCheckedTails() const { return !checked_tails_.empty() && !fill_extents_.empty(); }
   bool HasElidableGuards() const {
     return std::any_of(redundant_guards_.begin(), redundant_guards_.end(),
                        [](const auto& entry) { return entry.second; });
@@ -145,13 +154,16 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     if (const auto scalar = As<ScalarType>(statement->var_->GetType());
         scalar && (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt())) {
       auto range = GuardedTileTail(statement->value_);
+      if (collect_tail_bounds_ && As<Min>(statement->value_)) {
+        const auto [entry, inserted] = checked_tails_.emplace(statement.get(), range.has_value());
+        if (!inserted) entry->second &= range.has_value();
+      }
       if (!range) range = Bounds(statement->value_);
       if (call && scalar->dtype_.IsSignedInt() && scalar->dtype_.GetBit() < 64 &&
           (IsOp(call, "tensor.read") || IsOp(call, "tile.read") || IsOp(call, "buffer.gm_read") ||
            IsOp(call, "buffer.read"))) {
         // Only the representation range is known for a scalar memory value.
-        const int64_t max = (int64_t{1} << (scalar->dtype_.GetBit() - 1)) - 1;
-        range = arith::ConstIntBound{-max - 1, max};
+        range = NarrowSignedRepresentation(statement->var_);
       }
       if (dual_aiv_ && call && call->args_.empty() &&
           (IsOp(call, "tile.get_subblock_idx") || IsOp(call, "buffer.get_subblock_idx"))) {
@@ -267,10 +279,17 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     return found == scalar_values_.end() ? value : found->second;
   }
 
+  VarPtr TailOrdinal(const ExprPtr& value) const {
+    // Preserve the identity of a computed ordinal. Its machine value is
+    // already fixed at this cut, and need not be a loop induction variable.
+    const auto alias = AsVarLike(ScalarValue(value));
+    return alias ? alias : AsVarLike(value);
+  }
+
   std::optional<std::pair<TileTailKey, ExprPtr>> GetTileTailGuard(const ExprPtr& condition) {
     const auto less = As<Lt>(condition);
     if (!less) return std::nullopt;
-    const auto ordinal = AsVarLike(ScalarValue(less->left_));
+    const auto ordinal = TailOrdinal(less->left_);
     const auto quotient = As<FloorDiv>(ScalarValue(less->right_));
     const auto cap = quotient ? As<ConstInt>(quotient->right_) : nullptr;
     const auto padded = quotient ? As<Add>(quotient->left_) : nullptr;
@@ -279,8 +298,7 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
         !Bounds(quotient->left_)) {
       return std::nullopt;
     }
-    const auto index = Bounds(less->left_);
-    if (!index || index->min_value < 0) return std::nullopt;
+    if (!Bounds(less->left_)) return std::nullopt;
     return std::make_pair(TileTailKey{ordinal, cap->value_}, padded->left_);
   }
 
@@ -289,15 +307,16 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     if (!minimum) return std::nullopt;
     const bool cap_on_right = As<ConstInt>(minimum->right_) != nullptr;
     const auto cap = As<ConstInt>(cap_on_right ? minimum->right_ : minimum->left_);
-    const auto remainder = As<Sub>(cap_on_right ? minimum->left_ : minimum->right_);
-    const auto product = remainder ? As<Mul>(remainder->right_) : nullptr;
+    const auto remainder = As<Sub>(ScalarValue(cap_on_right ? minimum->left_ : minimum->right_));
+    const auto product = remainder ? As<Mul>(ScalarValue(remainder->right_)) : nullptr;
     const auto step = product ? As<ConstInt>(product->right_) : nullptr;
-    const auto ordinal = product ? AsVarLike(ScalarValue(product->left_)) : nullptr;
+    const auto ordinal = product ? TailOrdinal(product->left_) : nullptr;
     if (!cap || !step || cap->value_ != step->value_ || !ordinal) return std::nullopt;
     const auto guard = tail_guards_.find(TileTailKey{ordinal, cap->value_});
     // Only compare the same typed extent, and first prove every subtraction
-    // operand and result representable. For i >= 0, i < (n+C-1)/C gives
-    // n+C-1 >= (i+1)*C, hence 1 <= min(n-i*C,C) <= C.
+    // operand and result representable. Signed floor division gives
+    // n+C-1 >= (i+1)*C whenever i < floor((n+C-1)/C), including negative i.
+    // This bounds the width only. It supplies no tensor-index proof.
     if (guard == tail_guards_.end() || !Bounds(remainder) ||
         !SameTailExtent(guard->second, remainder->left_)) {
       return std::nullopt;
@@ -315,7 +334,16 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
         value, *analyzer_, [this](const VarPtr& var) { return ready_.count(var.get()) != 0; }, &bound_cache_);
   }
   static std::optional<arith::ConstIntBound> ObservedMinimum(const AssignStmtPtr& statement, DataType dtype) {
-    const auto minimum = As<Min>(statement->value_);
+    // A clamp of an observed machine value proves both endpoints even when
+    // the arithmetic producing the inner value has no replayable range.
+    auto operand = statement->value_;
+    ConstIntPtr lower;
+    if (const auto maximum = As<Max>(operand)) {
+      lower = As<ConstInt>(maximum->right_);
+      if (!lower || lower->dtype() != dtype || GetScalarDtype(maximum->left_) != dtype) return std::nullopt;
+      operand = maximum->left_;
+    }
+    const auto minimum = As<Min>(operand);
     if (!minimum || GetScalarDtype(minimum) != dtype || GetScalarDtype(minimum->left_) != dtype ||
         GetScalarDtype(minimum->right_) != dtype) {
       return std::nullopt;
@@ -333,7 +361,8 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
     // observed minimum cannot exceed its literal cap, even if the analysis
     // cannot justify replaying that assignment's numerical expression.
     const auto lo = bits == 64 ? arith::ConstIntBound::kNegInf : -static_cast<int64_t>(maximum) - 1;
-    return arith::ConstIntBound{lo, cap->value_};
+    if (lower && (lower->value_ < lo || lower->value_ > cap->value_)) return std::nullopt;
+    return arith::ConstIntBound{lower ? lower->value_ : lo, cap->value_};
   }
   bool Positive(const ExprPtr& extent) {
     if (AtomicInteger(extent) && analyzer_->const_int_bound(extent).min_value >= 1) return true;
@@ -468,6 +497,9 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
           entry->second = valid.size() == 2;
           for (size_t axis = 0; axis < 2 && entry->second; ++axis) {
             const auto capacity = As<ConstInt>(type->shape_[axis]);
+            if (collect_tail_bounds_) {
+              if (const auto variable = AsVarLike(valid[axis])) fill_extents_.insert(variable.get());
+            }
             const auto range = Bounds(valid[axis]);
             entry->second =
                 capacity && range && range->min_value >= 1 && range->max_value <= capacity->value_;
@@ -573,6 +605,12 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
           if (!bounded || bounded->min_value < 1 || bounded->max_value > type->shape_[axis]) {
             Refuse(call, "Minimum FillPad requires positive source extents within physical capacity");
           }
+        }
+      } else if (type && extents && backend::SupportsZeroFillPadColumnPrefix(type) &&
+                 Equal((*extents)[0], Constant(1, call->span_))) {
+        const auto cols = Bounds((*extents)[1]);
+        if (!cols || cols->min_value < 1 || cols->max_value > type->shape_[1]) {
+          Refuse(call, "Single-row FillPad requires positive source columns within physical capacity");
         }
       } else if (!type || !extents || !Equal((*extents)[1], Constant(type->shape_[1], call->span_)) ||
                  !AtomicInteger((*extents)[0]) || !analyzer_->CanProveGreaterEqual((*extents)[0], 1)) {
@@ -685,6 +723,9 @@ class BufferRuntimeValidAnalysis : public IRVisitor {
   std::optional<Issue> issue_;
   std::unordered_map<const Call*, bool> logical_scalar_points_;
   std::unordered_map<const Call*, bool> logical_minimum_padding_;
+  bool collect_tail_bounds_;
+  std::unordered_map<const AssignStmt*, bool> checked_tails_;
+  std::unordered_set<const Var*> fill_extents_;
   bool collect_guards_;
   bool check_payload_capacity_;
   // The same immutable statement/call can be reused. Every occurrence must

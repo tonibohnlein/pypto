@@ -403,7 +403,7 @@ class LaneImporter {
         // representative ordinals for one closed lexical borrow are needed.
         ordinals_ = entry;
       } else {
-        Import(statement, endpoint && tail);
+        Import(statement, endpoint && tail, /*lane_root=*/endpoint);
       }
     }
     if (!body.empty()) RequireClosedBorrows(body.back()->span_);
@@ -1362,7 +1362,7 @@ class LaneImporter {
     result_.input.segments.emplace_back();
   }
 
-  void Import(const StmtPtr& statement, bool terminal) {
+  void Import(const StmtPtr& statement, bool terminal, bool lane_root = false) {
     if (const auto returned = As<ReturnStmt>(statement)) {
       CHECK_SPAN(terminal, statement->span_) << "Unqualified peer local early return";
       for (const auto& value : returned->value_) {
@@ -1403,6 +1403,15 @@ class LaneImporter {
       return;
     }
     CHECK_SPAN(!As<GlobalVar>(call->op_), statement->span_) << "Unqualified outlined peer payload";
+    if (structured_ && !authored_acquire_ && lane_root && IsOp(call, "system.syncall")) {
+      CHECK_SPAN(IsA<EvalStmt>(statement) && cross_core_pipe::IsHardMixedSyncAll(call), statement->span_)
+          << "Peer local region requires an authored hard MIX SYNCALL";
+      RequireClosedBorrows(statement->span_);
+      // The structured dataflow carries outstanding local effects across the
+      // rendezvous. Preserve its native protocol and the receive cursor.
+      structured_->calls.at(call.get()).is_transport = true;
+      return;
+    }
     if (authored_acquire_ &&
         (cross_core_pipe::IsAuthoredGMProtocolCall(call) || cross_core_pipe::IsHardMixedSyncAll(call))) {
       CHECK_SPAN(IsA<EvalStmt>(statement), statement->span_)

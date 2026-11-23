@@ -35,9 +35,13 @@ std::optional<arith::ConstIntBound> BoundBufferLoopCoordinate(const ForStmtPtr& 
                                                               arith::Analyzer& analyzer,
                                                               const std::function<bool(const VarPtr&)>& ready,
                                                               BufferAccTrimBoundCache& cache);
+// A supplied or already-evaluated narrow signed value fits its machine type,
+// independently of the expression or memory contents that produced it.
+std::optional<arith::ConstIntBound> NarrowSignedRepresentation(const VarPtr& var);
 void BindBufferAccTrimParameters(const FunctionPtr& function, arith::Analyzer& analyzer,
                                  std::unordered_set<const Var*>& ready,
-                                 const std::vector<int>& positive_loop_parameters = {});
+                                 const std::vector<int>& positive_loop_parameters = {},
+                                 const std::map<size_t, std::pair<int64_t, int64_t>>& parameter_bounds = {});
 
 // Enter only distinct atomic integer comparison facts, with De Morgan handling
 // for false disjunctions. General Boolean DAGs are never sent to the recursive

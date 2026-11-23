@@ -372,6 +372,66 @@ def test_identity_slice_preserves_the_window_recipe_for_runtime_validity(tmp_pat
     _compile(tmp_path, result, ascend_backend, addressed=True)
 
 
+@pytest.mark.parametrize("observation", ["guarded", "unguarded", "full"])
+def test_row_prefix_padding_requires_proven_observable_rows(tmp_path, ascend_backend, observation):
+    condition = "row < rows" if observation != "unguarded" else "row < 16"
+    extra_store = "pl.store(combined, [0, 0], out)" if observation == "full" else ""
+    program = pl.parse_program(f"""
+@pl.program
+class GuardedRows:
+    @pl.function(type=pl.FunctionType.AIV)
+    def kernel(self, x: pl.Tensor[[16, 16], pl.FP32], coefficients: pl.Tensor[[16, 8], pl.FP32],
+               rows: pl.Scalar[pl.INDEX],
+               out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
+        full = pl.load(x, [0, 0], [16, 16])
+        pitched = pl.tile.slice(full, [16, 8], [0, 8])
+        prefix = pl.tile.load(coefficients, [0, 0], [16, 8], [rows, 8], target_memory=pl.Mem.Vec)
+        combined = pl.maximum(pl.mul(pitched, prefix), pitched)
+        {extra_store}
+        for row in pl.range(16):
+            if {condition}:
+                selected = pl.tile.slice(combined, [1, 8], [row, 0])
+                coeff = pl.tile.extract(prefix, row, 0, [1, 8], target_memory=pl.Mem.Vec)
+                out = pl.store(selected, [row, 0], out)
+                out = pl.store(coeff, [row, 8], out)
+        return out
+""")
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
+        result = PassManager(OptimizationStrategy.Default).run_passes(program)
+    kernel = result.get_function("kernel")
+    assert kernel is not None
+    if observation != "guarded":
+        assert kernel.ir_stage == ir.FunctionIRStage.Functional
+        return
+
+    assert kernel.ir_stage == ir.FunctionIRStage.Buffer
+    result = _verify_round_trip(result)
+    kernel = result.get_function("kernel")
+    assert kernel is not None
+    # Both the pitched arithmetic and the guarded extract use the materialized
+    # prefix. There is one copy and the GM load remains restricted to live rows.
+    (fill,) = _calls(result, "buffer.fillpad")
+    (extract,) = _calls(result, "buffer.extract")
+    assert extract.args[0].same_as(fill.args[1])
+    assert list(extract.args[3].type.valid_shape) == [1, 8]
+    loads = _calls(result, "buffer.load")
+    assert len(loads) == 2
+    (partial_load,) = [call for call in loads if call.args[3].same_as(fill.args[0])]
+    assert partial_load.args[2].elements[0].same_as(kernel.params[2])
+    x = torch.arange(256, dtype=torch.float32).reshape(16, 16)
+    coefficients = torch.arange(128, dtype=torch.float32).remainder(7).reshape(16, 8) - 2
+    namespace = {}
+    exec(torch_codegen(result), namespace)  # noqa: S102
+    for rows in (0, 5, 16):
+        output = torch.full((16, 16), -777.0)
+        expected = output.clone()
+        expected[:rows, :8] = torch.maximum(x[:rows, 8:] * coefficients[:rows], x[:rows, 8:])
+        expected[:rows, 8:] = coefficients[:rows]
+        namespace["kernel"](x, coefficients, rows, output)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    _compile(tmp_path, result, ascend_backend, addressed=True)
+
+
 def test_default_runtime_vec_insert_specializes_prefix_without_overwriting_tail(tmp_path, ascend_backend):
     @pl.program
     class RuntimeVecInsert:

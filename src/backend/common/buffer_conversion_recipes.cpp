@@ -66,6 +66,13 @@ const BufferConversionRecipe* FindBufferConversionRecipe(const std::string& name
   return found == index.end() ? nullptr : found->second;
 }
 
+// The zero-extension column path uses one contiguous FP32 row within a single
+// native vector repeat. Keep multi-row partial-column encodings separate.
+bool SupportsZeroFillPadColumnPrefix(const ir::BufferTypePtr& type) {
+  return IsAlignedDenseVecBufferGeometry(type) && type->dtype_ == DataType::FP32 && type->shape_[0] == 1 &&
+         type->shape_[1] <= 64;
+}
+
 namespace {
 using K = BufferConversionKind;
 
@@ -144,7 +151,8 @@ const char* OperandError(const BufferConversionRecipe& recipe, const std::vector
                    IsBufferVecFillValue(dst->pad_, dst->dtype_) && src->shape_ == dst->shape_ &&
                    src->dtype_ == dst->dtype_ &&
                    (src->valid_shape_[1] == src->shape_[1] || src->valid_shape_[1] == -1 ||
-                    (min_pad && src->valid_shape_[1] > 0 && src->valid_shape_[1] < src->shape_[1])) &&
+                    ((min_pad || SupportsZeroFillPadColumnPrefix(src)) && src->valid_shape_[1] > 0 &&
+                     src->valid_shape_[1] < src->shape_[1])) &&
                    src->shape_[0] <= kMaxRowRepeat &&
                    src->shape_[1] <= kMaxStrideBlocks * 32 / src->dtype_.GetByte() && bytes &&
                    *bytes <= kVecCapacityBytes
@@ -305,9 +313,14 @@ bool SupportsLogicalBufferConversion(const BufferConversionRecipe& recipe, const
              IsNamedOrPositiveExtent(valid[1], tile->shape_[1]) &&
              OperandError(recipe, {PhysicalLogicalVecDescriptor(tile), target}, {}) == nullptr;
     }
-    return ir::structural_equal(valid[1], tile->shape_[1]) &&
+    const auto source = PhysicalLogicalVecDescriptor(tile);
+    const auto cols = ir::As<ir::ConstInt>(valid[1]);
+    const bool column_prefix =
+        SupportsZeroFillPadColumnPrefix(source) && ir::structural_equal(valid[0], tile->shape_[0]) &&
+        (IsNamedOrPositiveExtent(valid[1], tile->shape_[1]) || (cols && cols->value_ == 0));
+    return (ir::structural_equal(valid[1], tile->shape_[1]) || column_prefix) &&
            (ir::AsVarLike(valid[0]) || ir::As<ir::ConstInt>(valid[0])) &&
-           OperandError(recipe, {PhysicalLogicalVecDescriptor(tile), target}, {}) == nullptr;
+           OperandError(recipe, {source, target}, {}) == nullptr;
   }
   const bool permit_zero_pad = recipe.kind == K::Cast;
   std::vector<ir::BufferTypePtr> types;

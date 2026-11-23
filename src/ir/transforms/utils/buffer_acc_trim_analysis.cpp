@@ -126,15 +126,7 @@ class CandidateIndex : public IRVisitor {
   CandidateIndex(const FunctionPtr& function,
                  const std::map<size_t, std::pair<int64_t, int64_t>>& parameter_bounds)
       : analyzer_(std::make_shared<arith::Analyzer>()) {
-    BindBufferAccTrimParameters(function, *analyzer_, ready_);
-    for (const auto& [index, range] : parameter_bounds) {
-      if (index >= function->params_.size()) continue;
-      const auto& parameter = function->params_[index];
-      if (!Integer(parameter)) continue;
-      const auto [min, max] = SignedLimits(parameter);
-      if (range.first >= min && range.second <= max && range.first <= range.second)
-        analyzer_->const_int_bound.Update(parameter, {range.first, range.second});
-    }
+    BindBufferAccTrimParameters(function, *analyzer_, ready_, {}, parameter_bounds);
     VisitStmt(function->body_);
   }
   std::unordered_set<const Type*> types;
@@ -495,12 +487,24 @@ std::optional<arith::ConstIntBound> BoundBufferLoopCoordinate(const ForStmtPtr& 
   return arith::ConstIntBound{start->min_value, static_cast<int64_t>(last)};
 }
 
+std::optional<arith::ConstIntBound> NarrowSignedRepresentation(const VarPtr& var) {
+  const auto type = As<ScalarType>(var->GetType());
+  if (!type || !type->dtype_.IsSignedInt() || type->dtype_.GetBit() >= 64) return std::nullopt;
+  const auto [lo, hi] = SignedLimits(var);
+  return arith::ConstIntBound{static_cast<int64_t>(lo), static_cast<int64_t>(hi)};
+}
+
 void BindBufferAccTrimParameters(const FunctionPtr& function, arith::Analyzer& analyzer,
                                  std::unordered_set<const Var*>& ready,
-                                 const std::vector<int>& positive_loop_parameters) {
+                                 const std::vector<int>& positive_loop_parameters,
+                                 const std::map<size_t, std::pair<int64_t, int64_t>>& parameter_bounds) {
   std::unordered_set<const Var*> shape_variables;
   for (const auto& parameter : function->params_) {
-    if (Integer(parameter)) ready.insert(parameter.get());
+    if (Integer(parameter)) {
+      ready.insert(parameter.get());
+      if (const auto range = NarrowSignedRepresentation(parameter))
+        analyzer.const_int_bound.Update(parameter, *range);
+    }
     const auto tensor = As<TensorType>(parameter->GetType());
     if (!tensor) continue;
     for (const auto& dimension : tensor->shape_) {
@@ -527,6 +531,14 @@ void BindBufferAccTrimParameters(const FunctionPtr& function, arith::Analyzer& a
     bind_positive(function->GetAttr<std::vector<int>>(kAttrBufferPositiveStepParameters, {}));
   }
   bind_positive(positive_loop_parameters);
+  for (const auto& [index, range] : parameter_bounds) {
+    if (index >= function->params_.size()) continue;
+    const auto& parameter = function->params_[index];
+    if (!Integer(parameter)) continue;
+    const auto [min, max] = SignedLimits(parameter);
+    if (range.first >= min && range.second <= max && range.first <= range.second)
+      analyzer.const_int_bound.Update(parameter, {range.first, range.second});
+  }
 }
 
 bool IsBufferAccTrimTargetQualified() {

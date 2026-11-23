@@ -2153,15 +2153,16 @@ def test_tensor_slice_out_of_bounds_is_padded():
     assert torch.allclose(out[32:, :], torch.zeros(32, 64))
 
 
-def test_tensor_fillpad_min_uses_valid_shape():
-    """tensor.fillpad should apply pad_value outside valid_shape metadata."""
+@pytest.mark.parametrize("mode", [ir.PadValue.min, ir.PadValue.max])
+def test_tensor_fillpad_extrema_use_valid_shape(mode):
+    """FP32 padding uses the native infinity bit patterns outside the valid rectangle."""
     src = _tensor_var("src", [8, 64], DataType.FP32)
     result = _tensor_var("result", [8, 64], DataType.FP32)
     shapes = _make_tuple(_int(8), _int(64))
     offsets = _make_tuple(_int(0), _int(0))
     valid_shape = _make_tuple(_int(8), _int(32))
     sliced = _op_call("tensor.slice", [src, shapes, offsets, valid_shape])
-    padded = _op_call("tensor.fillpad", [sliced], {"pad_value": ir.PadValue.min})
+    padded = _op_call("tensor.fillpad", [sliced], {"pad_value": mode})
     assign = ir.AssignStmt(result, padded, _span())
     ret = ir.ReturnStmt([result], _span())
     body = ir.SeqStmts([assign, ret], _span())
@@ -2174,7 +2175,8 @@ def test_tensor_fillpad_min_uses_valid_shape():
     out = ns["f"](x)
     assert out.shape == (8, 64)
     assert torch.allclose(out[:, :32], x[:, :32])
-    assert torch.all(out[:, 32:] == torch.finfo(torch.float32).min)
+    expected = -torch.inf if mode == ir.PadValue.min else torch.inf
+    assert torch.all(out[:, 32:] == expected)
 
 
 # ---------------------------------------------------------------------------

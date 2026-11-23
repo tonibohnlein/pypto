@@ -387,7 +387,8 @@ return out""",
 
 @pytest.mark.ptoas_compile
 @pytest.mark.usefixtures("ascend_backend")
-def test_hard_mix_syncall_separates_runtime_work_regions(tmp_path):
+@pytest.mark.parametrize("guarded_until", [None, 3])
+def test_hard_mix_syncall_separates_runtime_work_regions(tmp_path, guarded_until):
     snapshots = []
 
     def capture(transform, program):
@@ -396,7 +397,12 @@ def test_hard_mix_syncall_separates_runtime_work_regions(tmp_path):
 
     mixed_cut = "pl.system.syncall(core_type=pl.KernelType.MIX)"
     source = _mat_receive_epilogue(
-        128, "BF16", 2, loop=(1, 1), work=_PeerWorkLoop(5), region_boundaries=(mixed_cut,) * 2
+        128,
+        "BF16",
+        2,
+        loop=(1, 1),
+        work=_PeerWorkLoop(5, guarded_until=guarded_until),
+        region_boundaries=(mixed_cut,) * 2,
     )
     cfg = RunConfig(arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(tmp_path))
     with passes.PassContext(
@@ -416,7 +422,8 @@ def test_hard_mix_syncall_separates_runtime_work_regions(tmp_path):
         order = state.run()
         # Replay zero, one and many visits. Odd receive counts make some
         # regions start with a rotated slot, including the zero-trip path.
-        per_region = 3 + len(range(core, 5, workers)) * 3
+        active_items = 5 if guarded_until is None else guarded_until
+        per_region = 3 + len(range(core, active_items, workers)) * 3
         assert state.rendezvous == [per_region, 2 * per_region]
         assert len(state.pops) == len(state.readers) == 3 * per_region
         assert all(state.readers)

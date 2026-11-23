@@ -17,9 +17,11 @@
 
 #include "pypto/ir/transforms/utils/buffer_active_domain_analysis.h"
 
+#include <algorithm>
 #include <any>
 #include <cstddef>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <set>
 #include <string>
@@ -31,15 +33,20 @@
 #include "pypto/backend/common/buffer_axis_recipes.h"
 #include "pypto/backend/common/buffer_conversion_recipes.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
+#include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
+#include "pypto/ir/arith/analyzer.h"
+#include "pypto/ir/arith/const_fold.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/buffer_acc_trim_analysis.h"
 #include "pypto/ir/transforms/utils/loop_state_repair.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
@@ -162,6 +169,8 @@ class DomainIndex : public IRVisitor {
   std::unordered_map<const IterArg*, Domain> carries;
   std::unordered_map<const Var*, std::vector<const Var*>> aliases;
   std::unordered_set<const Var*> unsafe_metadata;
+  std::unordered_map<const Var*, size_t> storage_writers;
+  std::unordered_set<const Var*> scratch_roots;
   std::set<std::string> names;
   std::vector<std::pair<ExprPtr, Domain>> observations;
   bool invalid_carry = false;
@@ -201,7 +210,19 @@ class DomainIndex : public IRVisitor {
       node.dependencies = call->args_;
       node.defined = Forward(call);
       if (!KnownData(call)) ObserveUnknown(call);
-      if (IsVectorReshape(call) || IsOp(call, "tile.set_validshape")) Alias(statement->var_, call->args_[0]);
+      if (IsVectorReshape(call) || IsOp(call, "tile.set_validshape")) {
+        Alias(statement->var_, call->args_[0]);
+      } else if (!IsOp(call, "tile.create")) {
+        if (const auto memory = GetTypeMemRef(statement->var_->GetType())) {
+          ++storage_writers[(*memory)->base_.get()];
+        }
+      }
+      const auto axis = backend::FindLogicalBufferAxisRecipe(call->op_->name_);
+      if (axis && axis->HasScratch() && call->args_.size() > 1) {
+        if (const auto memory = GetTypeMemRef(call->args_[1]->GetType())) {
+          scratch_roots.insert((*memory)->base_.get());
+        }
+      }
     }
     nodes.emplace(statement->var_.get(), std::move(node));
   }
@@ -440,7 +461,9 @@ class CallIndex : public IRVisitor {
 // denote their original identities, not a recursive walk of their initializers.
 class MetadataUseIndex : public IRVisitor {
  public:
-  explicit MetadataUseIndex(BufferActiveDomainWork* work) : work_(work) {}
+  explicit MetadataUseIndex(BufferActiveDomainWork* work,
+                            const std::unordered_set<const Call*>* qualified = nullptr)
+      : work_(work), qualified_(qualified) {}
   std::unordered_set<const Var*> unsafe;
   std::vector<ExprPtr> scalar_expressions;
   std::vector<ExprPtr> aggregate_expressions;
@@ -449,7 +472,9 @@ class MetadataUseIndex : public IRVisitor {
 
   void VisitExpr(const ExprPtr& expression) override {
     if (!expression) return;
-    auto& seen = observing_ ? seen_observed_ : seen_data_;
+    const auto call = As<Call>(expression);
+    const bool unqualified_call = qualified_ && call && !QualifiedTopLevel(call);
+    auto& seen = observing_ || unqualified_call ? seen_observed_ : seen_data_;
     if (!seen.insert(expression.get()).second) return;
     if (work_) ++work_->metadata_expression_states;
     if (As<ScalarType>(expression->GetType())) scalar_expressions.push_back(expression);
@@ -476,18 +501,29 @@ class MetadataUseIndex : public IRVisitor {
   }
 
  protected:
+  void VisitStmt_(const AssignStmtPtr& assignment) override {
+    const auto previous = direct_call_;
+    direct_call_ = As<Call>(assignment->value_).get();
+    IRVisitor::VisitStmt_(assignment);
+    direct_call_ = previous;
+  }
+
   void VisitVarLike_(const VarPtr& value) override {
     if (observing_ && As<TileType>(value->GetType())) unsafe.insert(value.get());
   }
   void VisitExpr_(const IterArgPtr& value) override { VisitVarLike_(value); }
   void VisitExpr_(const CallPtr& call) override {
     const bool previous = observing_;
-    observing_ |= !KnownData(call);
+    observing_ |= qualified_ ? !QualifiedTopLevel(call) : !KnownData(call);
     for (const auto& argument : call->args_) VisitExpr(argument);
     // Reference-valued compiler metadata has no data-use restoration recipe.
     observing_ = true;
     for (const auto& [name, attribute] : call->attrs_)
       ForEachAttrExpr(attribute, [this](const ExprPtr& value) { VisitExpr(value); });
+    if (qualified_) {
+      for (const auto& [name, keyword] : call->kwargs_)
+        ForEachAttrExpr(keyword, [this](const ExprPtr& value) { VisitExpr(value); });
+    }
     observing_ = previous;
   }
   void VisitExpr_(const SubmitPtr& submit) override {
@@ -514,6 +550,12 @@ class MetadataUseIndex : public IRVisitor {
   std::unordered_set<const Type*> seen_types_;
   std::unordered_map<const Type*, bool> contains_tile_;
   BufferActiveDomainWork* work_;
+  const std::unordered_set<const Call*>* qualified_;
+  const Call* direct_call_ = nullptr;
+
+  bool QualifiedTopLevel(const CallPtr& call) const {
+    return call.get() == direct_call_ && qualified_->count(call.get());
+  }
 
   bool ContainsTile(const TypePtr& type) {
     const auto found = contains_tile_.find(type.get());
@@ -662,6 +704,8 @@ bool QualifyUses(DomainIndex& index) {
 // CSE. An expression depending on a changed Tile binding refuses the candidate.
 class ScalarStability {
  public:
+  explicit ScalarStability(std::unordered_set<const Var*> changed)
+      : changed_tiles_(std::move(changed)), work_(nullptr) {}
   ScalarStability(const DomainIndex& index, BufferActiveDomainWork* work) : work_(work) {
     // Immutable superset of precisely the Tile identities that rewriting may
     // replace. Same-type definitions and already-matching carries retain their
@@ -918,6 +962,535 @@ class PrefixRewriter : public IRMutator {
   }
 };
 
+bool IsGuardedRowArithmetic(const CallPtr& call) {
+  using backend::BufferElementwiseOperandKind;
+  using backend::BufferElementwiseTypePolicy;
+  using backend::BufferPrecisionKind;
+  const auto* recipe = backend::FindLogicalBufferElementwiseRecipe(call);
+  return recipe && recipe->default_enabled && recipe->inputs.size() == 2 &&
+         recipe->precision == BufferPrecisionKind::None &&
+         (recipe->types == BufferElementwiseTypePolicy::MatchingVec ||
+          recipe->types == BufferElementwiseTypePolicy::DenseFP32) &&
+         recipe->inputs[0].logical_index == 0 && recipe->inputs[1].logical_index == 1 &&
+         std::all_of(recipe->inputs.begin(), recipe->inputs.end(),
+                     [](const auto& input) { return input.kind == BufferElementwiseOperandKind::Buffer; });
+}
+
+// Follow a prefix only through equal-shaped lane operations. A guarded row
+// extraction discharges it: consumers of that row receive exactly the same
+// bytes and valid shape. The load remains partial; only selected read edges
+// will use the separately allocated padded value.
+class GuardedRowUses : public IRVisitor {
+ public:
+  struct Prefix {
+    ExprPtr extent;
+    bool refused = false;
+    bool observed = false;
+  };
+  struct Value {
+    Prefix* prefix;
+    bool load;
+  };
+
+  std::unordered_map<const Var*, Value> values;
+  std::unordered_set<const Call*> terminals;
+  std::unordered_set<const Call*> extracts;
+  std::unordered_set<const Call*> qualified;
+  std::unordered_set<const Var*> padded_sources;
+  std::unordered_map<const Var*, Prefix*> extract_results;
+  std::set<std::string> names;
+
+  void VisitExpr(const ExprPtr& value) override {
+    // Arbitrary scalar or aggregate expression users are checked by the
+    // bounded MetadataUseIndex, with these proven terminals as its exceptions.
+    if (const auto var = AsVarLike(value)) Refuse(var);
+  }
+
+  void CheckMetadata(const MetadataUseIndex& metadata) {
+    for (const auto* var : metadata.unsafe) {
+      if (const auto value = values.find(var); value != values.end()) value->second.prefix->refused = true;
+    }
+  }
+
+  bool Eligible(const Var* value) const {
+    const auto found = values.find(value);
+    return found != values.end() && padded_sources.count(value) && !found->second.prefix->refused &&
+           found->second.prefix->observed;
+  }
+
+ protected:
+  void VisitStmt_(const AssignStmtPtr& stmt) override {
+    names.insert(stmt->var_->name_hint_);
+    const auto call = As<Call>(stmt->value_);
+    const auto type = As<TileType>(stmt->var_->GetType());
+    if (!type) {
+      if (!call && GetScalarDtypeIfBool(stmt->var_)) guards_.emplace(stmt->var_.get(), stmt->value_);
+      if (call) CheckConsumers(call);
+      return;
+    }
+    const auto memory = GetTypeMemRef(type).value_or(nullptr);
+    const auto padded_load = LoadPrefix(call, stmt->var_, type, memory);
+    if (padded_load) {
+      auto [prefix, inserted] = prefixes_.try_emplace(padded_load.get(), Prefix{padded_load});
+      AddValue(stmt->var_, memory, {&prefix->second, true});
+      return;
+    }
+    if (const auto prefix = ArithmeticPrefix(call, type)) {
+      AddValue(stmt->var_, memory, {prefix, false});
+      for (const auto& arg : call->args_) RecordPad(arg);
+      qualified.insert(call.get());
+      return;
+    }
+    if (call && QualifyRowObserver(call, stmt->var_, type)) return;
+    if (call)
+      CheckConsumers(call);
+    else
+      VisitExpr(stmt->value_);
+    MarkRoot(memory);
+  }
+
+  void VisitStmt_(const EvalStmtPtr& stmt) override {
+    if (const auto call = As<Call>(stmt->expr_))
+      CheckConsumers(call);
+    else
+      VisitExpr(stmt->expr_);
+  }
+
+  void VisitStmt_(const ForStmtPtr& loop) override {
+    names.insert(loop->loop_var_->name_hint_);
+    for (const auto& arg : loop->iter_args_) {
+      names.insert(arg->name_hint_);
+      VisitExpr(arg->initValue_);
+      MarkRoot(GetTypeMemRef(arg->GetType()).value_or(nullptr));
+    }
+    const auto start = Literal(loop->start_);
+    const auto stop = Literal(loop->stop_);
+    const auto step = Literal(loop->step_);
+    const bool bounded = start && stop && step && start->value_ < stop->value_ && step->value_ > 0 &&
+                         __int128(stop->value_) - 1 + step->value_ <= std::numeric_limits<int64_t>::max() &&
+                         GetScalarDtype(loop->loop_var_) == DataType::INDEX;
+    if (bounded) analyzer_->Bind(loop->loop_var_, start->value_, stop->value_);
+    VisitStmt(loop->body_);
+    if (bounded) analyzer_->Unbind(loop->loop_var_);
+    for (const auto& arg : loop->return_vars_) names.insert(arg->name_hint_);
+  }
+
+  void VisitStmt_(const IfStmtPtr& stmt) override {
+    {
+      BufferAccTrimGuardScope guard(stmt->condition_, true, analyzer_, guards_);
+      VisitStmt(stmt->then_body_);
+    }
+    if (stmt->else_body_) {
+      BufferAccTrimGuardScope guard(stmt->condition_, false, analyzer_, guards_);
+      VisitStmt(*stmt->else_body_);
+    }
+    for (const auto& arg : stmt->return_vars_) names.insert(arg->name_hint_);
+  }
+
+ private:
+  std::unordered_map<const Expr*, Prefix> prefixes_;
+  std::unordered_map<const Var*, Prefix*> roots_;
+  std::unordered_map<const Var*, ExprPtr> guards_;
+  arith::AnalyzerPtr analyzer_ = std::make_shared<arith::Analyzer>();
+
+  static ConstIntPtr Literal(const ExprPtr& value) {
+    const auto constant = As<ConstInt>(value);
+    return constant && arith::detail::ConstIntFitsDtype(constant->value_, constant->dtype()) ? constant
+                                                                                             : nullptr;
+  }
+
+  static bool GetScalarDtypeIfBool(const VarPtr& var) {
+    const auto scalar = As<ScalarType>(var->GetType());
+    return scalar && scalar->dtype_ == DataType::BOOL;
+  }
+
+  static ExprPtr LoadPrefix(const CallPtr& call, const VarPtr& value, const TileTypePtr& tile,
+                            const MemRefPtr& memory) {
+    if (!IsOp(call, "tile.load") || tile->dtype_ != DataType::FP32 || tile->shape_.size() != 2 || !memory ||
+        !memory->base_ || memory->slot_count_ != 1 || memory->slot_index_ || memory->is_pinned_) {
+      return nullptr;
+    }
+    const auto domain = Declared(tile);
+    if (domain.kind != DomainKind::Prefix || domain.axis != 0 || !AsVarLike(domain.extent)) return nullptr;
+    const auto physical = backend::PhysicalLogicalVecDescriptor(tile);
+    if (!backend::IsAlignedDenseVecBufferGeometry(physical)) return nullptr;
+    const auto pad = OpRegistry::GetInstance().Create("tile.fillpad", {value},
+                                                      {{"pad_value", PadValue::zero}}, call->span_);
+    const auto* recipe = backend::FindLogicalBufferConversionRecipe("tile.fillpad");
+    return recipe && backend::SupportsLogicalBufferConversion(*recipe, pad) ? domain.extent : nullptr;
+  }
+
+  void AddValue(const VarPtr& var, const MemRefPtr& memory, Value value) {
+    values.emplace(var.get(), value);
+    if (!memory || !memory->base_ || memory->is_pinned_ || memory->slot_count_ != 1 || memory->slot_index_) {
+      value.prefix->refused = true;
+      return;
+    }
+    const auto [root, added] = roots_.emplace(memory->base_.get(), value.prefix);
+    if (!added) {
+      value.prefix->refused = true;
+      if (root->second) root->second->refused = true;
+    }
+  }
+
+  void MarkRoot(const MemRefPtr& memory) {
+    if (!memory || !memory->base_) return;
+    const auto [root, added] = roots_.try_emplace(memory->base_.get(), nullptr);
+    if (!added && root->second) root->second->refused = true;
+  }
+
+  const Value* Get(const ExprPtr& expr) const {
+    const auto found = values.find(AsVarLike(expr).get());
+    return found == values.end() ? nullptr : &found->second;
+  }
+
+  void RecordPad(const ExprPtr& expr) {
+    if (const auto* value = Get(expr); value && value->load) padded_sources.insert(AsVarLike(expr).get());
+  }
+
+  void Refuse(const ExprPtr& expr) const {
+    if (const auto* value = Get(expr)) value->prefix->refused = true;
+    const auto memory = GetTypeMemRef(expr->GetType()).value_or(nullptr);
+    if (!memory) return;
+    const auto found = roots_.find(memory->base_.get());
+    if (found != roots_.end() && found->second) found->second->refused = true;
+  }
+
+  void CheckConsumers(const CallPtr& call) const {
+    const auto& registry = OpRegistry::GetInstance();
+    const auto* entry = !As<GlobalVar>(call->op_) && registry.IsRegistered(call->op_->name_)
+                            ? &registry.GetEntry(call->op_->name_)
+                            : nullptr;
+    for (size_t i = 0; i < call->args_.size(); ++i) {
+      const auto& arg = call->args_[i];
+      if (As<TileType>(arg->GetType()) &&
+          (Get(arg) || !entry || entry->GetIRStage() != OpIRStage::Functional ||
+           ArgEffectWrites(entry->GetArgEffect(i, call->kwargs_)))) {
+        Refuse(arg);
+      }
+    }
+  }
+
+  Prefix* ArithmeticPrefix(const CallPtr& call, const TileTypePtr& result) const {
+    if (!IsGuardedRowArithmetic(call) || call->args_.size() != 2 || result->dtype_ != DataType::FP32 ||
+        Declared(result).kind != DomainKind::Full)
+      return nullptr;
+    Prefix* common = nullptr;
+    for (const auto& arg : call->args_) {
+      const auto type = As<TileType>(arg->GetType());
+      const auto* value = Get(arg);
+      if (!type || type->dtype_ != result->dtype_ ||
+          !tile_view_semantics::ShapeExprListsEquivalent(type->shape_, result->shape_) ||
+          (!value && Declared(type).kind != DomainKind::Full))
+        return nullptr;
+      if (!value) continue;
+      if (common && common != value->prefix) return nullptr;
+      common = value->prefix;
+    }
+    return common;
+  }
+
+  bool QualifyRowObserver(const CallPtr& call, const VarPtr& result_var, const TileTypePtr& result) {
+    const bool slice = IsOp(call, "tile.slice") && call->args_.size() == 3;
+    const bool extract = IsOp(call, "tile.extract") && call->args_.size() == 4;
+    if (!slice && !extract) return false;
+    const auto* value = Get(call->args_[0]);
+    // Guarded slices are aliases of full logical arithmetic results. A guarded
+    // extract from a load has independent storage and can use the padded copy.
+    if (!value || (slice == value->load) || result->shape_.size() != 2) return false;
+    const auto rows = Literal(result->shape_[0]);
+    const auto source = As<TileType>(call->args_[0]->GetType());
+    const auto declared = As<TileType>(call->GetType());
+    if (!rows || rows->value_ != 1 || source->shape_.size() != 2 || source->dtype_ != result->dtype_ ||
+        !declared || !structural_equal(CloneTypeWithoutMemRef(result), CloneTypeWithoutMemRef(declared)) ||
+        (slice && Declared(result).kind != DomainKind::Full))
+      return false;
+    const auto offsets = slice ? As<MakeTuple>(call->args_[2]) : nullptr;
+    if (slice && (!offsets || offsets->elements_.size() != 2)) return false;
+    const auto row = slice ? offsets->elements_[0] : call->args_[1];
+    const auto column = Literal(slice ? offsets->elements_[1] : call->args_[2]);
+    // This recipe admits precisely a full-width row. Existing admission still
+    // validates its native view, alignment, and independent extract layout.
+    if (!column || column->value_ != 0 || !structural_equal(source->shape_[1], result->shape_[1]) ||
+        (!AsVarLike(row) && !Literal(row)) || GetScalarDtype(row) != GetScalarDtype(value->prefix->extent) ||
+        !analyzer_->CanProveGreaterEqual(row, 0) ||
+        !analyzer_->CanProve(MakeLt(row, value->prefix->extent))) {
+      return false;
+    }
+    if (extract) {
+      // An annotated result must agree with the original extract's clipped
+      // validity, including the full-width columns. Only the proved row is
+      // preserved when the source is replaced with the full padded view.
+      const auto deduced =
+          OpRegistry::GetInstance().Create(call->op_->name_, call->args_, call->kwargs_, call->span_);
+      if (!structural_equal(CloneTypeWithoutMemRef(declared), CloneTypeWithoutMemRef(deduced->GetType())))
+        return false;
+    }
+    if (!terminals.insert(call.get()).second) {
+      value->prefix->refused = true;
+      return false;
+    }
+    if (extract) {
+      extracts.insert(call.get());
+      RecordPad(call->args_[0]);
+      extract_results.emplace(result_var.get(), value->prefix);
+      MarkRoot(GetTypeMemRef(result).value_or(nullptr));
+    }
+    qualified.insert(call.get());
+    value->prefix->observed = true;
+    return true;
+  }
+};
+
+class PaddingRewriter : public IRMutator {
+ public:
+  explicit PaddingRewriter(const std::set<std::string>& names) : names_(names) {}
+
+  FunctionPtr VisitFunction(const FunctionPtr& original) override {
+    auto body = VisitStmt(original->body_);
+    if (allocations_.empty()) return original;
+    auto result = MutableCopy(original);
+    result->body_ = InsertAllocsIntoBody(body, allocations_);
+    return result;
+  }
+
+ protected:
+  AssignStmtPtr MakeZeroPadding(const ExprPtr& source, const Span& span) {
+    const auto bytes = backend::DenseBufferBytes(backend::PhysicalLogicalVecDescriptor(source->GetType()));
+    INTERNAL_CHECK_SPAN(bytes, span) << "Internal error: qualified zero extension lost its dense capacity";
+    const auto base = std::make_shared<Var>(Fresh("mem_zero_extension_"), GetPtrType(), span);
+    const auto memory = std::make_shared<MemRef>(base, int64_t{0}, *bytes, span);
+    const auto deduced =
+        OpRegistry::GetInstance().Create("tile.fillpad", {source}, {{"pad_value", PadValue::zero}}, span);
+    const auto call = std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_,
+                                             CloneTypeWithoutMemRef(deduced->GetType()), span);
+    const auto padded =
+        std::make_shared<Var>(Fresh("zero_extended_"), CloneTypeWithMemRef(call->GetType(), memory), span);
+    allocations_.push_back(CreateAllocStatement(memory, MemorySpace::Vec));
+    return std::make_shared<AssignStmt>(padded, call, span);
+  }
+
+ private:
+  std::set<std::string> names_;
+  size_t next_name_ = 0;
+  std::vector<StmtPtr> allocations_;
+
+  std::string Fresh(const char* prefix) {
+    std::string name;
+    do {
+      name = prefix + std::to_string(next_name_++);
+    } while (!names_.insert(name).second);
+    return name;
+  }
+};
+
+class GuardedRowRewriter : public PaddingRewriter {
+ public:
+  explicit GuardedRowRewriter(const GuardedRowUses& uses) : PaddingRewriter(uses.names), uses_(uses) {}
+
+ protected:
+  ExprPtr VisitBinaryExpr_(const BinaryExprPtr& expression) override { return expression; }
+  ExprPtr VisitUnaryExpr_(const UnaryExprPtr& expression) override { return expression; }
+  ExprPtr VisitExpr_(const MakeTuplePtr& expression) override { return expression; }
+  ExprPtr VisitExpr_(const TupleGetItemExprPtr& expression) override { return expression; }
+  ExprPtr VisitExpr_(const IterArgPtr& expression) override {
+    return As<ScalarType>(expression->GetType()) ? expression : IRMutator::VisitExpr_(expression);
+  }
+
+  StmtPtr VisitStmt_(const AssignStmtPtr& original) override {
+    const auto call = As<Call>(original->value_);
+    auto rewritten = As<AssignStmt>(IRMutator::VisitStmt_(original));
+    if (uses_.Eligible(original->var_.get())) {
+      const auto pad = MakeZeroPadding(rewritten->var_, rewritten->span_);
+      padded_.emplace(rewritten->var_.get(), pad->var_);
+      return SeqStmts::Flatten({rewritten, pad}, rewritten->span_);
+    }
+    if (!IsGuardedRowArithmetic(call) && !uses_.extracts.count(call.get())) return rewritten;
+    auto replacement = RewriteUse(As<Call>(rewritten->value_), uses_.extracts.count(call.get()));
+    if (!replacement) return rewritten;
+    const auto type = WithCarriedMemRef(replacement->GetType(), original->var_->GetType());
+    auto result = MutableCopy(rewritten);
+    result->value_ = replacement;
+    if (!structural_equal(type, original->var_->GetType())) {
+      result->var_ = std::make_shared<Var>(original->var_->name_hint_, type, original->var_->span_);
+      var_remap_[original->var_.get()] = result->var_;
+    }
+    return result;
+  }
+
+ private:
+  const GuardedRowUses& uses_;
+  std::unordered_map<const Var*, VarPtr> padded_;
+
+  CallPtr RewriteUse(const CallPtr& call, bool extract) const {
+    auto args = call->args_;
+    bool changed = false;
+    for (auto& arg : args) {
+      const auto pad = padded_.find(AsVarLike(arg).get());
+      if (pad == padded_.end()) continue;
+      arg = pad->second;
+      changed = true;
+    }
+    if (!changed) return nullptr;
+    if (extract) {
+      const auto deduced =
+          OpRegistry::GetInstance().Create(call->op_->name_, args, call->kwargs_, call->span_);
+      return transform_utils::PreserveCallAttrs(call, deduced);
+    }
+    auto result = MutableCopy(call);
+    result->args_ = std::move(args);
+    return result;
+  }
+};
+
+FunctionPtr MaterializeGuardedRowPrefixes(const FunctionPtr& original, const DomainIndex& index,
+                                          const MetadataUseIndex& original_metadata) {
+  bool has_prefix_load = false;
+  bool has_row_use = false;
+  for (const auto& [value, node] : index.nodes) {
+    has_prefix_load |=
+        IsOp(node.call, "tile.load") && node.defined.kind == DomainKind::Prefix && node.defined.axis == 0;
+    has_row_use |= IsOp(node.call, "tile.slice") || IsOp(node.call, "tile.extract");
+    if (has_prefix_load && has_row_use) break;
+  }
+  if (!has_prefix_load || !has_row_use) return original;
+  GuardedRowUses uses;
+  for (const auto& param : original->params_) uses.names.insert(param->name_hint_);
+  uses.VisitStmt(original->body_);
+  if (uses.terminals.empty()) return original;
+  MetadataUseIndex metadata(nullptr, &uses.qualified);
+  metadata.VisitFunction(original);
+  if (metadata.unbound_tile_observer || metadata.tile_bearing_aggregate) return original;
+  uses.CheckMetadata(metadata);
+  std::unordered_set<const Var*> rebound_extracts;
+  for (const auto& [var, prefix] : uses.extract_results) {
+    if (original_metadata.unsafe.count(var)) prefix->refused = true;
+    if (!prefix->refused) rebound_extracts.insert(var);
+  }
+  if (std::none_of(uses.padded_sources.begin(), uses.padded_sources.end(),
+                   [&](const Var* value) { return uses.Eligible(value); }))
+    return original;
+  ScalarStability scalars(std::move(rebound_extracts));
+  for (const auto& expression : metadata.scalar_expressions)
+    if (!scalars.Check(expression)) return original;
+  for (const auto& expression : metadata.aggregate_expressions)
+    if (!scalars.Check(expression)) return original;
+  return GuardedRowRewriter(uses).VisitFunction(original);
+}
+
+// A partial load has no defined value outside its prefix when no padding
+// was requested. These producers preserve a zero extension, so it is legal
+// to choose zero for those unspecified lanes at a full-result add. In
+// particular, set_validshape is excluded: it can narrow a fully defined
+// buffer, whose old tail values must remain available to a physical read.
+class ZeroExtensionProof {
+ public:
+  explicit ZeroExtensionProof(const DomainIndex& index) : index_(index) {}
+
+  bool Proves(const ExprPtr& source) {
+    std::vector<const Var*> path;
+    bool proved = false;
+    for (auto value = AsVarLike(source); value;) {
+      const auto cached = proofs_.find(value.get());
+      if (cached != proofs_.end()) {
+        proved = cached->second;
+        break;
+      }
+      path.push_back(value.get());
+      const auto found = index_.nodes.find(value.get());
+      if (found == index_.nodes.end() || !FreshPrefix(found->second)) break;
+      const auto& node = found->second;
+      const auto& call = node.call;
+      if (IsOp(call, "tile.load")) {
+        proved = true;
+        break;
+      }
+      if (call && (IsVectorReshape(call) || IsCast(call) || IsOp(call, "tile.row_sum") ||
+                   (IsOp(call, "tile.mul") && call->args_.size() == 2 && call->args_[0] == call->args_[1]))) {
+        value = AsVarLike(call->args_[0]);
+      } else if (!call && node.dependencies.size() == 1) {
+        value = AsVarLike(node.dependencies[0]);
+      } else {
+        break;
+      }
+    }
+    for (const auto* value : path) proofs_.emplace(value, proved);
+    return proved;
+  }
+
+ private:
+  const DomainIndex& index_;
+  std::unordered_map<const Var*, bool> proofs_;
+
+  bool FreshPrefix(const Node& node) const {
+    const auto tile = As<TileType>(node.value->GetType());
+    const auto memory = GetTypeMemRef(tile);
+    if (!memory || node.defined.kind != DomainKind::Prefix || !Same(node.defined, Declared(tile)) ||
+        tile_view_semantics::GetEffectiveTileView(*tile).pad != PadValue::null ||
+        index_.unsafe_metadata.count(node.value.get()))
+      return false;
+    const auto* root = (*memory)->base_.get();
+    const auto writers = index_.storage_writers.find(root);
+    return writers != index_.storage_writers.end() && writers->second == 1 &&
+           !index_.scratch_roots.count(root);
+  }
+};
+
+class FullAddPaddingRewriter : public PaddingRewriter {
+ public:
+  FullAddPaddingRewriter(const std::set<std::string>& names, const std::unordered_set<const Var*>& additions)
+      : PaddingRewriter(names), additions_(additions) {}
+
+ protected:
+  ExprPtr VisitExpr(const ExprPtr& expression) override { return expression; }
+
+  StmtPtr VisitStmt_(const AssignStmtPtr& statement) override {
+    if (!additions_.count(statement->var_.get())) return statement;
+    const auto call = As<Call>(statement->value_);
+    const auto padding = MakeZeroPadding(call->args_[1], statement->span_);
+    const auto rewritten = MutableCopy(call);
+    rewritten->args_[1] = padding->var_;
+    const auto sum = MutableCopy(statement);
+    sum->value_ = rewritten;
+    return SeqStmts::Flatten({padding, sum}, statement->span_);
+  }
+
+ private:
+  const std::unordered_set<const Var*>& additions_;
+};
+
+FunctionPtr MaterializeFullAddPadding(const FunctionPtr& original, const DomainIndex& index) {
+  // An unknown Tile observer has no active-byte or value contract. Only
+  // ordinary dataflow may observe the deterministic extension.
+  if (!index.unsafe_metadata.empty()) return original;
+  ZeroExtensionProof proof(index);
+  std::unordered_set<const Var*> additions;
+  for (const auto& [value, node] : index.nodes) {
+    const auto& call = node.call;
+    if (!IsOp(call, "tile.add") || call->args_.size() != 2 ||
+        Declared(call->GetType()).kind != DomainKind::Full ||
+        Declared(call->args_[0]->GetType()).kind != DomainKind::Full)
+      continue;
+    const auto& source = call->args_[1];
+    const auto physical = backend::PhysicalLogicalVecDescriptor(source->GetType());
+    if (!backend::IsAlignedDenseVecBufferGeometry(physical) || physical->dtype_ != DataType::FP32 ||
+        !proof.Proves(source))
+      continue;
+    const auto pad = OpRegistry::GetInstance().Create("tile.fillpad", {source},
+                                                      {{"pad_value", PadValue::zero}}, call->span_);
+    const auto* fill = backend::FindLogicalBufferConversionRecipe("tile.fillpad");
+    if (!backend::SupportsLogicalBufferConversion(*fill, pad)) continue;
+    // Check the completed native add before allocating its new input. Keep
+    // both the original operand and return declarations on every other use.
+    const auto candidate = MutableCopy(call);
+    candidate->args_[1] = pad;
+    const auto* add = backend::FindLogicalBufferElementwiseRecipe(candidate);
+    if (backend::SupportsLogicalBufferElementwise(*add, candidate)) additions.insert(value);
+  }
+  return additions.empty() ? original
+                           : FullAddPaddingRewriter(index.names, additions).VisitFunction(original);
+}
+
 }  // namespace
 
 BufferActiveDomainCandidate NormalizeBufferActiveDomains(const FunctionPtr& function,
@@ -931,7 +1504,11 @@ BufferActiveDomainCandidate NormalizeBufferActiveDomains(const FunctionPtr& func
   if (metadata.unbound_tile_observer || metadata.tile_bearing_aggregate) return {function, function};
   DomainIndex index(function, std::move(calls.definitions), work);
   index.unsafe_metadata.insert(metadata.unsafe.begin(), metadata.unsafe.end());
-  if (!QualifyUses(index)) return {function, function};
+  if (!QualifyUses(index)) {
+    auto candidate = MaterializeGuardedRowPrefixes(function, index, metadata);
+    if (candidate == function) candidate = MaterializeFullAddPadding(function, index);
+    return {function, std::move(candidate)};
+  }
   ScalarStability scalars(index, work);
   for (const auto& expression : metadata.scalar_expressions)
     if (!scalars.Check(expression)) return {function, function};

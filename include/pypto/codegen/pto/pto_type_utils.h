@@ -30,6 +30,9 @@ namespace codegen {
 /// Convert DataType to MLIR type string (e.g., FP32 -> "f32", INT32 -> "i32")
 std::string DataTypeToMLIR(DataType dtype);
 
+/// Format an IEEE scalar constant, preserving target-width bit patterns for infinities and NaNs.
+std::string FormatFloatConstant(double value, DataType dtype);
+
 /// Emit an opt-in per-matmul HF32 attribute, rejecting unsupported targets.
 std::string FormatMatmulTf32Attr(const ir::CallPtr& call, const std::string& target_arch);
 

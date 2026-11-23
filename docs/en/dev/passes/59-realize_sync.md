@@ -63,6 +63,12 @@ A refusal delegates both endpoints to the shared PTOAS invocation. The exact
 policy uses the per-function route. Standalone passes also expose
 `require_whole_module=True` to require ownership of all local Buffer domains.
 
+When a FIFO endpoint contains conditional work and an authored hard MIX
+`syncall` between work loops, the structured planner checks that all FIFO
+borrows have closed at that cut. It keeps the rendezvous in place and carries
+outstanding local reader and writer obligations across it. The next receive
+continues from the current ring position.
+
 For whole-unit ownership, the compiler checks that every emitted domain,
 including linked peers, has complete ownership and that there are no generated
 helpers. Qualified empty and barrier-only plans can participate. The backend

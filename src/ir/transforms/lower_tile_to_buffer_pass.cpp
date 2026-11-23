@@ -64,6 +64,7 @@
 #include "pypto/ir/transforms/utils/buffer_indexed_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_insert_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_ir_selection.h"
+#include "pypto/ir/transforms/utils/buffer_minimum_fillpad_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_runtime_valid_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_tuple_results.h"
 #include "pypto/ir/transforms/utils/buffer_valid_analysis.h"
@@ -824,19 +825,20 @@ class LocalAccumulatorIndex : public IRVisitor {
 class TileToBufferMutator : public IRMutator {
  public:
   TileToBufferMutator(const StorageIndex& storage, bool guarded_valid,
-                      const LocalAccumulatorIndex* local_accumulators, const StmtPtr& body, FunctionType core,
+                      const LocalAccumulatorIndex* local_accumulators, const FunctionPtr& function,
                       const cross_core_pipe::PeerTransportEffects& transport,
                       const BufferAccTrimAnalysis& local_acc_trims)
       : storage_(storage),
         guarded_valid_(guarded_valid),
-        core_(core),
+        function_(function),
+        core_(function->func_type_),
         transport_(transport),
         local_acc_trims_(local_acc_trims),
         local_accumulators_(local_accumulators),
-        inserts_(body),
-        indexed_(body),
-        tuples_(body) {
-    canonical_slots_.VisitStmt(body);
+        inserts_(function->body_),
+        indexed_(function->body_),
+        tuples_(function->body_) {
+    canonical_slots_.VisitStmt(function->body_);
   }
 
   StmtPtr VisitStmt(const StmtPtr& stmt) override {
@@ -1183,6 +1185,23 @@ class TileToBufferMutator : public IRMutator {
       return SeqStmts::Flatten(states, call->span_);
     }
     if (!guarded_valid_) return WithValidState(call, result, LowerCall(call, result));
+    if (result && core_ == FunctionType::AIV &&
+        (IsOp(call, "tile.set_validshape") || IsOp(call, "tile.fillpad"))) {
+      if (!minimum_fills_) {
+        minimum_fills_.emplace(function_->body_);
+      }
+      if (IsOp(call, "tile.set_validshape") && minimum_fills_->DefersSetter(result)) {
+        return Empty(call->span_);
+      }
+      if (minimum_fills_->Handles(call)) {
+        if (!logical_validity_) {
+          logical_validity_.emplace(function_);
+        }
+        if (!logical_validity_->ProvesLogicalMinimumFillPad(call)) {
+          return LowerGuardedMinimumFillPad(call, result);
+        }
+      }
+    }
     if (result && core_ == FunctionType::AIV && IsOp(call, "tile.assemble")) {
       const auto cases = inserts_.Cases(call);
       if (!cases.empty()) return LowerVecInsert(call, result, cases);
@@ -1286,6 +1305,34 @@ class TileToBufferMutator : public IRMutator {
       return nullptr;
     const auto descriptor = As<BufferType>(Handle(tile)->GetType());
     return backend::IsBufferAccRowTrimDescriptor(descriptor) ? descriptor : nullptr;
+  }
+
+  StmtPtr LowerGuardedMinimumFillPad(const CallPtr& call, const VarPtr& result) {
+    const auto& span = call->span_;
+    const auto source = Handle(call->args_[0]);
+    const auto destination = Handle(result);
+    const auto valid = Valid(call->args_[0]);
+    const auto& width = valid->elements_[1];
+    const auto dtype = GetScalarDtype(width);
+    const auto type = As<BufferType>(source->GetType());
+    const auto zero = std::make_shared<ConstInt>(0, dtype, span);
+    const auto one = std::make_shared<ConstInt>(1, dtype, span);
+    const auto capacity = std::make_shared<ConstInt>(type->shape_[1], dtype, span);
+    const auto bounded = std::make_shared<Var>("fillpad_width", width->GetType(), span);
+    const auto positive = MakeGt(width, zero, span);
+    // The branch uses the original width. The lower clamp is redundant in
+    // the positive arm and independently proves the native capacity contract.
+    const auto clamp = MakeMax(MakeMin(width, capacity, span), one, span);
+    const auto extents =
+        std::make_shared<MakeTuple>(std::vector<ExprPtr>{valid->elements_[0], bounded}, span);
+    const auto nonempty = SeqStmts::Flatten({std::make_shared<AssignStmt>(bounded, clamp, span),
+                                             Operation("buffer.set_validshape", {source, extents}, span),
+                                             Operation("buffer.fillpad", {source, destination}, span)},
+                                            span);
+    const auto minimum =
+        std::make_shared<ConstFloat>(-std::numeric_limits<float>::infinity(), DataType::FP32, span);
+    const auto empty = Operation("buffer.full", {minimum, destination}, span);
+    return std::make_shared<IfStmt>(positive, nonempty, empty, std::vector<VarPtr>{}, span);
   }
 
   // A definition of a dynamic handle first states the valid extents it
@@ -1557,27 +1604,41 @@ class TileToBufferMutator : public IRMutator {
         const auto source = Handle(call->args_[0]);
         const auto destination = Handle(result);
         if (call->GetKwarg<PadValue>("pad_value", PadValue::zero) == PadValue::min) {
-          // Minimum padding is admitted only with positive, bounded source
-          // rows and columns. The empty-source zero-fill path below belongs
-          // exclusively to the zero-padding recipe.
+          // Unproved signed column prefixes are handled before restoring
+          // metadata in LowerDefinition. The direct native call requires
+          // positive, bounded rows and columns.
           return Operation(conversion->buffer_op, {source, destination}, call->span_);
         }
-        const auto rows = Valid(call->args_[0])->elements_[0];
-        const auto constant = As<ConstInt>(rows);
-        // TFillPad's row-copy loop requires a positive repeat count. Empty
-        // inputs still define every destination lane, using the ordinary fill.
-        if (constant && constant->value_ > 0) {
-          return Operation(conversion->buffer_op, {source, destination}, call->span_);
+        const auto valid = Valid(call->args_[0]);
+        const auto type = As<BufferType>(source->GetType());
+        ExprPtr positive_prefix;
+        bool empty = false;
+        for (size_t axis = 0; axis < valid->elements_.size(); ++axis) {
+          const auto& extent = valid->elements_[axis];
+          if (const auto literal = As<ConstInt>(extent)) {
+            empty |= literal->value_ <= 0;
+            continue;
+          }
+          const auto dtype = GetScalarDtype(extent);
+          auto positive = MakeGt(extent, std::make_shared<ConstInt>(0, dtype, call->span_));
+          if (axis == 1) {
+            const auto capacity = std::make_shared<ConstInt>(type->shape_[axis], dtype, call->span_);
+            positive = MakeAnd(positive, MakeLe(extent, capacity, call->span_));
+          }
+          positive_prefix = positive_prefix ? MakeAnd(positive_prefix, positive, call->span_) : positive;
         }
+        // TFillPad must consume a nonempty source. An empty source still
+        // materializes all destination lanes without reading the source.
+        if (!empty && !positive_prefix)
+          return Operation(conversion->buffer_op, {source, destination}, call->span_);
         const auto dtype = As<BufferType>(destination->GetType())->dtype_;
         const ExprPtr zero = dtype.IsSignedInt()
                                  ? ExprPtr(std::make_shared<ConstInt>(0, dtype, call->span_))
                                  : ExprPtr(std::make_shared<ConstFloat>(0.0, dtype, call->span_));
         const auto empty_result = Operation("buffer.full", {zero, destination}, call->span_);
-        if (constant) return empty_result;
-        const auto positive = MakeGt(rows, std::make_shared<ConstInt>(0, GetScalarDtype(rows), call->span_));
+        if (empty) return empty_result;
         const auto fill_copy = Operation(conversion->buffer_op, {source, destination}, call->span_);
-        return std::make_shared<IfStmt>(positive, fill_copy, empty_result, std::vector<VarPtr>{},
+        return std::make_shared<IfStmt>(positive_prefix, fill_copy, empty_result, std::vector<VarPtr>{},
                                         call->span_);
       }
       std::vector<ExprPtr> args;
@@ -2016,6 +2077,7 @@ class TileToBufferMutator : public IRMutator {
   const StorageIndex& storage_;
   CanonicalSlotCollector canonical_slots_;
   bool guarded_valid_;
+  const FunctionPtr& function_;
   FunctionType core_;
   const cross_core_pipe::PeerTransportEffects& transport_;
   const BufferAccTrimAnalysis& local_acc_trims_;
@@ -2031,6 +2093,8 @@ class TileToBufferMutator : public IRMutator {
   BufferInsertAnalysis inserts_;
   BufferIndexedAnalysis indexed_;
   BufferTupleResults tuples_;
+  std::optional<BufferMinimumFillPadAnalysis> minimum_fills_;
+  std::optional<BufferRuntimeValidAnalysis> logical_validity_;
   std::unordered_map<const Stmt*, std::vector<StmtPtr>> local_definitions_;
   std::unordered_map<const TileType*, VarPtr> window_handles_;
   std::unordered_map<const Var*, std::pair<VarPtr, MakeTuplePtr>> window_origins_;
@@ -2088,8 +2152,8 @@ ProgramPtr TransformProgram(const ProgramPtr& program) {
     }
     const auto transport = cross_core_pipe::AnalyzePeerTransportEffects(function);
     TileToBufferMutator mutator(storage, function->GetAttr<bool>(kAttrBufferIrSelected, false),
-                                local_accumulators ? &*local_accumulators : nullptr, function->body_,
-                                function->func_type_, transport, local_acc_trims);
+                                local_accumulators ? &*local_accumulators : nullptr, function, transport,
+                                local_acc_trims);
     auto lowered = std::make_shared<Function>(*function);
     lowered->body_ = mutator.VisitStmt(function->body_);
     lowered->ir_stage_ = FunctionIRStage::Buffer;
