@@ -30,7 +30,7 @@ def opname(name):
     return ir.get_op(name).name
 
 
-_BARRIERS = {
+LOCAL_BARRIER_PIPES = {
     opname("system.bar_mte2"): ir.PipeType.MTE2,
     opname("system.bar_mte3"): ir.PipeType.MTE3,
     opname("system.bar_v"): ir.PipeType.V,
@@ -191,8 +191,8 @@ class ClosedCommands:
         if call.op.name == opname("system.bar_all"):
             self.complete_all()
             return
-        if call.op.name in _BARRIERS:
-            self.barrier(_BARRIERS[call.op.name])
+        if call.op.name in LOCAL_BARRIER_PIPES:
+            self.barrier(LOCAL_BARRIER_PIPES[call.op.name])
             return
         assert not call.args, "oracle expects literal physical IDs"
         source = ir.PipeType(call.kwargs["src_pipe"])
@@ -425,9 +425,13 @@ class ClosedCommands:
         elif isinstance(call, ir.Call) and call.op.name == opname("buffer.slot"):
             group, index = call.args
             kind = statement.var.type
-            assert isinstance(kind, ir.BufferType) and kind.memory_space == ir.MemorySpace.Vec
+            assert isinstance(kind, ir.BufferType)
             rows, columns = kind.shape
             item_bytes = kind.dtype.get_byte()
+            assert kind.memory_space in (ir.MemorySpace.Vec, ir.MemorySpace.Mat)
+            if kind.memory_space == ir.MemorySpace.Mat:
+                # The dense stride below applies to whole, unpadded fractals.
+                assert kind.fractal == 512 and rows % 16 == 0 and columns % (32 // item_bytes) == 0
             stride = rows * columns * item_bytes
             slot = value(index, env)
             assert stride % 32 == 0 and 0 <= slot < group.type.slot_count
@@ -476,7 +480,7 @@ class ClosedCommands:
             if publication is not None:
                 self.used_tokens.add(publication)
                 self.acquire(source, ir.PipeType(call.kwargs["dst_pipe"]), publication)
-        elif call.op.name in _BARRIERS or call.op.name in (
+        elif call.op.name in LOCAL_BARRIER_PIPES or call.op.name in (
             opname("system.set_flag"),
             opname("system.wait_flag"),
             opname("system.bar_all"),

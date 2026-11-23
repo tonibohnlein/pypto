@@ -19,9 +19,17 @@ from itertools import combinations
 
 from pypto import ir
 
+from .sync_closed_command_oracle import LOCAL_BARRIER_PIPES
 from .sync_logical_oracle import CommandExecution, same_payload
 from .sync_matmul_oracle import hardware_reference, interpret
 from .test_finite_sync_analysis import closure
+
+_PHYSICAL_COMMANDS = {
+    *LOCAL_BARRIER_PIPES,
+    ir.get_op("system.bar_all").name,
+    ir.get_op("system.set_flag").name,
+    ir.get_op("system.wait_flag").name,
+}
 
 
 class PhysicalExecution(CommandExecution):
@@ -71,7 +79,7 @@ class PhysicalExecution(CommandExecution):
             self.ids[src, dst].add(key[2])
             pipe = src if is_set else dst
         else:
-            pipe = ir.PipeType.M if name == ir.get_op("system.bar_m").name else ir.PipeType.V
+            pipe = LOCAL_BARRIER_PIPES[name]
         node = ("physical", sum(map(len, self.commands.values())))
         self.vertices.add(node)
         if pipe in self.latest_payload:
@@ -113,16 +121,7 @@ class PhysicalExecution(CommandExecution):
                 self.edges.add((self.last_completion, node))
             return ()
         if isinstance(stmt, ir.EvalStmt) and isinstance(stmt.expr, ir.Call):
-            if stmt.expr.op.name in {
-                ir.get_op(name).name
-                for name in [
-                    "system.set_flag",
-                    "system.wait_flag",
-                    "system.bar_m",
-                    "system.bar_v",
-                    "system.bar_all",
-                ]
-            }:
+            if stmt.expr.op.name in _PHYSICAL_COMMANDS:
                 self.command(stmt.expr)
                 return None
         return super().execute(stmt, env)
@@ -139,16 +138,7 @@ def checked_payload_calls(original, emitted, parameters=None, *, block_index=Non
     class PayloadOnly(ir.IRMutator):
         def visit_eval_stmt(self, op):
             stmt = op
-            if isinstance(stmt.expr, ir.Call) and stmt.expr.op.name in {
-                ir.get_op(n).name
-                for n in (
-                    "system.set_flag",
-                    "system.wait_flag",
-                    "system.bar_m",
-                    "system.bar_v",
-                    "system.bar_all",
-                )
-            }:
+            if isinstance(stmt.expr, ir.Call) and stmt.expr.op.name in _PHYSICAL_COMMANDS:
                 return ir.SeqStmts([], stmt.span)
             return stmt
 

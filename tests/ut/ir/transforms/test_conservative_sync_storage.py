@@ -452,6 +452,57 @@ class StoreBeforeScalarWrite:
     assert (ir.PipeType.MTE3 in write["required_source_pipes"]) == (view != "disjoint")
 
 
+def _compile_matrix_fixture(program, *, disjoint_gm=False):
+    placed = []
+
+    def capture(transform, before):
+        if transform.get_name() == "RealizeSync":
+            placed.append(before.get_function("kernel"))
+
+    with passes.PassContext(
+        [passes.CallbackInstrument(before_pass=capture, name="capture_placed_matrices")],
+        enable_buffer_ir=True,
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+        autosync_disjoint_gm=disjoint_gm,
+    ):
+        lowered = PassManager(OptimizationStrategy.Default).run_passes(program)
+    (original,) = placed
+    function = lowered.get_function("kernel")
+    assert function is not None and function.attrs[PYPTO_AUTOSYNC_ATTR]
+    return original, function
+
+
+def _replay_matrix_commands(original, function, parameters=None):
+    calls, emitted_calls = checked_payload_calls(original, function, parameters)
+
+    class MatrixCommands(ClosedCommands):
+        def assign(self, statement, env):
+            if isinstance(statement.var.type, ir.ScalarType):
+                super().assign(statement, env)
+
+        def memory_footprint(self, call, env):
+            # The geometry interpreter above has already compared the source
+            # and emitted operands, including the NZ/ZN descriptor alias.
+            index = len(self.payloads)
+            assert emitted_calls[index][0].op.name == call.op.name
+            _, _, pipe, reads, writes = calls[index]
+            return pipe, reads, writes, call.op.name, None
+
+    execution = MatrixCommands(function, parameters or {}, range(8))
+    order = execution.run()
+    assert len(execution.payloads) == len(calls)
+    # Check every required completion-to-issue edge from the original payload
+    # geometry, including prior visits and accesses outside Mat. The command
+    # interpreter separately checks flag closure and consumption before reuse.
+    required = hardware_reference(original, calls)[2]
+    for (producer, completed), (consumer, issued_as_completion) in required:
+        if completed and not issued_as_completion:
+            assert (("payload", producer, "C"), ("payload", consumer, "I")) in order
+    return calls, order
+
+
 @pytest.mark.parametrize(
     ("rows", "trips", "reverse", "shared_elements"),
     [
@@ -500,41 +551,8 @@ class MatrixFiberReuse:
             out = pl.tile.store(result, [{row}, 0], out)
         return out
 """)
-    placed = []
-
-    def capture(transform, before):
-        if transform.get_name() == "RealizeSync":
-            placed.append(before.get_function("kernel"))
-
-    with passes.PassContext(
-        [passes.CallbackInstrument(before_pass=capture, name="capture_matrix_fibers")],
-        enable_buffer_ir=True,
-        memory_planner=passes.MemoryPlanner.PYPTO,
-        enable_pypto_autosync=True,
-        autosync_policy="conservative_prefix",
-    ):
-        lowered = PassManager(OptimizationStrategy.Default).run_passes(program)
-    (original,) = placed
-    function = lowered.get_function("kernel")
-    assert function is not None and function.attrs[PYPTO_AUTOSYNC_ATTR]
-    calls, emitted_calls = checked_payload_calls(original, function)
-
-    class MatrixCommands(ClosedCommands):
-        def assign(self, statement, env):
-            if isinstance(statement.var.type, ir.ScalarType):
-                super().assign(statement, env)
-
-        def memory_footprint(self, call, env):
-            # The geometry interpreter above has already compared the source
-            # and emitted operands, including the NZ/ZN descriptor alias.
-            index = len(self.payloads)
-            assert emitted_calls[index][0].op.name == call.op.name
-            _, _, pipe, reads, writes = calls[index]
-            return pipe, reads, writes, call.op.name, None
-
-    execution = MatrixCommands(function, {}, range(8))
-    order = execution.run()
-    assert len(execution.payloads) == len(calls)
+    original, function = _compile_matrix_fixture(program)
+    calls, order = _replay_matrix_commands(original, function)
     checked = 0
     for index, (read, write) in enumerate(zip(calls[:-1], calls[1:], strict=True)):
         if read[0].op.name != opname("buffer.extract") or write[0].op.name != opname("buffer.insert"):
@@ -547,14 +565,6 @@ class MatrixFiberReuse:
             assert (edge in order) == bool(shared)
         checked += 1
     assert checked == trips
-    # Check every required completion-to-issue edge from the original payload
-    # geometry, including prior visits and accesses outside Mat. The command
-    # interpreter separately checks flag closure and consumption before reuse.
-    required = hardware_reference(original, calls)[2]
-    for (producer, completed), (consumer, issued_as_completion) in required:
-        if completed and not issued_as_completion:
-            assert (("payload", producer, "C"), ("payload", consumer, "I")) in order
-
     if rows == 96:
         summary = testing.analyze_conservative_sync(original)
         sites = summary["sites"]
@@ -568,6 +578,52 @@ class MatrixFiberReuse:
         assert read and write and read.isdisjoint(write)
         assert cover >= read | write
         assert sites[insert]["refreshed_domains"] == []
+
+
+def test_matrix_readers_survive_conditional_visits_and_nested_loop_exits():
+    program = pl.parse_program("""
+@pl.program
+class LoopExit:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 32], pl.FP16],
+               replacement_input: pl.Tensor[[16, 32], pl.FP16],
+               rhs: pl.Tensor[[32, 32], pl.FP16],
+               visits: pl.Scalar[pl.INDEX],
+               out: pl.Out[pl.Tensor[[16, 32], pl.FP32]]) -> pl.Tensor[[16, 32], pl.FP32]:
+        right_mat = pl.tile.load(rhs, [0, 0], [32, 32], target_memory=pl.Mem.Mat)
+        right = pl.tile.move(right_mat, target_memory=pl.Mem.Right)
+        source = pl.tile.load(a, [0, 0], [64, 32], target_memory=pl.Mem.Mat)
+        for outer in pl.range(2):
+            for i in pl.range(2):
+                if 2 * outer + i < visits:
+                    left = pl.tile.extract(source, 32 * i, 0, [16, 32], target_memory=pl.Mem.Left)
+                    partial = pl.tile.matmul(left, right)
+                    out = pl.tile.store(partial, [0, 0], out)
+        replacement = pl.tile.load(replacement_input, [0, 0], [16, 32], target_memory=pl.Mem.Mat)
+        final_left = pl.tile.move(replacement, target_memory=pl.Mem.Left)
+        result = pl.tile.matmul(final_left, right)
+        return pl.tile.store(result, [0, 0], out)
+""")
+    original, function = _compile_matrix_fixture(program, disjoint_gm=True)
+    # Reuse the same physical Mat storage across different NZ pitches. The
+    # first extract in each inner loop reads a fractal the replacement writes.
+    # The second extract skips that fractal entirely.
+    for visits in range(5):
+        calls, order = _replay_matrix_commands(original, function, {3: visits})
+        overwrite = next(
+            i
+            for i, (call, *_) in enumerate(calls)
+            if call.op.name == opname("buffer.load") and call.args[0] is original.params[1]
+        )
+        readers = [i for i, (call, *_) in enumerate(calls) if call.op.name == opname("buffer.extract")]
+        assert len(readers) == visits
+        for visit, reader in enumerate(readers):
+            assert reader < overwrite
+            shared = calls[reader][3] & calls[overwrite][4]
+            # Each common 16x16 FP16 fractal occupies 512 physical bytes.
+            assert len(shared) == (256 if visit % 2 == 0 else 0)
+            if shared:
+                assert (("payload", reader, "C"), ("payload", overwrite, "I")) in order
 
 
 @pytest.mark.parametrize("count", [8, 32, 128])

@@ -14,7 +14,11 @@ from collections import defaultdict
 
 import pytest
 from pypto import ir, passes
-from pypto._function_attrs import PYPTO_AUTOSYNC_ATTR
+from pypto._function_attrs import (
+    AUTOSYNC_ANALYSIS_POLICY_ATTR,
+    AUTOSYNC_WHOLE_MODULE_ATTR,
+    PYPTO_AUTOSYNC_ATTR,
+)
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import PassManager
 from pypto.runtime import RunConfig
@@ -768,3 +772,203 @@ def test_peer_void_fallthrough_matches_explicit_completion(endpoint):
                 assert {edge for edge in actual_order if edge[1][0] != "return"} == {
                     edge for edge in expected_order if edge[1][0] != "return"
                 }
+
+
+class PeerMatrixCommands(ClosedCommands):
+    """Interpret matrix bytes on the sending endpoint of a qualified FIFO pair."""
+
+    def assign(self, statement, env):
+        call = statement.value
+        if isinstance(call, ir.Call) and call.op.name == opname("system.import_peer_buffer"):
+            env[statement.var] = None
+        else:
+            super().assign(statement, env)
+
+    def evaluate(self, statement, env):
+        if statement.expr.op.name != opname("system.aic_initialize_pipe"):
+            super().evaluate(statement, env)
+
+    def memory_footprint(self, call, env):
+        if call.op.name == opname("buffer.peer_push"):
+            source, valid = call.args
+            assert isinstance(valid, ir.MakeTuple)
+            rows, columns = (item.value for item in valid.elements)
+            rect = 0, 0, rows, columns
+            signature = call.op.name, self.signature(source), rect
+            return ir.PipeType.FIX, self.bytes(source, rect), frozenset(), signature, rect
+        return super().memory_footprint(call, env)
+
+
+def _with_matrix_slot_work(placed):
+    cube = placed["cube"]
+    span = cube.span
+    index = ir.DataType.INDEX
+
+    def ci(number):
+        return ir.ConstInt(number, index, span)
+
+    def tup(*numbers):
+        return ir.MakeTuple([ci(n) for n in numbers], span)
+
+    def call(name, args, kind=None):
+        return ir.Call(ir.get_op(name), args, kind or ir.VoidType(), span)
+
+    def define(var, name, *args):
+        return ir.AssignStmt(var, call(name, list(args), var.type), span)
+
+    def payload(name, *args):
+        return ir.EvalStmt(call(name, list(args)), span)
+
+    def matrix(shape, space):
+        return ir.BufferType(
+            shape,
+            ir.DataType.FP16,
+            space,
+            blayout=ir.TileLayout.col_major,
+            slayout=ir.TileLayout.row_major,
+            fractal=512,
+        )
+
+    assert cube.ir_stage == ir.FunctionIRStage.Buffer and isinstance(cube.body, ir.SeqStmts)
+    tensor = cube.params[0]
+    mat = matrix([32, 16], ir.MemorySpace.Mat)
+    ring = ir.Var("matrix_ring", ir.MultiBufferType(mat, 2), span)
+    left = ir.Var("subtile", matrix([16, 16], ir.MemorySpace.Left), span)
+    slot = ir.Var("matrix_slot", mat, span)
+    wrap = ir.Var("wrap_slot", mat, span)
+    iv = ir.Var("visit", ir.ScalarType(index), span)
+    block = ir.Var("block", ir.ScalarType(index), span)
+    loop = ir.ForStmt(
+        iv,
+        ci(0),
+        ci(2),
+        ci(1),
+        [],
+        ir.SeqStmts(
+            [
+                define(slot, "buffer.slot", ring, ir.FloorMod(iv, ci(2), index, span)),
+                payload("buffer.load", tensor, tup(0, 0), tup(32, 16), slot),
+                payload("buffer.extract", slot, ir.Mul(iv, ci(16), index, span), ci(0), left),
+                ir.YieldStmt([], span),
+            ],
+            span,
+        ),
+        [],
+        span,
+    )
+    *prefix, ret = cube.body.stmts
+    assert isinstance(ret, ir.ReturnStmt)
+    prefix = [
+        *prefix,
+        define(ring, "buffer.alloc_multi", tup(), ci(16384)),
+        define(left, "buffer.alloc", tup(), ci(8192)),
+        define(block, "buffer.get_block_idx"),
+    ]
+    suffix = [
+        define(wrap, "buffer.slot", ring, ci(0)),
+        payload("buffer.load", tensor, tup(0, 0), tup(32, 16), wrap),
+        ret,
+    ]
+
+    def replace_cube(work):
+        endpoint = ir.Function(
+            cube.name,
+            list(zip(cube.params, cube.param_directions, strict=True)),
+            cube.return_types,
+            ir.SeqStmts([*prefix, work, *suffix], span),
+            span,
+            cube.func_type,
+            cube.level,
+            cube.role,
+            cube.attrs,
+            cube.requires_runtime_binding,
+            cube.ir_stage,
+        )
+        return ir.Program(
+            [endpoint if fn.name == cube.name else fn for fn in placed.functions.values()],
+            placed.name,
+            placed.span,
+        )
+
+    # This authored, nonterminal conditional selects the structured peer
+    # importer. Block 0 executes the exact same original loop in both versions.
+    branch = ir.IfStmt(ir.Eq(block, ci(0), ir.DataType.BOOL, span), loop, None, [], span)
+    return replace_cube(loop), replace_cube(branch)
+
+
+@pytest.mark.usefixtures("ascend_backend")
+def test_peer_finite_and_structured_routes_order_the_same_moving_matrix_bytes():
+    checkpoints = []
+
+    def capture(transform, program):
+        if transform.get_name() == "RealizeSync":
+            checkpoints.append(program)
+
+    with passes.PassContext(
+        [passes.CallbackInstrument(before_pass=capture)],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+    ):
+        PassManager(ir.OptimizationStrategy.Default).run_passes(_paired_consumer(2, read_after_wrap=False))
+        (placed,) = checkpoints
+        originals = _with_matrix_slot_work(placed)
+        outputs = [passes.realize_sync()(program) for program in originals]
+
+    for output in outputs:
+        for name in ("cube", "vector"):
+            endpoint = output[name]
+            assert endpoint.attrs.get(PYPTO_AUTOSYNC_ATTR), endpoint.attrs
+            assert endpoint.attrs[AUTOSYNC_WHOLE_MODULE_ATTR]  # Published by the mixed peer planner.
+    # Only the structured peer route runs conservative analysis and attaches
+    # its policy outcome, even though both runs have the same PassContext.
+    direct, structured = (output["cube"] for output in outputs)
+    assert AUTOSYNC_ANALYSIS_POLICY_ATTR not in direct.attrs
+    assert structured.attrs[AUTOSYNC_ANALYSIS_POLICY_ATTR] == "conservative_prefix"
+
+    common_payloads = None
+    for original, output in zip(originals, outputs, strict=True):
+        endpoint = output["cube"]
+        before = PeerMatrixCommands(original["cube"], {}, range(8), block_index=0)
+        after = PeerMatrixCommands(endpoint, {}, range(8), block_index=0)
+        before.run()
+        order = after.run()  # Also checks consuming flag reuse and empty inventory at exit.
+        assert after.payloads == before.payloads and after.descriptors == before.descriptors
+        if common_payloads is None:
+            common_payloads = before.payloads
+        assert after.payloads == common_payloads
+        extract = [i for i, (call, *_) in enumerate(after.calls) if call.op.name == opname("buffer.extract")]
+        assert len(extract) == 2
+        for visit, i in enumerate(extract):
+            _, pipe, reads, writes = after.payloads[i]
+            # Every NZ box in this FP16 fixture contains 512 bytes. Slot 1
+            # begins 1024 bytes later, and its extraction starts at box 1.
+            start = 16384 + visit * 1024 + visit * 512
+            assert reads == {(ir.MemorySpace.Mat, address) for address in range(start, start + 512)}
+            assert writes == {(ir.MemorySpace.Left, address) for address in range(8192, 8192 + 512)}
+            assert pipe == ir.PipeType.MTE1
+            assert (("payload", i - 1, "C"), ("payload", i, "I")) in order
+        wrap = len(after.payloads) - 1
+        assert (("payload", extract[0], "C"), ("payload", wrap, "I")) in order
+        for i, (_, pipe, reads, writes) in enumerate(after.payloads):
+            for j, (_, earlier_pipe, earlier_reads, earlier_writes) in enumerate(after.payloads[:i]):
+                if pipe != earlier_pipe and ((earlier_writes & (reads | writes)) or (earlier_reads & writes)):
+                    assert (("payload", j, "C"), ("payload", i, "I")) in order, (j, i)
+        assert after.acquisitions and after.reuses
+        assert after.last_all is not None
+        assert all((("payload", i, "C"), after.last_all) in order for i in range(len(after.payloads)))
+
+    # The untaken structured path still performs the slot-0 overwrite. Any
+    # prefix event for that overwrite must be closed even without an extract.
+    skipped_before = PeerMatrixCommands(originals[1]["cube"], {}, range(8), block_index=1)
+    skipped_after = PeerMatrixCommands(structured, {}, range(8), block_index=1)
+    skipped_before.run()
+    skipped_after.run()
+    assert skipped_after.payloads == skipped_before.payloads
+    assert skipped_after.descriptors == skipped_before.descriptors
+    assert all(call.op.name != opname("buffer.extract") for call, *_ in skipped_after.calls)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
