@@ -1,0 +1,163 @@
+{
+  "library": "182990263ee87ef29c835ead20a716e3f4aa3d19",
+  "compiler_production_revisions": {
+    "current": "1056de181",
+    "before": "03f912b1a",
+    "stock": "03f912b1a"
+  },
+  "prefill": {
+    "current": {
+      "gate_up_proj": {
+        "blocks": 24,
+        "shapes": [
+          [
+            256,
+            4352
+          ],
+          [
+            128,
+            5120
+          ],
+          [
+            5120,
+            17408
+          ],
+          [
+            5120,
+            17408
+          ]
+        ],
+        "wrapper_sha256": "69919567eed49eda53b9d0dc24c80c6340a42ae7f3cd5a53830984c9106fd12a",
+        "ptoas_cpp_sha256": "7177f581f843d0f04d30b71ad3cd7f1deae647813923c155ad2775c45db01f75"
+      },
+      "down_proj": {
+        "blocks": 20,
+        "shapes": [
+          [
+            128,
+            5120
+          ],
+          [
+            128,
+            4352
+          ],
+          [
+            17408,
+            5120
+          ]
+        ],
+        "wrapper_sha256": "5e378dbb9c79b887df5fdbe6411cd57fd7b89c7c71749c1abc2f527635be0dea",
+        "ptoas_cpp_sha256": "6e25105ec3f41fa3b7388cb6334466c13c7d17f2145a49fd76443be606ac0d14"
+      }
+    },
+    "before": {
+      "gate_up_proj": {
+        "blocks": 24,
+        "shapes": [
+          [
+            256,
+            4352
+          ],
+          [
+            128,
+            5120
+          ],
+          [
+            5120,
+            17408
+          ],
+          [
+            5120,
+            17408
+          ]
+        ],
+        "wrapper_sha256": "f2a758d6eb6a43e163584fe444a3aac2881239a52a0c76dd451a8847c1889c43",
+        "ptoas_cpp_sha256": "d35d2c38ffefd69991d7ea74ec7bf83c74dd17bf258446a9d011020223a59374"
+      },
+      "down_proj": {
+        "blocks": 20,
+        "shapes": [
+          [
+            128,
+            5120
+          ],
+          [
+            128,
+            4352
+          ],
+          [
+            17408,
+            5120
+          ]
+        ],
+        "wrapper_sha256": "5e378dbb9c79b887df5fdbe6411cd57fd7b89c7c71749c1abc2f527635be0dea",
+        "ptoas_cpp_sha256": "6e25105ec3f41fa3b7388cb6334466c13c7d17f2145a49fd76443be606ac0d14"
+      }
+    },
+    "stock": {
+      "gate_up_proj": {
+        "blocks": 24,
+        "shapes": [
+          [
+            256,
+            4352
+          ],
+          [
+            128,
+            5120
+          ],
+          [
+            5120,
+            17408
+          ],
+          [
+            5120,
+            17408
+          ]
+        ],
+        "wrapper_sha256": "9168821170d8c0b995563622d3429bc2eee71790a98847504a477aa3c43e5c4c",
+        "ptoas_cpp_sha256": "38c4424ac0368b1c871b1d7331c93a3f27b37bc8169abe8dbee1787f369f2516"
+      },
+      "down_proj": {
+        "blocks": 20,
+        "shapes": [
+          [
+            128,
+            5120
+          ],
+          [
+            128,
+            4352
+          ],
+          [
+            17408,
+            5120
+          ]
+        ],
+        "wrapper_sha256": "58ca75060ddeb3222105d9c20b198362613c74064ce01937ef88efcff6ad0270",
+        "ptoas_cpp_sha256": "e1101dba0fa8162a5e3cf4b58c98f6bc9185f0ab518f4f0eeeb47ed3f445ce0a"
+      }
+    }
+  },
+  "persistent": {
+    "stock": {
+      "wrapper_sha256": "76ebae769856513e9be89aaf4830788ae3d740b907549bb5af68fb67204adc3f",
+      "selected_routes": []
+    },
+    "pypto": {
+      "wrapper_sha256": "ff9c4536f802e1ce169bfb5d0fe2f7ed5ad68294b9eb64f776da55d415910d9c",
+      "selected_routes": [
+        "pypto"
+      ]
+    },
+    "disjoint": {
+      "wrapper_sha256": "3f24aba648218a737b6ff7f400eeb365533bd4935fb243dbd4d2a55abaea7c20",
+      "selected_routes": [
+        "pypto"
+      ]
+    }
+  },
+  "changed_units_before_vs_current": [
+    "gate_up_proj.cpp"
+  ]
+}

@@ -1,0 +1,26 @@
+[
+  {
+    "rows": 48,
+    "arm": "B",
+    "cpp_sha256": "b0380eccf9599ea77247495c1da0602b538998f20873b8cac517c487e0bf4d24",
+    "set_flags": 12
+  },
+  {
+    "rows": 48,
+    "arm": "R",
+    "cpp_sha256": "7f2b4d86637460d58e956325461c0f12da24266fe3d2ac91e98f205703d5143e",
+    "set_flags": 15
+  },
+  {
+    "rows": 80,
+    "arm": "B",
+    "cpp_sha256": "c8bd136165751adb39f842855143cd8a32f87dca9764b059cd1c1975529dec9d",
+    "set_flags": 12
+  },
+  {
+    "rows": 80,
+    "arm": "R",
+    "cpp_sha256": "df39ea33ba78ccceb0f01c98a8d4b7bb45aeda49fdd04b2696b228aa62a21ca6",
+    "set_flags": 15
+  }
+]
