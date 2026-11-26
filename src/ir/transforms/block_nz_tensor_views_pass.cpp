@@ -312,8 +312,8 @@ constexpr size_t kNzRowFractalDim = 2;
 /// ``srcStride`` operand is a 16-bit field counting 32-byte blocks.
 constexpr int64_t kNzMaxGmGapBlocks = 65535;
 
-/// A2/A3 can advance full-width addresses between individual column-block
-/// bursts. For other targets, require the source gap to fit the strided DMA.
+/// Without a backend guarantee for wide NZ Mat loads, require the source gap
+/// to fit the conservative 16-bit DMA encoding.
 /// In a dense NZ view one logical row occupies one 32-byte block per C0.
 void CheckNzGmGapFitsBurstStride(const std::vector<ExprPtr>& blocked_shape, const ExprPtr& blocked_partition,
                                  const Span& span) {

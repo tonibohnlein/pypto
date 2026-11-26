@@ -399,7 +399,7 @@ class BackendHandler {
    */
   [[nodiscard]] virtual bool SupportsBf16AtomicAdd() const = 0;
 
-  /// Whether NZ Mat loads split wide GM gaps into separately addressed bursts.
+  /// Whether NZ Mat loads can address multiple column blocks beyond a 16-bit GM gap.
   [[nodiscard]] virtual bool SupportsWideNzLoadGap() const { return false; }
 
   /// Maximum logical columns in one FP32 Acc -> FP32 NZ GM store; zero means

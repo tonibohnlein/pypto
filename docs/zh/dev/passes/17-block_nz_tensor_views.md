@@ -336,7 +336,7 @@ NZ load 与 Acc store 的范围都有明确边界。范围之外一律报错并�
 | `tile.load` 的动态 `valid_shape[-2]` 可能止于 fractal 内部 | 拒绝——不完整的 fractal 没有分块形式 |
 | 分布式张量 | 拒绝——`remote_load` 没有 NZ 分块 |
 | 对 NZ 做 `tensor.view` / `tensor.reinterpret_view` | 在算子构造期拒绝 |
-| 多列块 Mat load 的 GM 行间隔超过 65535 个 block | Ascend910 按列块拆分传输。其他目标保留间隔检查。 |
+| 多列块 Mat load 的 GM 行间隔超过 65535 个 block | Ascend910 按列块拆分传输。Ascend950 使用相邻突发起始地址间的字节步长。 |
 
 ### NZ load 的 GM 行间隔
 
@@ -346,7 +346,7 @@ NZ load 与 Acc store 的范围都有明确边界。范围之外一律报错并�
 
 Ascend910 使用的 A2/A3 NZ 到 Mat 实现在间隔能放入步长字段时发出一条 DMA 指令。
 超出该范围时，每个列块分别发出一次传输，并使用 64 位算术推进源地址。
-其他目标对多列块传输保留 65535 个 block 的检查。[PTO-ISA 实现](https://github.com/hw-native-sys/pto-isa/blob/ffaa313e029055bac38eb0fd970ffb3384408d0b/include/pto/npu/a2a3/TLoad.hpp)
+Ascend950 可编码 40 位的起始地址间字节步长，超过范围时拆分加载。未配置后端时，对多列块传输保留 65535 个 block 的保守检查。[PTO-ISA 实现](https://github.com/hw-native-sys/pto-isa/blob/ffaa313e029055bac38eb0fd970ffb3384408d0b/include/pto/npu/a2a3/TLoad.hpp)
 
 ### 前导轴折叠进唯一的 batch 槽位
 

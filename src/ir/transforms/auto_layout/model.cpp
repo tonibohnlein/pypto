@@ -270,25 +270,23 @@ void LayoutCostModel::ValidateUseHorizon() const {
   }
 }
 
-std::string LayoutCostModel::TargetArch() const {
-  if (backend_type.has_value()) {
-    return (*backend_type == backend::BackendType::Ascend950) ? "a5" : "a2a3";
-  }
-  return resolved_arch_hint.empty() ? "a2a3" : resolved_arch_hint;
+void LayoutCostModel::SetBackend(const backend::Backend& target) {
+  backend_ = &target;
+  const auto* handler = target.GetHandler();
+  is_a5_ = handler->GetPtoTargetArch() == "a5";
+  l0_costs_ = handler->GetL0CostModel();
 }
 
 int64_t LayoutCostModel::GmAccessGranularityBytes() const {
-  return TargetArch() == "a5" ? 128 : l2_cache_line_bytes;
+  return backend_ ? backend_->GetHandler()->GetGmAccessGranularityBytes() : 512;
 }
 
 bool LayoutCostModel::SupportsWideNzMatLoad() const {
-  // The pinned A2/A3 TLOAD implementation splits wide NZ Mat gaps into
-  // individual bursts. Other targets keep the 16-bit gap restriction.
-  return backend_type == backend::BackendType::Ascend910;
+  return backend_ && backend_->GetHandler()->SupportsWideNzLoadGap();
 }
 
 bool LayoutCostModel::SupportsAccNzStore(const ValueNode& src_node, const ValueNode& dst_node) const {
-  if (TargetArch() == "a5") {
+  if (IsA5()) {
     return false;
   }
   if (dst_node.shape.size() != 2 && dst_node.shape.size() != 3) {
@@ -303,7 +301,7 @@ bool LayoutCostModel::SupportsAccNzStore(const ValueNode& src_node, const ValueN
 }
 
 double LayoutCostModel::EstimateVbrcbCost(int64_t rows) const {
-  if (TargetArch() == "a2a3") {
+  if (!IsA5()) {
     return vec_vbrcb_fixed_cycles + static_cast<double>(rows) * vec_vbrcb_cycles_per_row;
   }
   return 0.0;
@@ -469,9 +467,9 @@ double LayoutCostModel::EstimateMoveCost(const ValueNode& src_node, const ValueN
   }
   double bw = mte1_l1_to_l0_bytes_per_cycle;
   if (dst_node.memory_space == MemorySpace::Left) {
-    bw = mte1_l0a_bytes_per_cycle;
+    bw = mte1_l0a_bytes_per_cycle.value_or(l0_costs_.bw_l0a);
   } else if (dst_node.memory_space == MemorySpace::Right) {
-    bw = mte1_l0b_bytes_per_cycle;
+    bw = mte1_l0b_bytes_per_cycle.value_or(l0_costs_.bw_l0b);
   }
   const double base = total_bytes / bw;
   if (src_layout != dst_layout) {
@@ -486,11 +484,11 @@ double LayoutCostModel::EstimateMatmulCost(const ValueNode& lhs_node, const Valu
   const int64_t k_dim = lhs_node.shape.back();
   const int64_t n_dim = rhs_node.shape.back();
   const int bpe = DTypeByteWidth(lhs_node.dtype);
-  const int fp32_passes = mad_fp32_passes.has_value() ? *mad_fp32_passes : (TargetArch() == "a5" ? 8 : 2);
+  const int fp32_passes = mad_fp32_passes.value_or(l0_costs_.mad_fp32_passes);
   const int cpr = (bpe == 4) ? std::max(1, fp32_passes) : std::max(1, bpe / 2);
-  const int k_fractal = std::max(1, 32 / bpe);
+  const int k_fractal = std::max(1, l0_costs_.mad_k_fractal_bytes / bpe);
   const int64_t fractals = ((m_dim + 15) / 16) * ((n_dim + 15) / 16) * ((k_dim + k_fractal - 1) / k_fractal);
-  return cube_issue_overhead_cycles +
+  return cube_issue_overhead_cycles.value_or(l0_costs_.mad_head_cycles) +
          static_cast<double>(cpr) * static_cast<double>(fractals) * (4096.0 / cube_macs_per_cycle);
 }
 
@@ -502,20 +500,27 @@ double LayoutCostModel::EstimateStoreCost(const ValueNode& src_node, const Value
     return EstimateVecGmTransferCost(*this, src_node, dst_node, dst_layout, mte3_vec_bytes_per_cycle,
                                      mte3_vec_strided_bytes_per_cycle);
   }
-  const double bw = (dst_layout == LayoutSpec::NZ()) ? fixpipe_acc_to_nz_bytes_per_cycle
-                                                     : fixpipe_acc_to_nd_bytes_per_cycle;
+  const double bw = (dst_layout == LayoutSpec::NZ())
+                        ? fixpipe_acc_to_nz_bytes_per_cycle
+                        : fixpipe_acc_to_nd_bytes_per_cycle.value_or(l0_costs_.bw_drain);
   const int64_t m_rows = src_node.shape.size() >= 2 ? src_node.shape[src_node.shape.size() - 2] : 1;
   const int64_t n_cols = !src_node.shape.empty() ? src_node.shape.back() : 1;
   const int bpe_c = std::max(1, DTypeByteWidth(src_node.dtype));
-  const int64_t n0 = std::max<int64_t>(1, 32 / bpe_c);
+  const int64_t n0 = std::max<int64_t>(1, l0_costs_.drain_c0_bytes / bpe_c);
   const int64_t n1 = std::max<int64_t>(1, (n_cols + n0 - 1) / n0);
   int64_t odd_n1 = n1;
   while ((odd_n1 & 1) == 0) {
     odd_n1 >>= 1;
   }
-  const double odd_penalty =
-      static_cast<double>(m_rows) * fixpipe_odd_n1_penalty_cycles * static_cast<double>(odd_n1 - 1);
-  return fixpipe_drain_fixed_cycles + (total_bytes / bw) + odd_penalty;
+  const double odd_penalty = static_cast<double>(m_rows) *
+                             fixpipe_odd_n1_penalty_cycles.value_or(l0_costs_.drain_penalty_cycles) *
+                             static_cast<double>(odd_n1 - 1);
+  // The A5 FIXP fit includes a per-row issue floor for narrow Acc drains.
+  // The A2/A3 layout model retains its existing byte-throughput estimate.
+  const bool a5_drain = IsA5() && src_node.memory_space == MemorySpace::Acc && dst_layout == LayoutSpec::ND();
+  const double row_floor = a5_drain ? static_cast<double>(m_rows) * l0_costs_.drain_row_cycles : 0.0;
+  return fixpipe_drain_fixed_cycles.value_or(a5_drain ? l0_costs_.drain_fixed_cycles : 0.0) +
+         std::max(total_bytes / bw, row_floor) + odd_penalty;
 }
 
 std::optional<VecConversionStorage> LayoutCostModel::GetVecConversionStorage(
@@ -529,7 +534,7 @@ std::optional<VecConversionStorage> LayoutCostModel::GetVecConversionStorage(
   // A2/A3 non-Mat TMOV requires identical physical shapes. A strided subview
   // retains its backing pitch in PTOAS, while the writer allocates a compact
   // conversion destination.
-  if (val_node.is_strided_subview && TargetArch() == "a2a3") {
+  if (val_node.is_strided_subview && !IsA5()) {
     return std::nullopt;
   }
   if (src_layout == LayoutSpec::FractalNZ() || dst_layout == LayoutSpec::FractalNZ()) {
@@ -642,8 +647,7 @@ double LayoutProblemInstance::EstimateConversionCost(const ValueNode& val_node, 
     if (pair_it != val_it->second.end()) {
       // Measured costs override prices only for materializable conversions.
       if (val_node.memory_space == MemorySpace::Vec &&
-          (forbid_unmaterializable_gm_conversions ||
-           (val_node.is_strided_subview && cost_model.TargetArch() == "a2a3") ||
+          (forbid_unmaterializable_gm_conversions || (val_node.is_strided_subview && !cost_model.IsA5()) ||
            val_node.vec_conversion_headroom.has_value()) &&
           !cost_model.SupportsVecTileConversion(val_node, src_layout, dst_layout)) {
         return cost_model.vec_unsupported_conversion_cycles;

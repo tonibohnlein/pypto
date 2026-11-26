@@ -260,7 +260,7 @@ void TestHostMatrixLayout(HostMatrixDispatch dispatch, std::optional<int64_t> wo
   options.nz_inputs = {"weight"};
   options.reusable_tensors = {"weight"};
   options.cost_model.host_world_size = world_size;
-  options.cost_model.backend_type = backend;
+  options.cost_model.SetBackend(*pypto::backend::GetBackendInstance(backend));
   // Force NZ where legal so this checks writeback as well as extraction.
   options.cost_model.gm_pack_fixed_cycles = 0;
   options.cost_model.gm_pack_bytes_per_cycle = 1e12;
@@ -1459,7 +1459,7 @@ int main() {
   TestHostMatrixLayout(HostMatrixDispatch::Mutable, 1, false);
   // A Qwen-size NZ source needs multiple bursts with a gap over 16 bits.
   TestHostMatrixLayout(HostMatrixDispatch::Implicit, 1, true, true);
-  TestHostMatrixLayout(HostMatrixDispatch::Implicit, 1, false, true, pypto::backend::BackendType::Ascend950);
+  TestHostMatrixLayout(HostMatrixDispatch::Implicit, 1, true, true, pypto::backend::BackendType::Ascend950);
   TestHostInputProjectionCost(false, 1);
   TestHostInputProjectionCost(true, 1);
   TestHostInputProjectionCost(false, 3);

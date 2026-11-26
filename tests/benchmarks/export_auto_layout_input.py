@@ -43,8 +43,11 @@ def main() -> None:
     parser.add_argument("module", type=Path)
     parser.add_argument("entry", help="JIT entry with a no-argument specialization")
     parser.add_argument("output", type=Path)
+    parser.add_argument("--backend", choices=("a2a3", "a5"), default="a2a3")
     args = parser.parse_args()
-    backend.set_backend_type(backend.BackendType.Ascend910)
+    backend.set_backend_type(
+        backend.BackendType.Ascend950 if args.backend == "a5" else backend.BackendType.Ascend910
+    )
     program = _specialize_model(args.module, args.entry)
     prefix = passes.PassPipeline()
     for step in ir.PassManager.get_strategy(ir.OptimizationStrategy.AutoLayout).passes:

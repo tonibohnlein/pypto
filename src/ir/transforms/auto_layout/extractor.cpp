@@ -354,9 +354,7 @@ class VarUnionFind {
 };
 
 const backend::Backend* ResolveBackend(const LayoutCostModel& model) {
-  if (model.backend_type.has_value()) {
-    return backend::GetBackendInstance(*model.backend_type);
-  }
+  if (const auto* target = model.GetBackend()) return target;
   if (!backend::BackendConfig::IsConfigured()) return nullptr;
   if (auto* context = PassContext::Current()) return context->GetBackend();
   return backend::BackendConfig::GetBackend();
@@ -896,7 +894,7 @@ bool IsNzCompatibleTileStoreCall(const CallPtr& call, const TypePtr& tensor_type
   if (!shape.has_value() || !tt || (call->args_.size() != 3 && call->args_.size() != 4)) {
     return false;
   }
-  if (model.TargetArch() == "a5") {
+  if (model.IsA5()) {
     return false;
   }
   if (!tile_type || tile_type->dtype_ != DataType::FP32 || tt->dtype_ != DataType::FP32 ||
@@ -2374,7 +2372,7 @@ class PostInferInstanceExtractor {
         node.is_strided_subview |= strided;
         node.is_vec_slice |= slice;
         node.has_dense_vec_span &= dense;
-        if (strided && model_.TargetArch() == "a2a3") node.admissible_layouts = {node.current_layout};
+        if (strided && !model_.IsA5()) node.admissible_layouts = {node.current_layout};
       }
     }
     for (size_t index = first_op; index < instance_.operations.size(); ++index) {
@@ -2953,7 +2951,7 @@ class PostInferInstanceExtractor {
     const MemorySpace space = tile_type->GetMemorySpace().value_or(MemorySpace::Vec);
     const LayoutSpec cur_layout = EffectiveTileLayout(tile_type);
     std::vector<LayoutSpec> admissible;
-    if (is_strided_subview && model_.TargetArch() == "a2a3") {
+    if (is_strided_subview && !model_.IsA5()) {
       // A view retains its source layout. Keep consumer configurations from
       // requesting a layout that would require a compact copy of the view.
       admissible = {cur_layout};
@@ -4510,9 +4508,7 @@ LayoutProblemInstance ExtractLayoutInstance(const ProgramPtr& input, const Layou
   }
   const backend::Backend* be = ResolveBackend(resolved_model);
   if (bindings) bindings->backend = be;
-  if (!resolved_model.backend_type.has_value() && be != nullptr) {
-    resolved_model.backend_type = backend::BackendConfig::GetBackendType();
-  }
+  if (be) resolved_model.SetBackend(*be);
 
   LayoutProblemInstance instance;
   instance.cost_model = resolved_model;

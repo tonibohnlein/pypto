@@ -32,15 +32,51 @@
 namespace al = pypto::ir::auto_layout;
 
 int main(int argc, char** argv) {
-  if (argc != 2) {
-    std::cerr << "Usage: auto_layout_solver <pre-layout-program.msgpack>\n";
+  using pypto::backend::BackendType;
+  BackendType target = BackendType::Ascend910;
+  bool dump_costs = false;
+  for (int i = 2; i < argc; ++i) {
+    const std::string flag = argv[i];
+    if (flag == "--dump-costs") {
+      dump_costs = true;
+    } else if (flag == "--backend" && i + 1 < argc) {
+      const std::string arch = argv[++i];
+      if (arch != "a2a3" && arch != "a5") {
+        std::cerr << "Unknown backend: " << arch << '\n';
+        return 2;
+      }
+      target = arch == "a5" ? BackendType::Ascend950 : BackendType::Ascend910;
+    } else {
+      std::cerr << "Unknown or incomplete argument: " << flag << '\n';
+      return 2;
+    }
+  }
+  if (argc < 2) {
+    std::cerr
+        << "Usage: auto_layout_solver <pre-layout-program.msgpack> [--backend a2a3|a5] [--dump-costs]\n";
     return 2;
   }
   const auto program = std::dynamic_pointer_cast<const pypto::ir::Program>(
       pypto::ir::serialization::DeserializeFromFile(argv[1]));
   if (!program) throw pypto::ValueError("Expected serialized Program");
-  pypto::backend::BackendConfig::SetBackendType(pypto::backend::BackendType::Ascend910);
+  pypto::backend::BackendConfig::SetBackendType(target);
   const auto problem = al::ExtractLayoutInstance(program);
+  if (dump_costs) {
+    std::cout << "backend\top_id\top_name\tinputs\toutput\tinvocations\tcycles_per_invocation\n";
+    for (const auto& op : problem.operations) {
+      for (const auto& config : op.configs) {
+        std::cout << pypto::backend::BackendTypeToString(target) << '\t' << op.op_id << '\t' << op.op_name
+                  << '\t';
+        for (size_t i = 0; i < config.input_layouts.size(); ++i) {
+          if (i > 0) std::cout << ',';
+          std::cout << config.input_layouts[i].ShortName();
+        }
+        std::cout << '\t' << config.output_layout.ShortName() << '\t' << op.invocations << '\t'
+                  << std::setprecision(10) << config.op_cost_cycles << '\n';
+      }
+    }
+    return 0;
+  }
   const al::IndexedProblem indexed(problem);
   const auto movable = std::count_if(indexed.Ops().begin(), indexed.Ops().end(),
                                      [](const auto& op) { return op.costs.size() > 1; });

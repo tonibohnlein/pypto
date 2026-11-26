@@ -82,6 +82,9 @@ class Ascend950Handler : public BackendHandler {
   // destination (tstore_acc2gm case 60, `<1, float, bfloat16_t, bfloat16_t>`)
   // while the a5 port of that same case runs it with atomicType `<0, ...>`.
   [[nodiscard]] bool SupportsBf16AtomicAdd() const override { return false; }
+  // A5 TLoadCubeInstr takes a 40-bit start-to-start byte stride and falls back
+  // to individually addressed loads beyond that encoding.
+  [[nodiscard]] bool SupportsWideNzLoadGap() const override { return true; }
   [[nodiscard]] bool SupportsVecFp8NzGmStore() const override { return true; }
 
   // A5 fix-pipe Acc->GM destination whitelist, non-quant branch: same set as

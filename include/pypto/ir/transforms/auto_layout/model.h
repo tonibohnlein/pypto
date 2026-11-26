@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_handler.h"
 #include "pypto/core/dtype.h"
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/type.h"
@@ -193,8 +194,11 @@ struct LayoutCostModel {
   // Compile-time topology for named HOST inputs. It also proves that a
   // whole matrix forwarded by HOST can use one resident device allocation.
   std::optional<int64_t> host_world_size;
-  std::optional<backend::BackendType> backend_type;
-  std::string resolved_arch_hint = "a2a3";
+  // Bind the target once during extraction. Explicit coefficient overrides take
+  // precedence over the backend's calibrated defaults.
+  void SetBackend(const backend::Backend& target);
+  [[nodiscard]] const backend::Backend* GetBackend() const { return backend_; }
+  [[nodiscard]] bool IsA5() const { return is_a5_; }
 
   double mte2_nz2nz_bytes_per_cycle = 123.0;
   double mte2_nd2nz_bytes_per_cycle = 77.0;
@@ -202,18 +206,17 @@ struct LayoutCostModel {
   double mte2_nd2nz_row_penalty_cycles = 0.0;
   double mte2_nd2nz_sub512b_penalty_cycles = 2.5;
   double mte2_l2_reread_discount = 0.30;
-  int64_t l2_cache_line_bytes = 512;
   double mte2_vec_bytes_per_cycle = 192.0;
   double mte2_vec_strided_bytes_per_cycle = 96.0;
   double mte3_vec_bytes_per_cycle = 192.0;
   double mte3_vec_strided_bytes_per_cycle = 96.0;
   double vec_strided_burst_penalty_cycles = 3.0;
   double mte1_l1_to_l0_bytes_per_cycle = 129.7;
-  double mte1_l0a_bytes_per_cycle = 129.7;
-  double mte1_l0b_bytes_per_cycle = 85.4;
+  std::optional<double> mte1_l0a_bytes_per_cycle;
+  std::optional<double> mte1_l0b_bytes_per_cycle;
   double mte1_transpose_penalty_cycles = 8.0;
   double cube_macs_per_cycle = 4096.0;
-  double cube_issue_overhead_cycles = 21.0;
+  std::optional<double> cube_issue_overhead_cycles;
   std::optional<int> mad_fp32_passes;
   double vec_elements_per_cycle = 128.0;
   double vec_reshape_metadata_cycles = 1.0;
@@ -222,10 +225,10 @@ struct LayoutCostModel {
   double vec_vbrcb_cycles_per_row = 0.5;
   double vec_row_expand_issue_cycles = 4.0;
   double vec_unsupported_conversion_cycles = 1e12;
-  double fixpipe_acc_to_nd_bytes_per_cycle = 118.0;
+  std::optional<double> fixpipe_acc_to_nd_bytes_per_cycle;
   double fixpipe_acc_to_nz_bytes_per_cycle = 122.0;
-  double fixpipe_drain_fixed_cycles = 0.0;
-  double fixpipe_odd_n1_penalty_cycles = 2.6;
+  std::optional<double> fixpipe_drain_fixed_cycles;
+  std::optional<double> fixpipe_odd_n1_penalty_cycles;
   double gm_pack_bytes_per_cycle = 64.0;
   double gm_pack_fixed_cycles = 120.0;
   double onchip_relayout_bytes_per_cycle = 256.0;
@@ -236,7 +239,6 @@ struct LayoutCostModel {
   bool steady_state = false;
 
   void ValidateUseHorizon() const;
-  [[nodiscard]] std::string TargetArch() const;
   [[nodiscard]] int64_t GmAccessGranularityBytes() const;
   [[nodiscard]] bool SupportsWideNzMatLoad() const;
 
@@ -268,6 +270,12 @@ struct LayoutCostModel {
       const ValueNode& val_node, const LayoutSpec& src_layout, const LayoutSpec& dst_layout) const;
   [[nodiscard]] double EstimateConversionCost(const ValueNode& val_node, const LayoutSpec& src_layout,
                                               const LayoutSpec& dst_layout) const;
+
+ private:
+  // A standalone, unconfigured model retains the conservative NZ legality rule.
+  const backend::Backend* backend_ = nullptr;
+  bool is_a5_ = false;
+  backend::L0CostModel l0_costs_;
 };
 
 using CustomConversionCostMap =

@@ -378,7 +378,7 @@ never be silently mis-addressed.
 | `tile.load` dynamic `valid_shape[-2]` that may end inside a fractal | rejected — a partial fractal has no blocked form |
 | distributed tensor | rejected — `remote_load` has no NZ blocking |
 | `tensor.view` / `tensor.reinterpret_view` of NZ | rejected at op construction |
-| GM row gap above 65535 blocks on a multi-column-block Mat load | Ascend910 splits the transfer into single bursts. Other targets retain the gap check. |
+| GM row gap above 65535 blocks on a multi-column-block Mat load | Ascend910 splits the transfer into single bursts. Ascend950 uses a byte stride between burst starts. |
 
 ### GM row gap on NZ loads
 
@@ -390,8 +390,9 @@ increases the gap. A load of a single column block never steps over the gap.
 On Ascend910, the pinned A2/A3 NZ-to-Mat implementation uses a single DMA
 instruction when the gap fits the stride field. For larger gaps it issues a
 separate burst for each column block and advances the source address using
-64-bit arithmetic. Other targets retain the 65535-block check for multiple
-column blocks. [PTO-ISA implementation](https://github.com/hw-native-sys/pto-isa/blob/ffaa313e029055bac38eb0fd970ffb3384408d0b/include/pto/npu/a2a3/TLoad.hpp)
+64-bit arithmetic. Ascend950 instead encodes up to 40 bits of start-to-start byte stride
+and falls back to separate loads for larger strides. With no configured backend, the pass
+retains the conservative 65535-block check. [PTO-ISA implementation](https://github.com/hw-native-sys/pto-isa/blob/ffaa313e029055bac38eb0fd970ffb3384408d0b/include/pto/npu/a2a3/TLoad.hpp)
 
 ### Leading axes fold into the one batch slot
 

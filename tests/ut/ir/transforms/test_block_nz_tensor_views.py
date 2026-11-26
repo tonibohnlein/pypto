@@ -2274,24 +2274,42 @@ def test_accepts_the_largest_encodable_gm_gap():
 def test_oversized_gm_gap_uses_target_capability(backend):
     reset_for_testing()
     set_backend_type(backend)
-    program = _gap_program(rows=65552, tile_rows=16)
-    if backend == BackendType.Ascend910:
-        _run(program)
-    else:
-        with pytest.raises(ValueError, match="65536 32-byte blocks"):
-            _run(program)
+    _run(_gap_program(rows=65552, tile_rows=16))
+
+
+@pytest.mark.parametrize("rows", [65712, 65728, 152064])
+def test_a5_bf16_nz_load_encodes_parent_pitch(rows):
+    """The blocked descriptor's column stride is in BF16 elements, including for a nonzero row offset."""
+
+    @pl.program
+    class WideWeight:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            a: pl.Tensor[[16, 192], pl.BF16],
+            b: pl.Tensor[[rows, 512], pl.BF16, pl.NZ],
+            out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+        ):
+            ta = pl.load(a, [0, 0], [16, 192], target_memory=pl.Mem.Mat)
+            tb = pl.load(b, [1024, 0], [192, 512], target_memory=pl.Mem.Mat)
+            return pl.store(pl.matmul(ta, tb), [0, 0], out)
+
+    text = _emit_pto(WideWeight, BackendType.Ascend950)
+    view = next(line for line in text.splitlines() if "make_tensor_view" in line and "layout<nz>" in line)
+    assert f"%c{rows * 16}_index, %c256_index" in view
+    assert any("partition_view" in line and "%c64_index" in line for line in text.splitlines())
 
 
 def test_a_taller_row_tile_rescues_the_same_tensor():
-    """The wider row tile fits the stride field even on a target with the conservative guard."""
-    set_backend_type(BackendType.Ascend950)
+    """The wider row tile fits even without a configured backend."""
+    reset_for_testing()
     assert 65552 - 32 == 65520
     _run(_gap_program(rows=65552, tile_rows=32))
 
 
 def test_a_single_column_block_load_is_exempt_from_the_gap_limit():
-    """One burst needs no source stride, even on a target with the conservative guard."""
-    set_backend_type(BackendType.Ascend950)
+    """One burst needs no source stride, even without a configured backend."""
+    reset_for_testing()
     assert 65552 - 16 == 65536
     _run(_single_column_block_program(rows=65552, tile_rows=16))
 
@@ -2322,8 +2340,8 @@ def _valid_shape_program(rows: int, tile_rows: int, valid_rows: int):
 
 
 def test_a_narrowed_valid_shape_drives_the_gap_check():
-    """The conservative target checks the 65536-block gap of the emitted valid partition."""
-    set_backend_type(BackendType.Ascend950)
+    """Without a configured backend the emitted valid partition drives the conservative check."""
+    reset_for_testing()
     assert 65552 - 32 == 65520  # what `shapes` alone would report
     assert 65552 - 16 == 65536  # what pto-isa actually computes
     with pytest.raises(ValueError) as excinfo:

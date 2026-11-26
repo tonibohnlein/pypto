@@ -2790,7 +2790,7 @@ class LayoutAssignmentWriter : public IRMutator {
           }
         }
         if (IsFlatVecTransposePair(source_layout, *chosen_desc) &&
-            LayoutCostModel{}.SupportsVecTileConversion(geometry, source_layout, *chosen_desc)) {
+            instance_.cost_model.SupportsVecTileConversion(geometry, source_layout, *chosen_desc)) {
           auto [converted, stmts] =
               MaterializeFlatVecTranspose(source, source_layout, *chosen_desc, op->span_, rhs->attrs_);
           prefix.insert(prefix.end(), std::make_move_iterator(stmts.begin()),

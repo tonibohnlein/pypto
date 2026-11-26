@@ -130,12 +130,12 @@ double BruteForceExactBest(const al::LayoutProblemInstance& instance) {
 
 void TestCostModelHardwareEquations() {
   al::LayoutCostModel a2a3;
-  a2a3.backend_type = BackendType::Ascend910;
+  a2a3.SetBackend(*pypto::backend::GetBackendInstance(BackendType::Ascend910));
   al::LayoutCostModel a5;
-  a5.backend_type = BackendType::Ascend950;
+  a5.SetBackend(*pypto::backend::GetBackendInstance(BackendType::Ascend950));
 
-  Require(a2a3.TargetArch() == "a2a3", "Ascend910 should resolve to a2a3");
-  Require(a5.TargetArch() == "a5", "Ascend950 should resolve to a5");
+  Require(!a2a3.IsA5(), "Ascend910 should resolve to a2a3");
+  Require(a5.IsA5(), "Ascend950 should resolve to a5");
   Require(a2a3.GmAccessGranularityBytes() == 512, "a2a3 granularity should be 512");
   Require(a5.GmAccessGranularityBytes() == 128, "a5 granularity should be 128");
   RequireNear(a2a3.EstimateVbrcbCost(32), 4.0 + 32 * 0.5, 1e-9, "a2a3 vbrcb cost mismatch");
@@ -172,6 +172,18 @@ void TestCostModelHardwareEquations() {
               a2a3.EstimateMoveCost(mat_tile, l0b, al::LayoutSpec::FractalZN(), al::LayoutSpec::FractalZN()),
           "L0A MTE1 bandwidth should exceed L0B");
 
+  // The A5 camodel MTE1 calibration reverses the ordering of the two ports.
+  const auto nz = al::LayoutSpec::FractalNZ();
+  RequireNear(a5.EstimateMoveCost(mat_tile, l0a, nz, nz), mat_tile.ByteSize() / 206.3, 1e-9, "A5 L0A");
+  RequireNear(a5.EstimateMoveCost(mat_tile, l0b, nz, nz), mat_tile.ByteSize() / 223.8, 1e-9, "A5 L0B");
+  RequireNear(a5.EstimateStoreCost(acc_tile, gm_out, al::LayoutSpec::ND()), 343.4 + 64 * (256.0 / 30.0), 1e-9,
+              "A5 wide ND drain");
+  auto narrow = acc_tile;
+  narrow.shape = {64, 16};
+  RequireNear(a5.EstimateStoreCost(narrow, gm_out, al::LayoutSpec::ND()), 343.4 + 64 * 4.59, 1e-9,
+              "A5 narrow ND drain uses row floor");
+  RequireNear(a2a3.EstimateStoreCost(acc_tile, gm_out, al::LayoutSpec::ND()), acc_tile.ByteSize() / 118.0,
+              1e-9, "A2/A3 retains its ND drain cost");
   auto lhs_fp32 = l0a;
   lhs_fp32.dtype = DataType::FP32;
   auto rhs_fp32 = l0b;
@@ -180,6 +192,10 @@ void TestCostModelHardwareEquations() {
   Require(a5.EstimateMatmulCost(lhs_fp32, rhs_fp32, acc_fp32) >
               a2a3.EstimateMatmulCost(lhs_fp32, rhs_fp32, acc_fp32),
           "a5 FP32 matmul uses 8 passes vs 2 on a2a3");
+
+  RequireNear(a5.EstimateMatmulCost(lhs_fp32, rhs_fp32, acc_fp32), 25 + 8 * 4 * 16 * 4, 1e-9,
+              "A5 fp32 cube issue and work cycles");
+  RequireNear(a5.EstimateMatmulCost(l0a, l0b, acc_fp32), 25 + 4 * 8 * 4, 1e-9, "A5 fp16 cube cycles");
 
   // MTE3 Vec store & ROW_BCAST_FLAT conversion.
   auto vec_col = MakeValue(
