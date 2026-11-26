@@ -293,12 +293,13 @@ enum class VerificationLevel {
  * @brief Get the set of properties automatically verified during compilation
  *
  * Returns {SSAForm, TypeChecked, SimtValid, SimtOutputsMaterialized, SimtSpecialized, RegScopeValid,
- * HardwareLoopContractValid, InlineFunctionsEliminated, MixedKernelExpanded, AllocatedMemoryAddr,
- * BreakContinueValid, NoRedundantBlocks, InOutUseValid, CallDirectionsResolved, ManualDepsOnSubmitOnly,
- * ReturnParamsExplicit, AivSplitValid, AivSplitLoweredValid, TileMemoryInferred, TileOps2D,
- * HardSyncallOccupancyValid, IterArgCarryClassified, RuntimeScopesMaterialized, DistTensorCtxMaterialized,
- * GraphBoundaryLegalized, AccToGmStoreValid, FixpipeEpilogueValid, AccCompactValid, AtomicAddDtypeValid,
- * AccStorePhaseValid, AsyncHandleProvenance} — lightweight checks that catch the most common IR errors.
+ * LogicalSyncValid, HardwareLoopContractValid, InlineFunctionsEliminated, MixedKernelExpanded,
+ * AllocatedMemoryAddr, BreakContinueValid, NoRedundantBlocks, InOutUseValid, CallDirectionsResolved,
+ * ManualDepsOnSubmitOnly, ReturnParamsExplicit, AivSplitValid, AivSplitLoweredValid, TileMemoryInferred,
+ * TileOps2D, HardSyncallOccupancyValid, IterArgCarryClassified, RuntimeScopesMaterialized,
+ * DistTensorCtxMaterialized, GraphBoundaryLegalized, AccToGmStoreValid, FixpipeEpilogueValid,
+ * AccCompactValid, AtomicAddDtypeValid, AccStorePhaseValid, AsyncHandleProvenance} — lightweight checks that
+ * catch the most common IR errors.
  */
 const IRPropertySet& GetVerifiedProperties();
 
@@ -317,10 +318,10 @@ const IRPropertySet& GetStructuralProperties();
 /**
  * @brief Default property set for explicit verification
  *
- * Returns {SSAForm, TypeChecked, SimtValid, RegScopeValid, HardwareLoopContractValid, NoNestedCalls,
- * BreakContinueValid, NoRedundantBlocks, UseAfterDef, OutParamNotShadowed, NoNestedInCore, TileTypeCoherence,
- * ArrayNotEscaped, AsyncHandleProvenance} — the properties checked by run_verifier() when no explicit set is
- * given.
+ * Returns {SSAForm, TypeChecked, SimtValid, RegScopeValid, LogicalSyncValid, HardwareLoopContractValid,
+ * NoNestedCalls, BreakContinueValid, NoRedundantBlocks, UseAfterDef, OutParamNotShadowed, NoNestedInCore,
+ * TileTypeCoherence, ArrayNotEscaped, AsyncHandleProvenance} — the properties checked by run_verifier() when
+ * no explicit set is given.
  */
 const IRPropertySet& GetDefaultVerifyProperties();
 

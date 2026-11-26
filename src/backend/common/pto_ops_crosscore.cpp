@@ -308,7 +308,10 @@ static std::string MakeTpushCodegenPTO(const char* target, const CallPtr& op,
   const std::string op_name = std::string("tpush_to_") + target;
 
   const bool aiv_side = std::string_view(target) == "aic";
-  INTERNAL_CHECK_SPAN(ir::IsOp(op, "buffer.peer_push") ? op->args_.size() == 2 : (op->args_.size() == 1 || (aiv_side && op->args_.size() == 2)), op->span_)
+  const bool buffer_push = ir::IsOp(op, "buffer.peer_push");
+  INTERNAL_CHECK_SPAN(
+      buffer_push ? op->args_.size() == 2 : (op->args_.size() == 1 || (aiv_side && op->args_.size() == 2)),
+      op->span_)
       << op_name << " requires a tile and, on AIV only, an optional aiv_subblockid operand";
   auto tile = AsVarLike(op->args_[0]);
   INTERNAL_CHECK_SPAN(tile, op->span_) << op_name << " first argument must be a Var or IterArg";
@@ -344,8 +347,9 @@ static std::string MakeTpushCodegenPTO(const char* target, const CallPtr& op,
       ir::cross_core_pipe::GetA5C2VRowTailBoxStride(op->args_[0]->GetType()).has_value();
   const bool restore_valid_shape =
       !split_valid_rows && EmitTpushTransportValidShape(target, op, codegen, tile_buf, tile_type, split);
-  const std::string lane =
-      op->args_.size() == 2 ? EmitAivLaneOperand(op, codegen, op->args_[0]->GetType(), split) : "";
+  const std::string lane = !buffer_push && op->args_.size() == 2
+                               ? EmitAivLaneOperand(op, codegen, op->args_[0]->GetType(), split)
+                               : "";
 
   std::ostringstream oss;
   oss << "pto.tpush_to_" << target << "(" << tile_buf;
@@ -370,7 +374,9 @@ static std::string MakeTpopCodegenPTO(
   const std::string op_name = std::string("tpop_from_") + target;
 
   const bool aiv_side = std::string_view(target) == "aic";
-  INTERNAL_CHECK_SPAN(buffer_valid ? op->args_.size() == 2 : (op->args_.empty() || (aiv_side && op->args_.size() == 1)), op->span_)
+  INTERNAL_CHECK_SPAN(
+      buffer_valid ? op->args_.size() == 2 : (op->args_.empty() || (aiv_side && op->args_.size() == 1)),
+      op->span_)
       << op_name << " accepts only an optional AIV-side aiv_subblockid operand";
 
   if (std::string_view(target) == "aic") {
@@ -405,7 +411,8 @@ static std::string MakeTpopCodegenPTO(
   // Keep a statically empty pop empty: the dual-AIV no-split replay balances
   // the pipe, and a split lane with zero localized extent must also move nothing.
   auto result_tile_type = codegen.GetCurrentResultTileType();
-  const std::string lane = !op->args_.empty() ? EmitAivLaneOperand(op, codegen, result_tile_type, split) : "";
+  const std::string lane =
+      !buffer_valid && !op->args_.empty() ? EmitAivLaneOperand(op, codegen, result_tile_type, split) : "";
   bool statically_empty = false;
   bool has_static_logical_shape = false;
   if (result_tile_type) {

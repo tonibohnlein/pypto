@@ -792,7 +792,9 @@ class PeerMatrixCommands(ClosedCommands):
         if call.op.name == opname("buffer.peer_push"):
             source, valid = call.args
             assert isinstance(valid, ir.MakeTuple)
-            rows, columns = (item.value for item in valid.elements)
+            row, col = valid.elements
+            assert isinstance(row, ir.ConstInt) and isinstance(col, ir.ConstInt)
+            rows, columns = row.value, col.value
             rect = 0, 0, rows, columns
             signature = call.op.name, self.signature(source), rect
             return ir.PipeType.FIX, self.bytes(source, rect), frozenset(), signature, rect
@@ -919,11 +921,13 @@ def test_peer_finite_and_structured_routes_order_the_same_moving_matrix_bytes():
     for output in outputs:
         for name in ("cube", "vector"):
             endpoint = output[name]
+            assert endpoint is not None
             assert endpoint.attrs.get(PYPTO_AUTOSYNC_ATTR), endpoint.attrs
             assert endpoint.attrs[AUTOSYNC_WHOLE_MODULE_ATTR]  # Published by the mixed peer planner.
     # Only the structured peer route runs conservative analysis and attaches
     # its policy outcome, even though both runs have the same PassContext.
     direct, structured = (output["cube"] for output in outputs)
+    assert direct is not None and structured is not None
     assert AUTOSYNC_ANALYSIS_POLICY_ATTR not in direct.attrs
     assert structured.attrs[AUTOSYNC_ANALYSIS_POLICY_ATTR] == "conservative_prefix"
 

@@ -83,6 +83,27 @@ def test_explicit_empty_module_is_owned_without_commands_and_roundtrips(realize)
     assert report["kernels"][0]["reason"] == "complete module invocation contract"
 
 
+@pytest.mark.parametrize("realize", [False, True])
+def test_whole_module_respects_kernel_memory_planner_override(realize):
+    leaf = empty_function()
+    delegated = ir.Function(
+        leaf.name,
+        leaf.params,
+        leaf.return_types,
+        leaf.body,
+        S,
+        leaf.func_type,
+        ir_stage=leaf.ir_stage,
+        attrs={"ptoas_plan_memory": True},
+    )
+    program = ir.Program([delegated], "Delegated", S)
+    with pytest.raises(ValueError, match="requires PyPTO-placed storage"):
+        apply(program, realize=realize)
+    with passes.PassContext([], enable_pypto_autosync=True, autosync_disjoint_gm=True):
+        result = passes.realize_sync()(program).get_function("empty")
+    assert result is not None and not result.attrs[PYPTO_AUTOSYNC_ATTR]
+
+
 def test_explicit_request_does_not_reprocess_an_owned_empty_module():
     owned = apply(ir.Program([empty_function()], "Owned", S))
     before = ir.serialize(owned)

@@ -31,6 +31,7 @@
 #include "pypto/ir/transforms/utils/compact_sync_analysis.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/per_kernel_memory_planner.h"
 #include "pypto/ir/transforms/utils/simplify.h"
 #include "pypto/ir/verifier/sync.h"
 #include "src/ir/transforms/utils/closed_prefix_sync.h"
@@ -95,6 +96,8 @@ void CheckWholeModuleScope(const ProgramPtr& program) {
     CHECK_SPAN(IsOwnedLeaf(function) && function->ir_stage_ == FunctionIRStage::Buffer, function->span_)
         << "Whole-module synchronization ownership requires qualified local Buffer AIC/AIV leaves; "
            "mixed, external or helper ownership is unavailable";
+    CHECK_SPAN(GetFunctionMemoryPlanner(function) != MemoryPlanner::PtoAS, function->span_)
+        << "Whole-module synchronization ownership requires PyPTO-placed storage";
     CHECK_SPAN(!function->GetAttr<bool>(kAttrPyptoAutosync), function->span_)
         << "Whole-module synchronization ownership cannot reprocess an owned physical plan";
     ++leaves;
@@ -133,6 +136,8 @@ bool HasPhysicalCommands(const sync::LoweredLogicalSync& result) {
 // Internal child lowering never calls this wrapper: a child may return pending
 // payloads. This changes the invocation boundary, not the internal demand set.
 FunctionPtr CompleteOwnedInvocation(const FunctionPtr& function, const std::string& target) {
+  CHECK_SPAN(GetFunctionMemoryPlanner(function) != MemoryPlanner::PtoAS, function->span_)
+      << "Synchronization ownership requires PyPTO-placed storage";
   sync::CheckPhysicalSyncResult(function);
   const auto& execution = backend::RequireLocalSyncExecutionContract(target);
   // Current leaf import admits a canonical terminal return. Reject fallthrough
@@ -277,9 +282,9 @@ std::vector<std::shared_ptr<const sync::NativeSyncChild>> PrepareNativeSyncChild
   CHECK(function) << "Native child preparation requires an original function";
   CHECK_SPAN(IsOwnedLeaf(function), function->span_)
       << "Native child preparation requires an owned local leaf";
-  CHECK_SPAN(
-      function->ir_stage_ == FunctionIRStage::Buffer && context->GetMemoryPlanner() != MemoryPlanner::PtoAS,
-      function->span_)
+  CHECK_SPAN(function->ir_stage_ == FunctionIRStage::Buffer &&
+                 GetFunctionMemoryPlanner(function) != MemoryPlanner::PtoAS,
+             function->span_)
       << "Native child preparation requires physically placed Buffer IR";
   CheckLogicalSync(function);
   CHECK_SPAN(!sync::HasLogicalSync(function), function->span_)
@@ -310,7 +315,7 @@ std::vector<std::shared_ptr<const sync::EventfulSyncChild>> PrepareEventfulSyncC
   auto* context = PassContext::Current();
   CHECK(context && function) << "Eventful child preparation requires an original function and active context";
   CHECK_SPAN(IsOwnedLeaf(function) && function->ir_stage_ == FunctionIRStage::Buffer &&
-                 context->GetMemoryPlanner() != MemoryPlanner::PtoAS,
+                 GetFunctionMemoryPlanner(function) != MemoryPlanner::PtoAS,
              function->span_)
       << "Eventful child preparation requires a physically placed local Buffer owner";
   CheckLogicalSync(function);
@@ -384,7 +389,7 @@ Pass InsertSync(std::vector<std::shared_ptr<const sync::NativeSyncChild>> accept
           CHECK(!sync::HasLogicalSync(function)) << "InsertSync refuses preexisting logical synchronization";
           if (!IsOwnedLeaf(function)) continue;
           CHECK(function->ir_stage_ == FunctionIRStage::Buffer &&
-                context->GetMemoryPlanner() != MemoryPlanner::PtoAS)
+                GetFunctionMemoryPlanner(function) != MemoryPlanner::PtoAS)
               << "InsertSync requires physically placed Buffer IR";
           const auto found = children_by_owner.find(function.get());
           const auto& children = found == children_by_owner.end() ? no_children : found->second;
@@ -542,7 +547,8 @@ Pass RealizeSync(bool require_whole_module) {
     CHECK(ctx && ctx->GetEnablePyptoAutoSync()) << "RealizeSync requires enable_pypto_autosync=True";
     if (function->func_type_ != FunctionType::AIC && function->func_type_ != FunctionType::AIV)
       return sync::SyncOutcome(function, false, "PyPTO synchronization supports only AIC/AIV leaves");
-    if (function->ir_stage_ != FunctionIRStage::Buffer || ctx->GetMemoryPlanner() == MemoryPlanner::PtoAS) {
+    if (function->ir_stage_ != FunctionIRStage::Buffer ||
+        GetFunctionMemoryPlanner(function) == MemoryPlanner::PtoAS) {
       return sync::SyncOutcome(function, false, PlacedBufferFallback(function, ctx));
     }
     const bool prefix = ctx->GetAutoSyncPolicy() == "conservative_prefix";

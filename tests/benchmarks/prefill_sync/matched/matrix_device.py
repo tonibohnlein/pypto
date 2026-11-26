@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import matrix_program as mp  # noqa: E402
 from pypto import backend, ir, passes  # noqa: E402
 from pypto.backend import BackendType  # noqa: E402
+from pypto.ir.compiled_program import CompiledProgram  # noqa: E402
 from pypto.runtime import ChipWorker, ExecutionMode, ensure_pto_isa_root  # noqa: E402
 from pypto.runtime.runner import RunConfig  # noqa: E402
 
@@ -216,6 +217,7 @@ def main() -> None:
     failures: list[dict] = []
     exact = 0
     try:
+        assert isinstance(compiled, CompiledProgram)
         handle = worker.register(compiled)
         for launch in range(args.launches):
             which = launch % len(packs)

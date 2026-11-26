@@ -15,6 +15,7 @@ import json
 import re
 import shutil
 from pathlib import Path
+from typing import Any
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("output", type=Path)
@@ -33,7 +34,7 @@ def write_json(path, obj):
     path.write_text(json.dumps(obj, indent=2) + "\n")
 
 
-manifest = {
+manifest: dict[str, Any] = {
     "library": "182990263ee87ef29c835ead20a716e3f4aa3d19",
     "compiler_production_revisions": {"current": "1056de181", "before": "03f912b1a", "stock": "03f912b1a"},
     "prefill": {},

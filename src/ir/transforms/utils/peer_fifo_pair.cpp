@@ -33,6 +33,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
+#include "pypto/ir/transforms/utils/per_kernel_memory_planner.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/wrapper_call_utils.h"
 #include "src/ir/transforms/utils/peer_gm_invocation.h"
@@ -794,6 +795,13 @@ std::vector<PeerLocalDecision> PlanPeerLocalUnits(const ProgramPtr& program,
       continue;
     }
 
+    if (std::any_of(dispatch.functions.begin(), dispatch.functions.end(), [](const auto& function) {
+          return GetFunctionMemoryPlanner(function) == MemoryPlanner::PtoAS;
+        })) {
+      for (const auto& fn : dispatch.functions)
+        decisions.push_back({fn, "Peer synchronization requires PyPTO-placed storage for every member"});
+      continue;
+    }
     if (dispatch.authored_gm) {
       if (!std::all_of(dispatch.endpoints.begin(), dispatch.endpoints.end(), [](const auto& endpoint) {
             return endpoint.inner_callee->ir_stage_ == FunctionIRStage::Buffer;

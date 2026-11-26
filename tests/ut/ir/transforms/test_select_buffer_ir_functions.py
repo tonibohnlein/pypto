@@ -1271,6 +1271,7 @@ class CallerBoundedFillpad:
             super().visit_assign_stmt(op)
 
     witness = WidthWitness()
+    assert isinstance(serialized, ir.Program)
     witness.visit_function(_kernel(serialized))
     assert isinstance(witness.extent, ir.Max)
     assert isinstance(witness.extent.right, ir.ConstInt) and witness.extent.right.value == 1

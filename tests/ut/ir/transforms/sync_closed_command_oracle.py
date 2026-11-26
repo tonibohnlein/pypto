@@ -434,6 +434,7 @@ class ClosedCommands:
                 assert kind.fractal == 512 and rows % 16 == 0 and columns % (32 // item_bytes) == 0
             stride = rows * columns * item_bytes
             slot = value(index, env)
+            assert isinstance(slot, int) and isinstance(group.type, ir.MultiBufferType)
             assert stride % 32 == 0 and 0 <= slot < group.type.slot_count
             address = env[group] + slot * stride
             self.storage[statement.var] = (kind.memory_space, address, rows, columns, item_bytes)

@@ -273,6 +273,7 @@ nav:
           - en/reference/pto-isa/02-buffer_management.md
   - Developer:
       - en/dev/index.md
+      - en/dev/benchmarks/device-task-matched-prefill.md
       - en/dev/00-ecosystem.md
       - en/dev/01-compile-profiling.md
       - en/dev/08-artifact-identity.md

@@ -49,7 +49,7 @@ def _lower(program):
 def test_minimum_fillpad_writes_every_lane_at_all_signed_widths():
     program = _lower(MinimumPrefix)
     function = program.get_function("kernel")
-    assert function.ir_stage == ir.FunctionIRStage.Buffer
+    assert function is not None and function.ir_stage == ir.FunctionIRStage.Buffer
     pto = codegen.PTOCodegen().generate(program, emit_tile_addr=True, emit_source_loc=False)
     assert pto.count("pto.tfillpad") == 1
     assert pto.count("pto.texpands") == 1
@@ -103,7 +103,7 @@ def test_unproved_minimum_fillpad_cannot_defer_a_shared_prefix_setter():
             return padded_output, prefix_output
 
     function = _lower(SharedPrefix).get_function("kernel")
-    assert function.ir_stage == ir.FunctionIRStage.Functional
+    assert function is not None and function.ir_stage == ir.FunctionIRStage.Functional
     assert function.attrs["buffer_admission_property"] == "dynamic_valid_recipe"
     assert function.attrs["buffer_admission_operation"] == ir.get_op("tile.fillpad").name
 

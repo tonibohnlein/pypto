@@ -413,10 +413,12 @@ class GuardedRows:
     (fill,) = _calls(result, "buffer.fillpad")
     (extract,) = _calls(result, "buffer.extract")
     assert extract.args[0].same_as(fill.args[1])
+    assert isinstance(extract.args[3].type, ir.BufferType)
     assert list(extract.args[3].type.valid_shape) == [1, 8]
     loads = _calls(result, "buffer.load")
     assert len(loads) == 2
     (partial_load,) = [call for call in loads if call.args[3].same_as(fill.args[0])]
+    assert isinstance(partial_load.args[2], ir.MakeTuple)
     assert partial_load.args[2].elements[0].same_as(kernel.params[2])
     x = torch.arange(256, dtype=torch.float32).reshape(16, 16)
     coefficients = torch.arange(128, dtype=torch.float32).remainder(7).reshape(16, 8) - 2

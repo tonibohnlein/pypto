@@ -128,16 +128,16 @@ class CanonicalSlotCollector : public ir::IRVisitor {
       return false;
     }
     const auto start = ir::As<ir::ConstInt>(loop->start_);
-    const auto stop = ir::As<ir::ConstInt>(loop->stop_);
+    if (!ir::As<ir::ConstInt>(loop->stop_) && !loop->HasAttr(ir::kSoftwarePipelineSlotsAttr)) return false;
+    const auto stop_max = analyzer_.const_int_bound(loop->stop_).max_value;
     const auto step = ir::As<ir::ConstInt>(loop->step_);
-    if (!start || !stop || !step || start->value_ < 0 || start->value_ > stop->value_ ||
-        static_cast<uint64_t>(stop->value_) > count || step->value_ <= 0) {
+    if (!start || !step || start->value_ < 0 || start->value_ > stop_max ||
+        static_cast<uint64_t>(stop_max) > count || step->value_ <= 0) {
       return false;
     }
     // Every executed IV is <= stop-1. Qualify the original post-final increment
     // too; the new remainder must not conceal an overflowing source loop.
-    if (start->value_ < stop->value_ &&
-        step->value_ > std::numeric_limits<int64_t>::max() - (stop->value_ - 1)) {
+    if (start->value_ < stop_max && step->value_ > std::numeric_limits<int64_t>::max() - (stop_max - 1)) {
       return false;
     }
     auto divisor =

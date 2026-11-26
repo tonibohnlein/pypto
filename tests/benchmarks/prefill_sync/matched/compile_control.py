@@ -10,13 +10,16 @@
 """Compile one arm in a fresh interpreter from the matching PyPTO worktree."""
 
 import argparse
+from importlib import import_module
 from pathlib import Path
 
 import torch
 from pypto import backend, passes
 from pypto.backend import BackendType
 from pypto.runtime import RunConfig
-from transforms.test_tilelang_gemm_sync import jit_tilelang_persistent_gemm
+
+# The handoff selects the reference fixture through the active checkout on PYTHONPATH.
+gemm_cases = import_module("transforms.test_tilelang_gemm_sync")
 
 p = argparse.ArgumentParser()
 p.add_argument("arm", choices=["pypto", "stock", "disjoint"])
@@ -35,7 +38,7 @@ with passes.PassContext(
     autosync_policy="conservative_prefix",
     autosync_disjoint_gm=args.arm == "disjoint",
 ):
-    jit_tilelang_persistent_gemm.compile(
+    gemm_cases.jit_tilelang_persistent_gemm.compile(
         *inputs,
         config=RunConfig(
             arch=BackendType.Ascend910, codegen_only=True, save_kernels_dir=str(args.out.resolve())

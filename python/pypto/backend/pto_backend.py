@@ -1878,10 +1878,10 @@ def _get_ptoas_flags(
     level = "level2" if memory_planner == _passes.MemoryPlanner.PTOAS else "level3"
     if sync_owned and level != "level3":
         raise ValueError("Whole-module synchronization ownership requires preserved physical placement")
-    flags = [
-        ("--enable-insert-sync=false" if sync_owned else "--enable-bufid_sync" if buffer_id_sync else "--enable-insert-sync"),
-        f"--pto-level={level}",
-    ]
+    sync_flag = "--enable-bufid_sync" if buffer_id_sync else "--enable-insert-sync"
+    if sync_owned:
+        sync_flag = "--enable-insert-sync=false"
+    flags = [sync_flag, f"--pto-level={level}"]
     if passes_dump_dir is not None:
         flags.extend(
             [
@@ -2028,7 +2028,9 @@ def _compile_pto_module(
     _run_ptoas(
         pto_path,
         compiled_path,
-        ptoas_flags=_get_ptoas_flags(memory_planner, passes_dump_dir, buffer_id_sync=buffer_id_sync, sync_owned=sync_owned),
+        ptoas_flags=_get_ptoas_flags(
+            memory_planner, passes_dump_dir, buffer_id_sync=buffer_id_sync, sync_owned=sync_owned
+        ),
     )
 
     if is_vpto:

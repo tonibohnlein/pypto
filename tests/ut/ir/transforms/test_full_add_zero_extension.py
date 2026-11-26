@@ -3,7 +3,7 @@
 # CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
-# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
@@ -128,4 +128,6 @@ def test_narrowing_a_full_value_does_not_make_its_old_tail_unspecified():
             original = transform(original)
         selected = passes.select_buffer_ir_functions()(original).get_function("kernel")
     assert selected is not None and selected.attrs["buffer_ir_selected"] is False
-    ir.assert_structural_equal(original.get_function("kernel").body, selected.body)
+    kernel = original.get_function("kernel")
+    assert kernel is not None
+    ir.assert_structural_equal(kernel.body, selected.body)

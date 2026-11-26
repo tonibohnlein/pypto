@@ -116,7 +116,12 @@ def test_exact_interval_evidence_retains_physical_aliases(count, slots):
 def test_slot_reuse_waits_for_both_readers_and_leaves_the_other_slot_available():
     original = slot_fixture(count=1, slots=2)
     allocation, loop, ret = sequence_stmts(original.body)
+    assert isinstance(allocation, ir.AssignStmt) and isinstance(allocation.value, ir.Call)
+    assert isinstance(loop, ir.ForStmt)
     select, _, load, vector, store, _ = sequence_stmts(loop.body)
+    assert isinstance(select, ir.AssignStmt) and isinstance(select.value, ir.Call)
+    assert isinstance(load, ir.EvalStmt) and isinstance(load.expr, ir.Call)
+    assert isinstance(store, ir.EvalStmt) and isinstance(store.expr, ir.Call)
     group = allocation.var
     span = original.span
     ty = select.var.type
@@ -155,7 +160,7 @@ def test_slot_reuse_waits_for_both_readers_and_leaves_the_other_slot_available()
         [], enable_pypto_autosync=True, autosync_policy="conservative_prefix", autosync_disjoint_gm=True
     ):
         result = passes.realize_sync()(program)[function.name]
-    assert result.attrs[PYPTO_AUTOSYNC_ATTR]
+    assert result is not None and result.attrs[PYPTO_AUTOSYNC_ATTR]
     commands = ClosedCommands(result, {}, range(8), tensor_bases={0: 0, 1: 4096})
     order = commands.run()
     complete = [("payload", i, "C") for i in (1, 2)]
@@ -272,7 +277,9 @@ def matrix_insert_fixture(*, rotating=False, transposed=False, overlaps=True, in
     seed = staged_fixture(count=1, stages=1, n=32 if rotating else 16)
     span = seed.span
     *definitions, product, _, _ = sequence_stmts(seed.body)
-    acc = definitions[-1].var
+    definition = definitions[-1]
+    assert isinstance(definition, ir.AssignStmt)
+    acc = definition.var
 
     def ci(value):
         return ir.ConstInt(value, ir.DataType.INDEX, span)

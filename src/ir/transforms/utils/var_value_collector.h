@@ -29,6 +29,8 @@ namespace pypto::ir {
 /// receives. A Var absent from the map is bound some other way.
 class VarValueCollector : public IRVisitor {
  public:
+  // Bindings occur at statements. A shared RHS expression DAG can be large.
+  void VisitExpr(const ExprPtr&) override {}
   std::unordered_map<const Var*, std::vector<ExprPtr>> values;
 
   /// Find the common origin of a selected SSA value on every incoming path.

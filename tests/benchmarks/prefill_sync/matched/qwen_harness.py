@@ -11,6 +11,7 @@
 
 import argparse
 import hashlib
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -22,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # checkout, unmodified; the library root supplies the `golden` harness.
 _LIBRARY = Path(__import__("os").environ["LIBRARY"]).resolve()
 sys.path[:0] = [str(_LIBRARY / "models/qwen3_14b"), str(_LIBRARY)]
-import prefill_fwd as model  # noqa: E402
-from golden import run  # noqa: E402
+model = importlib.import_module("prefill_fwd")
+run = importlib.import_module("golden").run
 from pypto import passes  # noqa: E402
 from pypto.backend import BackendType  # noqa: E402
 from pypto.runtime import ExecutionMode  # noqa: E402

@@ -512,14 +512,9 @@ def _assert_logical_slot_index(mlir: str) -> None:
     assert gets, mlir
     for get in gets:
         slot = get.split("[")[1].split("]")[0]
-        # Two shapes are correct, and which one appears is a property of the
-        # loop, not of this pass. FloorMod follows the divisor's sign while
-        # `remsi` follows the dividend's, so a negative dividend needs the
-        # rem/cmp/add/select correction. When the induction variable cannot be
-        # negative — every loop here starts at a non-negative literal — the
-        # remainder is already in [0, divisor) and codegen emits the bare
-        # `remsi`, because that correction would be dead code. Asserting only
-        # the corrected form would pin an optimisation *away*.
+        # The tested loops start at zero. Their raw slot can therefore use
+        # signed or unsigned remainder. A signed floor correction must still
+        # use the original dividend, divisor and sign check.
         selected = re.fullmatch(r"arith\.select (%\w+), (%\w+), (%\w+) : index", definitions.get(slot, ""))
         if selected is not None:
             condition, corrected, remainder = selected.groups()
@@ -531,7 +526,8 @@ def _assert_logical_slot_index(mlir: str) -> None:
             assert definitions[comparison.group(1)] == "arith.constant 0 : index", mlir
         else:
             remainder = slot
-        division = re.fullmatch(r"arith\.remsi (%\w+), (%\w+) : index", definitions.get(remainder, ""))
+        opcode = "remsi" if selected else "rem[su]i"
+        division = re.fullmatch(rf"arith\.{opcode} (%\w+), (%\w+) : index", definitions.get(remainder, ""))
         assert division is not None, f"slot {slot} must depend on a remainder:\n{mlir}"
         dividend, divisor = division.groups()
         assert dividend == loop.group(1), f"the slot must depend on the loop index:\n{mlir}"

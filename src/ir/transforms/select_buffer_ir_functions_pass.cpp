@@ -70,6 +70,7 @@
 #include "pypto/ir/transforms/utils/loop_step_qualification.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
+#include "pypto/ir/transforms/utils/per_kernel_memory_planner.h"
 #include "pypto/ir/transforms/utils/slot_index_qualification.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
@@ -141,11 +142,10 @@ class BufferKernelSupport : public IRVisitor {
       const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
       const bool column = backend::IsColumnVectorBufferTile(tile, view);
       if (column && NeedsRuntimeBufferValid(tile)) {
-        const auto context = PassContext::Current();
         // Runtime column/row aliases use separately owned metadata objects at
         // proved placed addresses. Native addressless reinterpretation has no
         // corresponding metadata export; retain Functional IR before planning.
-        admission.Require(!context || context->GetMemoryPlanner() != MemoryPlanner::PtoAS,
+        admission.Require(GetFunctionMemoryPlanner(function_) != MemoryPlanner::PtoAS,
                           BufferAdmissionProperty::TypeLayout);
       }
       if (!column && !StaticShape(tile->shape_)) {
@@ -186,10 +186,9 @@ class BufferKernelSupport : public IRVisitor {
       } else {
         const bool padded = backend::IsFullPaddedVec(tile, view) || backend::IsEmptyPaddedVec(tile, view) ||
                             backend::IsMinimumPaddedVecRowPrefix(tile, view);
-        const auto* context = PassContext::Current();
         // Pad mode belongs to a native tile object. Only placed plans can
         // declare independent metadata objects for reused padded storage.
-        admission.Require(!padded || !context || context->GetMemoryPlanner() != MemoryPlanner::PtoAS,
+        admission.Require(!padded || GetFunctionMemoryPlanner(function_) != MemoryPlanner::PtoAS,
                           BufferAdmissionProperty::TypeLayout);
         admission.Require((padded || backend::IsDenseVecBufferTile(tile, view)) &&
                               cols % (256 / tile->dtype_.GetBit()) == 0,
@@ -1002,9 +1001,8 @@ class BufferKernelSupport : public IRVisitor {
 
   bool CanMaterializeFixedSlots(const TileTypePtr& tile, const MemRefPtr& memory, const ExprPtr& earlier,
                                 const ExprPtr& current) {
-    const auto* context = PassContext::Current();
     const auto space = tile->GetMemorySpace();
-    if ((context && context->GetMemoryPlanner() == MemoryPlanner::PtoAS) || !space ||
+    if (GetFunctionMemoryPlanner(function_) == MemoryPlanner::PtoAS || !space ||
         !backend::IsMatrixBufferSpace(*space) || !As<ConstInt>(earlier) || !As<ConstInt>(current) ||
         symbolic_slot_families_.count(memory->base_.get())) {
       return false;
@@ -1374,8 +1372,7 @@ class BufferKernelSupport : public IRVisitor {
 };
 
 bool SupportsDelegatedPeerTransport(const FunctionPtr& function) {
-  const auto* context = PassContext::Current();
-  if (context && context->GetMemoryPlanner() == MemoryPlanner::PtoAS) {
+  if (GetFunctionMemoryPlanner(function) == MemoryPlanner::PtoAS) {
     return false;
   }
   const auto transport = cross_core_pipe::AnalyzePeerTransportEffects(function);
@@ -1444,8 +1441,8 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& original, bool device_helper
       function = StageBufferScalarAccesses(function);
   }
   if (materialize_fill_tails) function = MaterializeFillTailBounds(function, invocation_bounds);
-  const BufferAccTrimAnalysis acc_trims(
-      function, !context || context->GetMemoryPlanner() != MemoryPlanner::PtoAS, invocation_bounds);
+  const BufferAccTrimAnalysis acc_trims(function, GetFunctionMemoryPlanner(function) != MemoryPlanner::PtoAS,
+                                        invocation_bounds);
   requirements.caller_acc_bounds = acc_trims.NeedsCallerBounds();
   std::vector<int> positive_formals;
   for (const auto& [index, range] : invocation_bounds) {
