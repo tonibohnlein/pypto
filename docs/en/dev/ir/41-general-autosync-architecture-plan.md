@@ -1,5 +1,7 @@
 # General autosync integration: architecture and Qwen acceptance plan
 
+For the current design contracts and their relationship to the synchronization draft and RFC #3375, see [Single-core AutoSync architecture](53-local-autosync-architecture.md).
+
 Continued P1–P5 repairs and the final matched matrix are in [the regional-construction checkpoint](52-autosync-construction-repair.md#p5-final-qualification-and-remaining-obligations). Automatic children improve bounded ordering; default ownership remains18/32, with21/32 only under explicit scalar staging. Original M1–M6 remain incomplete.
 
 Current checkpoint (2026-11-16): the [five construction repairs](52-autosync-construction-repair.md)

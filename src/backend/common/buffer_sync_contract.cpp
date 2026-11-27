@@ -254,12 +254,13 @@ BufferSyncImplementation SelectBufferSyncImplementation(const ir::CallPtr& call,
   }
   if (const auto row = FindBufferAxisRecipe(call->op_->name_); row && row->reduction && row->axis == 1) {
     CHECK(target == "a2a3") << "FP32 row reduction requires a qualified native implementation";
-    // pto-isa 5487a6b0 TRowSum/TRowMax dispatch FP32 to the generic vector
-    // reduction helper, including runtime-row descriptors. Scratch is explicit;
-    // the integer-only EVENT_ID0 scalar reduction branch is not selected.
-    // Inactive output rows are untouched, never an implicit zero-padding fact.
-    // Keep the catalog's existing conservative integer-variant reservation;
-    // selecting a narrower resource declaration is a separate contract change.
+    // PTO-ISA 45435c06 TRowSum, TRowMax and TRowMin dispatch FP32 to TRowReduceInstr on PIPE_V.
+    // The explicit scratch and ordinary payload effects remain in the model.
+    // The fixed V/S events in the macro catalog belong to the integer overload.
+    const auto src = As<BufferType>(call->args_[0]->GetType());
+    result.vec_fp32_row_reduction_ =
+        core == FunctionType::AIV && src && src->dtype_ == DataType::FP32 &&
+        (IsOp(call, "buffer.row_sum") || IsOp(call, "buffer.row_max") || IsOp(call, "buffer.row_min"));
   }
   if (IsOp(call, "buffer.col_expand_mul")) {
     CHECK(target == "a2a3") << "Column broadcast requires a qualified native implementation";
@@ -406,10 +407,11 @@ std::vector<sync::IsaResourceClaim> BufferSyncImplementation::Claims() const {
     using ir::PipeType;
     const auto& pool = claim.pool;
     const bool vector_to_scalar = pool.src == PipeType::V && pool.dst == PipeType::S;
-    const bool concat_tail = vector_to_scalar || (pool.src == PipeType::S && pool.dst == PipeType::V) ||
-                             (pool.src == PipeType::MTE2 && pool.dst == PipeType::S) ||
+    const bool vector_scalar_pair = vector_to_scalar || (pool.src == PipeType::S && pool.dst == PipeType::V);
+    const bool concat_tail = vector_scalar_pair || (pool.src == PipeType::MTE2 && pool.dst == PipeType::S) ||
                              (pool.src == PipeType::S && pool.dst == PipeType::MTE3);
-    if (((vec_fillpad_non_byte_ && vector_to_scalar) || (vec_concat_full_blocks_ && concat_tail)) &&
+    if (((vec_fillpad_non_byte_ && vector_to_scalar) || (vec_fp32_row_reduction_ && vector_scalar_pair) ||
+         (vec_concat_full_blocks_ && concat_tail)) &&
         pool.kind == ResourceKind::PipelineEvent && pool.core == CoreScope::AIV && pool.replica == 0 &&
         claim.source == IsaIdSource::Fixed && claim.lifetime == IsaResourceLifetime::Invocation &&
         claim.ids.size() == 1 && claim.ids.front() == 0) {

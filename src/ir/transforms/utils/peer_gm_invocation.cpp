@@ -42,6 +42,20 @@
 namespace pypto::ir::sync {
 namespace {
 
+std::map<size_t, ExprPtr> MakeGmDomains(const FunctionPtr& group, const std::set<size_t>& ordinary,
+                                        const std::set<size_t>& isolated) {
+  std::map<size_t, ExprPtr> domains;
+  if (!isolated.empty()) {
+    ExprPtr other;
+    for (const auto formal : ordinary) {
+      const auto& parameter = group->params_.at(formal);
+      if (!isolated.count(formal) && !other) other = parameter;
+      domains.emplace(formal, isolated.count(formal) ? parameter : other);
+    }
+  }
+  return domains;
+}
+
 bool IsPlainTensor(const VarPtr& value) {
   const auto tensor = value ? As<TensorType>(value->GetType()) : nullptr;
   return tensor && !tensor->tensor_view_;
@@ -228,7 +242,7 @@ class RootInventory final : public IRVisitor {
 
   void CheckAuthoredGM(const FunctionPtr& launch, size_t workspace_formal,
                        const std::vector<PeerGmEffects>& phases, const std::set<size_t>& ordinary,
-                       bool disjoint_gm, std::set<size_t>& isolated) const {
+                       bool disjoint_gm) const {
     const auto found = calls_.find(launch->name_);
     CHECK(found != calls_.end() && !found->second.empty())
         << "Authored GM synchronization requires an original root launch";
@@ -237,11 +251,25 @@ class RootInventory final : public IRVisitor {
       const auto workspace = StorageOf(site.arguments.at(workspace_formal).value);
       CHECK_SPAN(workspace.kind == OriginKind::Fresh, site.span)
           << "Authored FFTS workspace requires a fresh root allocation";
-      std::unordered_map<const Var*, size_t> first_fresh;
       for (const auto formal : ordinary) {
         const auto actual = StorageOf(site.arguments.at(formal).value);
         CHECK_SPAN(actual.Known() && actual.root != workspace.root, site.span)
             << "Authored FFTS workspace lacks separation from an ordinary GM access";
+      }
+    }
+    for (const auto& phase : phases) {
+      CheckScalarReads(launch, phase, disjoint_gm);
+    }
+  }
+
+  void RetainIsolatedFresh(const FunctionPtr& launch, const std::set<size_t>& ordinary,
+                           std::set<size_t>& isolated) const {
+    // Both invocation checkers have established known origins for every
+    // ordinary actual. Intersect the fresh, singly bound roots at every call.
+    for (const auto& site : calls_.at(launch->name_)) {
+      std::unordered_map<const Var*, size_t> first_fresh;
+      for (const auto formal : ordinary) {
+        const auto actual = StorageOf(site.arguments.at(formal).value);
         if (actual.kind != OriginKind::Fresh) {
           isolated.erase(formal);
           continue;
@@ -252,9 +280,6 @@ class RootInventory final : public IRVisitor {
           isolated.erase(formal);
         }
       }
-    }
-    for (const auto& phase : phases) {
-      CheckScalarReads(launch, phase, disjoint_gm);
     }
   }
 
@@ -836,19 +861,20 @@ std::map<size_t, ExprPtr> PeerInvocationGmEvidence::CheckAuthoredGM(const Functi
       if (!inventory) {
         inventory = std::make_unique<RootInventory>(root, state_->launches, state_->program, true);
       }
-      inventory->CheckAuthoredGM(launch, workspace_formal, phases, ordinary, disjoint_gm, isolated);
+      inventory->CheckAuthoredGM(launch, workspace_formal, phases, ordinary, disjoint_gm);
+      inventory->RetainIsolatedFresh(launch, ordinary, isolated);
     }
   }
-  std::map<size_t, ExprPtr> domains;
-  if (!isolated.empty()) {
-    ExprPtr other;
-    for (const auto formal : ordinary) {
-      const auto& parameter = group->params_.at(formal);
-      if (!isolated.count(formal) && !other) other = parameter;
-      domains.emplace(formal, isolated.count(formal) ? parameter : other);
-    }
+  return MakeGmDomains(group, ordinary, isolated);
+}
+
+std::map<size_t, ExprPtr> PeerInvocationGmEvidence::FifoGmDomains(const FunctionPtr& group,
+                                                                  const std::set<size_t>& ordinary) const {
+  auto isolated = ordinary;
+  for (const auto& [inventory, launch] : state_->qualified.at(group->name_)) {
+    inventory->RetainIsolatedFresh(launch, ordinary, isolated);
   }
-  return domains;
+  return MakeGmDomains(group, ordinary, isolated);
 }
 
 void PeerInvocationGmEvidence::CheckScalarReads(const FunctionPtr& group, const PeerGmEffects& effects,

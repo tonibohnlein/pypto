@@ -933,6 +933,19 @@ class DebtState {
     return true;
   }
 
+  // Only debts that predate the inline recipe enter this query. A record
+  // inside the recipe captures all such work issued on its source, plus
+  // whichever other entry prefixes that source had acquired at record time.
+  bool CoversInlineUse(PipeType destination, PipeMask acquired,
+                       const std::vector<SiteEffectFiber>& effects) const {
+    for (const auto& [key, pending] : pending_) {
+      if (!(pending & PipeToMask(destination))) continue;
+      if (acquired & (~pending | PipeToMask(key.src))) continue;
+      if (ConflictsAny(key, effects)) return false;
+    }
+    return true;
+  }
+
   std::vector<PipeType> Select(const std::vector<PipeType>& required, PipeType destination,
                                const std::vector<SiteEffectFiber>& site_effects) const {
     const size_t count = required.size();
@@ -953,7 +966,8 @@ class DebtState {
     return selected;
   }
 
-  bool operator!=(const DebtState& other) const { return pending_ != other.pending_; }
+  bool operator==(const DebtState& other) const { return pending_ == other.pending_; }
+  bool operator!=(const DebtState& other) const { return !(*this == other); }
 
  private:
   void AddOneEffect(MemorySpace space, PipeType pipe, bool write, size_t domain, const FiberKey& fiber,
@@ -1328,6 +1342,7 @@ class Builder {
     cost.range_indexed_definitions = range_work.indexed_definitions;
     cost.range_footprint_queries = range_work.footprint_queries;
     cost.range_fallback_definitions = range_work.fallback_definitions;
+    inline_entry_uses_.resize(children.size());
     for (size_t idx = 0; idx < children.size(); ++idx) {
       auto& child = children[idx];
       if (child.IsSubblockSlice()) {
@@ -1342,6 +1357,7 @@ class Builder {
         CollectChildEffects(child.scope, child.effects);
       }
       child.completion = ComputeEventfulCompletionSummary(child);
+      if (child.inline_subblock) IndexInlineEntryUses(idx, *child.inline_subblock);
     }
   }
 
@@ -1379,6 +1395,8 @@ class Builder {
     if (!has_backedge) {
       auto exit = SolveAcyclic(cfg, rpo, cfg_exit);
       TryPreciseCaptures(cfg, rpo, rpo_pos, cfg_entry);
+      CheckCaptureObservers();
+      CertifyInlineEntryOmissions(cfg, rpo, rpo_pos);
       return exit;
     }
 
@@ -1396,6 +1414,9 @@ class Builder {
       TryLoopEntrySplit(/*precise_captures=*/true);
     }
 
+    CheckCaptureObservers();
+    TryBorrowReleases(cfg, rpo, rpo_pos);
+    CertifyInlineEntryOmissions(cfg, rpo, rpo_pos);
     return retain_incoming_diagnostics_ ? live_out[cfg_exit].ToAccessSet() : ConservativeAccessSet{};
   }
 
@@ -1575,10 +1596,23 @@ class Builder {
     if (!MapReaderRecordVertices(cfg, rpo)) {
       return false;
     }
+    return CoversFixedDebts(cfg, rpo, rpo_pos);
+  }
+
+  bool CoversFixedDebts(const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo,
+                       const std::vector<size_t>& rpo_pos) {
     std::vector<DebtState> in, out;
     std::vector<bool> visited;
     SolveDebtFixedPoint(/*use_selected=*/true, cfg, rpo, rpo_pos, in, out, visited);
     for (const size_t vertex : rpo) {
+      if (cfg[vertex].kind == CfgVertex::Kind::Child) {
+        const size_t index = cfg[vertex].index;
+        if (children[index].inline_subblock) {
+          in[vertex].ApplyServiceMatrix(child_service_matrices_[index]);
+          if (!CoversInlineEntry(index, in[vertex])) return false;
+        }
+        continue;
+      }
       if (cfg[vertex].kind != CfgVertex::Kind::Site) {
         continue;
       }
@@ -1894,18 +1928,8 @@ class Builder {
         entry.required_services = entry.services;
         cost.baseline_services += services.size();
         cost.services += services.size();
-        std::array<PipeMask, kPhysicalPipeCount> matrix{};
-        for (const auto& [src, dst] : entry.services) {
-          const PipeMask sm = PipeToMask(src);
-          const PipeMask dm = PipeToMask(dst);
-          if (sm == 0 || dm == 0) continue;
-          for (size_t p = 0; p < kPhysicalPipeCount; ++p) {
-            const PipeMask p_bit = PipeMask{1} << p;
-            if (((p_bit | matrix[p]) & sm) != 0) matrix[p] |= dm;
-          }
-        }
         if (child_service_matrices_.size() <= v.index) child_service_matrices_.resize(v.index + 1);
-        child_service_matrices_[v.index] = matrix;
+        child_service_matrices_[v.index] = ServiceMatrix(entry.services);
       } else if (v.kind == CfgVertex::Kind::Site) {
         auto& site = sites[v.index];
         for (const auto& fact : site.effects) {
@@ -1959,9 +1983,7 @@ class Builder {
       }
       ++cost.certificate_visits;
       if (v.kind == CfgVertex::Kind::Child) {
-        const auto& entry_child = children[v.index];
-        INTERNAL_CHECK(entry_child.services == entry_child.required_services)
-            << "Internal error: protected child/rearming services changed";
+        ReduceInlineEntry(v.index, cur_in);
         debt_out[u] = TransferDebt(v, std::move(cur_in), /*use_selected=*/true);
       } else if (v.kind == CfgVertex::Kind::Site) {
         auto& site = sites[v.index];
@@ -2106,18 +2128,8 @@ class Builder {
         entry.required_services = entry.services;
         cost.baseline_services += services.size();
         cost.services += services.size();
-        std::array<PipeMask, kPhysicalPipeCount> matrix{};
-        for (const auto& [src, dst] : entry.services) {
-          const PipeMask sm = PipeToMask(src);
-          const PipeMask dm = PipeToMask(dst);
-          if (sm == 0 || dm == 0) continue;
-          for (size_t p = 0; p < kPhysicalPipeCount; ++p) {
-            const PipeMask p_bit = PipeMask{1} << p;
-            if (((p_bit | matrix[p]) & sm) != 0) matrix[p] |= dm;
-          }
-        }
         if (child_service_matrices_.size() <= v.index) child_service_matrices_.resize(v.index + 1);
-        child_service_matrices_[v.index] = matrix;
+        child_service_matrices_[v.index] = ServiceMatrix(entry.services);
         continue;
       }
       if (v.kind == CfgVertex::Kind::Site) {
@@ -2141,6 +2153,121 @@ class Builder {
         }
         site.required_source_pipes.assign(sources.begin(), sources.end());
         cost.baseline_services += sources.size();
+      }
+    }
+  }
+
+  using ServiceList = std::vector<std::pair<PipeType, PipeType>>;
+
+  static std::array<PipeMask, kPhysicalPipeCount> ServiceMatrix(const ServiceList& services) {
+    std::array<PipeMask, kPhysicalPipeCount> matrix{};
+    for (const auto& [source, destination] : services) {
+      const auto from = PipeToMask(source);
+      const auto to = PipeToMask(destination);
+      for (size_t p = 0; p < matrix.size(); ++p) {
+        const auto origin = PipeMask{1} << p;
+        if ((origin | matrix[p]) & from) matrix[p] |= to;
+      }
+    }
+    return matrix;
+  }
+
+  // The inline exporter emits a flat recipe of payloads and single-use
+  // record/wait pairs. Track which pre-entry pipe prefixes have actually
+  // reached each payload. A pipe does not implicitly complete its own work.
+  void IndexInlineEntryUses(size_t index, const InlineExactSubBlock& block) {
+    std::array<PipeMask, kPhysicalPipeCount> acquired{};
+    std::unordered_map<const Expr*, PipeMask> records;
+    auto& uses = inline_entry_uses_[index];
+    const auto& payloads = block.mathematics->State().input.segments.front().sites;
+    for (const auto& statement : As<SeqStmts>(block.spliced_seq)->stmts_) {
+      if (const auto found = site_index_.find(statement.get()); found != site_index_.end()) {
+        const auto site = found->second;
+        if (uses.size() == payloads.size() || sites[site].operation != payloads[uses.size()].original ||
+            sites[site].pipe == PipeType::ALL) {
+          uses.clear();
+          return;
+        }
+        uses.emplace_back(site, acquired[static_cast<size_t>(sites[site].pipe)]);
+        continue;
+      }
+      const auto call = transform_utils::GetCallFromStmt(statement);
+      if (IsOp(call, "sync.record")) {
+        const auto source = RequireSyncPipeKwarg(call, "pipe");
+        records.emplace(As<AssignStmt>(statement)->var_.get(),
+                        acquired[static_cast<size_t>(source)] | PipeToMask(source));
+      } else if (IsOp(call, "sync.wait")) {
+        const auto dst = RequireSyncPipeKwarg(call, "dst_pipe");
+        acquired[static_cast<size_t>(dst)] |= records.at(call->args_.front().get());
+      }
+    }
+    if (uses.size() != payloads.size()) uses.clear();
+  }
+
+  bool CoversInlineEntry(size_t index, const DebtState& after) const {
+    if (inline_entry_uses_[index].empty()) return false;
+    for (const auto& [site, acquired] : inline_entry_uses_[index]) {
+      if (!after.CoversInlineUse(sites[site].pipe, acquired, site_effect_fibers_[site])) return false;
+    }
+    return true;
+  }
+
+  void ReduceInlineEntry(size_t index, const DebtState& incoming) {
+    auto& child = children[index];
+    // Private child palettes have independent entry-rearm obligations.
+    if (!child.inline_subblock || child.services.empty()) return;
+    auto delivered = incoming;
+    delivered.ApplyServiceMatrix(child_service_matrices_[index]);
+
+    // First remove services whose deletion preserves the complete entry
+    // state. This certificate also preserves the parent fixed point.
+    auto reduce = [&](ServiceList services, const auto& covered) {
+      for (size_t i = services.size(); i-- > 0;) {
+        auto candidate = services;
+        candidate.erase(candidate.begin() + i);
+        auto after = incoming;
+        after.ApplyServiceMatrix(ServiceMatrix(candidate));
+        if (covered(after)) {
+          services = std::move(candidate);
+        }
+      }
+      return services;
+    };
+    child.services = reduce(child.services, [&](const DebtState& after) { return after == delivered; });
+    child_service_matrices_[index] = ServiceMatrix(child.services);
+    const auto omitted = child.required_services.size() - child.services.size();
+    cost.services -= omitted;
+    cost.certificate_omissions += omitted;
+    cost.suppressed_services += omitted;
+
+    // Internal waits may also cover incoming conflicts at their first use.
+    // Removing these services can change the exit state. Keep the proposal
+    // out of the baseline until all subsequent consumers have been selected.
+    auto candidate =
+        reduce(child.services, [&](const DebtState& after) { return CoversInlineEntry(index, after); });
+    if (candidate.size() != child.services.size()) {
+      inline_entry_candidates_.emplace(index, std::move(candidate));
+    }
+  }
+
+  void CertifyInlineEntryOmissions(const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo,
+                                   const std::vector<size_t>& rpo_pos) {
+    if (inline_entry_candidates_.empty()) return;
+    size_t omitted = 0;
+    for (auto& [index, proposal] : inline_entry_candidates_) {
+      auto& services = children[index].services;
+      omitted += services.size() - proposal.size();
+      services.swap(proposal);
+      child_service_matrices_[index] = ServiceMatrix(services);
+    }
+    if (CoversFixedDebts(cfg, rpo, rpo_pos)) {
+      cost.services -= omitted;
+      cost.certificate_omissions += omitted;
+      cost.suppressed_services += omitted;
+    } else {
+      for (auto& [index, original] : inline_entry_candidates_) {
+        children[index].services.swap(original);
+        child_service_matrices_[index] = ServiceMatrix(children[index].services);
       }
     }
   }
@@ -2319,9 +2446,7 @@ class Builder {
       for (const size_t u : rpo) {
         ++cost.certificate_visits;
         if (cfg[u].kind == CfgVertex::Kind::Child) {
-          const auto& entry_child = children[cfg[u].index];
-          INTERNAL_CHECK(entry_child.services == entry_child.required_services)
-              << "Internal error: protected child/rearming services changed";
+          ReduceInlineEntry(cfg[u].index, sel_in[u]);
         } else if (cfg[u].kind == CfgVertex::Kind::Site) {
           const auto& selected = sites[cfg[u].index];
           size_t next = 0;
@@ -2412,7 +2537,7 @@ class Builder {
           break;
         }
         record = producer;
-        const auto& incoming = sites[producer].required_source_pipes;
+        const auto& incoming = sites[producer].source_pipes;
         if (std::binary_search(incoming.begin(), incoming.end(), dst)) break;
       }
       return record;
@@ -2433,8 +2558,75 @@ class Builder {
       record = find_record(early_accesses);
     }
     if (!record) return false;
+    // Before WAIT, the destination cannot relay the captured completion back
+    // into this run. Reselection may restore a reverse service absent today.
+    // Recheck those potential observers once the final schedule is known.
+    for (auto it = source_run.rbegin(); *it != *record; ++it) {
+      const auto& required = sites[*it].required_source_pipes;
+      if (std::binary_search(required.begin(), required.end(), dst)) {
+        capture_observers_.emplace_back(*it, dst);
+      }
+    }
     sites[*record].precise_capture = ConservativePrefixCapture{sites[consumer].cut, dst};
     return true;
+  }
+
+  // Find a reader-pipe payload that the receive's original WAIT needlessly
+  // completes. The backwards walk only nominates a change. The full CFG
+  // certificate below includes uses beyond this borrow and on skipped visits.
+  bool CapturesIndependentReader(const std::vector<CfgVertex>& cfg, size_t vertex, PipeType reader) {
+    const auto receive = cfg[vertex].index;
+    LiveStorageState overwrite;
+    overwrite.AddEffects(site_effect_fibers_[receive]);
+    while (cfg[vertex].preds.size() == 1) {
+      vertex = cfg[vertex].preds.front();
+      if (cfg[vertex].kind != CfgVertex::Kind::Site) break;
+      const auto index = cfg[vertex].index;
+      const auto& site = sites[index];
+      if (site.pipe == sites[receive].pipe) break;
+      if (site.pipe != reader) continue;
+      const auto& effects = site_effect_fibers_[index];
+      return std::none_of(effects.begin(), effects.end(), [&](const auto& effect) {
+        return !overwrite.QueryConflicts(effect, cost).empty();
+      });
+    }
+    return false;
+  }
+
+  void TryBorrowReleases(const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo,
+                         const std::vector<size_t>& rpo_pos) {
+    // First-visit services need phase-specific replay. This proof uses the original CFG.
+    const auto phase_specific = [](const auto& site) { return site.loop_entry || site.guarded_capture; };
+    if (!enable_precise_captures_ || std::any_of(sites.begin(), sites.end(), phase_specific)) return;
+    std::vector<std::pair<size_t, size_t>> moves;
+    for (const size_t vertex : rpo) {
+      if (cfg[vertex].kind != CfgVertex::Kind::Site) continue;
+      const size_t receive = cfg[vertex].index;
+      auto& pop = sites[receive];
+      const auto& cut = imported_->calls.at(pop.operation.get());
+      for (const auto& [pipe, statement] : cut.last_borrow_readers) {
+        const auto reader = site_index_.at(statement);
+        const auto service = std::find(pop.source_pipes.begin(), pop.source_pipes.end(), pipe);
+        if (pipe == PipeType::S || pipe == pop.pipe || sites[reader].post_destination ||
+            service == pop.source_pipes.end() ||
+            imported_->calls.at(sites[reader].operation.get()).HasOpaqueProtocol() ||
+            !CapturesIndependentReader(cfg, vertex, pipe))
+          continue;
+        // Each pop and its matching last reader execute in the same control
+        // arm. Replace one service per visit; no cursor test or extra event
+        // operation is needed. Native free/credit carries no local completion.
+        pop.source_pipes.erase(service);
+        sites[reader].post_destination = pop.pipe;
+        moves.emplace_back(receive, reader);
+      }
+    }
+    if (moves.empty() || CoversFixedDebts(cfg, rpo, rpo_pos)) return;
+    for (const auto& [receive, reader] : moves) {
+      sites[reader].post_destination.reset();
+      auto& services = sites[receive].source_pipes;
+      services.insert(std::lower_bound(services.begin(), services.end(), sites[reader].pipe),
+                      sites[reader].pipe);
+    }
   }
 
   bool PrefixMetadata(const StmtPtr& statement, bool allow_peer_wait = false) const {
@@ -2461,8 +2653,16 @@ class Builder {
       for (const auto& child : seq->stmts_) {
         if (const auto found = site_index_.find(child.get()); found != site_index_.end()) {
           const auto current = found->second;
-          if (imported_->calls.at(sites[current].operation.get()).HasOpaqueProtocol()) {
+          const auto& cut = imported_->calls.at(sites[current].operation.get());
+          if (cut.HasOpaqueProtocol()) {
             flush();
+            // The transport's local operand has a qualified footprint. It can
+            // consume an earlier producer prefix at its original issue cut.
+            // End the window here: ready/credit and native commands inside the
+            // transfer cannot be crossed or used to relay local completion.
+            if (cut.is_transport && !cut.effects.empty() && !target_run.empty()) {
+              count += NominateCapture(target_run, {current});
+            }
             source_run.clear();
             target_run.clear();
             continue;
@@ -2495,6 +2695,14 @@ class Builder {
     if (const auto loop = As<ForStmt>(statement)) return NominatePreciseCaptures(loop->body_);
     if (const auto loop = As<WhileStmt>(statement)) return NominatePreciseCaptures(loop->body_);
     return 0;
+  }
+
+  void CheckCaptureObservers() const {
+    for (const auto& [producer, destination] : capture_observers_) {
+      const auto& selected = sites[producer].source_pipes;
+      CHECK(!std::binary_search(selected.begin(), selected.end(), destination))
+          << "Earlier completion record crosses a reselected reverse wait";
+    }
   }
 
   void TryPreciseCaptures(const std::vector<CfgVertex>& cfg, const std::vector<size_t>& rpo,
@@ -3511,6 +3719,7 @@ class Builder {
   bool enable_loop_prefixes_;
   const ImportedLocalSync* imported_;
   bool enable_precise_captures_;
+  std::vector<std::pair<size_t, PipeType>> capture_observers_;
   std::vector<size_t> issue_order_;
   std::unordered_map<const Var*, size_t> definition_order_;
   std::unordered_map<const ForStmt*, std::vector<size_t>> loop_capture_sources_;
@@ -3529,6 +3738,8 @@ class Builder {
   std::vector<bool> inside_child_;
   std::unordered_map<const Stmt*, size_t> child_index_;
   std::unordered_set<const Stmt*> seen_children_;
+  std::vector<std::vector<std::pair<size_t, PipeMask>>> inline_entry_uses_;
+  std::map<size_t, ServiceList> inline_entry_candidates_;
   std::vector<std::array<PipeMask, kPhysicalPipeCount>> child_service_matrices_;
   struct SliceWindow {
     size_t begin = 0;

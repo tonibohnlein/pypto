@@ -38,6 +38,8 @@ class PeerInvocationGmEvidence {
 
   const std::set<std::string>& CallersOf(const std::string& callee) const;
   void Check(const FunctionPtr& group, const std::set<size_t>& ordinary_formals, size_t workspace_formal);
+  // After Check has qualified every caller and every ordinary formal in this endpoint.
+  std::map<size_t, ExprPtr> FifoGmDomains(const FunctionPtr& group, const std::set<size_t>& ordinary) const;
   std::optional<SyncDispatchCoordinates> TryLaunchCoordinates(const FunctionPtr& group,
                                                               size_t workspace_formal);
   void CheckHostRankOneExtent(const FunctionPtr& group, size_t formal) const;

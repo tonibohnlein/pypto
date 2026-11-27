@@ -12,6 +12,7 @@
 import json
 from collections import defaultdict
 
+import pypto.language as pl
 import pytest
 from pypto import ir, passes
 from pypto._function_attrs import (
@@ -220,6 +221,65 @@ class MatSlotCommands(ClosedCommands):
             if previous_pipe != pipe and any(space != "gm" for space, _ in cells):
                 self.local_checks.append((previous_done, issue))
         self.buffer_accesses.append((pipe, reads, writes, done))
+
+
+@pytest.mark.usefixtures("ascend_backend")
+def test_borrow_release_excludes_independent_moves_before_guarded_pop():
+    @pl.program
+    class Work:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube(self, x: pl.Tensor[[16, 16], pl.FP16], out: pl.Out[pl.Tensor[[32, 16], pl.FP32]]):
+            fifo = pl.reserve_buffer(name="inbox", size=2048, base=0)
+            pl.aic_initialize_pipe(pl.const(0, pl.INT32), fifo, dir_mask=2, slot_size=1024, slot_num=2)
+            matrix = pl.load(x, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            right = pl.move(matrix, target_memory=pl.Mem.Right)
+            for i in pl.range(pl.tile.get_block_idx(), 5, pl.tile.get_block_num()):
+                if i < 4:
+                    left = pl.move(matrix, target_memory=pl.Mem.Left)
+                    out = pl.store(pl.matmul(left, right), [0, 0], out)
+                    pkt: pl.Tile[[16, 16], pl.FP16, pl.Mem.Mat] = pl.tpop_from_aiv(split=0)
+                    lhs = pl.move(pkt, target_memory=pl.Mem.Left)
+                    pl.tfree_to_aiv(pkt)
+                    out = pl.store(pl.matmul(lhs, right), [16, 0], out)
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vector(self, x: pl.Tensor[[16, 16], pl.FP16]):
+            peer = pl.import_peer_buffer(name="inbox", peer_func="cube")
+            pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer, dir_mask=2, slot_size=1024, slot_num=2)
+            tile = pl.load(x, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
+            for i in pl.range(pl.tile.get_block_idx(), 5, pl.tile.get_block_num()):
+                if i < 4:
+                    pl.tpush_to_aic(tile, split=0)
+
+        @pl.function(type=pl.FunctionType.Group)
+        def unit(self, x: pl.Tensor[[16, 16], pl.FP16], out: pl.Out[pl.Tensor[[32, 16], pl.FP32]]):
+            self.vector(x)
+            self.cube(x, out)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, x: pl.Tensor[[16, 16], pl.FP16], out: pl.Out[pl.Tensor[[32, 16], pl.FP32]]):
+            self.unit(x, out)
+
+    with passes.PassContext(
+        [],
+        memory_planner=passes.MemoryPlanner.PYPTO,
+        enable_buffer_ir=True,
+        enable_pypto_autosync=True,
+        autosync_policy="conservative_prefix",
+    ):
+        module = PassManager(ir.OptimizationStrategy.Default).run_passes(Work)
+    cube = module.get_function("cube")
+    assert cube is not None and cube.attrs.get(PYPTO_AUTOSYNC_ATTR), cube
+    for core, workers, visits in ((0, 1, 4), (1, 2, 2), (4, 5, 0)):
+        state = MatSlotCommands(cube, 2, core=core, workers=workers)
+        order = state.run()
+        assert len(state.pops) == visits
+        assert all(edge in order for edge in state.order_checks + state.local_checks + state.gm_checks)
+        for _, pop in state.pops:
+            # An ordinary Mat move, matmul and FIX store precede this receive.
+            move = pop - 3
+            assert state.calls[move].op.name == opname("buffer.copy")
+            assert (("done", move), ("issue", pop)) not in order
 
 
 @pytest.mark.ptoas_compile
@@ -641,6 +701,7 @@ class PeerSenderCommands(ClosedCommands):
                 opname("buffer.alloc"),
                 opname("buffer.peer_reserve"),
                 opname("buffer.peer_reserve_addr"),
+                opname("buffer.subview"),
             ):
                 return
             if name in self.payload_pipes:

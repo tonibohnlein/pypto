@@ -1,5 +1,7 @@
 # 通用自动同步集成：架构与 Qwen 验收计划
 
+当前设计契约及其与同步草稿和 RFC #3375 的关系见[单核 AutoSync 架构](53-local-autosync-architecture.md)。
+
 后续 P1–P5 修复及最终矩阵见[区域构造检查点](52-autosync-construction-repair.md)。自动子区域改善有限顺序质量，默认自有仍18/32，显式标量 staging 才是21/32；原 M1–M6 未完成。
 
 当前检查点：[五阶段构造修复](52-autosync-construction-repair.md)扩展原 R1–R4，保留原里程碑和全模型目标。默认保留原生标量访问，DMA staging 是独立显式选项。新匹配 prefix 捕获中，默认原生18个自有／14个委托叶，显式 staging21个自有／11个委托叶；均生成32/32 C++。历史21个自有捕获使用 staging，不是默认原生覆盖结果。第5阶段收据区分服务减少、有限顺序验证、编译成本及未完成限定；全模型所有权仍未完成。

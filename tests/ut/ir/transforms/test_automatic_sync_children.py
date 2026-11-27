@@ -835,3 +835,98 @@ def test_local_only_and_readonly_children_receive_caller_bounds_without_disjoint
         pf = next(f for g, f in phys_prog.functions.items() if g.name == "worker_caller_bounds_no_disjoint")
         assert dict(pf.attrs)["pypto_autosync"] is True
         check_closed_commands(log_fn, pf, {2: 2}, range(6), compare_commands=False, hardware_source=worker)
+
+
+@pytest.mark.parametrize("count", [None, 3], ids=["straight-line", "loop"])
+def test_inline_entry_reuses_delivered_completions(count):
+    # The two exact slices use overlapping Vec windows. A may-alias GM store
+    # separates the slices and publishes completions the next slice inherits.
+    fn = vec_fixture(count=count, visits=2, view="overlap")
+    analysis = inspect(fn)
+    assert len(analysis["children"]) == 2
+    assert all(child["scope"] is None for child in analysis["children"])
+    assert any(len(c["services"]) < len(c["required_services"]) for c in analysis["children"])
+    logical, physical = construct(fn)
+    for output in (0, 1 << 20, 2 << 20):
+        check_closed_commands(
+            logical,
+            physical,
+            {},
+            range(8),
+            tensor_bases={0: 0, 1: 1 << 20, 2: output},
+            compare_commands=False,
+        )
+
+
+@pytest.mark.parametrize("overlap", [False, True], ids=["disjoint-loads", "aliased-loads"])
+def test_inline_first_use_orders_prefetch_across_guarded_visits(overlap):
+    # The first vector consumer of prefetched runs after the slice's internal
+    # load-to-vector wait. The first load itself needs an entry barrier only
+    # when its destination overlaps the prefetch.
+    original = vec_fixture(view="overlap")
+    span = original.span
+    *allocs, load_x, abs_x, load_y, add, abs_z, store, ret = original.body.stmts
+    root = load_x.expr.args[-1]
+    idx = ir.DataType.INDEX
+
+    def ci(value):
+        return ir.ConstInt(value, idx, span)
+
+    def payload(name, args):
+        return ir.EvalStmt(ir.Call(ir.get_op(name), args, ir.VoidType(), span), span)
+
+    prefetched = ir.Var("prefetched", root.type, span)
+    alloc = ir.AssignStmt(
+        prefetched,
+        ir.Call(
+            ir.get_op("buffer.alloc"), [allocs[0].value.args[0], ci(0 if overlap else 3072)], root.type, span
+        ),
+        span,
+    )
+    prefetch = payload("buffer.load", [*load_x.expr.args[:-1], prefetched])
+    consume = payload("buffer.add", [prefetched, *abs_z.expr.args])
+    active = ir.Var("active", ir.ScalarType(ir.DataType.BOOL), span)
+    trips = ir.Var("trips", ir.ScalarType(idx), span)
+    branch = ir.IfStmt(
+        active, ir.SeqStmts([load_x, abs_x, load_y, add, consume, store], span), None, [], span
+    )
+    loop = ir.ForStmt(
+        ir.Var("i", trips.type, span),
+        ci(0),
+        trips,
+        ci(1),
+        [],
+        ir.SeqStmts([prefetch, branch, ir.YieldStmt([], span)], span),
+        [],
+        span,
+    )
+    fn = ir.Function(
+        "guarded_prefetch",
+        [*zip(original.params, original.param_directions, strict=True), active, trips],
+        original.return_types,
+        ir.SeqStmts([*allocs, alloc, loop, ret], span),
+        span,
+        type=original.func_type,
+        ir_stage=original.ir_stage,
+    )
+
+    (child,) = inspect(fn)["children"]
+    dma = ir.PipeType.MTE2
+    assert (dma, dma) in child["required_services"] and (dma, ir.PipeType.V) in child["required_services"]
+    assert ((dma, dma) in child["services"]) == overlap
+    assert (dma, ir.PipeType.V) not in child["services"]
+    logical, physical = construct(fn)
+    for taken, count in ((True, 0), (False, 3), (True, 1), (True, 3)):
+        _, commands = check_closed_commands(
+            logical,
+            physical,
+            {3: taken, 4: count},
+            range(8),
+            tensor_bases={0: 0, 1: 1 << 20, 2: 2 << 20},
+            compare_commands=False,
+        )
+        if taken:
+            for start in range(0, len(commands.payloads), 7):
+                complete = ("payload", start, "C")
+                assert ((complete, ("payload", start + 1, "I")) in commands.order) == overlap
+                assert (complete, ("payload", start + 5, "I")) in commands.order

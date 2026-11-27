@@ -19,6 +19,8 @@ from pypto.backend import BackendType
 from pypto.ir.pass_manager import PassManager
 from pypto.runtime import RunConfig
 
+from .test_peer_loop_slot_order import PeerSenderCommands
+
 pytestmark = pytest.mark.usefixtures("ascend_backend")
 
 
@@ -342,3 +344,78 @@ def test_peer_group_requires_a_distinct_runtime_sized_workspace(aliases_output: 
         # substituted workspace on allocation provenance alone.
         reason = "unique injected root tensor.create" if aliases_output and name == "vector" else refusal
         assert reason in endpoint.attrs[AUTOSYNC_FALLBACK_REASON_ATTR]
+
+
+@pytest.mark.parametrize(
+    "root_calls,may_alias",
+    [
+        ("self.paired(x, tmp)", False),
+        ("self.paired(x, out)", True),
+        ("self.paired(tmp, tmp)", True),
+        (
+            "self.paired(x, tmp)\nother = pl.create_tensor([16, 16], dtype=pl.FP16)\nself.paired(other, other)",
+            True,
+        ),
+    ],
+)
+@pytest.mark.parametrize("push_latest", [False, True])
+def test_fifo_local_completions_use_transfer_operand_and_all_callers(root_calls, may_alias, push_latest):
+    # A push consumes one of two results on V. A subsequent GM load can
+    # overlap the previous store only when every call separates their roots.
+    pushed = "late" if push_latest else "early"
+    program = pl.parse_program(f"""
+@pl.program
+class PeerCopies:
+    @pl.function(type=pl.FunctionType.AIV)
+    def vector(self, x: pl.Tensor[[16, 16], pl.FP16], out: pl.Out[pl.Tensor[[16, 16], pl.FP16]]):
+        peer = pl.import_peer_buffer(name="inbox", peer_func="cube")
+        pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer, dir_mask=2, slot_size=1024, slot_num=2)
+        core = pl.tile.get_block_idx()
+        if core < 1:
+            data = pl.load(x, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
+            early = pl.add(data, data)
+            late = pl.add(early, early)
+            pl.tpush_to_aic({pushed}, split=0)
+            out = pl.store(late, [0, 0], out)
+            following = pl.load(x, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
+            combined = pl.add(following, early)
+            pl.tpush_to_aic(pl.add(combined, late), split=0)
+
+    @pl.function(type=pl.FunctionType.AIC)
+    def cube(self):
+        fifo = pl.reserve_buffer(name="inbox", size=2048, base=0)
+        pl.aic_initialize_pipe(pl.const(0, pl.INT32), fifo, dir_mask=2, slot_size=1024, slot_num=2)
+        for i in pl.range(2):
+            pkt: pl.Tile[[16, 16], pl.FP16, pl.Mem.Mat] = pl.tpop_from_aiv(split=0)
+            pl.tfree_to_aiv(pkt)
+
+    @pl.function(type=pl.FunctionType.Group)
+    def paired(self, x: pl.Tensor[[16, 16], pl.FP16], out: pl.Out[pl.Tensor[[16, 16], pl.FP16]]):
+        self.cube()
+        self.vector(x, out)
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(self, x: pl.Tensor[[16, 16], pl.FP16], out: pl.Out[pl.Tensor[[16, 16], pl.FP16]]):
+        tmp = pl.create_tensor([16, 16], dtype=pl.FP16)
+{indent(root_calls, "        ")}
+""")
+    with _autosync_context([]):
+        lowered = PassManager(ir.OptimizationStrategy.Default).run_passes(program)
+    leaf = lowered.get_function("vector")
+    assert leaf is not None
+    assert leaf.attrs.get(PYPTO_AUTOSYNC_ATTR), str(leaf.attrs)
+    commands = PeerSenderCommands(leaf, 0)
+    for op, pipe in (
+        ("buffer.add", ir.PipeType.V),
+        ("buffer.store", ir.PipeType.MTE3),
+    ):
+        commands.payload_pipes[ir.get_op(op).name] = pipe
+    order = commands.run()
+    assert [c.op.name for c in commands.calls] == [
+        ir.get_op("buffer." + name).name
+        for name in ("load", "add", "add", "peer_push", "store", "load", "add", "add", "peer_push")
+    ]
+    assert (("done", 1), ("issue", 3)) in order
+    assert ((("done", 2), ("issue", 3)) in order) == push_latest
+    assert (("done", 2), ("issue", 4)) in order
+    assert ((("done", 4), ("issue", 5)) in order) == may_alias

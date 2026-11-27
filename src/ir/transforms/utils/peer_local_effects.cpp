@@ -560,6 +560,10 @@ class LaneImporter {
     if (window.pop) {
       const auto id = window.pop->pipe_id;
       const auto& ring = *transport_.pipes.at(id).receive;
+      if (site.structured && !write) {
+        const auto pop = GetCallFromStmt(window.pop->statement);
+        structured_->calls.at(pop.get()).last_borrow_readers[site.physical.pipe] = site.structured->statement;
+      }
       auto& storage = result_.input.storage;
       const auto [it, fresh] = ring_domains_.try_emplace(id, storage.size());
       if (fresh) {
@@ -603,7 +607,7 @@ class LaneImporter {
     if (write) {
       Gm().writes.insert(it->second);
     }
-    if (structured_ && authored_acquire_) {
+    if (structured_) {
       if (site.structured) {
         site.structured->effects.push_back({MemorySpace::DDR, write, std::nullopt, it->second});
       }

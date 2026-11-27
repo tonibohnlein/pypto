@@ -108,6 +108,10 @@ struct ImportedLocalCut {
   // Its native ready/credit, cursor and queue operations are opaque here.
   bool is_transport = false;
 
+  // For a receive, last local reader on each pipe of the tile borrowed at
+  // this cut. Borrow qualification forbids a live borrow at control joins.
+  std::map<PipeType, const Stmt*> last_borrow_readers{};
+
   bool HasOpaqueProtocol() const { return is_transport || has_native_claims; }
 };
 using ImportedLocalCuts = std::unordered_map<const Call*, ImportedLocalCut>;
@@ -178,7 +182,7 @@ struct ConservativeSyncSite {
   std::vector<PipeType> source_pipes;
   std::vector<PipeType> required_source_pipes;
   // A separately certified producer-side service, after this payload. The
-  // destination pipe has no later payload before the next loop visit.
+  // destination receives the prefix at this cut.
   std::optional<PipeType> post_destination;
   // Phase-only subsets of source_pipes. All other services run on both paths.
   std::optional<ConservativeLoopEntryServices> loop_entry;

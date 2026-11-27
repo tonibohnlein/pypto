@@ -196,7 +196,8 @@ def test_caller_specialization_is_not_implicitly_inherited_by_parent():
     assert "caller/launch" in result["reason"]
 
 
-def test_compound_native_flag_claims_prevent_resource_empty_export():
+@pytest.mark.parametrize("uses_native_event", [False, True])
+def test_compound_native_flag_claims_prevent_resource_empty_export(uses_native_event):
     base = row_fixture()
     span = base.span
 
@@ -206,6 +207,11 @@ def test_compound_native_flag_claims_prevent_resource_empty_export():
     assert isinstance(base.body, ir.SeqStmts)
     statements = list(base.body.stmts)
     definitions, load, row = statements[:4], statements[4], statements[5]
+    if uses_native_event:
+        # A2/A3 TRECIP uses a private V/S event. The FP32 TROWMAX control
+        # uses explicit scratch and vector instructions only.
+        src, dst = definitions[0].var, definitions[1].var
+        row = ir.EvalStmt(ir.Call(ir.get_op("buffer.recip"), [src, dst], ir.VoidType(), span), span)
     child = ir.ForStmt(
         ir.Var("once", ir.ScalarType(ir.DataType.INDEX), span),
         ci(0),
@@ -228,7 +234,8 @@ def test_compound_native_flag_claims_prevent_resource_empty_export():
     )
     function = clone(base, body=ir.SeqStmts([*definitions, outer, statements[-1]], span))
     result = testing.export_native_sync_child(testing.analyze_placed_sync(function, True), child)
-    assert result["status"] == "native_resources" and result["child"] is None
+    assert result["status"] == ("native_resources" if uses_native_event else "ready")
+    assert (result["child"] is None) == uses_native_event
 
 
 def test_missing_phase_inner_summary_remains_unavailable():

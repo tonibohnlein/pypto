@@ -126,11 +126,9 @@ def test_row_access_covers_selectors_and_commands(count, scratch_io):
     # and checks actual retained covers, four event queries and selectors.
     validate(original, retained)
     physical, _, _, _ = check(original, list(range(6)))
-    if count != 0:
-        assert set(physical["native_reserved_ids"]) == {
-            (ir.PipeType.V, ir.PipeType.S, 0),
-            (ir.PipeType.S, ir.PipeType.V, 0),
-        }
+    # The FP32 reductions use the generic vector implementation. The macro
+    # catalog also covers integer overloads with private V/S events.
+    assert not physical["native_reserved_ids"]
     emitted = apply_hybrid([original])[original.name]
     assert dict(emitted.attrs)[PYPTO_AUTOSYNC_ATTR] == (count != 0)
     run_physical(original, emitted, range(6))

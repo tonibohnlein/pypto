@@ -673,7 +673,7 @@ FunctionPtr PlanLocalEndpoint(const WrapperCallInfo& call, const FunctionPtr& gr
     coordinates->width_parameters = std::move(endpoint_widths);
   }
   const auto parameters = invocation.parameters.find(fn->name_);
-  const auto local = ImportPeerLocalEffects(
+  auto local = ImportPeerLocalEffects(
       fn, transport, "a2a3",
       parameters == invocation.parameters.end() ? SyncParameterBounds{} : parameters->second, coordinates);
   std::set<size_t> touched;
@@ -691,6 +691,15 @@ FunctionPtr PlanLocalEndpoint(const WrapperCallInfo& call, const FunctionPtr& gr
     }
   }
   gm.Check(group, touched, workspace_formal);
+  if (local.structured) {
+    const auto domains = gm.FifoGmDomains(group, touched);
+    if (!domains.empty()) {
+      for (const auto formal : local.gm.formals) {
+        const auto actual = AsVarLike(call.inner_call->args_[formal]);
+        local.structured->gm_domains.emplace(formal, domains.at(positions.at(actual.get())));
+      }
+    }
+  }
   for (const auto index : local.gm.host_extent_requirements) {
     const auto argument = AsVarLike(call.inner_call->args_[index]);
     const auto from = As<TensorType>(argument->GetType());

@@ -1,5 +1,7 @@
 # RealizeSync (experimental)
 
+For the current design contracts and their relationship to the synchronization draft and RFC #3375, see [Single-core AutoSync architecture](../ir/53-local-autosync-architecture.md).
+
 This optional pass tries PyPTO synchronization after storage lowering. Default
 compilation continues to delegate synchronization to PTOAS.
 
@@ -16,8 +18,8 @@ with passes.PassContext([], enable_pypto_autosync=False):
     baseline = kernel.compile(a, b, c, config=config)
 ```
 
-PyPTO runs the shared `InsertSync` producer, logical verification (the current
-`OptimizeSync` stage), and actual-token `LowerSync` consumer for physically placed Buffer IR on the
+PyPTO runs the shared `InsertSync` producer, logical token simplification and verification
+in `OptimizeSync`, and actual-token `LowerSync` consumer for physically placed Buffer IR on the
 qualified AIC matmul and AIV Vec fragments, using manual a2a3 macro variants. Missing placement,
 GM disjointness, target, access, control, endpoint or resource qualifications
 leave the **original kernel body** for PTOAS. This delegation does not promise
@@ -62,6 +64,17 @@ communication and qualifies local synchronization and shared-GM visibility.
 A refusal delegates both endpoints to the shared PTOAS invocation. The exact
 policy uses the per-function route. Standalone passes also expose
 `require_whole_module=True` to require ownership of all local Buffer domains.
+
+For structured FIFO endpoints, the planner checks the actual arguments at every
+launch. It gives a GM operand its own alias class when each launch binds it to a
+fresh allocation distinct from the endpoint's other GM operands. Other operands
+share a may-alias class. A transfer can wait for the producer of its local
+operand while later independent payloads on that producer pipe remain in flight.
+The wait stays at the authored transfer cut. After reselecting services, the
+planner verifies that no intervening producer acquires from the destination
+before that wait. FP32 row sum, maximum and minimum use the A2/A3 vector
+implementation with explicit scratch. Their integer implementations reserve
+private vector/scalar events.
 
 When a FIFO endpoint contains conditional work and an authored hard MIX
 `syncall` between work loops, the structured planner checks that all FIFO
@@ -156,6 +169,15 @@ on the original control flow, including event reuse. It keeps the candidate
 only when it can realize the release with the existing flag budget and wait
 placement.
 
+For a recurring FIFO receive, the importer tracks the last local reader on each
+pipe through aliases of the borrowed tile. When a wait at the next pop would
+also capture unrelated work, the planner can transfer completion immediately
+after the last reader. The pop and its reader execute in the same control arm,
+so moving the service uses the same number of event commands per visit.
+The planner rechecks storage dependencies across branches and loop iterations,
+and the allocator checks consuming-event reuse. Acquiring the release at the
+reader can also order other loads on the receive pipe earlier.
+
 A shared wait can order independent operands. For example, the left matrix
 move needs the earlier query load while the right move needs the later page
 load. The planner can keep the original page publication, deliver the earlier
@@ -187,6 +209,14 @@ directional ID. Inside a loop, retained commands must carry its consumption
 back to the publishing pipe before the next visit. These checks use the
 original control flow and introduce no guards. If the relay would also
 deliver unrelated work, the original batch remains eligible.
+
+For an inlined child sharing the parent event allocator, the planner removes
+an entry service if removal preserves the incoming completion state. It can
+also use a wait inside a straight-line child to cover an incoming access at
+its first conflicting payload. The proof tracks the prefixes captured by each
+record and delivered by each wait. A fixed-point replay checks the proposed
+removals together against later consumers, skipped branches and loop backedges,
+with all other services fixed. Physical allocation checks event reuse.
 
 A later retained child can inherit completion from an earlier region, including
 when the child is nested in a work loop. For an enclosing loop proved to run
