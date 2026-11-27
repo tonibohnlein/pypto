@@ -1,0 +1,73 @@
+--- candidate.cpp
++++ control.cpp
+@@ -525,2 +525,4 @@
+                 TPUSH<TPipe<0, Direction::DIR_BOTH, 8192, 2, 2, true>, Tile<TileType::Acc, float, 16, 128, BLayout::ColMajor, 16, 128, SLayout::RowMajor, 1024, PadValue::Null, CompactMode::Null>, TileSplitAxis::TILE_NO_SPLIT>(v117, v97);
++                set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
++                wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+                 // pto: %exp_scores_bf16_inline1839__tile_Left_mat
+@@ -534,4 +536,2 @@
+                 TMOV(v93, v197);
+-                set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+-                wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+                 TFREE<TPipe<0, Direction::DIR_BOTH, 8192, 2, 2, true>, TileSplitAxis::TILE_NO_SPLIT>(v117);
+@@ -663,2 +663,4 @@
+                 TPUSH<TPipe<0, Direction::DIR_BOTH, 8192, 2, 2, true>, Tile<TileType::Acc, float, 16, 128, BLayout::ColMajor, 16, 128, SLayout::RowMajor, 1024, PadValue::Null, CompactMode::Null>, TileSplitAxis::TILE_NO_SPLIT>(v117, v97);
++                set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
++                wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+                 // pto: %83
+@@ -672,4 +674,2 @@
+                 TMOV(v103, v230);
+-                set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+-                wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+                 TFREE<TPipe<0, Direction::DIR_BOTH, 8192, 2, 2, true>, TileSplitAxis::TILE_NO_SPLIT>(v117);
+@@ -799,2 +799,4 @@
+                 TPUSH<TPipe<0, Direction::DIR_BOTH, 8192, 2, 2, true>, Tile<TileType::Acc, float, 16, 128, BLayout::ColMajor, 16, 128, SLayout::RowMajor, 1024, PadValue::Null, CompactMode::Null>, TileSplitAxis::TILE_NO_SPLIT>(v117, v97);
++                set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
++                wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+                 // pto: %109
+@@ -808,4 +810,2 @@
+                 TMOV(v113, v263);
+-                set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+-                wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+                 TFREE<TPipe<0, Direction::DIR_BOTH, 8192, 2, 2, true>, TileSplitAxis::TILE_NO_SPLIT>(v117);
+@@ -915,2 +915,4 @@
+               TPUSH<TPipe<0, Direction::DIR_BOTH, 8192, 2, 2, true>, Tile<TileType::Acc, float, 16, 128, BLayout::ColMajor, 16, 128, SLayout::RowMajor, 1024, PadValue::Null, CompactMode::Null>, TileSplitAxis::TILE_NO_SPLIT>(v117, v97);
++              set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
++              wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+               // pto: %125
+@@ -919,4 +921,4 @@
+               TPOP<TPipe<0, Direction::DIR_BOTH, 8192, 2, 2, true>, Tile<TileType::Mat, bfloat16_t, 16, 128, BLayout::ColMajor, 16, 128, SLayout::RowMajor, 512, PadValue::Min, CompactMode::Null>, TileSplitAxis::TILE_NO_SPLIT>(v117, v289);
+-              set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID4);
+-              wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID4);
++              set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID3);
++              wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID3);
+               set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+@@ -924,4 +926,2 @@
+               TMOV(v93, v289);
+-              set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+-              wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+               TFREE<TPipe<0, Direction::DIR_BOTH, 8192, 2, 2, true>, TileSplitAxis::TILE_NO_SPLIT>(v117);
+@@ -1030,4 +1030,4 @@
+               TLOAD(v99, v318);
+-              set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID3);
+-              wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID3);
++              set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID4);
++              wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID4);
+               set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+@@ -1044,2 +1044,4 @@
+               TPUSH<TPipe<0, Direction::DIR_BOTH, 8192, 2, 2, true>, Tile<TileType::Acc, float, 16, 128, BLayout::ColMajor, 16, 128, SLayout::RowMajor, 1024, PadValue::Null, CompactMode::Null>, TileSplitAxis::TILE_NO_SPLIT>(v117, v97);
++              set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
++              wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+               // pto: %147
+@@ -1048,4 +1050,4 @@
+               TPOP<TPipe<0, Direction::DIR_BOTH, 8192, 2, 2, true>, Tile<TileType::Mat, bfloat16_t, 16, 128, BLayout::ColMajor, 16, 128, SLayout::RowMajor, 512, PadValue::Min, CompactMode::Null>, TileSplitAxis::TILE_NO_SPLIT>(v117, v319);
+-              set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID4);
+-              wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID4);
++              set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID3);
++              wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID3);
+               set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+@@ -1053,4 +1055,2 @@
+               TMOV(v103, v319);
+-              set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+-              wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+               TFREE<TPipe<0, Direction::DIR_BOTH, 8192, 2, 2, true>, TileSplitAxis::TILE_NO_SPLIT>(v117);

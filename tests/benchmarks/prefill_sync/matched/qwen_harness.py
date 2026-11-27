@@ -14,6 +14,7 @@ import hashlib
 import importlib
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -44,7 +45,7 @@ def ok_preview(af, ef, rtol, atol, a, e, override) -> bool:
 def digest(t: torch.Tensor) -> str:
     c = t.contiguous()
     raw = c.view(torch.int16) if c.dtype is torch.bfloat16 else c
-    return hashlib.sha256(raw.numpy().tobytes()).hexdigest()
+    return hashlib.sha256(memoryview(raw.numpy()).cast("B")).hexdigest()
 
 
 # The model's own stated criteria, per entry and output. Recorded in the result
@@ -118,7 +119,14 @@ def recorder(name: str, override: tuple[float, float, str] | None = None):
         # full-depth run either way, so the arm-to-arm comparison the handoff
         # asks for separately can be made from saved bytes rather than from a
         # digest that only says "different".
-        if (not ok_preview(af, ef, rtol, atol, a, e, override)) or SAVE_ALWAYS[0]:
+        winner_mismatch = entry.get("winning_token_actual") != entry.get("winning_token_expected")
+        finite = entry["actual_all_finite"] and entry["expected_all_finite"]
+        if (
+            not ok_preview(af, ef, rtol, atol, a, e, override)
+            or winner_mismatch
+            or not finite
+            or SAVE_ALWAYS[0]
+        ):
             index = len(RECORD["outputs"][name]) - 1
             torch.save({"actual": a, "expected": e}, OUT_DIR[0] / f"tensors_{name}_r{index}.pt")
         if override is not None and override[0] == 0.0 and override[1] == 0.0:
@@ -184,6 +192,9 @@ def main() -> None:
     parser.add_argument("--rtol", type=float, default=5e-3)
     parser.add_argument("--atol", type=float, default=5e-3)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--runtime-dir", type=Path, help="replay a prepared program without compiling the model"
+    )
     args = parser.parse_args()
 
     autosync = args.arm in ("B", "Bp")
@@ -211,6 +222,9 @@ def main() -> None:
     if args.capture:
         config |= {"enable_dep_gen": True}
 
+    # Preserve the RNG state used to construct the first actual input pack.
+    with torch.random.fork_rng(devices=[]) if args.runtime_dir else nullcontext():
+        input_digests = {s.name: digest(s.create_tensor()) for s in specs if s.init_value is not None}
     RECORD.update(
         {
             "arm": args.arm,
@@ -230,7 +244,8 @@ def main() -> None:
             "autosync_policy": "conservative_prefix",
             "criteria": {k: list(v) for k, v in CRITERIA[args.entry].items()},
             "spec_order": [s.name for s in specs],
-            "input_digests": {s.name: digest(s.create_tensor()) for s in specs if s.init_value is not None},
+            "input_digests": input_digests,
+            "runtime_dir": str(args.runtime_dir.resolve()) if args.runtime_dir else None,
         }
     )
 
@@ -240,6 +255,8 @@ def main() -> None:
         # Fresh specs each repeat: every InOut buffer (the KV cache above all)
         # is rebuilt from its initial value, so repeats start from equivalent
         # state rather than from the previous repeat's updated cache.
+        if args.runtime_dir:
+            torch.manual_seed(args.seed)
         specs, _ = prefill_case(model, args.case, args.layers)
         # The arm lives here. `enable_pypto_autosync` defaults to False when no
         # PassContext is active, so a compile outside one is the stock arm
@@ -256,6 +273,7 @@ def main() -> None:
         ):
             result = run(
                 fn=entry,
+                runtime_dir=str(args.runtime_dir) if args.runtime_dir else None,
                 specs=specs,
                 golden_fn=None if args.timing else golden_fn,
                 config=config,
@@ -278,6 +296,14 @@ def main() -> None:
 
     RECORD["verdicts"] = verdicts
     RECORD["passed"] = all(v["passed"] for v in verdicts)
+    if args.runtime_dir and not args.timing:
+        outputs = RECORD["outputs"].get("out", [])
+        RECORD["passed"] &= len(outputs) == args.repeats and all(
+            row["actual_all_finite"]
+            and row["expected_all_finite"]
+            and row["winning_token_actual"] == row["winning_token_expected"]
+            for row in outputs
+        )
     # Repeat variation: the same arm on the same inputs should land on the same
     # bytes; if it does not, that bound is reported beside the arm comparison.
     for name, entries in RECORD["outputs"].items():
